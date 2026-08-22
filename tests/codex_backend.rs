@@ -3371,6 +3371,176 @@ fn appserver_observe_reads_the_childs_own_exit_after_a_turn_completes() {
     assert_eq!(observation.native, NativeState::Exited);
 }
 
+/// The third, narrowest `InterruptedVia` arm (coverage-spec.md §2e names all
+/// three): the stream ends while `turn/interrupt` is still outstanding, so
+/// neither an acknowledgement nor an RPC failure is known to be what
+/// happened. `appserver_exits_before("turn/interrupt", 1)` closes the
+/// stub's stdout before it would otherwise reply to the very first
+/// `turn/interrupt` request -- an RPC that goes unanswered, not one that
+/// failed and not one the harness accepted. A short `interrupt` budget keeps
+/// `Backend::interrupt`'s own blocking call on the unanswered RPC from
+/// making this test slow; the reader thread settles the turn on EOF well
+/// before that budget ever expires.
+#[test]
+fn appserver_observe_reports_the_interrupt_rpc_as_unresolved_when_the_stream_closes_first() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_exits_before("turn/interrupt", 1);
+    let mut config = config_for(&stub, dir.path(), &dir.path().join("codex-home"));
+    config.transport = TransportChoice::AppServerOnly;
+    config.appserver_budgets = Some(Budgets {
+        handshake: Duration::from_secs(10),
+        thread_start: Duration::from_secs(10),
+        turn_start: Duration::from_secs(5),
+        interrupt: Duration::from_millis(300),
+        stderr_drain: Duration::from_secs(2),
+    });
+    let backend = CodexBackend::new(config);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    // Sets `InterruptProgress::Requested` before the RPC is even written, so
+    // the reader thread's EOF handling is guaranteed to see it outstanding.
+    let _ = backend.interrupt(&handle);
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the interrupt's own RPC never got an answer before the stream closed",
+        |o| {
+            o.evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("still outstanding"))
+        },
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("expected Running (resumable, no stage verdict), got {other:?}"),
+    }
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "the child's stdout closed while turn/interrupt was still outstanding, so nothing \
+             ever answered it either way"
+        ),
+        "the unresolved-RPC arm must name itself, not borrow either sibling's sentence; \
+         got: {evidence}"
+    );
+    assert!(
+        !evidence.contains("RPC failed") && !evidence.contains("was acknowledged"),
+        "must not be confused with either of the other two InterruptedVia arms; got: {evidence}"
+    );
+}
+
+/// The first `InterruptedVia` arm (coverage-spec.md §2e names all three):
+/// `turn/interrupt`'s own RPC comes back a JSON-RPC error, so
+/// `interrupt_appserver` falls back to the process-group kill it always
+/// keeps ready. Scripting an error reply resolves `call_reserved` to `Err`
+/// synchronously inside `Backend::interrupt` itself -- no EOF race to wait
+/// out, since `interrupt_appserver`'s own `Err` branch marks `RpcFailed`,
+/// kills the group, and settles the turn all before returning.
+#[test]
+fn appserver_observe_reports_the_interrupt_rpc_as_failed_falling_back_to_the_kill() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply(
+        "turn/interrupt",
+        &[r#"{"id":__ID__,"error":{"code":-32000,"message":"boom"}}"#],
+    );
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let _ = backend.interrupt(&handle);
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the interrupt RPC's own error must fall back to the process-group kill",
+        |o| {
+            o.evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("RPC failed"))
+        },
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("expected Running (resumable, no stage verdict), got {other:?}"),
+    }
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt's own RPC failed and sergeant fell back to the process-group kill"
+        ),
+        "the RPC-failure arm must name itself, not borrow either sibling's sentence; \
+         got: {evidence}"
+    );
+    assert!(
+        !evidence.contains("was acknowledged") && !evidence.contains("still outstanding"),
+        "must not be confused with either of the other two InterruptedVia arms; got: {evidence}"
+    );
+}
+
+/// The second `InterruptedVia` arm (coverage-spec.md §2e names all three):
+/// the harness answers `turn/interrupt` with a result -- `resolve` marks
+/// `Acknowledged` on the reader thread the instant it decodes that answer,
+/// "announce first, wake second" -- but the child's stdout then closes with
+/// no `turn/completed` ever naming a verdict. `appserver_exits_after
+/// ("turn/interrupt")` is exactly that shape: answer the one RPC, then EOF.
+#[test]
+fn appserver_observe_reports_the_interrupt_rpc_acknowledged_then_the_stream_closing() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply("turn/interrupt", &[r#"{"id":__ID__,"result":{}}"#]);
+    stub.appserver_exits_after("turn/interrupt");
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let _ = backend.interrupt(&handle);
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the harness acknowledged the interrupt before the stream closed with no \
+         turn/completed",
+        |o| {
+            o.evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("was acknowledged"))
+        },
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("expected Running (resumable, no stage verdict), got {other:?}"),
+    }
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt was acknowledged, but the child's stdout closed before \
+             turn/completed carried the harness's own verdict"
+        ),
+        "the acknowledged-then-closed arm must name itself, not borrow either sibling's \
+         sentence; got: {evidence}"
+    );
+    assert!(
+        !evidence.contains("RPC failed") && !evidence.contains("still outstanding"),
+        "must not be confused with either of the other two InterruptedVia arms; got: {evidence}"
+    );
+}
+
 // --------------------------------------------------------- §2f: small
 // residuals, one existing-infrastructure test each.
 
