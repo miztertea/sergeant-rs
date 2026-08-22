@@ -1637,6 +1637,23 @@ impl InterruptProgress {
             };
         }
     }
+
+    /// Whether this turn's interrupt is still worth actually asking the
+    /// harness for: only `NotRequested` (nobody has asked) or `RpcFailed`
+    /// (the last ask never got an honest answer, one way or the other) mean
+    /// that. `Requested { .. }` (an ask is already outstanding) and
+    /// `Acknowledged` (an ask already got the honest answer) both mean a
+    /// repeat call has nothing to add -- and, just as importantly, must not
+    /// overwrite either of them with a fresh, untracked `Requested`: doing so
+    /// is how a turn the harness genuinely acknowledged could end up
+    /// settling as if nothing had ever answered it, merely because *this*
+    /// call's own redundant RPC went unanswered.
+    fn worth_asking_again(&self) -> bool {
+        matches!(
+            self,
+            InterruptProgress::NotRequested | InterruptProgress::RpcFailed
+        )
+    }
 }
 
 /// Fold one turn's stream evidence plus the interrupt request, if any, into
@@ -1731,11 +1748,12 @@ fn settle_appserver_turn(state: &mut AppServerTurnState) -> Option<AppServerSett
         InterruptProgress::RpcFailed => Some(InterruptedVia::RpcFailed),
     };
     let taken = std::mem::replace(state, AppServerTurnState::Idle);
-    let AppServerTurnState::InFlight { acc, .. } = taken else {
+    let AppServerTurnState::InFlight { acc, turn_id, .. } = taken else {
         unreachable!("just matched InFlight above");
     };
     let outcome = classify_terminal(&acc, via);
     *state = AppServerTurnState::Finished {
+        turn_id,
         outcome: outcome.clone(),
         last_agent_message: acc.last_agent_message.clone(),
         message_items: acc.message_items,
@@ -2002,9 +2020,25 @@ enum AppServerTurnState {
         /// write-back would erase a terminal the adapter had already
         /// journaled. Never reused: a monotonic counter per runtime.
         epoch: u64,
+        /// The turn id [`AppServerRuntime::turn`] held just before this one
+        /// replaced it, if that turn ever got one (`""` when the previous
+        /// state was [`AppServerTurnState::Idle`], or a settled turn whose
+        /// `turn/start` never got far enough to learn its id). Lets a
+        /// notification that names this id, arriving after this cell already
+        /// moved on, be recognised as a straggler from the turn *this one
+        /// displaced* rather than folded into `acc` as if it were this turn's
+        /// own evidence -- the failure mode the "displacement" tests only
+        /// cover for a straggler that arrives *before* the displacement,
+        /// never one that arrives during the new turn's own `InFlight`
+        /// window.
+        superseded_turn_id: String,
     },
     /// The last turn's terminal, plus the evidence OBSERVE reports.
     Finished {
+        /// This turn's own id, carried forward so a later `InFlight` that
+        /// displaces this `Finished` can name it as `superseded_turn_id` and
+        /// keep recognising its stragglers even after the cell moves on.
+        turn_id: String,
         outcome: TerminalOutcome,
         last_agent_message: Option<String>,
         message_items: u32,
@@ -2116,6 +2150,24 @@ impl AppServerLineContext {
     }
 }
 
+/// The turn identity one app-server notification's envelope carries, when it
+/// carries one at all (spec §1.6's wire table). `turn/completed` nests it
+/// under `turn.id`; every other per-turn notification (`item/started`,
+/// `item/completed`, `thread/tokenUsage/updated`, the standalone `error`,
+/// ...) carries a flat `turnId` alongside its `threadId`. `thread/started`
+/// and the connection-level warning methods carry neither, and `None` here
+/// is read as "cannot be identified as a straggler" rather than "definitely
+/// belongs to the current turn" — the existing accept-when-unsure posture
+/// [`AppServerTurnState::InFlight`]'s own doc describes for the empty-
+/// `turn_id` window is left exactly as permissive as it was.
+fn notification_turn_id<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
+    if method == "turn/completed" {
+        params.pointer("/turn/id").and_then(Value::as_str)
+    } else {
+        params.get("turnId").and_then(Value::as_str)
+    }
+}
+
 /// The reader-thread callback every app-server child runs (spec §1.4/§3.4):
 /// decodes notifications through the shared [`TurnAccumulator`], emits their
 /// events immediately, finalizes the turn on `turn/completed`, and answers
@@ -2131,9 +2183,32 @@ fn appserver_on_line(
         codex_appserver::InboundLine::Notification { method, params } => {
             let mut state = turn_cell.lock().expect("appserver turn lock");
             let mut late_report = None;
+            let mut stray = false;
             let events = match &mut *state {
-                AppServerTurnState::InFlight { acc, .. } => {
-                    acc.ingest_appserver_notification(&method, &params)
+                AppServerTurnState::InFlight {
+                    acc,
+                    turn_id,
+                    superseded_turn_id,
+                    ..
+                } => {
+                    // A notification that names the turn this cell's own
+                    // `turn/start` *displaced* — never this cell's own turn,
+                    // and only when that displaced id is actually known — is
+                    // a straggler from the previous turn arriving inside the
+                    // new one's `InFlight` window, not evidence about the new
+                    // turn. Folding it into `acc` used to be how a stray
+                    // `turn/completed{status:"failed"}` for the old turn
+                    // could stamp `Terminal::Failed` onto a turn that never
+                    // failed; recognising it here instead of unconditionally
+                    // ingesting keeps this turn's own accumulator honest.
+                    stray = !superseded_turn_id.is_empty()
+                        && notification_turn_id(&method, &params)
+                            .is_some_and(|id| id == superseded_turn_id && id != turn_id.as_str());
+                    if stray {
+                        Vec::new()
+                    } else {
+                        acc.ingest_appserver_notification(&method, &params)
+                    }
                 }
                 // §3.4, from the far end: this turn is already settled, and
                 // nothing that arrives now re-decides it. What it must not do
@@ -2154,10 +2229,24 @@ fn appserver_on_line(
             for event in &events {
                 ctx.emit(&event.kind, event.payload.clone());
             }
-            let settlement = (method == "turn/completed")
+            // A stray `turn/completed` for the displaced turn must not
+            // settle *this* one — that would be the ceiling case above, one
+            // step further: the new turn's evidence has already been kept
+            // clean of it, and letting it trigger settlement anyway would
+            // finalize a turn that is still genuinely running.
+            let settlement = (method == "turn/completed" && !stray)
                 .then(|| settle_appserver_turn(&mut state))
                 .flatten();
             drop(state);
+            if stray {
+                ctx.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({
+                        "phase": "stray_notification_for_superseded_turn",
+                        "method": method,
+                    }),
+                );
+            }
             if let Some(payload) = late_report {
                 ctx.emit(KIND_TURN_HARNESS_ERROR, payload);
             }
@@ -3507,11 +3596,20 @@ impl CodexBackend {
                 AppServerTurnState::Finished { late, .. } => late.summary(),
                 AppServerTurnState::Idle | AppServerTurnState::InFlight { .. } => None,
             };
+            // The outgoing turn's own id, if it ever got one, so a straggler
+            // that names it after this line overwrites the cell is still
+            // recognisable as *that* turn's evidence rather than this new
+            // one's (see `superseded_turn_id`'s own doc).
+            let superseded_turn_id = match &*turn_state {
+                AppServerTurnState::Finished { turn_id, .. } => turn_id.clone(),
+                AppServerTurnState::Idle | AppServerTurnState::InFlight { .. } => String::new(),
+            };
             *turn_state = AppServerTurnState::InFlight {
                 turn_id: String::new(),
                 acc: TurnAccumulator::new(),
                 interrupt: InterruptProgress::NotRequested,
                 epoch,
+                superseded_turn_id,
             };
             displaced
         };
@@ -3583,20 +3681,37 @@ impl CodexBackend {
         // request goes out: the reader thread resolves this id the instant it
         // decodes the answer, and it can only do that if the cell already
         // names the id it is waiting on.
-        let interrupt_id = handle.reserve_id();
-        let turn_id = {
+        //
+        // Only fires the RPC (and stamps `Requested`) from `NotRequested` or
+        // `RpcFailed` -- the two states in which nobody has ever gotten an
+        // honest answer for this turn yet. `Backend::interrupt`/`stop` are
+        // expected to be called more than once on the same still-`InFlight`
+        // turn (the engine's own ceiling-triggered auto-interrupt followed by
+        // a later human cancel is one real path), and a repeat call landing
+        // on `Requested { .. }` (already outstanding) or `Acknowledged`
+        // (already confirmed) must not clobber that state: doing so is
+        // exactly how a turn the harness genuinely acknowledged could settle
+        // as `RpcUnresolved` because *this* call's redundant RPC went
+        // unanswered. A second ask has nothing to add in either case -- the
+        // outstanding request will still resolve on the reader thread, and
+        // an acknowledged one already got the honest answer -- so it is a
+        // no-op rather than a fresh, tracked attempt.
+        let attempt = {
             let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
             match &mut *turn_state {
                 AppServerTurnState::InFlight {
                     turn_id, interrupt, ..
-                } => {
-                    *interrupt = InterruptProgress::Requested { id: interrupt_id };
-                    Some(turn_id.clone())
+                } if interrupt.worth_asking_again() => {
+                    let id = handle.reserve_id();
+                    *interrupt = InterruptProgress::Requested { id };
+                    Some((turn_id.clone(), id))
                 }
-                AppServerTurnState::Idle | AppServerTurnState::Finished { .. } => None,
+                AppServerTurnState::InFlight { .. }
+                | AppServerTurnState::Idle
+                | AppServerTurnState::Finished { .. } => None,
             }
         };
-        let Some(turn_id) = turn_id else {
+        let Some((turn_id, interrupt_id)) = attempt else {
             return Completion::immediate();
         };
         let work_id = {
@@ -3642,7 +3757,10 @@ impl CodexBackend {
             // §15 / §3.4 point 3: a downgrade that nobody can see is the
             // dishonesty this wave exists to avoid, and a downgrade OBSERVE
             // can never resolve is the same dishonesty one step further —
-            // `interrupt_requested` was already set to `true` above, so this
+            // `interrupt` was already stamped `Requested` above (this branch
+            // is only reached for a call that actually sent the RPC; a
+            // repeat call landing on an already-`Acknowledged` or already-
+            // `Requested` cell returns before ever getting here), so this
             // resolves through the same `classify_terminal` the reader
             // thread's own EOF handling uses, landing on
             // `InterruptedRunning` (never `AmbiguousUnknown`): sergeant did
@@ -4379,6 +4497,7 @@ fn observe_appserver(execution: &CodexExecution, runtime: &AppServerRuntime) -> 
             evidence: Some(format!("turn {turn_id} in flight on thread {thread_ref}")),
         },
         AppServerTurnState::Finished {
+            turn_id: _,
             outcome,
             last_agent_message,
             message_items,
@@ -5300,6 +5419,7 @@ mod tests {
             acc: TurnAccumulator::new(),
             interrupt: InterruptProgress::Requested { id },
             epoch: 1,
+            superseded_turn_id: String::new(),
         }
     }
 
@@ -5354,6 +5474,50 @@ mod tests {
             settled_via(interrupted_turn(7)),
             Some(InterruptedVia::RpcUnresolved)
         );
+    }
+
+    /// `turn/completed` nests its turn id under `turn.id`; every other
+    /// per-turn notification carries a flat `turnId`. A notification neither
+    /// shape recognizes (`thread/started`, a connection-level warning) names
+    /// no turn at all -- `None`, not a guess.
+    #[test]
+    fn notification_turn_id_reads_the_shape_each_method_actually_carries() {
+        assert_eq!(
+            notification_turn_id(
+                "turn/completed",
+                &json!({"turn": {"id": "turn-9", "status": "completed"}})
+            ),
+            Some("turn-9")
+        );
+        assert_eq!(
+            notification_turn_id(
+                "item/completed",
+                &json!({"turnId": "turn-9", "item": {"id": "i1"}})
+            ),
+            Some("turn-9")
+        );
+        assert_eq!(
+            notification_turn_id("thread/started", &json!({"thread": {"id": "t1"}})),
+            None
+        );
+        assert_eq!(
+            notification_turn_id("configWarning", &json!({"message": "no bubblewrap"})),
+            None
+        );
+    }
+
+    /// A repeat `Backend::interrupt`/`stop` call on a turn that is still
+    /// `InFlight` -- the engine's own ceiling-triggered auto-interrupt
+    /// followed by a later human cancel is one real path -- must never
+    /// re-ask the harness once an ask has already gotten (or is already
+    /// getting) an honest answer. Only `NotRequested` and `RpcFailed` are
+    /// worth a fresh, tracked attempt.
+    #[test]
+    fn only_not_requested_and_rpc_failed_are_worth_asking_again() {
+        assert!(InterruptProgress::NotRequested.worth_asking_again());
+        assert!(InterruptProgress::RpcFailed.worth_asking_again());
+        assert!(!InterruptProgress::Requested { id: 1 }.worth_asking_again());
+        assert!(!InterruptProgress::Acknowledged.worth_asking_again());
     }
 
     #[test]

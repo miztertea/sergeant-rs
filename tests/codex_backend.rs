@@ -2422,6 +2422,185 @@ fn appserver_late_lines_are_summarized_when_the_next_turn_displaces_them() {
     backend.stop(&handle).expect("stop").wait();
 }
 
+/// A stray notification for a turn that already displaced its own cell must
+/// not be folded into the *new* turn's evidence — not even a `turn/completed`
+/// naming the superseded turn's own id. Without the guard, this stray
+/// `turn/completed{status:"failed"}` for turn 1 would stamp `Terminal::Failed`
+/// onto turn 2's still-live accumulator and settle turn 2 on the spot, before
+/// turn 2's own genuine completion ever arrives.
+#[test]
+fn appserver_a_stray_notification_for_the_displaced_turn_never_taints_the_new_one() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // Turn 1: starts as "turn-1" and settles cleanly, completed.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+        ],
+    );
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "turn 1 settles before turn 2 is ever sent",
+        |e| e.payload["outcome"] == "completed",
+    );
+
+    // Turn 2: starts as "turn-2", but before its own real completion, a
+    // straggler for turn 1 arrives -- a duplicate `turn/completed` naming
+    // turn 1's own id with a *disagreeing* status, exactly the shape a
+    // buffered late line from the displaced turn would have. Turn 2's own
+    // evidence (an `item/completed` and its own `turn/completed`) follows.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-2"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"failed","error":{"message":"stale turn-1 completion, arrived after turn 2 started"}}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"msg-2","text":"turn 2 done","phase":"final_answer"},"turnId":"turn-2"}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-2","status":"completed"}}}"#,
+        ],
+    );
+    backend.send(&handle, "second turn").expect("send");
+
+    let stray = wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "the straggler for turn 1 is journaled, not silently merged into turn 2",
+        |e| e.payload["phase"] == "stray_notification_for_superseded_turn",
+    );
+    assert_eq!(stray.payload["method"], "turn/completed");
+
+    // Turn 2 must still reach its own, genuine settlement -- the straggler
+    // must not have already finalized it as `failed` in the meantime.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let ended = loop {
+        let ended = events_of_kind(&events, "conversation.turn.ended");
+        if ended.len() >= 2 {
+            break ended;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "turn 2 never reached its own settlement; saw {:?}",
+            ended.iter().map(|e| e.payload.clone()).collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Exactly two turns ever ended, and turn 2's own outcome is `completed`
+    // -- the straggler's `failed` status never touched it.
+    assert_eq!(
+        ended.len(),
+        2,
+        "turn 1 and turn 2 each end exactly once: {:?}",
+        ended.iter().map(|e| e.payload.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(ended[1].payload["outcome"], "completed");
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "turn 2's own completion, not the stray failure, is what OBSERVE reports",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.contains("in flight on thread"))
+        },
+    );
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::StageCompleted { ref summary } => {
+            assert_eq!(summary.as_deref(), Some("turn 2 done"));
+        }
+        other => panic!("expected turn 2's own completion, got {other:?}"),
+    }
+}
+
+/// A second, redundant `Backend::interrupt` call on the same still-`InFlight`
+/// turn must not clobber a first call the harness genuinely acknowledged.
+/// The engine itself can produce exactly this sequence -- a ceiling-triggered
+/// auto-interrupt, acknowledged, followed by a later human cancel or restart
+/// reconcile hitting the same still-running turn -- and before this fix the
+/// second call's unconditional write turned a turn the harness had honestly
+/// confirmed into one whose evidence says nothing ever answered it.
+#[test]
+fn appserver_a_second_interrupt_call_does_not_clobber_the_first_acknowledgment() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply("turn/interrupt", &[r#"{"id":__ID__,"result":{}}"#]);
+    // The child answers the one `turn/interrupt` it ever receives, then exits
+    // of its own accord -- the same shape as
+    // `appserver_an_interrupt_acknowledged_then_cut_off_says_so_and_nothing_more`,
+    // with a second, redundant call added right after the first.
+    stub.appserver_exits_after("turn/interrupt");
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    backend.interrupt(&handle).expect("first interrupt").wait();
+    // Redundant: the engine can legitimately call interrupt (or stop, which
+    // calls interrupt itself) again on a turn that is still `InFlight` --
+    // a ceiling-triggered auto-interrupt followed by a later human cancel is
+    // one real path. This call must neither re-ask the harness nor clobber
+    // whatever the first call's own honest answer already recorded, whether
+    // it lands while the cell still says `Acknowledged` or after the reader
+    // thread has already settled it on the child's exit.
+    backend.interrupt(&handle).expect("second interrupt").wait();
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the turn stayed InFlight after the second, redundant interrupt call",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.contains("in flight on thread"))
+        },
+    );
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt was acknowledged, but the child's stdout closed before \
+             turn/completed carried the harness's own verdict"
+        ),
+        "the first call's genuine acknowledgment must survive a second, redundant call; \
+         got: {evidence}"
+    );
+    assert!(
+        !evidence.contains("never answered it") && !evidence.contains("RPC failed"),
+        "a second call must not turn an acknowledged interrupt into an unresolved or \
+         failed one; got: {evidence}"
+    );
+
+    let interrupt_requests = stub
+        .appserver_requests()
+        .iter()
+        .filter(|r| r["method"] == "turn/interrupt")
+        .count();
+    assert_eq!(
+        interrupt_requests, 1,
+        "a redundant interrupt call must not re-ask the harness once the first \
+         call already got an honest answer"
+    );
+}
+
 /// Test 22: when `turn/interrupt` itself fails, the adapter's own documented
 /// fallback (§2.2) kills the process group and journals
 /// `phase:"interrupt_downgraded"` — and, per §15/§3.4 point 3, must also
