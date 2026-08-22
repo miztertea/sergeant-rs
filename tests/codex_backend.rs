@@ -254,6 +254,13 @@ impl StubCodex {
                    else\n        \
                      safe=$(printf '%s' \"$method\" | tr '/' '_')\n        \
                      script_file=\"{appserver_scripts_dir}/$safe.jsonl\"\n        \
+                     if [ -f \"$script_file.exit_before\" ]; then\n          \
+                       seen=0\n          \
+                       if [ -f \"$script_file.count\" ]; then seen=$(cat \"$script_file.count\"); fi\n          \
+                       seen=$((seen+1))\n          \
+                       echo \"$seen\" > \"$script_file.count\"\n          \
+                       if [ \"$seen\" -ge \"$(cat \"$script_file.exit_before\")\" ]; then exit 0; fi\n        \
+                     fi\n        \
                      if [ -f \"$script_file\" ]; then\n          \
                        while IFS= read -r out; do\n            \
                          printf '%s\\n' \"$out\" | sed \"s/__ID__/$id/g\"\n          \
@@ -435,6 +442,23 @@ exit \"$(cat \"$script_file.exit_code\")\"; fi\n          \
             .appserver_scripts_dir
             .join(format!("{}.jsonl.exit_code", appserver_script_stem(method)));
         std::fs::write(&marker, code.to_string()).expect("write exit-code marker");
+        self
+    }
+
+    /// Mark this stub to close its stdout on the `nth` request for `method`
+    /// (1-based, and from then on) **before** emitting that method's scripted
+    /// reply — the sibling of [`Self::appserver_exits_after`] for the case it
+    /// cannot express: a child that dies with a request already in flight, so
+    /// the adapter's own `call` is left waiting for a response nobody will
+    /// ever write. The count is what lets one script serve a turn that must
+    /// succeed and a later turn that must die.
+    fn appserver_exits_before(&self, method: &str, nth: u32) -> &Self {
+        std::fs::create_dir_all(&self.appserver_scripts_dir).expect("scripts dir");
+        let marker = self.appserver_scripts_dir.join(format!(
+            "{}.jsonl.exit_before",
+            appserver_script_stem(method)
+        ));
+        std::fs::write(&marker, nth.to_string()).expect("write exit-before marker");
         self
     }
 
@@ -1832,6 +1856,41 @@ fn wait_for_observation(
     }
 }
 
+/// Every event of `kind` captured so far.
+fn events_of_kind(events: &Arc<Mutex<Vec<EventDraft>>>, kind: &str) -> Vec<EventDraft> {
+    events
+        .lock()
+        .expect("event capture lock")
+        .iter()
+        .filter(|e| e.kind == kind)
+        .cloned()
+        .collect()
+}
+
+/// Wait for one event of `kind` that `matches` accepts.
+fn wait_for_event(
+    events: &Arc<Mutex<Vec<EventDraft>>>,
+    kind: &str,
+    what: &str,
+    matches: impl Fn(&EventDraft) -> bool,
+) -> EventDraft {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(found) = events_of_kind(events, kind).into_iter().find(&matches) {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: no matching {kind} event arrived; saw {:?}",
+            events_of_kind(events, kind)
+                .iter()
+                .map(|e| e.payload.clone())
+                .collect::<Vec<_>>()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// §3.6 test 4: the captured `thread/start` params carry exactly `cwd`,
 /// `sandbox`, `approvalPolicy`, and `runtimeWorkspaceRoots` naming cwd plus
 /// the one binding outside it — never the inside-cwd binding (already
@@ -1939,6 +1998,137 @@ fn appserver_child_death_mid_turn_is_ambiguous_not_completed() {
     );
 }
 
+/// Finding 2: the fail-closed routes owe the journal the same
+/// `conversation.turn.ended` the happy path emits — exec's own finalizer
+/// states the invariant ("every turn ends with this event, however it
+/// ended"), and a turn that died mid-flight used to end with a bare
+/// `harness_error` and nothing else, throwing away the item tallies the
+/// accumulator was holding at the moment it was settled.
+#[test]
+fn appserver_child_death_mid_turn_still_journals_turn_ended() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // One completed item, then the child dies with no terminal: the tallies
+    // below are exactly what the settlement was holding.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"i1","type":"agentMessage","text":"half a thought"}}}"#,
+        ],
+    );
+    stub.appserver_exits_after("turn/start");
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let ended = wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "a turn that died mid-flight must still end with conversation.turn.ended",
+        |_| true,
+    );
+    assert_eq!(
+        ended.payload["outcome"], "ambiguous_unknown",
+        "the ambiguous outcome is the fact this event exists to carry: {:?}",
+        ended.payload
+    );
+    assert_eq!(ended.payload["interrupted"], false);
+    assert_eq!(
+        ended.payload["message_items"], 1,
+        "the item the accumulator had already decoded travels with the settlement, not \
+         into the bin: {:?}",
+        ended.payload
+    );
+    // The harness_error is *additional* evidence, never a substitute.
+    wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "the child-death harness_error still lands alongside it",
+        |e| e.payload["phase"] == "child_exited_mid_turn",
+    );
+
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// Finding 1: `turn/start`'s failure path used to be the one writer of the
+/// turn cell that was not guarded on what the cell currently held. A child
+/// that dies with `turn/start` in flight settles the turn from the reader
+/// thread (fail-closed, `AmbiguousUnknown`); the blind `= Idle` rollback then
+/// erased that settlement, and OBSERVE went back to reporting "has not run a
+/// turn yet" about a turn that had run, ended, and been journaled.
+///
+/// Both halves of the fix are pinned here: the failing `turn/start` reports
+/// the closed stream (it was drained on EOF, not left to expire its own
+/// budget), and the settled cell survives the rollback.
+#[test]
+fn appserver_a_failed_turn_start_never_clobbers_a_settled_turn() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // Turn 1 answers and completes normally. Turn 2's `turn/start` is never
+    // answered at all: the child dies with the request in flight.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+        ],
+    );
+    stub.appserver_exits_before("turn/start", 2);
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    wait_for_observation(&backend, &handle, "turn 1 never completed", |observation| {
+        matches!(
+            observation.signal,
+            sergeant_rs::backend::BackendSignal::StageCompleted { .. }
+        )
+    });
+
+    let refusal = backend
+        .send(&handle, "second turn")
+        .expect_err("the child died before answering turn/start");
+    let refusal = refusal.to_string();
+    assert!(
+        refusal.contains("the app-server child's output stream closed"),
+        "the pending request is drained the moment the stream ends, so the caller learns \
+         the child is gone instead of outliving its own budget; got: {refusal}"
+    );
+
+    // No polling: the EOF handler settles the turn *before* the pending
+    // senders are drained, so by the time `send` returned, the settlement is
+    // already installed. Anything else here is a clobber.
+    let observation = backend.observe(&handle).expect("observe");
+    let evidence = observation.evidence.clone().unwrap_or_default();
+    assert!(
+        evidence.contains("no turn/completed observed"),
+        "the fail-closed settlement of turn 2 must survive turn/start's rollback; got: \
+         {evidence}"
+    );
+    assert!(
+        !evidence.contains("has not run a turn yet"),
+        "the rollback clobbered a settled turn back to Idle: {evidence}"
+    );
+
+    backend.stop(&handle).expect("stop").wait();
+}
+
 /// Finding 4: the ambiguous terminal is the one outcome with no stream
 /// evidence of its own, so it must carry every scrap of process evidence the
 /// adapter holds — exit status, the last stream `error`, and the child's own
@@ -1994,6 +2184,244 @@ fn appserver_the_ambiguous_terminal_carries_exit_status_stderr_and_last_error() 
     );
 }
 
+/// Finding 3, path 2, reached the way production reaches it: STOP. §5.7's own
+/// note — on app-server the turn's process and the execution's process are the
+/// same child, so STOP is `turn/interrupt` followed by sergeant killing that
+/// child itself. The harness accepts the interrupt and is then killed before
+/// it can send `turn/completed`, which is not a failed RPC and must not be
+/// reported as one.
+///
+/// No polling: STOP's completion joins the reader thread, so by the time
+/// `wait()` returns, the EOF that settles this turn has already been handled.
+#[test]
+fn appserver_the_routine_stop_settles_as_an_acknowledged_interrupt_cut_short() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply("turn/interrupt", &[r#"{"id":__ID__,"result":{}}"#]);
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    backend.stop(&handle).expect("stop").wait();
+
+    let observation = backend.observe(&handle).expect("observe");
+    match observation.signal {
+        sergeant_rs::backend::BackendSignal::Running => {}
+        other => panic!("expected Running (resumable, no stage verdict), got {other:?}"),
+    }
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt was acknowledged, but the child's stdout closed before \
+             turn/completed carried the harness's own verdict"
+        ),
+        "STOP's own interrupt was accepted by the harness; got: {evidence}"
+    );
+    assert!(
+        !evidence.contains("RPC failed") && !evidence.contains("never answered it"),
+        "nothing about the routine STOP path failed or went unanswered; got: {evidence}"
+    );
+
+    // Finding 2 on this route too: the turn ended, so it ends with the event
+    // that says a turn ended.
+    let ended = wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "the turn STOP settled still ends with conversation.turn.ended",
+        |_| true,
+    );
+    assert_eq!(ended.payload["outcome"], "interrupted_running");
+    assert_eq!(ended.payload["interrupted"], true);
+}
+
+/// Finding 3, path 2 again, by the other route: INTERRUPT alone, with a child
+/// that answers and then dies of its own accord rather than being killed.
+/// `turn/interrupt` returned `Ok` — the harness accepted it — and the child's
+/// stdout then closed before `turn/completed` could carry the harness's own
+/// verdict. Same outcome as path 1, a different fact, and the arm used to
+/// claim path 1's sentence here too ("turn/interrupt's own RPC never confirmed
+/// it"), which is false of an RPC that returned `Ok`.
+#[test]
+fn appserver_an_interrupt_acknowledged_then_cut_off_says_so_and_nothing_more() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    script_appserver_launch(&stub);
+    stub.appserver_scripts_reply("turn/interrupt", &[r#"{"id":__ID__,"result":{}}"#]);
+    stub.appserver_exits_after("turn/interrupt");
+    let backend = appserver_backend(&stub, dir.path());
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the turn stayed InFlight after the acknowledged interrupt's stream closed",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.contains("in flight on thread"))
+        },
+    );
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt was acknowledged, but the child's stdout closed before \
+             turn/completed carried the harness's own verdict"
+        ),
+        "an acknowledged interrupt must not be reported as a failed RPC; got: {evidence}"
+    );
+    assert!(
+        !evidence.contains("RPC failed"),
+        "nothing about this path failed; got: {evidence}"
+    );
+}
+
+/// Finding 5: notifications that arrive after a turn is already settled used
+/// to be dropped where they stood — including a genuine `turn/completed`
+/// buffered behind an earlier settlement. The settlement is still final (a
+/// turn is never re-settled), but the late lines are journaled: one immediate
+/// report for the terminal, one end-of-stream summary for the tally.
+#[test]
+fn appserver_a_terminal_arriving_after_settlement_is_journaled_never_resettled() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // One burst, read in order by the one reader thread: the turn settles on
+    // the first `turn/completed`, and everything after it is late. The late
+    // terminal deliberately disagrees with the settled one (`failed` vs
+    // `completed`) so that "never re-settled" is a fact this test can see.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"i1","type":"agentMessage","text":"done"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"i2","type":"agentMessage","text":"late"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"failed","error":{"message":"too late"}}}}"#,
+        ],
+    );
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    let late_terminal = wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "a real terminal arriving after settlement must never be dropped silently",
+        |e| e.payload["phase"] == "post_settlement_terminal",
+    );
+    assert_eq!(late_terminal.payload["method"], "turn/completed");
+    assert_eq!(late_terminal.payload["settled_as"], "completed");
+
+    // STOP ends the child's stream, which is when the tally is final.
+    backend.stop(&handle).expect("stop").wait();
+    let summary = wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "the post-settlement tally is summarized once, at end of stream",
+        |e| e.payload["phase"] == "post_settlement_lines",
+    );
+    assert_eq!(summary.payload["lines"], 2);
+    assert_eq!(summary.payload["terminal_seen"], true);
+    assert_eq!(
+        summary.payload["methods"],
+        serde_json::json!(["item/completed", "turn/completed"])
+    );
+
+    // Exactly one settlement, and it is the first terminal's.
+    let ended = events_of_kind(&events, "conversation.turn.ended");
+    assert_eq!(
+        ended.len(),
+        1,
+        "a settled turn is never re-settled by a line that arrives after it: {:?}",
+        ended.iter().map(|e| e.payload.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(ended[0].payload["outcome"], "completed");
+}
+
+/// Finding 5's other exit. End of stream is not the only way a settled turn's
+/// post-settlement tally leaves the building: the next turn on the same thread
+/// overwrites the cell that tally lives in, and on a thread that runs more
+/// than one turn it gets there first. Reporting it only at EOF would drop it
+/// silently on exactly the flow the transport exists for.
+#[test]
+fn appserver_late_lines_are_summarized_when_the_next_turn_displaces_them() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.supports_appserver();
+    stub.appserver_scripts_reply(
+        "thread/start",
+        &[r#"{"id":__ID__,"result":{"thread":{"id":"01a02508-5880-7980-95b7-1d8bc22d5139","status":{"type":"idle"}}}}"#],
+    );
+    // The same burst every `turn/start` replays: settle, then two late lines.
+    stub.appserver_scripts_reply(
+        "turn/start",
+        &[
+            r#"{"id":__ID__,"result":{"turn":{"id":"turn-1"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"id":"i2","type":"agentMessage","text":"late"}}}"#,
+            r#"{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"failed","error":{"message":"too late"}}}}"#,
+        ],
+    );
+    stub.appserver_scripts_reply("turn/interrupt", &[r#"{"id":__ID__,"result":{}}"#]);
+    let backend = appserver_backend(&stub, dir.path());
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let prepared = backend
+        .prepare(&start_request(dir.path()))
+        .expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+
+    // Waiting for the late *terminal* is what makes the tally below exact:
+    // it is the last of turn 1's four lines, so both late lines have landed.
+    wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "turn 1's late terminal",
+        |e| e.payload["phase"] == "post_settlement_terminal",
+    );
+    assert!(
+        events_of_kind(&events, "conversation.turn.harness_error")
+            .iter()
+            .all(|e| e.payload["phase"] != "post_settlement_lines"),
+        "nothing has displaced or ended turn 1 yet, so its tally is not final"
+    );
+
+    backend.send(&handle, "second turn").expect("send");
+    let summary = wait_for_event(
+        &events,
+        "conversation.turn.harness_error",
+        "the displaced turn's tally must be journaled, not overwritten in silence",
+        |e| e.payload["phase"] == "post_settlement_lines",
+    );
+    assert_eq!(summary.payload["lines"], 2);
+    assert_eq!(summary.payload["terminal_seen"], true);
+
+    // Scripted only so this test's own teardown is not a 5-second wait on the
+    // interrupt budget: turn 2 may still be in flight when STOP asks.
+    backend.stop(&handle).expect("stop").wait();
+}
+
 /// Test 22: when `turn/interrupt` itself fails, the adapter's own documented
 /// fallback (§2.2) kills the process group and journals
 /// `phase:"interrupt_downgraded"` — and, per §15/§3.4 point 3, must also
@@ -2041,23 +2469,40 @@ fn appserver_interrupt_kills_the_process_group_when_the_rpc_fails() {
     };
     assert_eq!(downgraded.kind, "conversation.turn.harness_error");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let observation = loop {
-        let observation = backend.observe(&handle).expect("observe");
-        let evidence = observation.evidence.clone().unwrap_or_default();
-        if !evidence.contains("in flight on thread") {
-            break observation;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the turn stayed InFlight forever after the interrupt downgrade"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let observation = wait_for_observation(
+        &backend,
+        &handle,
+        "the turn stayed InFlight forever after the interrupt downgrade",
+        |observation| {
+            observation
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| !evidence.contains("in flight on thread"))
+        },
+    );
     match observation.signal {
         sergeant_rs::backend::BackendSignal::Running => {}
         other => panic!("expected Running (resumable, no stage verdict), got {other:?}"),
     }
+    // Finding 3, path 1: this outcome is reachable two ways, and the evidence
+    // names the one that happened. Here the RPC really did fail.
+    let evidence = observation.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(
+            "turn/interrupt's own RPC failed and sergeant fell back to the process-group kill"
+        ),
+        "the downgrade path must name itself; got: {evidence}"
+    );
+
+    // The fail-closed settlement journals a turn.ended here too (finding 2).
+    let ended = wait_for_event(
+        &events,
+        "conversation.turn.ended",
+        "a turn settled by the interrupt downgrade still ends with conversation.turn.ended",
+        |_| true,
+    );
+    assert_eq!(ended.payload["outcome"], "interrupted_running");
+    assert_eq!(ended.payload["interrupted"], true);
 }
 
 // ---------------------------------------------------------- §7.3 live suite

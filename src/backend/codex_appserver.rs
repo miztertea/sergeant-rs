@@ -495,9 +495,25 @@ impl Default for Budgets {
     }
 }
 
+/// Why a pending request will never receive a result.
+#[derive(Debug, Clone)]
+pub(super) enum PendingFailure {
+    /// The server answered with a JSON-RPC error object.
+    Rpc(JsonRpcErrorInfo),
+    /// The child's stdout closed before this request was answered — the
+    /// reader thread drains every pending sender with this on EOF (§3.4
+    /// point 3), so a caller blocked in [`AppServerHandle::call`] learns the
+    /// child is gone *now* rather than by outliving its own budget. That
+    /// distinction is not cosmetic: the budget expiry arrives long after the
+    /// EOF handler has already settled the turn, and a caller that wakes up
+    /// that late used to conclude "my request timed out" about a turn whose
+    /// fate was already decided and journaled.
+    ChildGone,
+}
+
 /// A pending in-flight request: the id this client minted, and where to
 /// deliver whatever comes back.
-type PendingMap = Arc<Mutex<BTreeMap<u64, SyncSender<Result<Value, JsonRpcErrorInfo>>>>>;
+type PendingMap = Arc<Mutex<BTreeMap<u64, SyncSender<Result<Value, PendingFailure>>>>>;
 
 /// The JSON-RPC bookkeeping half of one app-server child: cheap to clone
 /// (an `Arc` around its stdin lock, its shared id counter, its pending-
@@ -522,6 +538,16 @@ impl AppServerHandle {
         stdin.flush()
     }
 
+    /// Mint the id a subsequent [`Self::call_reserved`] will send under,
+    /// *before* the request goes out. Only worth doing for a request whose
+    /// caller must record something about it that the reader thread will read
+    /// back when the answer lands (today: `turn/interrupt`, whose progress the
+    /// turn cell tracks); everything else uses [`Self::call`], which mints its
+    /// own id and never has to name it.
+    pub(super) fn reserve_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
     /// Send one JSON-RPC request and block, bounded, for its response.
     /// `"jsonrpc":"2.0"` is stamped on everything sent (spec §1.5.1); nothing
     /// this client receives is required to carry it.
@@ -531,7 +557,17 @@ impl AppServerHandle {
         params: Value,
         budget: Duration,
     ) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        self.call_reserved(self.reserve_id(), method, params, budget)
+    }
+
+    /// [`Self::call`] under an id the caller minted with [`Self::reserve_id`].
+    pub(super) fn call_reserved(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+        budget: Duration,
+    ) -> Result<Value, String> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.pending.lock().expect("pending lock").insert(id, tx);
         let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
@@ -541,9 +577,12 @@ impl AppServerHandle {
         }
         match rx.recv_timeout(budget) {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => Err(format!(
+            Ok(Err(PendingFailure::Rpc(error))) => Err(format!(
                 "{method} refused: {} (code {})",
                 error.message, error.code
+            )),
+            Ok(Err(PendingFailure::ChildGone)) => Err(format!(
+                "{method} was never answered: the app-server child's output stream closed"
             )),
             Err(_) => {
                 self.pending.lock().expect("pending lock").remove(&id);
@@ -617,13 +656,36 @@ pub(super) enum ChildStatus {
 }
 
 /// One line the reader thread hands to whatever is consuming this child's
-/// output — a response/error already matched against the pending map is not
-/// re-delivered here; only notifications and server requests are.
+/// output — a response/error is delivered to its waiting caller through the
+/// pending map, and announced here as [`InboundLine::Resolved`] only so that a
+/// consumer which is tracking a request can learn its fate *in stream order*,
+/// on the reader's own thread, ahead of whatever the rest of the stream does
+/// next.
 #[derive(Debug, Clone)]
 pub(super) enum InboundLine {
     Notification {
         method: String,
         params: Value,
+    },
+    /// A request this client sent has been answered: `ok` is whether the
+    /// answer was a result rather than a JSON-RPC error. Announced *before*
+    /// the blocked caller is woken, and therefore strictly before the
+    /// [`InboundLine::Eof`] that ends this stream — which is the whole point.
+    /// A caller woken by its channel races the reader thread to whatever
+    /// shared state it wants to update, and on a child that answers and then
+    /// dies, that race has no winner it is entitled to: the settlement runs
+    /// on this thread, so the fact has to be recorded on this thread too.
+    ///
+    /// The losing schedule is latent rather than routine — a stub that exits
+    /// after answering leaves the reader waiting on the child's own teardown,
+    /// which the woken caller beats every time, so no deterministic test can
+    /// force it. What a test *can* pin is the mechanism, and
+    /// `an_answered_interrupt_settles_as_acknowledged_whoever_wakes_first`
+    /// does: the fate is recorded against the request id, so it does not
+    /// matter who runs next.
+    Resolved {
+        id: u64,
+        ok: bool,
     },
     /// `params` is read by `appserver_on_line` for `item/tool/
     /// requestUserInput` specifically (`params.questions`/`params.turnId`
@@ -737,23 +799,26 @@ impl AppServerChild {
                 };
                 match classify_line(&value) {
                     LineShape::Response { id, result } => {
-                        if let Some(tx) = reader_handle
+                        let waiting = reader_handle
                             .pending
                             .lock()
                             .expect("pending lock")
-                            .remove(&id)
-                        {
+                            .remove(&id);
+                        // Announce first, wake second: see `Resolved`.
+                        on_line(&reader_handle, InboundLine::Resolved { id, ok: true });
+                        if let Some(tx) = waiting {
                             let _ = tx.send(Ok(result));
                         }
                     }
                     LineShape::ErrorResponse { id, error } => {
-                        if let Some(tx) = reader_handle
+                        let waiting = reader_handle
                             .pending
                             .lock()
                             .expect("pending lock")
-                            .remove(&id)
-                        {
-                            let _ = tx.send(Err(error));
+                            .remove(&id);
+                        on_line(&reader_handle, InboundLine::Resolved { id, ok: false });
+                        if let Some(tx) = waiting {
+                            let _ = tx.send(Err(PendingFailure::Rpc(error)));
                         }
                     }
                     LineShape::Notification { method, params } => {
@@ -772,7 +837,19 @@ impl AppServerChild {
             // a read error alike (§3.4 point 3 / §15): either way, the child
             // is done talking, and whoever owns the turn state needs to know
             // once, so a turn left `InFlight` is never silently forgotten.
+            //
+            // Settle first, drain second, and never the other way round. The
+            // EOF callback is what turns an in-flight turn into a settled one;
+            // draining first would wake a blocked `call` into a race for the
+            // same cell, and a caller that won that race would reset the cell
+            // it owned before the fail-closed settlement could be written --
+            // the very outcome this ordering exists to make impossible.
             on_line(&reader_handle, InboundLine::Eof);
+            let orphaned =
+                std::mem::take(&mut *reader_handle.pending.lock().expect("pending lock"));
+            for (_, tx) in orphaned {
+                let _ = tx.send(Err(PendingFailure::ChildGone));
+            }
         });
 
         Ok(Self {
@@ -1130,13 +1207,16 @@ mod tests {
                 }
             }
         }
-        let outcome = super::super::classify_terminal(&acc, false);
+        let outcome = super::super::classify_terminal(&acc, None);
         assert!(matches!(
             outcome,
             super::super::TerminalOutcome::Interrupted
         ));
         assert!(
-            !matches!(outcome, super::super::TerminalOutcome::InterruptedRunning),
+            !matches!(
+                outcome,
+                super::super::TerminalOutcome::InterruptedRunning { .. }
+            ),
             "harness-confirmed interrupt must not collapse into the exec-only inferred arm"
         );
         assert!(!matches!(
@@ -1173,7 +1253,7 @@ mod tests {
             }
         }
         assert_eq!(acc.last_codex_error_info.as_deref(), Some("unauthorized"));
-        let outcome = super::super::classify_terminal(&acc, false);
+        let outcome = super::super::classify_terminal(&acc, None);
         match outcome {
             super::super::TerminalOutcome::Failed { message } => {
                 assert!(message.contains("expired") || message.contains("unauthorized"));

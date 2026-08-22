@@ -112,6 +112,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -1552,10 +1553,12 @@ enum TerminalOutcome {
         message: String,
     },
     /// No terminal arrived, but sergeant requested the kill: no conclusion
-    /// about the stage, the conversation stays resumable. Exec-only — this
-    /// transport has no native interrupt terminal, so this is *inferred*
-    /// from "we asked and nothing else arrived", never confirmed.
-    InterruptedRunning,
+    /// about the stage, the conversation stays resumable. Always *inferred*
+    /// from "we asked and nothing else arrived", never harness-confirmed —
+    /// and `via` records which of the three ways that inference was reached,
+    /// because OBSERVE's evidence string must name the one that actually
+    /// happened rather than the one that is easiest to write down.
+    InterruptedRunning { via: InterruptedVia },
     /// **App-server only** (W3 spec §2.2): `turn/completed` itself carried
     /// `turn.status == "interrupted"` — the harness *told* sergeant the turn
     /// was interrupted, a first-class, harness-confirmed terminal, distinct
@@ -1569,7 +1572,78 @@ enum TerminalOutcome {
     AmbiguousUnknown,
 }
 
-fn classify_terminal(acc: &TurnAccumulator, interrupted: bool) -> TerminalOutcome {
+/// How an [`TerminalOutcome::InterruptedRunning`] was arrived at. The three
+/// arms are three different *facts*, and the one OBSERVE reports has to be
+/// the one that happened: a single hardcoded sentence covering all three
+/// necessarily lies about two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptedVia {
+    /// Exec transport: there is no interrupt RPC to confirm anything with.
+    /// Sergeant killed the turn's process group and nothing else arrived.
+    ProcessKill,
+    /// App-server: `turn/interrupt` itself failed, and the adapter fell back
+    /// to the process-group kill (§2.2's downgrade).
+    RpcFailed,
+    /// App-server: `turn/interrupt` returned `Ok` — the harness accepted the
+    /// request — but the child's stdout closed before `turn/completed` could
+    /// carry the harness's own verdict. The routine STOP path lands here.
+    ClosedAfterAcknowledgedRpc,
+    /// App-server: the stream ended while `turn/interrupt` was still
+    /// outstanding — no answer to it was ever written — so neither of the two
+    /// above is known to be what happened. The honest third answer, and a
+    /// narrow one: an answer that *did* arrive is recorded on the reader
+    /// thread as it is decoded (`InboundLine::Resolved`), ahead of the EOF
+    /// that settles the turn, so "the child answered and then died" never
+    /// lands here.
+    RpcUnresolved,
+}
+
+/// How far `turn/interrupt` has got for the turn currently in flight. Kept
+/// on the cell (not inferred at settlement) because the settlement can
+/// happen on the reader thread at any moment, including between the RPC
+/// being sent and its answer arriving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum InterruptProgress {
+    /// Nobody has asked for this turn to stop.
+    #[default]
+    NotRequested,
+    /// `turn/interrupt` is in flight under this JSON-RPC id; it has not
+    /// resolved either way. The id is carried so that the *reader* thread can
+    /// recognise the answer when it decodes it and mark the outcome there —
+    /// the only thread whose marks are guaranteed to precede the EOF that
+    /// settles the turn.
+    Requested { id: u64 },
+    /// The harness answered `turn/interrupt` with a result.
+    Acknowledged,
+    /// `turn/interrupt` itself failed; the process-group kill is the
+    /// fallback. **Written before the kill is issued**, never after: the
+    /// kill is what ends the child's stdout, and the EOF that follows is
+    /// what settles the turn, so a mark made afterwards would routinely
+    /// arrive at a cell that had already recorded the wrong path.
+    RpcFailed,
+}
+
+impl InterruptProgress {
+    /// Record what the reader thread just decoded as the answer to request
+    /// `id`, but only if that is the request this cell is actually waiting on.
+    /// Anything else — a different request's answer, a turn whose interrupt
+    /// already resolved, a turn nobody interrupted — leaves the cell alone.
+    fn resolve(&mut self, id: u64, ok: bool) {
+        if matches!(*self, InterruptProgress::Requested { id: mine } if mine == id) {
+            *self = if ok {
+                InterruptProgress::Acknowledged
+            } else {
+                InterruptProgress::RpcFailed
+            };
+        }
+    }
+}
+
+/// Fold one turn's stream evidence plus the interrupt request, if any, into
+/// its outcome. `interrupt` is `None` when nobody asked for the kill; when
+/// somebody did, it names *how* the asking went, which is the only thing
+/// that separates the two honest sentences for the same outcome.
+fn classify_terminal(acc: &TurnAccumulator, interrupt: Option<InterruptedVia>) -> TerminalOutcome {
     match &acc.terminal {
         Terminal::Completed => TerminalOutcome::Completed,
         Terminal::Failed { message } => TerminalOutcome::Failed {
@@ -1579,39 +1653,88 @@ fn classify_terminal(acc: &TurnAccumulator, interrupted: bool) -> TerminalOutcom
         // interrupted, whether or not sergeant asked — a first-class
         // terminal, never inferred the way `InterruptedRunning` below is.
         Terminal::Interrupted => TerminalOutcome::Interrupted,
-        Terminal::None if interrupted => TerminalOutcome::InterruptedRunning,
-        Terminal::None => TerminalOutcome::AmbiguousUnknown,
+        Terminal::None => match interrupt {
+            Some(via) => TerminalOutcome::InterruptedRunning { via },
+            None => TerminalOutcome::AmbiguousUnknown,
+        },
     }
 }
 
-/// Fail closed (§3.4 point 3 / §15's invariant): if a turn is `InFlight` with
-/// no confirmation it ever reached a terminal, replace it with a `Finished`
-/// state — built the same way the `turn/completed` handler above does,
-/// through the same [`classify_terminal`], so a turn that was interrupted
-/// (even by the process-group-kill fallback when `turn/interrupt` itself
-/// failed) still resolves to `InterruptedRunning` rather than
-/// `AmbiguousUnknown`, exactly the distinction exec's own decoder draws.
-/// Returns the outcome it resolved to, or `None` if there was no in-flight
-/// turn to close — idempotent, so it is safe to call from more than one
-/// place without double-finalizing: the reader thread's own EOF handling and
-/// `interrupt_appserver`'s RPC-failure fallback both call this, because
-/// killing the child's process group ends its stdout on its own accord too,
-/// and the two must not race each other into two different outcomes.
-fn fail_closed_appserver_turn(turn_cell: &Mutex<AppServerTurnState>) -> Option<TerminalOutcome> {
-    let mut state = turn_cell.lock().expect("appserver turn lock");
-    let AppServerTurnState::InFlight {
-        interrupt_requested,
-        ..
-    } = &*state
-    else {
+/// One settled outcome's stable, snake_case name — the string the journal
+/// carries, kept out of `{:?}` so a payload consumer is not reading a
+/// derived Debug rendering that changes shape whenever a field is added.
+fn terminal_outcome_label(outcome: &TerminalOutcome) -> &'static str {
+    match outcome {
+        TerminalOutcome::Completed => "completed",
+        TerminalOutcome::Failed { .. } => "failed",
+        TerminalOutcome::InterruptedRunning { .. } => "interrupted_running",
+        TerminalOutcome::Interrupted => "interrupted",
+        TerminalOutcome::AmbiguousUnknown => "ambiguous_unknown",
+    }
+}
+
+/// Everything one settled app-server turn owes its journal and OBSERVE.
+/// Returned by [`settle_appserver_turn`] so that a caller which settles a
+/// turn cannot end up holding *less* than the `turn/completed` path holds:
+/// the fail-closed routes used to drop the accumulator on the floor and
+/// journal a bare `harness_error`, which is how "every turn ends with
+/// `conversation.turn.ended`, however it ended" became true of one route and
+/// false of the others.
+#[derive(Debug, Clone)]
+struct AppServerSettlement {
+    outcome: TerminalOutcome,
+    thread_id: Option<String>,
+    interrupted: bool,
+    message_items: u32,
+    tool_items: u32,
+    unknown_items: Vec<String>,
+    unknown_methods: Vec<String>,
+    usage: Option<Value>,
+}
+
+impl AppServerSettlement {
+    /// This settlement's `conversation.turn.ended` payload — one shape for
+    /// every route, so the fail-closed ones cannot drift from the happy one.
+    /// No `raw`/`raw_error` keys: unlike exec, this transport archives no
+    /// per-turn blob (there is no per-turn stream to archive — one child
+    /// carries every turn), and inventing a null-valued key would read as
+    /// "the archive failed" rather than "there is no archive here".
+    fn turn_ended_payload(&self) -> Value {
+        json!({
+            "thread_id": self.thread_id,
+            "interrupted": self.interrupted,
+            "outcome": terminal_outcome_label(&self.outcome),
+            "message_items": self.message_items,
+            "tool_items": self.tool_items,
+            "unknown_items": self.unknown_items,
+            "unknown_methods": self.unknown_methods,
+        })
+    }
+}
+
+/// The **one** place an app-server turn ever becomes `Finished`. Takes an
+/// already-locked cell; settles it if (and only if) it is `InFlight`, and
+/// hands back the facts both the journal and OBSERVE read from. `None` means
+/// there was nothing in flight to settle, which is what makes every caller
+/// idempotent and safe to race: the reader thread's own EOF handling, the
+/// `turn/completed` handler, and `interrupt_appserver`'s RPC-failure
+/// fallback all funnel through here, and the first one to arrive decides.
+fn settle_appserver_turn(state: &mut AppServerTurnState) -> Option<AppServerSettlement> {
+    let AppServerTurnState::InFlight { interrupt, .. } = &*state else {
         return None;
     };
-    let interrupted = *interrupt_requested;
-    let taken = std::mem::replace(&mut *state, AppServerTurnState::Idle);
+    let interrupted = *interrupt != InterruptProgress::NotRequested;
+    let via = match interrupt {
+        InterruptProgress::NotRequested => None,
+        InterruptProgress::Requested { .. } => Some(InterruptedVia::RpcUnresolved),
+        InterruptProgress::Acknowledged => Some(InterruptedVia::ClosedAfterAcknowledgedRpc),
+        InterruptProgress::RpcFailed => Some(InterruptedVia::RpcFailed),
+    };
+    let taken = std::mem::replace(state, AppServerTurnState::Idle);
     let AppServerTurnState::InFlight { acc, .. } = taken else {
         unreachable!("just matched InFlight above");
     };
-    let outcome = classify_terminal(&acc, interrupted);
+    let outcome = classify_terminal(&acc, via);
     *state = AppServerTurnState::Finished {
         outcome: outcome.clone(),
         last_agent_message: acc.last_agent_message.clone(),
@@ -1621,8 +1744,37 @@ fn fail_closed_appserver_turn(turn_cell: &Mutex<AppServerTurnState>) -> Option<T
         unknown_methods: acc.unknown_methods.clone(),
         last_codex_error_info: acc.last_codex_error_info.clone(),
         last_error: acc.last_error.clone(),
+        late: LateEvidence::default(),
     };
-    Some(outcome)
+    Some(AppServerSettlement {
+        outcome,
+        thread_id: acc.thread_id,
+        interrupted,
+        message_items: acc.message_items,
+        tool_items: acc.tool_items,
+        unknown_items: acc.unknown_items,
+        unknown_methods: acc.unknown_methods,
+        usage: acc.usage,
+    })
+}
+
+/// Fail closed (§3.4 point 3 / §15's invariant): if a turn is `InFlight` with
+/// no confirmation it ever reached a terminal, settle it — through the same
+/// [`settle_appserver_turn`] the `turn/completed` handler uses, so a turn
+/// that was interrupted (even by the process-group-kill fallback when
+/// `turn/interrupt` itself failed) still resolves to `InterruptedRunning`
+/// rather than `AmbiguousUnknown`, exactly the distinction exec's own decoder
+/// draws. Returns the settlement, or `None` if there was no in-flight turn to
+/// close — idempotent, so it is safe to call from more than one place without
+/// double-finalizing: the reader thread's own EOF handling and
+/// `interrupt_appserver`'s RPC-failure fallback both call this, because
+/// killing the child's process group ends its stdout on its own accord too,
+/// and the two must not race each other into two different outcomes.
+fn fail_closed_appserver_turn(
+    turn_cell: &Mutex<AppServerTurnState>,
+) -> Option<AppServerSettlement> {
+    let mut state = turn_cell.lock().expect("appserver turn lock");
+    settle_appserver_turn(&mut state)
 }
 
 // ----------------------------------------------------------------- liveness
@@ -1816,6 +1968,10 @@ struct AppServerRuntime {
     /// `sandbox_enforcement`/`model_selection` row is credited with, the
     /// same diagnostic-seam posture as [`CodexBackend::tracked_executions`].
     policy_echo: Value,
+    /// Mints [`AppServerTurnState::InFlight::epoch`]. Monotonic for this
+    /// runtime's whole life, never reset, so no two `turn/start` attempts
+    /// can ever mistake each other's cell for their own.
+    turn_epochs: AtomicU64,
 }
 
 /// One execution's current-or-last turn on the app-server transport.
@@ -1834,7 +1990,18 @@ enum AppServerTurnState {
     InFlight {
         turn_id: String,
         acc: TurnAccumulator,
-        interrupt_requested: bool,
+        /// How far this turn's `turn/interrupt` has got — the request bit
+        /// and the RPC's fate in one field, recorded as each step happens so
+        /// the settlement can name the path rather than guess at it.
+        interrupt: InterruptProgress,
+        /// Which `turn/start` attempt owns this cell. `appserver_send_turn`
+        /// stamps it before writing the request and compares it before
+        /// touching the cell again: by the time a failed `turn/start`
+        /// returns, the cell may already have been settled by the reader
+        /// thread (a dead child) or replaced by a later turn, and a blind
+        /// write-back would erase a terminal the adapter had already
+        /// journaled. Never reused: a monotonic counter per runtime.
+        epoch: u64,
     },
     /// The last turn's terminal, plus the evidence OBSERVE reports.
     Finished {
@@ -1849,7 +2016,76 @@ enum AppServerTurnState {
         /// kept for the ambiguous terminal's evidence: it is often the only
         /// thing that says *why* the turn never reached one.
         last_error: Option<String>,
+        /// What arrived on this thread after the turn was already settled.
+        late: LateEvidence,
     },
+}
+
+/// Notifications that arrived for a turn that was already settled (§3.4's
+/// ordering caveat, from the other end): the settlement is final — nothing
+/// here ever re-decides an outcome — but a line that arrives late is still
+/// evidence, and dropping it silently is how a genuine `turn/completed`
+/// buffered behind a fail-closed settlement used to vanish without trace.
+#[derive(Debug, Clone, Default)]
+struct LateEvidence {
+    /// How many post-settlement notifications arrived.
+    lines: u32,
+    /// Which methods, deduplicated and capped — a summary, not a second
+    /// unbounded journal.
+    methods: Vec<String>,
+    /// Whether a real terminal (`turn/completed`) was among them.
+    terminal_seen: bool,
+    /// Whether that terminal has already been journaled on arrival, so the
+    /// immediate report fires once rather than once per late terminal.
+    terminal_reported: bool,
+}
+
+/// How many distinct late method names are kept before the summary stops
+/// growing (`lines` keeps counting either way).
+const LATE_EVIDENCE_METHOD_CAP: usize = 8;
+
+impl LateEvidence {
+    /// Record one post-settlement notification. Returns the payload of the
+    /// report that must be journaled *now* rather than at end of stream —
+    /// only for the first real terminal, the one line whose silent loss
+    /// would mean the journal disagrees with what the harness actually said.
+    fn record(&mut self, method: &str, settled_as: &TerminalOutcome) -> Option<Value> {
+        self.lines = self.lines.saturating_add(1);
+        if self.methods.len() < LATE_EVIDENCE_METHOD_CAP
+            && !self.methods.iter().any(|seen| seen == method)
+        {
+            self.methods.push(method.to_string());
+        }
+        if method != "turn/completed" {
+            return None;
+        }
+        self.terminal_seen = true;
+        if self.terminal_reported {
+            return None;
+        }
+        self.terminal_reported = true;
+        Some(json!({
+            "phase": "post_settlement_terminal",
+            "method": method,
+            "settled_as": terminal_outcome_label(settled_as),
+            "detail": "a real terminal arrived after this turn was already settled; \
+                       the settled outcome stands (a turn is never re-settled) and the \
+                       terminal is recorded here rather than dropped",
+        }))
+    }
+
+    /// The end-of-stream summary, or `None` when nothing arrived late.
+    fn summary(&self) -> Option<Value> {
+        (self.lines > 0).then(|| {
+            json!({
+                "phase": "post_settlement_lines",
+                "lines": self.lines,
+                "methods": self.methods,
+                "terminal_seen": self.terminal_seen,
+                "capped": self.methods.len() >= LATE_EVIDENCE_METHOD_CAP,
+            })
+        })
+    }
 }
 
 /// Owned context for the app-server reader-thread callback (spec §1.4):
@@ -1894,55 +2130,47 @@ fn appserver_on_line(
     match line {
         codex_appserver::InboundLine::Notification { method, params } => {
             let mut state = turn_cell.lock().expect("appserver turn lock");
+            let mut late_report = None;
             let events = match &mut *state {
                 AppServerTurnState::InFlight { acc, .. } => {
                     acc.ingest_appserver_notification(&method, &params)
                 }
-                AppServerTurnState::Idle | AppServerTurnState::Finished { .. } => Vec::new(),
+                // §3.4, from the far end: this turn is already settled, and
+                // nothing that arrives now re-decides it. What it must not do
+                // is disappear — a buffered `turn/completed` behind a
+                // fail-closed settlement is exactly the line whose silent
+                // loss makes the journal disagree with the harness.
+                AppServerTurnState::Finished { late, outcome, .. } => {
+                    late_report = late.record(&method, outcome);
+                    Vec::new()
+                }
+                // No turn has ever been started on this thread, or the last
+                // `turn/start` failed before the harness acknowledged one.
+                // There is no turn for these lines to be evidence *about*,
+                // which is why they are not tallied the way a settled turn's
+                // late lines are.
+                AppServerTurnState::Idle => Vec::new(),
             };
             for event in &events {
                 ctx.emit(&event.kind, event.payload.clone());
             }
-            if method == "turn/completed"
-                && let AppServerTurnState::InFlight {
-                    interrupt_requested,
-                    ..
-                } = &*state
-            {
-                let interrupted = *interrupt_requested;
-                let taken = std::mem::replace(&mut *state, AppServerTurnState::Idle);
-                let AppServerTurnState::InFlight { acc, .. } = taken else {
-                    unreachable!("just matched InFlight above");
-                };
-                let outcome = classify_terminal(&acc, interrupted);
-                let thread_id_for_event = acc.thread_id.clone();
-                *state = AppServerTurnState::Finished {
-                    outcome: outcome.clone(),
-                    last_agent_message: acc.last_agent_message.clone(),
-                    message_items: acc.message_items,
-                    tool_items: acc.tool_items,
-                    unknown_items: acc.unknown_items.clone(),
-                    unknown_methods: acc.unknown_methods.clone(),
-                    last_codex_error_info: acc.last_codex_error_info.clone(),
-                    last_error: acc.last_error.clone(),
-                };
-                drop(state);
+            let settlement = (method == "turn/completed")
+                .then(|| settle_appserver_turn(&mut state))
+                .flatten();
+            drop(state);
+            if let Some(payload) = late_report {
+                ctx.emit(KIND_TURN_HARNESS_ERROR, payload);
+            }
+            if let Some(settlement) = settlement {
                 ctx.emit(
                     KIND_CONVERSATION_TURN_ENDED,
-                    json!({
-                        "thread_id": thread_id_for_event,
-                        "interrupted": interrupted,
-                        "message_items": acc.message_items,
-                        "tool_items": acc.tool_items,
-                        "unknown_items": acc.unknown_items,
-                        "unknown_methods": acc.unknown_methods,
-                    }),
+                    settlement.turn_ended_payload(),
                 );
-                if let Some(usage) = &acc.usage {
+                if let Some(usage) = &settlement.usage {
                     ctx.emit(
                         KIND_USAGE_UPDATED,
                         json!({
-                            "thread_id": thread_id_for_event,
+                            "thread_id": settlement.thread_id,
                             "usage": usage,
                             "model_pin": model_pin_evidence(ctx.model.as_deref()),
                         }),
@@ -1972,16 +2200,57 @@ fn appserver_on_line(
                 ctx.emit(KIND_TURN_HARNESS_ERROR, payload);
             }
         }
+        // One of this client's own requests has been answered. The only one
+        // whose fate the turn cell tracks is `turn/interrupt`, and it is
+        // tracked *here* rather than where the answer is awaited because the
+        // awaiting thread is woken by a channel and then has to race this one
+        // for the cell — a race it loses on exactly the child this matters
+        // for, one that answers the interrupt and dies in the same breath.
+        codex_appserver::InboundLine::Resolved { id, ok } => {
+            if let AppServerTurnState::InFlight { interrupt, .. } =
+                &mut *turn_cell.lock().expect("appserver turn lock")
+            {
+                interrupt.resolve(id, ok);
+            }
+        }
         codex_appserver::InboundLine::Unparsed => {}
         codex_appserver::InboundLine::Eof => {
-            if let Some(outcome) = fail_closed_appserver_turn(turn_cell) {
+            if let Some(settlement) = fail_closed_appserver_turn(turn_cell) {
                 ctx.emit(
                     KIND_TURN_HARNESS_ERROR,
                     json!({
                         "phase": "child_exited_mid_turn",
-                        "outcome": format!("{outcome:?}"),
+                        "outcome": terminal_outcome_label(&settlement.outcome),
                     }),
                 );
+                // §3.5's invariant, which exec's own finalizer states in
+                // one line ("every turn ends with this event, however it
+                // ended") and which this route used to be the exception to.
+                ctx.emit(
+                    KIND_CONVERSATION_TURN_ENDED,
+                    settlement.turn_ended_payload(),
+                );
+                if let Some(usage) = &settlement.usage {
+                    ctx.emit(
+                        KIND_USAGE_UPDATED,
+                        json!({
+                            "thread_id": settlement.thread_id,
+                            "usage": usage,
+                            "model_pin": model_pin_evidence(ctx.model.as_deref()),
+                        }),
+                    );
+                }
+            }
+            // End of stream is when the last settled turn's post-settlement
+            // tally is final, so it is where that turn's summary goes. The
+            // other exit is `appserver_send_turn`, for a turn whose cell a
+            // later turn overwrites before the stream ever ends.
+            let summary = match &*turn_cell.lock().expect("appserver turn lock") {
+                AppServerTurnState::Finished { late, .. } => late.summary(),
+                AppServerTurnState::Idle | AppServerTurnState::InFlight { .. } => None,
+            };
+            if let Some(summary) = summary {
+                ctx.emit(KIND_TURN_HARNESS_ERROR, summary);
             }
         }
     }
@@ -3148,6 +3417,7 @@ impl CodexBackend {
             child: Mutex::new(child),
             turn: turn_cell,
             policy_echo: thread_start_result.clone(),
+            turn_epochs: AtomicU64::new(1),
         });
         {
             let mut state = self.lock();
@@ -3175,7 +3445,14 @@ impl CodexBackend {
         }
 
         let prompt = compose_launch_prompt(request);
-        match self.appserver_send_turn(&runtime, &thread_id, &prompt, turn_start_budget) {
+        match self.appserver_send_turn(
+            &request.execution_id,
+            &request.work_id,
+            &runtime,
+            &thread_id,
+            &prompt,
+            turn_start_budget,
+        ) {
             Ok(()) => {
                 self.emit(
                     &request.execution_id,
@@ -3205,23 +3482,41 @@ impl CodexBackend {
     /// why), so no notification racing ahead of the response can be dropped.
     fn appserver_send_turn(
         &self,
+        execution_id: &str,
+        work_id: &str,
         runtime: &AppServerRuntime,
         thread_id: &str,
         prompt: &str,
         turn_start_budget: Duration,
     ) -> Result<(), BackendError> {
-        {
+        let epoch = runtime.turn_epochs.fetch_add(1, Ordering::SeqCst);
+        let displaced_late = {
             let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
             if let AppServerTurnState::InFlight { .. } = &*turn_state {
                 return Err(self.err_failed(
                     "already has a turn in flight; a codex thread runs one turn at a time",
                 ));
             }
+            // The outgoing turn's post-settlement tally dies with the cell
+            // this line overwrites, so it is reported here rather than lost.
+            // End of stream is the *other* place this summary is emitted, and
+            // on a thread that runs more than one turn it is not the first:
+            // "never silently drop" has to hold at both exits, not the one
+            // that is easier to remember.
+            let displaced = match &*turn_state {
+                AppServerTurnState::Finished { late, .. } => late.summary(),
+                AppServerTurnState::Idle | AppServerTurnState::InFlight { .. } => None,
+            };
             *turn_state = AppServerTurnState::InFlight {
                 turn_id: String::new(),
                 acc: TurnAccumulator::new(),
-                interrupt_requested: false,
+                interrupt: InterruptProgress::NotRequested,
+                epoch,
             };
+            displaced
+        };
+        if let Some(summary) = displaced_late {
+            self.emit(execution_id, work_id, KIND_TURN_HARNESS_ERROR, summary);
         }
         let handle = runtime.child.lock().expect("appserver child lock").handle();
         let mut params = json!({
@@ -3234,7 +3529,23 @@ impl CodexBackend {
         let result = match handle.call("turn/start", params, turn_start_budget) {
             Ok(v) => v,
             Err(e) => {
-                *runtime.turn.lock().expect("appserver turn lock") = AppServerTurnState::Idle;
+                // Roll back only what this call actually owns. Every other
+                // writer of this cell is state-guarded; this one used to be
+                // a blind `= Idle`, which meant a `turn/start` that failed
+                // *because the child died* would overwrite the fail-closed
+                // `Finished` the reader thread had already installed for the
+                // very same turn — leaving OBSERVE to report "has not run a
+                // turn yet" about a turn that had run, ended, and been
+                // journaled. A settled cell is never rolled back, and
+                // neither is a later turn's.
+                let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
+                if matches!(
+                    &*turn_state,
+                    AppServerTurnState::InFlight { epoch: mine, .. } if *mine == epoch
+                ) {
+                    *turn_state = AppServerTurnState::Idle;
+                }
+                drop(turn_state);
                 return Err(self.err_failed(format!("turn/start failed: {e}")));
             }
         };
@@ -3243,8 +3554,12 @@ impl CodexBackend {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        if let AppServerTurnState::InFlight { turn_id: slot, .. } =
-            &mut *runtime.turn.lock().expect("appserver turn lock")
+        if let AppServerTurnState::InFlight {
+            turn_id: slot,
+            epoch: mine,
+            ..
+        } = &mut *runtime.turn.lock().expect("appserver turn lock")
+            && *mine == epoch
         {
             *slot = turn_id;
         }
@@ -3263,15 +3578,19 @@ impl CodexBackend {
         thread_id: &str,
         interrupt_budget: Duration,
     ) -> Completion {
+        let handle = runtime.child.lock().expect("appserver child lock").handle();
+        // Mint the id before the cell is marked, and mark the cell before the
+        // request goes out: the reader thread resolves this id the instant it
+        // decodes the answer, and it can only do that if the cell already
+        // names the id it is waiting on.
+        let interrupt_id = handle.reserve_id();
         let turn_id = {
             let mut turn_state = runtime.turn.lock().expect("appserver turn lock");
             match &mut *turn_state {
                 AppServerTurnState::InFlight {
-                    turn_id,
-                    interrupt_requested,
-                    ..
+                    turn_id, interrupt, ..
                 } => {
-                    *interrupt_requested = true;
+                    *interrupt = InterruptProgress::Requested { id: interrupt_id };
                     Some(turn_id.clone())
                 }
                 AppServerTurnState::Idle | AppServerTurnState::Finished { .. } => None,
@@ -3280,7 +3599,6 @@ impl CodexBackend {
         let Some(turn_id) = turn_id else {
             return Completion::immediate();
         };
-        let handle = runtime.child.lock().expect("appserver child lock").handle();
         let work_id = {
             let state = self.lock();
             state
@@ -3289,11 +3607,29 @@ impl CodexBackend {
                 .map(|e| e.work_id.clone())
                 .unwrap_or_default()
         };
-        let result = handle.call(
+        let result = handle.call_reserved(
+            interrupt_id,
             "turn/interrupt",
             json!({"threadId": thread_id, "turnId": turn_id}),
             interrupt_budget,
         );
+        // An answer that arrived has already been recorded, on the reader
+        // thread, in stream order. What is left for this thread is the case
+        // the reader never saw: no answer was written at all — the budget
+        // expired, or the request could not even be sent. That is an RPC
+        // failure, and it is marked here *before* the process-group kill
+        // below, because the kill is what ends the child's stdout and the EOF
+        // that follows is what settles the turn.
+        //
+        // `resolve` is what keeps this from overwriting the reader's own
+        // verdict: it only fires while the cell still names this request as
+        // outstanding.
+        if result.is_err()
+            && let AppServerTurnState::InFlight { interrupt, .. } =
+                &mut *runtime.turn.lock().expect("appserver turn lock")
+        {
+            interrupt.resolve(interrupt_id, false);
+        }
         if let Err(e) = result {
             let pgid = runtime.child.lock().expect("appserver child lock").pgid();
             kill_process_group(Some(pgid));
@@ -3314,12 +3650,20 @@ impl CodexBackend {
             // confirmed it failed. Without this, the turn stays `InFlight`
             // forever and OBSERVE reports `Running` with no way to learn the
             // stage ended.
-            if fail_closed_appserver_turn(&runtime.turn).is_some() {
+            if let Some(settlement) = fail_closed_appserver_turn(&runtime.turn) {
                 self.emit(
                     execution_id,
                     &work_id,
                     KIND_TURN_HARNESS_ERROR,
                     json!({"phase": "turn_closed_after_interrupt_downgrade"}),
+                );
+                // Same invariant as the EOF route: a turn that ends here
+                // ends with `conversation.turn.ended` too.
+                self.emit(
+                    execution_id,
+                    &work_id,
+                    KIND_CONVERSATION_TURN_ENDED,
+                    settlement.turn_ended_payload(),
                 );
             }
         }
@@ -3499,7 +3843,10 @@ impl TurnReader {
                 .as_deref()
                 .and_then(|seen| thread_pin_mismatch(expected, seen))
         });
-        let terminal = classify_terminal(&acc, interrupted);
+        // Exec has no interrupt RPC at all: the kill *is* the request, so a
+        // turn that ends with no terminal after one can only ever be
+        // `ProcessKill`.
+        let terminal = classify_terminal(&acc, interrupted.then_some(InterruptedVia::ProcessKill));
         let thread_id_for_event = execution.thread_id.clone();
         let outcome = TurnOutcome {
             terminal,
@@ -3712,10 +4059,18 @@ impl Backend for CodexBackend {
                     .appserver_budgets
                     .map(|b| b.turn_start)
                     .unwrap_or_else(|| codex_appserver::Budgets::default().turn_start);
-                self.appserver_send_turn(&runtime, &thread_id, input, turn_start_budget)?;
+                let work_id = self.lock().executions[&handle.execution_id].work_id.clone();
+                self.appserver_send_turn(
+                    &handle.execution_id,
+                    &work_id,
+                    &runtime,
+                    &thread_id,
+                    input,
+                    turn_start_budget,
+                )?;
                 self.emit(
                     &handle.execution_id,
-                    &self.lock().executions[&handle.execution_id].work_id.clone(),
+                    &work_id,
                     KIND_CONVERSATION_USER,
                     json!({"text": input, "thread_id": thread_id}),
                 );
@@ -4032,6 +4387,7 @@ fn observe_appserver(execution: &CodexExecution, runtime: &AppServerRuntime) -> 
             unknown_methods,
             last_codex_error_info,
             last_error,
+            late: _,
         } => match outcome {
             TerminalOutcome::Completed => Observation {
                 native,
@@ -4074,33 +4430,46 @@ fn observe_appserver(execution: &CodexExecution, runtime: &AppServerRuntime) -> 
                 )),
             },
             // Reached only via `fail_closed_appserver_turn`'s own use of
-            // `classify_terminal` (§15/§3.4 point 3): `turn/interrupt` itself
-            // failed and the adapter fell back to the process-group kill
-            // (§2.2's "downgrade" path) or the child's stdout simply closed
-            // after an interrupt had already been requested. Sergeant did
-            // ask for the kill, but nothing confirmed it the way a real
+            // `classify_terminal` (§15/§3.4 point 3). Sergeant did ask for
+            // the kill, but nothing confirmed it the way a real
             // `turn/completed{status:"interrupted"}` would — never claim
-            // `harness-confirmed` for this arm.
-            TerminalOutcome::InterruptedRunning => Observation {
+            // `harness-confirmed` for this arm. *Which* unconfirmed path it
+            // was is recorded at settlement time and reported verbatim here:
+            // the two app-server paths are different facts, and the routine
+            // STOP path (an interrupt the harness accepted, then a closed
+            // stream) is not the RPC failure this arm used to assert it was.
+            TerminalOutcome::InterruptedRunning { via } => Observation {
                 native,
                 signal: BackendSignal::Running,
                 evidence: Some(format!(
                     "turn interrupted; thread {thread_ref} resumable (app-server: inferred, \
-                     not harness-confirmed -- turn/interrupt's own RPC never confirmed it)"
+                     not harness-confirmed -- {})",
+                    match via {
+                        InterruptedVia::RpcFailed =>
+                            "turn/interrupt's own RPC failed and sergeant fell back to the \
+                             process-group kill",
+                        InterruptedVia::ClosedAfterAcknowledgedRpc =>
+                            "turn/interrupt was acknowledged, but the child's stdout closed \
+                             before turn/completed carried the harness's own verdict",
+                        InterruptedVia::RpcUnresolved =>
+                            "the child's stdout closed while turn/interrupt was still \
+                             outstanding, so nothing ever answered it either way",
+                        // Unreachable on this transport (`ProcessKill` is
+                        // exec's own arm, minted only by `TurnReader`), and
+                        // named rather than collapsed into one of the three
+                        // above, which is how this arm went wrong before.
+                        InterruptedVia::ProcessKill =>
+                            "the turn's process group was killed with no interrupt RPC involved",
+                    }
                 )),
             },
-            // §5.2's ambiguity, and the one terminal with no stream evidence
-            // of its own: everything the adapter holds about the process goes
-            // here, exactly as exec's own ambiguous arm has carried exit
-            // status and a stderr tail since W1.
-            //
-            // `native` is whatever the child actually proved one lock ago — a
-            // child this observation just reaped is `Exited`, and reporting
-            // `Unknown` over the top of that proof would be the adapter lying
-            // about what it can see (the enum's own definition: "the backend
-            // cannot tell"). The fail-closed guarantee this arm owes is that
-            // it never reports a *stage verdict*, and it does not: `signal`
-            // stays `Running`.
+            // §5.2's ambiguity. `native` is whatever the child actually
+            // proved one lock ago — a child this observation just reaped is
+            // `Exited`, and reporting `Unknown` over the top of that proof
+            // would be the adapter lying about what it can see (the enum's
+            // own definition: "the backend cannot tell"). The fail-closed
+            // guarantee this arm owes is that it never reports a *stage
+            // verdict*, and it does not: `signal` stays `Running`.
             //
             // Worth naming, because it is a real consequence rather than a
             // free improvement: the engine blocks a Work outright on
@@ -4192,7 +4561,7 @@ fn observe_in_memory(execution: &CodexExecution) -> Observation {
                         outcome.raw_evidence()
                     )),
                 },
-                TerminalOutcome::InterruptedRunning => Observation {
+                TerminalOutcome::InterruptedRunning { .. } => Observation {
                     native: NativeState::Exited,
                     signal: BackendSignal::Running,
                     evidence: Some(format!(
@@ -4841,7 +5210,7 @@ mod tests {
         let fixture = include_str!("../../tests/fixtures/codex-0.149.0-turn-failed.jsonl");
         let (acc, events) = replay(fixture);
         assert!(matches!(acc.terminal, Terminal::Failed { .. }));
-        let terminal_outcome = classify_terminal(&acc, false);
+        let terminal_outcome = classify_terminal(&acc, None);
         match terminal_outcome {
             TerminalOutcome::Failed { message } => {
                 assert!(message.contains("gpt-5.6-nonexistent-model"));
@@ -4862,7 +5231,7 @@ mod tests {
         acc.ingest_line(&json!({"type": "turn.completed", "usage": {"input_tokens": 1}}));
         assert_eq!(acc.last_agent_message.as_deref(), Some("last"));
         assert!(matches!(
-            classify_terminal(&acc, false),
+            classify_terminal(&acc, None),
             TerminalOutcome::Completed
         ));
     }
@@ -4912,13 +5281,79 @@ mod tests {
         let mut acc = TurnAccumulator::new();
         acc.ingest_line(&json!({"type": "thread.started", "thread_id": "t1"}));
         assert!(matches!(
-            classify_terminal(&acc, false),
+            classify_terminal(&acc, None),
             TerminalOutcome::AmbiguousUnknown
         ));
         assert!(matches!(
-            classify_terminal(&acc, true),
-            TerminalOutcome::InterruptedRunning
+            classify_terminal(&acc, Some(InterruptedVia::ProcessKill)),
+            TerminalOutcome::InterruptedRunning {
+                via: InterruptedVia::ProcessKill
+            }
         ));
+    }
+
+    /// One in-flight app-server turn whose interrupt is outstanding under a
+    /// known request id.
+    fn interrupted_turn(id: u64) -> AppServerTurnState {
+        AppServerTurnState::InFlight {
+            turn_id: "turn-1".to_string(),
+            acc: TurnAccumulator::new(),
+            interrupt: InterruptProgress::Requested { id },
+            epoch: 1,
+        }
+    }
+
+    /// What `via` the settlement lands on for `state`.
+    fn settled_via(mut state: AppServerTurnState) -> Option<InterruptedVia> {
+        match settle_appserver_turn(&mut state)?.outcome {
+            TerminalOutcome::InterruptedRunning { via } => Some(via),
+            other => panic!("expected an inferred interrupt, got {other:?}"),
+        }
+    }
+
+    /// The truthfulness rule `InterruptedVia` exists for, at the one seam
+    /// where it is decided. `turn/interrupt`'s fate is recorded against its
+    /// own request id, by the reader thread, as the answer is decoded — so
+    /// whether the blocked caller or the reader-thread settlement runs next
+    /// changes nothing about which sentence OBSERVE prints. Recording it from
+    /// the woken caller instead leaves a schedule in which the adapter says
+    /// "nothing ever answered it either way" about an RPC the harness had
+    /// already answered, which is exactly the lie this type forbids.
+    #[test]
+    fn an_answered_interrupt_settles_as_acknowledged_whoever_wakes_first() {
+        // Some other request's answer is not this request's answer.
+        let mut state = interrupted_turn(7);
+        if let AppServerTurnState::InFlight { interrupt, .. } = &mut state {
+            interrupt.resolve(6, true);
+        }
+        assert_eq!(
+            settled_via(state),
+            Some(InterruptedVia::RpcUnresolved),
+            "id 6's answer must not settle the request sent under id 7"
+        );
+
+        let mut state = interrupted_turn(7);
+        if let AppServerTurnState::InFlight { interrupt, .. } = &mut state {
+            interrupt.resolve(7, true);
+        }
+        assert_eq!(
+            settled_via(state),
+            Some(InterruptedVia::ClosedAfterAcknowledgedRpc),
+            "the harness answered: the stream closing afterwards does not un-answer it"
+        );
+
+        let mut state = interrupted_turn(7);
+        if let AppServerTurnState::InFlight { interrupt, .. } = &mut state {
+            interrupt.resolve(7, false);
+        }
+        assert_eq!(settled_via(state), Some(InterruptedVia::RpcFailed));
+
+        // And nothing arrived at all: the honest third answer, reachable only
+        // when the id really was never answered.
+        assert_eq!(
+            settled_via(interrupted_turn(7)),
+            Some(InterruptedVia::RpcUnresolved)
+        );
     }
 
     #[test]
