@@ -1,7 +1,7 @@
 ---
 name: decompose
 description: Split a large, already-approved intent into independently executable child intents, with dependencies and sequencing between them. Use when a large approved intent needs splitting into units of work before each goes to select-workflow.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 **[external]** — new authorship, no estate evidence behind it, same

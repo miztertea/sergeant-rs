@@ -1,7 +1,7 @@
 ---
 name: review-outcome
 description: Interpret something Sergeant returned — completed work, findings, blockers, conflicting evidence, or a suggested follow-up intent — against the intent's declared acceptance criteria, and state which disposition applies. Use when Sergeant returned something and it needs interpreting - accept, reject, revise, remediate, or redispatch.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 Merged, adopted into the kernel.

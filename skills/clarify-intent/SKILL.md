@@ -1,7 +1,7 @@
 ---
 name: clarify-intent
 description: Turn "I want this thing" or "this seems broken" into a precise outcome or problem statement — synthesized from this conversation and codebase exploration, never a fresh interview. Use when desired outcome needs distinguishing from proposed implementation, fact from assumption, requirement from preference, known constraint from unresolved question.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 Merged; absorbs `to-spec`'s synthesis half (the "Problem Statement" /

@@ -1,7 +1,7 @@
 ---
 name: select-workflow
 description: Read `.sergeant/index.md` live and recommend a workflow, the applicable shared-context policies, and a delivery posture for an intent that's ready to leave the conversation — never restating the catalog or deciding for the human. Use when an intent is ready to leave the conversation and needs a workflow, policy, and delivery recommendation before `sgt run`.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 Merged; the deliverable of ruling (b) — the `AGENTS.md` dispatch-time

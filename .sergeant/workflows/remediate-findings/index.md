@@ -3,7 +3,7 @@ kind: workflow
 name: remediate-findings
 status: published
 version: 1
-edition: 0.2.0
+edition: 0.2.1
 description: >-
   Consume an approved typed finding set and account for every finding —
   accepted, rejected, superseded, or unverifiable — with the fixes

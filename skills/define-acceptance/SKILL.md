@@ -1,7 +1,7 @@
 ---
 name: define-acceptance
 description: Turn subjective completion language ("done," "working," "fixed") into observable success — behavioral acceptance criteria, quality constraints, required tests/evidence, expected documentation, thresholds, and blocking conditions. Use once scope is drawn and acceptance still needs stating before an intent leaves the conversation.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 Merged; absorbs `validate-intent` as an in-dialogue review.
