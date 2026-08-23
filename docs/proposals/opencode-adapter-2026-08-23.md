@@ -259,3 +259,75 @@ Capability upgrades, each landing only with its measured admission row:
 - **Live-spend discipline**: big-pickle costs $0 but consumes
   free-tier quota — live tests stay opt-in-gated exactly as if they
   billed (A3 pattern), no unbounded loops, not required PR checks.
+
+## As-landed postscript (2026-08-23, appended by W4)
+
+This plan's own open questions and candidate framings did not all land
+the way they were written above; recorded here rather than left for a
+reader to reconcile against `docs/adr/0021-opencode-adapter.md`
+silently.
+
+**Both W3 open questions this plan hedged resolved positive, not
+negative.** §W3 called `approval_flow` "a candidate" and framed `ask`
+as needing measurement "not prose-guessed" with no stated expectation
+either way. Both are `true` on the serve transport as shipped, each
+with a live admission test run against the installed 1.18.19 binary,
+`-m opencode/big-pickle`: `permission.asked`/the deprecated-but-live v1
+reply endpoint for `approval_flow`, and the distinct typed `question`
+tool/`question.asked` event for `ask` — the one place this plan
+predicted codex's own protocol *might* have exceeded Claude's and
+codex's open admission never closed it (ADR 0020's own "open
+admission test, not a claimed negative" section). opencode's did. Two
+corrections to this plan's own written spec surfaced only by running
+those live tests, both recorded in `opencode.rs`'s admission rows and
+ADR 0021 rather than silently absorbed: the serve abort's terminal
+signature also appears on the *synchronous* `POST` response, not only
+an SSE frame as assumed; and `structured_output` lands at
+`info.structured` with `info.finish == "tool-calls"`, not the guessed
+`structured_output` field with `"stop"`.
+
+**The K2 "no core changes" ledger is real but not empty, exactly as
+K2's own text anticipated ("the adapter is scope; no core changes" —
+not "zero files outside `src/backend/`").** Four items across W1–W3
+touched something outside `src/backend/`: the A4-required blob-ref
+PUT-site/recovery row (`tests/a4_blob_ref_pinning.rs`, W1, gate-forced
+by the suite's own admission rule); the `~/.opencode/bin`
+`toolchain_path_dirs` line (`src/harness.rs`, W2, pre-ratified by this
+plan's own W2 section as "this sprint's one touch outside
+`src/backend/`"); three pre-existing fixtures' registered-backend
+count/list widened by W2's registration commit itself
+(`tests/m3_execution.rs`, `tests/m2_daemon_api.rs`,
+`tests/m4_backends.rs`, mechanical fallout, not a separate decision);
+and `reqwest`'s own `"blocking"` feature flag made explicit
+(`Cargo.toml`, W3, `Cargo.lock` byte-identical before and after). All
+four are listed with their individual reasons in ADR 0021's own K2
+exception ledger for owner ratification at the head PR, exactly as
+this plan's own "Ratify-at-review" list promised.
+
+**The WebSocket carve-out the owner offered at kickoff went
+unused**, and this plan's own K2 bullet already predicted why: W3
+measured opencode's serve transport as HTTP + SSE, not WebSocket, so
+the already-installed `reqwest` (R5, zero new crates) carried the
+whole transport. The carve-out's existence was not wasted motion —
+it is the reason W3 did not have to stop and ask when the transport
+turned out not to need it.
+
+**Coverage-lift was added to W4's scope by owner ruling, not written
+into this plan's own W4 section above.** The W3 branch measured
+green at Gate D's 90% floor but thin on two files
+(`backend/opencode.rs` 82.91% lines, `backend/opencode_serve.rs`
+79.69% lines / 67.74% functions) — both driven by every existing
+serve-transport test pinning a transport explicitly, leaving the
+*default* `Auto` path, its gate-failure fallback, and several
+terminal-classification and ask/permission reply-relay arms
+unreached. W4 lifted both to 91%+ lines before finalize, per the
+owner's own ruling recorded in this task's brief rather than a change
+this document's own text anticipated.
+
+**No NORTH-STAR amendment landed, as this plan's own W4 section
+already said it would not.** opencode has no native sandbox
+mechanism to claim (permission config and per-tool disables only,
+policy the model's tool layer honors, not a kernel-level write
+barrier) — ADR 0020's amendment 4 permits an adapter to use native
+enforcement where the harness has one; this adapter has nothing that
+qualifies, so nothing was appended.

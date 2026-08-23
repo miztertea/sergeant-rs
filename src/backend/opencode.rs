@@ -2373,7 +2373,45 @@ impl OpencodeBackend {
         self.serve_gates.get_or_init(|| self.run_serve_gates())
     }
 
+    /// W4 fixer (release-blocking daemon-boot panic, measured twice and
+    /// reproduced in isolation): this function's own G2/G3 body builds a
+    /// `reqwest::blocking::Client` (`ServeHandle::new`) and sends a request
+    /// on it (`get_doc`) — and `reqwest` panics ("Cannot drop a runtime in a
+    /// context where blocking is not allowed") if *either* of those runs on
+    /// a thread already inside a tokio runtime (confirmed: the panic is not
+    /// specific to `build()`, an already-built client's `.send()` panics
+    /// the same way). Two callers reach `serve_gates()` — and therefore
+    /// here — from exactly such a thread, both directly from
+    /// `daemon::start_with` (async), with none of `api::blocking`'s
+    /// `block_in_place` guard the ordinary request path relies on:
+    /// `probe()`'s `ServeOnly` arm and `capabilities()`'s `Auto`/`ServeOnly`
+    /// resolution, called straight from the daemon's own backend-
+    /// registration loop, and — structurally identical, reached instead
+    /// through `launch_serve`'s independent `ServeHandle` — a fresh LAUNCH
+    /// `recovery::reconcile` (also called directly from `start_with`) can
+    /// drive at daemon-restart time. Running the whole gate-probing body on
+    /// a dedicated OS thread and joining it (a freshly spawned thread never
+    /// carries tokio's "inside a runtime" marker, regardless of what its
+    /// spawning thread carried) keeps every reqwest call in it off whatever
+    /// thread called `serve_gates()`, unconditionally — memoization
+    /// (`OnceLock`) means this runs at most once per backend either way, so
+    /// the extra thread costs nothing that matters.
     fn run_serve_gates(&self) -> ServeGates {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| self.run_serve_gates_inner())
+                .join()
+                .unwrap_or_else(|panic| ServeGates {
+                    result: Err(format!(
+                        "the serve gate probe's isolation thread panicked: {}",
+                        opencode_serve::describe_panic(panic.as_ref())
+                    )),
+                    stale: false,
+                })
+        })
+    }
+
+    fn run_serve_gates_inner(&self) -> ServeGates {
         let exe = &self.config.executable;
         // G1: `opencode --help` names the `serve` subcommand, and `opencode
         // serve --help` offers `--port`/`--hostname` (§5.4 steps 1-2). A
@@ -2992,7 +3030,41 @@ impl OpencodeBackend {
     /// There is no `?`-with-fallback anywhere in this function, and no arm
     /// may call `launch_run`. Every partially-built resource (the child, the
     /// SSE reader thread) is torn down before returning `Err`.
+    ///
+    /// W4 fixer (release-blocking daemon-boot panic; see `run_serve_gates`'s
+    /// own copy of this citation for the full mechanism): `launch_serve_inner`
+    /// below builds its own `ServeHandle` and sends several requests on it
+    /// (`get_doc`, `open_event_stream`, `create_session`) before this LAUNCH
+    /// can report back — every one of which panics if it runs on a thread
+    /// already inside a tokio runtime. The ordinary request path never hits
+    /// that: `api::blocking` wraps every LAUNCH in `block_in_place` before
+    /// it reaches here. `recovery::reconcile` does not — called directly
+    /// from `daemon::start_with` (async), it can drive a resumed work
+    /// straight through `Engine::run_inline` to a fresh `Next::Launch`,
+    /// `pending.perform()`, `Backend::launch`, here — with no such guard.
+    /// Running the entire launch on a dedicated OS thread and joining it
+    /// closes that gap the same way `run_serve_gates` closes its own,
+    /// unconditionally, regardless of which caller (or a future one) is
+    /// missing `block_in_place`.
     fn launch_serve(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| self.launch_serve_inner(prepared))
+                .join()
+                .unwrap_or_else(|panic| {
+                    Err(self.err_failed(format!(
+                        "serve launch refused (phase: bring_up): the launch's isolation thread \
+                         panicked: {}",
+                        opencode_serve::describe_panic(panic.as_ref())
+                    )))
+                })
+        })
+    }
+
+    fn launch_serve_inner(
+        &self,
+        prepared: &PreparedExecution,
+    ) -> Result<ExecutionHandle, BackendError> {
         let request = &prepared.request;
         let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
         let budgets = self.config.serve_budgets.unwrap_or_default();
@@ -5771,6 +5843,96 @@ mod tests {
             outcome,
             TerminalOutcome::InterruptedRunning,
             "an abort signature on the response itself must not be classified as a plain failure"
+        );
+    }
+
+    /// W4 coverage lift: §9.2's table row for a response naming a plain
+    /// (non-abort) `info.error` — the sync POST's own equivalent of the
+    /// run-json typed terminal error (probe 3), checked before `info.finish`
+    /// so a response that carries both (an error alongside a finish reason)
+    /// still reports the failure.
+    #[test]
+    fn classify_serve_terminal_reports_failed_when_the_response_names_a_plain_info_error() {
+        let post: Result<Value, opencode_serve::PostMessageError> = Ok(json!({
+            "info": {"error": {"name": "UnknownError", "data": {"message": "boom"}}},
+        }));
+        let outcome = classify_serve_terminal(&post, &None, false);
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Failed {
+                reason: "opencode reported info.error: {\"data\":{\"message\":\"boom\"},\"name\":\
+                         \"UnknownError\"}"
+                    .to_string()
+            }
+        );
+    }
+
+    /// §9.2's fail-closed default: a successful POST whose response carries
+    /// neither `info.error` nor `info.finish` decides nothing — this table
+    /// row exists precisely so that shape is `AmbiguousUnknown`, not silently
+    /// read as success.
+    #[test]
+    fn classify_serve_terminal_reports_ambiguous_when_the_response_decides_nothing() {
+        let post: Result<Value, opencode_serve::PostMessageError> = Ok(json!({"info": {}}));
+        let outcome = classify_serve_terminal(&post, &None, false);
+        assert_eq!(outcome, TerminalOutcome::AmbiguousUnknown);
+    }
+
+    /// §9.2's table: a non-2xx HTTP response is always `Failed`, never
+    /// `AmbiguousUnknown` — an HTTP status is an explicit statement from the
+    /// server, not a transport-level silence.
+    #[test]
+    fn classify_serve_terminal_reports_failed_on_a_non_2xx_http_response() {
+        let post: Result<Value, opencode_serve::PostMessageError> =
+            Err(opencode_serve::PostMessageError::Http {
+                status: 500,
+                body: "internal error".to_string(),
+            });
+        let outcome = classify_serve_terminal(&post, &None, false);
+        assert!(
+            matches!(&outcome, TerminalOutcome::Failed { reason } if reason.contains("500") && reason.contains("internal error")),
+            "{outcome:?}"
+        );
+    }
+
+    /// §9.2's table, the transport-failure row without an abort signature:
+    /// a connection-level failure the SSE side never separately confirmed as
+    /// an abort is ambiguous, whether or not the child is known to have
+    /// died — `child_died` changes only the evidence a caller assembles
+    /// around this outcome, never which outcome it is.
+    #[test]
+    fn classify_serve_terminal_reports_ambiguous_on_an_unconfirmed_transport_failure() {
+        let post: Result<Value, opencode_serve::PostMessageError> = Err(
+            opencode_serve::PostMessageError::Transport("connection reset by peer".to_string()),
+        );
+        assert_eq!(
+            classify_serve_terminal(&post, &None, false),
+            TerminalOutcome::AmbiguousUnknown,
+            "no SSE abort confirmation and the child's liveness is not known here either"
+        );
+        assert_eq!(
+            classify_serve_terminal(&post, &None, true),
+            TerminalOutcome::AmbiguousUnknown,
+            "child_died changes the evidence a caller assembles, never which outcome this is"
+        );
+    }
+
+    /// The other half of the same row: a transport failure the SSE side DID
+    /// separately confirm as an abort (`session_error` names
+    /// `MessageAbortedError`) is `InterruptedRunning`, not `AmbiguousUnknown`
+    /// — the §7.3 downgrade path's own shape, where the abort RPC succeeded
+    /// (setting `session_error`) but the turn's own POST then failed at the
+    /// transport level once the process group was killed out from under it.
+    #[test]
+    fn classify_serve_terminal_reports_interrupted_running_on_a_transport_failure_the_sse_side_confirmed_as_an_abort()
+     {
+        let post: Result<Value, opencode_serve::PostMessageError> = Err(
+            opencode_serve::PostMessageError::Transport("connection reset by peer".to_string()),
+        );
+        let session_error = Some(json!({"name": "MessageAbortedError", "data": {}}));
+        assert_eq!(
+            classify_serve_terminal(&post, &session_error, true),
+            TerminalOutcome::InterruptedRunning
         );
     }
 

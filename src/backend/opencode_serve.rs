@@ -495,6 +495,21 @@ pub(super) fn mint_server_password() -> String {
     format!("{a}{b}")
 }
 
+/// Best-effort text for a caught `std::thread::JoinHandle::join` panic
+/// payload — used only by `opencode.rs`'s two runtime-isolation joins
+/// (`run_serve_gates`, `launch_serve`; W4 fixer) to report *why* an
+/// isolated thread died, since a payload is `Box<dyn Any + Send>` and
+/// almost always one of these two concrete types in practice.
+pub(super) fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 // ------------------------------------------------------------ process-bound
 
 /// Why `ServeHandle::post_message` did not return a response body (§9.2's own
@@ -741,6 +756,20 @@ impl std::fmt::Debug for ServeHandle {
 }
 
 impl ServeHandle {
+    /// W4 fixer (release-blocking daemon-boot panic): building this client
+    /// -- and, measured separately, sending *any* request on it -- panics
+    /// ("Cannot drop a runtime in a context where blocking is not allowed")
+    /// when called from a thread already inside a tokio runtime. That is
+    /// `reqwest`'s own `blocking::wait::enter()` sanity check
+    /// (`reqwest-0.13.4/src/blocking/wait.rs`, debug-build only, but every
+    /// blocking call — `build()` included, via `ClientHandle::new`'s own
+    /// internal wait — routes through it), not something isolating just
+    /// this constructor can fix: an already-built client's later `.send()`
+    /// panics exactly the same way if *that* call happens on a
+    /// runtime-owned thread. See `run_serve_gates` and `launch_serve` for
+    /// where the whole reqwest-touching sequence is isolated instead — this
+    /// constructor stays plain so it behaves identically regardless of
+    /// which of them (or a future caller) is holding the isolation.
     pub(super) fn new(base_url: String, password: String) -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
             .build()
@@ -1421,5 +1450,147 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(frames[0].is_err());
         assert!(frames[1].is_ok());
+    }
+
+    // -------------------------------------------------------- ServeHandle's
+    // own client-error arms (W4 coverage lift). A real `opencode serve`
+    // (or `StubServe`, its python stand-in in `tests/opencode_backend.rs`)
+    // is always well-behaved on these paths in every other test in this
+    // codebase, so no existing suite reaches a non-2xx status or a
+    // malformed body from any of `ServeHandle`'s six HTTP methods -- this
+    // is a bare `TcpListener` speaking exactly the one canned response each
+    // test needs, with no HTTP semantics of its own beyond what the test
+    // writes by hand, so a genuinely bad response is trivial to construct.
+
+    /// Binds an ephemeral port, accepts exactly one connection, drains the
+    /// request (best-effort -- this helper parses nothing), writes `response`
+    /// verbatim, and closes. `response` must be a complete HTTP/1.1 response
+    /// (status line, headers including `Content-Length` and `Connection:
+    /// close`, body) -- this is socket plumbing only, not an HTTP stack.
+    fn one_shot_http_server(response: String) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buf = [0u8; 8192];
+                // Draining before writing keeps a small POST body from
+                // deadlocking against this thread's own write below on a
+                // platform where the request hasn't fully arrived yet.
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn http_response(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn handle_against(response: String) -> super::ServeHandle {
+        let base_url = one_shot_http_server(response);
+        super::ServeHandle::new(base_url, "pw".to_string()).expect("build handle")
+    }
+
+    #[test]
+    fn get_doc_names_the_username_rule_on_401() {
+        let handle = handle_against(http_response("401 Unauthorized", ""));
+        let err = handle
+            .get_doc(Duration::from_secs(5))
+            .expect_err("401 is refused with a named reason");
+        assert!(err.contains("username"), "{err}");
+    }
+
+    #[test]
+    fn get_doc_reports_a_non_2xx_status_that_is_not_401() {
+        let handle = handle_against(http_response("500 Internal Server Error", ""));
+        let err = handle
+            .get_doc(Duration::from_secs(5))
+            .expect_err("a non-2xx, non-401 status is still a refusal");
+        assert!(err.contains("500"), "{err}");
+    }
+
+    #[test]
+    fn get_doc_reports_when_the_body_is_not_json() {
+        let handle = handle_against(http_response("200 OK", "not json"));
+        let err = handle
+            .get_doc(Duration::from_secs(5))
+            .expect_err("a 2xx status with a non-JSON body is still a refusal");
+        assert!(err.contains("not JSON"), "{err}");
+    }
+
+    #[test]
+    fn create_session_reports_a_non_2xx_status() {
+        let handle = handle_against(http_response("500 Internal Server Error", ""));
+        let err = handle
+            .create_session(Duration::from_secs(5))
+            .expect_err("a non-2xx status is a refusal");
+        assert!(err.contains("500"), "{err}");
+    }
+
+    #[test]
+    fn create_session_reports_when_the_response_carries_no_id_field() {
+        let handle = handle_against(http_response("200 OK", "{}"));
+        let err = handle
+            .create_session(Duration::from_secs(5))
+            .expect_err("a response with no id is unusable, not silently accepted");
+        assert!(err.contains("no `id` field") || err.contains("id"), "{err}");
+    }
+
+    #[test]
+    fn get_messages_reports_a_non_2xx_status() {
+        let handle = handle_against(http_response("404 Not Found", ""));
+        let err = handle
+            .get_messages("ses_x", Duration::from_secs(5))
+            .expect_err("a non-2xx status is a refusal");
+        assert!(err.contains("404"), "{err}");
+    }
+
+    #[test]
+    fn post_message_reports_when_the_response_body_is_not_json() {
+        let handle = handle_against(http_response("200 OK", "not json"));
+        let err = handle
+            .post_message("ses_x", &json!({}), Duration::from_secs(5))
+            .expect_err("a 2xx status with a non-JSON body is still a refusal");
+        match err {
+            super::PostMessageError::Transport(detail) => {
+                assert!(detail.contains("not JSON"), "{detail}");
+            }
+            other => panic!("expected a Transport error naming the JSON failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_abort_reports_a_non_2xx_status() {
+        let handle = handle_against(http_response("500 Internal Server Error", ""));
+        let err = handle
+            .post_abort("ses_x", Duration::from_secs(5))
+            .expect_err("a non-2xx status is a refusal");
+        assert!(err.contains("500"), "{err}");
+    }
+
+    #[test]
+    fn post_permission_reply_reports_a_non_2xx_status() {
+        let handle = handle_against(http_response("404 Not Found", ""));
+        let err = handle
+            .post_permission_reply("ses_x", "per_1", "once", Duration::from_secs(5))
+            .expect_err("a non-2xx status is a refusal");
+        assert!(err.contains("404"), "{err}");
+    }
+
+    #[test]
+    fn post_question_reply_reports_a_non_2xx_status() {
+        let handle = handle_against(http_response("404 Not Found", ""));
+        let err = handle
+            .post_question_reply("que_1", &json!([["Blue"]]), Duration::from_secs(5))
+            .expect_err("a non-2xx status is a refusal");
+        assert!(err.contains("404"), "{err}");
     }
 }
