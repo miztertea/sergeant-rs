@@ -320,7 +320,7 @@ enforces it.
 ## K2 exception ledger — every touch outside `src/backend/` this
 sprint made, complete, for owner ratification at the head PR
 
-K2's own text is "scope is the adapter; no core changes." Four items
+K2's own text is "scope is the adapter; no core changes." Six items
 touched something outside `src/backend/opencode*.rs`, each named here
 with its wave, its reason, and why it does not read as a core change
 in spirit even where it touches a file outside that directory:
@@ -328,11 +328,13 @@ in spirit even where it touches a file outside that directory:
 | Item | Wave | File(s) | Reason |
 |---|---|---|---|
 | Required PUT-site + recovery-arm row | W1 | `tests/a4_blob_ref_pinning.rs` | Gate-forced, not discretionary: A4's own blob-ref-pinning suite requires every new blob-capture site (opencode's raw-stream archive) to carry a recoverability row, or the suite itself fails closed. The adapter cannot exist without this row; it is the suite's own admission gate operating exactly as designed, not a scope creep W1 chose. |
+| `"opencode"` registered in `BackendRegistry` | W2 | `src/daemon.rs` | `DaemonConfig` gained an `opencode: Option<OpencodeConfig>` field plus the construction/registration and event-sink-wiring block, mirroring the codex block exactly. Named here rather than folded into "adapter work" because it is a real edit to a core file outside `src/backend/`, even though ("Harness and backend axes," above) it decides nothing new: `router.rs`'s precedence ladder and `sgt opencode`'s origin affinity already existed, and registration only makes the name they already resolve toward real. |
 | `~/.opencode/bin` added to `toolchain_path_dirs` | W2 | `src/harness.rs` | Pre-ratified by name in the sprint plan itself (§ W2, "this sprint's one touch outside `src/backend/`"): the packet's own measured `command not found` evidence, and `harness.rs`'s module doc already states the list is designed to grow by measured entries — the same one-line remedy that put `~/.cargo/bin`/`~/.local/bin` there. |
-| Registered-backend count/list widened in three pre-existing fixtures | W2 | `tests/m3_execution.rs`, `tests/m2_daemon_api.rs`, `tests/m4_backends.rs` | Mechanical, not a design choice: registering a fourth backend moves every fixture that hardcoded "how many backends exist" or used `"opencode"` as a canonical *unregistered* name (swapped to `"goose"`, which stays unregistered). A direct, forced consequence of item 2 (daemon.rs registration) in the same commit, never a separate decision. |
+| Registered-backend count/list widened in three pre-existing fixtures | W2 | `tests/m3_execution.rs`, `tests/m2_daemon_api.rs`, `tests/m4_backends.rs` | Mechanical, not a design choice: registering a fourth backend moves every fixture that hardcoded "how many backends exist" or used `"opencode"` as a canonical *unregistered* name (swapped to `"goose"`, which stays unregistered). A direct, forced consequence of item 2 (`daemon.rs` registration) in the same commit, never a separate decision. |
 | `reqwest`'s own `"blocking"` feature flag | W3 | `Cargo.toml` | The owner's own offered carve-out, ultimately unneeded for a new crate (see "The WebSocket carve-out" above) but used here in its narrower form: making an already-transitively-enabled feature (via `opentelemetry-otlp`'s `reqwest-blocking-client`) an explicit direct one. `Cargo.lock` verified byte-identical before and after — an R5 rung citation, zero net dependency-graph change. |
+| #231(b) orphan-suite guard, written from scratch | W2 | `tests/coverage_stage_membership.rs`, `scripts/coverage/c2-suites.sh` | Neither file existed before this sprint's own W2. `coverage_stage_membership.rs` is a new structural test asserting every `tests/*.rs` suite is wired into a coverage stage script or named in its `ALLOWLIST`; that `ALLOWLIST` was seeded with the 18 suites already orphaned at authorship time (2026-08-23), a fact this sprint discovered, not inherited. `opencode_routing`/`opencode_backend` were wired into `c2-suites.sh` in the same commit that created them, so neither is itself an orphan — the guard's first act was to certify this sprint's own new suites, not to widen a ledger some earlier sprint had already built. |
 
-None of the four touch `src/backend/mod.rs`'s contract, the router, or
+None of the six touch `src/backend/mod.rs`'s contract, the router, or
 the engine — K2's actual substance (R3) is intact. They are named here
 individually, rather than folded into "adapter work," because K2's own
 words promise "no core changes" and a reader auditing that promise
@@ -368,18 +370,23 @@ rather than left implicit in a diff.
   subagent turn was ever run, on either transport. Documented is not
   supported (§15) — this is an open admission test for a future wave,
   not a claimed negative.
-- **#231(a)-style audit**: this sprint's own commits widened
-  `coverage_stage_membership.rs`'s allowlist by wiring
-  `opencode_routing`/`opencode_backend` into `c2-suites.sh` in the same
-  commit that created them (no self-orphaning), but the pre-existing
-  18-suite allowlist this guard was seeded with (W2 of the codex
-  sprint, #231(b)) is untouched by this sprint and remains exactly as
-  large as it was — named here so a reader does not assume this
-  sprint's own coverage-lift work (W4 Job 1) touched that ledger; it
-  did not.
-- **The 17/18-suite allowlist itself**: unrelated to this adapter,
-  carried forward unmodified. A future audit closing it is #231(a)'s
-  own hand-off, not this ADR's.
+- **#231(a)-style audit**: `tests/coverage_stage_membership.rs` and its
+  `ALLOWLIST` did not exist before this sprint — W2 wrote the guard
+  from scratch (#231(b)) and, in the same pass, discovered 18 suites
+  already orphaned at authorship time (2026-08-23), seeding the
+  `ALLOWLIST` with them. That same commit wired this sprint's own two
+  new suites, `opencode_routing`/`opencode_backend`, into
+  `c2-suites.sh` before the guard could ever see them as orphans — the
+  two actions are independent, not the same "widening": wiring a suite
+  into `c2-suites.sh` keeps it *out* of the allowlist, it does not add
+  to it. Named here so a reader does not assume this sprint's own
+  coverage-lift work (W4 Job 1) touched the 18-suite seed list; it did
+  not — that count has been unchanged since the commit that first
+  wrote it.
+- **The 18-suite allowlist itself**: pre-existing orphans discovered
+  when this sprint's W2 first wrote the guard, unrelated to what this
+  adapter does, carried forward unmodified since. Auditing and closing
+  those 18 individually is #231(a)'s own hand-off, not this ADR's.
 - **`always`'s persistence** (the approval_flow reply body) is relayed
   by this adapter but its actual durability across a later turn was
   schema-read only, never exercised end to end — recorded in the
