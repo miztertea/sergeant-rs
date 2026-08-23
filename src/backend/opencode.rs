@@ -5774,6 +5774,96 @@ mod tests {
         );
     }
 
+    /// W4 coverage lift: §9.2's table row for a response naming a plain
+    /// (non-abort) `info.error` — the sync POST's own equivalent of the
+    /// run-json typed terminal error (probe 3), checked before `info.finish`
+    /// so a response that carries both (an error alongside a finish reason)
+    /// still reports the failure.
+    #[test]
+    fn classify_serve_terminal_reports_failed_when_the_response_names_a_plain_info_error() {
+        let post: Result<Value, opencode_serve::PostMessageError> = Ok(json!({
+            "info": {"error": {"name": "UnknownError", "data": {"message": "boom"}}},
+        }));
+        let outcome = classify_serve_terminal(&post, &None, false);
+        assert_eq!(
+            outcome,
+            TerminalOutcome::Failed {
+                reason: "opencode reported info.error: {\"data\":{\"message\":\"boom\"},\"name\":\
+                         \"UnknownError\"}"
+                    .to_string()
+            }
+        );
+    }
+
+    /// §9.2's fail-closed default: a successful POST whose response carries
+    /// neither `info.error` nor `info.finish` decides nothing — this table
+    /// row exists precisely so that shape is `AmbiguousUnknown`, not silently
+    /// read as success.
+    #[test]
+    fn classify_serve_terminal_reports_ambiguous_when_the_response_decides_nothing() {
+        let post: Result<Value, opencode_serve::PostMessageError> = Ok(json!({"info": {}}));
+        let outcome = classify_serve_terminal(&post, &None, false);
+        assert_eq!(outcome, TerminalOutcome::AmbiguousUnknown);
+    }
+
+    /// §9.2's table: a non-2xx HTTP response is always `Failed`, never
+    /// `AmbiguousUnknown` — an HTTP status is an explicit statement from the
+    /// server, not a transport-level silence.
+    #[test]
+    fn classify_serve_terminal_reports_failed_on_a_non_2xx_http_response() {
+        let post: Result<Value, opencode_serve::PostMessageError> =
+            Err(opencode_serve::PostMessageError::Http {
+                status: 500,
+                body: "internal error".to_string(),
+            });
+        let outcome = classify_serve_terminal(&post, &None, false);
+        assert!(
+            matches!(&outcome, TerminalOutcome::Failed { reason } if reason.contains("500") && reason.contains("internal error")),
+            "{outcome:?}"
+        );
+    }
+
+    /// §9.2's table, the transport-failure row without an abort signature:
+    /// a connection-level failure the SSE side never separately confirmed as
+    /// an abort is ambiguous, whether or not the child is known to have
+    /// died — `child_died` changes only the evidence a caller assembles
+    /// around this outcome, never which outcome it is.
+    #[test]
+    fn classify_serve_terminal_reports_ambiguous_on_an_unconfirmed_transport_failure() {
+        let post: Result<Value, opencode_serve::PostMessageError> = Err(
+            opencode_serve::PostMessageError::Transport("connection reset by peer".to_string()),
+        );
+        assert_eq!(
+            classify_serve_terminal(&post, &None, false),
+            TerminalOutcome::AmbiguousUnknown,
+            "no SSE abort confirmation and the child's liveness is not known here either"
+        );
+        assert_eq!(
+            classify_serve_terminal(&post, &None, true),
+            TerminalOutcome::AmbiguousUnknown,
+            "child_died changes the evidence a caller assembles, never which outcome this is"
+        );
+    }
+
+    /// The other half of the same row: a transport failure the SSE side DID
+    /// separately confirm as an abort (`session_error` names
+    /// `MessageAbortedError`) is `InterruptedRunning`, not `AmbiguousUnknown`
+    /// — the §7.3 downgrade path's own shape, where the abort RPC succeeded
+    /// (setting `session_error`) but the turn's own POST then failed at the
+    /// transport level once the process group was killed out from under it.
+    #[test]
+    fn classify_serve_terminal_reports_interrupted_running_on_a_transport_failure_the_sse_side_confirmed_as_an_abort()
+     {
+        let post: Result<Value, opencode_serve::PostMessageError> = Err(
+            opencode_serve::PostMessageError::Transport("connection reset by peer".to_string()),
+        );
+        let session_error = Some(json!({"name": "MessageAbortedError", "data": {}}));
+        assert_eq!(
+            classify_serve_terminal(&post, &session_error, true),
+            TerminalOutcome::InterruptedRunning
+        );
+    }
+
     /// §8.2's absolute rule, as code: a serve child that fails before it
     /// ever finished spawning is a LAUNCH refusal, **never** a silent
     /// fallback to run-json, and it leaves no phantom execution behind.
