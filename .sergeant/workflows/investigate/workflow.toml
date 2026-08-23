@@ -1,0 +1,24 @@
+# investigate — answer a bounded question against evidence, with a
+# stated stopping condition, and leave a durable cited artifact.
+#
+# Authored 2026-08-22 for the distro content rebuild
+# (docs/proposals/distro-content-2026-08-22.md, W2). Derivation and the
+# evidence behind each stage: the design proposal §E.3, §F's stage
+# vocabulary, and the owner rulings recorded there.
+#
+# Six ordinary actor stages. Stage order here is authoritative; the
+# directory listing under this workflow's own tree MUST agree with it
+# lexically (docs/icm/convention.md §1 rule 4).
+#
+# Descends from the retired `research` (1 stage) and `wayfinder` (4
+# stages). `wayfinder/00-name-destination` is deleted, not carried:
+# naming a destination requires a live interview, which R-NS-6 places in
+# Captain, before dispatch — `00-frame` frames what the intent already
+# names, it never interviews. `wayfinder`'s ticket-graph/map mechanics
+# (10/30/40) do not survive as workflow stages; their frontier/fog
+# framing concept folds into `00-frame`'s stopping-condition contract.
+
+[workflow]
+name = "investigate"
+version = "1"
+stages = ["00-frame", "10-fan-out-evidence", "20-synthesize", "25-challenge", "30-record", "40-close"]

@@ -66,18 +66,33 @@ or `sgt init` if this directory should become one. Only `sgt --help`,
 
 | Trigger | Load | Owns |
 |---|---|---|
-| Work in a registered repo should become a durable, resumable Work item | `sgt run "<intent>"` | Intent shaping, workflow selection, execution |
+| Work in a registered repo should become a durable, resumable Work item | `sgt run "<intent>"` | Intent shaping and workflow selection (Captain's — see the dispatch-time discipline above); the command transports the selected intent to execution, it does not choose on Captain's behalf |
 | Read-only, doc/help-shaped question about installing, configuring, or diagnosing Sergeant itself | `sergeant-help` (`skills/sergeant-help/SKILL.md`) | Documentation lookup, command verification |
 | Estate not set up, or `sgt doctor` reports a fixable fault | `sgt init` / `sgt doctor` (CLI verbs, not skills; see ROUTING below) | Estate scaffolding, install repair |
 | Repos/groups/health not already confirmed this session | `estate-navigation` (`skills/estate-navigation/SKILL.md`) | Resolving declared repos/groups, syncing the working set |
-| A plan/decision/idea needs interviewing, or a "grill" trigger phrase | `grilling` / `grill-with-docs` (`skills/grilling/`, `skills/grill-with-docs/`) | A live, in-session interview — never `sgt run` (R-NS-6: execution ≠ dialogue) |
-| A design already discussed in this conversation should become a spec-shaped ticket | `to-spec` (`skills/to-spec/SKILL.md`) | Synthesizing this conversation's own content — never `sgt run`, which has no access to it |
+| A plan/decision/idea needs interviewing, or a "grill" trigger phrase | `grilling` (`skills/grilling/SKILL.md`) | A live, in-session interview — never `sgt run` (R-NS-6: execution ≠ dialogue) |
+| An intent is ready to leave the conversation and needs a workflow, policy, and delivery recommendation | `select-workflow` (`skills/select-workflow/SKILL.md`) | Reading `.sergeant/index.md` live and recommending — never restating the catalog or deciding for the human |
 | Substantive procedural work matches a published workflow | that workflow's `index.md` under `.sergeant/workflows/<name>/`, via `.sergeant/index.md` | That workflow's stages, inputs, outputs |
 | A `@@name` reference appears in an active stage's `CONTEXT.md` | `.sergeant/common/contexts/<name>.md` — this rule, no other | Shared context text |
 
 `.sergeant/index.md` is the full catalog; consult it directly when an
 intent doesn't obviously match a row above — this table is not a copy and
 is not kept in sync with every addition.
+
+Before any `sgt run`, consult `.sergeant/index.md` and name the workflow
+you selected. Omitting `--workflow` binds the embedded default loop
+(`software-change`); that is a selection and must be stated as one, with
+the reason the named catalog did not fit. An unnamed default is not a
+selection.
+
+**Captain owns ambiguity. Sergeant owns completion.** This is not new
+doctrine — it sharpens what this table's `R-NS-6` citation already
+enforces as a category rule: a procedure whose defining behavior needs a
+live human turn mid-procedure is resolving ambiguity, and ambiguity is
+Captain's; a procedure that runs to a terminal outcome and returns
+evidence is completing, and completion is Sergeant's. Where the two could
+disagree, R-NS-6 wins — this sentence explains the split, it does not
+relax it.
 
 ## SHOULD — disposition, norms, escalation
 
@@ -288,8 +303,7 @@ output.
 
 Before dispatching Work whose objective names auth, security, secrets,
 payments, databases, migrations, production, destructive, persistent-state,
-or state-transition territory (the same fixed keyword set `dispatch`'s
-`05-classify-risk` stage routes on), Captain composes the intent — via
+or state-transition territory, Captain composes the intent — via
 `sgt run --intent-file <path>` — covering eight dimensions:
 
 - **Objective** — what the Work is actually for.

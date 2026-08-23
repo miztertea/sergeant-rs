@@ -1,0 +1,22 @@
+# remediate-findings — consume an approved typed finding set and account
+# for every finding — accepted, rejected, superseded, or unverifiable —
+# with the fixes themselves re-attacked.
+#
+# Authored 2026-08-22 for the distro content rebuild
+# (docs/proposals/distro-content-2026-08-22.md, W2). Derivation and the
+# evidence behind each stage: the design proposal §E.5, §F's stage
+# vocabulary, and the owner rulings recorded there.
+#
+# Six ordinary actor stages. Stage order here is authoritative; the
+# directory listing under this workflow's own tree MUST agree with it
+# lexically (docs/icm/convention.md §1 rule 4).
+#
+# NEW package. Consumes a typed finding set most often produced by
+# `review-change` or `implement-change`, closing the loop review-change's
+# own read-only contract leaves open — reviewing never fixes, remediating
+# always requires a named human authorization.
+
+[workflow]
+name = "remediate-findings"
+version = "1"
+stages = ["00-ingest", "10-verify-against-current-state", "20-dispose", "30-implement-accepted", "35-re-verify", "40-disposition-matrix"]

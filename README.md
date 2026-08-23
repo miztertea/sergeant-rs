@@ -127,22 +127,32 @@ Sergeant does not impose a memory system of its own: the estate carries durable 
 A workflow is a standard way of working expressed as a directory:
 
 ```text
-.sergeant/workflows/software-change/
+.sergeant/workflows/implement-change/
 ├── workflow.toml
 ├── CONTEXT.md
-├── 00-prepare/
+├── 00-orient/
+│   └── CONTEXT.md
+├── 05-baseline/
 │   └── CONTEXT.md
 ├── 10-implement/
 │   └── CONTEXT.md
-├── 20-review/
+├── 15-validate/
 │   └── CONTEXT.md
-└── 30-close/
+├── 20-panel/
+│   └── CONTEXT.md
+├── 25-refute/
+│   └── CONTEXT.md
+├── 30-fix-confirmed/
+│   └── CONTEXT.md
+├── 35-re-verify/
+│   └── CONTEXT.md
+└── 40-close/
     └── CONTEXT.md
 ```
 
 Every stage is its own execution with its own contract. A stage declares the context and inputs it needs, produces explicit outputs, and ends before the next stage begins — context moves between stages through declared artifacts, not through one enormous agent conversation that must remain alive forever. A stage can be a fresh agent execution when judgment is needed, a Docker execution for deterministic work, repository-native scripts and tests, or a human decision when authority runs out. Agents where reasoning helps. Containers where determinism helps.
 
-Sergeant ships with workflows for software changes, code review, research, diagnosing bugs, prototyping, cross-repository work, intent validation, decision recording, validation and shipping, and more — the [workflow catalog](.sergeant/index.md) lists them all. Captain discovers them through the catalog and selects one based on the accepted intent.
+Sergeant ships with seven named workflows — implementing a change (with an in-loop review panel, refuters, and a re-verify pass over the fix), fixing a defect, investigating a bounded question, reviewing a diff that arrives from outside a Work, remediating a typed set of findings, authoring a document, and validating and shipping — the [workflow catalog](.sergeant/index.md) lists them all. Captain discovers them through the catalog and selects one based on the accepted intent; omitting `--workflow` binds the embedded default loop, which the catalog is a set of deliberate alternatives to, never a silent fallback.
 
 ### Write your own workflows
 
@@ -261,7 +271,7 @@ You can also submit directly:
 
 ```sh
 sgt run "add retry handling to the settlement worker" \
-  --workflow software-change \
+  --workflow implement-change \
   --group payments
 ```
 

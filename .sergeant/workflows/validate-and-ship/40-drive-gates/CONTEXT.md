@@ -18,6 +18,11 @@ Every gate resolved by exactly one response; ask-user findings relayed verbatim 
 
 ## Behavior contract
 
+Apply `@@independent-review`: the validating actor never edits the code.
+This stage's own restatements of that rule (below) narrow it to the
+pipeline-owned worktree specifically, rather than restating the rule
+itself in full each time.
+
 - **`axi run` and every `axi respond` block synchronously and each step can take several minutes, so a single call may not return for a while; that is normal, requires a long timeout, and must not be interrupted or re-issued because it seems slow — progress can be checked separately via `axi status` without disturbing the run.**
   (trigger: a pipeline call is in flight and appears slow; outcome: the actor waits out the call (backgrounding it if needed) rather than cancelling or re-issuing it, using `axi status` to observe progress)
 - **The `awaiting_agent: parked <duration>` field on status output means the run is parked at a gate waiting for `axi respond`; the field is observability only — it does not change gate resolution, auto-resume the run, or make `--yes` the default.**
@@ -50,7 +55,7 @@ Every gate resolved by exactly one response; ask-user findings relayed verbatim 
   (trigger: a run appears quiet; outcome: progress is checked without ever issuing a second, duplicate run command)
 - **At each gate, inspect every finding: auto-fix findings are authorized selectively after review; ask-user findings are relayed to the user and never approved, fixed, or skipped autonomously; no-op findings are informational and the gate is simply approved.**
   (trigger: a gate presents findings; outcome: each finding is handled according to its category, with human authority preserved for ask-user findings)
-- **While a run is active: do not edit the pipeline-owned worktree, do not abort or rerun to escape a gate, and preserve all pipeline-created commits; abort only when intentionally discarding the entire run.**
+- **While a run is active: preserve all pipeline-created commits and abort only when intentionally discarding the entire run** — the never-edit rule itself is `@@independent-review`'s, applied above; this bullet narrows only the abort/preserve consequence.
   (trigger: a run is active; outcome: the pipeline-owned worktree and commit history stay intact for the run's duration)
 - **Do not use --yes; use --skip=<steps> only for stages already proven irrelevant — skipping is not a substitute for checks that have not been performed.**
   (trigger: starting or configuring a no-mistakes run; outcome: gate steps are never bulk-approved or skipped without proven irrelevance)

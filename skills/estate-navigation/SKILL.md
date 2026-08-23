@@ -1,7 +1,7 @@
 ---
 name: estate-navigation
 description: Resolve an estate's declared repositories, groups, and health before acting in it, bring its working set up to date, register new repos/groups interactively, and file tracked work for gaps `sgt doctor` can't remedy — sergeant-rs's equivalent of upstream's sgt-context/sgt-sync/sergeant-setup.
-edition: 0.1.0
+edition: 0.2.1
 ---
 
 Provenance for this skill's citation record lives in

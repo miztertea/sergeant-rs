@@ -1,0 +1,22 @@
+# implement-change — take an intent for a change to code, produce the
+# change with its tests, attack it on four axes, refute the attack, fix
+# only what survives, re-attack the fixes, and close with evidence tied
+# to acceptance.
+#
+# Authored 2026-08-22 for the distro content rebuild
+# (docs/proposals/distro-content-2026-08-22.md, W2). Derivation and the
+# evidence behind each stage: the design proposal §E.1, §F's stage
+# vocabulary, and the owner rulings recorded there.
+#
+# Nine ordinary actor stages. Stage order here is authoritative; the
+# directory listing under this workflow's own tree MUST agree with it
+# lexically (docs/icm/convention.md §1 rule 4).
+#
+# NEW package — the sprint-proven shape. Absorbs `implement`'s two
+# middle stages and `worker-mission`'s mission-with-a-brief loop; both
+# packages retire with this one's publication.
+
+[workflow]
+name = "implement-change"
+version = "1"
+stages = ["00-orient", "05-baseline", "10-implement", "15-validate", "20-panel", "25-refute", "30-fix-confirmed", "35-re-verify", "40-close"]

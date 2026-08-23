@@ -1,0 +1,22 @@
+# review-change — review a diff that arrives from outside a Work on four
+# axes, and emit verified findings, not fixes.
+#
+# Authored 2026-08-22 for the distro content rebuild
+# (docs/proposals/distro-content-2026-08-22.md, W2). Derivation and the
+# evidence behind each stage: the design proposal §E.4, §F's stage
+# vocabulary, and the owner rulings recorded there.
+#
+# Six ordinary actor stages. Stage order here is authoritative; the
+# directory listing under this workflow's own tree MUST agree with it
+# lexically (docs/icm/convention.md §1 rule 4).
+#
+# Reshaped from the retired `code-review` package (v2, 4 stages, 2 axes).
+# `00-pin-fixed-point` and `10-identify-spec-source` carry over
+# substantially intact; the two-axis fan-out generalizes to the four-axis
+# `@@panel` mechanism; the old Standards/Spec axis names do not survive —
+# spec-fidelity absorbs Spec, simplicity absorbs Standards' smell half.
+
+[workflow]
+name = "review-change"
+version = "1"
+stages = ["00-pin-fixed-point", "10-identify-spec-source", "20-panel", "25-refute", "30-verify-and-severity", "40-report"]

@@ -1,7 +1,7 @@
 ---
 name: grilling
 description: Grill the user relentlessly about a plan, decision, or idea, one question at a time. Use when the user wants to stress-test their thinking, or uses a 'grill' trigger phrase.
-edition: 0.1.0
+edition: 0.2.1
 ---
 
 Ported from `.sergeant/workflows/grilling` (N1 candidate W28), which
