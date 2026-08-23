@@ -98,8 +98,10 @@
 //! [packet 2] measured a **hard** deny at 1.1.17: tool step `ACTIVE → ERROR`, a
 //! typed `tool_info.error {type: "TOOL_ERROR", message: "permission check
 //! failed … user denied permission to run command"}`, terminal `status:
-//! "ERROR"`, exit 1. **That is not what 1.1.19 does.** [W1 P2 control, three
-//! independent reproductions]:
+//! "ERROR"`, exit 1. **That is not what 1.1.19 does.** [two independent live
+//! reproductions, and only two: W1 P2's control turn (`p2-control`, terminal
+//! `CANCELED`, 1.48s) and W1 P3's turn 1 (`p3-writefile`, the denied `pwd`,
+//! terminal `CANCELED`, 2.32s), whose stderr captures are byte-identical]:
 //!
 //! - the tool step resolves `ACTIVE → **DONE**`, with **no** `tool_info.error`
 //!   and **no** `output`;
@@ -1621,7 +1623,8 @@ fn tool_denial_evidence(tool_info: &Value) -> bool {
 }
 
 /// Rule 2 of the denial detector, and **the one that actually fires at
-/// 1.1.19** [W1 P2, three independent reproductions]: the drained stderr
+/// 1.1.19** [W1 P2 control and W1 P3 turn 1 — two live reproductions, and only
+/// two; their stderr captures are byte-identical]: the drained stderr
 /// carries the CLI's own auto-denial notice.
 ///
 /// The substrings are taken from the binary's own format string —
