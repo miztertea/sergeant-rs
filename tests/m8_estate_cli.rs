@@ -317,8 +317,11 @@ fn init_written_templates_carry_the_binary_edition() {
 /// guard-map (#165's own acceptance criterion): `sgt run --workflow <name>`
 /// resolves a stock package on a *freshly initialized* estate instead of
 /// 422ing — the exact failure issue #165 describes ("workflow \"research\"
-/// not found (looked in ...)"). This submits against `prototype`, a real
-/// shipped package, through the actual daemon (`support::DataDir`, a real
+/// not found (looked in ...)"). This submits against `investigate` (the
+/// 2026-08-22 distro content rebuild's successor to the `research` package
+/// #165 itself named, and to the `prototype` package this test used
+/// before that rebuild retired it — docs/proposals/distro-content-2026-08-22.md,
+/// W2), a real shipped package, through the actual daemon (`support::DataDir`, a real
 /// spawn) rather than a hand-written fixture workflow, so the assertion is
 /// that resolution — not necessarily full execution — succeeds: any failure
 /// downstream of resolution (capability mismatch, etc.) is a different,
@@ -349,7 +352,7 @@ fn run_workflow_resolves_against_a_freshly_initialized_estate() {
             "--json",
             "run",
             "--workflow",
-            "prototype",
+            "investigate",
             "--backend",
             "fake",
             "--repo",

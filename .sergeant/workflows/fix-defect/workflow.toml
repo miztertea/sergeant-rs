@@ -1,0 +1,27 @@
+# fix-defect — reproduce a defect before touching it, prove the cause,
+# fix it with a regression test, and put the fix through the same review
+# chain a feature change gets (R-S0-12: a fix is code).
+#
+# Authored 2026-08-22 for the distro content rebuild
+# (docs/proposals/distro-content-2026-08-22.md, W2). Derivation and the
+# evidence behind each stage: the design proposal §E.2, §F's stage
+# vocabulary, and the owner rulings recorded there.
+#
+# Eight ordinary actor stages. Stage order here is authoritative; the
+# directory listing under this workflow's own tree MUST agree with it
+# lexically (docs/icm/convention.md §1 rule 4).
+#
+# Descends from the retired `diagnose-bug` (6 stages), which this package
+# supersedes and retires. The kickoff ruling names `fix-defect`,
+# superseding an earlier recommendation to keep the `diagnose-bug` name.
+# First five stages carry `diagnose-bug`'s content over with renumbering
+# (10→00, 20→10, 30→20, 40→30, 50→40); the three new stages
+# (50-panel, 55-refute, 60-re-verify-and-postmortem, folding the old
+# 60-cleanup-and-postmortem's closing checklist and architectural-finding
+# behavior into the postmortem half) are instantiations of the shared
+# panel/refute/re-verify contexts, not fresh authored content.
+
+[workflow]
+name = "fix-defect"
+version = "1"
+stages = ["00-build-feedback-loop", "10-reproduce-and-minimize", "20-hypothesize", "30-instrument", "40-fix-with-regression-test", "50-panel", "55-refute", "60-re-verify-and-postmortem"]

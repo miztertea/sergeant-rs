@@ -37,19 +37,21 @@ never via `sgt run`: there is no admitted-Work input that could carry
    first. Use the project's domain glossary vocabulary throughout, and
    respect any ADRs in the area you're touching.
 2. **Sketch the test seams before drafting the implementation section**,
-   using `@@tdd`'s definition of a seam (the public boundary you test at
-   — never against internals). Prefer an existing seam to a new one, and
-   the highest seam possible. Aim for as few new seams as possible —
-   ideally exactly one. Then confirm with the user, one exchange, that
-   the proposed seams match their expectations, before finalizing the
-   spec. **This is a distinct step from `@@tdd`'s own per-cycle seam
-   confirmation** (ICM-R3 note, resolving a duplication/drift risk the
-   independent reviewer flagged): here, seams are sketched once, at
-   spec-writing time, to shape the Testing Decisions section below;
-   `@@tdd`'s confirmation happens per red-green cycle, later, during
-   actual implementation. The two are related but not the same gate —
-   this skill does not duplicate `@@tdd`'s own content, it names the same
-   underlying concept (a seam) at an earlier point in the process.
+   using `@@test-first`'s definition of a seam (the public boundary you
+   test at — never against internals). Prefer an existing seam to a new
+   one, and the highest seam possible. Aim for as few new seams as
+   possible — ideally exactly one. Then confirm with the user, one
+   exchange, that the proposed seams match their expectations, before
+   finalizing the spec. **This is a distinct step from `@@test-first`'s
+   own per-cycle seam confirmation** (ICM-R3 note, resolving a
+   duplication/drift risk the independent reviewer flagged): here, seams
+   are sketched once, at spec-writing time, to shape the Testing
+   Decisions section below; `@@test-first`'s own confirmation (its
+   "Seams — where tests go" section) happens per red-green cycle, later,
+   during actual implementation. The two are related but not the same
+   gate — this skill does not duplicate `@@test-first`'s own content, it
+   names the same underlying concept (a seam) at an earlier point in the
+   process.
 3. **Write the spec on the template below**, then publish it to the
    project's issue tracker and apply the ready-for-agent triage label.
 
@@ -57,22 +59,23 @@ never via `sgt run`: there is no admitted-Work input that could carry
 in this repository — do not guess.** Two things are true at once here and
 this skill does not pick between them on your behalf:
 
-- The `ready-for-agent` label name comes from this repository's own
-  `triage` workflow, whose `50-apply-outcome` stage requires posting a
-  *structured agent brief comment* to reach that outcome
-  (`.sergeant/workflows/triage/50-apply-outcome/CONTEXT.md`) — not merely
-  applying the label.
+- A ticket handed to an agent carries a structured agent brief comment —
+  not merely a label — so a dispatched agent that later picks it up has
+  what it needs; this repository's own conventions may require that
+  brief before a ticket is considered ready, beyond applying the
+  `ready-for-agent` label alone.
 - This skill's own upstream source only says "apply the label... no need
-  for additional triage," and separately assumes an issue-tracker/label
+  for anything further," and separately assumes an issue-tracker/label
   vocabulary "provided to you" by a setup skill that does not exist in
   this repository (no `matt-pocock-skills` equivalent was ever ported
   here).
 
 If the user hasn't told you which convention applies, ask before applying
-`ready-for-agent`: either post the structured agent brief `triage`
-requires, or get the user's explicit go-ahead to apply the label alone.
-Do not silently pick one — a dispatched agent that later picks up this
-ticket may rely on the agent brief being present.
+`ready-for-agent`: either post the structured agent brief this
+repository's own convention requires, or get the user's explicit
+go-ahead to apply the label alone. Do not silently pick one — a
+dispatched agent that later picks up this ticket may rely on the agent
+brief being present.
 
 <spec-template>
 
@@ -155,8 +158,9 @@ Apply `@@bounded-judgment`.
   expectations, before finalizing the spec — one exchange, not an
   interview about the whole design.
 - Which `ready-for-agent` convention governs (label alone vs. a
-  structured agent brief per the `triage` workflow) whenever that hasn't
-  already been established, before publishing with that label.
+  structured agent brief per this repository's own convention) whenever
+  that hasn't already been established, before publishing with that
+  label.
 
 ### This skill must not do
 - Interview the user about the plan/design itself — synthesize from the

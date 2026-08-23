@@ -288,8 +288,7 @@ output.
 
 Before dispatching Work whose objective names auth, security, secrets,
 payments, databases, migrations, production, destructive, persistent-state,
-or state-transition territory (the same fixed keyword set `dispatch`'s
-`05-classify-risk` stage routes on), Captain composes the intent — via
+or state-transition territory, Captain composes the intent — via
 `sgt run --intent-file <path>` — covering eight dimensions:
 
 - **Objective** — what the Work is actually for.

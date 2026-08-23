@@ -15,8 +15,15 @@
 # the archived provenance for the full fold record). Stage order here is
 # authoritative; the directory listing under this workflow's own tree
 # must agree with it lexically (docs/icm/convention.md §1 rule 4).
+#
+# Reshaped in place at the 2026-08-22 distro content rebuild (W2):
+# 00-check-scope gains the delivery-state declared-content-policy act;
+# 40-drive-gates and 60-close-out reference @@independent-review in
+# place of their scattered restatements of the never-edit rule. Stage
+# list, the route-review-findings correction, and the #123 resolution
+# note are unchanged.
 
 [workflow]
 name = "validate-and-ship"
-version = "2"
+version = "3"
 stages = ["00-check-scope", "10-do-the-work", "20-select-intent-transport", "30-start-run", "40-drive-gates", "50-reconcile-custody", "60-close-out"]
