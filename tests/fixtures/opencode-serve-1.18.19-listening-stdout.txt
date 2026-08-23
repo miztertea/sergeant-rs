@@ -1,0 +1,4 @@
+opencode server listening on http://127.0.0.1:4096
+opencode server listening on http://127.0.0.1:46701
+opencode server listening on http://127.0.0.1:36873
+opencode server listening on http://127.0.0.1:41747

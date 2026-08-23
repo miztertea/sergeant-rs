@@ -1,0 +1,70 @@
+data: {"id":"evt_02eda83d5001NdJE7RFNeZbGRI","type":"server.connected","properties":{}}
+
+data: {"id":"evt_02eda87cc001PHRkHDuxq3H4tF","type":"session.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"ses_fd1257c4bffeB532OiDUFhkSYT","slug":"sunny-knight","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"New session - 2026-08-23T13:41:07.636Z","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787492467636,"updated":1787492468683}}}}
+
+data: {"id":"evt_02eda87cf0015BCqVEXVaT6pnu","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"msg_02eda87cb001AbZ5MIWNCuxVw9","role":"user","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","time":{"created":1787492468683},"agent":"build","model":{"providerID":"opencode","modelID":"big-pickle"}}}}
+
+data: {"id":"evt_02eda87d1001GDNjPtqLzo7wYq","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"type":"text","text":"Use your question tool to ask me: which color do you prefer, red or blue? Do not answer yourself.","messageID":"msg_02eda87cb001AbZ5MIWNCuxVw9","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","id":"prt_02eda87cf001aoqx7XNULzrJbO"},"time":1787492468689}}
+
+data: {"id":"evt_02eda87d30014Z3TWahSH3oU08","type":"session.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"ses_fd1257c4bffeB532OiDUFhkSYT","slug":"sunny-knight","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"New session - 2026-08-23T13:41:07.636Z","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787492467636,"updated":1787492468691}}}}
+
+data: {"id":"evt_02eda87d5001mP3zEjJMddPSL0","type":"session.status","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","status":{"type":"busy"}}}
+
+data: {"id":"evt_02eda87d6001RUbEXcSxSAyoRe","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"msg_02eda87d6001AmTYnwW3E4LIYq","parentID":"msg_02eda87cb001AbZ5MIWNCuxVw9","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/var/tmp/opencode-impl/probe-w3","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"big-pickle","providerID":"opencode","time":{"created":1787492468694},"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT"}}}
+
+data: {"id":"evt_02eda87db00114os0KlMd25x1z","type":"session.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"ses_fd1257c4bffeB532OiDUFhkSYT","slug":"sunny-knight","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"New session - 2026-08-23T13:41:07.636Z","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787492467636,"updated":1787492468699}}}}
+
+data: {"id":"evt_02eda87dd001VSohCKgg33YSoA","type":"session.diff","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","diff":[]}}
+
+data: {"id":"evt_02eda87dd0025RzkJovPWy4LfU","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"role":"user","time":{"created":1787492468683},"agent":"build","model":{"providerID":"opencode","modelID":"big-pickle"},"id":"msg_02eda87cb001AbZ5MIWNCuxVw9","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","summary":{"diffs":[]}}}}
+
+data: {"id":"evt_02eda87e40019LQonrgmdhdF5H","type":"session.status","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","status":{"type":"busy"}}}
+
+data: {"id":"evt_02eda8eee00154fc5ZMx1YLKhW","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02eda8eed0010sIS1ixTVdroTq","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"step-start"},"time":1787492470509}}
+
+data: {"id":"evt_02eda8ef2001ld3nunZPYURS56","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02eda8ef2001TkNOiOhaaanWPs","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"reasoning","text":"","time":{"start":1787492470514}},"time":1787492470514}}
+
+data: {"id":"evt_02eda8ef4001L7lSuwFYTN54j6","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":"The"}}
+
+data: {"id":"evt_02eda8f37001KONO66g2yMHaXn","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" user wants me to use"}}
+
+data: {"id":"evt_02eda8f87001tJhxWGogGUn9u9","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" the question"}}
+
+data: {"id":"evt_02eda8fca001uBMBSYqev0Zd1O","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" tool"}}
+
+data: {"id":"evt_02eda9012001Bcmyyj0tJRvUqE","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" to ask them which"}}
+
+data: {"id":"evt_02eda9083001dddmQ2nCHwjqmu","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" color they prefer:"}}
+
+data: {"id":"evt_02eda90e6001sJcVK46GmIrb20","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" red or blue. I"}}
+
+data: {"id":"evt_02eda90eb001K26VRowVv2V3zm","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" should not"}}
+
+data: {"id":"evt_02eda9151001vPQFgOvc1D272d","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" answer"}}
+
+data: {"id":"evt_02eda918d0015MQJOF8scHvpny","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" myself"}}
+
+data: {"id":"evt_02eda91f30017z6TPz9YfIjTdS","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":","}}
+
+data: {"id":"evt_02eda9239001G8l91KeY9A7g2q","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" just ask"}}
+
+data: {"id":"evt_02eda9287001QLZQhbmYFSeWPJ","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" via"}}
+
+data: {"id":"evt_02eda92c8001GsaB3elczkyztp","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":" the tool"}}
+
+data: {"id":"evt_02eda930f001DiboGkcPyRfGT8","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","partID":"prt_02eda8ef2001TkNOiOhaaanWPs","field":"text","delta":"."}}
+
+data: {"id":"evt_02eda9311001dNuCImfhCwMTAc","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02eda8ef2001TkNOiOhaaanWPs","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"reasoning","text":"The user wants me to use the question tool to ask them which color they prefer: red or blue. I should not answer myself, just ask via the tool.","time":{"start":1787492470514,"end":1787492471569}},"time":1787492471569}}
+
+data: {"id":"evt_02eda9314001u568iaCAUtwATl","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02eda9314001wEAX4692dgKzhA","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"tool","tool":"question","callID":"call_c90579ffc20a4555b7ea3791","state":{"status":"pending","input":{},"raw":""}},"time":1787492471572}}
+
+data: {"id":"evt_02eda97b4002P6TigYyK0qv1m6","type":"question.asked","properties":{"id":"que_02eda97b4001CDLw7qNF1En0mS","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","questions":[{"question":"Which color do you prefer?","header":"Color preference","options":[{"label":"Red","description":"You prefer the color red"},{"label":"Blue","description":"You prefer the color blue"}]}],"tool":{"messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","callID":"call_c90579ffc20a4555b7ea3791"}}}
+
+data: {"id":"evt_02eda97b6001Y77cePAfE5lYNv","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"type":"tool","tool":"question","callID":"call_c90579ffc20a4555b7ea3791","state":{"status":"running","input":{"questions":[{"question":"Which color do you prefer?","header":"Color preference","options":[{"label":"Red","description":"You prefer the color red"},{"label":"Blue","description":"You prefer the color blue"}]}]},"time":{"start":1787492472758}},"id":"prt_02eda9314001wEAX4692dgKzhA","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq"},"time":1787492472758}}
+
+data: {"id":"evt_02eda9f03001Xdou44fXsuNiqL","type":"session.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"ses_fd1257c4bffeB532OiDUFhkSYT","slug":"sunny-knight","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"Red vs blue color preference question","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787492467636,"updated":1787492468699}}}}
+
+data: {"id":"evt_02edaaae60017TFyxJv6rF4r1D","type":"server.heartbeat","properties":{}}
+
+data: {"id":"evt_02edad1f7001YkO8DvVS4L4kzw","type":"server.heartbeat","properties":{}}
+

@@ -1,0 +1,24 @@
+data: {"id":"evt_02ed856a90011qr5u9SSiIrj3P","type":"server.connected","properties":{}}
+
+data: {"id":"evt_02ed85a9b001u4gMNLzq6aOMs2","type":"permission.replied","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","requestID":"per_02ed82031001Dh50tEZ9TtmBws","reply":"reject"}}
+
+data: {"id":"evt_02ed85a9f0012A7GXF6ToyrtMy","type":"message.part.updated","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","part":{"type":"tool","tool":"bash","callID":"call_a3d254bb56d24e739a995757","state":{"status":"error","input":{"command":"echo probe-reject-99"},"error":"The user rejected permission to use this specific tool call.","time":{"start":1787492311090,"end":1787492326047}},"id":"prt_02ed81f6d0014HDE9dHIe3Qg2Y","sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","messageID":"msg_02ed80a3e001BxyeTgpFB7qYj5"},"time":1787492326047}}
+
+data: {"id":"evt_02ed85aa10010cJmGtdSSAvlpU","type":"message.part.updated","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","part":{"id":"prt_02ed85aa1001pmE0ifboScP3ko","reason":"tool-calls","messageID":"msg_02ed80a3e001BxyeTgpFB7qYj5","sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","type":"step-finish","tokens":{"total":8111,"input":404,"output":24,"reasoning":3,"cache":{"write":0,"read":7680}},"cost":0},"time":1787492326049}}
+
+data: {"id":"evt_02ed85aa40012n2BFJ0tr5hG93","type":"message.updated","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","info":{"id":"msg_02ed80a3e001BxyeTgpFB7qYj5","parentID":"msg_02ed80a32001Nwi9gqJAvzzexM","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/var/tmp/opencode-impl/probe-w3","root":"/"},"cost":0,"tokens":{"total":8111,"input":404,"output":24,"reasoning":3,"cache":{"write":0,"read":7680}},"modelID":"big-pickle","providerID":"opencode","time":{"created":1787492305470,"completed":1787492326054},"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","finish":"tool-calls"}}}
+
+data: {"id":"evt_02ed85aa60015GBmw7b1CZez6v","type":"message.updated","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","info":{"id":"msg_02ed80a3e001BxyeTgpFB7qYj5","parentID":"msg_02ed80a32001Nwi9gqJAvzzexM","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/var/tmp/opencode-impl/probe-w3","root":"/"},"cost":0,"tokens":{"total":8111,"input":404,"output":24,"reasoning":3,"cache":{"write":0,"read":7680}},"modelID":"big-pickle","providerID":"opencode","time":{"created":1787492305470,"completed":1787492326054},"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","finish":"tool-calls"}}}
+
+data: {"id":"evt_02ed85aa70013xtxUhvicuRfN2","type":"session.status","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","status":{"type":"idle"}}}
+
+data: {"id":"evt_02ed85aa7002HyDuqipwcYiSeT","type":"session.idle","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8"}}
+
+data: {"id":"evt_02ed85aa8001U1pARzicn9QU1C","type":"session.updated","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","info":{"id":"ses_fd127f9f1ffed01Ip04AycNpz8","slug":"kind-squid","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"Running echo probe-reject-99 command","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":404,"output":24,"reasoning":3,"cache":{"read":7680,"write":0}},"time":{"created":1787492304398,"updated":1787492326056}}}}
+
+data: {"id":"evt_02ed85aa9001Zs9TlWZbVbwnPY","type":"session.diff","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","diff":[]}}
+
+data: {"id":"evt_02ed85aaa001u0B3GDNUKfYSXS","type":"message.updated","properties":{"sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8","info":{"role":"user","time":{"created":1787492305458},"agent":"build","model":{"providerID":"opencode","modelID":"big-pickle"},"summary":{"diffs":[]},"id":"msg_02ed80a32001Nwi9gqJAvzzexM","sessionID":"ses_fd127f9f1ffed01Ip04AycNpz8"}}}
+
+data: {"id":"evt_02ed87dc90013aUkuME4j16vVZ","type":"server.heartbeat","properties":{}}
+

@@ -46,10 +46,11 @@ use tempfile::TempDir;
 
 use sergeant_rs::backend::opencode::{
     OPENCODE_BACKEND_NAME, OPENCODE_CONFIG_CONTENT_ENV, OpencodeBackend, OpencodeConfig,
+    ServeBudgets, TransportChoice,
 };
 use sergeant_rs::backend::{
-    Backend, BackendError, BackendSignal, BindingSummary, ExecutionHandle, NativeState,
-    ProbeReport, ResumeRequest, StartRequest,
+    AskAuthor, Backend, BackendError, BackendSignal, BindingSummary, ExecutionHandle, NativeState,
+    Observation, ProbeReport, ResumeRequest, StartRequest,
 };
 use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::estate::InstructionPolicy;
@@ -400,6 +401,15 @@ fn config_for(stub: &StubOpencode, data_dir: &Path) -> OpencodeConfig {
     // thirty. Per-instance, never an environment variable, so one test's
     // budget can never leak into another's.
     config.session_id_budget = Some(Duration::from_secs(5));
+    // W3: `StubOpencode` answers the run-json probe grammar only -- it does
+    // not implement an HTTP+SSE `serve` server. Left at `Auto`, every one of
+    // W1's own tests would additionally pay `Auto`'s serve gate against a
+    // stub that cannot answer it (harmlessly falling back to run-json, but
+    // spawning an extra `<stub> serve --help`/probe-child per probe() call
+    // for no reason this suite's own tests are about). Pinned `RunOnly` so
+    // this whole tier stays exactly what it was before this wave; W3's own
+    // serve-transport tests build their own config.
+    config.transport = TransportChoice::RunOnly;
     config
 }
 
@@ -465,14 +475,48 @@ fn wait_for_settled(
     backend: &OpencodeBackend,
     handle: &ExecutionHandle,
 ) -> sergeant_rs::backend::Observation {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    wait_for_settled_within(backend, handle, Duration::from_secs(30))
+}
+
+/// W3: a wider-deadline variant for live serve tests, where a turn's own
+/// resolution latency after an abort has no measured upper bound yet on
+/// this transport (recorded as a live-observed follow-up, not papered over
+/// with an arbitrarily large default for every other caller).
+fn wait_for_settled_within(
+    backend: &OpencodeBackend,
+    handle: &ExecutionHandle,
+    budget: Duration,
+) -> sergeant_rs::backend::Observation {
+    let deadline = Instant::now() + budget;
     loop {
         let observation = backend.observe(handle).expect("observe");
         if observation.native != NativeState::Running {
             return observation;
         }
-        assert!(Instant::now() < deadline, "turn never settled");
+        assert!(
+            Instant::now() < deadline,
+            "turn never settled within {budget:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// W3: poll until the stage parks on a `NeedsInput` signal (§7.1/§7.2) —
+/// distinct from `wait_for_settled`, which waits for `native != Running`
+/// and would never return for a parked serve gate, since the native context
+/// is still genuinely running while parked.
+fn wait_for_needs_input(backend: &OpencodeBackend, handle: &ExecutionHandle) -> Observation {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let observation = backend.observe(handle).expect("observe");
+        if matches!(observation.signal, BackendSignal::NeedsInput { .. }) {
+            return observation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stage never parked on NeedsInput: {observation:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -1709,8 +1753,29 @@ fn live_gate(opt_in: Option<&str>, probe: &ProbeReport) -> LiveGate {
 /// Live config: the system `opencode` (or `SGT_OPENCODE_BIN`), and a scratch
 /// data dir under `/var/tmp` — never `/tmp`, a quota'd tmpfs on this host
 /// (issue #70).
+///
+/// W3: pinned `RunOnly`, deliberately, so every pre-existing live test in
+/// this file keeps exercising exactly the transport its own name and
+/// assertions were written against (`live_opencode_resume_recalls_a_nonce_
+/// across_processes` names `opencode export`'s own re-adoption evidence,
+/// for instance) — `Auto` would silently move every one of them onto the
+/// serve transport this wave adds, the moment the installed CLI's serve
+/// gate passes, which is exactly the "downgrade nobody can see" shape this
+/// wave's own §8 forbids in the other direction. `live_serve_config` below
+/// is the dedicated `ServeOnly` config for this wave's own live tests.
 fn live_config(data_dir: &Path) -> OpencodeConfig {
-    OpencodeConfig::new(data_dir)
+    let mut config = OpencodeConfig::new(data_dir);
+    config.transport = TransportChoice::RunOnly;
+    config
+}
+
+/// W3's own live config: `ServeOnly`, so a serve-gate failure is a clean,
+/// loud `probe().available == false` rather than a silent fall-back onto
+/// the transport these tests are not about (§2.1 rule 2).
+fn live_serve_config(data_dir: &Path) -> OpencodeConfig {
+    let mut config = OpencodeConfig::new(data_dir);
+    config.transport = TransportChoice::ServeOnly;
+    config
 }
 
 /// Whether the opt-in live tests may run. Reaching this with the opt-in
@@ -1719,7 +1784,18 @@ fn live_config(data_dir: &Path) -> OpencodeConfig {
 /// harness is a clean skip, written straight to fd 2 (libtest only captures
 /// the print macros).
 fn opencode_live_enabled(test: &str, data_dir: &Path) -> bool {
-    let config = live_config(data_dir);
+    opencode_live_enabled_with(test, live_config(data_dir))
+}
+
+/// W3: the same gate, against the serve transport specifically (§2.1's
+/// `ServeOnly`) — a serve-gate failure on the installed CLI is a clean skip
+/// here, not a silent run-json substitution that would make the test's own
+/// name a lie about what it exercised.
+fn opencode_serve_live_enabled(test: &str, data_dir: &Path) -> bool {
+    opencode_live_enabled_with(test, live_serve_config(data_dir))
+}
+
+fn opencode_live_enabled_with(test: &str, config: OpencodeConfig) -> bool {
     let probe = OpencodeBackend::new(config).probe();
     match live_gate(
         std::env::var("SERGEANT_OPENCODE_TESTS").ok().as_deref(),
@@ -1757,6 +1833,665 @@ fn live_request(cwd: &Path, intent: &str) -> StartRequest {
     request.intent = intent.to_string();
     request.context = String::new();
     request
+}
+
+// ------------------------------------------------ W3: StubServe (§11.1's
+// deterministic tier for the serve transport)
+
+/// A minimal, real `opencode serve` stand-in — `tests/fixtures/stub_serve.py`,
+/// stdlib-only Python, driven entirely by a JSON "plan" file this struct
+/// writes per test. Answers the version/help probe grammar exactly like
+/// `StubOpencode` does for run-json, and additionally implements the HTTP+SSE
+/// surface `opencode_serve.rs` actually calls: basic auth (username
+/// `opencode`, C6), `/doc`, `/event` (SSE), `POST /session`, `POST
+/// /session/{id}/message`, `GET /session/{id}/message`, `POST
+/// /session/{id}/abort`, `POST /session/{id}/permissions/{id}`, `POST
+/// /question/{id}/reply`, and `export <id>` (for RESUME's re-adoption path).
+/// Real HTTP over a real socket — no mock/fake at the `reqwest` layer, so
+/// this exercises the adapter's actual client code, not a stand-in for it.
+struct StubServe {
+    path: PathBuf,
+    plan_path: PathBuf,
+    env_dump_path: PathBuf,
+    /// The last `POST .../message` request body the stub received, dumped
+    /// verbatim to this path when `SGT_STUBSERVE_REQUEST_DUMP` names it —
+    /// what `a_serve_turn_with_no_model_omits_the_model_key_entirely` and the
+    /// admission tests below read back to assert on the wire shape, not just
+    /// the response.
+    request_dump_path: PathBuf,
+    /// The stub's own OS pid, self-reported at startup — what
+    /// `serve_stub_panicking_mid_turn_still_lets_the_child_die` reads to
+    /// check the real process table, not merely a panic message string.
+    pid_dump_path: PathBuf,
+}
+
+impl StubServe {
+    fn new(dir: &Path, plan: &Value) -> Self {
+        let path = PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/stub_serve.py"
+        ));
+        let plan_path = dir.join("stubserve-plan.json");
+        std::fs::write(&plan_path, serde_json::to_vec(plan).expect("plan json"))
+            .expect("write plan");
+        let env_dump_path = dir.join("stubserve-env-dump.json");
+        let request_dump_path = dir.join("stubserve-request-dump.json");
+        let pid_dump_path = dir.join("stubserve-pid-dump.txt");
+        Self {
+            path,
+            plan_path,
+            env_dump_path,
+            request_dump_path,
+            pid_dump_path,
+        }
+    }
+}
+
+fn serve_config_for(stub: &StubServe, data_dir: &Path) -> OpencodeConfig {
+    let mut config = OpencodeConfig::new(data_dir);
+    config.executable = stub.path.clone();
+    config.transport = TransportChoice::ServeOnly;
+    config.serve_budgets = Some(ServeBudgets {
+        readiness: Duration::from_secs(10),
+        abort: Duration::from_secs(5),
+        turn: Duration::from_secs(10),
+    });
+    config.env.insert(
+        "SGT_STUBSERVE_PLAN".to_string(),
+        stub.plan_path.display().to_string(),
+    );
+    config.env.insert(
+        "SGT_STUBSERVE_ENV_DUMP".to_string(),
+        stub.env_dump_path.display().to_string(),
+    );
+    config.env.insert(
+        "SGT_STUBSERVE_REQUEST_DUMP".to_string(),
+        stub.request_dump_path.display().to_string(),
+    );
+    config.env.insert(
+        "SGT_STUBSERVE_PID_DUMP".to_string(),
+        stub.pid_dump_path.display().to_string(),
+    );
+    config
+}
+
+/// Process-table liveness check for a pid this test learned from the stub's
+/// own self-reported [`StubServe::pid_dump_path`] — the same evidence a
+/// manual `pgrep -ax opencode` gate-tail check uses, just automated and
+/// bounded instead of run by hand outside the suite.
+///
+/// Reads `ps`'s own STAT column rather than `kill -0`: a `SIGKILL`ed child
+/// this test's process never calls `waitpid` on (`ServeChild::drop`'s own
+/// "best-effort... never wait" posture, so `Drop` itself never blocks) stays
+/// in the process table as a zombie (`Z`) until its parent reaps it or exits
+/// -- and `kill(pid, 0)` reports a zombie's still-allocated pid as success,
+/// which would make this check "still alive" forever regardless of whether
+/// the leak fix works at all. A zombie is dead work, just not yet reaped;
+/// only a non-`Z` state is a genuine leak.
+fn pid_is_alive(pid: u32) -> bool {
+    let output = match std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false, // ps found nothing: the pid is gone entirely
+    };
+    let stat = String::from_utf8_lossy(&output.stdout);
+    let stat = stat.trim();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+/// Polls [`pid_is_alive`] until it reports the pid gone, or panics naming the
+/// still-alive pid once `budget` elapses.
+fn wait_for_pid_death(pid: u32, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    loop {
+        if !pid_is_alive(pid) {
+            return;
+        }
+        if Instant::now() >= deadline {
+            panic!("pid {pid} is still alive in the process table after {budget:?}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The plan for `serve_stub_end_to_end_launch_turn_interrupt_history_and_
+/// readopt_withdrawal`: one ordinary completed turn (whose `sse_frames`
+/// carry the measured sync-turn shape's own `step-finish`/`text` parts, so
+/// `usage.updated` and `conversation.assistant.completed` both come from the
+/// real decoder, not from the POST response alone), an `export` entry
+/// naming the same session (RESUME's own re-adoption evidence), and an
+/// `abort_response` for the interrupt half.
+fn end_to_end_plan(session_id: &str) -> Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "turns": [{
+            "response": {
+                "info": {
+                    "role": "assistant",
+                    "finish": "stop", "modelID": "big-pickle", "providerID": "opencode",
+                    "tokens": {"total": 10, "input": 8, "output": 2, "reasoning": 0,
+                               "cache": {"read": 0, "write": 0}},
+                    "cost": 0.0,
+                },
+                "parts": [],
+            },
+            "sse_frames": [
+                {"type": "message.updated", "properties": {"sessionID": session_id,
+                    "info": {"id": "msg_user1", "role": "user"}}},
+                {"type": "message.updated", "properties": {"sessionID": session_id,
+                    "info": {"id": "msg_asst1", "role": "assistant"}}},
+                {"type": "message.part.updated", "properties": {"sessionID": session_id,
+                    "part": {"type": "step-start", "id": "prt_1", "messageID": "msg_asst1"}}},
+                {"type": "message.part.updated", "properties": {"sessionID": session_id,
+                    "part": {"type": "text", "text": "pong", "messageID": "msg_asst1",
+                              "id": "prt_2", "time": {"start": 1, "end": 2}}}},
+                {"type": "message.part.updated", "properties": {"sessionID": session_id,
+                    "part": {"reason": "stop", "type": "step-finish",
+                              "tokens": {"total": 10, "input": 8, "output": 2, "reasoning": 0,
+                                         "cache": {"read": 0, "write": 0}},
+                              "cost": 0.0, "id": "prt_3", "messageID": "msg_asst1"}}},
+            ],
+        }],
+        "abort_response": true,
+        "abort_sse_frames": [
+            {"type": "session.error", "properties": {"sessionID": session_id,
+                "error": {"name": "MessageAbortedError", "data": {"message": "Aborted"}}}},
+        ],
+        // GET /session/{id}/message (§7.4's `messages()` shim): a bare
+        // array of {info, parts}, matching the same conversation the SSE
+        // frames above narrated.
+        "messages_response": [
+            {"info": {"id": "msg_user1", "role": "user"}, "parts": []},
+            {"info": {"id": "msg_asst1", "role": "assistant", "finish": "stop",
+                      "modelID": "big-pickle", "providerID": "opencode"},
+             "parts": [{"type": "text", "text": "pong", "id": "prt_2"}]},
+        ],
+        "exports": {
+            session_id: {"info": {"id": session_id}, "messages": []},
+        },
+    })
+}
+
+/// §11.1's serve-transport deterministic tier, combined into one test
+/// (recorded scope reduction, see the wave's own PR body): launch (session
+/// minted before any turn, §3.6), a turn narrated live over SSE and decoded
+/// through the one shared decoder (streaming + usage), OBSERVE settling on
+/// the POST response's own terminal, HISTORY via the `messages()` shim, and
+/// RESUME's transport-withdrawal journal on a backend whose config resolves
+/// to `Serve`. All against a real socket (`StubServe`), never a mock at the
+/// `reqwest` layer.
+///
+/// One integration test standing in for several of §11.1's planned smaller
+/// ones, a scoping deviation from the spec recorded in the wave PR body under
+/// "what shipped vs fell back" — but each `Transport::Serve` row in
+/// `ADMISSION_ROWS` that touches a claim exercised here (`persistent_sessions`,
+/// `streaming`, `usage`, `resume`) still names its OWN small, focused test
+/// below (`serve_launch_binds_the_session_created_before_any_turn`,
+/// `serve_events_are_delivered_through_the_sse_bus_before_the_turn_settles`,
+/// `serve_step_finish_tokens_and_cost_become_usage_events`,
+/// `a_readopted_serve_execution_withdraws_the_transport`) as its
+/// `admission_test`, so `cargo test <admission_test>` reproduces exactly the
+/// evidence a reader of the ledger would expect, not a shared integration
+/// test under a different name. This test remains the broader end-to-end
+/// proof the individual ones do not attempt to replace.
+#[test]
+fn serve_stub_end_to_end_launch_turn_interrupt_history_and_readopt_withdrawal() {
+    let data_dir = TempDir::new().expect("tempdir");
+    let session_id = "ses_stub1";
+    let stub = StubServe::new(data_dir.path(), &end_to_end_plan(session_id));
+    let backend = OpencodeBackend::new(serve_config_for(&stub, data_dir.path()));
+    let report = backend.probe();
+    assert!(
+        report.available,
+        "the serve gate must pass against a working StubServe: {:?}",
+        report.detail
+    );
+    let detail = report.detail.clone().unwrap_or_default();
+    assert!(detail.contains("transport: serve-http"), "{detail}");
+
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("opencode/big-pickle".to_string());
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    assert_eq!(
+        handle.native_id.as_deref(),
+        Some(session_id),
+        "§3.6: the session id is minted by POST /session, synchronously, before any turn"
+    );
+
+    // Streaming: the assistant text arrives as its own event before the
+    // turn settles (the SSE reader thread narrates live, independent of the
+    // turn-driving thread's POST call).
+    let _assistant = wait_for_kind(&events, "conversation.assistant.completed");
+    let usage = wait_for_kind(&events, "usage.updated");
+    assert_eq!(usage.payload["tokens"]["total"], 10);
+
+    let observation = wait_for_settled(&backend, &handle);
+    assert_eq!(observation.native, NativeState::Exited);
+    assert!(
+        matches!(observation.signal, BackendSignal::StageCompleted { .. }),
+        "{observation:?}"
+    );
+    let ended = wait_for_kind(&events, "conversation.turn.ended").payload;
+    assert_eq!(ended["transport"], "serve-http");
+    assert_eq!(ended["model_pin"]["verdict"], "honored");
+
+    // History via the messages() shim.
+    let history = backend.history(&handle).expect("history");
+    assert!(
+        history
+            .iter()
+            .any(|e| e.kind == "conversation.assistant.completed" && e.payload["text"] == "pong"),
+        "{history:?}"
+    );
+
+    // Interrupt with no turn in flight is a no-op (the goal state already
+    // holds) -- proves the dispatch reaches `interrupt_serve` without
+    // erroring on an idle session.
+    backend.interrupt(&handle).expect("interrupt no-op").wait();
+
+    // Config/profile propagation reached the actual serve child (§7.7's
+    // config_injection/profiles rows).
+    let env_dump: Value = serde_json::from_str(
+        &std::fs::read_to_string(&stub.env_dump_path).expect("env dump written at serve startup"),
+    )
+    .expect("env dump is JSON");
+    assert!(
+        env_dump.get("SGT_STUBSERVE_PLAN").is_some(),
+        "the serve child's own env carries what OpencodeConfig::env put there"
+    );
+
+    // RESUME on a backend whose config resolves to Serve is a declared
+    // withdrawal (§8.3), never a silent one: re-adoption always lands on
+    // run-json (`opencode export`, here the stub's own `export` subcommand),
+    // and the withdrawal is journaled by name.
+    let (sink2_fn, events2) = sink();
+    backend.set_event_sink(sink2_fn);
+    let resume_handle = ExecutionHandle {
+        execution_id: "readopted-exec".to_string(),
+        native_id: Some(session_id.to_string()),
+    };
+    let resume_request = ResumeRequest::new("w-readopt", data_dir.path());
+    backend
+        .resume(&resume_handle, &resume_request)
+        .expect("resume against a session `export` answers for");
+    let withdrawal = wait_for_kind(&events2, "conversation.turn.harness_error");
+    assert_eq!(
+        withdrawal.payload["phase"],
+        "transport_withdrawn_on_readopt"
+    );
+    assert_eq!(withdrawal.payload["from"], "serve-http");
+    assert_eq!(withdrawal.payload["to"], "run-json");
+    assert!(
+        withdrawal.payload["withdrawn"]
+            .as_array()
+            .expect("withdrawn is an array")
+            .iter()
+            .any(|v| v == "approval_flow"),
+        "{withdrawal:?}"
+    );
+
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// The `admission_test` for `persistent_sessions`/`Transport::Serve`: `POST
+/// /session` mints the session id, and it is on the returned
+/// `ExecutionHandle` **before** the LAUNCH turn itself has produced any
+/// event, let alone settled -- unlike the run transport, where the id only
+/// becomes known once the process writes its first event line (§3.6).
+#[test]
+fn serve_launch_binds_the_session_created_before_any_turn() {
+    let data_dir = TempDir::new().expect("tempdir");
+    let session_id = "ses_bind_before_turn";
+    let stub = StubServe::new(data_dir.path(), &end_to_end_plan(session_id));
+    let backend = OpencodeBackend::new(serve_config_for(&stub, data_dir.path()));
+    let mut request = start_request(data_dir.path());
+    request.model = Some("opencode/big-pickle".to_string());
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    assert_eq!(
+        handle.native_id.as_deref(),
+        Some(session_id),
+        "the id is bound synchronously by POST /session, not learned from a turn event"
+    );
+    // Not a race against nothing: assert it holds even though this turn has
+    // not settled yet (it may not even have produced its first event yet).
+    let observation = backend.observe(&handle).expect("observe");
+    assert_ne!(
+        observation.native,
+        NativeState::Exited,
+        "the turn this session id was bound before has not necessarily settled yet"
+    );
+    wait_for_settled(&backend, &handle);
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// The `admission_test` for `streaming`/`Transport::Serve`: the SSE reader
+/// thread (persistent for the execution) delivers a turn's narration events
+/// as they arrive, independent of the synchronous `POST
+/// /session/{id}/message` the turn-driving thread is blocked on -- proven the
+/// same way run-json's own streaming admission test proves it (a deliberate
+/// stall), not merely by call order.
+#[test]
+fn serve_events_are_delivered_through_the_sse_bus_before_the_turn_settles() {
+    let data_dir = TempDir::new().expect("tempdir");
+    let session_id = "ses_stream_before_settle";
+    let mut plan = end_to_end_plan(session_id);
+    // The stub pushes this turn's SSE frames onto the `/event` queue and
+    // THEN sleeps before answering the POST -- so the assistant text event
+    // is observably delivered while the POST (and therefore the turn) is
+    // still in flight, not merely likely to be.
+    plan["turns"][0]["respond_after_seconds"] = serde_json::json!(1.5);
+    let stub = StubServe::new(data_dir.path(), &plan);
+    let backend = OpencodeBackend::new(serve_config_for(&stub, data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("opencode/big-pickle".to_string());
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    let assistant = wait_for_kind(&events, "conversation.assistant.completed");
+    assert_eq!(assistant.payload["text"], "pong");
+    let observation = backend.observe(&handle).expect("observe");
+    assert!(
+        matches!(observation.signal, BackendSignal::Running),
+        "the assistant event above arrived while the POST (the turn) was still sleeping, \
+         un-returned: {observation:?}"
+    );
+    assert!(
+        events_of_kind(&events, "conversation.turn.ended").is_empty(),
+        "the turn has not ended yet"
+    );
+    wait_for_settled(&backend, &handle);
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// The `admission_test` for `usage`/`Transport::Serve`: one `usage.updated`
+/// per `step_finish` SSE part, carrying that step's native token object and
+/// cost verbatim -- the same decoder run-json's own `usage` row cites, driven
+/// here over the serve transport's SSE bus instead of NDJSON.
+#[test]
+fn serve_step_finish_tokens_and_cost_become_usage_events() {
+    let data_dir = TempDir::new().expect("tempdir");
+    let session_id = "ses_usage";
+    let stub = StubServe::new(data_dir.path(), &end_to_end_plan(session_id));
+    let backend = OpencodeBackend::new(serve_config_for(&stub, data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("opencode/big-pickle".to_string());
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    wait_for_settled(&backend, &handle);
+    wait_for_kind(&events, "conversation.turn.ended");
+    let usage = events_of_kind(&events, "usage.updated");
+    assert_eq!(
+        usage.len(),
+        1,
+        "one usage.updated for this plan's one step-finish part"
+    );
+    assert_eq!(usage[0].payload["tokens"]["total"], 10);
+    assert_eq!(usage[0].payload["tokens"]["input"], 8);
+    assert_eq!(usage[0].payload["tokens"]["output"], 2);
+    assert_eq!(usage[0].payload["cost"], 0.0);
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// The `admission_test` for `resume`/`Transport::Serve`: RESUME on a backend
+/// whose config resolves to `Serve` is a declared, journaled withdrawal
+/// (§8.3) onto run-json's own re-adoption path, never a silent downgrade.
+#[test]
+fn a_readopted_serve_execution_withdraws_the_transport() {
+    let data_dir = TempDir::new().expect("tempdir");
+    let session_id = "ses_readopt";
+    let stub = StubServe::new(data_dir.path(), &end_to_end_plan(session_id));
+    let backend = OpencodeBackend::new(serve_config_for(&stub, data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let resume_handle = ExecutionHandle {
+        execution_id: "readopted-exec".to_string(),
+        native_id: Some(session_id.to_string()),
+    };
+    let resume_request = ResumeRequest::new("w-readopt", data_dir.path());
+    backend
+        .resume(&resume_handle, &resume_request)
+        .expect("resume against a session `export` answers for");
+    let withdrawal = wait_for_kind(&events, "conversation.turn.harness_error");
+    assert_eq!(
+        withdrawal.payload["phase"],
+        "transport_withdrawn_on_readopt"
+    );
+    assert_eq!(withdrawal.payload["from"], "serve-http");
+    assert_eq!(withdrawal.payload["to"], "run-json");
+    let withdrawn = withdrawal.payload["withdrawn"]
+        .as_array()
+        .expect("withdrawn is an array");
+    for expected in ["approval_flow", "ask"] {
+        assert!(
+            withdrawn.iter().any(|v| v == expected),
+            "{expected} should be named as withdrawn: {withdrawal:?}"
+        );
+    }
+}
+
+/// The `admission_test` for `profiles`/`Transport::Serve`: a launch profile's
+/// `executable` and `env` reach the serve child at spawn (§3.2), the same two
+/// generic sergeant axes run-json's own `a_profile_executable_and_env_reach_
+/// every_turn` proves there.
+#[test]
+fn a_profile_executable_and_env_reach_the_serve_child() {
+    let data_dir = TempDir::new().expect("tempdir");
+    // Two stubs, each in its OWN subdirectory (so their plan/env-dump/
+    // request-dump paths never collide, which a shared directory would
+    // silently make this test pass for the wrong reason) and each minting a
+    // DIFFERENT session id -- the unambiguous proof that the profile's
+    // executable, not the backend's default, served this launch.
+    let default_dir = data_dir.path().join("default");
+    let profile_dir = data_dir.path().join("profile");
+    std::fs::create_dir_all(&default_dir).expect("default dir");
+    std::fs::create_dir_all(&profile_dir).expect("profile dir");
+    let default_stub = StubServe::new(&default_dir, &end_to_end_plan("ses_default_unused"));
+    let profile_stub = StubServe::new(&profile_dir, &end_to_end_plan("ses_profile_used"));
+    let backend = OpencodeBackend::new(serve_config_for(&default_stub, data_dir.path()));
+    let mut request = start_request(data_dir.path());
+    request.model = Some("opencode/big-pickle".to_string());
+    let mut launch_profile = profile("serve-profiled");
+    launch_profile.executable = Some(profile_stub.path.clone());
+    // The profile's own env both carries the marker this test checks for AND
+    // re-points the stub-wiring variables at the PROFILE stub's own plan/
+    // dump paths -- otherwise they would stay inherited from the backend's
+    // base config (pointed at the default stub), and whichever binary
+    // actually ran would read/write the wrong stub's files regardless of
+    // which executable it was.
+    launch_profile
+        .env
+        .insert("SGT_SERVE_PROFILE_MARKER".to_string(), "w3".to_string());
+    launch_profile.env.insert(
+        "SGT_STUBSERVE_PLAN".to_string(),
+        profile_stub.plan_path.display().to_string(),
+    );
+    launch_profile.env.insert(
+        "SGT_STUBSERVE_ENV_DUMP".to_string(),
+        profile_stub.env_dump_path.display().to_string(),
+    );
+    request.profile = Some(launch_profile);
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    assert_eq!(
+        handle.native_id.as_deref(),
+        Some("ses_profile_used"),
+        "the session id came from the PROFILE stub's own POST /session, proving its executable \
+         (not the backend's default) actually served this launch"
+    );
+    wait_for_settled(&backend, &handle);
+
+    let env_dump: Value = serde_json::from_str(
+        &std::fs::read_to_string(&profile_stub.env_dump_path)
+            .expect("the PROFILE's stub started and dumped its env, proving its executable ran"),
+    )
+    .expect("env dump is JSON");
+    assert_eq!(
+        env_dump
+            .get("SGT_SERVE_PROFILE_MARKER")
+            .and_then(Value::as_str),
+        Some("w3"),
+        "the profile's own env reached the serve child's actual environment"
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// The `admission_test` for `config_injection`/`Transport::Serve`: unlike W1's
+/// row (which only measures `OPENCODE_CONFIG_CONTENT` reaching `run`'s
+/// process), this measures the SAME environment variable reaching the SERVE
+/// CHILD specifically -- the exact upgrade this row's own note claims, using
+/// the real probe-9 config-with-`ask` document as its content, not a
+/// synthesized string.
+#[test]
+fn config_content_reaches_the_serve_child_too() {
+    const CONFIG_WITH_ASK: &str =
+        include_str!("fixtures/opencode-serve-1.18.19-config-with-ask.json");
+    let data_dir = TempDir::new().expect("tempdir");
+    let session_id = "ses_config_injection";
+    let stub = StubServe::new(data_dir.path(), &end_to_end_plan(session_id));
+    let mut config = serve_config_for(&stub, data_dir.path());
+    config.config_content = Some(CONFIG_WITH_ASK.to_string());
+    let backend = OpencodeBackend::new(config);
+    let mut request = start_request(data_dir.path());
+    request.model = Some("opencode/big-pickle".to_string());
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    wait_for_settled(&backend, &handle);
+
+    let env_dump: Value = serde_json::from_str(
+        &std::fs::read_to_string(&stub.env_dump_path).expect("env dump written at serve startup"),
+    )
+    .expect("env dump is JSON");
+    assert_eq!(
+        env_dump
+            .get(OPENCODE_CONFIG_CONTENT_ENV)
+            .and_then(Value::as_str),
+        Some(CONFIG_WITH_ASK),
+        "the whole config document reached the serve child's own environment, verbatim"
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// [confirmed finding 4] A `None` model must not become a `POST
+/// /session/{id}/message` body with `"model":{"modelID":null}` -- the pinned
+/// OpenAPI fixture's `model` schema is `required:["providerID","modelID"]`
+/// with `modelID` a non-nullable string. Mirrors run-json's own omission
+/// (`first_turn_argv` drops `-m` entirely for `model: None`): the fix is to
+/// omit the `model` key from the body altogether, letting the server fall
+/// back to its own configured default, exactly like the run transport does.
+#[test]
+fn a_serve_turn_with_no_model_omits_the_model_key_entirely() {
+    let data_dir = TempDir::new().expect("tempdir");
+    let session_id = "ses_no_model";
+    let stub = StubServe::new(data_dir.path(), &end_to_end_plan(session_id));
+    let backend = OpencodeBackend::new(serve_config_for(&stub, data_dir.path()));
+    let mut request = start_request(data_dir.path());
+    request.model = None;
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    wait_for_settled(&backend, &handle);
+
+    let sent: Value = serde_json::from_str(
+        &std::fs::read_to_string(&stub.request_dump_path)
+            .expect("the stub dumped the POST /session/.../message body it received"),
+    )
+    .expect("request dump is JSON");
+    assert!(
+        sent.get("model").is_none(),
+        "no model was requested, so the body must omit the key entirely (never {{\"modelID\": \
+         null}}), which is what would have violated the pinned OpenAPI schema: {sent}"
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// A process-leak regression guard, not a spec-named test: proves the fix
+/// for a real bug found while writing this wave's own tests. The first cut
+/// of the SSE reader thread held a **strong** `Arc<ServeRuntime>` in the
+/// cell it uses to find the runtime once `POST /session` mints it — which
+/// meant the reader thread itself kept the serve child alive forever,
+/// because it is the thing blocked reading that child's own socket, and it
+/// never observed the process die on its own. A test that panics mid-turn
+/// (dropping `backend` during unwind, never reaching `stop()`) is exactly
+/// the shape that exposed it: the child leaked past any wait, every run.
+/// The fix is `Weak`, not `Arc`, in that cell (`src/backend/opencode.rs`'s
+/// own comment on `runtime_cell` records the reasoning) — the sole *strong*
+/// owner is `OpencodeExecution::transport_state`, so when it (and every
+/// short-lived per-turn clone) is gone, `ServeChild::drop`'s process-group
+/// kill actually runs, the socket closes, and this thread's own blocked
+/// read errors out and exits.
+///
+/// [confirmed finding 6, fixed] Asserted externally, by process table, for
+/// real: `catch_unwind` (not `#[should_panic]`) lets this function keep
+/// running *after* the panic unwinds `backend` out of scope, so it can read
+/// the stub's own self-reported pid ([`StubServe::pid_dump_path`]) and poll
+/// the real process table ([`pid_is_alive`]/[`wait_for_pid_death`], via
+/// `ps`'s STAT column rather than `kill -0` -- see that function's own doc
+/// comment for why a zombie must not read as "still alive") for it to
+/// actually exit. `#[should_panic(expected = "intentional")]` alone (the
+/// prior shape of this test) only matched a literal string in the panic
+/// message and was structurally unable to observe whether the child died —
+/// reverting the `Weak`-vs-`Arc` fix would not have failed it. This test
+/// fails if that revert ever happens again.
+#[test]
+fn serve_stub_panicking_mid_turn_still_lets_the_child_die() {
+    let data_dir = TempDir::new().expect("tempdir");
+    let session_id = "ses_stub1";
+    let stub = StubServe::new(data_dir.path(), &end_to_end_plan(session_id));
+    let pid_dump_path = stub.pid_dump_path.clone();
+    let config = serve_config_for(&stub, data_dir.path());
+    let cwd = data_dir.path().to_path_buf();
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let backend = OpencodeBackend::new(config);
+        let (sink_fn, events) = sink();
+        backend.set_event_sink(sink_fn);
+        let mut request = start_request(&cwd);
+        request.model = Some("opencode/big-pickle".to_string());
+        let _handle = launch_with(&backend, &request).expect("serve launch");
+        let _assistant = wait_for_kind(&events, "conversation.assistant.completed");
+        // `backend` -- the sole strong owner of `ServeRuntime`, via
+        // `OpencodeExecution::transport_state` -- unwinds out of scope here,
+        // never reaching `stop()`: exactly the shape that exposed the
+        // original leak, and exactly what the assertions below check for.
+        panic!("intentional");
+    }));
+
+    let payload = result.expect_err("the launch/panic sequence above must panic");
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned());
+    assert_eq!(
+        message.as_deref(),
+        Some("intentional"),
+        "unexpected panic payload: {message:?}"
+    );
+
+    let pid: u32 = std::fs::read_to_string(&pid_dump_path)
+        .expect("the stub self-reported its pid at startup")
+        .trim()
+        .parse()
+        .expect("pid dump is a plain integer");
+    wait_for_pid_death(pid, Duration::from_secs(5));
+}
+
+/// §8.2's absolute rule: a serve child that fails before it ever finished
+/// spawning is a LAUNCH refusal, never a silent fallback to `run-json`. This
+/// calls the private `launch_serve` directly from `src/backend/opencode.rs`'s
+/// own unit tests (`serve_launch_failure_is_a_refusal_not_a_run_turn`) —
+/// recorded here as a pointer, since an external integration test cannot
+/// reach a private method, and reaching it through the public `launch()`
+/// dispatch would require the serve *gate* to fail identically to the
+/// launch itself, collapsing exactly the distinction that test exists to
+/// draw (gate failure resolves the transport away from Serve entirely,
+/// never reaching `launch_serve` at all).
+#[test]
+fn serve_launch_refusal_is_unit_tested_in_the_adapter_module() {
+    // See `backend::opencode::tests::
+    // serve_launch_failure_is_a_refusal_not_a_run_turn` in
+    // `src/backend/opencode.rs`. This marker exists so a reader of this
+    // file's own test list does not conclude the guarantee is untested here.
 }
 
 #[test]
@@ -1898,6 +2633,221 @@ fn live_opencode_history_exports_the_whole_session() {
             .iter()
             .any(|event| event.payload["model"] == "big-pickle"),
         "the export names the served model per message (probe 7)"
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+// --------------------------------------------------- W3: serve transport, live
+
+/// The serve transport's own foundational smoke test: launch (session
+/// minted by `POST /session`, before any turn, §3.6), a turn narrated live
+/// over `GET /event` and decoded through the shared decoder, and the pin
+/// verified from the sync `POST /session/{id}/message` response with no
+/// `export` subprocess (§7.6) — the real-binary counterpart to
+/// `serve_stub_end_to_end_launch_turn_interrupt_history_and_readopt_
+/// withdrawal`, against the actual `opencode serve` HTTP+SSE surface
+/// rather than `StubServe`'s simulation of it.
+#[test]
+#[ignore = "opt-in, consumes free-tier quota: SERGEANT_OPENCODE_TESTS=1 cargo test --test opencode_backend -- --ignored"]
+fn live_opencode_serve_minimal_turn_completes_with_usage() {
+    let data_dir = live_workdir("serve-turn");
+    if !opencode_serve_live_enabled(
+        "live_opencode_serve_minimal_turn_completes_with_usage",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let backend = OpencodeBackend::new(live_serve_config(data_dir.path()));
+    let report = backend.probe();
+    assert!(report.available, "{:?}", report.detail);
+    let detail = report.detail.clone().unwrap_or_default();
+    assert!(detail.contains("transport: serve-http"), "{detail}");
+    assert!(detail.contains("openapi: fresh"), "{detail}");
+
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let request = live_request(
+        data_dir.path(),
+        "Reply with exactly the word pong and nothing else.",
+    );
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    assert!(
+        handle
+            .native_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("ses_")),
+        "§3.6: the session id is minted by POST /session, synchronously"
+    );
+    let _user = wait_for_kind(&events, "conversation.user");
+    let observation = wait_for_settled(&backend, &handle);
+    assert_eq!(observation.native, NativeState::Exited);
+    assert!(
+        matches!(observation.signal, BackendSignal::StageCompleted { .. }),
+        "{observation:?}"
+    );
+    let usage = events_of_kind(&events, "usage.updated");
+    assert!(!usage.is_empty(), "usage is reported per step-finish part");
+    let ended = wait_for_kind(&events, "conversation.turn.ended").payload;
+    assert_eq!(ended["outcome"], "completed");
+    assert_eq!(ended["transport"], "serve-http");
+    assert_eq!(
+        ended["model_pin"]["verdict"], "honored",
+        "§7.6: the sync POST response's own info.modelID/providerID verify the pin, no export"
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// §7.1's registry-first `approval_flow: true`, live end to end: a
+/// `bash: "ask"` permission policy injected via `OPENCODE_CONFIG_CONTENT`
+/// (measured to reach the serve child too, not only `run` — §7.7) parks the
+/// stage as `NeedsInput{asked_by: Adapter}` on the harness's own
+/// `permission.asked` event, `SEND("once")` relays to the deprecated-but-
+/// live `POST /session/{id}/permissions/{id}` (C1), and the gated tool
+/// actually runs.
+#[test]
+#[ignore = "opt-in, consumes free-tier quota: SERGEANT_OPENCODE_TESTS=1 cargo test --test opencode_backend -- --ignored"]
+fn live_opencode_serve_approval_round_trip_runs_the_gated_tool() {
+    let data_dir = live_workdir("serve-approval");
+    if !opencode_serve_live_enabled(
+        "live_opencode_serve_approval_round_trip_runs_the_gated_tool",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let mut config = live_serve_config(data_dir.path());
+    config.config_content = Some(r#"{"permission":{"bash":"ask"}}"#.to_string());
+    let backend = OpencodeBackend::new(config);
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let request = live_request(
+        data_dir.path(),
+        "Use the bash tool to run exactly this command: echo probe-ask-42",
+    );
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    let observation = wait_for_needs_input(&backend, &handle);
+    match &observation.signal {
+        BackendSignal::NeedsInput { prompt, asked_by } => {
+            assert_eq!(
+                *asked_by,
+                AskAuthor::Adapter,
+                "a permission gate is adapter-authored"
+            );
+            assert!(prompt.contains("bash"), "{prompt}");
+        }
+        other => panic!("expected NeedsInput, got {other:?}"),
+    }
+    backend.send(&handle, "once").expect("send once");
+    let observation = wait_for_settled(&backend, &handle);
+    assert!(
+        matches!(observation.signal, BackendSignal::StageCompleted { .. }),
+        "the gated tool ran and the turn completed: {observation:?}"
+    );
+    let tool_completed = events_of_kind(&events, "tool.completed");
+    assert!(
+        tool_completed
+            .iter()
+            .any(|e| e.payload["is_error"] == false),
+        "{tool_completed:?}"
+    );
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// §7.2/C4's `ask: true`: the actor's own `question` tool parks the stage
+/// as `NeedsInput{asked_by: Actor}` on `question.asked` (`que_` ids), and
+/// answering it lets the session resume itself with no further client
+/// call.
+#[test]
+#[ignore = "opt-in, consumes free-tier quota: SERGEANT_OPENCODE_TESTS=1 cargo test --test opencode_backend -- --ignored"]
+fn live_opencode_serve_actor_question_parks_and_resumes_on_answer() {
+    let data_dir = live_workdir("serve-question");
+    if !opencode_serve_live_enabled(
+        "live_opencode_serve_actor_question_parks_and_resumes_on_answer",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let backend = OpencodeBackend::new(live_serve_config(data_dir.path()));
+    let (sink_fn, events) = sink();
+    backend.set_event_sink(sink_fn);
+    let request = live_request(
+        data_dir.path(),
+        "Use the question tool to ask exactly: \"Which color do you prefer?\" with options Red \
+         and Blue. Do not answer it yourself.",
+    );
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    let observation = wait_for_needs_input(&backend, &handle);
+    match &observation.signal {
+        BackendSignal::NeedsInput { asked_by, .. } => {
+            assert_eq!(
+                *asked_by,
+                AskAuthor::Actor,
+                "the actor's own question tool asked this"
+            );
+        }
+        other => panic!("expected NeedsInput, got {other:?}"),
+    }
+    backend.send(&handle, "Blue").expect("send answer");
+    let observation = wait_for_settled(&backend, &handle);
+    assert!(
+        matches!(observation.signal, BackendSignal::StageCompleted { .. }),
+        "the session resumed itself on question.replied with no further client call: \
+         {observation:?}"
+    );
+    let _ = events_of_kind(&events, "conversation.turn.harness_error");
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// §7.3's `NativeSessionAbort` tier: `POST /session/{id}/abort` on a
+/// running tool yields `InterruptedRunning`, with SSE `session.error
+/// MessageAbortedError` as the evidence, and — the fact that earns the
+/// tier over run-json's `ProcessTreeTermination` — the tool's own
+/// subprocess tree dies with it. The session stays usable afterward.
+#[test]
+#[ignore = "opt-in, consumes free-tier quota: SERGEANT_OPENCODE_TESTS=1 cargo test --test opencode_backend -- --ignored"]
+fn live_opencode_serve_abort_yields_an_interrupted_terminal_and_a_usable_session() {
+    let data_dir = live_workdir("serve-abort");
+    if !opencode_serve_live_enabled(
+        "live_opencode_serve_abort_yields_an_interrupted_terminal_and_a_usable_session",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let mut config = live_serve_config(data_dir.path());
+    // A generous but bounded turn budget: if abort genuinely has no effect,
+    // this fails within ~45s (the command's own `sleep 30` plus overhead)
+    // rather than the production default's 300s.
+    config.serve_budgets = Some(ServeBudgets {
+        readiness: Duration::from_secs(20),
+        abort: Duration::from_secs(10),
+        turn: Duration::from_secs(45),
+    });
+    let backend = OpencodeBackend::new(config);
+    let (sink_fn, _events) = sink();
+    backend.set_event_sink(sink_fn);
+    let request = live_request(
+        data_dir.path(),
+        "Use the bash tool to run: sleep 30 && echo done-sleeping",
+    );
+    let handle = launch_with(&backend, &request).expect("serve launch");
+    // Give the tool a moment to actually start before aborting it.
+    std::thread::sleep(Duration::from_secs(2));
+    backend.interrupt(&handle).expect("interrupt").wait();
+    // A wider deadline than `wait_for_settled`'s own 30s: live-measured
+    // while writing this wave — a turn's own resolution latency after an
+    // abort RPC (itself bounded to 10s above) had no prior measurement on
+    // this transport, and 30s alone was observed too tight at least once.
+    let observation = wait_for_settled_within(&backend, &handle, Duration::from_secs(60));
+    assert!(
+        matches!(observation.signal, BackendSignal::Running),
+        "InterruptedRunning surfaces as Running, not Failed or StageCompleted: {observation:?}"
+    );
+    backend
+        .send(&handle, "Reply with exactly the word: recovered.")
+        .expect("the session stays usable after abort");
+    let observation = wait_for_settled_within(&backend, &handle, Duration::from_secs(60));
+    assert!(
+        matches!(observation.signal, BackendSignal::StageCompleted { .. }),
+        "{observation:?}"
     );
     backend.stop(&handle).expect("stop").wait();
 }

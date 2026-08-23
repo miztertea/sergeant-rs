@@ -1,0 +1,253 @@
+{
+  "info": {
+    "id": "ses_fd1274563ffeD2117Ttnfp21wb",
+    "slug": "neon-wolf",
+    "projectID": "global",
+    "directory": "/var/tmp/opencode-impl/probe-w3",
+    "path": "var/tmp/opencode-impl/probe-w3",
+    "title": "Running 30-second sleep command",
+    "agent": "build",
+    "model": {
+      "id": "big-pickle",
+      "providerID": "opencode",
+      "variant": "default"
+    },
+    "version": "1.18.19",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 140,
+      "output": 10,
+      "reasoning": 4,
+      "cache": {
+        "read": 8064,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1787492350620,
+      "updated": 1787492401622
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1787492351666
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "opencode",
+          "modelID": "big-pickle"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_02ed8beb2001XXWpTmwWS8gof5",
+        "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Run the bash command: sleep 30 && echo done-sleeping",
+          "id": "prt_02ed8beb6001Vo1W2qO0nCvmAR",
+          "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb",
+          "messageID": "msg_02ed8beb2001XXWpTmwWS8gof5"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_02ed8beb2001XXWpTmwWS8gof5",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/var/tmp/opencode-impl/probe-w3",
+          "root": "/"
+        },
+        "cost": 0,
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "modelID": "big-pickle",
+        "providerID": "opencode",
+        "time": {
+          "created": 1787492351679,
+          "completed": 1787492355705
+        },
+        "error": {
+          "name": "MessageAbortedError",
+          "data": {
+            "message": "Aborted"
+          }
+        },
+        "id": "msg_02ed8bebf001LnNCZrAPJm674R",
+        "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb"
+      },
+      "parts": [
+        {
+          "type": "step-start",
+          "id": "prt_02ed8c773001AcYuXXpJZYGWa3",
+          "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb",
+          "messageID": "msg_02ed8bebf001LnNCZrAPJm674R"
+        },
+        {
+          "type": "reasoning",
+          "text": "The user wants me to run a bash command: sleep 30 && echo done-sleeping. This is a simple command that will take 30 seconds to complete. I should run it with an appropriate timeout (at least 30 seconds, so I'll set it higher, maybe 60000ms to be safe).",
+          "time": {
+            "start": 1787492353910,
+            "end": 1787492355053
+          },
+          "id": "prt_02ed8c776001j74jdxRSWuAoIH",
+          "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb",
+          "messageID": "msg_02ed8bebf001LnNCZrAPJm674R"
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_b770e7c7d71f4f969abb056e",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "sleep 30 && echo done-sleeping",
+              "timeout": 60000
+            },
+            "output": "(no output)\n\n<shell_metadata>\nUser aborted the command\n</shell_metadata>",
+            "metadata": {
+              "output": "(no output)\n\n<shell_metadata>\nUser aborted the command\n</shell_metadata>",
+              "exit": null,
+              "truncated": false
+            },
+            "title": "sleep 30 && echo done-sleeping",
+            "time": {
+              "start": 1787492355256,
+              "end": 1787492355703
+            }
+          },
+          "id": "prt_02ed8cbf20010EI87OFMJUkeHA",
+          "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb",
+          "messageID": "msg_02ed8bebf001LnNCZrAPJm674R"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1787492392429
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "opencode",
+          "modelID": "big-pickle"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_02ed95ded001HdyYyfdVXaKvy5",
+        "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Reply with exactly: pong",
+          "id": "prt_02ed95dee001zXMbqgMjt4Dotu",
+          "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb",
+          "messageID": "msg_02ed95ded001HdyYyfdVXaKvy5"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_02ed95ded001HdyYyfdVXaKvy5",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/var/tmp/opencode-impl/probe-w3",
+          "root": "/"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 8218,
+          "input": 140,
+          "output": 10,
+          "reasoning": 4,
+          "cache": {
+            "write": 0,
+            "read": 8064
+          }
+        },
+        "modelID": "big-pickle",
+        "providerID": "opencode",
+        "time": {
+          "created": 1787492392438,
+          "completed": 1787492401619
+        },
+        "finish": "stop",
+        "id": "msg_02ed95df6001xH7wkNSkXfB15r",
+        "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb"
+      },
+      "parts": [
+        {
+          "type": "step-start",
+          "id": "prt_02ed9805e0016t9heuJw0dKTyr",
+          "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb",
+          "messageID": "msg_02ed95df6001xH7wkNSkXfB15r"
+        },
+        {
+          "type": "reasoning",
+          "text": "The user wants me to reply with exactly \"pong\".",
+          "time": {
+            "start": 1787492401250,
+            "end": 1787492401486
+          },
+          "id": "prt_02ed98062001zChFRr31nUY6Nl",
+          "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb",
+          "messageID": "msg_02ed95df6001xH7wkNSkXfB15r"
+        },
+        {
+          "type": "text",
+          "text": "pong",
+          "time": {
+            "start": 1787492401490,
+            "end": 1787492401608
+          },
+          "id": "prt_02ed98152001YvybSq7mUdj783",
+          "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb",
+          "messageID": "msg_02ed95df6001xH7wkNSkXfB15r"
+        },
+        {
+          "reason": "stop",
+          "type": "step-finish",
+          "tokens": {
+            "total": 8218,
+            "input": 140,
+            "output": 10,
+            "reasoning": 4,
+            "cache": {
+              "write": 0,
+              "read": 8064
+            }
+          },
+          "cost": 0,
+          "id": "prt_02ed981ce001aT21VAcOSHuUwO",
+          "sessionID": "ses_fd1274563ffeD2117Ttnfp21wb",
+          "messageID": "msg_02ed95df6001xH7wkNSkXfB15r"
+        }
+      ]
+    }
+  ]
+}
