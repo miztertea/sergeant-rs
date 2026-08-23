@@ -2,7 +2,7 @@
 kind: workflow
 name: validate-and-ship
 status: published
-version: 2
+version: 3
 edition: 0.1.0
 description: >-
   The single final shipping boundary: validate a committed change through

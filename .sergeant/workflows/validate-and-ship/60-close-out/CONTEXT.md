@@ -18,6 +18,10 @@ Stop driving at `checks-passed`; on `failed`/`cancelled`, fix on the same branch
 
 ## Behavior contract
 
+Apply `@@independent-review`: this stage closes out a validation it never
+edited the code to produce — summarizing and handing off, never quietly
+patching something the pipeline missed on the way out.
+
 - **`checks-passed` means the change is validated and CI is green but the PR is not yet merged; the actor is done driving the pipeline and should tell the user the PR is ready to review and merge (link is in the `help` line) without waiting for the merge, since no-mistakes keeps monitoring the PR in the background until merged, closed, or idle-timed-out.**
   (trigger: the pipeline reaches the checks-passed outcome; outcome: the actor stops driving and hands the merge decision to the user, while the pipeline's own monitor continues in the background)
 - **`passed` means the changes cleared the gate and the PR was merged or closed.**

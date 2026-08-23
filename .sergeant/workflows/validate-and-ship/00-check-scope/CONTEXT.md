@@ -22,6 +22,10 @@ The correct one of the two invocation modes (validate-only or task-first) is ide
   (trigger: the user invokes /no-mistakes with or without a task description; outcome: the correct one of two distinct procedures is followed based on whether a task was given)
 - **When the user invokes /no-mistakes, the actor reports the outcome at the end; if the user asks for something specific (e.g. 'skip the lint step'), the actor translates that request into the matching `axi run` flag itself (e.g. `--skip=lint`), consulting `axi run --help` for available flags.**
   (trigger: the user invokes the no-mistakes command, optionally with a specific request; outcome: user intent is translated into concrete CLI flags rather than passed through unparsed)
+- **This stage reads the delivery state the intent declares — one of `validated-working-tree`, `local-commit`, `ready-branch`, `pushed-branch`, `pr`, `merge-ready-pr` — and records it; every later stage's contract is bounded by it, taking no external side effect beyond the declared state. When the intent declares none, this stage records `validated-working-tree` as the assumed floor and says explicitly that it assumed it, rather than inferring a broader state.**
+  (trigger: this stage begins; outcome: the run's own ceiling on external side effects — push, PR-open, CI-run — is stated once, up front, as declared content policy, not left to each later stage to guess)
+
+Delivery state is a declared field this stage reads out of free-text intent — there is no engine construct for this (J.12), and `sgt` neither parses nor validates intent content (the #166 ruling), so nothing enforces the declaration but this contract.
 
 ## Bounded judgment
 
@@ -30,6 +34,7 @@ Apply `@@bounded-judgment`.
 ### J2 — delegated to this stage
 - Distinguishing "already committed, just validate" (validate-only) from "do the task first" (task-first) from the user's own invocation.
 - Translating an ambiguous natural-language request (e.g. "skip the lint step") into the correct `axi run` flag, consulting `axi run --help` rather than guessing the grammar.
+- Recognizing the delivery state the intent declares (or its absence, in which case the `validated-working-tree` floor is recorded as assumed, not inferred).
 
 ### J1 — local choices allowed
 - None beyond ordinary tool mechanics — invocation-mode and flag-translation are the only material decisions this stage makes, and both are J2.
