@@ -49,9 +49,11 @@ use sergeant_rs::backend::{
     Backend, BackendError, BackendSignal, BindingSummary, ExecutionHandle, NativeState,
     Observation, ProbeReport, ResumeRequest, StartRequest,
 };
+use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::estate::InstructionPolicy;
 use sergeant_rs::domain::event::EventDraft;
 use sergeant_rs::domain::profile::Profile;
+use sergeant_rs::runtime::journal::Journal;
 
 mod support;
 
@@ -1983,4 +1985,99 @@ fn live_agy_resume_recalls_a_nonce_and_echoes_the_same_conversation_id() {
             .any(|e| e.payload["phase"] == serde_json::json!("resume_identity_mismatch")),
         "a real resume must raise no identity mismatch"
     );
+}
+
+// ------------------------------------------------------- W2 §1.4: registration
+
+/// A probeable agy registers for real: `daemon::start_with`, with no
+/// test-supplied stand-in for the name "agy", puts a real `AgyBackend`
+/// in its registry and journals its own probe evidence at registration
+/// — the direct proof of W2's registration change, not a repeat of any
+/// unit test on `AgyBackend` itself.
+#[tokio::test]
+async fn daemon_start_registers_agy_and_journals_its_own_probe() {
+    let data = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(data.path());
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(sergeant_rs::backend::BackendRegistry::new()),
+            default_backend: None,
+            agy: Some(config_for(&stub, data.path())),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start with an unmeasured-nothing agy must still start");
+    handle.shutdown().await;
+
+    let probed: Vec<_> = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == daemon::KIND_BACKEND_PROBED)
+        .collect();
+    let agy_probed = probed
+        .iter()
+        .find(|e| e.payload["backend"] == AGY_BACKEND_NAME)
+        .expect("a backend.probed record for agy");
+    assert_eq!(agy_probed.payload["available"], true);
+    assert_eq!(agy_probed.payload["runtime_scope"], "per_execution");
+    assert_eq!(agy_probed.payload["capabilities"]["ask"], false);
+    assert_eq!(
+        agy_probed.payload["capabilities"]["persistent_sessions"],
+        true
+    );
+    assert_eq!(
+        agy_probed.payload["capabilities"]["native_background"],
+        false
+    );
+    assert_eq!(agy_probed.payload["capabilities"]["streaming"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["history"], false);
+    assert_eq!(agy_probed.payload["capabilities"]["resume"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["interrupt"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["model_selection"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["profiles"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["approval_flow"], false);
+    assert_eq!(agy_probed.payload["capabilities"]["human_attach"], false);
+    assert_eq!(agy_probed.payload["capabilities"]["usage"], true);
+    assert_eq!(
+        agy_probed.payload["capabilities"]["native_subagents"],
+        false
+    );
+}
+
+/// Agy missing must not break daemon startup, and must be
+/// distinguishable from "unregistered": it registers anyway and
+/// journals honest, `available: false` evidence naming why it cannot
+/// run — the same posture Docker/Codex/Opencode already take for a
+/// host with no binary installed.
+#[tokio::test]
+async fn daemon_start_with_no_agy_installed_still_starts_and_says_why() {
+    let data = TempDir::new().expect("tempdir");
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(sergeant_rs::backend::BackendRegistry::new()),
+            default_backend: None,
+            agy: Some(AgyConfig {
+                executable: PathBuf::from("/nonexistent/definitely-not-agy"),
+                ..AgyConfig::new(data.path())
+            }),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("a host with no agy binary must still start a daemon");
+    handle.shutdown().await;
+
+    let agy_probed = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .find(|e| e.kind == daemon::KIND_BACKEND_PROBED && e.payload["backend"] == AGY_BACKEND_NAME)
+        .expect("agy is registered — and probed — even though it cannot run");
+    assert_eq!(agy_probed.payload["available"], false);
+    let detail = agy_probed.payload["detail"]
+        .as_str()
+        .expect("probe detail recorded");
+    assert!(detail.contains("cannot run"), "{detail}");
 }
