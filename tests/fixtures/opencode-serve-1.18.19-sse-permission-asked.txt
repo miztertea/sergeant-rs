@@ -1,0 +1,144 @@
+data: {"id":"evt_02ed714c3001gSYW0hBgrOsb4i","type":"server.connected","properties":{}}
+
+data: {"id":"evt_02ed718c9001J8rrwBSA8mWIq2","type":"session.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","info":{"id":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","slug":"glowing-orchid","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"New session - 2026-08-23T13:37:13.487Z","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787492233487,"updated":1787492243656}}}}
+
+data: {"id":"evt_02ed718ce001ngnWzfwQfSDhO7","type":"message.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","info":{"id":"msg_02ed718c8001Q8Pf0GE92v52Bd","role":"user","sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","time":{"created":1787492243656},"agent":"build","model":{"providerID":"opencode","modelID":"big-pickle"}}}}
+
+data: {"id":"evt_02ed719d1001ERnE9kQdzuJXFh","type":"message.part.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","part":{"type":"text","text":"Run the bash command: echo probe-ask-42","messageID":"msg_02ed718c8001Q8Pf0GE92v52Bd","sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","id":"prt_02ed718cd001SowFu9vm8vUVFS"},"time":1787492243921}}
+
+data: {"id":"evt_02ed719d3001TqL5xF0167BsIU","type":"session.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","info":{"id":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","slug":"glowing-orchid","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"New session - 2026-08-23T13:37:13.487Z","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787492233487,"updated":1787492243923}}}}
+
+data: {"id":"evt_02ed719d7001pnU5OtUTfLSvYx","type":"session.status","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","status":{"type":"busy"}}}
+
+data: {"id":"evt_02ed719d9001dAdQFdyyGSSvJN","type":"message.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","info":{"id":"msg_02ed719d9001yP8P1GoCxHGFJ5","parentID":"msg_02ed718c8001Q8Pf0GE92v52Bd","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/var/tmp/opencode-impl/probe-w3","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"big-pickle","providerID":"opencode","time":{"created":1787492243929},"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4"}}}
+
+data: {"id":"evt_02ed719ed001TMjC6sJ4ILr8Fj","type":"session.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","info":{"id":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","slug":"glowing-orchid","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"New session - 2026-08-23T13:37:13.487Z","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787492233487,"updated":1787492243949}}}}
+
+data: {"id":"evt_02ed719ef0011eQJmJknP12w2r","type":"session.diff","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","diff":[]}}
+
+data: {"id":"evt_02ed719f0001ncpAz0o7P0pBgf","type":"message.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","info":{"role":"user","time":{"created":1787492243656},"agent":"build","model":{"providerID":"opencode","modelID":"big-pickle"},"id":"msg_02ed718c8001Q8Pf0GE92v52Bd","sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","summary":{"diffs":[]}}}}
+
+data: {"id":"evt_02ed71a27001aTd3nePyQnYne3","type":"plugin.added","properties":{"id":"core/config-reference"}}
+
+data: {"id":"evt_02ed71a28001CUUj4SIju0KJQS","type":"plugin.added","properties":{"id":"agent"}}
+
+data: {"id":"evt_02ed71a28002Wfv5Z79s52heo0","type":"plugin.added","properties":{"id":"command"}}
+
+data: {"id":"evt_02ed71a28003As5PjQcTXtD2c5","type":"plugin.added","properties":{"id":"skill"}}
+
+data: {"id":"evt_02ed71a29001FU9naMg0OP9YCZ","type":"plugin.added","properties":{"id":"models-dev"}}
+
+data: {"id":"evt_02ed71a2a001V8mj200ECZ7zWm","type":"plugin.added","properties":{"id":"config-agent"}}
+
+data: {"id":"evt_02ed71a2a002wOk4MTKLsBQreC","type":"plugin.added","properties":{"id":"config-command"}}
+
+data: {"id":"evt_02ed71a2a003kcJPdlGZf45Vik","type":"plugin.added","properties":{"id":"config-skill"}}
+
+data: {"id":"evt_02ed71a2b001hS5m3r1Dd3tLC8","type":"plugin.added","properties":{"id":"alibaba"}}
+
+data: {"id":"evt_02ed71a2b002JaSimyFpT61gRH","type":"plugin.added","properties":{"id":"amazon-bedrock"}}
+
+data: {"id":"evt_02ed71a2b003Evbkfw690hM7QX","type":"plugin.added","properties":{"id":"anthropic"}}
+
+data: {"id":"evt_02ed71a2b004a7u3PvMI4Mhb6u","type":"plugin.added","properties":{"id":"azure-cognitive-services"}}
+
+data: {"id":"evt_02ed71a2f001Xwc7l3QXcQd29j","type":"plugin.added","properties":{"id":"azure"}}
+
+data: {"id":"evt_02ed71a2f002Ll7lnaidbM5Ds7","type":"plugin.added","properties":{"id":"cerebras"}}
+
+data: {"id":"evt_02ed71a30001r0JFVuJjLos0pj","type":"plugin.added","properties":{"id":"cloudflare-ai-gateway"}}
+
+data: {"id":"evt_02ed71a30002L5axE3gZxDbGFM","type":"plugin.added","properties":{"id":"cloudflare-workers-ai"}}
+
+data: {"id":"evt_02ed71a300035PiDhlWGgBN4oa","type":"plugin.added","properties":{"id":"cohere"}}
+
+data: {"id":"evt_02ed71a30004xT28oWUb43Ozja","type":"plugin.added","properties":{"id":"deepinfra"}}
+
+data: {"id":"evt_02ed71a31001WzG7WngeCGbZgh","type":"plugin.added","properties":{"id":"gateway"}}
+
+data: {"id":"evt_02ed71a31002oxWyoOoQ0fqej1","type":"plugin.added","properties":{"id":"github-copilot"}}
+
+data: {"id":"evt_02ed71a31003v1NMFYeQCv0gr3","type":"plugin.added","properties":{"id":"gitlab"}}
+
+data: {"id":"evt_02ed71a31004X0244AKbrAXH6J","type":"plugin.added","properties":{"id":"google"}}
+
+data: {"id":"evt_02ed71a32001cE4ZBIuJZy8X6c","type":"plugin.added","properties":{"id":"google-vertex-anthropic"}}
+
+data: {"id":"evt_02ed71a32002AERbN0eJinV2ws","type":"plugin.added","properties":{"id":"google-vertex"}}
+
+data: {"id":"evt_02ed71a3e001DuYK0geryqZ4jA","type":"plugin.added","properties":{"id":"groq"}}
+
+data: {"id":"evt_02ed71a3f001J01Z51Cebg270Z","type":"plugin.added","properties":{"id":"kilo"}}
+
+data: {"id":"evt_02ed71a3f0022SB0pn63pYa7wN","type":"plugin.added","properties":{"id":"llmgateway"}}
+
+data: {"id":"evt_02ed71a3f003cZbdTimf66HBdA","type":"plugin.added","properties":{"id":"mistral"}}
+
+data: {"id":"evt_02ed71a3f004oqlS8vLmiQVI2N","type":"plugin.added","properties":{"id":"nvidia"}}
+
+data: {"id":"evt_02ed71a41001Q2KohMc0I2TsVi","type":"plugin.added","properties":{"id":"opencode"}}
+
+data: {"id":"evt_02ed71a410028VMu7UqGmiiezS","type":"plugin.added","properties":{"id":"snowflake-cortex"}}
+
+data: {"id":"evt_02ed71a41003L0nYuIim06Z76I","type":"plugin.added","properties":{"id":"openai-compatible"}}
+
+data: {"id":"evt_02ed71a41004ysj6Oj8Uv1WMKP","type":"plugin.added","properties":{"id":"openai"}}
+
+data: {"id":"evt_02ed71a42001I7DI2KfOGbYqBk","type":"plugin.added","properties":{"id":"openrouter"}}
+
+data: {"id":"evt_02ed71a42002wX9cIfI7c6gtgl","type":"plugin.added","properties":{"id":"perplexity"}}
+
+data: {"id":"evt_02ed71a420035uhC655tHDHbbR","type":"plugin.added","properties":{"id":"sap-ai-core"}}
+
+data: {"id":"evt_02ed71a7b001XJ1kzDJ3a9epLj","type":"catalog.updated","properties":{}}
+
+data: {"id":"evt_02ed71a42004kYg43cxW7uZUeA","type":"plugin.added","properties":{"id":"togetherai"}}
+
+data: {"id":"evt_02ed71a7b002RiNxF6CgjCiJmT","type":"plugin.added","properties":{"id":"vercel"}}
+
+data: {"id":"evt_02ed71a7b003pmUAAHxQwbwaOJ","type":"plugin.added","properties":{"id":"venice"}}
+
+data: {"id":"evt_02ed71a7c0014WgsqE7UZkULNc","type":"plugin.added","properties":{"id":"xai"}}
+
+data: {"id":"evt_02ed71a7c002TpHX71MpnlDGla","type":"plugin.added","properties":{"id":"zenmux"}}
+
+data: {"id":"evt_02ed71a7c003oeRkx8vi437g9k","type":"plugin.added","properties":{"id":"dynamic-provider"}}
+
+data: {"id":"evt_02ed71a7d001pNjEcHYPq1bry6","type":"plugin.added","properties":{"id":"config-plugin"}}
+
+data: {"id":"evt_02ed71a7e001BgMD16JwuIW5dO","type":"plugin.added","properties":{"id":"config-provider"}}
+
+data: {"id":"evt_02ed71a7e002BdzXlWXTCkAmlc","type":"plugin.added","properties":{"id":"variant"}}
+
+data: {"id":"evt_02ed71a7e003S7qoxFUQKiNevD","type":"reference.updated","properties":{}}
+
+data: {"id":"evt_02ed71a8d001PRFb6VwJH4CDqB","type":"integration.updated","properties":{}}
+
+data: {"id":"evt_02ed71ac4001f0GgG2aBHxrYc5","type":"catalog.updated","properties":{}}
+
+data: {"id":"evt_02ed71ace001Yl7JAfkyzdKWiD","type":"session.status","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","status":{"type":"busy"}}}
+
+data: {"id":"evt_02ed72185001G6W8HlvIOeOeRT","type":"message.part.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","part":{"id":"prt_02ed72184001fHWBXZM1B8VvC9","messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5","sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","type":"step-start"},"time":1787492245893}}
+
+data: {"id":"evt_02ed72187001P4yV3fN76rOUSZ","type":"message.part.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","part":{"id":"prt_02ed72187001UBZP6iXpn9hquG","messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5","sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","type":"reasoning","text":"","time":{"start":1787492245895}},"time":1787492245895}}
+
+data: {"id":"evt_02ed72188001nvUEVhXSrYD10I","type":"message.part.delta","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5","partID":"prt_02ed72187001UBZP6iXpn9hquG","field":"text","delta":"The"}}
+
+data: {"id":"evt_02ed721dc001B8laFfzGtlOibu","type":"message.part.delta","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5","partID":"prt_02ed72187001UBZP6iXpn9hquG","field":"text","delta":" user wants me to run a"}}
+
+data: {"id":"evt_02ed722440016BQ9mfLVSXFWBw","type":"message.part.delta","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5","partID":"prt_02ed72187001UBZP6iXpn9hquG","field":"text","delta":" simple bash command:"}}
+
+data: {"id":"evt_02ed7229100159Pm4cHEqE2QB7","type":"message.part.delta","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5","partID":"prt_02ed72187001UBZP6iXpn9hquG","field":"text","delta":" echo probe-ask-42"}}
+
+data: {"id":"evt_02ed722c8001uJvwm5fW2Pmfxy","type":"message.part.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","part":{"id":"prt_02ed72187001UBZP6iXpn9hquG","messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5","sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","type":"reasoning","text":"The user wants me to run a simple bash command: echo probe-ask-42","time":{"start":1787492245895,"end":1787492246216}},"time":1787492246216}}
+
+data: {"id":"evt_02ed722cb0014sZo37JCEnolCc","type":"message.part.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","part":{"id":"prt_02ed722cb001AyV7SDIaM0yk6F","messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5","sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","type":"tool","tool":"bash","callID":"call_a258c4fb6a6f4b0db59aca41","state":{"status":"pending","input":{},"raw":""}},"time":1787492246219}}
+
+data: {"id":"evt_02ed723aa001zXd6UX9QTT9Vb0","type":"message.part.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","part":{"type":"tool","tool":"bash","callID":"call_a258c4fb6a6f4b0db59aca41","state":{"status":"running","input":{"command":"echo probe-ask-42"},"time":{"start":1787492246442}},"id":"prt_02ed722cb001AyV7SDIaM0yk6F","sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5"},"time":1787492246442}}
+
+data: {"id":"evt_02ed723d0002mq2C0mljIHMSKC","type":"permission.asked","properties":{"id":"per_02ed723d0001kZrOqHsxrQUgw7","sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","permission":"bash","patterns":["echo probe-ask-42"],"metadata":{"command":"echo probe-ask-42"},"always":["echo *"],"tool":{"messageID":"msg_02ed719d9001yP8P1GoCxHGFJ5","callID":"call_a258c4fb6a6f4b0db59aca41"}}}
+
+data: {"id":"evt_02ed73be2001v4dTt1OF7r1KEQ","type":"server.heartbeat","properties":{}}
+
+data: {"id":"evt_02ed74369001kzKWc64P2Bg54g","type":"session.updated","properties":{"sessionID":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","info":{"id":"ses_fd1290ef1ffeX8l7cvHH5bW8B4","slug":"glowing-orchid","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"Running echo probe-ask-42","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787492233487,"updated":1787492243949}}}}
+

@@ -1790,7 +1790,11 @@ async fn t7_routing_precedence_and_structured_failure() {
         &plain_handle,
         &plain,
         "unknown backend",
-        json!({"backend": "opencode"}),
+        // Since W2 the daemon registers a real Opencode adapter by default
+        // (codex forced the identical swap one wave earlier, for the same
+        // reason), so naming "opencode" here would no longer demonstrate an
+        // unknown backend — use "goose" instead, still never registered.
+        json!({"backend": "goose"}),
     )
     .await;
     assert_eq!(status, 422);
@@ -1802,7 +1806,7 @@ async fn t7_routing_precedence_and_structured_failure() {
     // "docker", so nothing pre-empts it here.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
+        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME, "opencode"])
     );
     plain_handle.shutdown().await;
 
@@ -1818,12 +1822,13 @@ async fn t7_routing_precedence_and_structured_failure() {
     assert_eq!(status, 422, "unroutable work must be refused: {body}");
     assert_eq!(body["error"]["code"], "no_backend_selected");
     // The scripted fake occupies the "claude" slot, so the daemon adds
-    // nothing there — but it still adds the real docker and codex adapters
-    // (N4/W2, nothing here is named "docker" or "codex"): codex is now the
-    // third real adapter the daemon registers by default, same as docker.
+    // nothing there — but it still adds the real docker, codex, and opencode
+    // adapters (N4/W2, nothing here is named "docker", "codex", or
+    // "opencode"): opencode is now the fourth real adapter the daemon
+    // registers by default, same as docker and codex.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", "docker"])
+        json!(["claude", "codex", "docker", "opencode"])
     );
     assert!(
         body["error"]["message"]
@@ -2030,19 +2035,19 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     );
     handle.shutdown().await;
 
-    // Row 4, second shape: a harness no daemon here registers. Since W2 the
-    // daemon registers a real Codex adapter by default, so naming "codex"
-    // here would no longer demonstrate an unregistered harness (it would be
-    // host-dependent: `backend_unavailable` with no codex on `PATH`, or an
-    // actual routing success on a host with a real logged-in one) — use
-    // "opencode" instead, the name already used elsewhere in this file for
-    // exactly this meaning (an unregistered backend/harness name).
+    // Row 4, second shape: a harness no daemon here registers. Since W2 (the
+    // opencode-adapter sprint) the daemon registers a real Opencode adapter
+    // by default too, so naming "opencode" here would no longer demonstrate
+    // an unregistered harness (it would be host-dependent: `backend_
+    // unavailable` with no opencode on `PATH`, or an actual routing success
+    // on a host with a real logged-in one) — codex forced the identical swap
+    // one wave earlier; use "goose" instead, still never registered.
     let repos = TempDir::new().expect("tempdir");
     let data = TempDir::new().expect("tempdir");
     let estate = repos.path().join("solo-estate");
     mixed_harness_repo(
         &estate,
-        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"opencode\"\n",
+        "\n[stage.\"10-b\"]\nkind = \"actor\"\nharness = \"goose\"\n",
     );
     let (registry, fake) = one_fake([]);
     let handle = start_with(
@@ -2062,13 +2067,13 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     .await;
     assert_eq!(status, 422, "must be refused: {body}");
     assert_eq!(body["error"]["code"], "backend_not_found");
-    // The daemon registers the real Claude, Codex, and Docker adapters
-    // alongside the scripted fake, so the options list names all four;
-    // "opencode" is still never registered, which is exactly why naming it
-    // fails.
+    // The daemon registers the real Claude, Codex, Docker, and Opencode
+    // adapters alongside the scripted fake, so the options list names all
+    // five; "goose" is still never registered, which is exactly why naming
+    // it fails.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
+        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME, "opencode"])
     );
     assert!(fake.starts().is_empty(), "no silent provider substitution");
     let list = get(&client, &handle, "/v1/work").await;
@@ -4686,6 +4691,11 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
         &handle,
         elsewhere.path(),
         "route me nowhere",
+        // Deliberately not the bare canonical name "opencode": since the
+        // opencode-adapter sprint's W2 that name is registered for real, and
+        // this sentinel only needs to stay permanently unregistrable, not to
+        // demonstrate the unregistered-harness case (that's rows 1793/2045,
+        // above, which do use the bare name and were swapped to "goose").
         json!({"backend": "opencode-does-not-exist"}),
     )
     .await;
@@ -4695,12 +4705,13 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     );
     assert_eq!(body["error"]["code"], "backend_not_found");
     // Since M4 the daemon registers the real claude adapter alongside the
-    // scripted fake, since N4 the docker adapter too, and since W2 the
-    // codex adapter as well (registered names sort: claude, codex, docker,
-    // fake).
+    // scripted fake, since N4 the docker adapter too, since W2 the codex
+    // adapter as well, and since the opencode-adapter sprint's own W2 the
+    // opencode adapter too (registered names sort: claude, codex, docker,
+    // fake, opencode).
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME])
+        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME, "opencode"])
     );
 
     // Only two works exist: the refusal created none.

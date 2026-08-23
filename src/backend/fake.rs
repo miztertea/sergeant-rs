@@ -106,11 +106,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use super::codex::KIND_TURN_HARNESS_ERROR;
 use super::{
     Backend, BackendError, Capabilities, Completion, ExecutionHandle, NativeEvent, NativeState,
     Observation, PreparedExecution, ProbeReport, ResumeRequest, RuntimeScope, StartRequest,
 };
 use crate::backend::BackendSignal;
+use crate::runtime::graph::{KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED};
 
 /// Name the default registry registers the fake under.
 pub const FAKE_BACKEND_NAME: &str = "fake";
@@ -182,6 +184,41 @@ pub struct FakeStep {
     /// alive") — so `native` is left exactly as it already reads, never
     /// forced to `Exited`.
     pub interrupt_confirmed: bool,
+    /// W4 (2026-08-23): set by [`FakeStep::typed_error`] — the structured
+    /// fields behind that step's rendered [`BackendSignal::Failed`] reason,
+    /// reported verbatim by `history()` as a [`KIND_TURN_HARNESS_ERROR`]
+    /// event. `None` for every other step, including one built with the
+    /// plain [`FakeStep::fail`].
+    pub typed_error: Option<TypedError>,
+    /// W4 (2026-08-23): set by [`FakeStep::complete_with_rejected_tool`] —
+    /// the tool call `history()` reports as an auto-rejected
+    /// `tool.requested`/`tool.completed` pair. `None` for every other step.
+    pub rejected_tool: Option<RejectedTool>,
+}
+
+/// W4 (2026-08-23): the structured fields behind opencode's typed terminal
+/// error (probe 3) — see [`FakeStep::typed_error`]. Every [`FakeStep`] field
+/// is public (this module's own existing idiom, predating W4), so this type
+/// is too — nothing here is a secret, it is exactly what a scripted typed
+/// error carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedError {
+    /// The typed error's `name` (e.g. `"UnknownError"`).
+    pub name: String,
+    /// The typed error's `data.message`.
+    pub message: String,
+    /// The typed error's `data.ref`.
+    pub reference: String,
+}
+
+/// W4 (2026-08-23): the tool call opencode's `run` transport auto-rejected
+/// (probe 4) — see [`FakeStep::complete_with_rejected_tool`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedTool {
+    /// The tool's name (e.g. `"bash"`).
+    pub name: String,
+    /// The rejected call's id.
+    pub call_id: String,
 }
 
 impl FakeStep {
@@ -242,6 +279,8 @@ impl FakeStep {
             interim_native: NativeState::Running,
             interim_signal: BackendSignal::Running,
             interrupt_confirmed: false,
+            typed_error: None,
+            rejected_tool: None,
         }
     }
 
@@ -268,9 +307,78 @@ impl FakeStep {
     /// same signal, different native evidence, the exact axis `with_native`
     /// already separates. The bare constructor's `NativeState::Unknown` matches
     /// exec's own arm instead (`observe_in_memory`'s `AmbiguousUnknown` arm,
-    /// `codex.rs:4710-4721`).
+    /// `codex.rs:4710-4721`). [`FakeStep::death_without_terminal`] is this
+    /// same variant given its own opencode-flavoured name.
     pub fn never_arrives() -> Self {
         Self::running(BackendSignal::Running).with_native(NativeState::Unknown)
+    }
+
+    /// W4 (2026-08-23): opencode's own SIGKILL shape (probe 10) — the
+    /// captured stream ends after `step_start` with **no terminal event of
+    /// any kind**, the §15 fail-closed ambiguous path, but the process
+    /// itself really is dead (a bun-compiled single binary — `pgrep -x
+    /// opencode` measured empty afterward — unlike codex exec's genuinely
+    /// unknown liveness for the same signal ambiguity) and the session store
+    /// survives it: a subsequent `run -s <sessionID>` recovered the pre-kill
+    /// state. This is exactly [`FakeStep::never_arrives`]`.with_native(
+    /// NativeState::Exited)` — the one refinement that distinguishes it from
+    /// codex's `Unknown`-native case — given its own name so a test scripting
+    /// "opencode died mid-turn" does not have to spell out that combination
+    /// itself. Probe 11's separate finding (a *tool* grandchild can survive
+    /// the opencode leader's death) is an interrupt/process-tree concern, not
+    /// this shape's — see `opencode_interrupt_kills_the_process_group`.
+    pub fn death_without_terminal() -> Self {
+        Self::never_arrives().with_native(NativeState::Exited)
+    }
+
+    /// W4 (2026-08-23): opencode's typed terminal error (probe 3) —
+    /// `{"type":"error", error:{name, data:{message, ref}}}`, exit 1. The
+    /// resulting [`BackendSignal::Failed`] reason renders exactly as
+    /// `opencode.rs`'s own `render_typed_error` would (`"{name}: {message}"`,
+    /// plus `" (ref {reference})"` when `reference` is non-empty), so a test
+    /// asserting on the signal alone sees the same prose a real adapter
+    /// would report. What a bare [`FakeStep::fail`] cannot express is the
+    /// *structured* fact underneath that prose: `history()` additionally
+    /// reports the name/message/ref fields verbatim as a
+    /// [`KIND_TURN_HARNESS_ERROR`] event, matching `opencode.rs`'s own
+    /// `ingest_error` — a test proving a caller reads the structured fields,
+    /// not just the rendered prose, needs this constructor.
+    pub fn typed_error(name: &str, message: &str, reference: &str) -> Self {
+        let mut rendered = format!("{name}: {message}");
+        if !reference.is_empty() {
+            rendered.push_str(&format!(" (ref {reference})"));
+        }
+        let mut step = Self::fail(&rendered);
+        step.typed_error = Some(TypedError {
+            name: name.to_string(),
+            message: message.to_string(),
+            reference: reference.to_string(),
+        });
+        step
+    }
+
+    /// W4 (2026-08-23): opencode's non-blocking-by-construction guarantee
+    /// (probe 4, the `AutoRejectOnAsk` admission row): a permission rule
+    /// resolving to `ask` in non-interactive mode auto-rejects the call —
+    /// stderr notice, `state.status: "error"`, `state.error: "The user
+    /// rejected permission to use this specific tool call."` — and the turn
+    /// **still completes** (exit 0; the model continues past the
+    /// rejection), rather than hanging the way a genuine interactive-only
+    /// approval gate would. `summary` is the completion the model produces
+    /// after the rejection, exactly as [`FakeStep::complete_with`] scripts
+    /// one; `tool_name`/`call_id` name the call that was rejected.
+    /// `history()` reports the same `tool.requested`/`tool.completed` pair
+    /// `opencode.rs`'s own decoder produces from one measured `tool_use`
+    /// line, `is_error: true` throughout — structured evidence, never
+    /// inferred from the narration text the way §37's own standing rule
+    /// (shape 5's test, below) forbids.
+    pub fn complete_with_rejected_tool(summary: &str, tool_name: &str, call_id: &str) -> Self {
+        let mut step = Self::complete_with(summary);
+        step.rejected_tool = Some(RejectedTool {
+            name: tool_name.to_string(),
+            call_id: call_id.to_string(),
+        });
+        step
     }
 
     /// Override the native evidence, leaving the signal alone. This is how a
@@ -343,6 +451,8 @@ impl FakeStep {
             interim_native: NativeState::Running,
             interim_signal: BackendSignal::Running,
             interrupt_confirmed: false,
+            typed_error: None,
+            rejected_tool: None,
         }
     }
 }
@@ -504,6 +614,9 @@ pub struct FakeBackend {
     archive_gate: Arc<Gate>,
     /// Whether STOP/INTERRUPT hand back a deferred completion at all.
     archive_armed: Arc<Mutex<bool>>,
+    /// W4 (2026-08-23): whether PREPARE mints no native identity at all —
+    /// see [`FakeBackend::with_server_minted_native_ids`].
+    server_minted_native_ids: bool,
 }
 
 impl FakeBackend {
@@ -553,6 +666,7 @@ impl FakeBackend {
             observe_gate: Arc::new(Gate::default()),
             archive_gate: Arc::new(Gate::default()),
             archive_armed: Arc::new(Mutex::new(false)),
+            server_minted_native_ids: false,
         }
     }
 
@@ -563,6 +677,28 @@ impl FakeBackend {
     /// refusal should not have to restate the whole capability set.
     pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// W4 (2026-08-23): opt into opencode's own PREPARE shape — the
+    /// sprint plan's "server-minted-session-id-learned-from-first-event".
+    /// opencode's session id is minted by the server, learned only once
+    /// LAUNCH itself reads the first NDJSON event line, so its PREPARE
+    /// reserves nothing (`native_id: None`, `opencode.rs:4421`) — the
+    /// opposite of every other adapter here, which names an identity (or a
+    /// deterministic placeholder) before the process even starts. With this
+    /// set, [`FakeBackend::prepare`] returns `native_id: None` too; LAUNCH's
+    /// own existing fallback (`prepared.native_id.clone().unwrap_or_else(
+    /// ...)`) already mints exactly the same `fake-session-<id>` identity in
+    /// that case, so nothing else about LAUNCH has to change — only the
+    /// phase at which the identity becomes visible to a caller inspecting
+    /// the intermediate [`PreparedExecution`].
+    ///
+    /// Default off: every other test in this suite reads PREPARE's eager
+    /// `Some(fake-session-<id>)` today, so flipping the default would be a
+    /// breaking change to this whole test suite, not a fidelity improvement.
+    pub fn with_server_minted_native_ids(mut self) -> Self {
+        self.server_minted_native_ids = true;
         self
     }
 
@@ -918,9 +1054,13 @@ impl Backend for FakeBackend {
                     .unwrap_or_else(|| "scripted unavailable".to_string()),
             });
         }
+        // W4: server-minted identity has nothing to reserve here — see
+        // `FakeBackend::with_server_minted_native_ids`.
+        let native_id = (!self.server_minted_native_ids)
+            .then(|| format!("fake-session-{}", request.execution_id));
         Ok(PreparedExecution {
             execution_id: request.execution_id.clone(),
-            native_id: Some(format!("fake-session-{}", request.execution_id)),
+            native_id,
             request: request.clone(),
         })
     }
@@ -1144,16 +1284,41 @@ impl Backend for FakeBackend {
                 }
             })
             .collect();
+        // W4 (2026-08-23): the auto-rejected tool call (probe 4), if this
+        // step scripted one — the *only* thing in this module that ever
+        // produces a `tool.*`-shaped event, and it comes from an explicit,
+        // structured [`FakeStep::complete_with_rejected_tool`] field, never
+        // from reading narration text (see the invariant this preserves,
+        // just below). Ordered before the assistant's own completion text to
+        // match the measured shape: the model continues PAST the rejection,
+        // so the call happened first.
+        if let Some(tool) = &execution.step.rejected_tool {
+            events.push(NativeEvent {
+                kind: KIND_TOOL_REQUESTED.to_string(),
+                payload: json!({"id": tool.call_id, "name": tool.name, "input": null}),
+            });
+            events.push(NativeEvent {
+                kind: KIND_TOOL_COMPLETED.to_string(),
+                payload: json!({
+                    "tool_use_id": tool.call_id,
+                    "name": tool.name,
+                    "is_error": true,
+                    "status": "error",
+                    "error": "The user rejected permission to use this specific tool call.",
+                }),
+            });
+        }
         // R-H0-7 (2026-08-22): the assistant's own completion text, exactly as
         // a real adapter's `agent_message`/`agentMessage` narrates it — and,
         // deliberately, the *only* thing that ever produces a `tool.*`-shaped
-        // event out of this backend is nothing at all: there is no branch here,
-        // or anywhere in this module, that reads narration text as evidence of
-        // a tool having run. A test scripting a narration that *claims* a tool
-        // effect (`complete_with("ran pytest, 42 passed")`) and asserting zero
-        // `tool.*` kinds in the returned Vec is this wave's expression of the
-        // hazard `codex.rs`'s decoder was written to survive — pinned here as
-        // an assertable structural fact instead of an unwritten one.
+        // event out of this backend from **narration** is nothing at all:
+        // there is no branch here, or anywhere in this module, that reads
+        // narration text as evidence of a tool having run. A test scripting a
+        // narration that *claims* a tool effect (`complete_with("ran pytest,
+        // 42 passed")`) and asserting zero `tool.*` kinds in the returned Vec
+        // is this wave's expression of the hazard `codex.rs`'s decoder was
+        // written to survive — pinned here as an assertable structural fact
+        // instead of an unwritten one.
         if let BackendSignal::StageCompleted {
             summary: Some(text),
         } = &execution.step.signal
@@ -1161,6 +1326,21 @@ impl Backend for FakeBackend {
             events.push(NativeEvent {
                 kind: "conversation.assistant.completed".to_string(),
                 payload: json!({"text": text}),
+            });
+        }
+        // W4 (2026-08-23): the typed terminal error (probe 3), if this step
+        // scripted one — the structured fields behind the rendered
+        // `BackendSignal::Failed` reason, reported the same way
+        // `opencode.rs`'s own `ingest_error` reports them.
+        if let Some(err) = &execution.step.typed_error {
+            events.push(NativeEvent {
+                kind: KIND_TURN_HARNESS_ERROR.to_string(),
+                payload: json!({
+                    "phase": "typed_error",
+                    "name": err.name,
+                    "message": err.message,
+                    "ref": err.reference,
+                }),
             });
         }
         Ok(events)
@@ -1799,6 +1979,180 @@ mod tests {
                 Err(BackendError::UnknownExecution { .. })
             ),
             "an execution this backend never had is refused, not reported as an empty history"
+        );
+    }
+
+    /// W4 fake fidelity shape 1: opencode's typed terminal error (probe 3)
+    /// is scriptable as a structured fact, not just a prose [`FakeStep::fail`]
+    /// reason — the signal renders exactly as `opencode.rs`'s own
+    /// `render_typed_error` would, and `history()` additionally reports the
+    /// name/message/ref fields verbatim as a `KIND_TURN_HARNESS_ERROR`
+    /// event, matching `opencode.rs`'s own `ingest_error`.
+    #[test]
+    fn typed_error_renders_the_same_prose_fail_does_and_also_reports_the_structured_fields() {
+        let fake = FakeBackend::scripted(
+            "fake",
+            [FakeStep::typed_error(
+                "UnknownError",
+                "Unexpected server error. Check server logs for details.",
+                "err_a2c9f0ac",
+            )],
+        );
+        let handle = fake.start(&request("bad-model")).expect("start");
+
+        let observed = fake.observe(&handle).expect("observe");
+        assert_eq!(
+            observed.signal,
+            BackendSignal::Failed {
+                reason: "UnknownError: Unexpected server error. Check server logs for \
+                         details. (ref err_a2c9f0ac)"
+                    .to_string()
+            },
+            "the rendered reason matches opencode.rs's own render_typed_error format"
+        );
+
+        assert_eq!(
+            fake.history(&handle).expect("history"),
+            vec![NativeEvent {
+                kind: "conversation.turn.harness_error".to_string(),
+                payload: json!({
+                    "phase": "typed_error",
+                    "name": "UnknownError",
+                    "message": "Unexpected server error. Check server logs for details.",
+                    "ref": "err_a2c9f0ac",
+                }),
+            }],
+            "history reports the structured fields verbatim, not just the rendered prose \
+             a bare fail() step would leave behind"
+        );
+    }
+
+    /// W4 fake fidelity shape 2: opencode's non-blocking-by-construction
+    /// guarantee (probe 4) — an `ask`-resolving permission auto-rejects the
+    /// *call*, not the turn, so the turn still completes (exit 0) — with the
+    /// rejected call reported as structured `tool.*` evidence, ordered
+    /// before the completion text it preceded, never inferred from that
+    /// text the way shape 5's own standing test (above) proves this backend
+    /// never does.
+    #[test]
+    fn complete_with_rejected_tool_completes_the_turn_and_reports_a_failed_tool_pair() {
+        let fake = FakeBackend::scripted(
+            "fake",
+            [FakeStep::complete_with_rejected_tool(
+                "I could not run that command, but here is what I found instead.",
+                "bash",
+                "call_1",
+            )],
+        );
+        let handle = fake.start(&request("gated-bash")).expect("start");
+
+        assert_eq!(
+            fake.observe(&handle).expect("observe").signal,
+            BackendSignal::StageCompleted {
+                summary: Some(
+                    "I could not run that command, but here is what I found instead.".to_string()
+                )
+            },
+            "an ask-resolving permission rejects the call, not the turn — the turn \
+             still completes"
+        );
+
+        assert_eq!(
+            fake.history(&handle).expect("history"),
+            vec![
+                NativeEvent {
+                    kind: "tool.requested".to_string(),
+                    payload: json!({"id": "call_1", "name": "bash", "input": null}),
+                },
+                NativeEvent {
+                    kind: "tool.completed".to_string(),
+                    payload: json!({
+                        "tool_use_id": "call_1",
+                        "name": "bash",
+                        "is_error": true,
+                        "status": "error",
+                        "error": "The user rejected permission to use this specific tool call.",
+                    }),
+                },
+                NativeEvent {
+                    kind: "conversation.assistant.completed".to_string(),
+                    payload: json!({
+                        "text": "I could not run that command, but here is what I found \
+                                  instead."
+                    }),
+                },
+            ],
+            "the rejected call is structured evidence ordered before the completion \
+             text it preceded, matching the measured order: the model continues PAST \
+             the rejection"
+        );
+    }
+
+    /// W4 fake fidelity shape 3: opencode's own SIGKILL shape (probe 10) —
+    /// no terminal event of any kind, ever, but the process really is dead
+    /// (unlike codex exec's genuinely unknown liveness for the same signal
+    /// ambiguity), and the session store survives it: RESUME still
+    /// re-adopts the execution afterward.
+    #[test]
+    fn death_without_terminal_reports_exited_native_with_no_signal_and_survives_resume() {
+        let fake = FakeBackend::scripted("fake", [FakeStep::death_without_terminal()]);
+        let handle = fake.start(&request("killed")).expect("start");
+
+        for tick in 0..3 {
+            let observed = fake.observe(&handle).expect("observe");
+            assert_eq!(
+                observed.native,
+                NativeState::Exited,
+                "tick {tick}: the opencode process really is dead — a single \
+                 bun-compiled binary, no process-tree survivor at this level"
+            );
+            assert_eq!(
+                observed.signal,
+                BackendSignal::Running,
+                "tick {tick}: no terminal event of any kind was ever emitted, so \
+                 nothing ever resolves this shape on its own"
+            );
+        }
+
+        fake.resume(&handle, &ResumeRequest::new("w", "/anywhere"))
+            .expect("the session store survives an uncleanly killed turn (probe 10)");
+    }
+
+    /// W4 fake fidelity shape 4: opencode's own PREPARE mints no native
+    /// identity at all — the session id is server-minted, learned only once
+    /// LAUNCH itself reads the first event line — the opposite of every
+    /// other adapter here, which names an identity (or a deterministic
+    /// placeholder) before the process even starts. LAUNCH's existing
+    /// fallback already mints the same identity once it is actually needed,
+    /// so nothing about LAUNCH's own behavior has to change for this shape.
+    #[test]
+    fn server_minted_native_ids_leaves_prepare_with_no_identity_until_launch_mints_one() {
+        let fake = FakeBackend::new("fake").with_server_minted_native_ids();
+
+        let prepared = fake.prepare(&request("first-turn")).expect("prepare");
+        assert_eq!(
+            prepared.native_id, None,
+            "opencode's PREPARE has nothing to reserve — the id does not exist yet"
+        );
+
+        let handle = fake.launch(&prepared).expect("launch");
+        assert_eq!(
+            handle.native_id.as_deref(),
+            Some("fake-session-first-turn"),
+            "LAUNCH mints the identity once it is actually needed — 'learned from \
+             the first event', not reserved up front"
+        );
+
+        // The default backend is unaffected: every other test in this suite
+        // still sees PREPARE mint the identity eagerly.
+        let default_fake = FakeBackend::new("fake");
+        let default_prepared = default_fake
+            .prepare(&request("first-turn"))
+            .expect("prepare");
+        assert_eq!(
+            default_prepared.native_id.as_deref(),
+            Some("fake-session-first-turn"),
+            "the opt-in leaves every other script's eager PREPARE unchanged"
         );
     }
 }

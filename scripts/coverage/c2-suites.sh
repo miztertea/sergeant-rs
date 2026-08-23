@@ -82,3 +82,30 @@ cov_stage_end 1 "the codex_backend test binary must write its own profile (StubC
 cov_stage_begin c2-codex_routing
 cov_run cargo llvm-cov --no-report --test codex_routing --locked || cov_fail "codex_routing failed under instrumentation"
 cov_stage_end 1 "the codex_routing test binary must write its own profile"
+
+# Added 2026-08-23, in the same commit that adds the suite (the W1 opencode
+# wave) — wired at birth rather than recovered later, per the owner's 90-floor
+# ruling and the #231 lesson: a suite absent from every stage list contributes
+# nothing to Gate D however green it runs. Sits in C2, not C3, for
+# codex_backend's exact reasons: StubOpencode is a shell-script stand-in
+# (uninstrumented, no profile expected), and the suite spawns no `sgt`
+# subprocess. Floor 1.
+cov_stage_begin c2-opencode_backend
+cov_run cargo llvm-cov --no-report --test opencode_backend --locked || cov_fail "opencode_backend failed under instrumentation"
+cov_stage_end 1 "the opencode_backend test binary must write its own profile (StubOpencode's children are shell-script stand-ins, uninstrumented and no loss, per codex_backend's precedent)"
+
+# Added 2026-08-23, in the same commit that creates the suite (W2, opencode
+# registration wave) — codex_routing's exact rationale: in-process-only
+# throughout (no StubOpencode, no subprocess), so it sits in C2 rather than
+# needing C3's ≥2-profile floor. Floor 1.
+cov_stage_begin c2-opencode_routing
+cov_run cargo llvm-cov --no-report --test opencode_routing --locked || cov_fail "opencode_routing failed under instrumentation"
+cov_stage_end 1 "the opencode_routing test binary must write its own profile"
+
+# Added 2026-08-23, same commit that creates the suite (W2, opencode
+# registration wave, item 6 / #231(b)): a plain static-scan test, no
+# subprocess, no daemon — sits in C2 for the same reason codex_routing does.
+# Floor 1.
+cov_stage_begin c2-coverage_stage_membership
+cov_run cargo llvm-cov --no-report --test coverage_stage_membership --locked || cov_fail "coverage_stage_membership failed under instrumentation"
+cov_stage_end 1 "the coverage_stage_membership test binary must write its own profile"

@@ -1,0 +1,269 @@
+{
+  "info": {
+    "id": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+    "slug": "jolly-harbor",
+    "projectID": "global",
+    "directory": "/tmp/claude-1001/-home-miztertea-sergeant-rs-workspace/2d319996-ceb4-462b-bb01-981d39e2e04d/scratchpad/oc-probe",
+    "path": "tmp/claude-1001/-home-miztertea-sergeant-rs-workspace/2d319996-ceb4-462b-bb01-981d39e2e04d/scratchpad/oc-probe",
+    "title": "New session - 2026-08-23T10:58:13.586Z",
+    "agent": "build",
+    "model": {
+      "id": "big-pickle",
+      "providerID": "opencode",
+      "variant": "default"
+    },
+    "version": "1.18.19",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 435,
+      "output": 41,
+      "reasoning": 14,
+      "cache": {
+        "read": 15104,
+        "write": 0
+      }
+    },
+    "permission": [
+      {
+        "permission": "question",
+        "pattern": "*",
+        "action": "deny"
+      },
+      {
+        "permission": "plan_enter",
+        "pattern": "*",
+        "action": "deny"
+      },
+      {
+        "permission": "plan_exit",
+        "pattern": "*",
+        "action": "deny"
+      }
+    ],
+    "time": {
+      "created": 1787482693586,
+      "updated": 1787482701509
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1787482693617
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "opencode",
+          "modelID": "big-pickle"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_02e455ff1001fWArHi26TrPtPt",
+        "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "\"Remember this nonce: zebra-7134. Reply only: stored.\"",
+          "id": "prt_02e455ff6001678U817BzZt0RJ",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e455ff1001fWArHi26TrPtPt"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_02e455ff1001fWArHi26TrPtPt",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/tmp/claude-1001/-home-miztertea-sergeant-rs-workspace/2d319996-ceb4-462b-bb01-981d39e2e04d/scratchpad/oc-probe",
+          "root": "/"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 7772,
+          "input": 394,
+          "output": 13,
+          "reasoning": 5,
+          "cache": {
+            "write": 0,
+            "read": 7360
+          }
+        },
+        "modelID": "big-pickle",
+        "providerID": "opencode",
+        "time": {
+          "created": 1787482693874,
+          "completed": 1787482696993
+        },
+        "finish": "stop",
+        "id": "msg_02e4560f2001TLMkv3GeLVRU3M",
+        "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD"
+      },
+      "parts": [
+        {
+          "type": "step-start",
+          "id": "prt_02e456b01001JP5XZJml1QVj6j",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e4560f2001TLMkv3GeLVRU3M"
+        },
+        {
+          "type": "reasoning",
+          "text": "The user wants me to remember a nonce and reply only \"stored.\"",
+          "time": {
+            "start": 1787482696451,
+            "end": 1787482696820
+          },
+          "id": "prt_02e456b030012V669XDWbVfz68",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e4560f2001TLMkv3GeLVRU3M"
+        },
+        {
+          "type": "text",
+          "text": "stored.",
+          "time": {
+            "start": 1787482696823,
+            "end": 1787482696984
+          },
+          "id": "prt_02e456c770014eD7L95LSZ8hlv",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e4560f2001TLMkv3GeLVRU3M"
+        },
+        {
+          "reason": "stop",
+          "type": "step-finish",
+          "tokens": {
+            "total": 7772,
+            "input": 394,
+            "output": 13,
+            "reasoning": 5,
+            "cache": {
+              "write": 0,
+              "read": 7360
+            }
+          },
+          "cost": 0,
+          "id": "prt_02e456d1d001cJaE05ZWq0giZG",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e4560f2001TLMkv3GeLVRU3M"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1787482697839
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "opencode",
+          "modelID": "big-pickle"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_02e45706f0015soAwiPXrxX0pI",
+        "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "\"What was the nonce? Reply with only the nonce.\"",
+          "id": "prt_02e4570710016q667MrWAMRcaC",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e45706f0015soAwiPXrxX0pI"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_02e45706f0015soAwiPXrxX0pI",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/tmp/claude-1001/-home-miztertea-sergeant-rs-workspace/2d319996-ceb4-462b-bb01-981d39e2e04d/scratchpad/oc-probe",
+          "root": "/"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 7822,
+          "input": 41,
+          "output": 28,
+          "reasoning": 9,
+          "cache": {
+            "write": 0,
+            "read": 7744
+          }
+        },
+        "modelID": "big-pickle",
+        "providerID": "opencode",
+        "time": {
+          "created": 1787482698092,
+          "completed": 1787482701497
+        },
+        "finish": "stop",
+        "id": "msg_02e45716c001uVyjsjR5Y99jjm",
+        "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD"
+      },
+      "parts": [
+        {
+          "type": "step-start",
+          "id": "prt_02e457bba001eMF4BnjZQ7dQTs",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e45716c001uVyjsjR5Y99jjm"
+        },
+        {
+          "type": "reasoning",
+          "text": "The user asked me to remember a nonce \"zebra-7134\" and now asks what it was. Reply with only the nonce.",
+          "time": {
+            "start": 1787482700733,
+            "end": 1787482701362
+          },
+          "id": "prt_02e457bbd001OAUQg5eWIEKVWM",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e45716c001uVyjsjR5Y99jjm"
+        },
+        {
+          "type": "text",
+          "text": "zebra-7134",
+          "time": {
+            "start": 1787482701365,
+            "end": 1787482701486
+          },
+          "id": "prt_02e457e35001q2qCgkqBm0TXqR",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e45716c001uVyjsjR5Y99jjm"
+        },
+        {
+          "reason": "stop",
+          "type": "step-finish",
+          "tokens": {
+            "total": 7822,
+            "input": 41,
+            "output": 28,
+            "reasoning": 9,
+            "cache": {
+              "write": 0,
+              "read": 7744
+            }
+          },
+          "cost": 0,
+          "id": "prt_02e457eb5001nfxjg2O7YAgm0s",
+          "sessionID": "ses_fd1baa02dffeRqK8HTSxGEhQDD",
+          "messageID": "msg_02e45716c001uVyjsjR5Y99jjm"
+        }
+      ]
+    }
+  ]
+}
