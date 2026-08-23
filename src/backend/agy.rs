@@ -221,7 +221,7 @@
 //! contract-tested, and is reachable by nothing yet.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::SyncSender;
@@ -293,6 +293,23 @@ const INIT_LINE_BUDGET: Duration = Duration::from_secs(30);
 /// [W1 P0.6] are stderr-only facts, and the first of them is the *sole*
 /// evidence that a tool was denied at 1.1.19.
 const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Wall-clock ceiling on [`AgyBackend::read_config_probe`]'s `-p "/config"`
+/// call. **Measured (W2, agy-registration wave): this call is not always
+/// zero-interaction the way the doc comment above it claims** — an
+/// unauthenticated `agy` (no cached credentials under the effective
+/// `settings_home`/`HOME`) answers it by printing an OAuth URL and blocking
+/// on an interactive login for up to 60s before giving up on its own. `run_probe`
+/// runs synchronously inside daemon registration (`daemon::start_with`,
+/// before the descriptor is published), so an unbounded wait here is exactly
+/// the class of regression this project already tracks for a blocking HTTP
+/// client built during registration — its subprocess analogue, on any host
+/// that has `agy` installed but not yet logged in. Five seconds is
+/// generous headroom over the sub-second reply a real, authenticated `agy`
+/// gave in measurement; a probe that cannot answer inside it is killed and
+/// treated exactly like any other probe failure — best-effort by
+/// construction either way.
+const CONFIG_PROBE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Cap on the in-memory accumulation of one turn's raw stdout before it is
 /// archived to the blob store (§20), and of its stderr. Every line is still
@@ -2038,21 +2055,58 @@ impl AgyBackend {
 
     /// The zero-quota `/config` read. Best-effort by construction: a CLI that
     /// cannot answer it is not refused, it is a CLI whose effective
-    /// configuration this adapter cannot report.
+    /// configuration this adapter cannot report. Bounded by
+    /// [`CONFIG_PROBE_BUDGET`] — see its doc for why an unbounded wait here is
+    /// not safe to run inside registration.
     fn read_config_probe(&self) -> ConfigProbe {
         let mut command = Command::new(&self.config.executable);
         command
             .args(["-p", "/config", "--output-format", "json"])
-            .stdin(Stdio::null());
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         apply_env(
             &mut command,
             &self.config.env,
             self.config.settings_home.as_deref(),
         );
-        let Ok(out) = command.output() else {
+        let Ok(mut child) = command.spawn() else {
             return ConfigProbe::default();
         };
-        serde_json::from_slice::<Value>(&out.stdout)
+        let Some(mut stdout) = child.stdout.take() else {
+            return ConfigProbe::default();
+        };
+        // Piped but deliberately unread here: a probe that never touches this
+        // is not a probe whose stderr this adapter has ever needed. Drained on
+        // its own thread purely so a child that writes to it does not block on
+        // (or SIGPIPE from) a closed pipe while this call is still waiting on
+        // stdout.
+        if let Some(mut stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut sink = Vec::new();
+                let _ = stderr.read_to_end(&mut sink);
+            });
+        }
+        let child = Arc::new(Mutex::new(child));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+        let stdout_bytes = match rx.recv_timeout(CONFIG_PROBE_BUDGET) {
+            Ok(buf) => buf,
+            Err(_) => {
+                // Most likely cause, per the measurement in `CONFIG_PROBE_BUDGET`'s
+                // doc: an unauthenticated `agy` blocked this call on an
+                // interactive login prompt. Killed and treated as any other
+                // probe failure — never propagated as a hang.
+                let _ = child.lock().expect("agy config-probe child lock").kill();
+                Vec::new()
+            }
+        };
+        let _ = child.lock().expect("agy config-probe child lock").wait();
+        serde_json::from_slice::<Value>(&stdout_bytes)
             .map(|value| decode_config_probe(&value))
             .unwrap_or_default()
     }

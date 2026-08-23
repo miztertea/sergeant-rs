@@ -13,10 +13,10 @@
 //! `sgt doctor` as the remedy, not a daemon started just to have something
 //! to report. Bare `sgt` (no subcommand) is a third thing again: a static
 //! homepage that never touches the daemon at all (ADR 0010). `sgt
-//! claude`/`codex`/`opencode`/`goose` are a fourth thing: they never reach
-//! the daemon either, because they never return to this process at all —
-//! they compose an environment and `exec` into the harness (ADR 0006, D2;
-//! see `crate::harness`).
+//! claude`/`codex`/`opencode`/`goose`/`agy` are a fourth thing: they never
+//! reach the daemon either, because they never return to this process at
+//! all — they compose an environment and `exec` into the harness (ADR 0006,
+//! D2; see `crate::harness`).
 //!
 //! Stale-descriptor policy (contract): endpoint refuses *and* PID is dead →
 //! stale, replace it; PID alive but endpoint unresponsive → ambiguous, fail
@@ -328,6 +328,13 @@ enum Command {
     /// claude` (ADR 0006, D2).
     Goose {
         /// Arguments to pass through to `goose`, verbatim, after `--`.
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Launch `agy` bound to this estate — the same passthrough as `sgt
+    /// claude` (ADR 0006, D2).
+    Agy {
+        /// Arguments to pass through to `agy`, verbatim, after `--`.
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -720,7 +727,7 @@ fn resolve_data_dir(
 ///
 /// Estate-scoped: `run`, `status`, `work *`, `respond`/`retry`/`extend`/
 /// `cancel`, `watch`, `analytics`, `tui`, `daemon`(+`stop`), `repo *`,
-/// `group *`, `workflow *`, and the four harnesses. Unscoped: bare `sgt`,
+/// `group *`, `workflow *`, and the five harnesses. Unscoped: bare `sgt`,
 /// `--help`, `--version`, `init`, `doctor` — nothing else.
 fn is_estate_scoped(command: &Command) -> bool {
     !matches!(command, Command::Doctor | Command::Init { .. })
@@ -1328,6 +1335,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             exec_harness("opencode", &args, &estate_root(&estate), &data_dir)
         }
         Command::Goose { args } => exec_harness("goose", &args, &estate_root(&estate), &data_dir),
+        Command::Agy { args } => exec_harness("agy", &args, &estate_root(&estate), &data_dir),
     }
 }
 
@@ -3314,7 +3322,7 @@ pub(crate) mod doctor {
     }
 
     /// ADR 0006's residual hole, named in the ADR and in proposal §5.2:
-    /// `sgt claude`/`codex`/`opencode`/`goose` only fix the environment for
+    /// `sgt claude`/`codex`/`opencode`/`goose`/`agy` only fix the environment for
     /// sessions that go through the front door. `sgt run` from a terminal
     /// that never did returns to #60. This is the complement the ADR names —
     /// issue #100 — checking the *current* process's own environment against
@@ -3331,7 +3339,7 @@ pub(crate) mod doctor {
             return Check::warn(
                 "environment",
                 "$HOME is not set — cannot check toolchain PATH enrichment",
-                "set HOME, or run through `sgt claude` (or codex/opencode/goose), which composes \
+                "set HOME, or run through `sgt claude` (or codex/opencode/goose/agy), which composes \
                  PATH before it needs HOME to be set at all",
             );
         };
@@ -3345,7 +3353,7 @@ pub(crate) mod doctor {
             Check::ok(
                 "environment",
                 "PATH already includes the toolchain directories `sgt claude` (and codex/\
-                 opencode/goose) compose — or none of them exist on this host",
+                 opencode/goose/agy) compose — or none of them exist on this host",
             )
         } else {
             let names: Vec<String> = missing.iter().map(|d| d.display().to_string()).collect();
@@ -3360,7 +3368,7 @@ pub(crate) mod doctor {
                     if names.len() == 1 { "is" } else { "are" },
                 ),
                 format!(
-                    "run this session through `sgt claude` (or codex/opencode/goose), which \
+                    "run this session through `sgt claude` (or codex/opencode/goose/agy), which \
                      composes PATH before exec'ing, or add {} to PATH yourself",
                     names.join(", ")
                 ),

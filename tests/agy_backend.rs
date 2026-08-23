@@ -49,9 +49,11 @@ use sergeant_rs::backend::{
     Backend, BackendError, BackendSignal, BindingSummary, ExecutionHandle, NativeState,
     Observation, ProbeReport, ResumeRequest, StartRequest,
 };
+use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::estate::InstructionPolicy;
 use sergeant_rs::domain::event::EventDraft;
 use sergeant_rs::domain::profile::Profile;
+use sergeant_rs::runtime::journal::Journal;
 
 mod support;
 
@@ -118,6 +120,7 @@ struct StubAgy {
     record: PathBuf,
     replay: PathBuf,
     config_answer: PathBuf,
+    config_hang: PathBuf,
     hang: PathBuf,
     stderr: PathBuf,
     exit_code: PathBuf,
@@ -132,6 +135,7 @@ impl StubAgy {
         let record = dir.join(format!("{name}-launches.txt"));
         let replay = dir.join(format!("{name}-replay.jsonl"));
         let config_answer = dir.join(format!("{name}-config.json"));
+        let config_hang = dir.join(format!("{name}-config-hang"));
         let hang = dir.join(format!("{name}-hang"));
         let stderr = dir.join(format!("{name}-stderr"));
         let exit_code = dir.join(format!("{name}-exit-code"));
@@ -146,7 +150,10 @@ impl StubAgy {
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo \"{version}\"; exit 0; fi\n\
              if [ \"$1\" = \"--help\" ]; then printf '%s\\n' \"{help}\" >&2; exit 0; fi\n\
-             if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"/config\" ]; then cat \"{config_answer}\"; exit 0; fi\n\
+             if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"/config\" ]; then\n  \
+               if [ -f \"{config_hang}\" ]; then exec sleep 60; fi\n  \
+               cat \"{config_answer}\"; exit 0\n\
+             fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$(printf '%s' \"$arg\" | tr '\\n' '|')\"; done;\n\
              env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
@@ -163,6 +170,7 @@ impl StubAgy {
             version = version,
             help = help,
             config_answer = config_answer.display(),
+            config_hang = config_hang.display(),
             record = record.display(),
             replay = replay.display(),
             stderr = stderr.display(),
@@ -181,6 +189,7 @@ impl StubAgy {
             record,
             replay,
             config_answer,
+            config_hang,
             hang,
             stderr,
             exit_code,
@@ -208,6 +217,18 @@ impl StubAgy {
     /// events must be observable *while the process is still running*.
     fn hangs_after_replay(&self) -> &Self {
         std::fs::write(&self.hang, b"hang\n").expect("write hang marker");
+        self
+    }
+
+    /// Makes the zero-quota `-p "/config"` read specifically hang — the
+    /// unauthenticated-CLI-blocks-on-an-interactive-login case
+    /// `CONFIG_PROBE_BUDGET`'s doc describes. Deliberately distinct from
+    /// `hangs_after_replay`: that marker is checked *after* the script's
+    /// recording arm, which the `/config` call never reaches (it returns from
+    /// its own arm first), so it cannot exercise `read_config_probe`'s
+    /// kill-on-timeout path at all.
+    fn hangs_on_config(&self) -> &Self {
+        std::fs::write(&self.config_hang, b"hang\n").expect("write config-hang marker");
         self
     }
 
@@ -627,6 +648,40 @@ fn an_unreadable_config_probe_is_reported_not_refused() {
             .detail
             .expect("detail")
             .contains("cannot report the harness's effective permission configuration")
+    );
+}
+
+/// The regression `CONFIG_PROBE_BUDGET` exists to prevent: an unauthenticated
+/// `agy` blocks the `/config` read on an interactive login prompt. This must
+/// never become an unbounded wait inside `daemon::start_with` — the exact
+/// class of registration-time hang this project's CI/CD sprint already
+/// tracked once for a blocking HTTP client (0.2.2 regression, commit
+/// c46152a2), now with a subprocess in place of a transport.
+#[test]
+fn a_hung_config_probe_is_killed_within_budget_and_falls_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    stub.hangs_on_config();
+    let backend = AgyBackend::new(config_for(&stub, dir.path()));
+    let started = Instant::now();
+    let report = backend.probe();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "read_config_probe must be bounded by CONFIG_PROBE_BUDGET (5s), not the stub's \
+         60s hang: probe() took {elapsed:?}"
+    );
+    assert!(
+        report.available,
+        "a killed /config read is a best-effort miss, never a refusal"
+    );
+    assert!(
+        report
+            .detail
+            .expect("detail")
+            .contains("cannot report the harness's effective permission configuration"),
+        "a timed-out config probe must fall back to the same ConfigProbe::default() detail \
+         as an unreadable one"
     );
 }
 
@@ -1983,4 +2038,99 @@ fn live_agy_resume_recalls_a_nonce_and_echoes_the_same_conversation_id() {
             .any(|e| e.payload["phase"] == serde_json::json!("resume_identity_mismatch")),
         "a real resume must raise no identity mismatch"
     );
+}
+
+// ------------------------------------------------------- W2 §1.4: registration
+
+/// A probeable agy registers for real: `daemon::start_with`, with no
+/// test-supplied stand-in for the name "agy", puts a real `AgyBackend`
+/// in its registry and journals its own probe evidence at registration
+/// — the direct proof of W2's registration change, not a repeat of any
+/// unit test on `AgyBackend` itself.
+#[tokio::test]
+async fn daemon_start_registers_agy_and_journals_its_own_probe() {
+    let data = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(data.path());
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(sergeant_rs::backend::BackendRegistry::new()),
+            default_backend: None,
+            agy: Some(config_for(&stub, data.path())),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start with an unmeasured-nothing agy must still start");
+    handle.shutdown().await;
+
+    let probed: Vec<_> = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == daemon::KIND_BACKEND_PROBED)
+        .collect();
+    let agy_probed = probed
+        .iter()
+        .find(|e| e.payload["backend"] == AGY_BACKEND_NAME)
+        .expect("a backend.probed record for agy");
+    assert_eq!(agy_probed.payload["available"], true);
+    assert_eq!(agy_probed.payload["runtime_scope"], "per_execution");
+    assert_eq!(agy_probed.payload["capabilities"]["ask"], false);
+    assert_eq!(
+        agy_probed.payload["capabilities"]["persistent_sessions"],
+        true
+    );
+    assert_eq!(
+        agy_probed.payload["capabilities"]["native_background"],
+        false
+    );
+    assert_eq!(agy_probed.payload["capabilities"]["streaming"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["history"], false);
+    assert_eq!(agy_probed.payload["capabilities"]["resume"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["interrupt"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["model_selection"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["profiles"], true);
+    assert_eq!(agy_probed.payload["capabilities"]["approval_flow"], false);
+    assert_eq!(agy_probed.payload["capabilities"]["human_attach"], false);
+    assert_eq!(agy_probed.payload["capabilities"]["usage"], true);
+    assert_eq!(
+        agy_probed.payload["capabilities"]["native_subagents"],
+        false
+    );
+}
+
+/// Agy missing must not break daemon startup, and must be
+/// distinguishable from "unregistered": it registers anyway and
+/// journals honest, `available: false` evidence naming why it cannot
+/// run — the same posture Docker/Codex/Opencode already take for a
+/// host with no binary installed.
+#[tokio::test]
+async fn daemon_start_with_no_agy_installed_still_starts_and_says_why() {
+    let data = TempDir::new().expect("tempdir");
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(sergeant_rs::backend::BackendRegistry::new()),
+            default_backend: None,
+            agy: Some(AgyConfig {
+                executable: PathBuf::from("/nonexistent/definitely-not-agy"),
+                ..AgyConfig::new(data.path())
+            }),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("a host with no agy binary must still start a daemon");
+    handle.shutdown().await;
+
+    let agy_probed = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .find(|e| e.kind == daemon::KIND_BACKEND_PROBED && e.payload["backend"] == AGY_BACKEND_NAME)
+        .expect("agy is registered — and probed — even though it cannot run");
+    assert_eq!(agy_probed.payload["available"], false);
+    let detail = agy_probed.payload["detail"]
+        .as_str()
+        .expect("probe detail recorded");
+    assert!(detail.contains("cannot run"), "{detail}");
 }

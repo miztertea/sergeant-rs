@@ -1803,10 +1803,18 @@ async fn t7_routing_precedence_and_structured_failure() {
     // `start_with` always registers the real docker adapter unless the
     // config already names one (N4), the same way it always adds claude
     // unless the config pre-empts it — none of these three fakes is named
-    // "docker", so nothing pre-empts it here.
+    // "docker", so nothing pre-empts it here. "agy" is present too, since
+    // the agy-adapter sprint's own W2, for the identical reason.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME, "opencode"])
+        json!([
+            "agy",
+            "claude",
+            "codex",
+            "docker",
+            FAKE_BACKEND_NAME,
+            "opencode"
+        ])
     );
     plain_handle.shutdown().await;
 
@@ -1822,13 +1830,13 @@ async fn t7_routing_precedence_and_structured_failure() {
     assert_eq!(status, 422, "unroutable work must be refused: {body}");
     assert_eq!(body["error"]["code"], "no_backend_selected");
     // The scripted fake occupies the "claude" slot, so the daemon adds
-    // nothing there — but it still adds the real docker, codex, and opencode
-    // adapters (N4/W2, nothing here is named "docker", "codex", or
-    // "opencode"): opencode is now the fourth real adapter the daemon
-    // registers by default, same as docker and codex.
+    // nothing there — but it still adds the real docker, codex, opencode,
+    // and agy adapters (N4/W2/agy-W2, nothing here is named "docker",
+    // "codex", "opencode", or "agy"): agy is now the fifth real adapter the
+    // daemon registers by default, same as docker, codex, and opencode.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", "docker", "opencode"])
+        json!(["agy", "claude", "codex", "docker", "opencode"])
     );
     assert!(
         body["error"]["message"]
@@ -2067,13 +2075,20 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     .await;
     assert_eq!(status, 422, "must be refused: {body}");
     assert_eq!(body["error"]["code"], "backend_not_found");
-    // The daemon registers the real Claude, Codex, Docker, and Opencode
-    // adapters alongside the scripted fake, so the options list names all
-    // five; "goose" is still never registered, which is exactly why naming
-    // it fails.
+    // The daemon registers the real Claude, Codex, Docker, Opencode, and
+    // Agy adapters alongside the scripted fake, so the options list names
+    // all six; "goose" is still never registered, which is exactly why
+    // naming it fails.
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME, "opencode"])
+        json!([
+            "agy",
+            "claude",
+            "codex",
+            "docker",
+            FAKE_BACKEND_NAME,
+            "opencode"
+        ])
     );
     assert!(fake.starts().is_empty(), "no silent provider substitution");
     let list = get(&client, &handle, "/v1/work").await;
@@ -4706,12 +4721,20 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     assert_eq!(body["error"]["code"], "backend_not_found");
     // Since M4 the daemon registers the real claude adapter alongside the
     // scripted fake, since N4 the docker adapter too, since W2 the codex
-    // adapter as well, and since the opencode-adapter sprint's own W2 the
-    // opencode adapter too (registered names sort: claude, codex, docker,
-    // fake, opencode).
+    // adapter as well, since the opencode-adapter sprint's own W2 the
+    // opencode adapter too, and since the agy-adapter sprint's own W2 the
+    // agy adapter as well (registered names sort: agy, claude, codex,
+    // docker, fake, opencode).
     assert_eq!(
         body["error"]["available_backends"],
-        json!(["claude", "codex", "docker", FAKE_BACKEND_NAME, "opencode"])
+        json!([
+            "agy",
+            "claude",
+            "codex",
+            "docker",
+            FAKE_BACKEND_NAME,
+            "opencode"
+        ])
     );
 
     // Only two works exist: the refusal created none.
