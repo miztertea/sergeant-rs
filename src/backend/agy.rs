@@ -407,7 +407,7 @@ pub struct AgyConfig {
     /// state (or symlink it) will fail authentication. That is the operator's
     /// call to make, and the probe detail says so.
     pub settings_home: Option<PathBuf>,
-    /// Override for [`INIT_LINE_BUDGET`], `None` in every production path. A
+    /// Override for `INIT_LINE_BUDGET`, `None` in every production path. A
     /// per-instance field rather than an environment variable, for the reason
     /// `CodexConfig::thread_id_budget` documents: each test builds its own
     /// config, so a shrunk budget can never leak into another test's
@@ -2901,8 +2901,8 @@ impl Backend for AgyBackend {
     }
 
     /// Capabilities as measured at 1.1.19. Every `true` names a contract test
-    /// in [`ADMISSION_ROWS`] (L8, made structural by
-    /// [`tests::admission_rows_agree_with_capabilities`]); every `false` names
+    /// in `ADMISSION_ROWS` (L8, made structural by the module's own
+    /// `tests::admission_rows_agree_with_capabilities`); every `false` names
     /// its reason in the same row.
     ///
     /// `history: false` is the row that differs from opencode's: agy has **no
@@ -3173,7 +3173,7 @@ impl Backend for AgyBackend {
     /// conversation. So `Ok` from RESUME is a weaker claim here than there: it
     /// says this adapter now owns the id and will compose `--conversation` with
     /// it, and the durable-context check is deferred to the first subsequent
-    /// SEND — where [`TurnReader::resume_mismatch`] fails the turn closed if
+    /// SEND — where `TurnReader::resume_mismatch` fails the turn closed if
     /// the `init` line echoes a different id (W1 P0.6's silent fork). Said
     /// plainly rather than papered over.
     ///
