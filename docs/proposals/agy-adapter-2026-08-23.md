@@ -67,8 +67,9 @@ invocations pin `--model gemini-3.7-flash-low`** (K1).
   `conversation_id`, the effective `model`, the full tool roster, and
   the effective permission mode before any model output (probe 1) —
   native launch-time pin verification, better than claude's post-hoc
-  modelUsage and than codex/opencode's substitution-undetectable
-  posture. Per-step usage {input/output/thinking/cache_read/total}
+  modelUsage, opencode's post-hoc export/response verification
+  (substitution detectable, after the turn — its own rows' words), and
+  codex's genuinely substitution-undetectable posture. Per-step usage {input/output/thinking/cache_read/total}
   rides every step (probe 1). Both are R4 delta candidates.
 - **Default print mode auto-DENIES tool permissions and the whole turn
   errors** (typed TOOL_ERROR, terminal `status:"ERROR"`, exit 1, ~4.5s,
@@ -148,8 +149,11 @@ test, transport-tagged rows from day one):
   process death with no terminal → fail-closed ambiguous with raw
   evidence (§15). The 1.1.16 changelog class (empty-success on a
   dropped stream) argues for a completeness check on SUCCESS
-  terminals: a SUCCESS with no response and no steps is suspicious,
-  recorded honestly.
+  terminals: a SUCCESS with no response and no steps is suspicious.
+  Consequence specified (panel amendment, 2026-08-23): such a terminal
+  classifies **fail-closed ambiguous with raw evidence — never
+  completed-clean**, pinned by a StubAgy fixture replaying the
+  dropped-stream shape.
 - interrupt: process-group termination (the probe-11 grandchild
   lesson, carried); W1's probe answers the SIGKILL-mid-turn class
   (terminal event? conversation resumable? orphaned children?).
@@ -157,9 +161,20 @@ test, transport-tagged rows from day one):
   a permission config reaches the run without dirtying the Work's own
   diff (the file is user-global; workspace/env override unmeasured) —
   and resolves the soft-deny discrepancy, both with recorded answers.
-  If no clean channel exists, W1 ships with agy's defaults (auto-deny,
-  measured non-blocking) and records the finding; the blanket
-  dangerous flag is never a default.
+  **Shipping on agy's defaults is NOT a viable fallback for
+  tool-bearing stages** (panel amendment, 2026-08-23): probe 2
+  measured default `request-review` auto-denying the tool AND erroring
+  the whole turn — an adapter on defaults cannot execute any tool. The
+  honest ladder: (a) a measured clean injection channel (env var,
+  workspace-level settings, flag) → use it, mapping the Work's
+  declared mutation surface onto the `permissions` namespaces; (b) no
+  clean channel measured → the adapter documents the operator-config
+  requirement, and PREPARE/LAUNCH reads the **effective
+  `permission_mode` off the init line** (measured, probe 1) so a
+  tool-bearing intent launching under a denying mode is reported
+  honestly at launch, not discovered as a mid-run turn error. Either
+  outcome rides the head-PR ratify list; the blanket dangerous flag is
+  never a default.
 - version provenance, not gate (R1): probe records `agy --version`
   (bare token); 1.1.17 is the measured floor; below → available with
   unmeasured-provenance detail. Unparseable version or missing
@@ -174,8 +189,14 @@ test, transport-tagged rows from day one):
   measurement** — headless is stateless by default and no export verb
   is documented; unlike opencode there is no cheap true here, and §15
   forbids emulation; ask/approval_flow/native_subagents/
-  native_background/human_attach false pending W3. `--print-timeout`
-  expiry shape is a W1 probe (adapter-local detail, no v1 boolean).
+  native_background/human_attach false pending W3; **`profiles`**
+  (panel amendment, 2026-08-23 — all 13 contract booleans now
+  accounted): candidate via `--agent` + the custom-agent definition
+  mechanism (doc-claimed; `agy agents` printed an empty list on this
+  host — probe), true only if a W1 admission test measures a defined
+  agent altering the launch (opencode's precedent), else false with
+  the probe recorded. `--print-timeout` expiry shape is a W1 probe
+  (adapter-local detail, no v1 boolean).
 - Contract tests: `tests/agy_backend.rs` — StubAgy shell-script
   stand-in + fixtures recorded at 1.1.17 for the deterministic tier;
   live tier `#[ignore]`d + `SERGEANT_AGY_TESTS=1` + probe/auth
@@ -261,7 +282,12 @@ Capability upgrades, each landing only with its live admission row:
   0.2.2 precedent: measure per wave, lift before finalize).
 - Doctrine: ADR 0022 (the agy adapter — transports, the soft-deny
   discrepancy's resolution, the sandbox stance, R4 deltas, the
-  complete K2 exception ledger); `docs/DEVELOPMENT.md` backend list;
+  complete K2 exception ledger); **the NORTH-STAR amendment-4 outcome
+  is W4's assigned writing task** (panel amendment): if W3 measured a
+  real nsjail enforcement mechanism, W4 appends the dated amendment-4
+  claim at codex's "enforcement-claimed, not locally proven" tier; if
+  not, ADR 0022 records honest silence — the decision is written
+  either way, not left implicit. `docs/DEVELOPMENT.md` backend list;
   CHANGELOG 0.2.3; README quickstart line.
 - Finalize: version 0.2.3 (K3), retro, head PR un-drafted. Proof: the
   agy contract suite green against the installed harness ON the PR;
@@ -278,7 +304,10 @@ Capability upgrades, each landing only with its live admission row:
 3. The sandbox stance (amendment-4 claim or honest silence).
 4. The soft-deny discrepancy's resolution and any terminal-classifier
    consequence.
-5. ADR 0022's text.
+5. The permission-injection channel shipped — or, if no clean channel
+   measured, the documented operator-config requirement plus the
+   launch-time permission-mode honesty check (panel amendment).
+6. ADR 0022's text.
 
 ## Risks
 
@@ -301,3 +330,19 @@ Capability upgrades, each landing only with its live admission row:
   measurement finds it unfit (deadlocks, no mid-turn events on
   stdin), every W3 candidate falls back to print mode and the ADR
   records why; the sprint still ships parity on W1's transport.
+
+## Plan-review record (2026-08-23, pre-W1)
+
+Owner-directed panel review before any wave ran: blind 4-axis panel
+(evidence grounding, doctrine/template fidelity, technical soundness,
+completeness/risk) + one adversarial refuter per finding, default
+refuted — all sonnet. 12 raw findings, 5 confirmed, 7 refuted with
+recorded reasons. The five confirmed amendments are applied in place
+above, each marked "(panel amendment, 2026-08-23)": the opencode
+model_selection mischaracterization corrected; the permission-fallback
+"ship with defaults" defect (blocking — probe 2 shows defaults error
+every tool-bearing turn) replaced with the honest two-rung ladder and
+a launch-time permission-mode check; the empty-SUCCESS completeness
+check given its fail-closed classification consequence and fixture;
+`profiles` added so all 13 contract booleans are accounted; the
+NORTH-STAR amendment-4 outcome assigned to W4 as a writing task.
