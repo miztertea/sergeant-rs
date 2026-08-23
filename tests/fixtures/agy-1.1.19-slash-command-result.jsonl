@@ -1,0 +1,2 @@
+{"event":"command_result","command":{"name":"permissions","data":{"permissions":[{"scope":"project"},{"scope":"shared"},{"scope":"global"}]}}}
+{"event":"result","result":{"conversation_id":"","status":"SUCCESS","response":"","duration_seconds":0,"num_turns":0,"usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0},"command":{"name":"permissions","data":{"permissions":[{"scope":"project"},{"scope":"shared"},{"scope":"global"}]}}}}
