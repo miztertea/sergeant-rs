@@ -12,6 +12,189 @@ released before a release can proceed.
 
 (nothing yet)
 
+## [0.2.1] - 2026-08-23
+
+Content-only release: the distro content rebuild commissioned 2026-08-22
+(`docs/proposals/distro-content-2026-08-22.md`; design record and every
+ratified item at `sergeant-rs-workspace/knowledge/evidence/resources/
+distro-content-series/design-proposal-2026-08-22.md`). Zero engine-behavior
+change: every content byte in this release lives under `skills/`,
+`.sergeant/workflows/`, `.sergeant/common/contexts/`, `.sergeant/index.md`,
+or `AGENTS.md`; `git diff --stat main -- src/ .github/` is empty, and this
+section's own version bump is the only `Cargo.toml`/`Cargo.lock` edit. The
+embedded `software-change` default loop is untouched — see "Deferred"
+below for why, and why this release is 0.2.1, not the sprint plan's
+originally proposed 0.3.0.
+
+### Workflow catalog rebuilt: 19 published workflows -> 7
+
+Owner ruling (2026-08-22), from direct knowledge of the estate's own
+history: "I never guided to select any other workflows because the ones we
+had never applied or sucked. They're like one stage or fragile." Sixty of
+the estate's own sixty-one dispatched Works ran the engine's embedded
+default and never selected a published workflow; nine of the nineteen fail
+the owner's own stated bar — genuinely multi-stage and robust — on
+inspection. The rebuild is ratified; every surviving and new package
+states a robustness argument: what each stage boundary buys under crash or
+stall, which stage attacks the previous stage's output, and what happens
+when a stage cannot complete.
+
+- **`implement-change`** (9 stages) — the flagship. Orient, baseline,
+  implement, validate, a 4-axis panel (spec-fidelity, invariants,
+  simplicity, test-honesty) run as isolated sub-agent seats spawned in one
+  message, per-axis refuters defaulting to refuted, fix on confirmed
+  findings only, re-verify over the fix commits, close. Absorbs
+  `implement` and `worker-mission`.
+- **`fix-defect`** (8 stages) — reproduce-first, hard-gated: no edit until
+  the defect reproduces; then hypothesize, instrument, fix with a
+  regression test, and the same panel -> refute -> re-verify chain.
+  Reshaped from `diagnose-bug` (6 stages, name changed); it remains the
+  only workflow a live Work has ever bound.
+- **`investigate`** (6 stages) — frame a bounded question with a stated
+  stopping condition, fan out N isolated evidence seats, synthesize one
+  cited document, challenge it with a refuter, record, close. Absorbs
+  `research` (shipped as a single stage) and `wayfinder` minus its
+  `00-name-destination` stage, deleted rather than carried forward:
+  naming a destination needs a live interview, which R-NS-6 places in
+  Captain, before dispatch, never in a dispatched stage.
+- **`review-change`** (6 stages) — the standalone, read-only panel for a
+  diff arriving from outside a Work: pin the revision, identify the spec
+  source, run the 4-axis panel, refute, independently verify each
+  survivor against current state, emit a typed finding set. Never fixes.
+  Reshaped from `code-review` (4 stages, 2 axes).
+- **`remediate-findings`** (6 stages, new) — consumes an approved typed
+  finding set and accounts for every one: verify against current state,
+  dispose (accept/reject/supersede, with a reason), fix accepted findings
+  only, re-verify over the fix commits, and a disposition matrix proving
+  nothing was silently dropped.
+- **`author-document`** (6 stages, new) — a document as the deliverable,
+  fidelity to the brief as the top-weighted review axis. Absorbs
+  `record-decisions` as a named profile section — a section, not a
+  construct, since sergeant has no profile mechanism yet (filed as an
+  engine ask, not silently assumed).
+- **`validate-and-ship`** (7 stages, `version: 3`) — kept and reshaped in
+  place: the one shipping invariant in the catalog, and the ancestor of
+  `review-change`'s never-edit rule.
+
+### Eighteen retired
+
+`code-review`, `cross-repo-work`, `deepen-module`, `diagnose-bug`,
+`dispatch`, `implement`, `prototype`, `record-decisions`,
+`recover-stalled-worker`, `repo-to-icm`, `research`,
+`resolving-merge-conflicts`, `to-tickets`, `triage`, `validate-intent`,
+`vet-external-skill`, `wayfinder`, `worker-mission`. Every disposition and
+its reason is recorded in `.sergeant/index.md`'s retirement log; each
+package's full content survives in git history. Two dispositions named
+here because they cost something rather than merely tidying:
+
+- **`dispatch`'s retirement removes the only place safety-sensitive
+  keyword routing (auth/secrets/payments/migrations/production) lived.**
+  This release does not replace it. Named as a live gap on the head PR's
+  ratify list, not silently absorbed.
+- **`repo-to-icm` relocates rather than retires** — to
+  `sergeant-rs-workspace/.sergeant/local/workflows/`, this project's own
+  doctrine-bootstrapping tool and never a product capability — and takes
+  with it the library's only `kind = "execute"` stage. This library no
+  longer exercises that stage kind anywhere.
+
+### Captain's kernel: 5 published skills -> 14
+
+Three ship byte-identical (`grilling`, `estate-navigation`,
+`sergeant-help` — edition bump only). Eleven are new or reshaped:
+`orient`, `brainstorm`, `clarify-intent`, `scope-intent`,
+`define-acceptance` (absorbing `validate-intent`'s eight-dimension check
+as an in-dialogue review — the cost is independence, stated rather than
+hidden), `decide` (carrying the one-question-per-turn discipline),
+`decompose`, **`select-workflow`** (reads `.sergeant/index.md` live, never
+restates it, and leaves a dated selection record naming what was passed
+over and why — the direct answer to the sixty unrecorded choices above),
+**`plan-sprint`** (the three-sprint-proven method, codified with its
+engine caveat stated honestly: its recon and panel seats are harness
+sub-agents, not Sergeant Works, until child-workflow dispatch lands),
+`review-outcome`, `retrospective`. `to-spec` and `grill-with-docs` retire
+into their successors.
+
+### AGENTS.md: the dispatch-time discipline
+
+- The `## Trigger -> skill/workflow routing table`'s dispatch row now
+  names **Captain**, not the `sgt run` command, as the workflow selector —
+  correcting the cell the sixty unrecorded selections trace back to.
+- New stable-operating-invariant text: "Before any `sgt run`, consult
+  `.sergeant/index.md` and name the workflow you selected. Omitting
+  `--workflow` binds the embedded default loop; that is a selection and
+  must be stated as one... An unnamed default is not a selection."
+- "**Captain owns ambiguity. Sergeant owns completion.**" stated beside
+  `R-NS-6`, which remains the enforcing rule where the two could disagree.
+
+### Contexts
+
+`.sergeant/common/contexts/` gains nine reusable stage contexts (shared
+panel/refute/fan-out-evidence/pin-fixed-point/identify-spec-source/
+resolve-conflicts machinery, authored once instead of re-derived per
+package) and four policy contexts: `test-first` (consolidating `tdd.md`
+and `test-quality.md`, both deleted this release, closing a dangling
+reference to the already-retired `tdd` package that had stood since
+ICM-R3), `independent-review`, `evidence-requirements`, and
+`model-assignment` — the last un-copy-pasted from three separate sprint
+plans' identical paragraph.
+
+### Fixed (docs)
+
+- `docs/glossary.md`'s Placement Ladder citation pointed at
+  `.sergeant/workflows/repo-to-icm/_config/icm-ladder.md`, a path this
+  release's `repo-to-icm` relocation removes from this repository;
+  repointed to the file's new home in `sergeant-rs-workspace`.
+- `NORTH-STAR.md`'s cross-repo delivery-ordering gap named the now-retired
+  `cross-repo-work` workflow as its current home; repointed to
+  `scope-intent`'s `targets.dependency_order` field, the claim's actual
+  owner since the dissolution (the underlying gap — no engine-side
+  dependency contract — is unchanged and still open).
+- `README.md`'s workflow-directory illustration and catalog summary named
+  `software-change` as an on-disk package and six retired workflows
+  (`code review`, `research`, `prototyping`, `cross-repository work`,
+  `intent validation`, `decision recording`) as the shipped set; both now
+  show the real seven, and the illustration uses `implement-change`, the
+  package actually on disk.
+- `edition` front matter aligned to `0.2.1` across all 21 shipped
+  templates (was a mix of `0.2.0` and one `0.1.0` outlier). Cosmetic —
+  `sgt init`/update always stamps the running binary's own version at
+  write time regardless of the checked-in value (ADR 0016) — fixed
+  because it was odd on sight, per W2's own ratify list.
+
+### Deferred (ratified at kickoff, not executed this release)
+
+The kickoff ruling retired the embedded `software-change` default outright
+("an old way of ensuring there's at least one workflow"; unspecified
+`--workflow` becomes bare intent execution) and granted the one
+engine-code exception that requires. **This sprint does not execute that
+retirement.** The owner's own scope ruling — "the only changes here should
+be to workflows/, skills/, and AGENTS.md" — bounds this sprint's diff to
+content, and a real `src/domain/workflow.rs` fallback change plus a
+`src/workflows/software-change/` deletion do not fit inside that boundary
+regardless of what the kickoff separately ratified. W2's spec deferred the
+retirement to a future release that actually touches `src/`; it remains
+ratified and outstanding, carried on this release's own ratify list (see
+the head PR). **This release's version number reflects the deferral**:
+`0.2.1`, a content-only patch — not the sprint plan's originally proposed
+`0.3.0`, which priced in the retirement this release does not ship.
+
+### Ratify-at-review (owner, at the head PR)
+
+Carried forward from W2 §8 and W3, restated here for the release record:
+the `tests/f_doctrine_skew.rs` edit (a fourth surface touched, under the
+plan's existing test rider); the two homeless-policy homes
+(`test-first`/`model-assignment` in shared contexts, AGENTS.md pointing
+rather than restating); the safety-sensitive routing gap `dispatch`'s
+retirement opens with no replacement; the `record-decisions` profile
+section standing in for a profile construct sergeant does not have yet
+(J.11); the `.sergeant/lib/` relocation and the finalize ruling (no
+shipped stage invokes a helper `sgt init` does not write); the unmeasured
+panel budget (four seats plus four refuters in one stage, against a
+two-seat precedent) — this release's proof obligations are on the head
+PR, not executed here (W4 is finalize, not proof; see the head PR's own
+scope note); and this section's own version-number correction (0.2.1, not
+the plan's 0.3.0) and the still-outstanding embedded-default retirement.
+
 ## [0.2.0] - 2026-08-22
 
 Sergeant speaks Codex: a second native backend, selectable the same way
