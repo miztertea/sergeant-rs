@@ -527,15 +527,25 @@ struct AdmissionRow {
     tier: &'static str,
     evidence: Evidence,
     /// The exact test name backing a `claimed: true`, or `""` when `claimed` is
-    /// `false` (the structural reason lives in `note`).
+    /// `false` (the structural reason lives in `note`). The name must resolve to
+    /// a `fn` in this module or in `tests/agy_backend.rs`;
+    /// `tests::every_admission_test_name_resolves_to_a_real_test` enforces it.
     admission_test: &'static str,
     note: &'static str,
 }
 
-/// The wave's own ledger. [`tests::admission_rows_agree_with_capabilities`] is
-/// the structural check that keeps it honest: a `claimed: true` with no
-/// `admission_test` fails the build, and so does a row whose `Evidence` tier
-/// disagrees with whether its named test is a `live_agy_*` one.
+/// The wave's own ledger. Three structural checks keep it honest, and each
+/// fails the build rather than a review:
+///
+/// - `tests::admission_rows_agree_with_capabilities` — a `claimed: true` with
+///   no `admission_test` (and an unclaimed row that names one) is a build
+///   failure, as is a row whose `claimed` disagrees with [`Backend::capabilities`];
+/// - `tests::every_admission_test_name_resolves_to_a_real_test` — the name is
+///   read back against the text of this module and of `tests/agy_backend.rs`, so
+///   a typo'd or later-renamed `admission_test` cannot sit here citing a test
+///   that does not exist;
+/// - `tests::a_claimed_row_naming_a_live_test_is_labelled_live_measured` — the
+///   `Evidence` tier must agree with whether the named test is a `live_agy_*` one.
 const ADMISSION_ROWS: &[AdmissionRow] = &[
     AdmissionRow {
         capability: "persistent_sessions",
@@ -4476,6 +4486,46 @@ mod tests {
             v1.len() + adapter_local.len(),
             "every row is one of the thirteen v1 flags or one of the four adapter-local rows — \
              an unlisted row is a claim nothing checks"
+        );
+    }
+
+    /// This module's own source, and the integration suite's — the only two
+    /// places an `admission_test` name may resolve. Reading them as text is how
+    /// [`every_admission_test_name_resolves_to_a_real_test`] turns "the ledger
+    /// cites a real test" from a claim in a commit message into something the
+    /// build enforces (the same trick `tests/coverage_stage_membership.rs` uses
+    /// on suite wiring). `include_str!` of this very file is deliberate.
+    const THIS_MODULE_SOURCE: &str = include_str!("agy.rs");
+    const INTEGRATION_SUITE_SOURCE: &str = include_str!("../../tests/agy_backend.rs");
+
+    /// The gap the template left open: [`admission_rows_agree_with_capabilities`]
+    /// checks that a claimed row *names* a test, never that the name resolves,
+    /// so a typo or a later rename would keep passing while the ledger cited a
+    /// test that does not exist — the exact failure mode this wave's rules call
+    /// disqualifying. This closes it mechanically.
+    #[test]
+    fn every_admission_test_name_resolves_to_a_real_test() {
+        let mut checked = 0usize;
+        for row in ADMISSION_ROWS {
+            if row.admission_test.is_empty() {
+                continue;
+            }
+            let definition = format!("fn {}(", row.admission_test);
+            assert!(
+                THIS_MODULE_SOURCE.contains(&definition)
+                    || INTEGRATION_SUITE_SOURCE.contains(&definition),
+                "{}: admission_test `{}` names no `{definition}` in src/backend/agy.rs or \
+                 tests/agy_backend.rs — a ledger row citing a test that does not exist is the \
+                 defect the last sprint's panel caught",
+                row.capability,
+                row.admission_test
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            ADMISSION_ROWS.iter().filter(|row| row.claimed).count(),
+            "every claimed row owes a resolvable test name, and only claimed rows carry one"
         );
     }
 
