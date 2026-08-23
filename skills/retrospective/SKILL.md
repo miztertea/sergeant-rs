@@ -38,10 +38,6 @@ intent.
   it one.
 - Fabricate a timeline from memory when the actual artifacts (journal,
   PRs, panel results) are available to read instead.
-- Run via `sgt run` or any durable Work dispatch — this skill's defining
-  behavior is a live discussion this session holds.
-- Present an unconfirmed, harness-degraded best guess as a closed
-  retrospective; say so plainly instead.
 
 ### Durable handoff
 The retrospective document, when the human wants one kept; otherwise

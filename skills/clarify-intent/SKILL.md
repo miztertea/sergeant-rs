@@ -44,8 +44,6 @@ own inherited constraint.
 - Run via `sgt run` or any durable Work dispatch — the entire procedure
   depends on this conversation's own content, which a dispatched
   execution cannot receive.
-- Present an unconfirmed, harness-degraded best guess as a settled
-  outcome/problem statement; say so plainly instead.
 
 ### Durable handoff
 A precise outcome/problem statement, consumed by

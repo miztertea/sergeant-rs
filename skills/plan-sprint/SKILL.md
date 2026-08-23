@@ -130,11 +130,6 @@ copy-pasted-into-every-plan defect this kernel exists to stop repeating.
   that reason.
 - Re-copy the model-assignment policy text inline — name
   `.sergeant/common/contexts/model-assignment.md` instead.
-- Run this skill's own planning/rulings turns via `sgt run` or any
-  durable Work dispatch — the load-bearing moments are owner rulings made
-  live, in conversation.
-- Present an unconfirmed, harness-degraded best guess as a ratified
-  ruling; say so plainly instead.
 
 ### Durable handoff
 The sprint-plan document itself (with panel amendments folded in as

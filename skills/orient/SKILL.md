@@ -46,11 +46,6 @@ mechanical question is the open one.
 - Treat "we both used the same nouns" as sufficient without confirming
   the immediate decision in view.
 - Proceed to `brainstorm`/`clarify-intent` before the model check closes.
-- Run via `sgt run` or any durable Work dispatch — this skill's defining
-  behavior is a live turn this session holds, which a dispatched Work
-  cannot receive.
-- Present an unconfirmed, harness-degraded best guess as a reached shared
-  model; say so plainly instead.
 
 ### Durable handoff
 None — the shared model is consumed in-session by whatever skill runs

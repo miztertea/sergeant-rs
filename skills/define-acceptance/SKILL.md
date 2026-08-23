@@ -54,10 +54,6 @@ dropped.
   "'tests passed' is not completion" evidence-requirement policy, homed
   at `.sergeant/common/contexts/evidence-requirements.md`, is named by
   pointer here, not restated.
-- Run via `sgt run` or any durable Work dispatch — this skill's dialogue
-  walk is a live, in-conversation call.
-- Present an unconfirmed, harness-degraded best guess as final acceptance
-  criteria; say so plainly instead.
 
 ### Durable handoff
 Drafted acceptance criteria on the intent that reaches `sgt run`, or a

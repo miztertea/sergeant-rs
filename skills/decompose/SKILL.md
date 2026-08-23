@@ -35,10 +35,6 @@ ready for `select-workflow`.
   stage content.
 - Dispatch any child intent itself — that is `select-workflow`'s and
   ultimately `sgt run`'s job, downstream of this skill's output.
-- Run via `sgt run` or any durable Work dispatch itself — the confirmation
-  gate this skill ends on is a live turn.
-- Present an unconfirmed, harness-degraded decomposition as an approved
-  one; say so plainly instead.
 
 ### Durable handoff
 The set of child intents and their declared dependency order, carried

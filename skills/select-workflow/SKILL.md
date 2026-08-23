@@ -9,14 +9,6 @@ discipline this skill's own output satisfies ("consult
 `.sergeant/index.md` and name the workflow you selected... An unnamed
 default is not a selection").
 
-*(Note on this file's own provenance: the spec commissioning this skill
-pointed to "full specification at §2" of that spec document for this
-skill's detailed content; that document's actual §2 is its `AGENTS.md`
-edits section and carries no further `select-workflow` procedure beyond
-the summary reproduced below. This skill's content is therefore authored
-from that summary plus the §1.0 shape every skill in this kernel carries,
-not from a missing longer section.)*
-
 ## When to use
 
 An intent is ready to leave the conversation and needs a workflow,
@@ -31,7 +23,18 @@ loop named honestly when nothing published fits — the embedded
 citable outcome of this skill, not a failure of it); the applicable
 shared-context policies for the work in view; and a delivery posture. The
 human may override the recommendation. Produce a **dated selection
-record** naming what was passed over and why.
+record** naming what was passed over and why, in this shape:
+
+```
+intent: change
+workflow: software-change        # or: none — default loop
+targets: [repos...]
+policies: [test-first, independent-review, safety-sensitive]
+delivery: { stop_at: validated-working-tree }
+passed_over:
+  - review-change: no diff exists yet
+  - investigate: the question is already settled
+```
 
 ## Bounded judgment
 
@@ -53,6 +56,8 @@ record** naming what was passed over and why.
 - Claim "no named workflow fits, use the embedded default" is a failure
   of this skill — it is a valid, honestly-stated outcome (§0's scope
   correction: the embedded `software-change` default is not retired).
+- Restate the ROUTING table — dispatch-vs-in-session is `AGENTS.md`'s
+  judgment and this skill applies it, never re-derives it.
 
 ### Durable handoff
 The dated selection record — the workflow recommended, the policies

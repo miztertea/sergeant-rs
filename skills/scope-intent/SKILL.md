@@ -44,10 +44,6 @@ fan-out that *consumes* this field is runtime, never this skill's job.
   stage pointed rather than restated.
 - Perform the per-repository fan-out itself — that is runtime, not this
   skill's job.
-- Run via `sgt run` or any durable Work dispatch — this skill's own
-  scoping judgment is a live, in-conversation call.
-- Present an unconfirmed, harness-degraded best guess as settled scope;
-  say so plainly instead.
 
 ### Durable handoff
 The `targets`/scope fields on the intent that eventually reaches `sgt

@@ -46,10 +46,6 @@ human's behalf even when asked to.
 - Transfer a decision from a class PACE marks non-transferable
   (destructive or irreversible action, merges to a default branch, scope
   or policy changes), regardless of who asks.
-- Run via `sgt run` or any durable Work dispatch — this skill's defining
-  behavior is a live decision turn.
-- Present an unconfirmed, harness-degraded best guess as a ruling; say so
-  plainly instead.
 
 ### Durable handoff
 This workspace's ratified `owner-ruling` record type

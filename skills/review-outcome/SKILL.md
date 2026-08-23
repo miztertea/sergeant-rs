@@ -41,12 +41,6 @@ workflow produced it — a human accepts it here first, matching
   terminality is not correctness either.
 - Authorize remediation on a finding set that isn't the typed shape
   `review-change`'s `40-report` stage actually emits.
-- Run this skill's own disposition-authorizing turn via `sgt run` or any
-  durable Work dispatch when that turn is itself a scope-changing
-  decision reserved to a live human.
-- Present an unconfirmed, harness-degraded best guess as a settled
-  disposition when the evidence is genuinely ambiguous; say so plainly
-  instead.
 
 ### Durable handoff
 The disposition decision itself, and — when the disposition is

@@ -37,10 +37,6 @@ it to a precise outcome statement.
 - Produce implementation detail, code, or a file edit.
 - Present a narrowed candidate as a decided intent — that handoff belongs
   to `clarify-intent`/`decide`.
-- Run via `sgt run` or any durable Work dispatch — this skill's defining
-  behavior is a live, exploratory turn this session holds.
-- Present an unconfirmed, harness-degraded best guess as a reached
-  candidate direction; say so plainly instead.
 
 ### Durable handoff
 None — output is narrowed possibilities or one candidate intent, carried
