@@ -90,7 +90,4 @@ into.
 never admitted procedure, never listed here (`docs/icm/convention.md` §2).
 
 Operator skills (never dispatched as Work; loaded directly by the harness)
-live at `skills/<name>/SKILL.md`: `sergeant-help`, `grilling`,
-`grill-with-docs`, `estate-navigation`, `to-spec` (added at ICM-R3, REHOME
-from the retired `to-spec` workflow — its defining behavior synthesizes
-from the current conversation, which a dispatched Work cannot receive).
+live at `skills/<name>/SKILL.md`; see `skills/` for the current fourteen.
