@@ -1,0 +1,23 @@
+# author-document — produce a document as the deliverable, with fidelity
+# to the brief as the top-weighted review axis.
+#
+# Authored 2026-08-22 for the distro content rebuild
+# (docs/proposals/distro-content-2026-08-22.md, W2). Derivation and the
+# evidence behind each stage: the design proposal §E.6, §F's stage
+# vocabulary, and the owner rulings recorded there.
+#
+# Six ordinary actor stages. Stage order here is authoritative; the
+# directory listing under this workflow's own tree MUST agree with it
+# lexically (docs/icm/convention.md §1 rule 4).
+#
+# NEW package. Absorbs the retired `record-decisions` package's contract
+# as a named section inside `10-establish-structure` and
+# `30-verify-fidelity-and-facts` — not as a separate package and not as a
+# separate stage. Sergeant has no profile construct; "profile" here
+# means a section inside these stage contexts (see this package's own
+# Notes for reviewers).
+
+[workflow]
+name = "author-document"
+version = "1"
+stages = ["00-map-sources", "10-establish-structure", "20-draft", "30-verify-fidelity-and-facts", "35-challenge", "40-finalize"]
