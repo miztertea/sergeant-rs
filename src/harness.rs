@@ -54,12 +54,21 @@ const ORIGIN_CLIENT_ENV: &str = "SGT_ORIGIN_CLIENT";
 /// attempt to replicate a login shell's full startup environment — sourcing
 /// `.bashrc`/`.profile` would make sergeant responsible for parsing and
 /// running arbitrary shell config it does not own (proposal §8.1's
-/// over-specification warning); this instead states two concrete, measured
-/// directories and stops.
+/// over-specification warning); this instead states each directory by name,
+/// with its own measured evidence, and stops.
+///
+/// - `~/.cargo/bin`, `~/.local/bin` — measured (`docs/environments/
+///   cerberus.md`), see the module doc above.
+/// - `~/.opencode/bin` — measured (`knowledge/evidence/
+///   opencode-adapter-probes-2026-08-23.md`, "Installation facts"):
+///   opencode's own binary lives there on Cerberus, absent from a
+///   non-interactive shell's default PATH — the identical #60 failure class
+///   `~/.cargo/bin`/`~/.local/bin` were added to fix.
 pub fn toolchain_path_dirs(home: &Path) -> Vec<PathBuf> {
     vec![
         home.join(".cargo").join("bin"),
         home.join(".local").join("bin"),
+        home.join(".opencode").join("bin"),
     ]
 }
 
@@ -249,13 +258,14 @@ mod tests {
     }
 
     #[test]
-    fn toolchain_path_dirs_names_cargo_and_local_bin() {
+    fn toolchain_path_dirs_names_cargo_local_and_opencode_bin() {
         let home = Path::new("/home/x");
         assert_eq!(
             toolchain_path_dirs(home),
             vec![
                 PathBuf::from("/home/x/.cargo/bin"),
-                PathBuf::from("/home/x/.local/bin")
+                PathBuf::from("/home/x/.local/bin"),
+                PathBuf::from("/home/x/.opencode/bin"),
             ]
         );
     }

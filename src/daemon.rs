@@ -39,6 +39,7 @@ use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig};
 use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
+use crate::backend::opencode::{OPENCODE_BACKEND_NAME, OpencodeBackend, OpencodeConfig};
 use crate::backend::{BackendRegistry, EventSink};
 use crate::domain::estate::Estate;
 use crate::domain::event::{EventDraft, EventSource};
@@ -336,6 +337,10 @@ pub struct DaemonConfig {
     /// itself. `None` is the system `codex`, adapter state under this data
     /// dir — mirrors `claude`/`docker` above for the same reason.
     pub codex: Option<CodexConfig>,
+    /// Launch configuration for the Opencode adapter this daemon registers
+    /// itself. `None` is the system `opencode`, adapter state under this data
+    /// dir — mirrors `claude`/`docker`/`codex` above for the same reason.
+    pub opencode: Option<OpencodeConfig>,
     /// §28 OpenTelemetry export. `None` is **off**, and off is the default:
     /// with no pipeline here the daemon builds no provider, spawns no
     /// exporter task, and subscribes nothing to the event stream.
@@ -423,6 +428,7 @@ impl Default for DaemonConfig {
             claude: None,
             docker: None,
             codex: None,
+            opencode: None,
             telemetry: None,
             completion_poll: COMPLETION_POLL_INTERVAL,
             turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
@@ -816,6 +822,25 @@ pub async fn start_with(
     } else {
         None
     };
+    // W2 (opencode-adapter sprint, mirrors the codex block directly above):
+    // the Opencode executor, registered the same way and for the same reason
+    // as Claude/Docker/Codex. No `seed_capability_provenance_from` call here
+    // either — that method exists only on `ClaudeBackend`, and
+    // `OpencodeBackend::capabilities().ask` is `false` unconditionally
+    // (opencode.rs's own ADMISSION_ROWS `ask` row: no measured
+    // actor-authored-question record on this transport), so there is no
+    // journaled withdrawal to seed.
+    let opencode = if config.backends.get(OPENCODE_BACKEND_NAME).is_none() {
+        let opencode_config = config
+            .opencode
+            .clone()
+            .unwrap_or_else(|| OpencodeConfig::new(data_dir));
+        let adapter = Arc::new(OpencodeBackend::new(opencode_config));
+        backends = backends.with(adapter.clone());
+        Some(adapter)
+    } else {
+        None
+    };
     let backends = Arc::new(backends);
 
     // 4b-ii. The capability/version probe, recorded at registration (M4
@@ -955,6 +980,11 @@ pub async fn start_with(
     // (same reasoning as Claude's/Docker's, directly above).
     if let Some(codex) = codex {
         codex.set_event_sink(journaling_sink(state.core.clone()));
+    }
+    // The Opencode adapter's normalized events flow through the identical
+    // sink (same reasoning as Claude's/Docker's/Codex's, directly above).
+    if let Some(opencode) = opencode {
+        opencode.set_event_sink(journaling_sink(state.core.clone()));
     }
     let app = router(state.clone());
 

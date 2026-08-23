@@ -22,6 +22,13 @@
 //! `support::wait_until_executable` is borrowed, for the ETXTBSY window a
 //! freshly-chmod'ed stub has.
 //!
+//! Two daemon-level tests (W2) prove registration itself — that
+//! `daemon::start_with` puts an "opencode" entry in the registry with no
+//! test-supplied stand-in — via in-process `daemon::start_with` +
+//! `handle.shutdown().await`, the same rig `tests/m3_execution.rs`/
+//! `tests/estate_routes.rs` use, so `tests/support::DataDir`'s reaper does
+//! not apply to them either (no subprocess is spawned).
+//!
 //! Every fixture under `tests/fixtures/opencode-1.18.19-*` is a **real
 //! capture** at opencode 1.18.19 — nothing in this file authors an event
 //! stream. Where a test needs a shape no probe recorded (an export document
@@ -44,9 +51,11 @@ use sergeant_rs::backend::{
     Backend, BackendError, BackendSignal, BindingSummary, ExecutionHandle, NativeState,
     ProbeReport, ResumeRequest, StartRequest,
 };
+use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::estate::InstructionPolicy;
 use sergeant_rs::domain::event::EventDraft;
 use sergeant_rs::domain::profile::Profile;
+use sergeant_rs::runtime::journal::Journal;
 
 mod support;
 
@@ -1891,4 +1900,111 @@ fn live_opencode_history_exports_the_whole_session() {
         "the export names the served model per message (probe 7)"
     );
     backend.stop(&handle).expect("stop").wait();
+}
+
+// ------------------------------------------------------- W2 §1.4: registration
+
+/// A probeable opencode registers for real: `daemon::start_with`, with no
+/// test-supplied stand-in for the name "opencode", puts a real
+/// `OpencodeBackend` in its registry and journals its own probe evidence at
+/// registration — the direct proof of W2's registration change, not a repeat
+/// of any unit test on `OpencodeBackend` itself.
+#[tokio::test]
+async fn daemon_start_registers_opencode_and_journals_its_own_probe() {
+    let data = TempDir::new().expect("tempdir");
+    let stub = StubOpencode::passing(data.path());
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(sergeant_rs::backend::BackendRegistry::new()),
+            default_backend: None,
+            opencode: Some(config_for(&stub, data.path())),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start with an unmeasured-nothing opencode must still start");
+    handle.shutdown().await;
+
+    let probed: Vec<_> = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == daemon::KIND_BACKEND_PROBED)
+        .collect();
+    let opencode_probed = probed
+        .iter()
+        .find(|e| e.payload["backend"] == OPENCODE_BACKEND_NAME)
+        .expect("a backend.probed record for opencode");
+    assert_eq!(opencode_probed.payload["available"], true);
+    assert_eq!(opencode_probed.payload["runtime_scope"], "per_execution");
+    assert_eq!(opencode_probed.payload["capabilities"]["ask"], false);
+    assert_eq!(
+        opencode_probed.payload["capabilities"]["persistent_sessions"],
+        true
+    );
+    assert_eq!(
+        opencode_probed.payload["capabilities"]["native_background"],
+        false
+    );
+    assert_eq!(opencode_probed.payload["capabilities"]["streaming"], true);
+    // NOTE: unlike codex (false), opencode's `history` is TRUE — R4, via
+    // `export`, per opencode.rs:2690's Capabilities literal.
+    assert_eq!(opencode_probed.payload["capabilities"]["history"], true);
+    assert_eq!(opencode_probed.payload["capabilities"]["resume"], true);
+    assert_eq!(opencode_probed.payload["capabilities"]["interrupt"], true);
+    assert_eq!(
+        opencode_probed.payload["capabilities"]["model_selection"],
+        true
+    );
+    assert_eq!(opencode_probed.payload["capabilities"]["profiles"], true);
+    assert_eq!(
+        opencode_probed.payload["capabilities"]["approval_flow"],
+        false
+    );
+    assert_eq!(
+        opencode_probed.payload["capabilities"]["human_attach"],
+        false
+    );
+    assert_eq!(opencode_probed.payload["capabilities"]["usage"], true);
+    assert_eq!(
+        opencode_probed.payload["capabilities"]["native_subagents"],
+        false
+    );
+}
+
+/// Opencode missing must not break daemon startup, and must be
+/// distinguishable from "unregistered": it registers anyway and journals
+/// honest, `available: false` evidence naming why it cannot run — the same
+/// posture Docker already takes for a host with no Docker installed.
+#[tokio::test]
+async fn daemon_start_with_no_opencode_installed_still_starts_and_says_why() {
+    let data = TempDir::new().expect("tempdir");
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(sergeant_rs::backend::BackendRegistry::new()),
+            default_backend: None,
+            opencode: Some(OpencodeConfig {
+                executable: PathBuf::from("/nonexistent/definitely-not-opencode"),
+                ..OpencodeConfig::new(data.path())
+            }),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("a host with no opencode binary must still start a daemon");
+    handle.shutdown().await;
+
+    let opencode_probed = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .find(|e| {
+            e.kind == daemon::KIND_BACKEND_PROBED && e.payload["backend"] == OPENCODE_BACKEND_NAME
+        })
+        .expect("opencode is registered — and probed — even though it cannot run");
+    assert_eq!(opencode_probed.payload["available"], false);
+    let detail = opencode_probed.payload["detail"]
+        .as_str()
+        .expect("probe detail recorded");
+    assert!(detail.contains("cannot run"), "{detail}");
 }
