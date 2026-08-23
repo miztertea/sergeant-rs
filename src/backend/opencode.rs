@@ -15,11 +15,19 @@
 //! carried verbatim from the codex sprint).
 //!
 //! **Ponytail rungs this module cites.** R1 (build the smallest thing the
-//! evidence supports) is the reason there is no process-group machinery, no
-//! `Stability` column in the admission ledger, and no permission-policy
-//! synthesis here; R2 (reuse a shipped shape rather than re-derive it) is why
-//! the ledger, the `TurnReader`, the fail-closed terminal and the live-test
-//! gate are `codex.rs`'s shapes with opencode's own evidence in them; R3/K2
+//! evidence supports) is the reason there is no `Stability` column in the
+//! admission ledger and no permission-policy synthesis here; it is also why
+//! this module shipped `interrupt` on a plain `Child::kill()` at first —
+//! probe 10 measured no `opencode` process surviving it. Probe 11 (recorded
+//! 2026-08-23, post-W1-implementation, on the same evidence page) closed
+//! that measurement's gap: a bash-tool grandchild reparented to init and
+//! **kept running** after the harness was killed, so `interrupt` now mirrors
+//! `codex.rs`'s process-group termination (`kill_process_group`/`kill_turn`,
+//! §5.5) — R1 built the smaller thing until the evidence stopped supporting
+//! it, then this wave built the next rung up. R2 (reuse a shipped shape
+//! rather than re-derive it) is why the ledger, the `TurnReader`, the
+//! fail-closed terminal, the live-test gate, and now the process-group kill
+//! itself are `codex.rs`'s shapes with opencode's own evidence in them; R3/K2
 //! (adapter only) is why nothing outside `src/backend/` is touched — in
 //! particular why this module declares **no new `KIND_*` constant**
 //! (`tests/m6_surfaces.rs`'s `t6` would then require an `api::SSE_EVENT_KINDS`
@@ -143,7 +151,7 @@
 //! matches claude's today.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::SyncSender;
@@ -270,10 +278,31 @@ const SESSION_ID_BUDGET: Duration = Duration::from_secs(30);
 /// stderr, and it is the whole explanation of a tool part that says `error`.
 const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 
+/// Cap on the **in-memory** accumulation of one turn's raw NDJSON stdout
+/// before it is archived to the blob store (§20), and of its stderr. Neither
+/// pipe had a cap before this: a turn with very large tool output (a `cat` of
+/// a big file) or a process that writes pathologically to stderr could grow
+/// `TurnReader::run`'s `raw` `String` and the stderr-drain thread's buffer
+/// without bound, a per-turn, per-daemon memory-exhaustion vector (`codex.rs`
+/// carries the identical unbounded pattern; this bounds only this adapter's
+/// copy of it, since `codex.rs` is out of this wave's scope). Every line is
+/// still parsed and forwarded to the normal event pipeline regardless of
+/// this cap — nothing downstream of a single line is affected — and both
+/// pipes are still drained to EOF past the cap, so a capped turn's process
+/// never blocks on a full pipe. What is lost past the cap is only the raw
+/// archive's completeness beyond it; [`TurnReader::run`] and
+/// [`read_bounded`] mark that loss in the archived text itself rather than
+/// silently truncating it. 16 MiB is generous against every fixture this
+/// suite carries (the largest is a few KiB) while still being a real,
+/// finite bound rather than none at all.
+const STREAM_MEMORY_CAP: usize = 16 * 1024 * 1024;
+
 /// Bounded tail of a `tool_use` part's `output` kept inline in
-/// `tool.completed`'s payload. The full bytes are never dropped — they are in
-/// the turn's raw blob by construction (§20) — this only bounds what an
-/// unbounded command output costs the journal a second time. `docker.rs`'s
+/// `tool.completed`'s payload. The full bytes are never dropped up to
+/// [`STREAM_MEMORY_CAP`] — they are in the turn's raw blob by construction
+/// (§20), unless the turn's raw stream itself hit that cap — this only
+/// bounds what an unbounded command output costs the journal a second time.
+/// `docker.rs`'s
 /// `TAIL_BYTES` bounded-tail-plus-blob pattern is the precedent.
 const TOOL_OUTPUT_TAIL: usize = 1024;
 
@@ -286,7 +315,16 @@ pub const OPENCODE_CONFIG_CONTENT_ENV: &str = "OPENCODE_CONFIG_CONTENT";
 
 /// Launch configuration for the adapter, resolved once at construction from
 /// the daemon's own environment.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-written, not derived (below): `env` and `config_content`
+/// can plausibly carry provider API keys (the latter is documented above as
+/// "a whole opencode config document", per opencode's own config schema),
+/// and a derived `Debug` would print both in full into any future `{:?}`
+/// format of this struct -- a diagnostic log line, a panic message, a
+/// `dbg!()` left in during later wiring. No call site formats this struct
+/// today, but the hazard is latent, not hypothetical, so it is closed here
+/// rather than left for the first log line that does.
+#[derive(Clone)]
 pub struct OpencodeConfig {
     /// The CLI executable (a profile may override it per execution).
     pub executable: PathBuf,
@@ -313,6 +351,28 @@ pub struct OpencodeConfig {
     /// `launch()` — no process-global mutable state, no `--test-threads`
     /// ordering hazard, no `unsafe { std::env::set_var }` to serialize.
     pub session_id_budget: Option<Duration>,
+}
+
+impl std::fmt::Debug for OpencodeConfig {
+    /// Redacts `env` (values may be provider API keys) and `config_content`
+    /// (may embed provider credentials per opencode's own config schema,
+    /// probe 9) to a count and a length rather than their contents -- see
+    /// the struct's own doc comment for why this is hand-written.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpencodeConfig")
+            .field("executable", &self.executable)
+            .field("data_dir", &self.data_dir)
+            .field("env", &format!("<{} vars, redacted>", self.env.len()))
+            .field(
+                "config_content",
+                &self
+                    .config_content
+                    .as_ref()
+                    .map(|c| format!("<redacted, {} bytes>", c.len())),
+            )
+            .field("session_id_budget", &self.session_id_budget)
+            .finish()
+    }
 }
 
 impl OpencodeConfig {
@@ -414,9 +474,20 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         claimed: true,
         tier: "-",
         evidence: Evidence::LocallyMeasured,
-        admission_test: "launch_binds_the_server_minted_session_id",
-        note: "the session is minted by the harness and appears on every event; opencode's own \
-               store keeps it (measured resumable even after an uncleanly killed turn, probe 10)",
+        // `launch_binds_the_server_minted_session_id` only proves the id is
+        // bound and cited within one turn -- it never issues a second turn,
+        // so it cannot back "sessions outlive a single turn" (mod.rs's own
+        // definition). `a_resume_turn_names_the_session_and_keeps_the_pin`
+        // is the test that actually does: it drives SEND after LAUNCH's turn
+        // has settled, and asserts the *same* session id is composed
+        // (`-s <id>`) on that second, separately-spawned `opencode run`
+        // process -- the session surviving past the first turn's process,
+        // which is exactly this capability's claim.
+        admission_test: "a_resume_turn_names_the_session_and_keeps_the_pin",
+        note: "the session is minted by the harness on turn 1 and reused, unprompted, as the \
+               pin on turn 2's separately-spawned process -- opencode's own store keeps it \
+               (also measured resumable even after an uncleanly killed turn, probe 10, and \
+               across a daemon restart under the distinct `resume` capability below)",
     },
     AdmissionRow {
         capability: "native_background",
@@ -466,14 +537,21 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         capability: "interrupt",
         transport: Transport::Run,
         claimed: true,
-        tier: "ProcessKill",
+        tier: "ProcessTreeTermination",
+        // `opencode_interrupt_kills_the_process_group` is StubOpencode-driven
+        // and deterministic, mirroring `codex.rs`'s own split between this
+        // row and a live resumability test -- tagging this row
+        // `LiveMeasured` would credit the wrong test with a live run it
+        // never performs.
         evidence: Evidence::LocallyMeasured,
-        admission_test: "interrupt_kills_the_turn_and_leaves_the_session_resumable",
-        note: "plain Child::kill(): probe 10 measured `pgrep -x opencode` empty afterwards (the \
-               bun-compiled binary is a single process), so no process-group walk is built here. \
-               Recorded limit: that scan looked for surviving *opencode* processes, not for a \
-               grandchild the bash tool had spawned -- a process-group kill is the remedy if one \
-               is ever measured surviving, and this row is where that measurement lands",
+        admission_test: "opencode_interrupt_kills_the_process_group",
+        note: "probe 10 measured `pgrep -x opencode` empty after a plain Child::kill() (the \
+               bun-compiled binary is a single process), but probe 11 (2026-08-23, \
+               post-W1-implementation) measured the gap that scan missed: a bash-tool \
+               grandchild reparented to init and kept running after the harness was killed. \
+               interrupt now mirrors codex.rs's process-group termination -- process_group(0) \
+               at spawn, a negated-pgid SIGKILL at interrupt -- so the whole turn tree dies, not \
+               just the opencode leader",
     },
     AdmissionRow {
         capability: "model_selection",
@@ -1374,7 +1452,24 @@ fn decode_export(export: &Value) -> Vec<NativeEvent> {
 
 /// One export `tool` part → the same `tool.requested`/`tool.completed` pair
 /// the live stream produces, so a history replay and a live turn describe the
-/// same call the same way.
+/// same call the same way -- **if** an export `tool` part is shaped the way
+/// this function assumes.
+///
+/// That assumption was never measured. Every field this function reads
+/// (`callID`, `tool`, `state.status`, `state.input`, `state.output`,
+/// `state.metadata.exit`) is copied verbatim from the *run-json stream's*
+/// `tool_use` part shape (probes 2/4) on the unverified guess that `export`
+/// serializes a tool call the same way. No probe in the evidence packet ever
+/// exercised a tool call and then exported that session -- probe 6, the only
+/// export probe, used a tool-free nonce prompt -- and the committed
+/// `tests/fixtures/opencode-1.18.19-export-session.json` fixture (the only
+/// real export capture in this repo) contains no `"type":"tool"` part at
+/// all. `decode_export_turns_a_tool_part_into_the_same_pair_the_stream_does`
+/// proves only that *this function* round-trips a hand-authored literal built
+/// from the stream's shape -- it is a decoder unit test, not evidence the
+/// real CLI ever emits that literal from `export`. Until a live probe closes
+/// this gap, treat this branch's shape as guessed, not measured -- the same
+/// honesty this module gives `config_home` and the unqualified-pin case.
 fn decode_export_tool(part: &Value, out: &mut Vec<NativeEvent>) {
     let call_id = part.get("callID").cloned().unwrap_or(Value::Null);
     let tool = part.get("tool").cloned().unwrap_or(Value::Null);
@@ -1602,6 +1697,18 @@ struct OpencodeExecution {
     bindings_outside_cwd: Vec<PathBuf>,
     turns: u32,
     turn: TurnState,
+    /// The process group id of the most recent turn, recorded at **spawn**
+    /// (mirrors `codex.rs::CodexExecution::turn_pgid`, §5.5): `process_group
+    /// (0)` makes the turn's direct child its own group leader, so this is
+    /// that child's pid. Kept here rather than read back out of
+    /// `TurnState::InFlight` at kill time, because the group outlives the
+    /// leader — a bash-tool command the turn started keeps running in this
+    /// group after the opencode process itself has exited and been reaped
+    /// (probe 11), and that is exactly the case INTERRUPT exists to clean
+    /// up. Stays valid to signal for as long as it is worth signalling:
+    /// Linux keeps a pid number allocated while any process still uses it as
+    /// its process-group id.
+    turn_pgid: Option<u32>,
     stopped: bool,
     interrupt_requested: bool,
     reader: Option<std::thread::JoinHandle<()>>,
@@ -2090,6 +2197,15 @@ impl OpencodeBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         apply_env(&mut command, &plan.env, plan.config_content.as_deref());
+        // §5.5 (codex.rs): every turn's tool commands run as children of this
+        // process; a new process group is what lets INTERRUPT kill the whole
+        // tree (probe 11 measured a bash-tool grandchild survive a plain
+        // kill of the leader).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
 
         let mut child = command
             .spawn()
@@ -2119,13 +2235,17 @@ impl OpencodeBackend {
         let stderr_rx = stderr.map(|mut stderr| {
             let (tx, rx) = std::sync::mpsc::sync_channel::<String>(1);
             std::thread::spawn(move || {
-                let mut text = String::new();
-                let _ = stderr.read_to_string(&mut text);
+                let text = read_bounded(&mut stderr, STREAM_MEMORY_CAP);
                 let _ = tx.send(text);
             });
             rx
         });
 
+        // Recorded here, at spawn, never derived from the child at kill
+        // time -- `process_group(0)` above made this child its own group
+        // leader, so its pid *is* the group's id, and that id stays the
+        // right thing to signal after the child itself has exited.
+        let turn_pgid = child.id();
         let child = Arc::new(Mutex::new(child));
         {
             let mut state = self.lock();
@@ -2134,6 +2254,7 @@ impl OpencodeBackend {
                 .get_mut(execution_id)
                 .ok_or_else(|| self.err_unknown(execution_id))?;
             execution.turn = TurnState::InFlight(Arc::clone(&child));
+            execution.turn_pgid = Some(turn_pgid);
             execution.turns += 1;
             execution.interrupt_requested = false;
         }
@@ -2212,27 +2333,78 @@ impl OpencodeBackend {
         }
     }
 
-    /// Kill this execution's in-flight turn process, if there is one.
-    ///
-    /// A plain [`Child::kill`], no process-group walk: probe 10 measured the
-    /// bun-compiled `opencode` as a single process with nothing surviving the
-    /// kill (`pgrep -x opencode` empty afterwards). `codex.rs` needs a group
-    /// kill because `codex exec` spawns `/bin/bash -lc …` children it was
-    /// measured to leave behind; building the same machinery here on an
-    /// unmeasured suspicion would be machinery ahead of its evidence (R1).
-    /// The limit of that measurement is recorded on the `interrupt` admission
-    /// row, which is where a contrary measurement should land.
+    /// Kill this execution's in-flight turn process, group and all — probe
+    /// 11 measured a bash-tool grandchild survive a plain `Child::kill()` of
+    /// the leader (see [`kill_turn`]). The group id is taken whatever the
+    /// turn state says, the same reasoning `codex.rs::interrupt` uses: a turn
+    /// that has already ended can still have left a background command
+    /// running in its group.
     fn kill_inflight_turn(&self, execution_id: &str) {
-        let child = {
+        let (pgid, child) = {
             let state = self.lock();
-            match state.executions.get(execution_id).map(|e| &e.turn) {
-                Some(TurnState::InFlight(child)) => Some(Arc::clone(child)),
+            let Some(execution) = state.executions.get(execution_id) else {
+                return;
+            };
+            let child = match &execution.turn {
+                TurnState::InFlight(child) => Some(Arc::clone(child)),
                 _ => None,
-            }
+            };
+            (execution.turn_pgid, child)
         };
-        if let Some(child) = child {
-            let _ = child.lock().expect("opencode turn child lock").kill();
+        kill_turn(pgid, child.as_ref());
+    }
+}
+
+/// Kill a turn's whole process group (mirrors `codex.rs::kill_process_group`,
+/// §5.5): `SIGKILL` to the negated group id recorded at spawn, through a
+/// shell rather than a `libc`/`nix` dependency for one signal (R5). Through
+/// `/bin/sh -c` specifically, not by spawning `kill` as a program: `kill` is
+/// a shell builtin every POSIX shell has, while `kill(1)` as an executable on
+/// `PATH` is a package a host need not install, and `Command::new("kill")`
+/// fails with `ENOENT` on such a host — a silent no-op if the caller drops
+/// the result.
+///
+/// Nothing gates this on the leader being alive, and that is the whole
+/// point: the group routinely outlives its leader (a command the turn
+/// started in the background survives the opencode process once it has
+/// exited and been reaped — exactly probe 11's finding), so the group id is
+/// signalled unconditionally and `ESRCH` (an already-empty group) is
+/// success, not an error to report.
+fn kill_process_group(pgid: Option<u32>) {
+    let Some(pgid) = pgid else { return };
+    #[cfg(unix)]
+    {
+        if let Err(e) = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("kill -KILL -{pgid}"))
+            .output()
+        {
+            tracing::warn!(
+                pgid,
+                error = %e,
+                "could not run the process-group kill; the turn's direct child is all that \
+                 INTERRUPT reached — any commands it spawned may still be running"
+            );
         }
+    }
+    #[cfg(not(unix))]
+    {
+        tracing::warn!(
+            pgid,
+            "no process-group signal mechanism on this platform; killing only the direct \
+             child — any commands it spawned may still be running"
+        );
+    }
+}
+
+/// The group kill above plus `Child::kill()` on the direct child as a belt,
+/// for the callers that still hold a live child handle. The group goes
+/// first: the child's own death must never be what decides whether the group
+/// is signalled.
+fn kill_turn(pgid: Option<u32>, child: Option<&Arc<Mutex<Child>>>) {
+    kill_process_group(pgid);
+    if let Some(child) = child {
+        let _ = child.lock().expect("opencode turn child lock").kill();
     }
 }
 
@@ -2261,16 +2433,65 @@ struct TurnReader {
     first_turn_signal: Option<SyncSender<FirstTurnSignal>>,
 }
 
+/// Read `reader` to EOF exactly as `Read::read_to_string` does, except the
+/// returned `String` never grows past `cap` bytes. Every byte is still read
+/// (never left sitting in the pipe — that would stall whatever is writing to
+/// the other end, which is worse than losing them); bytes past `cap` are
+/// simply not appended. Non-UTF-8 bytes are replaced (`str::from_utf8_lossy`)
+/// rather than failing the whole read the way `read_to_string` would, which
+/// only makes the capture *more* complete than before on a stream that
+/// writes invalid UTF-8, not less.
+///
+/// A trailing marker records the loss when the cap was actually hit, so a
+/// capped capture reads as "capped, N bytes missing" rather than silently
+/// looking complete.
+fn read_bounded(reader: &mut impl std::io::Read, cap: usize) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut total: usize = 0;
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if buf.len() < cap {
+                    let take = (cap - buf.len()).min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if total > buf.len() {
+        text.push_str(&format!(
+            "\n...<{}-byte in-memory cap hit; {} further bytes were read and discarded, not \
+             archived>",
+            cap,
+            total - buf.len()
+        ));
+    }
+    text
+}
+
 impl TurnReader {
     fn run(self, stdout: std::process::ChildStdout) {
         let mut raw = String::new();
+        let mut raw_truncated = false;
         let mut acc = TurnAccumulator::new();
         let mut announced_session = false;
 
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
-            raw.push_str(&line);
-            raw.push('\n');
+            // Every line is parsed and forwarded to the event pipeline below
+            // regardless of the cap — only the raw archive's completeness is
+            // bounded (`STREAM_MEMORY_CAP`).
+            if raw.len() < STREAM_MEMORY_CAP {
+                raw.push_str(&line);
+                raw.push('\n');
+            } else {
+                raw_truncated = true;
+            }
             match serde_json::from_str::<Value>(&line) {
                 Ok(value) => {
                     for event in acc.ingest_line(&value) {
@@ -2294,6 +2515,12 @@ impl TurnReader {
                 }
                 Err(_) => acc.unparsed_lines += 1,
             }
+        }
+        if raw_truncated {
+            raw.push_str(&format!(
+                "\n...<{STREAM_MEMORY_CAP}-byte in-memory cap hit; further stdout lines were \
+                 still parsed and emitted above but were not archived here>\n"
+            ));
         }
 
         // Stdout is closed; reap. The child lock is only taken after EOF so
@@ -2548,6 +2775,7 @@ impl Backend for OpencodeBackend {
                     bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
                     turns: 0,
                     turn: TurnState::Unlaunched,
+                    turn_pgid: None,
                     stopped: false,
                     interrupt_requested: false,
                     reader: None,
@@ -2635,24 +2863,31 @@ impl Backend for OpencodeBackend {
     /// Interrupting an execution with no turn in flight is a no-op, not an
     /// error — the goal state already holds.
     fn interrupt(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
-        let child = {
+        let (pgid, child) = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = state
                 .executions
                 .get_mut(&handle.execution_id)
                 .expect("presence checked above");
-            match &execution.turn {
+            // The group id is taken whatever the turn state says (mirrors
+            // `codex.rs::interrupt`, §5.5): a turn that has already ended can
+            // still have left a background command running in its group —
+            // exactly what probe 11 measured surviving a plain kill of the
+            // leader — so the group kill is never gated on the direct child
+            // being alive. Only the `interrupt_requested` bit, a claim about
+            // a *running* turn's outcome, is still the in-flight turn's
+            // alone.
+            let child = match &execution.turn {
                 TurnState::InFlight(child) => {
                     execution.interrupt_requested = true;
                     Some(Arc::clone(child))
                 }
                 TurnState::Finished(_) | TurnState::Unlaunched | TurnState::Adopted => None,
-            }
+            };
+            (execution.turn_pgid, child)
         };
-        if let Some(child) = child {
-            let _ = child.lock().expect("opencode turn child lock").kill();
-        }
+        kill_turn(pgid, child.as_ref());
         Ok(Completion::immediate())
     }
 
@@ -2732,6 +2967,7 @@ impl Backend for OpencodeBackend {
                 bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
                 turns: 1,
                 turn: TurnState::Adopted,
+                turn_pgid: None,
                 stopped: false,
                 interrupt_requested: false,
                 reader: None,

@@ -101,6 +101,8 @@ struct StubOpencode {
     hang: PathBuf,
     stderr: PathBuf,
     exit_code: PathBuf,
+    grandchild: PathBuf,
+    grandchild_pid: PathBuf,
 }
 
 impl StubOpencode {
@@ -115,6 +117,8 @@ impl StubOpencode {
         let hang = dir.join(format!("{name}-hang"));
         let stderr = dir.join(format!("{name}-stderr"));
         let exit_code = dir.join(format!("{name}-exit-code"));
+        let grandchild = dir.join(format!("{name}-grandchild"));
+        let grandchild_pid = dir.join(format!("{name}-grandchild-pid"));
         std::fs::create_dir_all(&exports).expect("exports dir");
         // The subcommand arms are ordered exactly as the real CLI resolves
         // them: `run --help` is help, not a run, so it must be recognised
@@ -142,6 +146,10 @@ impl StubOpencode {
              fi\n\
              if [ -f \"{replay}\" ]; then cat \"{replay}\"; fi\n\
              if [ -f \"{stderr}\" ]; then cat \"{stderr}\" >&2; fi\n\
+             if [ -f \"{grandchild}\" ]; then\n  \
+               ( i=0; while [ \"$i\" -lt 300 ]; do sleep 0.1; i=$((i+1)); done ) &\n  \
+               echo $! > \"{grandchild_pid}\"\n\
+             fi\n\
              if [ -f \"{hang}\" ]; then exec sleep 30; fi\n\
              if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n\
              exit 0\n",
@@ -154,6 +162,8 @@ impl StubOpencode {
             release = release.display(),
             replay = replay.display(),
             stderr = stderr.display(),
+            grandchild = grandchild.display(),
+            grandchild_pid = grandchild_pid.display(),
             hang = hang.display(),
             exit_code = exit_code.display(),
         );
@@ -172,6 +182,8 @@ impl StubOpencode {
             hang,
             stderr,
             exit_code,
+            grandchild,
+            grandchild_pid,
         }
     }
 
@@ -219,6 +231,37 @@ impl StubOpencode {
     fn exits_with(&self, code: i32) -> &Self {
         std::fs::write(&self.exit_code, code.to_string()).expect("write exit code");
         self
+    }
+
+    /// Marks the stub to fork a background grandchild (a detached loop, not
+    /// a `setsid`) right after replay, and record that grandchild's own
+    /// pid — the process a single `child.kill()` would never reach, and the
+    /// whole reason INTERRUPT kills the turn's process *group* instead
+    /// (probe 11; mirrors `tests/codex_backend.rs::StubCodex::
+    /// spawns_a_grandchild`).
+    fn spawns_a_grandchild(&self) -> &Self {
+        std::fs::write(&self.grandchild, b"go\n").expect("write grandchild marker");
+        self
+    }
+
+    fn grandchild_pid(&self) -> Option<u32> {
+        std::fs::read_to_string(&self.grandchild_pid)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+    }
+
+    fn wait_for_grandchild_pid(&self) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = self.grandchild_pid() {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "grandchild pid was never recorded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn launches(&self) -> Vec<Launch> {
@@ -307,6 +350,38 @@ impl Launch {
 }
 
 // ----------------------------------------------------------------- helpers
+
+/// Whether a pid is still alive — genuinely running, not merely present in
+/// the process table. Identical to `tests/codex_backend.rs::pid_alive`
+/// (kept as its own copy here rather than a shared `support` fn, matching
+/// this suite's existing precedent of a self-contained `StubOpencode` file):
+/// a bare `kill -0` reports "alive" for an unreaped zombie too, and the
+/// grandchild this test tracks is never this process's own child (it is
+/// forked deep inside the stub's shell script and reparented to init the
+/// instant that shell dies), so nothing in this process tree can `wait()` it
+/// away. `ps -o state=` reports `Z` for a zombie on both procps and BSD
+/// `ps`; that means the kernel already delivered the fatal signal, so this
+/// reports it as dead even though init has not reaped its entry yet.
+fn pid_alive(pid: u32) -> bool {
+    match std::process::Command::new("ps")
+        .args(["-o", "state=", "-p", &pid.to_string()])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            !String::from_utf8_lossy(&out.stdout).trim().starts_with('Z')
+        }
+        // `ps` itself reports no such pid at all (nonzero exit) — gone.
+        Ok(_) => false,
+        // Couldn't gather the fact (`ps` missing?): fall back to plain
+        // existence rather than silently declaring victory.
+        Err(_) => std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false),
+    }
+}
 
 fn config_for(stub: &StubOpencode, data_dir: &Path) -> OpencodeConfig {
     let mut config = OpencodeConfig::new(data_dir);
@@ -986,9 +1061,12 @@ fn a_turn_that_dies_without_a_terminal_is_ambiguous_and_fails_closed() {
     backend.stop(&backend_handle).expect("stop").wait();
 }
 
-/// The admission test behind `interrupt`: a plain `Child::kill()` ends the
-/// turn, the outcome is "interrupted, no verdict", and the session identity
-/// survives so a later turn can continue it (probe 10).
+/// `interrupt`'s outcome semantics: the turn ends "interrupted, no verdict",
+/// and the session identity survives so a later turn can continue it (probe
+/// 10). The process-group *mechanism* itself — the thing that actually keeps
+/// a bash-tool grandchild from surviving the kill (probe 11) — is proved
+/// separately, below, by `opencode_interrupt_kills_the_process_group` (the
+/// admission test the `interrupt` row now names).
 #[test]
 fn interrupt_kills_the_turn_and_leaves_the_session_resumable() {
     let dir = TempDir::new().expect("tempdir");
@@ -1028,6 +1106,57 @@ fn interrupt_kills_the_turn_and_leaves_the_session_resumable() {
         .expect("send after interrupt");
     let launches = stub.wait_for_run_launches(2);
     assert_eq!(launches[1].value_after("-s"), Some(TRUNCATED_SESSION));
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// The deterministic half of the `interrupt` row's `ProcessTreeTermination`
+/// claim (mirrors `tests/codex_backend.rs::codex_interrupt_kills_the_
+/// process_group`, itself the admission test the row now names): a turn's
+/// bash-tool commands run as *children of the opencode process*, so a plain
+/// `child.kill()` on just the direct leader would leave any grandchild
+/// running — probe 11 measured exactly that. INTERRUPT's whole justification
+/// after probe 11 is that it kills the turn's process *group* instead
+/// (`kill_process_group`/`kill_turn`) — this proves that mechanism, not just
+/// that `interrupt()` returns `Ok`. If `interrupt`/`kill_inflight_turn` were
+/// ever reverted to a plain `Child::kill()`, this test fails: the grandchild
+/// is reparented to init and outlives the ten-second poll below.
+#[test]
+fn opencode_interrupt_kills_the_process_group() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubOpencode::passing(dir.path());
+    stub.replays(SIGKILL_TRUNCATED);
+    stub.hangs_after_replay();
+    stub.spawns_a_grandchild();
+    let backend = OpencodeBackend::new(config_for(&stub, dir.path()));
+    let handle = launch_with(&backend, &start_request(dir.path())).expect("launch");
+
+    let grandchild_pid = stub.wait_for_grandchild_pid();
+    assert!(
+        pid_alive(grandchild_pid),
+        "the grandchild must be running before INTERRUPT, or this test proves nothing"
+    );
+    assert_eq!(
+        backend.observe(&handle).expect("observe").native,
+        NativeState::Running,
+        "the leader must still be running before INTERRUPT, or this test proves nothing"
+    );
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if !pid_alive(grandchild_pid) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grandchild pid {grandchild_pid} survived INTERRUPT: the whole turn process group \
+             should have been killed, not just the direct child (opencode leader) -- if \
+             `interrupt`/`kill_inflight_turn` were reverted to a plain `Child::kill()`, this is \
+             exactly the failure that would reproduce (probe 11)"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     backend.stop(&handle).expect("stop").wait();
 }
 
