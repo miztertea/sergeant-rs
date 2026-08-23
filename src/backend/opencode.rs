@@ -1,6 +1,24 @@
 //! OpenCode adapter: `opencode run --format json` non-interactive turns over
 //! a durable, **server-minted** session (W1 of the *Sergeant speaks OpenCode*
-//! sprint, `docs/proposals/opencode-adapter-2026-08-23.md`).
+//! sprint, `docs/proposals/opencode-adapter-2026-08-23.md`), **plus** (W3)
+//! an adapter-owned `opencode serve` HTTP+SSE child, one per execution,
+//! driven from [`opencode_serve`] — a protocol client that knows HTTP/SSE
+//! and opencode's serve operation names and nothing else, declared via the
+//! `#[path]` child-module pattern `codex_appserver.rs` established. §2's
+//! [`TransportChoice`] picks which transport a registration drives
+//! (`Auto` prefers serve, falling back to `run-json` when the serve gate
+//! fails); §2.2's [`capabilities_for`] is the one real divergence from
+//! `codex.rs`'s equivalent split — the two opencode transports claim
+//! *different* capability sets (serve adds `approval_flow` and `ask`, both
+//! `false` on `run-json`), so `capabilities()` follows whichever transport
+//! this registration actually resolved to rather than a value fixed at
+//! compile time. Every serve-transport claim in [`ADMISSION_ROWS`] carries
+//! its own provenance exactly as W1's run-json rows do, including two
+//! places a live measurement corrected the wave's own written spec rather
+//! than the other way around — recorded inline at [`classify_serve_terminal`]
+//! (the sync `POST` response's own abort signature) and in the
+//! `structured_output`/Serve row (the result lands at `info.structured`,
+//! not the guessed `structured_output` field).
 //!
 //! Every claim below carries its provenance. **[measured]** means opencode
 //! **1.18.19** on Cerberus, 2026-08-23 — the probe packet
@@ -159,6 +177,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+
+#[path = "opencode_serve.rs"]
+mod opencode_serve;
 
 use super::codex::KIND_TURN_HARNESS_ERROR;
 use super::{
@@ -351,6 +372,19 @@ pub struct OpencodeConfig {
     /// `launch()` — no process-global mutable state, no `--test-threads`
     /// ordering hazard, no `unsafe { std::env::set_var }` to serialize.
     pub session_id_budget: Option<Duration>,
+    /// Which transport this registration drives (W3 §2). Resolved **once**,
+    /// at probe time, memoized, and never revisited per execution (§2.3).
+    pub transport: TransportChoice,
+    /// Override for [`ServeBudgets`], `None` in every production path — the
+    /// same per-instance-not-global reasoning [`Self::session_id_budget`]
+    /// documents.
+    pub serve_budgets: Option<ServeBudgets>,
+    /// A JSON Schema constraining the `format` field of every `session.
+    /// prompt` call on the serve transport (W3 §7.5, §9.1). Adapter-local
+    /// until a contract revision gives native structured output a home in
+    /// `Capabilities` — `codex.rs::output_schema` is the precedent. `None`
+    /// (the default) sends no `format` at all.
+    pub structured_format: Option<Value>,
 }
 
 impl std::fmt::Debug for OpencodeConfig {
@@ -371,6 +405,12 @@ impl std::fmt::Debug for OpencodeConfig {
                     .map(|c| format!("<redacted, {} bytes>", c.len())),
             )
             .field("session_id_budget", &self.session_id_budget)
+            .field("transport", &self.transport)
+            .field("serve_budgets", &self.serve_budgets)
+            .field(
+                "structured_format",
+                &self.structured_format.as_ref().map(|_| "<schema present>"),
+            )
             .finish()
     }
 }
@@ -386,6 +426,50 @@ impl OpencodeConfig {
             env: BTreeMap::new(),
             config_content: None,
             session_id_budget: None,
+            transport: TransportChoice::Auto,
+            serve_budgets: None,
+            structured_format: None,
+        }
+    }
+}
+
+/// Which transport this registration drives (W3 §2). Operator-facing;
+/// [`Transport`] is the adapter-internal resolved value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportChoice {
+    /// Prefer `serve`; fall back to `run-json` when the serve gate fails,
+    /// and say so in the probe detail. The default.
+    #[default]
+    Auto,
+    /// W1's transport, unconditionally. No serve child is ever spawned.
+    RunOnly,
+    /// `serve` or nothing: a failed gate makes `probe()` report
+    /// `available: false` (codex §5.2 rule 2, verbatim).
+    ServeOnly,
+}
+
+/// Budgets for the serve transport's own operations (§3.5, §7.3), each
+/// overridable per-instance — never a global (the same reasoning
+/// `OpencodeConfig::session_id_budget` documents).
+#[derive(Debug, Clone, Copy)]
+pub struct ServeBudgets {
+    /// Bound on every readiness gate (§3.5): the port line, the
+    /// authenticated `/doc` liveness check, and the `server.connected`
+    /// first frame.
+    pub readiness: Duration,
+    /// Bound on `POST /session/{id}/abort` (§7.3).
+    pub abort: Duration,
+    /// Bound on `POST /session/{id}/message` (§9.1) — generous: this is a
+    /// live model turn, not a handshake.
+    pub turn: Duration,
+}
+
+impl Default for ServeBudgets {
+    fn default() -> Self {
+        Self {
+            readiness: Duration::from_secs(20),
+            abort: Duration::from_secs(10),
+            turn: Duration::from_secs(300),
         }
     }
 }
@@ -399,14 +483,17 @@ impl OpencodeConfig {
 /// existing row to it. Transport-tagged from day one, as the plan asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Transport {
-    /// `opencode run --format json`, this wave's only transport.
+    /// `opencode run --format json`, W1's transport.
     Run,
+    /// `opencode serve` over HTTP+SSE, this wave's transport (§3).
+    Serve,
 }
 
 impl Transport {
     fn as_str(self) -> &'static str {
         match self {
             Transport::Run => "run-json",
+            Transport::Serve => "serve-http",
         }
     }
 }
@@ -583,12 +670,30 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         transport: Transport::Run,
         claimed: false,
         tier: "-",
-        evidence: Evidence::DocClaimed,
+        evidence: Evidence::LocallyMeasured,
         admission_test: "",
         note: "structural on this transport: a permission that resolves to `ask` auto-rejects \
-               (probe 4) -- there is nobody to approve to. The interactive loop \
-               (`permission.asked` + POST /session/:id/permissions/:permissionID) is doc-claimed \
-               on the serve transport and is W3's first-true candidate",
+               (probe 4) -- there is nobody to approve to. W1 called the serve loop this wave's \
+               first-true candidate; it is now measured and claimed on Serve below",
+    },
+    AdmissionRow {
+        capability: "approval_flow",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "PermissionAskedReply",
+        evidence: Evidence::LiveMeasured,
+        admission_test: "live_opencode_serve_approval_round_trip_runs_the_gated_tool",
+        note: "the registry's first true on this flag. permission.asked (per_ ids) parks the stage \
+               as NeedsInput{asked_by: adapter} -- AskAuthor's own doc names a permission gate as \
+               adapter-authored, so this needs no `ask` -- and SEND relays once/always/reject to \
+               POST /session/{id}/permissions/{permissionID}, the DEPRECATED v1 endpoint, which is \
+               the one that is functionally live on 1.18.19: permission.v2.asked never fired and a \
+               v2 reply 404'd PermissionNotFoundError. Both once (tool ran) and reject (state.status \
+               error, state.error 'The user rejected permission...') measured. `always` is relayed \
+               but its persistence is schema-read only, never exercised. A third endpoint, the \
+               NON-deprecated POST /permission/{requestID}/reply, exists and matches \
+               permission.replied's own {requestID, reply} vocabulary -- it was never tried, and is \
+               recorded as the alternative to measure, not silently preferred (C1)",
     },
     AdmissionRow {
         capability: "human_attach",
@@ -636,6 +741,23 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
                end-of-turn here. Guessing one from a text part is precisely the heuristic \
                Capabilities::ask forbids",
     },
+    AdmissionRow {
+        capability: "ask",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "TypedQuestionEvent",
+        evidence: Evidence::LiveMeasured,
+        admission_test: "live_opencode_serve_actor_question_parks_and_resumes_on_answer",
+        note: "opencode ships a distinct `question` tool with its OWN typed event question.asked \
+               (que_ ids, wholly disjoint from permission.asked's per_) naming the actor's own \
+               tool.callID -- actor authorship is schema-distinguishable, not guessed from prose, \
+               which is exactly what Capabilities::ask asks for. Measured end to end: reply \
+               {answers:[[\"Blue\"]]} -> question.replied -> the session resumed ITSELF with no \
+               further client call and produced 'You prefer blue.'. Answering is restricted to the \
+               measured shape: exactly one question, one exact label match; more than one question, \
+               or an unmatched label, is a structured refusal naming the labels. Multi-select and \
+               /question/{id}/reject are schema-claimed and unwired (C4)",
+    },
     // Two rows with no v1 boolean at all, the same adapter-local-evidence
     // posture codex's `structured_output`/`sandbox_enforcement` rows take.
     AdmissionRow {
@@ -659,7 +781,194 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         admission_test: "an_auto_rejected_tool_call_is_a_failed_tool_event_not_a_hang",
         note: "probe 4: an `ask`-resolving permission auto-rejects in non-interactive mode \
                (stderr notice, state.status:\"error\", exit 0) -- the same non-hang guarantee \
-               `codex exec` has, and the reason this adapter never passes `--auto`",
+               `codex exec` has, and the reason this adapter never passes `--auto`. On serve the \
+               analogous guarantee is different in kind -- a gate PARKS rather than auto-rejects, \
+               which is the approval_flow row above, not a second non_blocking_run row",
+    },
+    // ------------------------------------------------------- W3: Serve rows
+    //
+    // §7.7's "rows that do not move": the same v1 flag, claimed the same way,
+    // but re-evidenced on the serve transport because a registration that
+    // resolves to Serve must never cite a Run-transport test for its own
+    // claim (§2.2's structural check drives `capabilities_for` for both
+    // transports independently).
+    AdmissionRow {
+        capability: "persistent_sessions",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "serve_launch_binds_the_session_created_before_any_turn",
+        note: "stronger than run's: POST /session mints the id BEFORE any turn (§3.6), so W1's \
+               ambiguous 'process alive, no event line yet' window does not exist on this \
+               transport at all -- SESSION_ID_BUDGET and ExitedWithoutSession are structurally \
+               unreachable here",
+    },
+    AdmissionRow {
+        capability: "native_background",
+        transport: Transport::Serve,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        admission_test: "",
+        note: "the serve child dies with the execution by construction (§3.7, per-execution, not \
+               per-daemon); not even meaningful to ask of a per-execution child",
+    },
+    AdmissionRow {
+        capability: "streaming",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "serve_events_are_delivered_through_the_sse_bus_before_the_turn_settles",
+        note: "finer-grained than run: message.part.delta frames arrive mid-part. Deltas are \
+               counted, never decoded (§4.3, ARCHIVED_NOT_DECODED_TYPES) -- the completed snapshot \
+               already produces the event",
+    },
+    AdmissionRow {
+        capability: "history",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "ServerMessages",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "serve_messages_and_export_decode_to_identical_history",
+        note: "GET /session/{id}/message. Measured against `opencode export` on the same rich \
+               session (4 messages incl. an aborted tool call, \
+               step-start/reasoning/text/tool/step-finish): structurally identical role/part-type \
+               sequences and key sets, no completeness gap either direction (C3). Cheaper at equal \
+               completeness -- no new CLI subprocess -- so it wins the contract's own tie-break; \
+               export stays primary on run-json. Returns a BARE ARRAY, so a one-line shim wraps it \
+               in export's {info, messages} envelope and decode_export runs unchanged (one \
+               decoder)",
+    },
+    AdmissionRow {
+        capability: "resume",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_readopted_serve_execution_withdraws_the_transport",
+        note: "a serve child dies with the daemon; RESUME re-adopts through W1's existing run-json \
+               evidence path (opencode export's exit status) and the execution continues on \
+               OpencodeTransportState::Run, journaling phase:\"transport_withdrawn_on_readopt\" \
+               naming exactly what was withdrawn (approval_flow, ask, interrupt's \
+               NativeSessionAbort tier, history's ServerMessages tier, structured_output) -- a \
+               declared per-execution withdrawal (§8.3), never a silent downgrade. Re-spawning a \
+               serve child against the durable session id is plausible but unmeasured (§10)",
+    },
+    AdmissionRow {
+        capability: "interrupt",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "NativeSessionAbort",
+        evidence: Evidence::LiveMeasured,
+        admission_test: "live_opencode_serve_abort_yields_an_interrupted_terminal_and_a_usable_session",
+        note: "POST /session/{id}/abort -> 200 true, and -- the evidence that earns the tier -- \
+               the tool's OWN subprocess tree died (no surviving `sleep 30`), unlike probe 11's \
+               raw SIGKILL which orphaned a grandchild to init. Session stayed usable: a \
+               follow-up turn returned finish:stop. Abort ends the TURN, not the child; the child \
+               survives for later turns. DEVIATION FROM THE SPEC, LIVE-MEASURED (not a fixture \
+               guess): the sync POST /session/{id}/message response itself settles with \
+               info.error.name==\"MessageAbortedError\" on an aborted turn -- the spec's own \
+               fixtures only ever captured the abort signature via a separate SSE session.error \
+               frame and left the sync-POST shape explicitly unmeasured (§9.2's own caveat). \
+               classify_serve_terminal checks both sources; \
+               classify_serve_terminal_recognizes_an_abort_signature_on_the_post_response_itself \
+               pins it. On any abort-RPC failure the adapter falls back to the process-group kill \
+               and journals phase:\"interrupt_downgraded\" (codex's precedent, §7.3)",
+    },
+    AdmissionRow {
+        capability: "model_selection",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "ResponseVerifiedPin",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "the_sync_message_fixture_verifies_the_pin_without_an_export",
+        note: "model:{providerID, modelID} on every POST /session/{id}/message; the SAME response's \
+               info.modelID/info.providerID carry the served model, so the post-turn verdict costs \
+               no subprocess at all (run-json's ExportVerifiedPin needs one per turn). \
+               verify_model_pin is reused verbatim behind a one-line envelope shim -- one verdict \
+               function, two transports",
+    },
+    AdmissionRow {
+        capability: "profiles",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_profile_executable_and_env_reach_the_serve_child",
+        note: "same axes, same refusals as run-json (config_home refused, opencode_agent refused) -- \
+               the profile's executable and env reach the serve child at spawn (§3.2)",
+    },
+    AdmissionRow {
+        capability: "human_attach",
+        transport: Transport::Serve,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        admission_test: "",
+        note: "a scope decision, not an unlooked-for absence: --mdns, --cors, /tui/* were read from \
+               /doc and never exercised; the serve child is per-execution and 127.0.0.1-bound by \
+               design (§10)",
+    },
+    AdmissionRow {
+        capability: "usage",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "serve_step_finish_tokens_and_cost_become_usage_events",
+        note: "the same step-finish parts through the same decoder; info.tokens/info.cost on the \
+               POST /session/{id}/message response are a second, cross-checkable source",
+    },
+    AdmissionRow {
+        capability: "native_subagents",
+        transport: Transport::Serve,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::DocClaimed,
+        admission_test: "",
+        note: "agents exist (--agent on session.create and session.prompt [schema-claimed]); no \
+               subagent was ever run. Documented is not supported (§15)",
+    },
+    AdmissionRow {
+        capability: "config_injection",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "EnvConfigContent",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "config_content_reaches_the_serve_child_too",
+        note: "upgraded evidence over W1's row: OPENCODE_CONFIG_CONTENT was measured applying to \
+               the SERVE CHILD, not only to `run` (fixture -config-with-ask.json), which is what \
+               makes the whole ask flow reachable",
+    },
+    // Adapter-local row with no v1 boolean, the same posture codex's own
+    // `structured_output` row takes (C2).
+    AdmissionRow {
+        capability: "structured_output",
+        transport: Transport::Run,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        admission_test: "",
+        note: "no measured --format json_schema equivalent on `opencode run`; never looked for \
+               beyond `run --help`, which names no such flag",
+    },
+    AdmissionRow {
+        capability: "structured_output",
+        transport: Transport::Serve,
+        claimed: true,
+        tier: "NativeSchema",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "the_structured_output_fixture_lands_at_info_structured_with_a_tool_calls_finish",
+        note: "format:{type:json_schema, schema} on session.prompt. CORRECTS THE PLAN'S GUESS: the \
+               result is at info.structured, NOT structured_output, and info.finish is \
+               \"tool-calls\", not \"stop\" -- a classifier that treats non-stop as abnormal would \
+               mark every structured turn abnormal (C2). Mechanism is a synthetic StructuredOutput \
+               TOOL part (metadata.valid:true), so the decoder emits an ordinary \
+               tool.requested/completed pair for it, which is correct and deliberate. W3 wires the \
+               channel and synthesizes no schema: sergeant has no per-stage output-schema surface \
+               and inventing one is a core change (K2)",
     },
 ];
 
@@ -690,6 +999,71 @@ fn render_admission_rows() -> String {
         ));
     }
     out
+}
+
+/// The capability set each transport honestly supports (§2.2). A pure
+/// function of the transport, so the structural admission check
+/// ([`tests::admission_rows_agree_with_capabilities`]) can drive it for both
+/// without a backend instance — and so a registration that resolved to
+/// `run-json` can never advertise serve's `approval_flow`/`ask`.
+///
+/// This is the one real divergence from `codex.rs`: codex's two transports
+/// claim identical capability sets, so one `Capabilities` value serves both.
+/// Here it is the interesting fact — serve claims `approval_flow` and `ask`
+/// that run cannot — so `capabilities()` must follow whichever transport this
+/// registration actually resolved to, never a value fixed at compile time.
+fn capabilities_for(transport: Transport) -> Capabilities {
+    match transport {
+        Transport::Run => Capabilities {
+            persistent_sessions: true,
+            native_background: false,
+            streaming: true,
+            history: true,
+            resume: true,
+            interrupt: true,
+            model_selection: true,
+            profiles: true,
+            approval_flow: false,
+            human_attach: false,
+            usage: true,
+            native_subagents: false,
+            ask: false,
+        },
+        Transport::Serve => Capabilities {
+            persistent_sessions: true,
+            native_background: false,
+            streaming: true,
+            history: true,
+            resume: true,
+            interrupt: true,
+            model_selection: true,
+            profiles: true,
+            approval_flow: true,
+            human_attach: false,
+            usage: true,
+            native_subagents: false,
+            ask: true,
+        },
+    }
+}
+
+/// §5.4's serve gate outcome, memoized on [`OpencodeBackend::serve_gates`].
+#[derive(Debug, Clone)]
+struct ServeGates {
+    result: Result<(), String>,
+    /// Whether the installed build's OpenAPI document's scoped fingerprint
+    /// disagreed with [`opencode_serve::MEASURED_DOC_FINGERPRINT`] —
+    /// provenance, never a gate failure (R1, §5.3). Only meaningful when
+    /// `result` reached G3; `false` on a G1/G2 failure, harmlessly.
+    stale: bool,
+}
+
+/// §2.1's resolved outcome for one registration — computed once, journaled,
+/// never revisited per execution (§2.3).
+#[derive(Debug, Clone)]
+struct TransportResolution {
+    transport: Transport,
+    detail: String,
 }
 
 // ------------------------------------------------------------------- probe
@@ -1061,6 +1435,12 @@ struct TurnAccumulator {
     /// evidence — it is often the only thing that says *why* a turn never
     /// reached a terminal.
     last_error: Option<String>,
+    /// Serve-only (§6.2 gate 4): `reasoning` parts seen and deliberately
+    /// left undecoded — a known type this vocabulary has no envelope kind
+    /// for, counted separately from `unknown_events` (which names types this
+    /// decoder does not recognize at all). Always `0` on the run-json
+    /// transport, which never calls the code path that increments it.
+    reasoning_parts: u32,
 }
 
 impl TurnAccumulator {
@@ -1712,6 +2092,11 @@ struct OpencodeExecution {
     stopped: bool,
     interrupt_requested: bool,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// §3.1: which transport actually drives this execution. `Run`-only
+    /// fields above (`turn`, `turn_pgid`, `reader`) stay at their inert
+    /// defaults for a `Serve` execution — [`ServeRuntime`] owns the real
+    /// turn state for that transport.
+    transport_state: OpencodeTransportState,
 }
 
 #[derive(Debug, Default)]
@@ -1765,6 +2150,14 @@ struct SpawnPlan {
 pub struct OpencodeBackend {
     config: OpencodeConfig,
     probe_outcome: OnceLock<ProbeOutcome>,
+    /// §5.4's serve gate: G1 (`serve --help`), G2 (authenticated `/doc`
+    /// liveness against a probe child), G3 (the OpenAPI fingerprint).
+    /// Memoized, run at most once per backend instance.
+    serve_gates: OnceLock<ServeGates>,
+    /// §2.1's resolution: which transport this registration actually
+    /// drives. Resolved once, at first use, and never revisited per
+    /// execution (§2.3).
+    transport_resolution: OnceLock<TransportResolution>,
     state: Arc<Mutex<AdapterState>>,
     sink: Mutex<Option<EventSink>>,
 }
@@ -1784,6 +2177,8 @@ impl OpencodeBackend {
         Self {
             config,
             probe_outcome: OnceLock::new(),
+            serve_gates: OnceLock::new(),
+            transport_resolution: OnceLock::new(),
             state: Arc::new(Mutex::new(AdapterState::default())),
             sink: Mutex::new(None),
         }
@@ -1953,6 +2348,177 @@ impl OpencodeBackend {
             detail,
             version: Some(canonical),
             provenance: Some(provenance),
+        }
+    }
+
+    /// §5.4's serve gate, memoized. Token-free: help text, a probe child
+    /// reaching only readiness gates 1-2 (no `/event`, no session), the
+    /// authenticated `/doc` fetch and its fingerprint — then killed.
+    fn serve_gates(&self) -> &ServeGates {
+        self.serve_gates.get_or_init(|| self.run_serve_gates())
+    }
+
+    fn run_serve_gates(&self) -> ServeGates {
+        let exe = &self.config.executable;
+        // G1: `opencode --help` names the `serve` subcommand, and `opencode
+        // serve --help` offers `--port`/`--hostname` (§5.4 steps 1-2). A
+        // `RunOnly` registration must never be refused for a missing serve
+        // subcommand (hence this is a gate function, not a mutation of
+        // `REQUIRED_SUBCOMMANDS`, which every transport's probe reads).
+        let top_help = match self.help_text(&["--help"]) {
+            Ok(text) => text,
+            Err(reason) => {
+                return ServeGates {
+                    result: Err(reason),
+                    stale: false,
+                };
+            }
+        };
+        if !top_help.contains("serve") {
+            return ServeGates {
+                result: Err("opencode --help does not offer a `serve` subcommand".to_string()),
+                stale: false,
+            };
+        }
+        let serve_help = match self.help_text(&["serve", "--help"]) {
+            Ok(text) => text,
+            Err(reason) => {
+                return ServeGates {
+                    result: Err(reason),
+                    stale: false,
+                };
+            }
+        };
+        for flag in ["--port", "--hostname"] {
+            if !serve_help.contains(flag) {
+                return ServeGates {
+                    result: Err(format!(
+                        "opencode serve --help does not offer required flag {flag}"
+                    )),
+                    stale: false,
+                };
+            }
+        }
+        // G2/G3: spawn one probe child, reach only readiness gates 1-2 (no
+        // /event, no session), GET /doc, fingerprint it, kill it.
+        let readiness = self.config.serve_budgets.unwrap_or_default().readiness;
+        let password = opencode_serve::mint_server_password();
+        let scratch = self.config.data_dir.join(".opencode-serve-gate-probe");
+        let _ = std::fs::create_dir_all(&scratch);
+        let spawn = opencode_serve::ServeChild::spawn(
+            exe,
+            &scratch,
+            &self.config.env,
+            self.config.config_content.as_deref(),
+            &password,
+            readiness,
+        );
+        let (mut child, base_url) = match spawn {
+            Ok(pair) => pair,
+            Err(reason) => {
+                return ServeGates {
+                    result: Err(format!("G2: {reason}")),
+                    stale: false,
+                };
+            }
+        };
+        let handle = match opencode_serve::ServeHandle::new(base_url, password) {
+            Ok(handle) => handle,
+            Err(reason) => {
+                child.kill();
+                return ServeGates {
+                    result: Err(format!("G2: {reason}")),
+                    stale: false,
+                };
+            }
+        };
+        let doc = match handle.get_doc(readiness) {
+            Ok(doc) => doc,
+            Err(reason) => {
+                child.kill();
+                return ServeGates {
+                    result: Err(format!("G2: {reason}")),
+                    stale: false,
+                };
+            }
+        };
+        let fingerprint = opencode_serve::compute_doc_fingerprint(&doc);
+        child.kill();
+        match fingerprint {
+            Ok(fingerprint) => ServeGates {
+                result: Ok(()),
+                stale: fingerprint != opencode_serve::MEASURED_DOC_FINGERPRINT,
+            },
+            Err(reason) => ServeGates {
+                // §5.3: a doc that cannot be fingerprinted at all is a
+                // client that cannot be built (a missing pinned operation),
+                // not drift — the gate fails, it does not merely go stale.
+                result: Err(format!("G3: {reason}")),
+                stale: false,
+            },
+        }
+    }
+
+    fn serve_detail(&self, why: &str) -> String {
+        let gates = self.serve_gates();
+        let mut detail = format!("transport: {} ({why})", Transport::Serve.as_str());
+        if gates.stale {
+            detail.push_str(&format!(
+                "; openapi: stale (fingerprint [{}] != measured {})",
+                opencode_serve::FINGERPRINT_ALGORITHM,
+                opencode_serve::MEASURED_DOC_FINGERPRINT,
+            ));
+        } else {
+            detail.push_str(&format!(
+                "; openapi: fresh (fingerprint [{}] matches measured)",
+                opencode_serve::FINGERPRINT_ALGORITHM,
+            ));
+        }
+        detail
+    }
+
+    /// §2.1's resolution rule, memoized.
+    fn transport_resolution(&self) -> &TransportResolution {
+        self.transport_resolution
+            .get_or_init(|| self.resolve_transport())
+    }
+
+    fn resolve_transport(&self) -> TransportResolution {
+        match self.config.transport {
+            TransportChoice::RunOnly => TransportResolution {
+                transport: Transport::Run,
+                detail: format!(
+                    "transport: {} (RunOnly configured)",
+                    Transport::Run.as_str()
+                ),
+            },
+            TransportChoice::ServeOnly => match &self.serve_gates().result {
+                Ok(()) => TransportResolution {
+                    transport: Transport::Serve,
+                    detail: self.serve_detail("ServeOnly configured"),
+                },
+                Err(reason) => TransportResolution {
+                    // Irrelevant: `probe()` reports `available: false` for
+                    // this exact case (§2.1 rule, codex §5.2 rule 2
+                    // verbatim) before this value is ever read for a launch
+                    // decision.
+                    transport: Transport::Run,
+                    detail: format!("transport: serve requested (ServeOnly) but refused: {reason}"),
+                },
+            },
+            TransportChoice::Auto => match &self.serve_gates().result {
+                Ok(()) => TransportResolution {
+                    transport: Transport::Serve,
+                    detail: self.serve_detail("Auto"),
+                },
+                Err(reason) => TransportResolution {
+                    transport: Transport::Run,
+                    detail: format!(
+                        "transport: {} (Auto: serve gate failed: {reason})",
+                        Transport::Run.as_str()
+                    ),
+                },
+            },
         }
     }
 
@@ -2353,6 +2919,530 @@ impl OpencodeBackend {
         };
         kill_turn(pgid, child.as_ref());
     }
+
+    /// W1's LAUNCH body, unchanged in substance: register the execution,
+    /// spawn turn 1, and wait bounded for the first event line's session id
+    /// before returning a handle at all. A failed launch leaves no phantom:
+    /// adapter state is removed on every error path.
+    fn launch_run(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        let request = &prepared.request;
+        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        {
+            let mut state = self.lock();
+            state.executions.insert(
+                request.execution_id.clone(),
+                OpencodeExecution {
+                    session_id: None,
+                    work_id: request.work_id.clone(),
+                    cwd: request.cwd.clone(),
+                    model: request.model.clone(),
+                    executable,
+                    env,
+                    config_content: self.config.config_content.clone(),
+                    bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
+                    turns: 0,
+                    turn: TurnState::Unlaunched,
+                    turn_pgid: None,
+                    stopped: false,
+                    interrupt_requested: false,
+                    reader: None,
+                    transport_state: OpencodeTransportState::Run,
+                },
+            );
+        }
+        let policy = format!("{:?}", request.instruction_policy);
+        match self.spawn_first_turn(
+            &request.execution_id,
+            compose_launch_prompt(request),
+            Some(policy),
+        ) {
+            Ok(session_id) => Ok(ExecutionHandle {
+                execution_id: request.execution_id.clone(),
+                native_id: Some(session_id),
+            }),
+            Err(e) => {
+                self.lock().executions.remove(&request.execution_id);
+                Err(e)
+            }
+        }
+    }
+
+    /// LAUNCH on the serve transport (§3, §8.2): spawn the child, clear
+    /// every readiness gate, mint the session (**before any turn**, closing
+    /// W1's `SESSION_ID_BUDGET` hazard by construction, §3.6), register the
+    /// execution, and fire turn 1 on its own thread — non-blocking, exactly
+    /// like `spawn_first_turn` is for the run transport.
+    ///
+    /// §8.2's absolute rule: **every** failure here is a LAUNCH refusal.
+    /// There is no `?`-with-fallback anywhere in this function, and no arm
+    /// may call `launch_run`. Every partially-built resource (the child, the
+    /// SSE reader thread) is torn down before returning `Err`.
+    fn launch_serve(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        let request = &prepared.request;
+        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let budgets = self.config.serve_budgets.unwrap_or_default();
+        let config_content = self.config.config_content.clone();
+        let password = opencode_serve::mint_server_password();
+
+        let (mut child, base_url) = opencode_serve::ServeChild::spawn(
+            &executable,
+            &request.cwd,
+            &env,
+            config_content.as_deref(),
+            &password,
+            budgets.readiness,
+        )
+        .map_err(|e| self.err_failed(format!("serve launch refused (phase: spawn): {e}")))?;
+
+        let handle = match opencode_serve::ServeHandle::new(base_url, password) {
+            Ok(handle) => handle,
+            Err(e) => {
+                child.kill();
+                return Err(self.err_failed(format!("serve launch refused (phase: auth): {e}")));
+            }
+        };
+        // Readiness gate 2 (§3.5): authenticated liveness.
+        if let Err(e) = handle.get_doc(budgets.readiness) {
+            child.kill();
+            return Err(self.err_failed(format!("serve launch refused (phase: auth): {e}")));
+        }
+        // Readiness gate 3 (§3.5): the event stream must be open, and its
+        // first frame must be `server.connected`, **before** `POST
+        // /session` — otherwise the first turn's events are lost.
+        let response = match handle.open_event_stream() {
+            Ok(response) => response,
+            Err(e) => {
+                child.kill();
+                return Err(
+                    self.err_failed(format!("serve launch refused (phase: event_stream): {e}"))
+                );
+            }
+        };
+
+        // `Weak`, deliberately, not `Arc`: this cell is how the persistent
+        // reader thread finds the runtime once it exists, but the runtime's
+        // one and only *strong* owner must be `OpencodeExecution::
+        // transport_state` (below) — a strong clone held here would make
+        // the reader thread itself keep the serve child alive forever, since
+        // it never observes the process die on its own (it is what is
+        // BLOCKED reading that process's socket). `ServeChild::drop` (§3.7)
+        // only runs once every strong owner is gone; with a `Weak` here,
+        // that is exactly "the execution was dropped, or explicitly
+        // stopped/killed" — at which point the child dies, this thread's
+        // next blocking read errors out, and the thread itself exits,
+        // releasing the last thing that was ever keeping it running.
+        let runtime_cell: Arc<Mutex<Option<std::sync::Weak<ServeRuntime>>>> =
+            Arc::new(Mutex::new(None));
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        let sink = self.sink.lock().expect("opencode sink lock").clone();
+        let execution_id = request.execution_id.clone();
+        let work_id = request.work_id.clone();
+        {
+            let runtime_cell = Arc::clone(&runtime_cell);
+            let mut first = true;
+            std::thread::spawn(move || {
+                opencode_serve::drive_sse_reader(
+                    response,
+                    |frame| {
+                        if first {
+                            first = false;
+                            let event_type =
+                                frame.get("type").and_then(Value::as_str).unwrap_or("");
+                            let ok = event_type == "server.connected";
+                            let _ = first_tx.send(if ok {
+                                Ok(())
+                            } else {
+                                Err(format!(
+                                    "first SSE frame was {event_type:?}, not server.connected"
+                                ))
+                            });
+                        }
+                        let runtime = runtime_cell
+                            .lock()
+                            .expect("serve runtime cell lock")
+                            .as_ref()
+                            .and_then(std::sync::Weak::upgrade);
+                        // `None` either because `POST /session` has not yet
+                        // minted a session id (frames before that point have
+                        // nothing to be scoped against — measured to hold,
+                        // at most, the `server.connected` frame itself), or
+                        // because every strong owner is already gone and
+                        // this process is on its way down; either way, the
+                        // frame is archived (via `on_raw` below) but not
+                        // dispatched.
+                        let Some(runtime) = runtime else { return };
+                        let event_type = frame
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let properties = frame.get("properties").cloned().unwrap_or(Value::Null);
+                        if !opencode_serve::frame_in_scope(
+                            &event_type,
+                            &properties,
+                            &runtime.session_id,
+                        ) {
+                            return;
+                        }
+                        ServeSseReader {
+                            sink: sink.clone(),
+                            execution_id: execution_id.clone(),
+                            work_id: work_id.clone(),
+                            runtime,
+                        }
+                        .dispatch_frame(&event_type, properties);
+                    },
+                    |line| {
+                        if let Some(runtime) = runtime_cell
+                            .lock()
+                            .expect("serve runtime cell lock")
+                            .as_ref()
+                            .and_then(std::sync::Weak::upgrade)
+                        {
+                            let mut raw = runtime.sse_raw.lock().expect("serve sse_raw lock");
+                            if raw.len() < STREAM_MEMORY_CAP {
+                                raw.push_str(line);
+                                raw.push('\n');
+                            }
+                        }
+                    },
+                );
+            });
+        }
+        match first_rx.recv_timeout(budgets.readiness) {
+            Ok(Ok(())) => {}
+            Ok(Err(reason)) => {
+                child.kill();
+                return Err(self.err_failed(format!(
+                    "serve launch refused (phase: event_stream): {reason}"
+                )));
+            }
+            Err(_) => {
+                child.kill();
+                return Err(self.err_failed(format!(
+                    "serve launch refused (phase: event_stream): no server.connected frame \
+                     within {:?}",
+                    budgets.readiness
+                )));
+            }
+        }
+
+        // §3.6: the session id comes back synchronously, before any turn.
+        let session_id = match handle.create_session(budgets.readiness) {
+            Ok(id) => id,
+            Err(e) => {
+                child.kill();
+                return Err(
+                    self.err_failed(format!("serve launch refused (phase: session_create): {e}"))
+                );
+            }
+        };
+
+        let runtime = Arc::new(ServeRuntime {
+            child: Mutex::new(child),
+            handle,
+            session_id: session_id.clone(),
+            message_roles: Mutex::new(BTreeMap::new()),
+            pending_gate: Mutex::new(None),
+            session_error: Mutex::new(None),
+            turn: Mutex::new(ServeTurnState::Idle),
+            turn_acc: Mutex::new(TurnAccumulator::new()),
+            sse_raw: Mutex::new(String::new()),
+        });
+        *runtime_cell.lock().expect("serve runtime cell lock") = Some(Arc::downgrade(&runtime));
+
+        {
+            let mut state = self.lock();
+            state.executions.insert(
+                request.execution_id.clone(),
+                OpencodeExecution {
+                    session_id: Some(session_id.clone()),
+                    work_id: request.work_id.clone(),
+                    cwd: request.cwd.clone(),
+                    model: request.model.clone(),
+                    executable,
+                    env,
+                    config_content: self.config.config_content.clone(),
+                    bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
+                    turns: 0,
+                    turn: TurnState::Unlaunched,
+                    turn_pgid: None,
+                    stopped: false,
+                    interrupt_requested: false,
+                    reader: None,
+                    transport_state: OpencodeTransportState::Serve(runtime),
+                },
+            );
+        }
+
+        if let Err(e) = self.spawn_serve_turn(&request.execution_id, compose_launch_prompt(request))
+        {
+            self.lock().executions.remove(&request.execution_id);
+            return Err(e);
+        }
+
+        Ok(ExecutionHandle {
+            execution_id: request.execution_id.clone(),
+            native_id: Some(session_id),
+        })
+    }
+
+    /// Spawn one serve turn (§9.1): reset the shared per-turn state, fire
+    /// `POST /session/{id}/message` on its own thread (non-blocking — the
+    /// SSE reader thread, already running, produces the narration events as
+    /// the turn proceeds), and return once the thread is launched.
+    fn spawn_serve_turn(&self, execution_id: &str, prompt: String) -> Result<(), BackendError> {
+        let (runtime, work_id, model, structured_format) = {
+            let state = self.lock();
+            let execution = state
+                .executions
+                .get(execution_id)
+                .ok_or_else(|| self.err_unknown(execution_id))?;
+            let OpencodeTransportState::Serve(runtime) = &execution.transport_state else {
+                return Err(self.err_failed("spawn_serve_turn called on a non-serve execution"));
+            };
+            (
+                Arc::clone(runtime),
+                execution.work_id.clone(),
+                execution.model.clone(),
+                self.config.structured_format.clone(),
+            )
+        };
+        *runtime.turn_acc.lock().expect("serve turn_acc lock") = TurnAccumulator::new();
+        *runtime.turn.lock().expect("serve turn lock") = ServeTurnState::InFlight;
+        runtime.sse_raw.lock().expect("serve sse_raw lock").clear();
+        {
+            let mut state = self.lock();
+            if let Some(execution) = state.executions.get_mut(execution_id) {
+                execution.turns += 1;
+                execution.interrupt_requested = false;
+            }
+        }
+        self.emit(
+            execution_id,
+            &work_id,
+            KIND_CONVERSATION_USER,
+            json!({"text": prompt, "session_id": runtime.session_id}),
+        );
+        let driver = ServeTurnDriver {
+            backend_state: Arc::clone(&self.state),
+            sink: self.sink.lock().expect("opencode sink lock").clone(),
+            data_dir: self.config.data_dir.clone(),
+            execution_id: execution_id.to_string(),
+            work_id,
+            model,
+            structured_format,
+            runtime,
+            turn_budget: self.config.serve_budgets.unwrap_or_default().turn,
+        };
+        std::thread::spawn(move || driver.run(prompt));
+        Ok(())
+    }
+
+    /// SEND on the serve transport (§7.1, §7.2, §9.1): a pending gate takes
+    /// priority — the reply is relayed to its endpoint and does **not**
+    /// start a new turn — otherwise this starts a new turn exactly like the
+    /// run transport does.
+    fn send_serve(&self, handle: &ExecutionHandle, input: &str) -> Result<(), BackendError> {
+        let (runtime, gate) = {
+            let state = self.lock();
+            self.check_identity(&state, handle)?;
+            let execution = &state.executions[&handle.execution_id];
+            let OpencodeTransportState::Serve(runtime) = &execution.transport_state else {
+                return Err(self.err_failed("send_serve called on a non-serve execution"));
+            };
+            let runtime = Arc::clone(runtime);
+            let gate = runtime
+                .pending_gate
+                .lock()
+                .expect("serve pending_gate lock")
+                .clone();
+            (runtime, gate)
+        };
+        let budget = self.config.serve_budgets.unwrap_or_default().readiness;
+        if let Some(gate) = &gate {
+            match gate {
+                opencode_serve::PendingGate::Permission { id, .. } => {
+                    let response_value = opencode_serve::parse_permission_reply(input)
+                        .map_err(|e| self.err_failed(e))?;
+                    runtime
+                        .handle
+                        .post_permission_reply(&runtime.session_id, id, response_value, budget)
+                        .map_err(|e| self.err_failed(format!("permission reply failed: {e}")))?;
+                }
+                opencode_serve::PendingGate::Question { id, .. } => {
+                    let answers = opencode_serve::parse_question_reply(gate, input)
+                        .map_err(|e| self.err_failed(e))?;
+                    runtime
+                        .handle
+                        .post_question_reply(id, &answers, budget)
+                        .map_err(|e| self.err_failed(format!("question reply failed: {e}")))?;
+                }
+            }
+            return Ok(());
+        }
+        {
+            let turn = runtime.turn.lock().expect("serve turn lock");
+            if matches!(&*turn, ServeTurnState::InFlight) {
+                return Err(self.err_failed(format!(
+                    "execution {} already has a turn in flight; an opencode session runs one turn \
+                     at a time",
+                    handle.execution_id
+                )));
+            }
+        }
+        self.spawn_serve_turn(&handle.execution_id, input.to_string())
+    }
+
+    /// INTERRUPT on the serve transport (§7.3): `POST /session/{id}/abort`,
+    /// bounded; on any failure, fall back to the process-group kill and
+    /// journal `phase:"interrupt_downgraded"` (codex's precedent, reused
+    /// verbatim). A no-op when no turn is in flight — the goal state already
+    /// holds.
+    fn interrupt_serve(
+        &self,
+        execution_id: &str,
+        work_id: &str,
+        runtime: &Arc<ServeRuntime>,
+        budget: Duration,
+    ) -> Completion {
+        {
+            let turn = runtime.turn.lock().expect("serve turn lock");
+            if !matches!(&*turn, ServeTurnState::InFlight) {
+                return Completion::immediate();
+            }
+        }
+        {
+            let mut state = self.lock();
+            if let Some(execution) = state.executions.get_mut(execution_id) {
+                execution.interrupt_requested = true;
+            }
+        }
+        if let Err(e) = runtime.handle.post_abort(&runtime.session_id, budget) {
+            let pgid = runtime.child.lock().expect("serve child lock").pgid();
+            kill_process_group(Some(pgid));
+            self.emit(
+                execution_id,
+                work_id,
+                KIND_TURN_HARNESS_ERROR,
+                json!({"phase": "interrupt_downgraded", "detail": e}),
+            );
+        }
+        Completion::immediate()
+    }
+}
+
+/// Map a serve execution's runtime state to an Observation (§7.1/§7.2's
+/// pending-gate → `NeedsInput` translation, and §9's terminal → `Observation`
+/// translation, mirrored from [`observe_in_memory`]).
+fn observe_serve(runtime: &ServeRuntime) -> Observation {
+    if let Some(gate) = runtime
+        .pending_gate
+        .lock()
+        .expect("serve pending_gate lock")
+        .clone()
+    {
+        let prompt = gate.prompt();
+        let signal = match &gate {
+            // §7.1: a permission gate is adapter-authored (`AskAuthor::
+            // Adapter`'s own doc names exactly this case).
+            opencode_serve::PendingGate::Permission { .. } => BackendSignal::needs_input(prompt),
+            // §7.2: the actor's own `question` tool — actor-authored.
+            opencode_serve::PendingGate::Question { .. } => BackendSignal::ask(prompt),
+        };
+        return Observation {
+            native: NativeState::Running,
+            signal,
+            evidence: Some(format!(
+                "session_id={}; pending_gate={:?}",
+                runtime.session_id, gate
+            )),
+        };
+    }
+    let turn = runtime.turn.lock().expect("serve turn lock");
+    match &*turn {
+        ServeTurnState::Idle => Observation {
+            native: NativeState::Unknown,
+            signal: BackendSignal::Running,
+            evidence: Some(format!(
+                "session {} bound (serve transport), no turn launched yet",
+                runtime.session_id
+            )),
+        },
+        ServeTurnState::InFlight => Observation {
+            native: NativeState::Running,
+            signal: BackendSignal::Running,
+            evidence: Some(format!("turn in flight on session {}", runtime.session_id)),
+        },
+        ServeTurnState::Finished(outcome) => {
+            if let Some(mismatch) = &outcome.pin_mismatch {
+                return Observation {
+                    native: NativeState::Exited,
+                    signal: BackendSignal::Failed {
+                        reason: mismatch.clone(),
+                    },
+                    evidence: Some(format!(
+                        "session_id={}; model_pin={}; raw={}",
+                        runtime.session_id,
+                        outcome.pin,
+                        outcome.raw_evidence()
+                    )),
+                };
+            }
+            match &outcome.terminal {
+                TerminalOutcome::Completed => Observation {
+                    native: NativeState::Exited,
+                    signal: BackendSignal::StageCompleted {
+                        summary: outcome.summary.clone(),
+                    },
+                    evidence: Some(format!(
+                        "session_id={}; model_pin={}; raw={}; steps={}, text_parts={}, \
+                         tool_parts={}, unknown_events={:?}",
+                        runtime.session_id,
+                        outcome.pin,
+                        outcome.raw_evidence(),
+                        outcome.steps,
+                        outcome.text_parts,
+                        outcome.tool_parts,
+                        outcome.unknown_events,
+                    )),
+                },
+                TerminalOutcome::Failed { reason } => Observation {
+                    native: NativeState::Exited,
+                    signal: BackendSignal::Failed {
+                        reason: format!("turn failed: {}", truncate(reason, 400)),
+                    },
+                    evidence: Some(format!(
+                        "session_id={}; raw={}; stderr: {}",
+                        runtime.session_id,
+                        outcome.raw_evidence(),
+                        truncate(outcome.stderr.trim(), 400)
+                    )),
+                },
+                TerminalOutcome::InterruptedRunning => Observation {
+                    native: NativeState::Exited,
+                    signal: BackendSignal::Running,
+                    evidence: Some(format!(
+                        "turn interrupted by request; session {} remains resumable (abort ends \
+                         the turn, not the child); raw={}",
+                        runtime.session_id,
+                        outcome.raw_evidence()
+                    )),
+                },
+                TerminalOutcome::AmbiguousUnknown => Observation {
+                    native: NativeState::Unknown,
+                    signal: BackendSignal::Running,
+                    evidence: Some(format!(
+                        "turn process ended with no confirmed terminal (session {}); \
+                         last_error={:?}; raw={}",
+                        runtime.session_id,
+                        outcome.last_error,
+                        outcome.raw_evidence()
+                    )),
+                },
+            }
+        }
+    }
 }
 
 /// Kill a turn's whole process group (mirrors `codex.rs::kill_process_group`,
@@ -2667,6 +3757,536 @@ impl TurnReader {
     }
 }
 
+// ------------------------------------------------------- W3: serve runtime
+
+/// Which transport one execution is actually driven by, and — for `Serve` —
+/// the per-execution runtime that transport owns (§3.1). Distinct from
+/// [`Transport`] (§2), which names the *backend's* resolved transport: an
+/// execution's own state can diverge from that after a §8.3 withdrawal on
+/// re-adoption, which is exactly what makes the withdrawal a fact worth
+/// journaling rather than silently true by construction.
+enum OpencodeTransportState {
+    Run,
+    Serve(Arc<ServeRuntime>),
+}
+
+impl std::fmt::Debug for OpencodeTransportState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpencodeTransportState::Run => write!(f, "Run"),
+            OpencodeTransportState::Serve(runtime) => {
+                write!(f, "Serve(session_id={:?})", runtime.session_id)
+            }
+        }
+    }
+}
+
+/// Turn lifecycle on the serve transport (§9). Simpler than the run
+/// transport's `TurnState`: the serve child is spawned once at LAUNCH and
+/// the session id is known before this ever matters, so there is no
+/// `Unlaunched`/`Adopted` split to make here — a re-adopted execution never
+/// re-enters `Serve` at all (§8.3).
+#[derive(Debug)]
+enum ServeTurnState {
+    Idle,
+    InFlight,
+    Finished(Box<TurnOutcome>),
+}
+
+/// One execution's serve-transport state (§3.1): the child, the HTTP+SSE
+/// handle, the durable session id, and everything the SSE reader thread
+/// (persistent for the life of the execution) and the turn-driving thread
+/// (one per turn) share.
+struct ServeRuntime {
+    child: Mutex<opencode_serve::ServeChild>,
+    handle: opencode_serve::ServeHandle,
+    session_id: String,
+    /// §4.3: the *only* source of role, populated from `message.updated`
+    /// frames — what makes [`opencode_serve::serve_part_envelope`]'s role
+    /// gate (C10) possible.
+    message_roles: Mutex<BTreeMap<String, String>>,
+    /// §6.3: at most one outstanding harness-issued gate.
+    pending_gate: Mutex<Option<opencode_serve::PendingGate>>,
+    /// The last `session.error` frame's `properties.error` seen for this
+    /// session — §9.2's terminal table reads `name == "MessageAbortedError"`
+    /// off this to distinguish an aborted turn from every other failure.
+    session_error: Mutex<Option<Value>>,
+    turn: Mutex<ServeTurnState>,
+    /// Reset at the start of every turn by the turn-driving thread; filled
+    /// continuously by the SSE reader thread for the life of that turn.
+    turn_acc: Mutex<TurnAccumulator>,
+    /// §4.4: the raw SSE frame text archived for the turn in flight, reset
+    /// at the same point `turn_acc` is. Capped at `STREAM_MEMORY_CAP`, the
+    /// same bound and the same reported-never-swallowed archive-failure
+    /// posture W1's run-json transport already has.
+    sse_raw: Mutex<String>,
+}
+
+impl std::fmt::Debug for ServeRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServeRuntime")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The withdrawal §8.3 journals on every re-adoption of a backend whose
+/// resolved transport is `Serve`: what a re-adopted execution can no longer
+/// claim, now that it runs on `run-json` instead.
+const SERVE_WITHDRAWN_ON_READOPT: &[&str] = &[
+    "approval_flow",
+    "ask",
+    "interrupt:NativeSessionAbort",
+    "history:ServerMessages",
+    "structured_output",
+];
+
+/// Fold one turn's serve-side evidence into a terminal (§9.2's table,
+/// verbatim). `post` is `ServeHandle::post_message`'s own outcome;
+/// `session_error` is the last `session.error` frame's `properties.error`
+/// this session's SSE reader recorded, taken as a snapshot at the moment the
+/// POST settled.
+fn classify_serve_terminal(
+    post: &Result<Value, opencode_serve::PostMessageError>,
+    session_error: &Option<Value>,
+    child_died: bool,
+) -> TerminalOutcome {
+    // §7.3's own caveat, now resolved by a live measurement this wave's own
+    // implementer made (recorded here, not only in the PR body): the spec's
+    // fixtures only ever captured the abort signature on the SSE side
+    // (`session.error` naming `MessageAbortedError`) and left "what the
+    // SYNC POST returns when its own turn is aborted" explicitly unmeasured.
+    // It is measured now: on 1.18.19, the sync `POST /session/{id}/message`
+    // response settles with `info.error.name == "MessageAbortedError"`
+    // **on the response itself**, not only via a separate SSE frame. Both
+    // sources are therefore checked — whichever arrives is sufficient — and
+    // an abort must be recognized as one before the generic `info.error`
+    // arm below would otherwise call it a plain `Failed`.
+    let sse_aborted = session_error
+        .as_ref()
+        .and_then(|e| e.get("name"))
+        .and_then(Value::as_str)
+        == Some("MessageAbortedError");
+    let response_aborted = |response: &Value| {
+        response.pointer("/info/error/name").and_then(Value::as_str) == Some("MessageAbortedError")
+    };
+    match post {
+        Ok(response) => {
+            let aborted = sse_aborted || response_aborted(response);
+            if aborted {
+                return TerminalOutcome::InterruptedRunning;
+            }
+            let info_error = response.pointer("/info/error");
+            if info_error.is_some_and(|e| !e.is_null()) {
+                return TerminalOutcome::Failed {
+                    reason: format!("opencode reported info.error: {}", info_error.unwrap()),
+                };
+            }
+            if response
+                .pointer("/info/finish")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                return TerminalOutcome::Completed;
+            }
+            TerminalOutcome::AmbiguousUnknown
+        }
+        Err(opencode_serve::PostMessageError::Http { .. }) => TerminalOutcome::Failed {
+            reason: format!(
+                "POST /session/.../message failed: {}",
+                post.as_ref().unwrap_err()
+            ),
+        },
+        // §9.2's own table gives both rows here the same terminal
+        // (`AmbiguousUnknown`) — §15's fail-closed invariant carried onto
+        // this transport unchanged: a transport failure with no abort
+        // confirmation is ambiguous whether or not the child is known to
+        // have died. `child_died` is not dropped, though: the caller folds
+        // it into this outcome's evidence (`ServeTurnDriver`'s own
+        // `child_exit_evidence`/`last_error` assembly), which is where the
+        // fact belongs — a human reading OBSERVE's evidence string should
+        // see it, even though it does not change *which* outcome this is.
+        Err(opencode_serve::PostMessageError::Transport(_)) if sse_aborted => {
+            TerminalOutcome::InterruptedRunning
+        }
+        Err(opencode_serve::PostMessageError::Transport(_)) => {
+            let _ = child_died;
+            TerminalOutcome::AmbiguousUnknown
+        }
+    }
+}
+
+/// The persistent (life-of-the-execution) SSE reader context: everything
+/// needed to translate one filtered frame into normalized events and journal
+/// entries. Spawned once at LAUNCH; outlives every individual turn.
+struct ServeSseReader {
+    sink: Option<EventSink>,
+    execution_id: String,
+    work_id: String,
+    runtime: Arc<ServeRuntime>,
+}
+
+impl ServeSseReader {
+    fn emit(&self, kind: &str, payload: Value) {
+        if let Some(sink) = &self.sink {
+            sink(EventDraft {
+                source: EventSource::new("backend", OPENCODE_BACKEND_NAME),
+                workspace_id: None,
+                work_id: Some(self.work_id.clone()),
+                execution_id: Some(self.execution_id.clone()),
+                correlation_id: Some(self.execution_id.clone()),
+                causation_id: None,
+                kind: kind.to_string(),
+                payload,
+            });
+        }
+    }
+
+    /// Dispatch one already-parsed, already-in-scope-checked SSE frame
+    /// (§4.2's filter runs in the caller, before this is ever reached).
+    fn dispatch_frame(&self, event_type: &str, properties: Value) {
+        match opencode_serve::serve_event_view(event_type) {
+            opencode_serve::ServeEventDisposition::PartUpdated => {
+                let part_type = properties
+                    .pointer("/part/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if part_type == "reasoning" {
+                    let role = properties
+                        .pointer("/part/messageID")
+                        .and_then(Value::as_str)
+                        .and_then(|id| {
+                            self.runtime
+                                .message_roles
+                                .lock()
+                                .expect("serve message_roles lock")
+                                .get(id)
+                                .cloned()
+                        });
+                    if role.as_deref() == Some("assistant") {
+                        self.runtime
+                            .turn_acc
+                            .lock()
+                            .expect("serve turn_acc lock")
+                            .reasoning_parts += 1;
+                    }
+                    return;
+                }
+                let envelope = {
+                    let roles = self
+                        .runtime
+                        .message_roles
+                        .lock()
+                        .expect("serve message_roles lock");
+                    opencode_serve::serve_part_envelope(&properties, |id| roles.get(id).cloned())
+                };
+                let Some(envelope) = envelope else { return };
+                let events = self
+                    .runtime
+                    .turn_acc
+                    .lock()
+                    .expect("serve turn_acc lock")
+                    .ingest_line(&envelope);
+                for event in events {
+                    self.emit(&event.kind, event.payload);
+                }
+            }
+            opencode_serve::ServeEventDisposition::MessageUpdated => {
+                if let (Some(id), Some(role)) = (
+                    properties.pointer("/info/id").and_then(Value::as_str),
+                    properties.pointer("/info/role").and_then(Value::as_str),
+                ) {
+                    self.runtime
+                        .message_roles
+                        .lock()
+                        .expect("serve message_roles lock")
+                        .insert(id.to_string(), role.to_string());
+                }
+            }
+            opencode_serve::ServeEventDisposition::PermissionAsked => {
+                if let Some(gate) = opencode_serve::PendingGate::from_permission_asked(&properties)
+                {
+                    *self
+                        .runtime
+                        .pending_gate
+                        .lock()
+                        .expect("serve pending_gate lock") = Some(gate);
+                }
+                self.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({"phase": "permission_asked", "detail": properties}),
+                );
+            }
+            opencode_serve::ServeEventDisposition::PermissionReplied => {
+                *self
+                    .runtime
+                    .pending_gate
+                    .lock()
+                    .expect("serve pending_gate lock") = None;
+                self.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({"phase": "permission_replied", "detail": properties}),
+                );
+            }
+            opencode_serve::ServeEventDisposition::QuestionAsked => {
+                if let Some(gate) = opencode_serve::PendingGate::from_question_asked(&properties) {
+                    *self
+                        .runtime
+                        .pending_gate
+                        .lock()
+                        .expect("serve pending_gate lock") = Some(gate);
+                }
+                self.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({"phase": "question_asked", "detail": properties}),
+                );
+            }
+            opencode_serve::ServeEventDisposition::QuestionReplied => {
+                *self
+                    .runtime
+                    .pending_gate
+                    .lock()
+                    .expect("serve pending_gate lock") = None;
+                self.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({"phase": "question_replied", "detail": properties}),
+                );
+            }
+            opencode_serve::ServeEventDisposition::SessionError => {
+                let error = properties.get("error").cloned().unwrap_or(Value::Null);
+                *self
+                    .runtime
+                    .session_error
+                    .lock()
+                    .expect("serve session_error lock") = Some(error.clone());
+                self.emit(
+                    KIND_TURN_HARNESS_ERROR,
+                    json!({"phase": "session_error", "detail": error}),
+                );
+            }
+            opencode_serve::ServeEventDisposition::Archived => {}
+            opencode_serve::ServeEventDisposition::Unknown => {
+                self.runtime
+                    .turn_acc
+                    .lock()
+                    .expect("serve turn_acc lock")
+                    .unknown_events
+                    .push(event_type.to_string());
+            }
+        }
+    }
+
+    // The reader thread's own loop (open the stream, verify `server.
+    // connected`, then dispatch every in-scope frame) lives inline in
+    // `OpencodeBackend::launch_serve`, not as a method here: it has to run
+    // *before* this struct's own `runtime` field can exist (§3.5's ordering
+    // — the bus must attach before `POST /session` mints the session id
+    // this struct's `runtime.session_id` needs), so the loop is driven
+    // against a `Arc<Mutex<Option<Arc<ServeRuntime>>>>` cell that starts
+    // empty and is filled once the session exists. `dispatch_frame` above is
+    // the one piece both that bootstrap window and this struct's own
+    // documented role share, and it lives here so there is exactly one copy
+    // of it.
+}
+
+/// One turn on the serve transport: `POST /session/{id}/message`, blocking,
+/// then §9.2's reconciliation. The SSE reader thread (already running,
+/// persistent for the execution) is what actually produced the narration
+/// events *as the turn ran* — this thread's job is the POST itself and the
+/// post-turn bookkeeping (terminal, pin, usage, archive, journal).
+struct ServeTurnDriver {
+    backend_state: Arc<Mutex<AdapterState>>,
+    sink: Option<EventSink>,
+    data_dir: PathBuf,
+    execution_id: String,
+    work_id: String,
+    model: Option<String>,
+    structured_format: Option<Value>,
+    runtime: Arc<ServeRuntime>,
+    turn_budget: Duration,
+}
+
+impl ServeTurnDriver {
+    fn emit(&self, kind: &str, payload: Value) {
+        if let Some(sink) = &self.sink {
+            sink(EventDraft {
+                source: EventSource::new("backend", OPENCODE_BACKEND_NAME),
+                workspace_id: None,
+                work_id: Some(self.work_id.clone()),
+                execution_id: Some(self.execution_id.clone()),
+                correlation_id: Some(self.execution_id.clone()),
+                causation_id: None,
+                kind: kind.to_string(),
+                payload,
+            });
+        }
+    }
+
+    fn run(self, prompt: String) {
+        let mut body = json!({
+            "model": self.model.as_deref().and_then(|m| m.split_once('/')).map(
+                |(provider, model)| json!({"providerID": provider, "modelID": model})
+            ).unwrap_or_else(|| json!({"providerID": "opencode", "modelID": self.model.clone()})),
+            "parts": [{"type": "text", "text": prompt}],
+        });
+        if let Some(format) = &self.structured_format {
+            body["format"] = format.clone();
+        }
+        let post =
+            self.runtime
+                .handle
+                .post_message(&self.runtime.session_id, &body, self.turn_budget);
+
+        let child_status = self
+            .runtime
+            .child
+            .lock()
+            .expect("serve child lock")
+            .status();
+        let (child_died, child_exit_evidence) = match &child_status {
+            opencode_serve::ServeChildStatus::Exited { detail, code } => (
+                true,
+                Some(format!("serve child exited: {detail} (code {code:?})")),
+            ),
+            opencode_serve::ServeChildStatus::Running => (false, None),
+            opencode_serve::ServeChildStatus::Unknown(why) => (
+                false,
+                Some(format!("serve child liveness unknowable: {why}")),
+            ),
+        };
+        let session_error = self
+            .runtime
+            .session_error
+            .lock()
+            .expect("serve session_error lock")
+            .clone();
+        let interrupted = {
+            let state = self
+                .backend_state
+                .lock()
+                .expect("opencode adapter state lock");
+            state
+                .executions
+                .get(&self.execution_id)
+                .is_some_and(|e| e.interrupt_requested)
+        };
+        // Mirrors run-json's `classify_terminal` ordering (§9.2 carried onto
+        // this transport): an explicit statement (a clean completion, or a
+        // named failure) outranks a kill we asked for; everything else, once
+        // sergeant asked for the kill, collapses to `InterruptedRunning` —
+        // including the §7.3 downgrade path, where the abort RPC itself
+        // failed and the process group was killed out from under an
+        // in-flight POST with no `session.error` ever arriving to confirm
+        // it.
+        let normal_terminal = classify_serve_terminal(&post, &session_error, child_died);
+        let terminal = if interrupted {
+            match normal_terminal {
+                TerminalOutcome::Completed | TerminalOutcome::Failed { .. } => normal_terminal,
+                _ => TerminalOutcome::InterruptedRunning,
+            }
+        } else {
+            normal_terminal
+        };
+
+        let acc_snapshot = {
+            let acc = self.runtime.turn_acc.lock().expect("serve turn_acc lock");
+            (
+                acc.steps,
+                acc.text_parts,
+                acc.tool_parts,
+                acc.reasoning_parts,
+                acc.unknown_events.clone(),
+                acc.last_step_summary.clone(),
+            )
+        };
+        let (steps, text_parts, tool_parts, reasoning_parts, unknown_events, summary) =
+            acc_snapshot;
+
+        let verdict = match &post {
+            Ok(response) => verify_model_pin(
+                self.model.as_deref(),
+                &json!({"info": {"id": self.runtime.session_id}, "messages": [response]}),
+            ),
+            Err(_) => match self.model.as_deref() {
+                None => PinVerdict::Unpinned,
+                Some(_) => PinVerdict::Attempted(
+                    "the serve turn's own POST response could not be read, so nothing evidences \
+                     which model served this turn"
+                        .to_string(),
+                ),
+            },
+        };
+        let pin_mismatch = verdict.mismatch(self.model.as_deref());
+        let pin = verdict.as_json(self.model.as_deref());
+
+        let raw = {
+            let mut held = self.runtime.sse_raw.lock().expect("serve sse_raw lock");
+            std::mem::take(&mut *held)
+        };
+        let (raw_blob, raw_error) = if raw.is_empty() {
+            (None, None)
+        } else {
+            match BlobStore::open(&self.data_dir).and_then(|store| store.put(raw.as_bytes())) {
+                Ok(blob_ref) => (Some(blob_ref.to_string()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        };
+        let stderr = self
+            .runtime
+            .child
+            .lock()
+            .expect("serve child lock")
+            .stderr_tail();
+        let last_error = post
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .or_else(|| {
+                session_error
+                    .as_ref()
+                    .map(|e| format!("session.error: {e}"))
+            })
+            .or(child_exit_evidence);
+
+        *self.runtime.turn.lock().expect("serve turn lock") =
+            ServeTurnState::Finished(Box::new(TurnOutcome {
+                terminal: terminal.clone(),
+                pin_mismatch,
+                pin: pin.clone(),
+                steps,
+                text_parts,
+                tool_parts,
+                unknown_events: unknown_events.clone(),
+                unparsed_lines: 0,
+                summary: summary.clone(),
+                last_error: last_error.clone(),
+                exit_code: None,
+                raw_blob: raw_blob.clone(),
+                raw_error: raw_error.clone(),
+                stderr: stderr.clone(),
+            }));
+
+        self.emit(
+            KIND_CONVERSATION_TURN_ENDED,
+            json!({
+                "session_id": self.runtime.session_id,
+                "interrupted": interrupted,
+                "outcome": terminal_outcome_label(&terminal),
+                "steps": steps,
+                "text_parts": text_parts,
+                "tool_parts": tool_parts,
+                "reasoning_parts": reasoning_parts,
+                "unknown_events": unknown_events,
+                "model_pin": pin,
+                "raw": raw_blob,
+                "raw_error": raw_error,
+                "stderr": truncate(stderr.trim(), 400),
+                "transport": Transport::Serve.as_str(),
+            }),
+        );
+    }
+}
+
 impl Backend for OpencodeBackend {
     fn name(&self) -> &str {
         OPENCODE_BACKEND_NAME
@@ -2682,22 +4302,15 @@ impl Backend for OpencodeBackend {
     /// record, which is exactly what [`Capabilities::history`] asks for and
     /// what neither claude's per-turn stream nor codex's unmeasured rollout
     /// format could honestly supply (R4).
+    ///
+    /// §2.2: resolution-dependent, not a fixed value — the one real
+    /// divergence this wave has from `codex.rs`. Whatever transport this
+    /// registration resolved to (§2.1, memoized at first use, never
+    /// revisited per execution) is the only capability set it may ever
+    /// advertise, so a registration that fell back to `run-json` can never
+    /// claim serve's `approval_flow`/`ask`.
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            persistent_sessions: true,
-            native_background: false,
-            streaming: true,
-            history: true,
-            resume: true,
-            interrupt: true,
-            model_selection: true,
-            profiles: true,
-            approval_flow: false,
-            human_attach: false,
-            usage: true,
-            native_subagents: false,
-            ask: false,
-        }
+        capabilities_for(self.transport_resolution().transport)
     }
 
     /// §17: each turn is its own short-lived process; there is no
@@ -2717,11 +4330,27 @@ impl Backend for OpencodeBackend {
                 detail: Some(outcome.detail.clone()),
             };
         }
+        // §2.1 rule 2 / codex §5.2 rule 2, verbatim: `ServeOnly` with a
+        // failed gate is the one place a resolution decision *is* a probe
+        // failure, rather than a fallback the detail merely names.
+        if self.config.transport == TransportChoice::ServeOnly
+            && let Err(reason) = &self.serve_gates().result
+        {
+            return ProbeReport {
+                available: false,
+                detail: Some(format!(
+                    "{}; serve requested (ServeOnly) but refused: {reason}",
+                    outcome.detail
+                )),
+            };
+        }
+        let resolution = self.transport_resolution();
         ProbeReport {
             available: true,
             detail: Some(format!(
-                "{}\nadmission rows:\n{}",
+                "{}\n{}\nadmission rows:\n{}",
                 outcome.detail,
+                resolution.detail,
                 render_admission_rows()
             )),
         }
@@ -2753,54 +4382,20 @@ impl Backend for OpencodeBackend {
         })
     }
 
-    /// LAUNCH: register the execution, spawn turn 1, and wait bounded for the
-    /// first event line's session id before returning a handle at all. A
-    /// failed launch leaves no phantom: adapter state is removed on every
-    /// error path.
+    /// LAUNCH: dispatch to whichever transport this registration resolved to
+    /// (§2.1, §8.2). A serve-launch failure is a refusal, never a silent
+    /// fallback to `run-json` — §8.2's absolute rule, because a mid-
+    /// registration downgrade would leave `capabilities()` advertising
+    /// `approval_flow`/`ask` for a session that has neither.
     fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
-        let request = &prepared.request;
-        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
-        {
-            let mut state = self.lock();
-            state.executions.insert(
-                request.execution_id.clone(),
-                OpencodeExecution {
-                    session_id: None,
-                    work_id: request.work_id.clone(),
-                    cwd: request.cwd.clone(),
-                    model: request.model.clone(),
-                    executable,
-                    env,
-                    config_content: self.config.config_content.clone(),
-                    bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
-                    turns: 0,
-                    turn: TurnState::Unlaunched,
-                    turn_pgid: None,
-                    stopped: false,
-                    interrupt_requested: false,
-                    reader: None,
-                },
-            );
-        }
-        let policy = format!("{:?}", request.instruction_policy);
-        match self.spawn_first_turn(
-            &request.execution_id,
-            compose_launch_prompt(request),
-            Some(policy),
-        ) {
-            Ok(session_id) => Ok(ExecutionHandle {
-                execution_id: request.execution_id.clone(),
-                native_id: Some(session_id),
-            }),
-            Err(e) => {
-                self.lock().executions.remove(&request.execution_id);
-                Err(e)
-            }
+        match self.transport_resolution().transport {
+            Transport::Run => self.launch_run(prepared),
+            Transport::Serve => self.launch_serve(prepared),
         }
     }
 
     fn send(&self, handle: &ExecutionHandle, input: &str) -> Result<(), BackendError> {
-        {
+        let transport_is_serve = {
             let state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = &state.executions[&handle.execution_id];
@@ -2810,6 +4405,14 @@ impl Backend for OpencodeBackend {
                     handle.execution_id
                 )));
             }
+            matches!(execution.transport_state, OpencodeTransportState::Serve(_))
+        };
+        if transport_is_serve {
+            return self.send_serve(handle, input);
+        }
+        {
+            let state = self.lock();
+            let execution = &state.executions[&handle.execution_id];
             if let TurnState::InFlight(_) = execution.turn {
                 return Err(self.err_failed(format!(
                     "execution {} already has a turn in flight; an opencode session runs one turn \
@@ -2826,6 +4429,11 @@ impl Backend for OpencodeBackend {
         if state.executions.contains_key(&handle.execution_id) {
             self.check_identity(&state, handle)?;
             let execution = &state.executions[&handle.execution_id];
+            if let OpencodeTransportState::Serve(runtime) = &execution.transport_state {
+                let runtime = Arc::clone(runtime);
+                drop(state);
+                return Ok(observe_serve(&runtime));
+            }
             if matches!(execution.turn, TurnState::Adopted) {
                 let session_id = execution.session_id.clone().unwrap_or_default();
                 let cwd = execution.cwd.clone();
@@ -2870,6 +4478,14 @@ impl Backend for OpencodeBackend {
                 .executions
                 .get_mut(&handle.execution_id)
                 .expect("presence checked above");
+            if let OpencodeTransportState::Serve(runtime) = &execution.transport_state {
+                let runtime = Arc::clone(runtime);
+                let work_id = execution.work_id.clone();
+                let execution_id = handle.execution_id.clone();
+                let budget = self.config.serve_budgets.unwrap_or_default().abort;
+                drop(state);
+                return Ok(self.interrupt_serve(&execution_id, &work_id, &runtime, budget));
+            }
             // The group id is taken whatever the turn state says (mirrors
             // `codex.rs::interrupt`, §5.5): a turn that has already ended can
             // still have left a background command running in its group —
@@ -2954,6 +4570,26 @@ impl Backend for OpencodeBackend {
             }
             return Ok(());
         }
+        // §8.3: a serve child dies with the daemon, so every re-adoption
+        // lands on `run-json` regardless of what launched the original
+        // execution — `transport_resolution()` is a backend-level value, not
+        // per-execution memory, so a backend resolved to `Serve` is exactly
+        // the case in which this re-adoption *is* a withdrawal, and it is
+        // journaled as one rather than silently true by construction (§8.3's
+        // own rule: "a declared per-execution withdrawal, not a downgrade").
+        if self.transport_resolution().transport == Transport::Serve {
+            self.emit(
+                &handle.execution_id,
+                &request.work_id,
+                KIND_TURN_HARNESS_ERROR,
+                json!({
+                    "phase": "transport_withdrawn_on_readopt",
+                    "from": Transport::Serve.as_str(),
+                    "to": Transport::Run.as_str(),
+                    "withdrawn": SERVE_WITHDRAWN_ON_READOPT,
+                }),
+            );
+        }
         state.executions.insert(
             handle.execution_id.clone(),
             OpencodeExecution {
@@ -2971,12 +4607,16 @@ impl Backend for OpencodeBackend {
                 stopped: false,
                 interrupt_requested: false,
                 reader: None,
+                transport_state: OpencodeTransportState::Run,
             },
         );
         Ok(())
     }
 
-    /// HISTORY: the whole session, decoded from `opencode export` (§27).
+    /// HISTORY: dispatched by transport (§7.4). Serve's `GET /session/{id}/
+    /// message` is a bare array shimmed into `export`'s envelope so
+    /// `decode_export` runs unchanged (one decoder for history too); run-json
+    /// keeps `opencode export` (§27).
     ///
     /// The one adapter in this registry that can answer this honestly. The
     /// answer is complete or it is a refusal — never a prefix — and
@@ -2987,7 +4627,7 @@ impl Backend for OpencodeBackend {
     /// "this conversation said nothing", which is exactly the confusion
     /// [`Capabilities::history`] exists to prevent.
     fn history(&self, handle: &ExecutionHandle) -> Result<Vec<NativeEvent>, BackendError> {
-        let (executable, cwd, env, config_content, session_id) = {
+        let (executable, cwd, env, config_content, session_id, serve) = {
             let state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = &state.executions[&handle.execution_id];
@@ -2995,14 +4635,32 @@ impl Backend for OpencodeBackend {
                 .session_id
                 .clone()
                 .ok_or_else(|| self.err_unknown(&handle.execution_id))?;
+            let serve = match &execution.transport_state {
+                OpencodeTransportState::Serve(runtime) => Some(Arc::clone(runtime)),
+                OpencodeTransportState::Run => None,
+            };
             (
                 execution.executable.clone(),
                 execution.cwd.clone(),
                 execution.env.clone(),
                 execution.config_content.clone(),
                 session_id,
+                serve,
             )
         };
+        if let Some(runtime) = serve {
+            let budget = self.config.serve_budgets.unwrap_or_default().readiness;
+            let messages = runtime
+                .handle
+                .get_messages(&session_id, budget)
+                .map_err(|why| {
+                    self.err_failed(format!(
+                        "cannot retrieve native history for session {session_id}: {why}"
+                    ))
+                })?;
+            let export = json!({"info": {"id": session_id}, "messages": messages});
+            return Ok(decode_export(&export));
+        }
         let export = run_export(
             &executable,
             &cwd,
@@ -3022,10 +4680,12 @@ impl Backend for OpencodeBackend {
 
     /// STOP: kill any in-flight turn, refuse further input, hand back the
     /// reader's join as the completion's tail (issue #14/B3's rule — the
-    /// engine never waits on it under the core lock).
+    /// engine never waits on it under the core lock). §3.7: STOP kills the
+    /// serve child too (INTERRUPT deliberately does not — abort is a session
+    /// operation and the child survives for later turns).
     fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
         self.interrupt(handle)?.wait();
-        let reader = {
+        let (reader, serve) = {
             let mut state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = state
@@ -3033,8 +4693,15 @@ impl Backend for OpencodeBackend {
                 .get_mut(&handle.execution_id)
                 .expect("presence checked above");
             execution.stopped = true;
-            execution.reader.take()
+            let serve = match &execution.transport_state {
+                OpencodeTransportState::Serve(runtime) => Some(Arc::clone(runtime)),
+                OpencodeTransportState::Run => None,
+            };
+            (execution.reader.take(), serve)
         };
+        if let Some(runtime) = serve {
+            runtime.child.lock().expect("serve child lock").kill();
+        }
         match reader {
             None => Ok(Completion::immediate()),
             Some(reader) => Ok(Completion::deferred(move || {
@@ -3176,6 +4843,14 @@ mod tests {
         include_str!("../../tests/fixtures/opencode-1.18.19-error-unknown-model.jsonl");
     const EXPORT_SESSION: &str =
         include_str!("../../tests/fixtures/opencode-1.18.19-export-session.json");
+    const SERVE_MESSAGES_FULL_HISTORY: &str =
+        include_str!("../../tests/fixtures/opencode-serve-1.18.19-messages-full-history.json");
+    const SERVE_EXPORT_FULL_HISTORY: &str =
+        include_str!("../../tests/fixtures/opencode-serve-1.18.19-export-full-history.json");
+    const SERVE_SYNC_MESSAGE_RESPONSE: &str =
+        include_str!("../../tests/fixtures/opencode-serve-1.18.19-sync-message-response.json");
+    const SERVE_STRUCTURED_OUTPUT_RESPONSE: &str =
+        include_str!("../../tests/fixtures/opencode-serve-1.18.19-structured-output-response.json");
 
     /// Replay a fixture through the decoder, exactly as `TurnReader::run`
     /// does, and hand back the accumulator plus every event it produced.
@@ -3818,57 +5493,89 @@ mod tests {
     // ------------------------------------------------------ admission rows
 
     /// L8, made structural: every `true` in `capabilities()` has a row, every
-    /// row agrees with the contract, and every claimed row names a real test.
+    /// row agrees with the contract, and every claimed row names a real
+    /// test. §2.2 extension: driven for **both** transports independently
+    /// via `capabilities_for`, which is what makes "a registration that
+    /// resolved to run-json can never advertise serve's approval_flow/ask" a
+    /// structural fact rather than an intention — the two transports' rows
+    /// are checked against `capabilities_for(Run)`/`capabilities_for(Serve)`
+    /// separately, never against one shared value.
     #[test]
     fn admission_rows_agree_with_capabilities() {
-        let backend = OpencodeBackend::new(OpencodeConfig::new(Path::new("/nonexistent")));
-        let caps = backend.capabilities();
-        let flags: &[(&str, bool)] = &[
-            ("persistent_sessions", caps.persistent_sessions),
-            ("native_background", caps.native_background),
-            ("streaming", caps.streaming),
-            ("history", caps.history),
-            ("resume", caps.resume),
-            ("interrupt", caps.interrupt),
-            ("model_selection", caps.model_selection),
-            ("profiles", caps.profiles),
-            ("approval_flow", caps.approval_flow),
-            ("human_attach", caps.human_attach),
-            ("usage", caps.usage),
-            ("native_subagents", caps.native_subagents),
-            ("ask", caps.ask),
-        ];
-        for &(flag, claimed_by_contract) in flags {
-            let row = ADMISSION_ROWS
-                .iter()
-                .find(|row| row.capability == flag && row.transport == Transport::Run)
-                .unwrap_or_else(|| panic!("no ADMISSION_ROWS entry for {flag}"));
-            assert_eq!(
-                row.claimed, claimed_by_contract,
-                "{flag}: capabilities() says {claimed_by_contract}, the row says {}",
-                row.claimed
-            );
-            if row.claimed {
-                assert!(
-                    !row.admission_test.is_empty(),
-                    "{flag}: claimed true with no admission_test named"
+        fn flags_for(caps: Capabilities) -> Vec<(&'static str, bool)> {
+            vec![
+                ("persistent_sessions", caps.persistent_sessions),
+                ("native_background", caps.native_background),
+                ("streaming", caps.streaming),
+                ("history", caps.history),
+                ("resume", caps.resume),
+                ("interrupt", caps.interrupt),
+                ("model_selection", caps.model_selection),
+                ("profiles", caps.profiles),
+                ("approval_flow", caps.approval_flow),
+                ("human_attach", caps.human_attach),
+                ("usage", caps.usage),
+                ("native_subagents", caps.native_subagents),
+                ("ask", caps.ask),
+            ]
+        }
+        let mut flag_count = 0;
+        for transport in [Transport::Run, Transport::Serve] {
+            let flags = flags_for(capabilities_for(transport));
+            flag_count += flags.len();
+            for (flag, claimed_by_contract) in flags {
+                let row = ADMISSION_ROWS
+                    .iter()
+                    .find(|row| row.capability == flag && row.transport == transport)
+                    .unwrap_or_else(|| {
+                        panic!("no ADMISSION_ROWS entry for {flag} on {transport:?}")
+                    });
+                assert_eq!(
+                    row.claimed, claimed_by_contract,
+                    "{flag}/{transport:?}: capabilities_for says {claimed_by_contract}, the row \
+                     says {}",
+                    row.claimed
                 );
+                if row.claimed {
+                    assert!(
+                        !row.admission_test.is_empty(),
+                        "{flag}/{transport:?}: claimed true with no admission_test named"
+                    );
+                }
             }
         }
-        // The two rows with no v1 boolean hold the same invariant.
-        for capability in ["config_injection", "non_blocking_run"] {
+        // Adapter-local rows with no v1 boolean hold the same invariant.
+        // `non_blocking_run` is Run-only (§7.7: serve's analogous guarantee
+        // is `approval_flow`, not a second non_blocking_run row).
+        for (capability, transport) in [
+            ("config_injection", Transport::Run),
+            ("config_injection", Transport::Serve),
+            ("non_blocking_run", Transport::Run),
+            ("structured_output", Transport::Serve),
+        ] {
             let row = ADMISSION_ROWS
                 .iter()
-                .find(|row| row.capability == capability)
-                .unwrap_or_else(|| panic!("no ADMISSION_ROWS entry for {capability}"));
+                .find(|row| row.capability == capability && row.transport == transport)
+                .unwrap_or_else(|| {
+                    panic!("no ADMISSION_ROWS entry for {capability}/{transport:?}")
+                });
             assert!(row.claimed);
             assert!(!row.admission_test.is_empty());
         }
+        let row = ADMISSION_ROWS
+            .iter()
+            .find(|row| row.capability == "structured_output" && row.transport == Transport::Run)
+            .expect("structured_output/Run row exists");
+        assert!(!row.claimed);
+        assert!(row.admission_test.is_empty());
+
+        // 13 v1 flags * 2 transports, + config_injection * 2 transports, +
+        // non_blocking_run (Run only) + structured_output * 2 transports.
         assert_eq!(
             ADMISSION_ROWS.len(),
-            flags.len() + 2,
-            "every row is one of the thirteen v1 flags or one of the two adapter-local rows — an \
-             unlisted row is a claim nothing checks"
+            flag_count + 2 + 1 + 2,
+            "every row is one of the thirteen v1 flags (on each transport) or one of the \
+             adapter-local rows — an unlisted row is a claim nothing checks"
         );
     }
 
@@ -3920,5 +5627,158 @@ mod tests {
         assert_eq!(truncate("abcdef", 3), "abc");
         assert_eq!(truncate("abc", 10), "abc");
         assert_eq!(truncate("héllo", 2), "hé");
+    }
+
+    // ---------------------------------------------------- W3: serve rows
+
+    /// §7.4/C3: `messages()`'s bare-array shim, wrapped into `export`'s
+    /// `{info, messages}` envelope and decoded by the exact same
+    /// `decode_export` both transports share, must yield the byte-identical
+    /// event sequence `export`'s own document decodes to on the same rich
+    /// session (4 messages, incl. an aborted tool call, spanning
+    /// step-start/reasoning/text/tool/step-finish) — the completeness proof
+    /// the wave contract asks for, and the one-decoder rule extended to
+    /// history.
+    #[test]
+    fn serve_messages_and_export_decode_to_identical_history() {
+        let messages: Value =
+            serde_json::from_str(SERVE_MESSAGES_FULL_HISTORY).expect("messages fixture is JSON");
+        let export: Value =
+            serde_json::from_str(SERVE_EXPORT_FULL_HISTORY).expect("export fixture is JSON");
+        let shimmed = json!({"info": export.pointer("/info"), "messages": messages});
+        let from_messages = decode_export(&shimmed);
+        let from_export = decode_export(&export);
+        assert!(
+            !from_messages.is_empty(),
+            "the rich session decodes to at least one event"
+        );
+        assert_eq!(
+            from_messages, from_export,
+            "messages() (shimmed) and export must decode to the byte-identical event sequence"
+        );
+    }
+
+    /// §7.6: the sync `POST /session/{id}/message` response's own `info.
+    /// modelID`/`info.providerID` verify the pin with **no export
+    /// subprocess** — `verify_model_pin` is reused verbatim behind a
+    /// one-line envelope shim.
+    #[test]
+    fn the_sync_message_fixture_verifies_the_pin_without_an_export() {
+        let response: Value =
+            serde_json::from_str(SERVE_SYNC_MESSAGE_RESPONSE).expect("fixture is JSON");
+        let shimmed = json!({"info": {"id": "ses_fixture"}, "messages": [response]});
+        let verdict = verify_model_pin(Some("opencode/big-pickle"), &shimmed);
+        assert_eq!(
+            verdict,
+            PinVerdict::Honored("opencode/big-pickle".to_string())
+        );
+    }
+
+    /// §7.5/C2: `format:{type:json_schema,...}` lands the result at
+    /// `info.structured`, **not** a field named `structured_output` (the
+    /// plan's own guess), and `info.finish` is `"tool-calls"` — a
+    /// classifier that treats a non-`stop` finish as abnormal would mark
+    /// every structured turn abnormal. The mechanism is a synthetic
+    /// `StructuredOutput` tool part, so the shared decoder must emit an
+    /// ordinary `tool.requested`/`tool.completed` pair for it — deliberate,
+    /// not a bug to "fix" later.
+    #[test]
+    fn the_structured_output_fixture_lands_at_info_structured_with_a_tool_calls_finish() {
+        let response: Value =
+            serde_json::from_str(SERVE_STRUCTURED_OUTPUT_RESPONSE).expect("fixture is JSON");
+        assert_eq!(
+            response.pointer("/info/structured"),
+            Some(&json!({"word": "pong"}))
+        );
+        assert_eq!(
+            response.pointer("/info/finish").and_then(Value::as_str),
+            Some("tool-calls")
+        );
+        assert!(
+            response.pointer("/info/structured_output").is_none(),
+            "the plan's own guessed field name must not be the one that carries the payload"
+        );
+        let shimmed = json!({"info": {"id": "ses_fixture"}, "messages": [response]});
+        let events = decode_export(&shimmed);
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert!(kinds.contains(&KIND_TOOL_REQUESTED), "{kinds:?}");
+        assert!(kinds.contains(&KIND_TOOL_COMPLETED), "{kinds:?}");
+        let completed = events
+            .iter()
+            .find(|e| e.kind == KIND_TOOL_COMPLETED)
+            .expect("a tool.completed event for the synthetic StructuredOutput tool");
+        assert_eq!(completed.payload["name"], "StructuredOutput");
+        assert_eq!(completed.payload["is_error"], false);
+    }
+
+    /// Live-measured deviation from the spec (recorded, not silently
+    /// patched): §9.2's own caveat left "what the sync `POST /session/{id}/
+    /// message` returns when its own turn is aborted" explicitly
+    /// unmeasured. A live run against opencode 1.18.19 while implementing
+    /// this wave measured it — the response settles with
+    /// `info.error.name == "MessageAbortedError"` **on the POST response
+    /// itself**, not only via a separate SSE `session.error` frame. Without
+    /// checking the response too, `classify_serve_terminal` called this a
+    /// generic `Failed` instead of `InterruptedRunning`.
+    #[test]
+    fn classify_serve_terminal_recognizes_an_abort_signature_on_the_post_response_itself() {
+        let post: Result<Value, opencode_serve::PostMessageError> = Ok(json!({
+            "info": {"error": {"name": "MessageAbortedError", "data": {"message": "Aborted"}}},
+        }));
+        let outcome = classify_serve_terminal(&post, &None, false);
+        assert_eq!(
+            outcome,
+            TerminalOutcome::InterruptedRunning,
+            "an abort signature on the response itself must not be classified as a plain failure"
+        );
+    }
+
+    /// §8.2's absolute rule, as code: a serve child that fails before it
+    /// ever finished spawning is a LAUNCH refusal, **never** a silent
+    /// fallback to run-json, and it leaves no phantom execution behind.
+    /// Calls the private `launch_serve` directly (this test lives in the
+    /// same module) precisely so the serve *gate*'s own success/failure is
+    /// not entangled with this assertion — see the pointer test in
+    /// `tests/opencode_backend.rs` for why an external test cannot exercise
+    /// this the same way.
+    #[test]
+    fn serve_launch_failure_is_a_refusal_not_a_run_turn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stub_path = dir.path().join("broken-serve-stub");
+        std::fs::write(&stub_path, "#!/bin/sh\nexit 7\n").expect("write stub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&stub_path).expect("stat").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&stub_path, perms).expect("chmod");
+        }
+
+        let mut config = OpencodeConfig::new(dir.path());
+        config.executable = stub_path;
+        config.serve_budgets = Some(ServeBudgets {
+            readiness: Duration::from_secs(2),
+            abort: Duration::from_secs(2),
+            turn: Duration::from_secs(2),
+        });
+        let backend = OpencodeBackend::new(config);
+        let request = prompt_request(vec![]);
+        let prepared = PreparedExecution {
+            execution_id: request.execution_id.clone(),
+            native_id: None,
+            request,
+        };
+
+        let result = backend.launch_serve(&prepared);
+        let err = result.expect_err("a stub that exits without a listening line must refuse");
+        let message = err.to_string();
+        assert!(
+            message.contains("phase: spawn"),
+            "the refusal must name the phase it failed at: {message}"
+        );
+        assert!(
+            backend.tracked_executions().is_empty(),
+            "a failed serve launch must leave no phantom execution behind"
+        );
     }
 }

@@ -1,0 +1,70 @@
+data: {"id":"evt_02edb2b28001KKDy4mWlhcQ5kS","type":"server.connected","properties":{}}
+
+data: {"id":"evt_02edb2f1b001Mtr39yKFrTiBCi","type":"question.replied","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","requestID":"que_02eda97b4001CDLw7qNF1En0mS","answers":[["Blue"]]}}
+
+data: {"id":"evt_02edb2f20001t9Opyq4J93UbUd","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"type":"tool","tool":"question","callID":"call_c90579ffc20a4555b7ea3791","state":{"status":"completed","input":{"questions":[{"question":"Which color do you prefer?","header":"Color preference","options":[{"label":"Red","description":"You prefer the color red"},{"label":"Blue","description":"You prefer the color blue"}]}]},"output":"User has answered your questions: \"Which color do you prefer?\"=\"Blue\". You can now continue with the user's answers in mind.","metadata":{"answers":[["Blue"]],"truncated":false},"title":"Asked 1 question","time":{"start":1787492472758,"end":1787492511520}},"id":"prt_02eda9314001wEAX4692dgKzhA","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq"},"time":1787492511520}}
+
+data: {"id":"evt_02edb2f24001u07roP35RRxNet","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02edb2f24001Nocelvj4flqG3Q","reason":"tool-calls","messageID":"msg_02eda87d6001AmTYnwW3E4LIYq","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"step-finish","tokens":{"total":8194,"input":32,"output":83,"reasoning":15,"cache":{"write":0,"read":8064}},"cost":0},"time":1787492511524}}
+
+data: {"id":"evt_02edb2f26001IPFkAJvna7NQr9","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"msg_02eda87d6001AmTYnwW3E4LIYq","parentID":"msg_02eda87cb001AbZ5MIWNCuxVw9","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/var/tmp/opencode-impl/probe-w3","root":"/"},"cost":0,"tokens":{"total":8194,"input":32,"output":83,"reasoning":15,"cache":{"write":0,"read":8064}},"modelID":"big-pickle","providerID":"opencode","time":{"created":1787492468694,"completed":1787492511528},"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","finish":"tool-calls"}}}
+
+data: {"id":"evt_02edb2f28001zaxCtPgQaF3O6w","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"msg_02eda87d6001AmTYnwW3E4LIYq","parentID":"msg_02eda87cb001AbZ5MIWNCuxVw9","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/var/tmp/opencode-impl/probe-w3","root":"/"},"cost":0,"tokens":{"total":8194,"input":32,"output":83,"reasoning":15,"cache":{"write":0,"read":8064}},"modelID":"big-pickle","providerID":"opencode","time":{"created":1787492468694,"completed":1787492511528},"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","finish":"tool-calls"}}}
+
+data: {"id":"evt_02edb2f29001AliXwxwsmrmDh3","type":"session.status","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","status":{"type":"busy"}}}
+
+data: {"id":"evt_02edb2f2b001I6Ax7T3A3c2kg3","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"msg_02edb2f2a001H7KCMtNE7GkewR","parentID":"msg_02eda87cb001AbZ5MIWNCuxVw9","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/var/tmp/opencode-impl/probe-w3","root":"/"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"modelID":"big-pickle","providerID":"opencode","time":{"created":1787492511531},"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT"}}}
+
+data: {"id":"evt_02edb2f2f001H8fPEFGjrPS5sn","type":"session.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"ses_fd1257c4bffeB532OiDUFhkSYT","slug":"sunny-knight","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"Red vs blue color preference question","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":32,"output":83,"reasoning":15,"cache":{"read":8064,"write":0}},"time":{"created":1787492467636,"updated":1787492511534}}}}
+
+data: {"id":"evt_02edb2f300014k1NdS7NGs3JUJ","type":"session.diff","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","diff":[]}}
+
+data: {"id":"evt_02edb2f31001jfrVygbRtQ8lSp","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"role":"user","time":{"created":1787492468683},"agent":"build","model":{"providerID":"opencode","modelID":"big-pickle"},"summary":{"diffs":[]},"id":"msg_02eda87cb001AbZ5MIWNCuxVw9","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT"}}}
+
+data: {"id":"evt_02edb2f3e0017NukR1NVReIToA","type":"session.status","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","status":{"type":"busy"}}}
+
+data: {"id":"evt_02edb39e6001nPRpVxch6kKjjd","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02edb39e50011p2dY1oJGAvwKP","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"step-start"},"time":1787492514278}}
+
+data: {"id":"evt_02edb39e7001oea4og9jaL8qNy","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02edb39e70013RYWQQAvTzovUE","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"reasoning","text":"","time":{"start":1787492514279}},"time":1787492514279}}
+
+data: {"id":"evt_02edb39e8001opitX4GgtBapNy","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","partID":"prt_02edb39e70013RYWQQAvTzovUE","field":"text","delta":"The"}}
+
+data: {"id":"evt_02edb3a2c0019aJPVwstB8a8Nf","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","partID":"prt_02edb39e70013RYWQQAvTzovUE","field":"text","delta":" user answered \""}}
+
+data: {"id":"evt_02edb3a7c001HNnYHI1GJCREQl","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","partID":"prt_02edb39e70013RYWQQAvTzovUE","field":"text","delta":"Blue\". I should report"}}
+
+data: {"id":"evt_02edb3ab7001oFofJZMrJQSyxo","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","partID":"prt_02edb39e70013RYWQQAvTzovUE","field":"text","delta":" that"}}
+
+data: {"id":"evt_02edb3afd001lB7uVUg91V0h3A","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","partID":"prt_02edb39e70013RYWQQAvTzovUE","field":"text","delta":" conc"}}
+
+data: {"id":"evt_02edb3bfe001a93FQZq6Xt0KHu","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","partID":"prt_02edb39e70013RYWQQAvTzovUE","field":"text","delta":"isely."}}
+
+data: {"id":"evt_02edb3c00001eKEuRqT125d3gP","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02edb39e70013RYWQQAvTzovUE","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"reasoning","text":"The user answered \"Blue\". I should report that concisely.","time":{"start":1787492514279,"end":1787492514815}},"time":1787492514816}}
+
+data: {"id":"evt_02edb3c03001qX36N4ixyrNDyq","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02edb3c03001WQP7mb6hCnOKUh","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"text","text":"","time":{"start":1787492514819}},"time":1787492514819}}
+
+data: {"id":"evt_02edb3c04001kmVUz9I2acR2lz","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","partID":"prt_02edb3c03001WQP7mb6hCnOKUh","field":"text","delta":"You prefer"}}
+
+data: {"id":"evt_02edb3c04002kQ7SAx0b5QUoCM","type":"message.part.delta","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","partID":"prt_02edb3c03001WQP7mb6hCnOKUh","field":"text","delta":" blue."}}
+
+data: {"id":"evt_02edb3c98001mzoHtUl16UuQCn","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02edb3c03001WQP7mb6hCnOKUh","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"text","text":"You prefer blue.","time":{"start":1787492514819,"end":1787492514968}},"time":1787492514968}}
+
+data: {"id":"evt_02edb3c9c0017B41bd2X4sLGRB","type":"message.part.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","part":{"id":"prt_02edb3c9c001GWeunb7fopuleV","reason":"stop","messageID":"msg_02edb2f2a001H7KCMtNE7GkewR","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","type":"step-finish","tokens":{"total":8246,"input":162,"output":14,"reasoning":6,"cache":{"write":0,"read":8064}},"cost":0},"time":1787492514972}}
+
+data: {"id":"evt_02edb3c9e001rDX19ZvyjY1sL3","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"msg_02edb2f2a001H7KCMtNE7GkewR","parentID":"msg_02eda87cb001AbZ5MIWNCuxVw9","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/var/tmp/opencode-impl/probe-w3","root":"/"},"cost":0,"tokens":{"total":8246,"input":162,"output":14,"reasoning":6,"cache":{"write":0,"read":8064}},"modelID":"big-pickle","providerID":"opencode","time":{"created":1787492511531,"completed":1787492514976},"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","finish":"stop"}}}
+
+data: {"id":"evt_02edb3ca0001reYkCU9Xx9JeDc","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"msg_02edb2f2a001H7KCMtNE7GkewR","parentID":"msg_02eda87cb001AbZ5MIWNCuxVw9","role":"assistant","mode":"build","agent":"build","path":{"cwd":"/var/tmp/opencode-impl/probe-w3","root":"/"},"cost":0,"tokens":{"total":8246,"input":162,"output":14,"reasoning":6,"cache":{"write":0,"read":8064}},"modelID":"big-pickle","providerID":"opencode","time":{"created":1787492511531,"completed":1787492514976},"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","finish":"stop"}}}
+
+data: {"id":"evt_02edb3ca0002UHzXORmciEBt6c","type":"session.status","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","status":{"type":"busy"}}}
+
+data: {"id":"evt_02edb3ca2001AndHVQDrkz5i5q","type":"session.status","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","status":{"type":"idle"}}}
+
+data: {"id":"evt_02edb3ca2002buByYOkfMd8esW","type":"session.idle","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT"}}
+
+data: {"id":"evt_02edb3ca2003yayEfTa7yqecDC","type":"session.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"id":"ses_fd1257c4bffeB532OiDUFhkSYT","slug":"sunny-knight","projectID":"global","directory":"/var/tmp/opencode-impl/probe-w3","path":"var/tmp/opencode-impl/probe-w3","title":"Red vs blue color preference question","agent":"build","model":{"id":"big-pickle","providerID":"opencode","variant":"default"},"version":"1.18.19","summary":{"additions":0,"deletions":0,"files":0},"cost":0,"tokens":{"input":194,"output":97,"reasoning":21,"cache":{"read":16128,"write":0}},"time":{"created":1787492467636,"updated":1787492514978}}}}
+
+data: {"id":"evt_02edb3ca3001fTzd7jgcWZBscX","type":"session.diff","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","diff":[]}}
+
+data: {"id":"evt_02edb3ca4001WlrxSmxJJWZOVL","type":"message.updated","properties":{"sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT","info":{"role":"user","time":{"created":1787492468683},"agent":"build","model":{"providerID":"opencode","modelID":"big-pickle"},"summary":{"diffs":[]},"id":"msg_02eda87cb001AbZ5MIWNCuxVw9","sessionID":"ses_fd1257c4bffeB532OiDUFhkSYT"}}}
+
+data: {"id":"evt_02edb5248001zwuRhd6t03KQQR","type":"server.heartbeat","properties":{}}
+
