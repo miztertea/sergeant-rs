@@ -42,6 +42,13 @@ pub mod claude;
 pub mod codex;
 pub mod docker;
 pub mod fake;
+/// The `opencode run --format json` adapter (W1 of the *Sergeant speaks
+/// OpenCode* sprint, `docs/proposals/opencode-adapter-2026-08-23.md` — see
+/// the module's own doc comment for the measurements it rests on).
+/// Registration in `daemon.rs` and every CLI surface remain W2's gap (K2:
+/// this wave is the adapter and nothing else): this module compiles, is unit-
+/// and contract-tested, and is reachable by nothing yet.
+pub mod opencode;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
