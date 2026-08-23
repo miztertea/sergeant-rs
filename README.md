@@ -26,7 +26,7 @@ Sergeant is local-first, designed for one developer per installation, and curren
 You need:
 
 - **Git**
-- **[Claude Code](https://claude.com/claude-code) or [Codex](https://developers.openai.com/codex/cli)** — agent workflow stages execute on either; everything else works without them via a deterministic test backend
+- **[Claude Code](https://claude.com/claude-code), [Codex](https://developers.openai.com/codex/cli), or [OpenCode](https://opencode.ai)** — agent workflow stages execute on any of the three; everything else works without them via a deterministic test backend
 - **Docker**, if your workflows include deterministic container stages — optional otherwise, and `sgt doctor` will tell you either way
 
 Install the latest release:
@@ -240,9 +240,9 @@ Whatever toolchains your repositories use, Sergeant itself needs only Git (repos
 | Platforms | Linux, macOS, and Windows through WSL2 |
 | Harness launchers | `sgt claude`, `sgt codex`, `sgt opencode`, `sgt goose` |
 | Primary Captain harnesses | Claude Code and Codex |
-| Agent workflow execution | Claude and Codex (`--backend claude\|codex`); stages that stop to ask a question are Claude-only for now |
+| Agent workflow execution | Claude, Codex, and OpenCode (`--backend claude\|codex\|opencode`); stages that stop to ask a question run on Claude or OpenCode's serve transport — Codex is not yet a supported backend for those |
 | Deterministic workflow execution | Docker |
-| Planned | OpenCode, Goose, and Antigravity as full Captain and backend targets |
+| Planned | Goose and Antigravity as full Captain and backend targets |
 
 Sergeant is pre-1.0. Configuration and interfaces may change between releases while the product model settles.
 
@@ -275,7 +275,7 @@ sgt run "add retry handling to the settlement worker" \
   --group payments
 ```
 
-Agent stages run on the backend you route to (`--backend claude|codex`, or a routing profile in `sergeant.toml`). Add `--backend fake` to any `sgt run` to try the whole loop deterministically without spending tokens, or run `scripts/demo.sh` from a source checkout for a guided end-to-end walkthrough. `sgt --help` and each subcommand's `--help` are the authority on the current command surface.
+Agent stages run on the backend you route to (`--backend claude|codex|opencode`, or a routing profile in `sergeant.toml`). Add `--backend fake` to any `sgt run` to try the whole loop deterministically without spending tokens, or run `scripts/demo.sh` from a source checkout for a guided end-to-end walkthrough. `sgt --help` and each subcommand's `--help` are the authority on the current command surface.
 
 ## Bounded history, never silent deletion
 

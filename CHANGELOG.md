@@ -12,6 +12,93 @@ released before a release can proceed.
 
 (nothing yet)
 
+## [0.2.2] - 2026-08-23
+
+Sergeant speaks OpenCode: a third native backend, registered the same
+way Claude and Codex are, with two capability firsts this release adds
+to the registry — a real approval round trip and a schema-distinguishable
+actor question — plus a coverage-guard fix and a PATH addition.
+
+### OpenCode backend
+
+- **`sgt run --backend opencode` and `sgt opencode`** are real now —
+  the opencode adapter (`src/backend/opencode.rs`, `opencode_serve.rs`)
+  is registered in the `BackendRegistry` alongside Claude, Codex, and
+  Docker (`docs/adr/0021-opencode-adapter.md`). Backend and harness
+  selection were already separate, user-composable axes before this
+  release (`sgt claude`/`codex`/`opencode`/`goose`, `--backend <name>`,
+  `sergeant.toml`'s routing profiles); this release makes `opencode` a
+  real option in that existing chain rather than an unregistered name.
+- Two transports, chosen once per registration and journaled, never
+  mixed mid-execution: `opencode run --format json` (one process per
+  turn, server-minted session id, the simple fallback every capability
+  below still works on) and an adapter-owned `opencode serve`
+  HTTP+SSE child, one per execution, driven over the already-installed
+  `reqwest` — no new crate, `Cargo.lock` byte-identical before and
+  after the one feature-flag line this release needed.
+- **`history: true`**, via token-free `opencode export` on run-json and
+  `GET /session/{id}/message` on serve — the first `true` on this flag
+  in the registry (both claude and codex report `false`). R4's "parity
+  is the floor, not the ceiling" cashed in.
+- **`approval_flow: true`** on the serve transport — the registry's
+  first `true` on this flag anywhere. `permission.asked` parks the
+  stage as `NeedsInput`; replies relay to the deprecated-but-live v1
+  endpoint, measured to be the one that actually fires on 1.18.19
+  despite the OpenAPI document naming a v2 as current.
+- **`ask: true`** on the serve transport, through a genuinely distinct
+  mechanism from approval_flow: opencode's own `question` tool carries
+  a typed `question.asked` event naming the actor's own tool call —
+  schema-distinguishable authorship, not guessed from narration.
+  Measured end to end: an answer relayed to the reply endpoint resumes
+  the session with no further client call.
+- **Native turn interrupt** upgrades from a process-group kill
+  (run-json) to `POST /session/{id}/abort` on serve, which kills the
+  tool's own subprocess tree and leaves the session usable for a
+  follow-up turn — a live-measured correction to this wave's own
+  written spec: the synchronous abort response itself, not only a
+  separate SSE frame, carries the abort signature.
+- **No native OS sandbox to claim.** Unlike Codex's `workspace-write`
+  enforcement, opencode exposes no OS-level sandbox mechanism at all —
+  only permission config and per-tool disables, policy the model's own
+  tool layer honors. Sergeant's observation layer stays the sole
+  source of truth for this adapter, exactly as it already is for core;
+  no NORTH-STAR amendment was needed, because there was nothing new to
+  bind.
+- **Every adapter's version-floor-as-provenance posture (R1)** applied
+  here from this adapter's first commit: `opencode.rs` never had a
+  refusal branch to strike, unlike claude/codex's own history with
+  that rule.
+
+### Coverage guard
+
+- `src/backend/opencode.rs` and `src/backend/opencode_serve.rs` both
+  cleared the repo's 90%-line coverage floor (Gate D) this release:
+  91.21% and 91.22% respectively, up from a thin 82.91%/79.69% left by
+  the wave that shipped the serve transport. The gap was almost
+  entirely the *default* `Auto` transport path and its gate-failure
+  fallback, never exercised because every existing serve test pinned a
+  transport explicitly — now covered, alongside several
+  previously-unreached terminal-classification and ask/permission
+  reply-relay paths.
+
+### Fake backend
+
+- Four measured opencode failure shapes, for contract-test authors who
+  need to drive the engine against them deterministically: a typed
+  terminal error rendered identically to the real adapter's, a tool
+  call the harness auto-rejected but the turn still completed around,
+  a SIGKILL-with-no-terminal death, and an opt-in "the harness mints no
+  native id until the first event" shape matching opencode's own
+  server-minted session id. All additive — every existing fake-backend
+  test is unchanged.
+
+### PATH
+
+- `~/.opencode/bin` added to `toolchain_path_dirs`
+  (`src/harness.rs`) — measured absent from a non-interactive shell's
+  PATH on Cerberus, the same failure class and the same one-line
+  remedy that put `~/.cargo/bin`/`~/.local/bin` there.
+
 ## [0.2.1] - 2026-08-23
 
 Content-only release: the distro content rebuild commissioned 2026-08-22
