@@ -35,6 +35,7 @@ use crate::api::{
     API_REVISION, ApiState, COMPLETION_POLL_INTERVAL, Core, CoreError, CoreGuard,
     drive_completions, router,
 };
+use crate::backend::agy::{AGY_BACKEND_NAME, AgyBackend, AgyConfig};
 use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig};
 use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
@@ -341,6 +342,11 @@ pub struct DaemonConfig {
     /// itself. `None` is the system `opencode`, adapter state under this data
     /// dir — mirrors `claude`/`docker`/`codex` above for the same reason.
     pub opencode: Option<OpencodeConfig>,
+    /// Launch configuration for the Agy adapter this daemon registers
+    /// itself. `None` is the system `agy`, adapter state under this data
+    /// dir — mirrors `claude`/`docker`/`codex`/`opencode` above for the same
+    /// reason.
+    pub agy: Option<AgyConfig>,
     /// §28 OpenTelemetry export. `None` is **off**, and off is the default:
     /// with no pipeline here the daemon builds no provider, spawns no
     /// exporter task, and subscribes nothing to the event stream.
@@ -429,6 +435,7 @@ impl Default for DaemonConfig {
             docker: None,
             codex: None,
             opencode: None,
+            agy: None,
             telemetry: None,
             completion_poll: COMPLETION_POLL_INTERVAL,
             turn_ceiling: crate::runtime::engine::DEFAULT_TURN_CEILING,
@@ -841,6 +848,24 @@ pub async fn start_with(
     } else {
         None
     };
+    // W2 (agy-adapter sprint, mirrors the opencode block directly above):
+    // the Agy executor, registered the same way and for the same reason
+    // as Claude/Docker/Codex/Opencode. No `seed_capability_provenance_from`
+    // call — `AgyBackend::capabilities().ask` is `false` unconditionally
+    // (agy.rs's own ADMISSION_ROWS `ask` row: no measured actor-authored-
+    // question record on this transport), so there is no journaled
+    // withdrawal to seed.
+    let agy = if config.backends.get(AGY_BACKEND_NAME).is_none() {
+        let agy_config = config
+            .agy
+            .clone()
+            .unwrap_or_else(|| AgyConfig::new(data_dir));
+        let adapter = Arc::new(AgyBackend::new(agy_config));
+        backends = backends.with(adapter.clone());
+        Some(adapter)
+    } else {
+        None
+    };
     let backends = Arc::new(backends);
 
     // 4b-ii. The capability/version probe, recorded at registration (M4
@@ -985,6 +1010,12 @@ pub async fn start_with(
     // sink (same reasoning as Claude's/Docker's/Codex's, directly above).
     if let Some(opencode) = opencode {
         opencode.set_event_sink(journaling_sink(state.core.clone()));
+    }
+    // The Agy adapter's normalized events flow through the identical sink
+    // (same reasoning as Claude's/Docker's/Codex's/Opencode's, directly
+    // above).
+    if let Some(agy) = agy {
+        agy.set_event_sink(journaling_sink(state.core.clone()));
     }
     let app = router(state.clone());
 
