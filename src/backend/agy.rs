@@ -2444,6 +2444,7 @@ impl AgyBackend {
             child: Arc::clone(&child),
             stderr_rx,
             first_turn_signal,
+            settings_home: self.config.settings_home.clone(),
         };
         let reader_handle = std::thread::spawn(move || reader.run(stdout));
         if let Some(execution) = self.lock().executions.get_mut(execution_id) {
@@ -2666,6 +2667,13 @@ struct TurnReader {
     /// Present only for turn 1: how this reader tells LAUNCH the identity (or
     /// that the harness refused before minting one).
     first_turn_signal: Option<SyncSender<FirstTurnSignal>>,
+    /// [`AgyConfig::settings_home`], so this reader can compute the
+    /// [`PermissionPosture`] itself at init-parse time. The reader is also the
+    /// thread that composes `conversation.turn.ended`, so storing the posture
+    /// here — not only from LAUNCH after the [`FirstTurnSignal`] round-trip —
+    /// makes the turn-end read race-free by construction: a fast child cannot
+    /// reach turn-end before the same thread has stored the posture.
+    settings_home: Option<PathBuf>,
 }
 
 impl TurnReader {
@@ -2713,6 +2721,15 @@ impl TurnReader {
                             if execution.conversation_id.is_none() {
                                 execution.conversation_id = Some(id.clone());
                             }
+                            // Same lock, same thread that later composes
+                            // `conversation.turn.ended`: turn-end can never
+                            // observe `posture: None` after an init line
+                            // landed. LAUNCH stores it again after the signal
+                            // round-trip — same value, belt not braces.
+                            execution.posture = Some(PermissionPosture::from_init(
+                                acc.init_permission_mode.as_deref(),
+                                self.settings_home.as_deref(),
+                            ));
                         }
                         if let Some(tx) = &self.first_turn_signal {
                             let _ = tx.send(FirstTurnSignal::Initialized {

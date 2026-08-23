@@ -88,9 +88,11 @@ const FIXTURE_MODEL: &str = "gemini-3.7-flash-low";
 /// `src/backend/agy.rs`'s own `#[cfg(test)]` block includes the same file.
 const DENIAL_NOTICE: &str = include_str!("fixtures/agy-1.1.19-denial-notice.txt");
 
-/// The measured warning agy writes when `--conversation <id>` names something it
-/// does not know — and then starts a *fresh* conversation anyway (W1 P0.6).
-const RESUME_FORK_WARNING: &str = "warning: conversation \\\"missing-id\\\" not found";
+/// The warning agy writes when `--conversation <id>` names something it does
+/// not know — and then starts a *fresh* conversation anyway. Shape verbatim
+/// from W1 P0.6 (which captured the zero-UUID form: plain double quotes, no
+/// escapes); the id here is substituted for the stub's scenario.
+const RESUME_FORK_WARNING: &str = "warning: conversation \"missing-id\" not found";
 
 /// K1: every live turn in this file pins the cheap flash model, and nothing in
 /// `src/backend/agy.rs` hardcodes a model — the pin travels on
