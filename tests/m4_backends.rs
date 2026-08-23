@@ -2092,12 +2092,12 @@ async fn the_capability_probe_is_journaled_at_registration() {
         .filter(|e| e.kind == daemon::KIND_BACKEND_PROBED)
         .collect();
     // One record per registered backend: claude (this test's subject),
-    // docker, and codex (N4/W2 — `start_with` always registers them
-    // alongside claude, same as claude is added here even though this
-    // test's registry started empty). Located by name rather than
-    // trusted-by-index, so this stays correct regardless of how many
-    // backends a future adapter adds the same way.
-    assert_eq!(probed.len(), 3, "one record per registered backend");
+    // docker, codex (N4/W2), and opencode (opencode-adapter sprint's own
+    // W2) — `start_with` always registers them alongside claude, same as
+    // claude is added here even though this test's registry started empty.
+    // Located by name rather than trusted-by-index, so this stays correct
+    // regardless of how many backends a future adapter adds the same way.
+    assert_eq!(probed.len(), 4, "one record per registered backend");
     let claude_probed = probed
         .iter()
         .find(|e| e.payload["backend"] == CLAUDE_BACKEND_NAME)

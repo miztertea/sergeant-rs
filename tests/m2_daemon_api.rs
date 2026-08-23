@@ -836,15 +836,15 @@ async fn event_history_from_seq_returns_exactly_the_tail() {
     cancel(&http, &handle, &work_id, &ulid()).await;
 
     // daemon.started + backend.probed (one per registered backend: fake,
-    // claude, docker, and codex as of N4/W2 — DaemonConfig::default's
-    // registry plus the three adapters `start_with` always adds)
-    // + 2×(work.submitted, command.accepted) + work.canceled
+    // claude, docker, codex, and opencode as of N4/W2/opencode-W2 —
+    // DaemonConfig::default's registry plus the four adapters `start_with`
+    // always adds) + 2×(work.submitted, command.accepted) + work.canceled
     // + command.accepted.
     let all = history_seqs(&http, &handle, None).await;
-    assert_eq!(all.len(), 11, "unexpected history: {all:?}");
+    assert_eq!(all.len(), 12, "unexpected history: {all:?}");
     assert_eq!(
         all,
-        (1..=11).collect::<Vec<u64>>(),
+        (1..=12).collect::<Vec<u64>>(),
         "seqs are 1..n in order"
     );
 
