@@ -495,6 +495,21 @@ pub(super) fn mint_server_password() -> String {
     format!("{a}{b}")
 }
 
+/// Best-effort text for a caught `std::thread::JoinHandle::join` panic
+/// payload — used only by `opencode.rs`'s two runtime-isolation joins
+/// (`run_serve_gates`, `launch_serve`; W4 fixer) to report *why* an
+/// isolated thread died, since a payload is `Box<dyn Any + Send>` and
+/// almost always one of these two concrete types in practice.
+pub(super) fn describe_panic(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 // ------------------------------------------------------------ process-bound
 
 /// Why `ServeHandle::post_message` did not return a response body (§9.2's own
@@ -741,6 +756,20 @@ impl std::fmt::Debug for ServeHandle {
 }
 
 impl ServeHandle {
+    /// W4 fixer (release-blocking daemon-boot panic): building this client
+    /// -- and, measured separately, sending *any* request on it -- panics
+    /// ("Cannot drop a runtime in a context where blocking is not allowed")
+    /// when called from a thread already inside a tokio runtime. That is
+    /// `reqwest`'s own `blocking::wait::enter()` sanity check
+    /// (`reqwest-0.13.4/src/blocking/wait.rs`, debug-build only, but every
+    /// blocking call — `build()` included, via `ClientHandle::new`'s own
+    /// internal wait — routes through it), not something isolating just
+    /// this constructor can fix: an already-built client's later `.send()`
+    /// panics exactly the same way if *that* call happens on a
+    /// runtime-owned thread. See `run_serve_gates` and `launch_serve` for
+    /// where the whole reqwest-touching sequence is isolated instead — this
+    /// constructor stays plain so it behaves identically regardless of
+    /// which of them (or a future caller) is holding the isolation.
     pub(super) fn new(base_url: String, password: String) -> Result<Self, String> {
         let client = reqwest::blocking::Client::builder()
             .build()

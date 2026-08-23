@@ -3523,6 +3523,75 @@ async fn daemon_start_registers_opencode_and_journals_its_own_probe() {
     );
 }
 
+/// W4 fixer: the release-blocking regression this test exists to pin down.
+/// Every daemon-registration test above this one uses `StubOpencode`, which
+/// never advertises (or answers) a real `serve` subcommand — G1 (or G2) of
+/// `run_serve_gates` always fails first, so `ServeHandle::new` is never
+/// actually called from any of them. That is exactly why the bug survived:
+/// with a *serve-capable* opencode reachable on the configured executable
+/// path and `TransportChoice::Auto` (the default), `daemon::start_with`'s
+/// own registration loop (`for name in backends.names() { ...
+/// backend.capabilities() ... }`) resolves transport by clearing every gate
+/// for real — G1's `--help`, G2's spawned probe child and authenticated
+/// `/doc` fetch, G3's fingerprint — which means it really does build a
+/// `reqwest::blocking::Client` (`ServeHandle::new`, opencode_serve.rs) from a
+/// thread `daemon::start_with`'s own tokio runtime owns. Before the fix, that
+/// panicked at boot with "Cannot drop a runtime in a context where blocking
+/// is not allowed" and took the daemon down with it — reproduced by
+/// temporarily reverting `ServeHandle::new` to its pre-fix body and running
+/// this test, which failed exactly that way; restoring the fix turned it
+/// green again (both runs are transcribed in this fixer's own report).
+///
+/// `StubServe` (`tests/fixtures/stub_serve.py`) is the real thing to use
+/// here rather than a closer look at `StubOpencode`: it is a real HTTP
+/// server over a real socket, so this exercises the adapter's actual
+/// `reqwest` client code — not a stand-in for it — the same way the serve
+/// transport's own end-to-end tests do.
+#[tokio::test]
+async fn daemon_start_with_a_serve_capable_opencode_reachable_does_not_panic_at_boot() {
+    let data = TempDir::new().expect("tempdir");
+    let stub = StubServe::new(data.path(), &end_to_end_plan("ses_registration_regression"));
+    let mut config = serve_config_for(&stub, data.path());
+    // The default a bare `OpencodeConfig::new` picks, and the choice that
+    // makes the registration loop actually run the serve gate (a
+    // `RunOnly` registration would never touch it at all).
+    config.transport = TransportChoice::Auto;
+
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(sergeant_rs::backend::BackendRegistry::new()),
+            default_backend: None,
+            opencode: Some(config),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start with a serve-capable opencode reachable must not panic at boot");
+    handle.shutdown().await;
+
+    let probed: Vec<_> = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == daemon::KIND_BACKEND_PROBED)
+        .collect();
+    let opencode_probed = probed
+        .iter()
+        .find(|e| e.payload["backend"] == OPENCODE_BACKEND_NAME)
+        .expect("a backend.probed record for opencode");
+    assert_eq!(opencode_probed.payload["available"], true);
+    // Proof this test actually reached and cleared the serve gate, rather
+    // than silently falling back to run-json the way every other
+    // daemon-registration test in this file does: `approval_flow`/`ask` are
+    // serve-only capability rows (§2.2), true here only if `Auto` resolved
+    // to `Serve`.
+    assert_eq!(
+        opencode_probed.payload["capabilities"]["approval_flow"],
+        true
+    );
+    assert_eq!(opencode_probed.payload["capabilities"]["ask"], true);
+}
+
 /// Opencode missing must not break daemon startup, and must be
 /// distinguishable from "unregistered": it registers anyway and journals
 /// honest, `available: false` evidence naming why it cannot run — the same

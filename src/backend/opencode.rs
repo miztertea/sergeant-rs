@@ -2373,7 +2373,45 @@ impl OpencodeBackend {
         self.serve_gates.get_or_init(|| self.run_serve_gates())
     }
 
+    /// W4 fixer (release-blocking daemon-boot panic, measured twice and
+    /// reproduced in isolation): this function's own G2/G3 body builds a
+    /// `reqwest::blocking::Client` (`ServeHandle::new`) and sends a request
+    /// on it (`get_doc`) — and `reqwest` panics ("Cannot drop a runtime in a
+    /// context where blocking is not allowed") if *either* of those runs on
+    /// a thread already inside a tokio runtime (confirmed: the panic is not
+    /// specific to `build()`, an already-built client's `.send()` panics
+    /// the same way). Two callers reach `serve_gates()` — and therefore
+    /// here — from exactly such a thread, both directly from
+    /// `daemon::start_with` (async), with none of `api::blocking`'s
+    /// `block_in_place` guard the ordinary request path relies on:
+    /// `probe()`'s `ServeOnly` arm and `capabilities()`'s `Auto`/`ServeOnly`
+    /// resolution, called straight from the daemon's own backend-
+    /// registration loop, and — structurally identical, reached instead
+    /// through `launch_serve`'s independent `ServeHandle` — a fresh LAUNCH
+    /// `recovery::reconcile` (also called directly from `start_with`) can
+    /// drive at daemon-restart time. Running the whole gate-probing body on
+    /// a dedicated OS thread and joining it (a freshly spawned thread never
+    /// carries tokio's "inside a runtime" marker, regardless of what its
+    /// spawning thread carried) keeps every reqwest call in it off whatever
+    /// thread called `serve_gates()`, unconditionally — memoization
+    /// (`OnceLock`) means this runs at most once per backend either way, so
+    /// the extra thread costs nothing that matters.
     fn run_serve_gates(&self) -> ServeGates {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| self.run_serve_gates_inner())
+                .join()
+                .unwrap_or_else(|panic| ServeGates {
+                    result: Err(format!(
+                        "the serve gate probe's isolation thread panicked: {}",
+                        opencode_serve::describe_panic(panic.as_ref())
+                    )),
+                    stale: false,
+                })
+        })
+    }
+
+    fn run_serve_gates_inner(&self) -> ServeGates {
         let exe = &self.config.executable;
         // G1: `opencode --help` names the `serve` subcommand, and `opencode
         // serve --help` offers `--port`/`--hostname` (§5.4 steps 1-2). A
@@ -2992,7 +3030,41 @@ impl OpencodeBackend {
     /// There is no `?`-with-fallback anywhere in this function, and no arm
     /// may call `launch_run`. Every partially-built resource (the child, the
     /// SSE reader thread) is torn down before returning `Err`.
+    ///
+    /// W4 fixer (release-blocking daemon-boot panic; see `run_serve_gates`'s
+    /// own copy of this citation for the full mechanism): `launch_serve_inner`
+    /// below builds its own `ServeHandle` and sends several requests on it
+    /// (`get_doc`, `open_event_stream`, `create_session`) before this LAUNCH
+    /// can report back — every one of which panics if it runs on a thread
+    /// already inside a tokio runtime. The ordinary request path never hits
+    /// that: `api::blocking` wraps every LAUNCH in `block_in_place` before
+    /// it reaches here. `recovery::reconcile` does not — called directly
+    /// from `daemon::start_with` (async), it can drive a resumed work
+    /// straight through `Engine::run_inline` to a fresh `Next::Launch`,
+    /// `pending.perform()`, `Backend::launch`, here — with no such guard.
+    /// Running the entire launch on a dedicated OS thread and joining it
+    /// closes that gap the same way `run_serve_gates` closes its own,
+    /// unconditionally, regardless of which caller (or a future one) is
+    /// missing `block_in_place`.
     fn launch_serve(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| self.launch_serve_inner(prepared))
+                .join()
+                .unwrap_or_else(|panic| {
+                    Err(self.err_failed(format!(
+                        "serve launch refused (phase: bring_up): the launch's isolation thread \
+                         panicked: {}",
+                        opencode_serve::describe_panic(panic.as_ref())
+                    )))
+                })
+        })
+    }
+
+    fn launch_serve_inner(
+        &self,
+        prepared: &PreparedExecution,
+    ) -> Result<ExecutionHandle, BackendError> {
         let request = &prepared.request;
         let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
         let budgets = self.config.serve_budgets.unwrap_or_default();
