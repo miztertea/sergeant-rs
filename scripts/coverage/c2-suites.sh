@@ -82,3 +82,14 @@ cov_stage_end 1 "the codex_backend test binary must write its own profile (StubC
 cov_stage_begin c2-codex_routing
 cov_run cargo llvm-cov --no-report --test codex_routing --locked || cov_fail "codex_routing failed under instrumentation"
 cov_stage_end 1 "the codex_routing test binary must write its own profile"
+
+# Added 2026-08-23, in the same commit that adds the suite (the W1 opencode
+# wave) — wired at birth rather than recovered later, per the owner's 90-floor
+# ruling and the #231 lesson: a suite absent from every stage list contributes
+# nothing to Gate D however green it runs. Sits in C2, not C3, for
+# codex_backend's exact reasons: StubOpencode is a shell-script stand-in
+# (uninstrumented, no profile expected), and the suite spawns no `sgt`
+# subprocess. Floor 1.
+cov_stage_begin c2-opencode_backend
+cov_run cargo llvm-cov --no-report --test opencode_backend --locked || cov_fail "opencode_backend failed under instrumentation"
+cov_stage_end 1 "the opencode_backend test binary must write its own profile (StubOpencode's children are shell-script stand-ins, uninstrumented and no loss, per codex_backend's precedent)"
