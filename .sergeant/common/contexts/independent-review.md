@@ -23,9 +23,10 @@ execution boundary, not in whether the reviewer happens to share a
 workflow wrapper with the work it reviews.
 
 **Stated honestly, not oversold.** An in-stage panel (`@@panel`,
-`@@fan-out-evidence`) spawns several sub-agent seats inside *one* stage
-execution — one execution boundary, not four (see `@@panel`'s own
-isolation-honesty paragraph). The property this policy names —
+`@@fan-out-evidence`) spawns several sub-agent seats inside a single
+stage execution — a single execution boundary shared by every seat (see
+`@@panel`'s own isolation-honesty paragraph for the full statement). The
+property this policy names —
 independence anchored in a fresh execution — is only partly available
 today, and this is exactly where: a genuinely separate Work would give it
 in full; a same-Work later stage gives it in part; a same-stage spawned

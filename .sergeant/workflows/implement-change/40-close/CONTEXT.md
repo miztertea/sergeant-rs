@@ -45,8 +45,9 @@ narrowing:
   `25-refute`, `30-fix-confirmed`, and `35-re-verify` is named by path and
   confirmed to exist.** This is the disposition act itself, performed by
   this stage as a named act in its own contract — no deterministic
-  finalize helper does this (§1.7 of the design record: `sgt init` does
-  not ship `.sergeant/lib/`).
+  finalize helper does this (§1.7 of the design record: the directory a
+  finalize helper would live under is not one `sgt init` writes into an
+  estate).
   (trigger: closing the run; outcome: the "silence promotes nothing"
   policy is applied explicitly rather than assumed)
 - **Any recommended follow-up intent — from `30-fix-confirmed`'s
