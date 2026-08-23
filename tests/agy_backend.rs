@@ -75,13 +75,18 @@ const TOOL_USE_CONVERSATION: &str = "f0e10575-b9d6-4263-bd21-665bf2841bf2";
 /// The model `init` echoes in every real capture (they were all pinned to it).
 const FIXTURE_MODEL: &str = "gemini-3.7-flash-low";
 
-/// The auto-denial notice agy actually writes to stderr, verbatim from W1 P2's
-/// control turn. At 1.1.19 this is the **only** machine-readable evidence that a
-/// tool was denied.
-const DENIAL_NOTICE: &str = "jetski: no output produced - a tool required the \\\"command\\\" \
-                             permission that headless mode cannot prompt for, so it was \
-                             auto-denied. Add an allow-rule under permissions.allow in \
-                             settings.json (e.g. command(<target>)).";
+/// The auto-denial notice agy actually writes to stderr — the **captured bytes**
+/// of W1 P2's control turn, byte-identical to P3 turn 1's capture, trailing
+/// newline and em-dash included. At 1.1.19 this is the **only** machine-readable
+/// evidence that a tool was denied.
+///
+/// It is a file, not a string literal, for the reason the JSONL captures are:
+/// two hand-typed copies of the same "verbatim" text drift (this one did — a
+/// hyphen for the em-dash and escaped quotes that were never in the capture),
+/// and a fixture that claims provenance it does not have is exactly the
+/// narration-vs-reality gap the wave's evidence rules exist to catch.
+/// `src/backend/agy.rs`'s own `#[cfg(test)]` block includes the same file.
+const DENIAL_NOTICE: &str = include_str!("fixtures/agy-1.1.19-denial-notice.txt");
 
 /// The measured warning agy writes when `--conversation <id>` names something it
 /// does not know — and then starts a *fresh* conversation anyway (W1 P0.6).

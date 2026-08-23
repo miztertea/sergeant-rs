@@ -3461,12 +3461,12 @@ mod tests {
     const JSON_SCHEMA: &str = include_str!("../../tests/fixtures/agy-1.1.19-json-schema.jsonl");
     const RESUME_TURN: &str = include_str!("../../tests/fixtures/agy-1.1.19-resume-turn.jsonl");
 
-    /// The measured auto-denial notice, verbatim from W1 P2's control turn.
-    const DENIAL_NOTICE: &str = "jetski: no output produced — a tool required the \"command\" \
-                                 permission that headless mode cannot prompt for, so it was \
-                                 auto-denied. Add an allow-rule under permissions.allow in \
-                                 settings.json (e.g. command(<target>)). Alternatively, re-run \
-                                 with --dangerously-skip-permissions to auto-approve all tools.";
+    /// The measured auto-denial notice — the captured bytes of W1 P2's control
+    /// turn, byte-identical to P3 turn 1's. Shared with `tests/agy_backend.rs`
+    /// through the file so the two copies cannot drift apart again (they had:
+    /// the integration copy carried a hyphen for the em-dash and escaped quotes
+    /// the capture never contained).
+    const DENIAL_NOTICE: &str = include_str!("../../tests/fixtures/agy-1.1.19-denial-notice.txt");
 
     /// The measured resume-fork warning, verbatim from W1 P0.6.
     const RESUME_WARNING: &str =
