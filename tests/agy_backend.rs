@@ -120,6 +120,7 @@ struct StubAgy {
     record: PathBuf,
     replay: PathBuf,
     config_answer: PathBuf,
+    config_hang: PathBuf,
     hang: PathBuf,
     stderr: PathBuf,
     exit_code: PathBuf,
@@ -134,6 +135,7 @@ impl StubAgy {
         let record = dir.join(format!("{name}-launches.txt"));
         let replay = dir.join(format!("{name}-replay.jsonl"));
         let config_answer = dir.join(format!("{name}-config.json"));
+        let config_hang = dir.join(format!("{name}-config-hang"));
         let hang = dir.join(format!("{name}-hang"));
         let stderr = dir.join(format!("{name}-stderr"));
         let exit_code = dir.join(format!("{name}-exit-code"));
@@ -148,7 +150,10 @@ impl StubAgy {
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then echo \"{version}\"; exit 0; fi\n\
              if [ \"$1\" = \"--help\" ]; then printf '%s\\n' \"{help}\" >&2; exit 0; fi\n\
-             if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"/config\" ]; then cat \"{config_answer}\"; exit 0; fi\n\
+             if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"/config\" ]; then\n  \
+               if [ -f \"{config_hang}\" ]; then exec sleep 60; fi\n  \
+               cat \"{config_answer}\"; exit 0\n\
+             fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$(printf '%s' \"$arg\" | tr '\\n' '|')\"; done;\n\
              env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
@@ -165,6 +170,7 @@ impl StubAgy {
             version = version,
             help = help,
             config_answer = config_answer.display(),
+            config_hang = config_hang.display(),
             record = record.display(),
             replay = replay.display(),
             stderr = stderr.display(),
@@ -183,6 +189,7 @@ impl StubAgy {
             record,
             replay,
             config_answer,
+            config_hang,
             hang,
             stderr,
             exit_code,
@@ -210,6 +217,18 @@ impl StubAgy {
     /// events must be observable *while the process is still running*.
     fn hangs_after_replay(&self) -> &Self {
         std::fs::write(&self.hang, b"hang\n").expect("write hang marker");
+        self
+    }
+
+    /// Makes the zero-quota `-p "/config"` read specifically hang — the
+    /// unauthenticated-CLI-blocks-on-an-interactive-login case
+    /// `CONFIG_PROBE_BUDGET`'s doc describes. Deliberately distinct from
+    /// `hangs_after_replay`: that marker is checked *after* the script's
+    /// recording arm, which the `/config` call never reaches (it returns from
+    /// its own arm first), so it cannot exercise `read_config_probe`'s
+    /// kill-on-timeout path at all.
+    fn hangs_on_config(&self) -> &Self {
+        std::fs::write(&self.config_hang, b"hang\n").expect("write config-hang marker");
         self
     }
 
@@ -629,6 +648,40 @@ fn an_unreadable_config_probe_is_reported_not_refused() {
             .detail
             .expect("detail")
             .contains("cannot report the harness's effective permission configuration")
+    );
+}
+
+/// The regression `CONFIG_PROBE_BUDGET` exists to prevent: an unauthenticated
+/// `agy` blocks the `/config` read on an interactive login prompt. This must
+/// never become an unbounded wait inside `daemon::start_with` — the exact
+/// class of registration-time hang this project's CI/CD sprint already
+/// tracked once for a blocking HTTP client (0.2.2 regression, commit
+/// c46152a2), now with a subprocess in place of a transport.
+#[test]
+fn a_hung_config_probe_is_killed_within_budget_and_falls_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    stub.hangs_on_config();
+    let backend = AgyBackend::new(config_for(&stub, dir.path()));
+    let started = Instant::now();
+    let report = backend.probe();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "read_config_probe must be bounded by CONFIG_PROBE_BUDGET (5s), not the stub's \
+         60s hang: probe() took {elapsed:?}"
+    );
+    assert!(
+        report.available,
+        "a killed /config read is a best-effort miss, never a refusal"
+    );
+    assert!(
+        report
+            .detail
+            .expect("detail")
+            .contains("cannot report the harness's effective permission configuration"),
+        "a timed-out config probe must fall back to the same ConfigProbe::default() detail \
+         as an unreadable one"
     );
 }
 
