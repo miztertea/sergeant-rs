@@ -76,10 +76,19 @@ fn all_suites() -> Vec<String> {
 }
 
 /// Suite names invoked via `--test <name>` in one coverage stage script.
+///
+/// Only counts lines that are actually executed by the shell: a line whose
+/// first non-whitespace character is `#` is a comment (whether it's a prose
+/// comment mentioning `--test`, or a whole `cov_run ... --test <name> ...`
+/// invocation commented out to disable a suite — the more realistic
+/// maintenance action) and must not register as "wired", or this guard would
+/// silently stop catching the exact #231 failure class it exists to catch:
+/// a suite that no coverage stage actually runs, however green it looks.
 fn wired_suites(script: &str) -> Vec<String> {
     let text = std::fs::read_to_string(repo_root().join("scripts/coverage").join(script))
         .unwrap_or_else(|e| panic!("read {script}: {e}"));
     text.lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
         .filter_map(|line| line.split_once("--test "))
         .map(|(_, rest)| rest.split_whitespace().next().unwrap_or("").to_string())
         .filter(|name| !name.is_empty())
