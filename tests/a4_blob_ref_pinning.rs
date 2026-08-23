@@ -67,6 +67,10 @@ const PUT_SITES: &[PutSite] = &[
         file: "src/backend/docker.rs",
         context: "fn stream_one",
     },
+    PutSite {
+        file: "src/backend/opencode.rs",
+        context: "impl TurnReader",
+    },
 ];
 
 /// Every `.put(`/`.put_stream(` call in `file`'s non-test code, as
@@ -441,6 +445,128 @@ fn codex_arm_refs_in_event_recovers_the_archived_raw_ref() {
     assert_eq!(
         usage_refs, ended_refs,
         "refs_in_event must recover the same ref from both events"
+    );
+}
+
+// ------------------------------------------------------------------
+// Layer 2, opencode arm: a real recorded turn, through the real adapter (W1)
+// ------------------------------------------------------------------
+
+const OPENCODE_RECORDED_TURN: &str = include_str!("fixtures/opencode-1.18.19-minimal-turn.jsonl");
+
+/// A minimal stub `opencode`: answers the probe's three gates (`--version`
+/// on stdout, both `--help`s on **stderr**, where the real CLI measurably
+/// writes them), then replays the recorded transcript on every turn
+/// invocation. Deliberately smaller than `tests/opencode_backend.rs`'s own
+/// `StubOpencode` — this suite needs exactly one recorded turn through the
+/// real adapter, not the full launch-grammar contract surface.
+fn write_opencode_stub(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("opencode-stub-a4");
+    let replay = dir.join("opencode-replay-a4.jsonl");
+    std::fs::write(&replay, OPENCODE_RECORDED_TURN).expect("write replay fixture");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo \"1.18.19\"; exit 0; fi\n\
+         if [ \"$1\" = \"run\" ] && [ \"$2\" = \"--help\" ]; then echo \"--format --model --session\" >&2; exit 0; fi\n\
+         if [ \"$1\" = \"--help\" ]; then echo \"Commands: opencode run | opencode export\" >&2; exit 0; fi\n\
+         cat \"{}\"\n",
+        replay.display()
+    );
+    std::fs::write(&path, script).expect("write stub");
+    let mut perm = std::fs::metadata(&path).expect("stat").permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&path, perm).expect("chmod");
+    support::wait_until_executable(&path);
+    path
+}
+
+/// Drive one recorded turn through the real `OpencodeBackend`, over the stub
+/// above, into a real journal + blob store under `data_dir`. Returns the
+/// journaled `conversation.turn.ended` event — the only one this adapter
+/// carries the archived-raw ref on (its `usage.updated` events are per-step
+/// native usage records, emitted while the turn is still streaming and long
+/// before there is a blob to name).
+fn drive_one_recorded_opencode_turn(data_dir: &Path) -> Event {
+    let stub_path = write_opencode_stub(data_dir);
+    let mut config = sergeant_rs::backend::opencode::OpencodeConfig::new(data_dir);
+    config.executable = stub_path;
+    let backend = sergeant_rs::backend::opencode::OpencodeBackend::new(config);
+    let shared = Arc::new(tokio::sync::Mutex::new(core(data_dir)));
+    backend.set_event_sink(journaling_sink(shared.clone()));
+
+    let handle = backend
+        .start(&sergeant_rs::backend::StartRequest {
+            work_id: "work-a4-opencode".to_string(),
+            execution_id: "e-a4-opencode".to_string(),
+            stage_id: "00-only".to_string(),
+            attempt: 1,
+            cwd: data_dir.to_path_buf(),
+            intent: "a4 fixture replay".to_string(),
+            context: String::new(),
+            model: None,
+            profile: None,
+            execute: None,
+            instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
+            bindings: Vec::new(),
+        })
+        .expect("start");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let observation = backend.observe(&handle).expect("observe");
+        if observation.native != sergeant_rs::backend::NativeState::Running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn did not settle");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let core = shared.blocking_lock();
+        let events: Vec<Event> = core
+            .journal
+            .replay()
+            .expect("replay")
+            .collect::<Result<_, _>>()
+            .expect("events");
+        let ended = events
+            .iter()
+            .find(|e| e.kind == "conversation.turn.ended")
+            .cloned();
+        if let Some(ended) = ended {
+            return ended;
+        }
+        drop(core);
+        assert!(Instant::now() < deadline, "turn.ended never journaled");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn opencode_arm_refs_in_event_recovers_the_archived_raw_ref() {
+    let data = TempDir::new().expect("tempdir");
+    let ended = drive_one_recorded_opencode_turn(data.path());
+
+    let ended_refs = refs_in_event(&ended);
+    assert_eq!(
+        ended_refs.len(),
+        1,
+        "expected exactly one ref in conversation.turn.ended"
+    );
+    let the_ref = ended_refs.iter().next().unwrap();
+
+    let path = data.path().join("blobs").join("b3").join(the_ref.hex());
+    assert!(
+        path.exists(),
+        "the ref's hex must name a real blob file: {path:?}"
+    );
+    let bytes = std::fs::read(&path).expect("read blob");
+    assert_eq!(
+        blake3::hash(&bytes).to_hex().to_string(),
+        the_ref.hex(),
+        "the store's own contract, re-proved from the extractor's side"
     );
 }
 
