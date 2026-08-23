@@ -693,7 +693,11 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
                but its persistence is schema-read only, never exercised. A third endpoint, the \
                NON-deprecated POST /permission/{requestID}/reply, exists and matches \
                permission.replied's own {requestID, reply} vocabulary -- it was never tried, and is \
-               recorded as the alternative to measure, not silently preferred (C1)",
+               recorded as the alternative to measure, not silently preferred (C1). \
+               [confirmed finding 1, fixed] The implementer's own session wrote this admission_test \
+               but never ran it to completion (\"written and gated but not executed this session\") \
+               -- the W3 fixer session (2026-08-23) ran it for real, SERGEANT_OPENCODE_TESTS=1 \
+               against the installed 1.18.19 binary, -m opencode/big-pickle: it passed",
     },
     AdmissionRow {
         capability: "human_attach",
@@ -756,7 +760,10 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
                further client call and produced 'You prefer blue.'. Answering is restricted to the \
                measured shape: exactly one question, one exact label match; more than one question, \
                or an unmatched label, is a structured refusal naming the labels. Multi-select and \
-               /question/{id}/reject are schema-claimed and unwired (C4)",
+               /question/{id}/reject are schema-claimed and unwired (C4). [confirmed finding 1, \
+               fixed] Also written-but-not-run by the implementer's own session; the W3 fixer \
+               session (2026-08-23) ran it for real against the installed 1.18.19 binary and it \
+               passed",
     },
     // Two rows with no v1 boolean at all, the same adapter-local-evidence
     // posture codex's `structured_output`/`sandbox_enforcement` rows take.
@@ -875,7 +882,15 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
                classify_serve_terminal checks both sources; \
                classify_serve_terminal_recognizes_an_abort_signature_on_the_post_response_itself \
                pins it. On any abort-RPC failure the adapter falls back to the process-group kill \
-               and journals phase:\"interrupt_downgraded\" (codex's precedent, §7.3)",
+               and journals phase:\"interrupt_downgraded\" (codex's precedent, §7.3). [confirmed \
+               finding 2, fixed] The implementer's own session attempted this test three times and \
+               went zero-for-three: attempt 1 hit a real classify_serve_terminal bug (fixed), \
+               attempts 2-3 (post-fix) hung on the recovery turn's own wait_for_settled_within -- \
+               root-caused by the W3 fixer session to `session_error` (finding 3, also fixed) never \
+               being reset between turns, so turn 1's abort permanently misclassified every later \
+               turn on the same session as InterruptedRunning. With that fix in, the W3 fixer \
+               session ran this test for real against the installed 1.18.19 binary and it passed \
+               clean, including the recovery turn",
     },
     AdmissionRow {
         capability: "model_selection",
@@ -3211,6 +3226,17 @@ impl OpencodeBackend {
         *runtime.turn_acc.lock().expect("serve turn_acc lock") = TurnAccumulator::new();
         *runtime.turn.lock().expect("serve turn lock") = ServeTurnState::InFlight;
         runtime.sse_raw.lock().expect("serve sse_raw lock").clear();
+        // Reset alongside turn_acc/sse_raw, not left to accumulate across
+        // turns: `session_error` is written by the SSE reader whenever a
+        // `session.error` frame arrives (dispatch_frame's SessionError arm)
+        // and is otherwise never cleared. Left stale, the first abort a
+        // session ever sees would latch `classify_serve_terminal`'s
+        // `sse_aborted` check permanently true, misclassifying every later,
+        // cleanly-completed turn on this session as `InterruptedRunning`.
+        *runtime
+            .session_error
+            .lock()
+            .expect("serve session_error lock") = None;
         {
             let mut state = self.lock();
             if let Some(execution) = state.executions.get_mut(execution_id) {
@@ -3807,9 +3833,13 @@ struct ServeRuntime {
     message_roles: Mutex<BTreeMap<String, String>>,
     /// §6.3: at most one outstanding harness-issued gate.
     pending_gate: Mutex<Option<opencode_serve::PendingGate>>,
-    /// The last `session.error` frame's `properties.error` seen for this
-    /// session — §9.2's terminal table reads `name == "MessageAbortedError"`
-    /// off this to distinguish an aborted turn from every other failure.
+    /// The last `session.error` frame's `properties.error` seen for the turn
+    /// currently in flight — §9.2's terminal table reads `name ==
+    /// "MessageAbortedError"` off this to distinguish an aborted turn from
+    /// every other failure. Reset to `None` at the start of every turn
+    /// (`spawn_serve_turn`, alongside `turn_acc`/`sse_raw`) so one turn's
+    /// abort can never misclassify a later, cleanly-completed turn on the
+    /// same session.
     session_error: Mutex<Option<Value>>,
     turn: Mutex<ServeTurnState>,
     /// Reset at the start of every turn by the turn-driving thread; filled
@@ -4124,11 +4154,22 @@ impl ServeTurnDriver {
 
     fn run(self, prompt: String) {
         let mut body = json!({
-            "model": self.model.as_deref().and_then(|m| m.split_once('/')).map(
-                |(provider, model)| json!({"providerID": provider, "modelID": model})
-            ).unwrap_or_else(|| json!({"providerID": "opencode", "modelID": self.model.clone()})),
             "parts": [{"type": "text", "text": prompt}],
         });
+        // Mirrors the Run transport's own omission (`first_turn_argv`, which
+        // drops `-m` entirely when `model` is `None` and lets the server use
+        // its configured default): the pinned OpenAPI fixture's `model`
+        // sub-object requires `modelID: {"type": "string"}` -- non-nullable,
+        // `additionalProperties: false` -- so a `None` model must omit the
+        // `model` key altogether, never send `{"modelID": null}`, which
+        // would violate the adapter's own pinned schema.
+        if let Some(model) = self.model.as_deref() {
+            let model_obj = model
+                .split_once('/')
+                .map(|(provider, model)| json!({"providerID": provider, "modelID": model}))
+                .unwrap_or_else(|| json!({"providerID": "opencode", "modelID": model}));
+            body["model"] = model_obj;
+        }
         if let Some(format) = &self.structured_format {
             body["format"] = format.clone();
         }

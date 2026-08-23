@@ -76,12 +76,23 @@ pub(super) const MEASURED_DOC_FINGERPRINT: &str =
 
 /// Parse the bound base URL out of one `opencode serve` stdout line (§3.3).
 ///
-/// Exact measured shape, four independent captures (ports 4096 / 41357 /
-/// 39001 / 42003): `"opencode server listening on http://127.0.0.1:<port>"`,
-/// single, newline-terminated (the newline is not part of `line`), no
-/// trailing whitespace. Prefix-matched; the remainder is trimmed and must
-/// parse as `http://127.0.0.1:<u16>` with a **non-zero** port. Anything else
-/// is startup chatter, not this line — `None`, never a partial guess.
+/// Exact measured shape: `"opencode server listening on
+/// http://127.0.0.1:<port>"`, single, newline-terminated (the newline is not
+/// part of `line`), no trailing whitespace. Prefix-matched; the remainder is
+/// trimmed and must parse as `http://127.0.0.1:<u16>` with a **non-zero**
+/// port. Anything else is startup chatter, not this line — `None`, never a
+/// partial guess.
+///
+/// Backed by `tests/fixtures/opencode-serve-1.18.19-listening-stdout.txt`,
+/// four independent port captures against the real, installed 1.18.19
+/// binary, re-captured fresh by the W3 fixer session (2026-08-23) rather than
+/// carried over from the implementer's own session-local claim: `4096` (the
+/// conventional default, port free), `46701` and `41747` (two separate runs
+/// with 4096 pre-occupied by another listener, forcing a true OS-assigned
+/// ephemeral port), and `36873` (a second instance started concurrently with
+/// a first that took 4096). `parse_listening_line_pins_the_measured_shape`
+/// parses every line in that committed fixture, so this claim is checkable
+/// without re-running the binary.
 pub(super) fn parse_listening_line(line: &str) -> Option<String> {
     const PREFIX: &str = "opencode server listening on ";
     let remainder = line.strip_prefix(PREFIX)?.trim();
@@ -1003,18 +1014,42 @@ mod tests {
         include_str!("../../tests/fixtures/opencode-serve-1.18.19-sse-permission-asked.txt");
     const SSE_QUESTION_ASKED: &str =
         include_str!("../../tests/fixtures/opencode-serve-1.18.19-sse-question-asked.txt");
+    const LISTENING_STDOUT: &str =
+        include_str!("../../tests/fixtures/opencode-serve-1.18.19-listening-stdout.txt");
 
     // -------------------------------------------------------- port learning
 
+    /// Every line in the committed fixture is a real capture (see the
+    /// fixture's own provenance note on [`parse_listening_line`]'s doc
+    /// comment, above) against the installed 1.18.19 binary, not a
+    /// synthesized string — this is what makes the claim checkable rather
+    /// than circular.
     #[test]
     fn parse_listening_line_pins_the_measured_shape() {
-        for port in [4096u16, 41357, 39001, 42003] {
-            let line = format!("opencode server listening on http://127.0.0.1:{port}");
-            assert_eq!(
-                parse_listening_line(&line),
-                Some(format!("http://127.0.0.1:{port}"))
+        let mut lines_checked = 0;
+        for line in LISTENING_STDOUT.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let base = parse_listening_line(line)
+                .unwrap_or_else(|| panic!("fixture line failed to parse: {line:?}"));
+            assert!(
+                base.starts_with("http://127.0.0.1:"),
+                "unexpected base url: {base}"
             );
+            let port: u16 = base
+                .rsplit(':')
+                .next()
+                .expect("port suffix")
+                .parse()
+                .expect("numeric port");
+            assert_ne!(port, 0, "a captured port must be a real bound port");
+            lines_checked += 1;
         }
+        assert_eq!(
+            lines_checked, 4,
+            "expected all four committed captures to parse"
+        );
         assert_eq!(
             parse_listening_line("opencode server listening on http://127.0.0.1:0"),
             None,

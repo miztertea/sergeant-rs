@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 VERSION = "1.18.19"
@@ -72,6 +73,11 @@ def serve():
     if env_dump:
         with open(env_dump, "w") as f:
             json.dump(dict(os.environ), f)
+    pid_dump = os.environ.get("SGT_STUBSERVE_PID_DUMP")
+    if pid_dump:
+        with open(pid_dump, "w") as f:
+            f.write(str(os.getpid()))
+    request_dump = os.environ.get("SGT_STUBSERVE_REQUEST_DUMP")
     password = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
     state = {"turn_index": 0, "queue": [], "cond": threading.Condition(), "closed": False}
 
@@ -178,11 +184,20 @@ def serve():
                 self._json(plan.get("question_reply_response", True))
                 return
             if self.path.endswith("/message"):
+                if request_dump and _body:
+                    try:
+                        with open(request_dump, "w") as f:
+                            f.write(_body.decode("utf-8"))
+                    except OSError:
+                        pass
                 turns = plan.get("turns", [])
                 idx = state["turn_index"]
                 state["turn_index"] += 1
                 entry = turns[idx] if idx < len(turns) else {"response": {"info": {}, "parts": []}}
                 push_frames(entry.get("sse_frames", []))
+                delay = entry.get("respond_after_seconds")
+                if delay:
+                    time.sleep(delay)
                 self._json(entry.get("response", {}), entry.get("response_status", 200))
                 return
             self._json({"error": "not found"}, 404)
