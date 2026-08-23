@@ -2688,7 +2688,18 @@ impl TurnReader {
                             .executions
                             .get_mut(&self.execution_id)
                         {
-                            execution.conversation_id = Some(id.clone());
+                            // Only turn 1 mints identity. A later turn's `init`
+                            // line is CHECKED against the id we asked for
+                            // (`resume_mismatch`), never allowed to replace it:
+                            // agy warns-and-continues on an unknown
+                            // `--conversation` and starts a fresh conversation
+                            // (W1 P0.6), so adopting whatever came back would be
+                            // the adapter silently following the fork instead of
+                            // reporting it — and would make every later handle
+                            // an `UnknownExecution` besides.
+                            if execution.conversation_id.is_none() {
+                                execution.conversation_id = Some(id.clone());
+                            }
                         }
                         if let Some(tx) = &self.first_turn_signal {
                             let _ = tx.send(FirstTurnSignal::Initialized {
