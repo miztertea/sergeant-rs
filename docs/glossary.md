@@ -17,7 +17,9 @@ answering "what is the lowest-authority, smallest-surface representation
 that faithfully owns this behavior?" — applied to one source-cited
 behavior unit at a time, stopping at the first rung that honestly holds.
 Distinct from the pre-existing decomposition ladder in
-`.sergeant/workflows/repo-to-icm/_config/icm-ladder.md`: PL extends it
+`sergeant-rs-workspace/.sergeant/local/workflows/repo-to-icm/_config/icm-ladder.md`
+(relocated from this repository's own `.sergeant/workflows/repo-to-icm/`
+at the 2026-08-22 distro content rebuild): PL extends it
 with the driver/admission-boundary discriminator (Captain versus
 stage-actor versus deterministic versus runtime; pre-Work versus in-Work
 versus post-Work) the prior ladder lacked. Ratified as accepted vocabulary

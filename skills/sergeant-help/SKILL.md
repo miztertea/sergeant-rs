@@ -1,7 +1,7 @@
 ---
 name: sergeant-help
 description: Answer a Sergeant usage/setup/troubleshooting question from repository-owned documentation with a fixed precedence order, read-only, never inventing behavior.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 # Sergeant Help

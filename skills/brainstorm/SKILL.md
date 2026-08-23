@@ -1,7 +1,7 @@
 ---
 name: brainstorm
 description: Explore goals, approaches, constraints, non-goals, and consequences before an intent is precise enough to hand to clarify-intent. Use when what's wanted isn't yet settled enough to state as a candidate intent.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 **[external]** — new authorship, no estate evidence behind it. Carried

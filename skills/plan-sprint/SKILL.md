@@ -1,7 +1,7 @@
 ---
 name: plan-sprint
 description: Run a multi-wave sprint end to end — recon, plan, panel, rulings, waves, finalize — codifying the integration-branch/wave-branch/blind-panel method this estate's completed sprints have actually used. Use when a body of work needs a sprint-shaped plan with an integration branch, wave branches, and a blind panel gate before waves run.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 **[proven]** — new authorship, this skill's protocol is VERBATIM-faithful

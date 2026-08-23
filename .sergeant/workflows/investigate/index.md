@@ -3,7 +3,7 @@ kind: workflow
 name: investigate
 status: published
 version: 1
-edition: 0.2.0
+edition: 0.2.1
 description: >-
   Answer a bounded question against evidence, with a stated stopping
   condition, and leave a durable cited artifact.

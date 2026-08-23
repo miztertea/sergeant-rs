@@ -1,7 +1,7 @@
 ---
 name: orient
 description: Establish shared terminology, actors, and the immediate decision in view before any other skill or `sgt run` touches this system this session. Use when a session opens on a project/system/estate the human and Captain have not yet established a shared model for.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 **[external]** — new authorship, no estate evidence behind it. This skill

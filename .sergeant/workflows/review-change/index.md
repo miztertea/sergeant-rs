@@ -3,7 +3,7 @@ kind: workflow
 name: review-change
 status: published
 version: 1
-edition: 0.2.0
+edition: 0.2.1
 description: >-
   Review a diff that arrives from outside a Work — a colleague's PR, a
   merge candidate, a change someone else built — on four axes, and emit

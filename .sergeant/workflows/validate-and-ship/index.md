@@ -3,7 +3,7 @@ kind: workflow
 name: validate-and-ship
 status: published
 version: 3
-edition: 0.1.0
+edition: 0.2.1
 description: >-
   The single final shipping boundary: validate a committed change through
 the pipeline to a terminal outcome, routing every finding, without the

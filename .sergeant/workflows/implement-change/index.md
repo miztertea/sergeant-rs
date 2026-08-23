@@ -3,7 +3,7 @@ kind: workflow
 name: implement-change
 status: published
 version: 1
-edition: 0.2.0
+edition: 0.2.1
 description: >-
   Take an intent for a change to code, produce the change with its tests,
   attack it on four axes, refute the attack, fix only what survives,

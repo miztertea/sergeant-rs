@@ -295,7 +295,10 @@ submit, and repeatable `--repo` plus client-side `--group` expansion,
 pinned by `tests/m3_execution.rs::t2_multi_repo_workspace_binds_one_worktree_per_repository`
 and `tests/m8_estate_cli.rs::run_group_expansion_itself_survives_an_unrelated_declared_repo_missing_from_disk`.
 What remains uncontracted is narrower: cross-repo *delivery ordering* is
-planned by hand in the `cross-repo-work` workflow with no engine-side
+planned by hand — since the 2026-08-22 distro rebuild dissolved
+`cross-repo-work` into `scope-intent`'s `targets.dependency_order` field
+(Captain-side intent-shaping) plus an unbuilt runtime fan-out
+(design-proposal-2026-08-22.md §I.3, J.14) — with no engine-side
 dependency contract, and the multi-repo execution cwd —
 `WorkSurface::execution_cwd` falls back to the surface root for
 two-or-more repositories — is construction, not a ruling), soak evidence (#19),

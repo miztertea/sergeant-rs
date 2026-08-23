@@ -1,7 +1,7 @@
 ---
 name: scope-intent
 description: Establish where the work applies and where it does not — repository/artifact targets, components/interfaces, dependency boundaries, explicit non-goals, blast radius, single-repo vs. estate topology. Use once a precise outcome exists and needs its scope and boundaries drawn before it leaves the conversation.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 Merged and load-bearing; absorbs `cross-repo-work`'s ownership/

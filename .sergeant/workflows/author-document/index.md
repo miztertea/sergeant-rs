@@ -3,7 +3,7 @@ kind: workflow
 name: author-document
 status: published
 version: 1
-edition: 0.2.0
+edition: 0.2.1
 description: >-
   Produce a document as the deliverable, with fidelity to the brief as
   the top-weighted review axis.

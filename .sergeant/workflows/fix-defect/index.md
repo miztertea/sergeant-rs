@@ -3,7 +3,7 @@ kind: workflow
 name: fix-defect
 status: published
 version: 1
-edition: 0.2.0
+edition: 0.2.1
 description: >-
   Reproduce a defect before touching it, prove the cause, fix it with a
   regression test, and put the fix through the same review chain a

@@ -1,7 +1,7 @@
 ---
 name: retrospective
 description: Discuss what happened, what was learned, and whether a process, workflow, policy, or product change should become a new intent. Use when discussing the conversation around a postmortem's findings, at sprint scale or smaller.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 **[proven]** — kept.

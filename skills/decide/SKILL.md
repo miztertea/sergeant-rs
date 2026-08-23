@@ -1,7 +1,7 @@
 ---
 name: decide
 description: Compare alternatives and make an explicit decision with the human — options, comparison dimensions, recommendation, human decision, rationale, rejected alternatives and why, and when the decision should be revisited. Use when alternatives need comparing and the human needs to make an explicit decision.
-edition: 0.2.0
+edition: 0.2.1
 ---
 
 Merged; carries J0's one-question discipline and absorbs the
