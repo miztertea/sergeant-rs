@@ -261,10 +261,9 @@ fn embedded_skills_carry_the_real_root_and_preflight_remedies() {
 /// Captain, context composition, estate root, the disclaimed upstream
 /// "sgt-dispatch" name, …) appears in that paragraph or an adjacent one —
 /// prose in this corpus routinely puts the caveat in the very next
-/// paragraph rather than the same one (`dispatch/80-monitor/CONTEXT.md` is
-/// exactly this shape). A false negative here is possible; a false positive
-/// on real, already-disclaimed content is not, because every current file
-/// is asserted to pass below.
+/// paragraph rather than the same one. A false negative here is possible;
+/// a false positive on real, already-disclaimed content is not, because
+/// every current file is asserted to pass below.
 #[test]
 fn no_embedded_workflow_instructs_a_stage_actor_to_run_estate_scoped_commands_from_its_surface() {
     const VERB_CUES: &[&str] = &[
@@ -468,83 +467,43 @@ fn close_out_completion_boundary_covers_external_pipeline_runs() {
 }
 
 // ------------------------------------------------- 5. dispatch doctrine (#166/#167)
+//
+// `classify_risk_states_the_real_intent_file_mechanics` and
+// `monitor_states_the_real_reconciliation_mechanism` lived here, pinning
+// `.sergeant/workflows/dispatch/05-classify-risk/CONTEXT.md` and
+// `.../80-monitor/CONTEXT.md` byte-for-byte: --intent-file's real
+// pure-content-transport mechanics (#166), the pointer to AGENTS.md's
+// INTENT section for the eight-dimension risk brief rather than a
+// restatement of it, the real automatic-at-startup reconciliation
+// mechanism with no on-demand sync verb (#167), and the absence of any
+// leftover "Engine gap" note. Both tests are removed here because the
+// package they pinned, `dispatch`, was retired by the 2026-08-22 distro
+// content rebuild (docs/proposals/distro-content-2026-08-22.md, W2;
+// design proposal §4.1) — the kickoff ruling cut it outright rather than
+// keeping it alive as a transitional package, and neither file exists
+// under `.sergeant/workflows/` any more for a test to read.
+//
+// The doctrine these tests pinned is not thereby licensed to drift: the
+// `--intent-file` mechanics they asserted are still true of the binary
+// and are still stated in AGENTS.md's INTENT section. The third
+// assertion `classify_risk_states_the_real_intent_file_mechanics` made —
+// that AGENTS.md carries that section at all — is preserved below as its
+// own standalone test rather than lost with the package that pointed at
+// it.
 
-/// `05-classify-risk/CONTEXT.md` states `--intent-file`'s real mechanics —
-/// pure-content transport, mechanical guards only, pointing at AGENTS.md's
-/// Captain intent discipline rather than restating it — now that #166 has
-/// shipped the flag. Quoted verbatim so this test tracks the doctrine text,
-/// not a paraphrase of it (the house pattern this suite already uses for
-/// `60-close-out`, above).
+/// AGENTS.md still carries the `### INTENT — Captain's intent discipline`
+/// section — the one home for the eight-dimension risk brief, which used
+/// to be pinned as a side effect of `classify_risk_states_the_real_intent_
+/// file_mechanics` (removed above, with `dispatch`). Lifted into its own
+/// test so retiring that package's pinning test does not silently drop
+/// this half of the claim.
 #[test]
-fn classify_risk_states_the_real_intent_file_mechanics() {
-    let context_md = std::fs::read_to_string(
-        repo_root().join(".sergeant/workflows/dispatch/05-classify-risk/CONTEXT.md"),
-    )
-    .expect("read 05-classify-risk/CONTEXT.md");
-
-    assert!(
-        context_md.contains(
-            "It is pure-content transport: `sgt` validates only mechanics — the leaf must \
-             not be a symlink, must be a regular file, is capped at 1 MiB, and must be valid \
-             UTF-8 (`src/cli.rs`'s `read_intent_file`) — and neither parses the contents nor \
-             requires any particular section structure."
-        ),
-        "05-classify-risk/CONTEXT.md no longer states --intent-file's real mechanics — \
-         update this test and the doctrine text together"
-    );
-    assert!(
-        context_md.contains(
-            "The eight-dimension risk brief named in AGENTS.md's `### INTENT — Captain's \
-             intent discipline` — the authoritative list — is Captain's own discipline, \
-             stated once there; this stage points at it rather than restating it."
-        ),
-        "05-classify-risk/CONTEXT.md no longer points at AGENTS.md's INTENT section as the \
-         one home for the eight dimensions — update this test and the doctrine text together"
-    );
-
-    // The claim must actually be true: AGENTS.md must carry that section.
+fn agents_md_carries_the_intent_section() {
     let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
     assert!(
         agents_md.contains("### INTENT — Captain's intent discipline"),
-        "AGENTS.md no longer carries the INTENT section 05-classify-risk points at"
-    );
-}
-
-/// `80-monitor/CONTEXT.md` states the real reconciliation mechanism —
-/// automatic, once, at daemon startup via `runtime::recovery`, with no
-/// on-demand sync verb — now that #167 has closed with no such verb.
-/// Quoted verbatim, same house pattern as above.
-#[test]
-fn monitor_states_the_real_reconciliation_mechanism() {
-    let context_md = std::fs::read_to_string(
-        repo_root().join(".sergeant/workflows/dispatch/80-monitor/CONTEXT.md"),
-    )
-    .expect("read 80-monitor/CONTEXT.md");
-
-    assert!(
-        context_md.contains(
-            "Reconciliation runs automatically once, at daemon startup, before the daemon \
-             serves its first request: journal replay is followed by \
-             `runtime::recovery::reconcile`, which reattaches, resumes, or classifies every \
-             work believed `active` and appends `execution.reconciled` for each."
-        ),
-        "80-monitor/CONTEXT.md no longer states the real startup-reconciliation mechanism — \
-         update this test and the doctrine text together"
-    );
-    assert!(
-        context_md.contains(
-            "There is deliberately no on-demand sync verb: the upstream `--sync-all` was \
-             file-drift repair for a daemon-less shell tool with no continuous supervisor of \
-             its own; this daemon has one."
-        ),
-        "80-monitor/CONTEXT.md no longer states why there is no on-demand sync verb (#167) — \
-         update this test and the doctrine text together"
-    );
-
-    // No engine-gap ghost text should survive the rewrite.
-    assert!(
-        !context_md.contains("Engine gap"),
-        "80-monitor/CONTEXT.md still carries an 'Engine gap' note #167's closure removed"
+        "AGENTS.md no longer carries the INTENT section that named the eight-dimension \
+         risk brief for sensitive-territory Work"
     );
 }
 
