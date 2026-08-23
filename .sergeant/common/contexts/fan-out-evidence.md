@@ -8,7 +8,7 @@ Resolved as `@@fan-out-evidence` from
 `refute.md` specialize for the four fixed axes).
 
 The only proven mechanism in the library for isolated concurrent
-sub-agent work, on the precedent of the shipped `code-review`
+sub-agent work, on the precedent of the retired `code-review`
 package's own two-call parallel dispatch: N seats, spawned together in a
 single message, each with a self-contained brief, each capped, reporting
 back to a stage that collects rather than reviews.

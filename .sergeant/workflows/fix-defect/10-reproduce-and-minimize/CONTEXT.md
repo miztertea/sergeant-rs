@@ -67,9 +67,10 @@ a discretionary choice. **No edit to the subject under diagnosis happens
 before this gate is passed.**
 
 ### J0 — must become `needs_input`
-The bug cannot be reproduced at all despite genuine attempts — record
-what was tried and stop; this becomes a terminal blocked outcome with
-evidence, not an escalation asking permission to guess.
+Inherits workflow envelope unchanged. This stage's one failure mode — the
+bug cannot be reproduced at all despite genuine attempts — is governed by
+`J5` above: it is a terminal, evidenced `work.blocked`, never a
+`needs_input` escalation asking permission to guess.
 
 ### Completion boundary
 This stage may complete only when the loop reproduces the user's exact

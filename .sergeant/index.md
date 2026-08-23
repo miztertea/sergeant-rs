@@ -45,7 +45,7 @@ Eighteen packages leave `.sergeant/workflows/` at this round, all
 | `diagnose-bug` | reshape | → `fix-defect` |
 | `dispatch` | cut | Its `05-classify-risk` safety-keyword routing is a live gap (named in the head PR's ratify list); `80-monitor`'s reconciliation doctrine is engine-true prose that leaves with it |
 | `implement` | absorb | → `implement-change` (its two stages are the loop's middle) |
-| `prototype` | retire | Zero live bindings; a spike is a change with a throwaway intent |
+| `prototype` | retire | Zero live bindings; a spike is a change with a throwaway intent. Retiring it required a second, undeclared `tests/` edit beyond the wave's one named exception (`tests/f_doctrine_skew.rs`, §7.5): `tests/m8_estate_cli.rs`'s `run_workflow_resolves_against_a_freshly_initialized_estate` retargeted its `--workflow` argument from `prototype` to `investigate` (commit `89fa3a52`), or `cargo test --locked` would 422 against a retired package. Named here, on the head PR's ratify list |
 | `record-decisions` | absorb | → `author-document` profile (a section, not a construct — see that package's own Notes for reviewers) |
 | `recover-stalled-worker` | retire | → engine lead (recovering sergeant's own stalled worker is engine behavior) |
 | `repo-to-icm` | relocate | → `sergeant-rs-workspace/.sergeant/local/workflows/`; takes the library's only `kind = "execute"` stage with it — this library no longer exercises `kind = "execute"` anywhere |
