@@ -76,6 +76,8 @@ const LOOP_SUBAGENT: &str = include_str!("fixtures/agy-1.1.19-loop-subagent-info
 const LOOP_DENIED_TOOL: &str =
     include_str!("fixtures/agy-1.1.19-loop-denied-tool-kills-child.jsonl");
 const LOOP_RESUME_INIT_ECHO: &str = include_str!("fixtures/agy-1.1.19-loop-resume-init-echo.jsonl");
+const LOOP_CONTROL_REFUSAL: &str =
+    include_str!("fixtures/agy-1.1.19-loop-control-request-refusal.jsonl");
 
 /// The single `init` line a loop child emits at **child start**, before any
 /// stdin line is read — the real capture of W3 P1 row I's empty-stdin child.
@@ -142,7 +144,8 @@ struct StubAgy {
     /// stdin line is read — the shape W3 P1 row I measured.
     loop_init: PathBuf,
     /// Prefix for the loop arm's per-turn marker files (`-stderr-<n>`,
-    /// `-stderr-pre-<n>`, `-die-after-<n>`, `-no-init`, `-init-hang`).
+    /// `-stderr-pre-<n>`, `-die-after-<n>`, `-no-init`, `-init-hang`,
+    /// `-preinit-err`, `-preinit-out`, `-exit-now`).
     loop_prefix: PathBuf,
 }
 
@@ -175,7 +178,7 @@ impl StubAgy {
                if [ -f \"{config_hang}\" ]; then exec sleep 60; fi\n  \
                cat \"{config_answer}\"; exit 0\n\
              fi\n\
-             if [ \"$1\" = \"--print=\" ]; then\n                 {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n                   env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n                   printf 'cwd %s\\n' \"$(pwd)\"; printf 'end\\n'; }} >> \"{record}\"\n                 if [ ! -f \"{loop_prefix}-no-init\" ]; then cat \"{loop_init}\"; fi\n                 if [ -f \"{grandchild}\" ]; then\n                   ( i=0; while [ \"$i\" -lt 600 ]; do sleep 0.1; i=$((i+1)); done ) &\n                   echo $! > \"{grandchild_pid}\"\n                 fi\n                 if [ -f \"{loop_prefix}-init-hang\" ]; then exec sleep 60; fi\n                 n=0\n                 while IFS= read -r line; do\n                     n=$((n+1))\n                     printf 'stdin %s\\n' \"$line\" >> \"{record}\"\n                     if [ -f \"{loop_prefix}-stderr-pre-$n\" ]; then cat \"{loop_prefix}-stderr-pre-$n\" >&2; fi\n                     if [ -f \"{replay}\" ]; then awk -v n=$n 'BEGIN{{s=1}} /^---turn---$/{{s=s+1;next}} s==n{{print}}' \"{replay}\"; fi\n                     if [ -f \"{loop_prefix}-stderr-$n\" ]; then cat \"{loop_prefix}-stderr-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-die-after-$n\" ]; then exit \"$(cat \"{loop_prefix}-die-after-$n\")\"; fi\n                 done\n                 if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n                 exit 0\n             fi\n\
+             if [ \"$1\" = \"--print=\" ]; then\n                 {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n                   env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n                   printf 'cwd %s\\n' \"$(pwd)\"; printf 'end\\n'; }} >> \"{record}\"\n                 if [ ! -f \"{loop_prefix}-no-init\" ]; then cat \"{loop_init}\"; fi\n                 if [ -f \"{loop_prefix}-preinit-err\" ]; then cat \"{loop_prefix}-preinit-err\" >&2; fi\n                 if [ -f \"{loop_prefix}-preinit-out\" ]; then cat \"{loop_prefix}-preinit-out\"; fi\n                 if [ -f \"{loop_prefix}-exit-now\" ]; then exit \"$(cat \"{loop_prefix}-exit-now\")\"; fi\n                 if [ -f \"{grandchild}\" ]; then\n                   ( i=0; while [ \"$i\" -lt 600 ]; do sleep 0.1; i=$((i+1)); done ) &\n                   echo $! > \"{grandchild_pid}\"\n                 fi\n                 if [ -f \"{loop_prefix}-init-hang\" ]; then exec sleep 60; fi\n                 n=0\n                 while IFS= read -r line; do\n                     n=$((n+1))\n                     printf 'stdin %s\\n' \"$line\" >> \"{record}\"\n                     if [ -f \"{loop_prefix}-stderr-pre-$n\" ]; then cat \"{loop_prefix}-stderr-pre-$n\" >&2; fi\n                     if [ -f \"{replay}\" ]; then awk -v n=$n 'BEGIN{{s=1}} /^---turn---$/{{s=s+1;next}} s==n{{print}}' \"{replay}\"; fi\n                     if [ -f \"{loop_prefix}-stderr-$n\" ]; then cat \"{loop_prefix}-stderr-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-die-after-$n\" ]; then exit \"$(cat \"{loop_prefix}-die-after-$n\")\"; fi\n                 done\n                 if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n                 exit 0\n             fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$(printf '%s' \"$arg\" | tr '\\n' '|')\"; done;\n\
              env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
@@ -271,6 +274,47 @@ impl StubAgy {
             .expect("write no-init marker");
         std::fs::write(format!("{}-init-hang", self.loop_prefix.display()), b"x")
             .expect("write init-hang marker");
+        self
+    }
+
+    /// Emit no `init` line and then **exit promptly** with `code`, saying
+    /// nothing at all. Deliberately distinct from [`Self::loop_never_initializes`],
+    /// which hangs: that shape can only ever exercise the LAUNCH-side
+    /// `recv_timeout` expiry, and this one is the only way to reach
+    /// `LoopReader`'s own `Terminal::None => ExitedWithoutInit` classification.
+    fn loop_exits_before_init(&self, code: i32, stderr: &str) -> &Self {
+        std::fs::write(format!("{}-no-init", self.loop_prefix.display()), b"x")
+            .expect("write no-init marker");
+        std::fs::write(
+            format!("{}-preinit-err", self.loop_prefix.display()),
+            stderr,
+        )
+        .expect("write pre-init stderr");
+        std::fs::write(
+            format!("{}-exit-now", self.loop_prefix.display()),
+            code.to_string(),
+        )
+        .expect("write exit-now marker");
+        self
+    }
+
+    /// Emit no `init` line but a typed terminal `result` — a harness that
+    /// refuses before minting a conversation — then exit with `code`. Reaches
+    /// `LoopReader`'s `Terminal::Status => RefusedBeforeIdentity` arm, the one
+    /// whose refusal quotes agy's own `error` verbatim.
+    fn loop_refuses_before_init(&self, result_line: &str, code: i32) -> &Self {
+        std::fs::write(format!("{}-no-init", self.loop_prefix.display()), b"x")
+            .expect("write no-init marker");
+        std::fs::write(
+            format!("{}-preinit-out", self.loop_prefix.display()),
+            format!("{}\n", result_line.trim_end()),
+        )
+        .expect("write pre-init output");
+        std::fs::write(
+            format!("{}-exit-now", self.loop_prefix.display()),
+            code.to_string(),
+        )
+        .expect("write exit-now marker");
         self
     }
 
@@ -2234,6 +2278,74 @@ fn a_loop_launch_fails_closed_when_no_init_line_arrives() {
     assert!(detail.contains("no `init` line"), "{detail}");
     assert!(detail.contains("no turn has been spent"), "{detail}");
     assert!(backend.tracked_executions().is_empty());
+}
+
+#[test]
+fn a_loop_child_that_exits_before_init_fails_launch_naming_its_exit_code() {
+    // The OTHER no-init shape, and a genuinely different code path: the test
+    // above never leaves `spawn_loop_child`'s `recv_timeout` expiry, because
+    // its child hangs. A child that *exits* promptly having said nothing is
+    // classified by `LoopReader` itself — `Terminal::None` => `ExitedWithoutInit`
+    // — and the refusal names the exit code rather than a budget.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    stub.loop_exits_before_init(7, "agy: could not reach the model service\n");
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let error = launch_with(&backend, &loop_pinned_request(dir.path())).expect_err("fails closed");
+    let BackendError::Failed { detail, .. } = error else {
+        panic!("a Failed refusal")
+    };
+    assert!(
+        detail.contains("emitted no terminal either"),
+        "the reader's own classification, not the LAUNCH-side budget expiry: {detail}"
+    );
+    assert!(detail.contains("exit_code=Some(7)"), "{detail}");
+    assert!(
+        detail.contains("could not reach the model service"),
+        "the child's stderr is the operator's only clue when it streamed nothing: {detail}"
+    );
+    assert!(
+        !detail.contains("no turn has been spent"),
+        "a hang and a fast exit must not be reported as the same thing: {detail}"
+    );
+    // Same fail-closed contract as the hang: no handle, no phantom execution,
+    // and nothing was ever written down the child's stdin.
+    assert!(backend.tracked_executions().is_empty());
+    assert!(stub.loop_stdin_lines().is_empty());
+}
+
+#[test]
+fn a_loop_child_that_refuses_before_init_quotes_agys_own_error() {
+    // A harness that answers with a typed terminal instead of an identity. The
+    // refusal must carry agy's own `error` verbatim — the operator's only clue
+    // — rather than the generic said-nothing message, and the pre-`init`
+    // `result` must NOT be settled as a turn: nothing was ever written to this
+    // child's stdin, so a `conversation.turn.ended` here would invent one.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let refusal = LOOP_CONTROL_REFUSAL
+        .lines()
+        .find(|line| line.contains(r#""event":"result""#))
+        .expect("the capture's terminal result line");
+    stub.loop_refuses_before_init(refusal, 1);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let error = launch_with(&backend, &loop_pinned_request(dir.path())).expect_err("fails closed");
+    let BackendError::Failed { detail, .. } = error else {
+        panic!("a Failed refusal")
+    };
+    assert!(detail.contains("before minting a conversation"), "{detail}");
+    assert!(detail.contains("status=ERROR"), "{detail}");
+    assert!(
+        detail.contains("is not supported yet"),
+        "agy's own error, verbatim: {detail}"
+    );
+    assert!(backend.tracked_executions().is_empty());
+    assert!(
+        events_of_kind(&events, "conversation.turn.ended").is_empty(),
+        "a result that precedes `init` is a refusal, not a turn — no turn was ever sent"
+    );
 }
 
 #[test]

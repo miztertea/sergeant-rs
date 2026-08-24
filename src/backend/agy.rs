@@ -4571,7 +4571,17 @@ impl LoopReader {
                 identity = LoopIdentity::from_accumulator(&acc);
                 self.announce_identity(&identity);
             }
-            if event == "result" {
+            // A `result` that arrives **before** any `init` is not a turn: no
+            // line has been written to this child's stdin yet, so settling one
+            // here would fabricate a `conversation.turn.ended` (and a
+            // `TurnState::Finished`) for a turn nobody sent, and would reset the
+            // accumulator that carries agy's own refusal text. Leaving it in
+            // `acc` is what lets the `!announced_init` classifier below report
+            // `RefusedBeforeIdentity` with that text verbatim instead of the
+            // said-nothing-at-all `ExitedWithoutInit`. `init` precedes any
+            // message being consumed on this transport [W3 P1], so this window
+            // only ever holds a harness refusal.
+            if event == "result" && announced_init {
                 turns_settled += 1;
                 let settled = self.settle_turn(
                     &mut acc,
