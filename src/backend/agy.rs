@@ -220,13 +220,13 @@
 //! wave is the adapter and nothing else) — this module compiles, is unit- and
 //! contract-tested, and is reachable by nothing yet.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Read};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -279,6 +279,23 @@ pub const REQUIRED_FLAGS: &[&str] = &[
     "--disable-slash-commands",
     "--json-schema",
 ];
+
+/// The extra flag the **input-loop** transport composes, checked separately
+/// from [`REQUIRED_FLAGS`] rather than added to it.
+///
+/// **Declared deviation from the W3 spec (§2.1 vs §2.8), and the reason.** §2.1
+/// says `REQUIRED_FLAGS` gains `--input-format`; §2.8 says an `Auto` resolution
+/// whose gate fails resolves to [`Transport::Print`] with a probe *detail*
+/// naming the missing flag. Those two sentences cannot both hold: a flag in
+/// `REQUIRED_FLAGS` makes the whole probe `available: false`, so a build with no
+/// `--input-format` would be refused outright instead of being served on the
+/// print transport it fully supports. §2.8's behaviour is the load-bearing one
+/// (it is what keeps an older `agy` usable at all), so the membership rule is
+/// preserved — `required_flags_are_exactly_what_the_launch_grammar_composes`
+/// checks *both* lists against *both* argv builders, in both directions — while
+/// the gate lives here. Recorded in the wave PR's K2/deviation ledger rather
+/// than resolved silently.
+pub const LOOP_GATE_FLAGS: &[&str] = &["--input-format"];
 
 /// How long LAUNCH waits for the `init` line — which is line 1, emitted before
 /// the model's first token [packet 1, W1 P2] — before concluding the launch
@@ -333,6 +350,82 @@ const TOOL_OUTPUT_TAIL: usize = 1024;
 /// PREPARE refuses it; 120_000 leaves ~11 k of headroom for the flag bytes and
 /// argv overhead around it, and is a real bound rather than none.
 const ARGV_PROMPT_CAP: usize = 120_000;
+
+/// Composed-prompt bytes the **input-loop** transport can carry.
+///
+/// [`ARGV_PROMPT_CAP`] does **not** bind here: the prompt travels as the
+/// `content` of one NDJSON line on stdin, not on argv [W3 P1], which is a real
+/// capability delta — the loop can carry a `CONTEXT.md` that print mode refuses
+/// at PREPARE. It is deliberately **not** claimed as unbounded. Nothing
+/// measured a limit, and "no measured limit" is not "no limit"; 16 MiB is the
+/// same order as [`STREAM_MEMORY_CAP`], and PREPARE must refuse on the
+/// transport it will actually launch on rather than on the other one's number.
+const LOOP_PROMPT_CAP: usize = 16 * 1024 * 1024;
+
+/// How long a settled loop turn waits for stderr lines that belong to it before
+/// attributing what it has (§2.6).
+///
+/// **Deliberately not [`STDERR_DRAIN_BUDGET`]**, and the difference is the
+/// transport's: on print mode that five seconds is a one-shot wait at process
+/// exit, while here it would be paid *by every turn* of a long-lived child and
+/// would serialize straight into each turn's settle latency. The race it closes
+/// is a same-instant one (the notice is written as the `result` is flushed), so
+/// a short grace closes it; a line that arrives later is not dropped, it is
+/// carried to the next turn and labelled `adjacent`.
+const LOOP_STDERR_GRACE: Duration = Duration::from_millis(250);
+
+/// How long STOP waits, after closing the loop child's stdin, for an in-flight
+/// turn's `result` before group-killing. Closing stdin is the *graceful*
+/// shutdown — [W3 P2] measured queued turns running to completion and the child
+/// then exiting 0 with no further event — so this budget is the one place the
+/// adapter chooses between "let the turn finish" and "stop now"; it expires
+/// into the same group kill INTERRUPT uses.
+const LOOP_STOP_DRAIN_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long a failed stdin write waits for the reader thread's death record
+/// before falling back to reporting the raw I/O error. Comfortably over
+/// [`LOOP_STDERR_GRACE`], which is the wait it is racing: the reader settles the
+/// turn and drains stderr before recording the exit, so a SEND that arrives in
+/// that window would otherwise report `Broken pipe` instead of the refusal that
+/// names the still-resumable conversation.
+const LOOP_DEATH_RECORD_GRACE: Duration = Duration::from_secs(3);
+
+/// The terminal `error` string a `--print-timeout` expiry produces [W1 P5] —
+/// **and, measured [W3 P4], the one a SIGINT we sent produces too**. `status`
+/// can never disambiguate the two, which is why [`classify_terminal`] arm 1
+/// consults `interrupt_requested` for exactly this string and why every such
+/// terminal carries `terminal_ambiguity` into its evidence.
+const LOOP_TIMEOUT_TERMINAL_ERROR: &str = "timeout waiting for response";
+
+/// Prefix every typed stdin-message refusal shares [W3 P1 rows C–F, H]. The
+/// adapter constructs only the accepted shape, so a terminal carrying one of
+/// those refusals is an **adapter defect**, not a stage failure, and is reported
+/// as one.
+///
+/// **The prefix alone is not the test, and measurement is why.** [W3 A7]
+/// measured a SIGINT to an idle loop child producing
+/// `stream input cancelled: context canceled` — the same prefix, and the
+/// opposite meaning: nothing was malformed, we killed it. Classifying that as an
+/// adapter defect would have blamed this file for an interrupt it performed
+/// correctly, so [`TurnAccumulator::loop_input_rejection`] requires the prefix
+/// **and** one of the measured refusal markers.
+const LOOP_INPUT_REJECTION_PREFIX: &str = "stream input ";
+
+/// The three sentence fragments every measured stdin-message refusal contains
+/// [W3 P1 rows C–F, H], and which the cancellation terminal contains none of.
+const LOOP_INPUT_REJECTION_MARKERS: &[&str] =
+    &["is missing the", "has no content", "is not supported"];
+
+/// The terminal a SIGINT produces when it lands **between** turns, while the
+/// child is blocked reading stdin [W3 A7].
+///
+/// The wave's spec expected only [`LOOP_TIMEOUT_TERMINAL_ERROR`] here, on
+/// [W3 P4]'s evidence. Re-measuring it found **two** shapes, split by where the
+/// signal lands: mid-turn (awaiting the model) gives the timeout string, and
+/// idle gives this one. Both are fatal to the child, both are `status: ERROR`,
+/// and both are an interrupt when we asked for one — but only the first is
+/// *ambiguous*, because only the first collides with a real deadline expiry.
+const LOOP_CANCELLED_TERMINAL_ERROR: &str = "stream input cancelled: context canceled";
 
 /// ADR 0007(a)'s execution-model half, **agy-worded**. Copied in spirit from
 /// the sibling adapters' constants of the same purpose, never imported: the
@@ -433,6 +526,16 @@ pub struct AgyConfig {
     /// `launch()` — no process-global mutable state, no `--test-threads`
     /// ordering hazard, no `unsafe { std::env::set_var }` to serialize.
     pub init_line_budget: Option<Duration>,
+    /// Override for [`LOOP_STOP_DRAIN_BUDGET`], `None` in every production
+    /// path. Same per-instance shape, and for the same reason, as
+    /// [`AgyConfig::init_line_budget`]: STOP's bounded graceful shutdown has two
+    /// outcomes — the in-flight turn settles, or the budget expires into the
+    /// group kill — and the second is only testable deterministically if a test
+    /// can shrink the budget below the turn it is racing.
+    pub stop_drain_budget: Option<Duration>,
+    /// Which transport to run on (W3). `Auto` — the default — resolves from the
+    /// `--help` text the probe already read, spawning nothing extra.
+    pub transport: TransportChoice,
 }
 
 impl std::fmt::Debug for AgyConfig {
@@ -453,6 +556,8 @@ impl std::fmt::Debug for AgyConfig {
             )
             .field("settings_home", &self.settings_home)
             .field("init_line_budget", &self.init_line_budget)
+            .field("stop_drain_budget", &self.stop_drain_budget)
+            .field("transport", &self.transport)
             .finish()
     }
 }
@@ -469,6 +574,8 @@ impl AgyConfig {
             json_schema: None,
             settings_home: None,
             init_line_budget: None,
+            stop_drain_budget: None,
+            transport: TransportChoice::default(),
         }
     }
 }
@@ -487,23 +594,58 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>, settings_hom
 
 // ---------------------------------------------------------- admission rows
 
-/// Which transport a row's evidence was gathered on. One variant today, and the
-/// column exists anyway: W3 adds `InputLoop` (the persistent
-/// `--input-format stream-json` child), and the codex sprint's own experience
-/// is that retrofitting the column *after* a second transport arrives silently
-/// re-attributes every existing row to it.
+/// Which transport a row's evidence was gathered on. W1 carried this column
+/// with one variant precisely so that W3's second transport could not silently
+/// re-attribute every existing row to itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Transport {
-    /// `agy -p … --output-format stream-json`, W1's transport.
+    /// `agy -p … --output-format stream-json`, W1's transport: one OS process
+    /// per turn.
     Print,
+    /// `agy --print= --input-format stream-json --output-format stream-json`,
+    /// W3's: **one process for the whole execution**, one NDJSON `user` message
+    /// per turn on its stdin [W3 P0/P1/P2].
+    Loop,
 }
 
 impl Transport {
     fn as_str(self) -> &'static str {
         match self {
             Transport::Print => "print-stream-json",
+            Transport::Loop => "input-loop-stream-json",
         }
     }
+}
+
+/// Which transport an operator asks this backend to run on.
+///
+/// `opencode.rs`'s `TransportChoice` verbatim in shape, and deliberately so
+/// (R2). The one thing that differs is what `Auto` *costs*, and it is the whole
+/// reason this enum is safe to resolve inside daemon registration — see
+/// [`AgyBackend::transport_resolution`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransportChoice {
+    /// Resolve from the memoized probe: the loop when the installed `--help`
+    /// offers `--input-format`, print otherwise.
+    #[default]
+    Auto,
+    /// Always [`Transport::Print`], whatever the installed build offers.
+    PrintOnly,
+    /// Always [`Transport::Loop`]; a build whose `--help` does not offer
+    /// `--input-format` probes **`available: false`** naming the flag, rather
+    /// than being quietly served on the other transport (codex §5.2 rule 2).
+    LoopOnly,
+}
+
+/// How [`TransportChoice`] resolved against the installed build. Computed once,
+/// from a value the probe already had.
+#[derive(Debug, Clone)]
+struct TransportResolution {
+    transport: Transport,
+    /// `false` only for `LoopOnly` against a build with no `--input-format`:
+    /// the one resolution that makes the whole backend unavailable.
+    available: bool,
+    detail: String,
 }
 
 /// How a capability's `true`/`false` was established. The codex/opencode four
@@ -814,6 +956,347 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
                v1 boolean invented (R3), the posture codex's and opencode's own structured_output \
                rows take",
     },
+    // ------------------------------------------------------------------
+    // Transport::Loop — W3's rows. Every one of these was measured on the
+    // input-loop transport specifically; nothing is inherited from the print
+    // column, because a claim carried across transports is a claim nobody made.
+    // ------------------------------------------------------------------
+    AdmissionRow {
+        capability: "persistent_sessions",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "OneChildOneConversation",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_loop_turn_boundary_resets_the_accumulator_but_not_the_conversation",
+        note: "stronger than print's on the same flag: one OS process carries EVERY turn of the \
+               execution over one conversation, minted on the child's single `init` line and \
+               never re-minted (W3 P2: no second init, every step_update and every result carries \
+               the same conversation_id). --conversation still re-adopts it from a fresh child \
+               (W3 P3), so the print column's claim also holds here",
+    },
+    AdmissionRow {
+        capability: "native_background",
+        transport: Transport::Loop,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::DocClaimed,
+        admission_test: "",
+        note: "unchanged from print and for a related reason: the `schedule` tool is in the roster \
+               (W3 A1 measured the model actually CALLING it, to wait for a subagent) but nothing \
+               measured a mechanism for work to outlive the child, and closing stdin lets queued \
+               turns finish and then exits (W3 P2). Documented is not supported",
+    },
+    AdmissionRow {
+        capability: "streaming",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_loop_child_streams_each_turns_events_before_the_next_is_written",
+        note: "W3 P2's timeline shows text_delta steps arriving mid-turn, 2 s before the terminal, \
+               on a child that then ran a second turn. Same decoder as print (ADR 0020/0021's \
+               seam): the loop is a driver, not a second decoder",
+    },
+    AdmissionRow {
+        capability: "history",
+        transport: Transport::Loop,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        admission_test: "",
+        note: "no export verb exists on either transport, so §15's rule stands unchanged: \
+               Backend::history refuses rather than emulating. The loop adds ONE lead and does not \
+               promote it — W3 A1's subagent_info carries a log_uri pointing at a real \
+               transcript.jsonl under the settings home, which is a CHILD trajectory's log and not \
+               this conversation's history",
+    },
+    AdmissionRow {
+        capability: "resume",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "InitEchoAtChildStart",
+        evidence: Evidence::LiveMeasured,
+        admission_test: "live_agy_loop_resume_echoes_the_conversation_before_any_turn",
+        note: "the same check as print's ConversationIdEchoOnNextTurn, moved BEFORE the first \
+               turn: --conversation on the loop grammar makes the child echo the requested id on \
+               its init line at child start, so the silent-fork guard (W1 P0.6) costs ZERO quota \
+               and runs once per child instead of once per turn. Measured live both ways in W3: \
+               the real id echoed back exactly, and an unknown id echoed a DIFFERENT fresh id with \
+               `warning: conversation \"…\" not found` on stderr — both for no turns at all",
+    },
+    AdmissionRow {
+        capability: "interrupt",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "ProcessTreeTermination",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "loop_interrupt_group_kills_the_child_and_its_grandchild",
+        note: "the UPGRADE CANDIDATE IS REFUTED and the group kill stands. W3 P4: SIGINT to a loop \
+               child yields no INTERRUPTED status anywhere, kills the child within ~100 ms (there \
+               is no cancel-the-turn-keep-the-session gesture), and emits status ERROR with error \
+               \"timeout waiting for response\" — BYTE-IDENTICAL to a --print-timeout expiry \
+               (W1 P5). So a SIGINT-first ladder would trade a measured guarantee for a \
+               mislabelled terminal. native_interrupt_refuted; the downgrade is journaled rather \
+               than implicit (codex §7.3), and classify_terminal arm 1a now reads that terminal as \
+               InterruptedRunning when we asked and Failed when we did not, carrying \
+               terminal_ambiguity=timeout_or_interrupt in both readings",
+    },
+    AdmissionRow {
+        capability: "model_selection",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "InitEchoVerifiedPin",
+        evidence: Evidence::LiveMeasured,
+        admission_test: "live_agy_loop_resume_echoes_the_conversation_before_any_turn",
+        note: "same tier as print, and a cost no adapter in the registry can match: init.model \
+               echoes the resolved pin at CHILD START, before any message is consumed (W3 P1 row \
+               I proved init arrives even when stdin is closed with nothing written), so a \
+               Substituted verdict refuses the LAUNCH having spent ZERO quota where print mode \
+               must burn turn 1 to find out. One live test backs two rows, which is why they share \
+               a name",
+    },
+    AdmissionRow {
+        capability: "profiles",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_profile_executable_and_env_reach_a_loop_child",
+        note: "W1's DECLARED DIVERGENCE carries over verbatim and no live turn was spent on it: \
+               generic sergeant axes only (executable + env), config_home REFUSED rather than \
+               ignored, and agy's own --agent still unwired (W1 P6: the documented workspace \
+               mechanism does not work on this host, and `agy agents` is an interactive TUI that \
+               hangs headless). The loop changes nothing about this row except that env now \
+               reaches ONE child rather than one per turn, which is strictly easier to guarantee",
+    },
+    AdmissionRow {
+        capability: "approval_flow",
+        transport: Transport::Loop,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "",
+        note: "MEASURED false, not merely unmeasured — the plan's headline hope, refuted. \
+               ask_permission/ask_custom_permission are in the 57-tool roster, but W3 P1 wrote \
+               SIXTEEN candidate reply-event names into a live child and every one but \
+               control_request was skipped with `warning: ignoring unsupported stream input \
+               message event`; control_request itself is refused as \"not supported yet\" (rc=2, \
+               upstream's own word, quoted). There is no message the driver may send to approve or \
+               deny. The working permission channel is the one W1 shipped — the settings home via \
+               HOME — and it is a LAUNCH-time policy, not an interactive flow; see config_injection",
+    },
+    AdmissionRow {
+        capability: "human_attach",
+        transport: Transport::Loop,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::Unmeasured,
+        admission_test: "",
+        note: "unchanged: the loop child is still non-interactive (--print=), and \
+               --prompt-interactive/-i is a different execution mode this adapter composes nowhere",
+    },
+    AdmissionRow {
+        capability: "usage",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_conversation_scoped_counter_is_never_assumed_to_start_at_zero",
+        note: "per-step and terminal usage both present, same as print. The loop adds one hazard \
+               this row owns: result.num_turns, step_index and duration_seconds are all \
+               CONVERSATION-scoped, not child-scoped (W3 P2 saw 0,1,2 then 3,4 and num_turns 1 \
+               then 2; W3 P3's resumed child opened at step_index 5 with num_turns 3 and \
+               duration_seconds 133.16). Nothing keys on any of them starting at zero, and \
+               duration_seconds is carried verbatim and NEVER read as a turn duration",
+    },
+    AdmissionRow {
+        capability: "native_subagents",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "TypedSubagentInfoRecord",
+        evidence: Evidence::LiveMeasured,
+        admission_test: "live_agy_loop_invokes_a_subagent_and_records_its_typed_conversation_id",
+        note: "THE WAVE'S HEADLINE, and the first `true` for this flag anywhere in the registry. \
+               Admitted on all three pieces of evidence the spec demanded and nothing less: (1) a \
+               step_update with step_type \"subagent\" and tool_name invoke_subagent, (2) a TYPED \
+               subagent_info payload on it carrying conversation_id 18a52ef3-… — DISTINCT from the \
+               parent's 24c4ff64-… — plus a log_uri to the child's own transcript.jsonl, and (3) \
+               that step reaching DONE. The measured shape is a LIST \
+               (subagent_info.subagents[{type_name, role, initial_prompt, conversation_id, \
+               log_uri}]) and not the flat object the changelog's prose implied, and the child's \
+               identity appears ONLY on the resolved step — the ACTIVE one carries the first three \
+               fields. Explicitly NOT evidence and not accepted: assistant text saying it \
+               delegated, a tool step distinguished only by its name, or a subagent_info with no \
+               child conversation_id. The child id is carried verbatim into tool.completed so a \
+               human can resume that trajectory by hand; sergeant does NOT adopt it as an \
+               execution, which would be a second execution nothing prepared",
+    },
+    AdmissionRow {
+        capability: "ask",
+        transport: Transport::Loop,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "",
+        note: "MEASURED false, and this is the stronger statement of the two refutations. It is \
+               not that a question is unrecognisable here — CORTEX_STEP_TYPE_ASK_QUESTION exists \
+               and ask_question is in the roster, so a question may well SURFACE — it is that \
+               W3 P1 measured there is NO channel to answer one on (sixteen candidate reply events \
+               skipped, control_request refused \"not supported yet\", and printmode's complete \
+               123-name symbol table contains no answer, reply or permission handler). A question \
+               that surfaces with nobody able to answer it is a stage sergeant would park forever. \
+               Capabilities::ask forbids guessing a question from prose; this row says even a \
+               TYPED one would be unanswerable",
+    },
+    AdmissionRow {
+        capability: "config_injection",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "SettingsHomeViaHome",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_settings_home_reaches_a_loop_child",
+        note: "W1's measured channel, re-exercised on this transport for every paid W3 probe: the \
+               subagent admission, the denied-tool admission and the sandbox probe each ran under \
+               their own HOME=<dir> with their own settings.json and got three different measured \
+               behaviours out of it, which is the channel working. W3 also read the \
+               AUTHORITATIVE permission-rule namespace list out of the binary — the regex \
+               ^(command|read_file|write_file|read_url|mcp|execute_url|unsandboxed)\\s*\\(.*\\)$ — \
+               two namespaces (execute_url, unsandboxed) more than W1's docs-derived list. W3 \
+               still synthesizes NO policy: mapping a Work's mutation surface onto those \
+               namespaces remains unbuilt, because a policy invented here is a security decision \
+               with no measurement behind it",
+    },
+    AdmissionRow {
+        capability: "permission_mode_reported_at_launch",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "InitEchoPermissionModeBeforeAnyTurn",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_loop_launch_learns_identity_and_posture_before_any_message_is_written",
+        note: "the rung-(b) honesty check, and on this transport it is read BEFORE turn 1 rather \
+               than during it: init lands at child start, so the posture notice and the \
+               cwd_outside_trusted_workspaces notice are both emitted while zero quota has been \
+               spent. Still deliberately over-warns for W1's reason (the mode string predicts \
+               nothing), and W3 measured a third value's behaviour for the first time — see the \
+               sandbox row for what proceed-in-sandbox actually did",
+    },
+    AdmissionRow {
+        capability: "non_blocking_run",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "DeniedToolKillsTheChild",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_denied_tool_on_the_loop_kills_the_child_and_the_next_send_is_refused",
+        note: "the non-hang guarantee holds — it resolved in 4.2 s — but the SHAPE INVERTS W1 and \
+               this is the wave's most operationally important measurement. W3 A2, one live turn \
+               with no allow-rule: the tool step resolved ACTIVE->ERROR carrying the PACKET'S OWN \
+               1.1.17 typed shape (tool_info.error {type TOOL_ERROR, message \"permission check \
+               failed … user denied permission to run command\"}), the terminal was ERROR with \
+               that same string, stderr was EMPTY — no auto-denied notice at all — and the CHILD \
+               EXITED 1, so the second message queued behind it never ran. On print mode 1.1.19 \
+               the same stimulus gives DONE/CANCELED/exit 0/stderr-only. Two consequences: W1's \
+               tool_denial_evidence detector (kept 'in case a build emits it') is the one that \
+               fires here, and §2.5's dead-transport path is ROUTINE on this transport rather than \
+               exceptional — which is a genuine argument for PrintOnly as an operator's default \
+               until a per-Work allow-rule policy exists. The conversation survives: a fresh child \
+               re-adopted it at zero quota immediately afterwards",
+    },
+    AdmissionRow {
+        capability: "structured_output",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "NativeSchemaFlag",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "the_loop_schema_fixture_carries_structured_output_on_every_turn",
+        note: "the open question is CLOSED and it closed the good way. --help says --json-schema \
+               is \"for stream-json, only applicable to the final result\", which on a multi-turn \
+               child is ambiguous between the final result of each TURN and of the CHILD. W3 A3, \
+               two live turns through one child with a two-field schema: BOTH results carried a \
+               validated structured_output ({word:alpha,n:1} then {word:bravo,n:2}) plus a \
+               json_schema echo. So the tier is unchanged from print and a None on an intermediate \
+               turn would be an anomaly, not an expectation. The channel is still \
+               AgyConfig::json_schema and this wave synthesizes no schema (K2)",
+    },
+    AdmissionRow {
+        capability: "turn_serialization",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "HarnessQueuesAndSerializes",
+        evidence: Evidence::LiveMeasured,
+        admission_test: "live_agy_loop_invokes_a_subagent_and_records_its_typed_conversation_id",
+        note: "W3 P2 wrote two messages back-to-back at t=0.001 s with no wait and they ran \
+               STRICTLY sequentially — turn 2's first step landed 205 ms after turn 1's result, \
+               never interleaved — so the documented \"wait for result before the next line\" rule \
+               is a courtesy, not a liveness requirement. The adapter keeps its own \
+               one-turn-in-flight rule anyway, for two reasons said out loud: nothing measured a \
+               BOUND on that queue, and sergeant's SEND contract is per-turn regardless of what \
+               the harness would tolerate. The live test drives two turns through one child, one \
+               after the other, which is the rule being exercised rather than merely asserted",
+    },
+    AdmissionRow {
+        capability: "identity_before_first_turn",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "InitAtChildStart",
+        evidence: Evidence::LiveMeasured,
+        admission_test: "live_agy_loop_resume_echoes_the_conversation_before_any_turn",
+        note: "the transport's real prize, and a registry first. init is emitted at CHILD START, \
+               before any message is consumed — proven by W3 P1 row I, an empty-stdin child that \
+               emitted init and exited 0 having consumed nothing, and re-run by this wave as its \
+               own zero-turn transport probe. Consequences, all free: the conversation id, the \
+               resolved model and the effective permission_mode are known before quota is spent, \
+               so verify_pin_from_init's Substituted verdict refuses the LAUNCH for ZERO turns, \
+               PermissionPosture::from_init and the trusted-workspace notice are emitted for zero \
+               turns, and on a resume the silent-fork check runs once, free, at child start. If \
+               init does NOT arrive within INIT_LINE_BUDGET the launch fails closed and the child \
+               is group-killed — W1's rule verbatim",
+    },
+    AdmissionRow {
+        capability: "prompt_channel",
+        transport: Transport::Loop,
+        claimed: true,
+        tier: "StdinNdjsonNoArgvCap",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "a_prompt_over_the_loop_cap_is_refused_at_prepare_not_truncated",
+        note: "a real capability delta over print: the prompt travels as the content of one NDJSON \
+               line on stdin, so ARGV_PROMPT_CAP's measured 131072-byte E2BIG wall (W1 P0.4) does \
+               NOT bind and the loop can carry a CONTEXT.md that print mode refuses at PREPARE. It \
+               is NOT claimed as unbounded: nothing measured a limit, \"no measured limit\" is not \
+               \"no limit\", and LOOP_PROMPT_CAP (16 MiB) refuses at PREPARE on the transport this \
+               execution will actually launch on. The line is serialized from a typed struct, \
+               never string-formatted — a hand-built line carrying arbitrary stage text is a \
+               JSON-injection defect waiting for a newline, and W3 P1 measured that a malformed \
+               line is fatal to the WHOLE CHILD",
+    },
+    AdmissionRow {
+        capability: "sandbox",
+        transport: Transport::Loop,
+        claimed: false,
+        tier: "-",
+        evidence: Evidence::LocallyMeasured,
+        admission_test: "",
+        note: "HONEST SILENCE, and it is now an argued decision rather than an absence — W4 owes \
+               ADR 0022 either way. Free reconnaissance first: nsjail appears NOWHERE in the \
+               installed binary, nor does sandbox-exec, so the packet's OS-native-mechanism claim \
+               is website documentation with no corroboration in the shipped artifact. Grammar: \
+               --sandbox and --add-dir are accepted on the loop grammar and change NOTHING \
+               observable in init (permission_mode still request-review, no sandbox field), so \
+               sandbox state is not launch-observable and this adapter must not pretend to report \
+               it. Then one paid turn (W3 S1): toolPermission proceed-in-sandbox with NO \
+               permissions.allow at all, launched --sandbox, asking for run_command. The \
+               permission gate DID lift — there was no auto-deny and no \"user denied permission\" \
+               anywhere — and the tool then failed at the MECHANISM: tool_info.error {TOOL_ERROR, \
+               \"connecting to sandbox server: read unix @->@: recvmsg: connection reset by \
+               peer\"}, a retry that resolved DONE with no output, and a terminal ERROR carrying \
+               the same string. So proceed-in-sandbox is evidenced as a real SECOND PERMISSION \
+               CHANNEL (one needing no per-Work allow-rule synthesis) on a host where the sandbox \
+               itself does not run — which is exactly why nothing is claimed, and why the adapter \
+               composes neither --sandbox nor --add-dir by default on either transport: an \
+               uninvited sandbox here is not merely an invented launch decision, it is a broken \
+               one. S2 and S3 were CUT deliberately, not for budget: with no working sandbox \
+               server on this host, a write-escape probe would have measured the same connect \
+               failure again",
+    },
 ];
 
 fn render_admission_rows() -> String {
@@ -862,6 +1345,33 @@ fn capabilities_for(transport: Transport) -> Capabilities {
             native_subagents: false,
             ask: false,
         },
+        // **The divergence between the two columns is deliberately small, and
+        // that is the honest result.** The loop's wins are in *cost and timing*
+        // — zero-quota identity, a pre-turn pin refusal, a zero-quota
+        // resume-fork check, no argv cap — and those live in tiers, notes and
+        // adapter-local rows, not in v1 booleans. A wave that flipped booleans
+        // to look productive would be the defect this ledger exists to prevent.
+        //
+        // Exactly one boolean moves, and only on the typed record [W3 A1]
+        // demanded of it: `native_subagents`, the first `true` for that flag
+        // anywhere in the registry. `ask` and `approval_flow` do NOT move and
+        // are now **measured** false rather than merely unmeasured false
+        // (§3.1/§3.2) — a refutation is a result, not a gap.
+        Transport::Loop => Capabilities {
+            persistent_sessions: true,
+            native_background: false,
+            streaming: true,
+            history: false,
+            resume: true,
+            interrupt: true,
+            model_selection: true,
+            profiles: true,
+            approval_flow: false,
+            human_attach: false,
+            usage: true,
+            native_subagents: true,
+            ask: false,
+        },
     }
 }
 
@@ -906,6 +1416,17 @@ struct ProbeOutcome {
     version: Option<String>,
     provenance: Option<VersionProvenance>,
     config: ConfigProbe,
+    /// Whether the `--help` text this probe already read offers every entry of
+    /// [`LOOP_GATE_FLAGS`]. **The whole of `TransportChoice::Auto`'s
+    /// resolution**, and the reason it costs nothing: it is a substring test on
+    /// a string the probe had in hand, so `capabilities()` called straight from
+    /// `daemon::start_with` spawns no process, opens no port and builds no HTTP
+    /// client. That is the 0.2.2 daemon-panic lesson (c46152a2) applied by
+    /// construction rather than by isolation-thread patchwork.
+    loop_gate: bool,
+    /// The `--help` entries [`LOOP_GATE_FLAGS`] wanted and did not find, for the
+    /// resolution detail to name.
+    loop_gate_missing: Vec<&'static str>,
 }
 
 /// Parse `agy --version`'s output into a comparable triple.
@@ -1044,6 +1565,89 @@ fn resume_turn_argv(
     argv
 }
 
+/// The **input-loop** child's argv, after `<executable>` [W3 P0].
+///
+/// A sibling of [`first_turn_argv`]/[`resume_turn_argv`] rather than a boolean
+/// parameter on them: the two grammars share no positional structure at all —
+/// the loop carries **no prompt on argv** — and a shared builder with a mode
+/// flag would be one `if` away from composing a print turn with no prompt.
+///
+/// Three measured rules, each load-bearing:
+///
+/// - **`--print=` with the `=` and an empty value is mandatory.** A bare `-p`
+///   consumes the next flag as its prompt and fails **rc=2 with plain-text
+///   stderr and no NDJSON at all** [W3 P0] — a shape the stream decoder can
+///   never see, so it must never be composed.
+/// - **`--input-format stream-json` requires `--output-format stream-json`**;
+///   the binary refuses otherwise (`Error: --input-format %s requires
+///   --output-format %s`). They are composed together or not at all.
+/// - `--disable-slash-commands` on **every** child (W1's rule).
+///
+/// `--sandbox`/`--add-dir` are composed by neither transport: [W3 S1] measured
+/// `--sandbox` on this host failing every `run_command` at
+/// `connecting to sandbox server`, so a sandbox the operator did not ask for is
+/// not merely an uninvited launch decision — it is a broken one.
+fn loop_argv(
+    model: Option<&str>,
+    json_schema: Option<&str>,
+    conversation: Option<&str>,
+) -> Vec<String> {
+    let mut argv = vec![
+        "--print=".to_string(),
+        "--input-format".to_string(),
+        "stream-json".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--disable-slash-commands".to_string(),
+    ];
+    if let Some(model) = model {
+        argv.push("--model".to_string());
+        argv.push(model.to_string());
+    }
+    if let Some(schema) = json_schema {
+        argv.push("--json-schema".to_string());
+        argv.push(schema.to_string());
+    }
+    if let Some(conversation) = conversation {
+        argv.push("--conversation".to_string());
+        argv.push(conversation.to_string());
+    }
+    argv
+}
+
+/// One stdin line's `message` body.
+#[derive(Debug, serde::Serialize)]
+struct LoopUserBody<'a> {
+    role: &'static str,
+    content: &'a str,
+}
+
+/// The **only** stdin shape this adapter composes [W3 P1 row A]:
+/// `{"event":"user","message":{"role":"user","content":"<prompt>"}}`.
+///
+/// A typed struct serialized with `serde_json`, never a `format!` — the prompt
+/// carries arbitrary stage text, and a hand-built line is a JSON-injection
+/// defect waiting for a newline. The block-list form (row B) is equally
+/// accepted by the harness and deliberately unused: one wire shape, one
+/// fixture, and `"text"` is the only supported block type anyway.
+#[derive(Debug, serde::Serialize)]
+struct LoopUserMessage<'a> {
+    event: &'static str,
+    message: LoopUserBody<'a>,
+}
+
+/// Serialize one turn's stdin line, **without** its trailing newline.
+fn compose_loop_message(prompt: &str) -> String {
+    serde_json::to_string(&LoopUserMessage {
+        event: "user",
+        message: LoopUserBody {
+            role: "user",
+            content: prompt,
+        },
+    })
+    .expect("a struct of two &'static strs and one &str always serializes")
+}
+
 /// §10.1's section body: the header, then one line per bound repository —
 /// identical shape to the sibling adapters' own copies.
 fn mutation_surface_section(bindings: &[BindingSummary]) -> String {
@@ -1114,6 +1718,36 @@ fn preflight_model_pin(model: &str) -> Result<(), String> {
 /// **MUST NOT truncate.** Truncating a `CONTEXT.md` would be the adapter
 /// silently dropping §12 procedure data — the exact class of dishonesty this
 /// whole ledger exists to prevent.
+fn check_prompt_budget(
+    transport: Transport,
+    prompt: &str,
+    request: &StartRequest,
+) -> Result<(), String> {
+    match transport {
+        Transport::Print => check_argv_prompt_budget(prompt, request),
+        Transport::Loop => check_loop_prompt_budget(prompt, request),
+    }
+}
+
+/// The loop transport's own bound. See [`LOOP_PROMPT_CAP`] for why there is one
+/// at all when nothing measured a limit.
+fn check_loop_prompt_budget(prompt: &str, request: &StartRequest) -> Result<(), String> {
+    let len = prompt.len();
+    if len <= LOOP_PROMPT_CAP {
+        return Ok(());
+    }
+    let intent = request.intent.len();
+    let context = request.context.len();
+    Err(format!(
+        "the composed prompt is {len} bytes, over the input-loop transport's \
+         {LOOP_PROMPT_CAP}-byte cap (intent {intent} B, context {context} B). This transport \
+         carries the prompt as the `content` of one NDJSON line on stdin, so the {ARGV_PROMPT_CAP}\
+         -byte argv cap does NOT bind here — but no upper bound was ever measured either, and \
+         \"no measured limit\" is not \"no limit\". Nothing is truncated: dropping part of a \
+         stage's CONTEXT.md would be the adapter silently discarding procedure data."
+    ))
+}
+
 fn check_argv_prompt_budget(prompt: &str, request: &StartRequest) -> Result<(), String> {
     let len = prompt.len();
     if len <= ARGV_PROMPT_CAP {
@@ -1310,8 +1944,14 @@ struct TurnAccumulator {
     /// produce two requests for one call.
     requested_tools: BTreeSet<String>,
     /// Tools whose own `tool_info.error` evidenced a permission denial
-    /// ([`tool_denial_evidence`] — the packet's 1.1.17 shape).
+    /// ([`tool_denial_evidence`] — the packet's 1.1.17 shape, which [W3 A2]
+    /// measured **does** fire on the input-loop transport).
     denied_tools: Vec<String>,
+    /// Child conversation ids recovered from a **typed** `subagent_info`
+    /// payload [W3 A1]. This is the `native_subagents` admission's own
+    /// evidence: a name in a tool roster is not a subagent, a child
+    /// `conversation_id` on the wire is.
+    subagent_conversations: Vec<String>,
     /// Text accumulated per `step_index`, because one step can emit `ACTIVE`
     /// with a partial `text_delta` and then `DONE` with the rest (measured, the
     /// W1 json-schema capture). Keyed rather than single-slotted so an
@@ -1439,6 +2079,15 @@ impl TurnAccumulator {
             self.ingest_tool_info(index, &state, resolved, tool_info, out);
             return;
         }
+        // The subagent path, routed on the same rule and for the same reason.
+        // Measured [W3 A1]: an `invoke_subagent` step carries `subagent_info`
+        // *instead of* `tool_info`, so a decoder that only looked at
+        // `tool_info` would have shown a delegated child trajectory as nothing
+        // at all.
+        if let Some(subagent_info) = step.get("subagent_info") {
+            self.ingest_subagent_info(index, &state, &step_type, resolved, subagent_info, out);
+            return;
+        }
 
         match step_type.as_str() {
             // Our own prompt echoed back. Counted, no event.
@@ -1545,6 +2194,94 @@ impl TurnAccumulator {
         });
     }
 
+    /// Decode a **typed** `subagent_info` payload into the existing tool
+    /// vocabulary (R3/K2: no new `KIND_*` constant, which would force a core
+    /// `api::SSE_EVENT_KINDS` edit).
+    ///
+    /// **The measured shape** [W3 A1, the `native_subagents` admission
+    /// transcript], which is a list and not the flat object the changelog's
+    /// prose implied:
+    ///
+    /// ```json
+    /// "subagent_info": {"subagents": [{
+    ///    "type_name": "echoer", "role": "Word Echoer", "initial_prompt": "delta",
+    ///    "conversation_id": "18a52ef3-…", "log_uri": "file:///…/transcript.jsonl"}]}
+    /// ```
+    ///
+    /// The `ACTIVE` step carries the first three fields and the `DONE` step
+    /// adds `conversation_id` and `log_uri` — so the child's identity exists
+    /// only on the **resolved** step, which is exactly why the admission demands
+    /// a settled record rather than an in-flight one.
+    ///
+    /// The child `conversation_id` is carried **verbatim** so a human can resume
+    /// that trajectory by hand. Sergeant deliberately does **not** adopt it as an
+    /// execution: that would be a second execution nothing prepared, with no
+    /// Work, no surface and no journal row of its own.
+    fn ingest_subagent_info(
+        &mut self,
+        index: i64,
+        state: &str,
+        step_type: &str,
+        resolved: bool,
+        subagent_info: &Value,
+        out: &mut Vec<NativeEvent>,
+    ) {
+        let name = format!("subagent:{step_type}");
+        let id = format!("step-{index}");
+        // The same `parameters`-verbatim posture `ingest_tool_info` takes: the
+        // whole typed record travels, and nothing here interprets it.
+        let subagents = subagent_info
+            .get("subagents")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if self.requested_tools.insert(id.clone()) {
+            out.push(NativeEvent {
+                kind: KIND_TOOL_REQUESTED.to_string(),
+                payload: json!({
+                    "id": id,
+                    "name": name,
+                    "input": subagent_info.clone(),
+                }),
+            });
+        }
+        if !resolved {
+            return;
+        }
+        self.tool_steps += 1;
+        let children: Vec<Value> = subagents
+            .iter()
+            .map(|child| {
+                let conversation = child.get("conversation_id").and_then(Value::as_str);
+                if let Some(conversation) = conversation.filter(|id| !id.is_empty()) {
+                    self.subagent_conversations.push(conversation.to_string());
+                }
+                json!({
+                    "name": child.get("type_name").cloned().unwrap_or(Value::Null),
+                    "role": child.get("role").cloned().unwrap_or(Value::Null),
+                    "conversation_id": conversation,
+                    "log_uri": child.get("log_uri").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect();
+        out.push(NativeEvent {
+            kind: KIND_TOOL_COMPLETED.to_string(),
+            payload: json!({
+                "tool_use_id": id,
+                "name": name,
+                "state": state,
+                "is_error": state == "ERROR",
+                "error": Value::Null,
+                "denied": false,
+                "has_output": !children.is_empty(),
+                "output_tail": "",
+                // The admission's own evidence, in the payload rather than only
+                // in a note: a reader can see the child's identity and its log.
+                "subagent": children,
+            }),
+        });
+    }
+
     fn ingest_result(&mut self, result: Option<&Value>, out: &mut Vec<NativeEvent>) {
         let Some(result) = result else {
             self.unknown_events
@@ -1611,6 +2348,53 @@ impl TurnAccumulator {
             response,
             error,
         };
+    }
+
+    /// The typed refusal text when this turn's terminal says the *adapter* sent
+    /// a malformed stdin message [W3 P1] — never a stage failure, always an
+    /// adapter defect, and fatal to the child either way.
+    ///
+    /// The adapter constructs only the accepted shape
+    /// ([`compose_loop_message`]), so this can only fire if that construction
+    /// broke; reporting it as a stage failure would blame a Work for a bug in
+    /// this file.
+    fn loop_input_rejection(&self) -> Option<&str> {
+        match &self.terminal {
+            Terminal::Status { error, .. }
+                if error.starts_with(LOOP_INPUT_REJECTION_PREFIX)
+                    && LOOP_INPUT_REJECTION_MARKERS
+                        .iter()
+                        .any(|marker| error.contains(marker)) =>
+            {
+                Some(error.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this turn's terminal is one a signal we sent could have caused
+    /// [W3 P4, W3 A7] — the timeout string (mid-turn) or the cancellation
+    /// string (idle). Only the first is *ambiguous* with a real deadline
+    /// expiry; both are an interrupt when `interrupt_requested` is set.
+    fn terminal_is_signal_shaped(&self) -> bool {
+        matches!(
+            &self.terminal,
+            Terminal::Status { status, error, .. }
+                if status == "ERROR"
+                    && (error == LOOP_TIMEOUT_TERMINAL_ERROR
+                        || error == LOOP_CANCELLED_TERMINAL_ERROR)
+        )
+    }
+
+    /// Whether this turn's terminal is the [W3 P4] ambiguity: an `ERROR` whose
+    /// text is [`LOOP_TIMEOUT_TERMINAL_ERROR`], which a deadline expiry and an
+    /// interrupt we sent produce **identically**.
+    fn terminal_is_timeout_ambiguous(&self) -> bool {
+        matches!(
+            &self.terminal,
+            Terminal::Status { status, error, .. }
+                if status == "ERROR" && error == LOOP_TIMEOUT_TERMINAL_ERROR
+        )
     }
 
     /// The status string this turn's terminal carried, if any.
@@ -1758,13 +2542,28 @@ fn classify_terminal(
         // Arm 1 — the harness's own explicit statement, the ONLY route to
         // Failed. [W1 P5] measured `--print-timeout` expiry landing here with
         // `error: "timeout waiting for response"`.
-        "ERROR" | "INVALID" => TerminalOutcome::Failed {
-            reason: if error.is_empty() {
-                format!("agy reported status {status} with no error text")
-            } else {
-                error.clone()
-            },
-        },
+        //
+        // **Arm 1a, the W3 amendment, and it is a correctness fix rather than a
+        // nicety.** [W3 P4] measured a SIGINT to a loop child producing that
+        // *same* `ERROR` + `timeout waiting for response` terminal — the status
+        // can never disambiguate "the deadline expired" from "we killed it",
+        // and only this adapter's own `interrupt_requested` bit can. A stage we
+        // interrupted is not a stage that failed, so when we asked for the kill
+        // the outcome is `InterruptedRunning`; the ambiguity travels into the
+        // evidence in **both** readings as `terminal_ambiguity`, so a reader can
+        // see the classifier leant on our bit rather than on the wire.
+        "ERROR" | "INVALID" => {
+            if interrupted && acc.terminal_is_signal_shaped() {
+                return TerminalOutcome::InterruptedRunning;
+            }
+            TerminalOutcome::Failed {
+                reason: if error.is_empty() {
+                    format!("agy reported status {status} with no error text")
+                } else {
+                    error.clone()
+                },
+            }
+        }
         "SUCCESS" => {
             // Arm 2 — the SUCCESS-hiding-denied-tools rule. The harness said
             // the turn succeeded while a tool the actor asked for did not run;
@@ -1893,6 +2692,165 @@ enum TurnState {
     Finished(Box<TurnOutcome>),
 }
 
+// ------------------------------------------------------- the loop transport
+
+/// The shared, bounded, **line-stamped** stderr of one loop child (§2.6).
+///
+/// On print mode stderr is per-turn because the process is per-turn. On the
+/// loop it is **one stream for the whole child**, and it carries the only
+/// machine-readable evidence of a resume fork [W1 P0.6] — and, on builds that
+/// soft-deny, of an auto-denied tool [W1 P2]. So it is read line by line on its
+/// own thread and each line is stamped, rather than read to EOF once at the end
+/// (which on this transport is the end of the *execution*, far too late for the
+/// turn that earned it).
+#[derive(Debug, Default)]
+struct StderrLog {
+    lines: VecDeque<(Instant, String)>,
+    bytes: usize,
+    /// Lines evicted by the cap. Counted rather than silently forgotten: a
+    /// dropped auto-denial notice is the exact hazard this structure exists for.
+    dropped: usize,
+}
+
+impl StderrLog {
+    fn push(&mut self, mut line: String) {
+        // A single line longer than the whole cap is truncated rather than
+        // allowed to evict everything including itself — the loss is marked, so
+        // a capped line reads as "capped" and not as complete.
+        if line.len() > STREAM_MEMORY_CAP {
+            line = format!(
+                "{}...<{STREAM_MEMORY_CAP}-byte stderr line cap hit; the rest was discarded>",
+                truncate(&line, STREAM_MEMORY_CAP)
+            );
+            self.dropped += 1;
+        }
+        self.bytes += line.len() + 1;
+        self.lines.push_back((Instant::now(), line));
+        while self.bytes > STREAM_MEMORY_CAP && self.lines.len() > 1 {
+            match self.lines.pop_front() {
+                Some((_, gone)) => {
+                    self.bytes -= gone.len() + 1;
+                    self.dropped += 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn take_all(&mut self) -> Vec<(Instant, String)> {
+        self.lines.drain(..).collect::<Vec<_>>()
+    }
+}
+
+/// One turn's share of the shared stderr stream, and how sure the classifier is
+/// that it belongs to that turn.
+#[derive(Debug, Clone)]
+struct StderrSlice {
+    text: String,
+    /// `"exact"` when every line landed between this turn's first event and its
+    /// `result`; `"adjacent"` when at least one line could only be placed *next
+    /// to* a settled turn rather than inside one.
+    ///
+    /// **Attribution fails closed toward noticing, never toward silence.** A
+    /// line that cannot be placed is attached to the turn in flight (or, failing
+    /// that, carried to the next one) and labelled — because dropping it would
+    /// make an auto-denied tool invisible, which is the exact hazard W1 built
+    /// [`denial_evidence_in_stderr`] for.
+    attribution: &'static str,
+    dropped: usize,
+}
+
+impl Default for StderrSlice {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            attribution: "exact",
+            dropped: 0,
+        }
+    }
+}
+
+/// A loop child that has exited, and everything the next SEND owes its caller.
+#[derive(Debug, Clone)]
+struct LoopDeath {
+    exit_code: Option<i32>,
+    stderr_tail: String,
+    /// **The actionable part.** [W3 P3] measured a conversation resuming
+    /// perfectly from a *fresh* child, and [W3 A2] measured it resuming after a
+    /// denied tool had killed the child — so a dead transport is not a lost
+    /// conversation, and the refusal names the id to resume.
+    conversation_id: Option<String>,
+}
+
+/// The persistent child one loop-transport execution owns.
+///
+/// Spawned in LAUNCH (or, for a re-adopted execution, on its first SEND), held
+/// by [`AgyExecution`], and execution-scoped: [`RuntimeScope::PerExecution`] is
+/// unchanged and `mod.rs`'s ENSURE-RUNTIME seam is untouched.
+#[derive(Debug)]
+struct LoopChild {
+    child: Arc<Mutex<Child>>,
+    /// `None` once STOP has closed it. Closing stdin is the graceful shutdown:
+    /// [W3 P2] measured queued turns running to completion and the child then
+    /// exiting 0 with no further event.
+    stdin: Arc<Mutex<Option<std::process::ChildStdin>>>,
+    /// Recorded at **spawn** (`process_group(0)` made the child its own group
+    /// leader), never derived at kill time — the group can outlive the leader
+    /// (opencode probe 11, carried without re-deriving it).
+    pgid: Option<u32>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    /// Set by the reader thread when the child exits. **The one field SEND
+    /// consults before writing**: a turn written to a dead pipe would surface as
+    /// an I/O error with none of the context that makes it actionable.
+    ///
+    /// The shared [`StderrLog`] is deliberately *not* held here — the reader
+    /// thread owns the only `Arc` that consumes it, and it folds the tail into
+    /// this record at death. A second handle here would be a second reader of a
+    /// drain-on-read structure, which is how a turn's stderr goes missing.
+    death: Arc<Mutex<Option<LoopDeath>>>,
+}
+
+/// The identity one loop child learned from its single `init` line, carried
+/// across every turn of that child.
+///
+/// **This is why a per-turn accumulator does not lose the conversation.**
+/// [W3 P1 row I / P2] measured `init` arriving once, at child start, before any
+/// message is consumed; a turn-2 accumulator that started empty would emit
+/// `conversation_id: null` and would make [`verify_pin_from_init`] answer
+/// `Attempted` for a pin that was verified — at zero quota — before turn 1 ever
+/// ran.
+#[derive(Debug, Clone, Default)]
+struct LoopIdentity {
+    conversation_id: Option<String>,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    cwd: Option<String>,
+    tool_count: usize,
+}
+
+impl LoopIdentity {
+    fn from_accumulator(acc: &TurnAccumulator) -> Self {
+        Self {
+            conversation_id: acc.conversation_id.clone(),
+            model: acc.init_model.clone(),
+            permission_mode: acc.init_permission_mode.clone(),
+            cwd: acc.init_cwd.clone(),
+            tool_count: acc.init_tool_count,
+        }
+    }
+
+    /// Seed a fresh per-turn accumulator with the child's identity. Everything
+    /// else — step counts, texts, tool records, the terminal — starts empty,
+    /// which is the whole point of cutting the accumulator at each `result`.
+    fn reseed(&self, acc: &mut TurnAccumulator) {
+        acc.conversation_id = self.conversation_id.clone();
+        acc.init_model = self.model.clone();
+        acc.init_permission_mode = self.permission_mode.clone();
+        acc.init_cwd = self.cwd.clone();
+        acc.init_tool_count = self.tool_count;
+    }
+}
+
 /// Adapter-side record of one execution (one durable agy conversation).
 #[derive(Debug)]
 struct AgyExecution {
@@ -1924,6 +2882,15 @@ struct AgyExecution {
     stopped: bool,
     interrupt_requested: bool,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// Which transport this execution runs on, snapshotted at LAUNCH/RESUME.
+    /// Per-execution rather than read back off the backend so a resolution that
+    /// somehow changed under a running execution could never re-route its
+    /// turns halfway through.
+    transport: Transport,
+    /// The persistent child, on [`Transport::Loop`] only. `None` on the print
+    /// transport, and on a re-adopted loop execution until its first SEND
+    /// spawns one.
+    loop_child: Option<LoopChild>,
 }
 
 #[derive(Debug, Default)]
@@ -1931,8 +2898,9 @@ struct AdapterState {
     executions: BTreeMap<String, AgyExecution>,
 }
 
-/// One outcome of spawning turn 1, delivered from the reader thread back to the
-/// LAUNCH call blocking on it.
+/// One outcome of spawning turn 1 (print) or the loop child (loop), delivered
+/// from the reader thread back to the call blocking on it.
+#[derive(Debug)]
 enum FirstTurnSignal {
     /// The `init` line landed: identity, resolved model, permission mode.
     Initialized {
@@ -1981,6 +2949,11 @@ struct SpawnPlan {
 pub struct AgyBackend {
     config: AgyConfig,
     probe_outcome: OnceLock<ProbeOutcome>,
+    /// Memoized [`TransportChoice`] resolution. A `OnceLock` beside the probe's
+    /// own, not a field of it: the resolution is a pure function of the probe
+    /// **and** of the operator's choice, and folding it into `ProbeOutcome`
+    /// would make the probe's cached value depend on config it does not carry.
+    transport: OnceLock<TransportResolution>,
     state: Arc<Mutex<AdapterState>>,
     sink: Mutex<Option<EventSink>>,
 }
@@ -2000,6 +2973,7 @@ impl AgyBackend {
         Self {
             config,
             probe_outcome: OnceLock::new(),
+            transport: OnceLock::new(),
             state: Arc::new(Mutex::new(AdapterState::default())),
             sink: Mutex::new(None),
         }
@@ -2023,6 +2997,74 @@ impl AgyBackend {
     /// [changelog 1.1.12, W1 P0.2].
     fn probe_outcome(&self) -> &ProbeOutcome {
         self.probe_outcome.get_or_init(|| self.run_probe())
+    }
+
+    /// Resolve [`AgyConfig::transport`] against the installed build, once.
+    ///
+    /// **This spawns nothing.** The gate is one substring test over a `--help`
+    /// text the probe already read (from **stderr**, where 1.1.19 actually
+    /// writes it — [W1 P0.1]) plus the parsed version, so `capabilities()`
+    /// called straight out of `daemon::start_with` performs no I/O it was not
+    /// already doing. opencode's `Auto` had to spawn a serve child and build a
+    /// blocking HTTP client to answer the same question, which is the shape of
+    /// the 0.2.2 registration panic; agy's needs no process, no port and no
+    /// client. `resolving_capabilities_spawns_no_extra_process` pins it.
+    ///
+    /// **There is no per-execution downgrade here or anywhere.** This runs once,
+    /// at probe time, before any execution exists. A loop child that later fails
+    /// to spawn, or that never emits `init`, fails LAUNCH honestly (codex §5.3 /
+    /// ADR 0021): the print transport remaining available as a *registration*
+    /// choice at every capability is what the ruling's word "fallback" means,
+    /// never that some execution quietly changed transports mid-flight.
+    fn transport_resolution(&self) -> &TransportResolution {
+        self.transport.get_or_init(|| {
+            let probe = self.probe_outcome();
+            match self.config.transport {
+                TransportChoice::PrintOnly => TransportResolution {
+                    transport: Transport::Print,
+                    available: true,
+                    detail: format!(
+                        "transport: {} (PrintOnly: the operator pinned it)",
+                        Transport::Print.as_str()
+                    ),
+                },
+                TransportChoice::LoopOnly if probe.loop_gate => TransportResolution {
+                    transport: Transport::Loop,
+                    available: true,
+                    detail: format!(
+                        "transport: {} (LoopOnly: the operator pinned it and --help offers {})",
+                        Transport::Loop.as_str(),
+                        LOOP_GATE_FLAGS.join(", ")
+                    ),
+                },
+                TransportChoice::LoopOnly => TransportResolution {
+                    transport: Transport::Loop,
+                    available: false,
+                    detail: format!(
+                        "capability probe: transport LoopOnly was pinned, but this build's --help                          offers no {}; the persistent stdin turn loop cannot be composed against                          it. Refused rather than served on the print transport, which is a                          different set of measured claims than the one that was asked for.",
+                        probe.loop_gate_missing.join(", ")
+                    ),
+                },
+                TransportChoice::Auto if probe.loop_gate => TransportResolution {
+                    transport: Transport::Loop,
+                    available: true,
+                    detail: format!(
+                        "transport: {} (Auto: --help offers {})",
+                        Transport::Loop.as_str(),
+                        LOOP_GATE_FLAGS.join(", ")
+                    ),
+                },
+                TransportChoice::Auto => TransportResolution {
+                    transport: Transport::Print,
+                    available: true,
+                    detail: format!(
+                        "transport: {} (Auto: {} absent from --help). This is a RESOLUTION, not a downgrade: it happens once, at probe time, before any execution exists",
+                        Transport::Print.as_str(),
+                        probe.loop_gate_missing.join(", ")
+                    ),
+                },
+            }
+        })
     }
 
     /// One `--help`-shaped invocation's text, **stdout and stderr
@@ -2132,6 +3174,8 @@ impl AgyBackend {
                     version: None,
                     provenance: None,
                     config: ConfigProbe::default(),
+                    loop_gate: false,
+                    loop_gate_missing: LOOP_GATE_FLAGS.to_vec(),
                 };
             }
         };
@@ -2155,6 +3199,8 @@ impl AgyBackend {
                 version: None,
                 provenance: None,
                 config: ConfigProbe::default(),
+                loop_gate: false,
+                loop_gate_missing: LOOP_GATE_FLAGS.to_vec(),
             };
         };
         let canonical = format!("{}.{}.{}", triple.0, triple.1, triple.2);
@@ -2173,6 +3219,8 @@ impl AgyBackend {
                     version: Some(canonical),
                     provenance: Some(provenance),
                     config: ConfigProbe::default(),
+                    loop_gate: false,
+                    loop_gate_missing: LOOP_GATE_FLAGS.to_vec(),
                 };
             }
         };
@@ -2188,8 +3236,14 @@ impl AgyBackend {
                 version: Some(canonical),
                 provenance: Some(provenance),
                 config: ConfigProbe::default(),
+                loop_gate: false,
+                loop_gate_missing: LOOP_GATE_FLAGS.to_vec(),
             };
         }
+        // Computed here, from the text already read, and never again: this is
+        // the entirety of `TransportChoice::Auto`'s resolution work.
+        let loop_gate_missing = missing_entries(&help, LOOP_GATE_FLAGS);
+        let loop_gate = loop_gate_missing.is_empty();
 
         let config = self.read_config_probe();
         let version_clause = match provenance {
@@ -2209,9 +3263,8 @@ impl AgyBackend {
             ),
         };
         let mut detail = format!(
-            "{version_clause}; all {} required flags present; transport: {}",
+            "{version_clause}; all {} required flags present",
             REQUIRED_FLAGS.len(),
-            Transport::Print.as_str(),
         );
         // §11.3: the posture reaches `sgt doctor` (W2's reader) before any Work
         // runs, not only the turn that discovers it.
@@ -2249,6 +3302,8 @@ impl AgyBackend {
             version: Some(canonical),
             provenance: Some(provenance),
             config,
+            loop_gate,
+            loop_gate_missing,
         }
     }
 
@@ -2530,6 +3585,459 @@ impl AgyBackend {
                      to hand back"
                 )))
             }
+        }
+    }
+
+    /// Spawn this execution's persistent loop child and block, bounded, for its
+    /// `init` line.
+    ///
+    /// **No turn is spent here.** [W3 P1 row I] measured `init` arriving at
+    /// child start even when nothing is ever written to stdin, so identity, the
+    /// resolved model and the effective permission mode are all free — which is
+    /// what lets a `Substituted` pin refuse the LAUNCH having spent **zero**
+    /// quota, where print mode must burn turn 1 to find out.
+    ///
+    /// **If `init` does not arrive inside the budget, this fails closed and the
+    /// child is group-killed** — W1's rule, verbatim. A loop child that fails to
+    /// spawn, or that never speaks, fails LAUNCH honestly; it is never quietly
+    /// re-routed onto the print transport.
+    fn spawn_loop_child(
+        &self,
+        execution_id: &str,
+        conversation: Option<String>,
+    ) -> Result<FirstTurnSignal, BackendError> {
+        let plan = self.spawn_plan(execution_id)?;
+        let mut command = Command::new(&plan.executable);
+        command
+            .args(loop_argv(
+                plan.model.as_deref(),
+                plan.json_schema.as_deref(),
+                conversation.as_deref(),
+            ))
+            .current_dir(&plan.cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        apply_env(&mut command, &plan.env, plan.settings_home.as_deref());
+        // Every turn of this execution runs under this one process, so the group
+        // is the execution's, not the turn's. Carried from opencode probe 11
+        // without re-deriving it (R2).
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let mut child = command.spawn().map_err(|e| {
+            self.err_failed(format!(
+                "cannot spawn the loop child {:?}: {e}. This LAUNCH fails rather than falling back \
+                 to the print transport: a per-execution downgrade would silently change which \
+                 measured capability set this execution is running under",
+                plan.executable
+            ))
+        })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| self.err_failed("loop child stdout was not piped"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| self.err_failed("loop child stdin was not piped"))?;
+        let pgid = child.id();
+        let stderr_log = Arc::new(Mutex::new(StderrLog::default()));
+        if let Some(stderr) = child.stderr.take() {
+            let sink = Arc::clone(&stderr_log);
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    let Ok(line) = line else { break };
+                    sink.lock().expect("agy loop stderr lock").push(line);
+                }
+            });
+        }
+        let child = Arc::new(Mutex::new(child));
+        let death = Arc::new(Mutex::new(None));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<FirstTurnSignal>(1);
+        let reader = LoopReader {
+            backend_state: Arc::clone(&self.state),
+            sink: self.sink.lock().expect("agy sink lock").clone(),
+            data_dir: self.config.data_dir.clone(),
+            execution_id: execution_id.to_string(),
+            work_id: plan.work_id.clone(),
+            model: plan.model.clone(),
+            expected_conversation: conversation.clone(),
+            bindings_outside_cwd: plan.bindings_outside_cwd.clone(),
+            child: Arc::clone(&child),
+            stderr: Arc::clone(&stderr_log),
+            death: Arc::clone(&death),
+            init_signal: Some(tx),
+            settings_home: self.config.settings_home.clone(),
+        };
+        let reader_handle = std::thread::spawn(move || reader.run(stdout));
+        {
+            let mut state = self.lock();
+            let execution = state
+                .executions
+                .get_mut(execution_id)
+                .ok_or_else(|| self.err_unknown(execution_id))?;
+            execution.turn_pgid = Some(pgid);
+            execution.loop_child = Some(LoopChild {
+                child: Arc::clone(&child),
+                stdin: Arc::new(Mutex::new(Some(stdin))),
+                pgid: Some(pgid),
+                reader: Some(reader_handle),
+                death,
+            });
+        }
+        let budget = self.config.init_line_budget.unwrap_or(INIT_LINE_BUDGET);
+        match rx.recv_timeout(budget) {
+            Ok(signal) => Ok(signal),
+            Err(_) => {
+                self.kill_loop_child(execution_id);
+                Err(self.err_failed(format!(
+                    "the agy loop child emitted no `init` line within {budget:?}; it was \
+                     group-killed. On this transport `init` precedes any message being consumed \
+                     (W3 P1), so a child that has not spoken by now has no identity to hand back \
+                     and no turn has been spent"
+                )))
+            }
+        }
+    }
+
+    /// Group-kill this execution's loop child, whatever state it is in.
+    fn kill_loop_child(&self, execution_id: &str) {
+        let (pgid, child) = {
+            let state = self.lock();
+            let Some(execution) = state.executions.get(execution_id) else {
+                return;
+            };
+            match &execution.loop_child {
+                Some(loop_child) => (loop_child.pgid, Some(Arc::clone(&loop_child.child))),
+                None => (execution.turn_pgid, None),
+            }
+        };
+        kill_turn(pgid, child.as_ref());
+    }
+
+    /// Whether this execution's loop child has already exited, and with what.
+    fn loop_death(&self, execution_id: &str) -> Option<LoopDeath> {
+        self.lock()
+            .executions
+            .get(execution_id)?
+            .loop_child
+            .as_ref()?
+            .death
+            .lock()
+            .expect("agy loop death lock")
+            .clone()
+    }
+
+    /// The refusal a SEND owes its caller when the transport is gone (§2.5).
+    ///
+    /// **Not an auto-respawn**, deliberately: [W3 P3] proves a fresh child
+    /// resumes a conversation, but respawning silently is how a stage's turn
+    /// count starts lying, and inventing a recovery policy is not this wave's
+    /// work. So the refusal is made *actionable* instead — it names the exit
+    /// code, the stderr tail and the conversation id that is still fully
+    /// resumable.
+    fn err_loop_transport_dead(&self, execution_id: &str, death: &LoopDeath) -> BackendError {
+        self.err_failed(format!(
+            "execution {execution_id}'s agy loop child has exited (exit_code={:?}), so this \
+             transport is gone and no further turn can be written to it. The conversation is NOT \
+             lost: {} is fully resumable from a fresh child (measured W3 P3, and again in W3 A2 \
+             after a denied tool killed a child mid-execution). This adapter does not respawn one \
+             by itself — a recovery policy invented here is how a stage's turn count starts lying. \
+             stderr tail: {}",
+            death.exit_code,
+            death
+                .conversation_id
+                .as_deref()
+                .unwrap_or("<no conversation was ever minted>"),
+            if death.stderr_tail.is_empty() {
+                "<empty>"
+            } else {
+                &death.stderr_tail
+            },
+        ))
+    }
+
+    /// Write exactly one NDJSON `user` message — one turn — to the loop child's
+    /// stdin.
+    ///
+    /// The adapter keeps its own **one-turn-in-flight** rule even though
+    /// [W3 P2] measured agy serialising its own queue (two messages written at
+    /// t≈0 ran strictly sequentially). Two reasons, said out loud: nothing
+    /// measured a *bound* on that queue, and sergeant's SEND contract is
+    /// per-turn regardless of what the harness would tolerate.
+    fn write_loop_turn(
+        &self,
+        execution_id: &str,
+        prompt: &str,
+        instruction_policy: Option<String>,
+    ) -> Result<(), BackendError> {
+        if prompt.len() > LOOP_PROMPT_CAP {
+            return Err(self.err_failed(format!(
+                "this turn's prompt is {} bytes, over the input-loop transport's \
+                 {LOOP_PROMPT_CAP}-byte cap. Nothing is truncated.",
+                prompt.len()
+            )));
+        }
+        if let Some(death) = self.loop_death(execution_id) {
+            return Err(self.err_loop_transport_dead(execution_id, &death));
+        }
+        let line = compose_loop_message(prompt);
+        // The handles are lifted out from under the adapter lock and the write
+        // happens without it: a blocking write to a child's pipe is I/O, and
+        // §22.6's rule about not doing I/O under a lock does not stop being
+        // true because the lock is this adapter's own.
+        let (child, stdin) = {
+            let state = self.lock();
+            let execution = state
+                .executions
+                .get(execution_id)
+                .ok_or_else(|| self.err_unknown(execution_id))?;
+            let loop_child = execution.loop_child.as_ref().ok_or_else(|| {
+                self.err_failed(format!(
+                    "execution {execution_id} has no loop child to write a turn to"
+                ))
+            })?;
+            (Arc::clone(&loop_child.child), Arc::clone(&loop_child.stdin))
+        };
+        {
+            let mut handle = stdin.lock().expect("agy loop stdin lock");
+            let handle = handle.as_mut().ok_or_else(|| {
+                self.err_failed(format!(
+                    "execution {execution_id}'s loop child has had its stdin closed (STOP's \
+                     graceful shutdown), so no further turn can be written to it"
+                ))
+            })?;
+            handle
+                .write_all(line.as_bytes())
+                .and_then(|()| handle.write_all(b"\n"))
+                .and_then(|()| handle.flush())
+                .map_err(|e| self.write_failure(execution_id, e))?;
+        }
+        let (work_id, conversation, bindings) = {
+            let mut state = self.lock();
+            let execution = state
+                .executions
+                .get_mut(execution_id)
+                .ok_or_else(|| self.err_unknown(execution_id))?;
+            execution.turn = TurnState::InFlight(child);
+            execution.turns += 1;
+            execution.interrupt_requested = false;
+            (
+                execution.work_id.clone(),
+                execution.conversation_id.clone(),
+                execution.bindings_outside_cwd.clone(),
+            )
+        };
+        self.emit(
+            execution_id,
+            &work_id,
+            KIND_CONVERSATION_USER,
+            json!({
+                "text": prompt,
+                "transport": Transport::Loop.as_str(),
+                "conversation_id": conversation,
+                "bindings_outside_cwd": bindings,
+                "instruction_policy_unenforced": instruction_policy,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Turn a failed stdin write into the most useful refusal available.
+    ///
+    /// A child that died a moment ago has not necessarily finished being
+    /// *recorded* dead: the reader settles the turn and drains stderr before it
+    /// writes the death record. A SEND racing that window would otherwise
+    /// surface a bare `Broken pipe` — technically true and operationally
+    /// useless — instead of the refusal that names the still-resumable
+    /// conversation. So the failure path waits, bounded, for the better answer.
+    /// It only ever runs on a write that has already failed.
+    fn write_failure(&self, execution_id: &str, e: std::io::Error) -> BackendError {
+        let deadline = Instant::now() + LOOP_DEATH_RECORD_GRACE;
+        loop {
+            if let Some(death) = self.loop_death(execution_id) {
+                return self.err_loop_transport_dead(execution_id, &death);
+            }
+            if Instant::now() >= deadline {
+                return self.err_failed(format!(
+                    "cannot write this turn to the agy loop child's stdin: {e}, and no exit was \
+                     recorded for it within {LOOP_DEATH_RECORD_GRACE:?}. The child is most likely \
+                     gone; a malformed message would have been answered with a typed refusal \
+                     instead (W3 P1)"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// LAUNCH on the loop transport: spawn the child, cash in the free identity
+    /// window, then write turn 1.
+    fn launch_loop(&self, request: &StartRequest) -> Result<ExecutionHandle, BackendError> {
+        let signal = self.spawn_loop_child(&request.execution_id, None)?;
+        let (conversation_id, model, permission_mode) = match signal {
+            FirstTurnSignal::Initialized {
+                conversation_id,
+                model,
+                permission_mode,
+            } => (conversation_id, model, permission_mode),
+            FirstTurnSignal::RefusedBeforeIdentity {
+                status,
+                error,
+                exit_code,
+            } => {
+                return Err(self.err_failed(format!(
+                    "agy refused this loop child before minting a conversation (status={status}, \
+                     exit_code={exit_code:?}), so no identity exists and nothing is resumable — \
+                     and no turn was spent finding out. agy's own error, verbatim: {error}"
+                )));
+            }
+            FirstTurnSignal::ExitedWithoutInit {
+                exit_code,
+                stderr,
+                raw_blob,
+            } => {
+                return Err(self.err_failed(format!(
+                    "the agy loop child exited before any `init` line arrived and emitted no \
+                     terminal either (exit_code={exit_code:?}), so no conversation was ever \
+                     minted; stderr: {}; raw={}",
+                    truncate(stderr.trim(), 400),
+                    raw_blob
+                        .unwrap_or_else(|| "unarchived (the child streamed nothing)".to_string())
+                )));
+            }
+        };
+        // The R4 delta cashed in at the earliest possible moment and for the
+        // fewest possible tokens — which on this transport is **none at all**.
+        let verdict = verify_pin_from_init(request.model.as_deref(), model.as_deref());
+        if let PinVerdict::Substituted(served) = &verdict {
+            self.kill_loop_child(&request.execution_id);
+            return Err(self.err_failed(format!(
+                "agy's init line names {served} as the model serving this conversation, but this \
+                 execution requested {}. On the input-loop transport the init line arrives before \
+                 any message is consumed, so this launch is refused having spent ZERO quota — no \
+                 adapter in the registry can otherwise say that.",
+                request.model.as_deref().unwrap_or("<none>")
+            )));
+        }
+        let posture = PermissionPosture::from_init(
+            permission_mode.as_deref(),
+            self.config.settings_home.as_deref(),
+        );
+        if let Some(execution) = self.lock().executions.get_mut(&request.execution_id) {
+            execution.posture = Some(posture.clone());
+        }
+        self.announce_launch_posture(
+            &request.execution_id,
+            &request.work_id,
+            &request.cwd,
+            &posture,
+        );
+        self.write_loop_turn(
+            &request.execution_id,
+            &compose_launch_prompt(request),
+            Some(format!("{:?}", request.instruction_policy)),
+        )?;
+        Ok(ExecutionHandle {
+            execution_id: request.execution_id.clone(),
+            native_id: Some(conversation_id),
+        })
+    }
+
+    /// A re-adopted loop execution has no child of this daemon's yet. Spawning
+    /// one on its first SEND is **not** the auto-respawn §2.5 refuses: that is
+    /// about a child this daemon watched die mid-execution, and this is a
+    /// conversation this daemon has never had a child for at all. The
+    /// distinction is the whole difference between a recovery policy nobody
+    /// specified and RESUME's own contract.
+    ///
+    /// The silent-resume-fork check runs here, at child start, for zero quota.
+    fn adopt_loop_child(&self, execution_id: &str) -> Result<(), BackendError> {
+        let conversation = {
+            let state = self.lock();
+            let execution = state
+                .executions
+                .get(execution_id)
+                .ok_or_else(|| self.err_unknown(execution_id))?;
+            if execution.loop_child.is_some() {
+                return Ok(());
+            }
+            execution.conversation_id.clone()
+        };
+        let conversation = conversation.ok_or_else(|| {
+            self.err_failed(format!(
+                "execution {execution_id} has no conversation id, so there is nothing to compose \
+                 --conversation with"
+            ))
+        })?;
+        let signal = self.spawn_loop_child(execution_id, Some(conversation.clone()))?;
+        match signal {
+            FirstTurnSignal::Initialized {
+                conversation_id, ..
+            } if conversation_id == conversation => Ok(()),
+            FirstTurnSignal::Initialized {
+                conversation_id, ..
+            } => {
+                self.kill_loop_child(execution_id);
+                Err(self.err_failed(format!(
+                    "re-adopting conversation {conversation} spawned a loop child whose init line \
+                     echoed {conversation_id} instead. agy warns-and-continues on an unknown \
+                     conversation and starts a FRESH one (W1 P0.6, re-measured on this transport), \
+                     so this is a silent fork caught before a single turn was spent — not a resume."
+                )))
+            }
+            other => {
+                self.kill_loop_child(execution_id);
+                Err(self.err_failed(format!(
+                    "re-adopting conversation {conversation} could not start a loop child: \
+                     {other:?}"
+                )))
+            }
+        }
+    }
+
+    /// Close the loop child's stdin — the graceful shutdown [W3 P2] — and say
+    /// whether there was one to close. `false` on the print transport, which
+    /// has nothing to close and whose STOP therefore behaves exactly as W1
+    /// shipped it.
+    fn close_loop_stdin(&self, execution_id: &str) -> bool {
+        let state = self.lock();
+        let Some(execution) = state.executions.get(execution_id) else {
+            return false;
+        };
+        let Some(loop_child) = &execution.loop_child else {
+            return false;
+        };
+        // Dropped, not shut down: dropping the handle closes the pipe, which is
+        // exactly the stimulus measured.
+        loop_child
+            .stdin
+            .lock()
+            .expect("agy loop stdin lock")
+            .take()
+            .is_some()
+    }
+
+    /// Wait, bounded, for a loop execution's in-flight turn to settle after its
+    /// stdin was closed. Expiry is not an error — it falls through to the group
+    /// kill, which is what a bounded graceful shutdown means.
+    fn await_loop_settle(&self, execution_id: &str, budget: Duration) {
+        let deadline = Instant::now() + budget;
+        loop {
+            let in_flight = matches!(
+                self.lock()
+                    .executions
+                    .get(execution_id)
+                    .map(|execution| &execution.turn),
+                Some(TurnState::InFlight(_))
+            );
+            if !in_flight || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -2819,14 +4327,7 @@ impl TurnReader {
         // is a turn whose raw capture silently does not exist. This is the
         // module's single `BlobStore::put` call site (A4's ledger row pins it
         // to `impl TurnReader`).
-        let (raw_blob, raw_error) = if raw.is_empty() {
-            (None, None)
-        } else {
-            match BlobStore::open(&self.data_dir).and_then(|store| store.put(raw.as_bytes())) {
-                Ok(blob_ref) => (Some(blob_ref.to_string()), None),
-                Err(e) => (None, Some(e.to_string())),
-            }
-        };
+        let (raw_blob, raw_error) = Self::archive(&self.data_dir, &raw);
 
         let stderr = self
             .stderr_rx
@@ -2961,6 +4462,478 @@ impl TurnReader {
         ))
     }
 
+    /// §20's archive, and **this module's single `BlobStore::put` call site**
+    /// for both transports.
+    ///
+    /// An associated function of `TurnReader` on purpose: `tests/
+    /// a4_blob_ref_pinning.rs`'s ledger row pins agy's put site to
+    /// `impl TurnReader`, and W3 adds a second reader. Routing the loop
+    /// transport's archive through here keeps that row true **without a K2 edit
+    /// to a core test** — and it is the R2 answer anyway, since one archive path
+    /// for both transports is exactly what "the one decoder serves both" means
+    /// applied to the blob store.
+    ///
+    /// Archived **before any conclusion is drawn from it**, and an archive
+    /// failure is reported rather than swallowed: the alternative is a turn
+    /// whose raw capture silently does not exist.
+    fn archive(data_dir: &Path, raw: &str) -> (Option<String>, Option<String>) {
+        if raw.is_empty() {
+            return (None, None);
+        }
+        match BlobStore::open(data_dir).and_then(|store| store.put(raw.as_bytes())) {
+            Ok(blob_ref) => (Some(blob_ref.to_string()), None),
+            Err(e) => (None, Some(e.to_string())),
+        }
+    }
+
+    fn emit(&self, kind: &str, payload: Value) {
+        if let Some(sink) = &self.sink {
+            sink(EventDraft {
+                source: EventSource::new("backend", AGY_BACKEND_NAME),
+                workspace_id: None,
+                work_id: Some(self.work_id.clone()),
+                execution_id: Some(self.execution_id.clone()),
+                correlation_id: Some(self.execution_id.clone()),
+                causation_id: None,
+                kind: kind.to_string(),
+                payload,
+            });
+        }
+    }
+}
+
+// -------------------------------------------------------- the loop reader
+
+/// Everything the **input-loop** child's stdout reader thread needs.
+///
+/// One thread for the child's whole life, not one per turn — which is the
+/// transport's defining difference and the source of its one genuinely new
+/// hazard (§2.6's stderr attribution). It reuses [`TurnAccumulator`],
+/// [`classify_terminal`], [`verify_pin_from_init`], [`PermissionPosture`] and
+/// [`TurnReader::archive`] **unchanged in behaviour**: this is a driver, not a
+/// second decoder (ADR 0020/0021's seam, R2).
+struct LoopReader {
+    backend_state: Arc<Mutex<AdapterState>>,
+    sink: Option<EventSink>,
+    data_dir: PathBuf,
+    execution_id: String,
+    work_id: String,
+    model: Option<String>,
+    /// The conversation id this child composed `--conversation` with, when it is
+    /// a resume. `None` for a fresh child.
+    expected_conversation: Option<String>,
+    bindings_outside_cwd: Vec<PathBuf>,
+    child: Arc<Mutex<Child>>,
+    stderr: Arc<Mutex<StderrLog>>,
+    death: Arc<Mutex<Option<LoopDeath>>>,
+    /// Present until the `init` line lands: how this reader tells the caller
+    /// blocking on LAUNCH (or on the first SEND of a re-adopted execution) that
+    /// identity arrived — or that the harness refused before minting one.
+    init_signal: Option<SyncSender<FirstTurnSignal>>,
+    settings_home: Option<PathBuf>,
+}
+
+impl LoopReader {
+    fn run(self, stdout: std::process::ChildStdout) {
+        let mut identity = LoopIdentity::default();
+        let mut acc = TurnAccumulator::new();
+        let mut raw = String::new();
+        let mut raw_truncated = false;
+        let mut announced_init = false;
+        // Where a turn's stderr slice starts: the first stream event seen since
+        // the previous `result`. `None` between turns, which is precisely the
+        // window whose stderr can only be attributed `adjacent`.
+        let mut first_event_at: Option<Instant> = None;
+        // Turn 1's blob, referenced by every later turn's evidence so the `init`
+        // line is archived exactly once and every turn still traces back to it.
+        let mut init_blob: Option<String> = None;
+        let mut turns_settled: u32 = 0;
+
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            // Byte-exact, never normalize_pty'd: §20 fidelity means the blob is
+            // what the harness wrote. Every line is still parsed and forwarded
+            // regardless of the cap; only the archive is bounded.
+            if raw.len() < STREAM_MEMORY_CAP {
+                raw.push_str(&line);
+                raw.push('\n');
+            } else {
+                raw_truncated = true;
+            }
+            if first_event_at.is_none() {
+                first_event_at = Some(Instant::now());
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                acc.unparsed_lines += 1;
+                continue;
+            };
+            let event = value
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            for native in acc.ingest_line(&value) {
+                self.emit(&native.kind, native.payload);
+            }
+            if event == "init" && !announced_init {
+                announced_init = true;
+                identity = LoopIdentity::from_accumulator(&acc);
+                self.announce_identity(&identity);
+            }
+            // A `result` that arrives **before** any `init` is not a turn: no
+            // line has been written to this child's stdin yet, so settling one
+            // here would fabricate a `conversation.turn.ended` (and a
+            // `TurnState::Finished`) for a turn nobody sent, and would reset the
+            // accumulator that carries agy's own refusal text. Leaving it in
+            // `acc` is what lets the `!announced_init` classifier below report
+            // `RefusedBeforeIdentity` with that text verbatim instead of the
+            // said-nothing-at-all `ExitedWithoutInit`. `init` precedes any
+            // message being consumed on this transport [W3 P1], so this window
+            // only ever holds a harness refusal.
+            if event == "result" && announced_init {
+                turns_settled += 1;
+                let settled = self.settle_turn(
+                    &mut acc,
+                    &identity,
+                    std::mem::take(&mut raw),
+                    raw_truncated,
+                    first_event_at,
+                    init_blob.clone(),
+                    None,
+                );
+                if turns_settled == 1 {
+                    init_blob = settled;
+                }
+                raw_truncated = false;
+                first_event_at = None;
+                acc = TurnAccumulator::new();
+                identity.reseed(&mut acc);
+            }
+        }
+
+        // Stdout is closed; reap. The child lock is only taken after EOF so
+        // INTERRUPT can always kill.
+        let exit_code = self
+            .child
+            .lock()
+            .expect("agy loop child lock")
+            .wait()
+            .ok()
+            .and_then(|status| status.code());
+
+        // The harness refused before minting identity, or died saying nothing.
+        // Only a caller blocking on the init line has anyone listening.
+        if !announced_init && let Some(tx) = &self.init_signal {
+            let stderr = self.take_stderr(None).text;
+            let (raw_blob, _) = TurnReader::archive(&self.data_dir, &raw);
+            let signal = match &acc.terminal {
+                Terminal::Status { status, error, .. } => FirstTurnSignal::RefusedBeforeIdentity {
+                    status: status.clone(),
+                    error: error.clone(),
+                    exit_code,
+                },
+                Terminal::None => FirstTurnSignal::ExitedWithoutInit {
+                    exit_code,
+                    stderr,
+                    raw_blob,
+                },
+            };
+            let _ = tx.send(signal);
+            self.record_death(exit_code, &identity);
+            return;
+        }
+
+        // A turn that was in flight when the child died settles here, through
+        // the *same* classifier: arms 9/10 read `InterruptedRunning` if we asked
+        // and `AmbiguousUnknown` otherwise. Unchanged code, new call site.
+        //
+        // [W3 A2] made this a routine path rather than an exceptional one on
+        // this transport: a denied tool exits the whole child.
+        let in_flight = matches!(
+            self.backend_state
+                .lock()
+                .expect("agy adapter state lock")
+                .executions
+                .get(&self.execution_id)
+                .map(|execution| &execution.turn),
+            Some(TurnState::InFlight(_))
+        );
+        if in_flight {
+            self.settle_turn(
+                &mut acc,
+                &identity,
+                std::mem::take(&mut raw),
+                raw_truncated,
+                first_event_at,
+                init_blob.clone(),
+                Some(exit_code),
+            );
+        }
+        self.record_death(exit_code, &identity);
+    }
+
+    /// Store the child's identity and posture, and release the caller blocked
+    /// on the `init` line.
+    ///
+    /// **The transport's real prize, and this is the moment it is cashed in.**
+    /// [W3 P1 row I] proved `init` arrives even when nothing is ever written to
+    /// stdin, so everything below — the conversation id, the resolved model, the
+    /// effective permission mode, and therefore the pin check, the posture
+    /// notice and the silent-resume-fork check — is known for **zero turns and
+    /// zero quota**. Print mode can only learn any of it by spending turn 1.
+    fn announce_identity(&self, identity: &LoopIdentity) {
+        if let Some(execution) = self
+            .backend_state
+            .lock()
+            .expect("agy adapter state lock")
+            .executions
+            .get_mut(&self.execution_id)
+        {
+            // Only a fresh child mints identity. A resumed child's `init` is
+            // CHECKED against the id we asked for, never allowed to replace it:
+            // agy warns-and-continues on an unknown `--conversation` and starts
+            // a fresh conversation [W1 P0.6], so adopting whatever came back
+            // would be the adapter silently following the fork.
+            if execution.conversation_id.is_none() {
+                execution.conversation_id = identity.conversation_id.clone();
+            }
+            execution.posture = Some(PermissionPosture::from_init(
+                identity.permission_mode.as_deref(),
+                self.settings_home.as_deref(),
+            ));
+        }
+        if let (Some(tx), Some(id)) = (&self.init_signal, identity.conversation_id.clone()) {
+            let _ = tx.send(FirstTurnSignal::Initialized {
+                conversation_id: id,
+                model: identity.model.clone(),
+                permission_mode: identity.permission_mode.clone(),
+            });
+        }
+    }
+
+    /// Cut this turn at its `result` (or at the child's death), archive its raw
+    /// bytes, classify it, record it and journal `conversation.turn.ended`.
+    /// Returns the blob ref, so turn 1 can hand its `init`-bearing archive to
+    /// every later turn's evidence.
+    #[allow(clippy::too_many_arguments)]
+    fn settle_turn(
+        &self,
+        acc: &mut TurnAccumulator,
+        identity: &LoopIdentity,
+        mut raw: String,
+        raw_truncated: bool,
+        first_event_at: Option<Instant>,
+        init_blob: Option<String>,
+        died_with: Option<Option<i32>>,
+    ) -> Option<String> {
+        if raw_truncated {
+            raw.push_str(&format!(
+                "\n...<{STREAM_MEMORY_CAP}-byte in-memory cap hit; further stdout lines were still \
+                 parsed and emitted above but were not archived here>\n"
+            ));
+        }
+        let (raw_blob, raw_error) = TurnReader::archive(&self.data_dir, &raw);
+        let stderr = self.take_stderr(first_event_at);
+
+        let verdict = verify_pin_from_init(self.model.as_deref(), identity.model.as_deref());
+        let pin_mismatch = verdict.mismatch(self.model.as_deref());
+        let pin = verdict.as_json(self.model.as_deref());
+        let resume_mismatch = self.resume_mismatch(identity, &stderr.text);
+        if let Some(mismatch) = &resume_mismatch {
+            self.emit(
+                KIND_TURN_HARNESS_ERROR,
+                json!({
+                    "phase": "resume_identity_mismatch",
+                    "requested": self.expected_conversation,
+                    "echoed": identity.conversation_id,
+                    "stderr_warning": resume_fork_warning_in_stderr(&stderr.text),
+                    "detail": mismatch,
+                }),
+            );
+        }
+        // The adapter composes only the accepted stdin shape
+        // ([`compose_loop_message`]), so this is never a stage's fault — and it
+        // is fatal to the child besides [W3 P1]. Named as an adapter defect
+        // rather than reported as a failed turn, which would blame a Work for a
+        // bug in this file.
+        if let Some(rejection) = acc.loop_input_rejection() {
+            self.emit(
+                KIND_TURN_HARNESS_ERROR,
+                json!({
+                    "phase": "loop_input_rejected",
+                    "error": rejection,
+                    "detail": "agy refused a line this adapter wrote to the loop child's stdin. \
+                               The adapter composes exactly one message shape and this is not a \
+                               stage failure but an adapter defect; the refusal is fatal to the \
+                               whole child (W3 P1), so the transport is now dead and the \
+                               conversation must be resumed from a fresh one",
+                }),
+            );
+        }
+
+        let mut state = self.backend_state.lock().expect("agy adapter state lock");
+        let Some(execution) = state.executions.get_mut(&self.execution_id) else {
+            return raw_blob;
+        };
+        let interrupted = execution.interrupt_requested;
+        let exit_code = died_with.flatten();
+        let terminal = classify_terminal(acc, exit_code, interrupted, &stderr.text);
+        let conversation_for_event = execution.conversation_id.clone();
+        let posture = execution.posture.clone();
+        execution.turn = TurnState::Finished(Box::new(TurnOutcome {
+            terminal: terminal.clone(),
+            pin_mismatch,
+            pin: pin.clone(),
+            resume_mismatch,
+            steps: acc.steps,
+            agent_response_steps: acc.agent_response_steps,
+            text_deltas: acc.text_deltas,
+            tool_steps: acc.tool_steps,
+            denied_tools: acc.denied_tools.clone(),
+            unknown_events: acc.unknown_events.clone(),
+            unparsed_lines: acc.unparsed_lines,
+            saw_command_result: acc.saw_command_result,
+            summary: acc.last_response.clone(),
+            status: acc.status().map(str::to_string),
+            last_error: acc.last_error.clone(),
+            exit_code,
+            raw_blob: raw_blob.clone(),
+            raw_error: raw_error.clone(),
+            stderr: stderr.text.clone(),
+        }));
+        drop(state);
+
+        self.emit(
+            KIND_CONVERSATION_TURN_ENDED,
+            json!({
+                "conversation_id": conversation_for_event,
+                "transport": Transport::Loop.as_str(),
+                "interrupted": interrupted,
+                "outcome": terminal_outcome_label(&terminal),
+                "status": acc.status(),
+                "init": {
+                    "model": identity.model,
+                    "permission_mode": identity.permission_mode,
+                    "cwd": identity.cwd,
+                    "tool_count": identity.tool_count,
+                },
+                // The `init` line is archived exactly once, in turn 1's blob;
+                // every later turn points at it rather than re-archiving it.
+                "init_blob": init_blob,
+                "permission_posture": posture.map(|p| p.as_json()),
+                "steps": acc.steps,
+                "agent_response_steps": acc.agent_response_steps,
+                "text_deltas": acc.text_deltas,
+                "tool_steps": acc.tool_steps,
+                "denied_tools": acc.denied_tools,
+                // The admission's own evidence, journaled: child conversation
+                // ids recovered from a TYPED subagent_info record [W3 A1].
+                "subagent_conversations": acc.subagent_conversations,
+                "stderr_denial_notice": denial_evidence_in_stderr(&stderr.text),
+                "stderr_attribution": stderr.attribution,
+                "stderr_lines_dropped": stderr.dropped,
+                // [W3 P4]: an ERROR + "timeout waiting for response" terminal is
+                // ambiguous between a deadline expiry and an interrupt we sent,
+                // and `status` can never disambiguate them. Carried in BOTH
+                // readings so a consumer can see the classifier leant on this
+                // adapter's own bit rather than on the wire.
+                "terminal_ambiguity": acc
+                    .terminal_is_timeout_ambiguous()
+                    .then_some("timeout_or_interrupt"),
+                "loop_input_rejected": acc.loop_input_rejection(),
+                "unknown_events": acc.unknown_events,
+                "unparsed_lines": acc.unparsed_lines,
+                "saw_command_result": acc.saw_command_result,
+                "bindings_outside_cwd": self.bindings_outside_cwd,
+                "usage_final_step": acc.last_step_usage,
+                "usage_turn": acc.terminal_usage,
+                "structured_output": acc.structured_output,
+                "model_pin": pin,
+                "exit_code": exit_code,
+                "raw": raw_blob,
+                "raw_error": raw_error,
+                "stderr": truncate(normalize_pty(stderr.text.trim()).as_str(), 400).to_string(),
+            }),
+        );
+        raw_blob
+    }
+
+    /// This turn's slice of the shared stderr stream (§2.6).
+    ///
+    /// Every pending line is taken — **none is ever dropped**. Lines stamped at
+    /// or after this turn's first stream event are inside it (`exact`); anything
+    /// older arrived between turns and can only be placed *next to* one, so it
+    /// is attached here and the whole slice is labelled `adjacent` so a reader
+    /// can see the classifier was not certain.
+    ///
+    /// The short [`LOOP_STDERR_GRACE`] closes the same-instant race W1 already
+    /// fixes on the other transport: the auto-denial notice is written as the
+    /// `result` is flushed, and a reader that snapshots the moment the result
+    /// parses is racing the thread still filling the log.
+    fn take_stderr(&self, first_event_at: Option<Instant>) -> StderrSlice {
+        std::thread::sleep(LOOP_STDERR_GRACE);
+        let mut log = self.stderr.lock().expect("agy loop stderr lock");
+        let dropped = log.dropped;
+        let lines = log.take_all();
+        drop(log);
+        let mut adjacent = false;
+        let mut text = String::new();
+        for (stamped, line) in lines {
+            if first_event_at.is_none_or(|start| stamped < start) {
+                adjacent = true;
+            }
+            text.push_str(&line);
+            text.push('\n');
+        }
+        StderrSlice {
+            text,
+            attribution: if adjacent { "adjacent" } else { "exact" },
+            dropped,
+        }
+    }
+
+    /// The silent-resume-fork guard, run against the child's **single** `init`
+    /// line — so on this transport it costs zero quota and happens once, at
+    /// child start, rather than being checked after a turn has already run
+    /// [W3 P3].
+    fn resume_mismatch(&self, identity: &LoopIdentity, stderr: &str) -> Option<String> {
+        let requested = self.expected_conversation.as_deref()?;
+        let echoed = identity.conversation_id.as_deref();
+        if echoed == Some(requested) {
+            return None;
+        }
+        Some(format!(
+            "resume identity mismatch: this loop child asked for conversation {requested} and \
+             agy's init line echoed {}. agy warns-and-continues on an unknown conversation rather \
+             than refusing (measured, W1 P0.6 and re-measured on this transport in W3: a \
+             plain-text stderr `warning: conversation \"…\" not found` and a fresh conversation), \
+             so a fresh conversation would otherwise have been silently mistaken for a resume. \
+             stderr carried that warning: {}",
+            echoed.unwrap_or("<no init line at all>"),
+            resume_fork_warning_in_stderr(stderr),
+        ))
+    }
+
+    /// Record that the transport is gone, with everything the next SEND owes
+    /// its caller — including the conversation id, which is fully resumable
+    /// from a fresh child [W3 P3, W3 A2].
+    fn record_death(&self, exit_code: Option<i32>, identity: &LoopIdentity) {
+        let stderr_tail = self.take_stderr(None).text;
+        let conversation_id = identity.conversation_id.clone().or_else(|| {
+            self.backend_state
+                .lock()
+                .expect("agy adapter state lock")
+                .executions
+                .get(&self.execution_id)
+                .and_then(|execution| execution.conversation_id.clone())
+        });
+        *self.death.lock().expect("agy loop death lock") = Some(LoopDeath {
+            exit_code,
+            stderr_tail: truncate(stderr_tail.trim(), 400).to_string(),
+            conversation_id,
+        });
+    }
+
     fn emit(&self, kind: &str, payload: Value) {
         if let Some(sink) = &self.sink {
             sink(EventDraft {
@@ -2994,7 +4967,7 @@ impl Backend for AgyBackend {
     /// emulation — so [`Backend::history`] refuses rather than returning what
     /// this process happened to see.
     fn capabilities(&self) -> Capabilities {
-        capabilities_for(Transport::Print)
+        capabilities_for(self.transport_resolution().transport)
     }
 
     /// §17: each turn is its own short-lived process; there is no backend-level
@@ -3011,11 +4984,23 @@ impl Backend for AgyBackend {
                 detail: Some(outcome.detail.clone()),
             };
         }
+        // The only resolution that can make an otherwise-usable build
+        // unavailable is `LoopOnly` against a build with no `--input-format`
+        // (codex §5.2 rule 2): serving it on the other transport would be
+        // serving a different set of measured claims than the one asked for.
+        let resolution = self.transport_resolution();
+        if !resolution.available {
+            return ProbeReport {
+                available: false,
+                detail: Some(format!("{}; {}", outcome.detail, resolution.detail)),
+            };
+        }
         ProbeReport {
             available: true,
             detail: Some(format!(
-                "{}\nadmission rows:\n{}",
+                "{}; {}\nadmission rows:\n{}",
                 outcome.detail,
+                resolution.detail,
                 render_admission_rows()
             )),
         }
@@ -3041,6 +5026,13 @@ impl Backend for AgyBackend {
                 detail: probe.detail.clone(),
             });
         }
+        let resolution = self.transport_resolution();
+        if !resolution.available {
+            return Err(BackendError::Unavailable {
+                backend: AGY_BACKEND_NAME.to_string(),
+                detail: resolution.detail.clone(),
+            });
+        }
         if let Some(model) = &request.model {
             preflight_model_pin(model).map_err(|reason| self.err_failed(reason))?;
         }
@@ -3048,9 +5040,15 @@ impl Backend for AgyBackend {
         // two phases can never disagree about it.
         self.launch_config(request.profile.as_ref())?;
         // Refused here rather than at LAUNCH so it costs nothing and is
-        // journaled before any process exists.
-        check_argv_prompt_budget(&compose_launch_prompt(request), request)
-            .map_err(|reason| self.err_failed(reason))?;
+        // journaled before any process exists — and refused against the
+        // transport this execution will ACTUALLY launch on, since the loop
+        // carries its prompt on stdin and the argv cap does not bind there.
+        check_prompt_budget(
+            resolution.transport,
+            &compose_launch_prompt(request),
+            request,
+        )
+        .map_err(|reason| self.err_failed(reason))?;
         Ok(PreparedExecution {
             execution_id: request.execution_id.clone(),
             native_id: None,
@@ -3066,6 +5064,7 @@ impl Backend for AgyBackend {
     fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
         let request = &prepared.request;
         let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let transport = self.transport_resolution().transport;
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -3087,8 +5086,22 @@ impl Backend for AgyBackend {
                     stopped: false,
                     interrupt_requested: false,
                     reader: None,
+                    transport,
+                    loop_child: None,
                 },
             );
+        }
+        // Both transports share this function's one guarantee: a failed launch
+        // leaves NO phantom execution behind, whichever way it failed.
+        if transport == Transport::Loop {
+            return match self.launch_loop(request) {
+                Ok(handle) => Ok(handle),
+                Err(e) => {
+                    self.kill_loop_child(&request.execution_id);
+                    self.lock().executions.remove(&request.execution_id);
+                    Err(e)
+                }
+            };
         }
         let policy = format!("{:?}", request.instruction_policy);
         let signal = match self.spawn_first_turn(
@@ -3174,7 +5187,7 @@ impl Backend for AgyBackend {
     }
 
     fn send(&self, handle: &ExecutionHandle, input: &str) -> Result<(), BackendError> {
-        {
+        let transport = {
             let state = self.lock();
             self.check_identity(&state, handle)?;
             let execution = &state.executions[&handle.execution_id];
@@ -3184,6 +5197,10 @@ impl Backend for AgyBackend {
                     handle.execution_id
                 )));
             }
+            // Kept on BOTH transports. W3 P2 measured agy serialising its own
+            // queue, so this is not a liveness requirement on the loop — but
+            // nothing measured a bound on that queue, and sergeant's SEND
+            // contract is per-turn regardless of what the harness tolerates.
             if let TurnState::InFlight(_) = execution.turn {
                 return Err(self.err_failed(format!(
                     "execution {} already has a turn in flight; an agy conversation runs one turn \
@@ -3198,8 +5215,17 @@ impl Backend for AgyBackend {
                     handle.execution_id
                 )));
             }
+            execution.transport
+        };
+        match transport {
+            Transport::Print => {
+                self.spawn_turn(&handle.execution_id, input.to_string(), None, None)
+            }
+            Transport::Loop => {
+                self.adopt_loop_child(&handle.execution_id)?;
+                self.write_loop_turn(&handle.execution_id, input, None)
+            }
         }
-        self.spawn_turn(&handle.execution_id, input.to_string(), None, None)
     }
 
     fn observe(&self, handle: &ExecutionHandle) -> Result<Observation, BackendError> {
@@ -3237,7 +5263,21 @@ impl Backend for AgyBackend {
                 }
                 TurnState::Finished(_) | TurnState::Unlaunched | TurnState::Adopted => None,
             };
-            let reader = child.is_some().then(|| execution.reader.take()).flatten();
+            // The reader lives on the execution for the print transport and on
+            // the loop child for the loop one; either way INTERRUPT hands it
+            // back as the completion's tail so the killed turn's archive is
+            // durable before the interrupt's promise is true.
+            let reader = child
+                .is_some()
+                .then(|| {
+                    execution.reader.take().or_else(|| {
+                        execution
+                            .loop_child
+                            .as_mut()
+                            .and_then(|loop_child| loop_child.reader.take())
+                    })
+                })
+                .flatten();
             (execution.turn_pgid, child, reader)
         };
         kill_turn(pgid, child.as_ref());
@@ -3312,6 +5352,8 @@ impl Backend for AgyBackend {
                 stopped: false,
                 interrupt_requested: false,
                 reader: None,
+                transport: self.transport_resolution().transport,
+                loop_child: None,
             },
         );
         Ok(())
@@ -3349,6 +5391,19 @@ impl Backend for AgyBackend {
     /// never waits on it under the core lock), so the turn's archive is durable
     /// before STOP's promise is true.
     fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError> {
+        // On the loop transport, closing stdin is the GRACEFUL shutdown: W3 P2
+        // measured queued turns running to completion and the child then
+        // exiting 0 with no further event. So STOP closes stdin, waits a bounded
+        // while for the in-flight turn to settle, and only then falls through to
+        // the group kill — where print mode has nothing to close and goes
+        // straight there.
+        if self.close_loop_stdin(&handle.execution_id) {
+            let budget = self
+                .config
+                .stop_drain_budget
+                .unwrap_or(LOOP_STOP_DRAIN_BUDGET);
+            self.await_loop_settle(&handle.execution_id, budget);
+        }
         self.interrupt(handle)?.wait();
         let reader = {
             let mut state = self.lock();
@@ -3358,7 +5413,12 @@ impl Backend for AgyBackend {
                 .get_mut(&handle.execution_id)
                 .expect("presence checked above");
             execution.stopped = true;
-            execution.reader.take()
+            execution.reader.take().or_else(|| {
+                execution
+                    .loop_child
+                    .as_mut()
+                    .and_then(|loop_child| loop_child.reader.take())
+            })
         };
         match reader {
             None => Ok(Completion::immediate()),
@@ -4472,57 +6532,732 @@ mod tests {
         assert_eq!(probe.tool_permission.as_deref(), Some("strict"));
     }
 
+    // ------------------------------------------------- W3: the loop transport
+
+    const LOOP_TWO_TURNS: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-two-turns.jsonl");
+    const LOOP_INIT_ONLY: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-init-only-empty-stdin.jsonl");
+    const LOOP_RESUME_INIT_ECHO: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-resume-init-echo.jsonl");
+    const LOOP_CONTROL_REQUEST: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-control-request-refusal.jsonl");
+    const LOOP_MISSING_EVENT: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-missing-event-field.jsonl");
+    const LOOP_BAD_BLOCK: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-unsupported-block-type.jsonl");
+    const LOOP_UNKNOWN_EVENT_WARNING: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-unknown-event-warning.txt");
+    const LOOP_SUBAGENT: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-subagent-info.jsonl");
+    const LOOP_SCHEMA: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-schema-two-turns.jsonl");
+    const LOOP_DENIED_TOOL: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-denied-tool-kills-child.jsonl");
+    const LOOP_SIGINT_CANCELLED: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-sigint-cancelled-terminal.jsonl");
+    const LOOP_SANDBOX_UNAVAILABLE: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-sandbox-unavailable.jsonl");
+    const LOOP_RESUME_FORK_WARNING: &str =
+        include_str!("../../tests/fixtures/agy-1.1.19-loop-resume-fork-warning.txt");
+
+    /// Replay one loop child's whole stream the way [`LoopReader`] does — a
+    /// fresh [`TurnAccumulator`] cut at every `result`, reseeded from the
+    /// child's single `init` — and return one entry per settled turn.
+    ///
+    /// This is the reader's turn loop with the I/O taken out, which is what
+    /// makes every loop behaviour drivable with no `agy` binary and no quota.
+    fn replay_loop(fixture: &str) -> Vec<(TurnAccumulator, Vec<NativeEvent>)> {
+        let mut identity = LoopIdentity::default();
+        let mut acc = TurnAccumulator::new();
+        let mut events = Vec::new();
+        let mut turns = Vec::new();
+        for line in fixture.lines().filter(|line| !line.trim().is_empty()) {
+            let value: Value = serde_json::from_str(line).expect("fixture line parses");
+            let event = value.get("event").and_then(Value::as_str).unwrap_or("");
+            events.extend(acc.ingest_line(&value));
+            if event == "init" {
+                identity = LoopIdentity::from_accumulator(&acc);
+            }
+            if event == "result" {
+                turns.push((std::mem::take(&mut acc), std::mem::take(&mut events)));
+                identity.reseed(&mut acc);
+            }
+        }
+        // Anything left over is an unsettled turn — a child that died mid-turn.
+        if acc.steps > 0 || !matches!(acc.terminal, Terminal::None) {
+            turns.push((acc, events));
+        }
+        turns
+    }
+
+    #[test]
+    fn loop_argv_carries_the_measured_launch_grammar() {
+        let argv = loop_argv(Some("gemini-3.7-flash-low"), None, None);
+        // `--print=` with the `=` and an empty value: a bare `-p` swallows the
+        // next flag and fails rc=2 with plain-text stderr and NO NDJSON at all
+        // (W3 P0) — a shape the stream decoder can never see.
+        assert_eq!(argv[0], "--print=");
+        assert!(!argv.iter().any(|arg| arg == "-p"));
+        // `--input-format stream-json` REQUIRES `--output-format stream-json`;
+        // composed together or not at all.
+        let input_at = argv
+            .iter()
+            .position(|a| a == "--input-format")
+            .expect("flag");
+        assert_eq!(argv[input_at + 1], "stream-json");
+        let output_at = argv
+            .iter()
+            .position(|a| a == "--output-format")
+            .expect("flag");
+        assert_eq!(argv[output_at + 1], "stream-json");
+        assert!(argv.contains(&"--disable-slash-commands".to_string()));
+        // No prompt anywhere on argv: that is the transport's whole point.
+        assert!(!argv.iter().any(|arg| arg.contains("do the")));
+        // Never composed by default on either transport (W3 S1 measured
+        // --sandbox breaking every run_command on this host).
+        assert!(!argv.iter().any(|arg| arg == "--sandbox"));
+        assert!(!argv.iter().any(|arg| arg == "--add-dir"));
+        assert!(!argv.iter().any(|arg| arg == "--agent"));
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+        assert!(!argv.iter().any(|a| a == "--json-schema"));
+        assert!(!argv.iter().any(|a| a == "--conversation"));
+
+        let resumed = loop_argv(None, Some("{}"), Some("conv-1"));
+        assert!(!resumed.iter().any(|a| a == "--model"));
+        let at = resumed
+            .iter()
+            .position(|a| a == "--conversation")
+            .expect("--conversation");
+        assert_eq!(resumed[at + 1], "conv-1");
+        let schema_at = resumed
+            .iter()
+            .position(|a| a == "--json-schema")
+            .expect("--json-schema");
+        assert_eq!(resumed[schema_at + 1], "{}");
+    }
+
+    #[test]
+    fn the_loop_gate_flag_is_what_the_loop_grammar_composes() {
+        // The membership rule `required_flags_are_exactly_what_the_launch_grammar
+        // _composes` enforces for print, enforced for the loop's own gate — in
+        // both directions, which is what makes LOOP_GATE_FLAGS a gate and not a
+        // wish. See LOOP_GATE_FLAGS' own doc for why it is not folded into
+        // REQUIRED_FLAGS.
+        let argv = loop_argv(Some("m"), Some("{}"), Some("c"));
+        for flag in LOOP_GATE_FLAGS {
+            assert!(
+                argv.iter().any(|arg| arg == flag),
+                "LOOP_GATE_FLAGS names {flag}, which the loop grammar never composes"
+            );
+        }
+        // And every flag the loop composes is gated by one list or the other.
+        for arg in &argv {
+            if !arg.starts_with("--") {
+                continue;
+            }
+            let long = arg.split('=').next().unwrap_or(arg);
+            assert!(
+                REQUIRED_FLAGS.contains(&long) || LOOP_GATE_FLAGS.contains(&long),
+                "the loop grammar composes {long}, which neither gate list requires — a flag this \
+                 adapter composes but never checks for is a grammar it never measured"
+            );
+        }
+    }
+
+    #[test]
+    fn the_adapter_composes_exactly_one_accepted_stdin_shape() {
+        // W3 P1: five of the six typed refusals are shape refusals, and every
+        // one of them is FATAL TO THE WHOLE CHILD. So the composed line is
+        // round-tripped against each refusal's own condition, rather than
+        // trusted to be right because it was written carefully.
+        let line = compose_loop_message("say pong");
+        assert!(!line.contains('\n'), "one NDJSON object, one line");
+        let value: Value = serde_json::from_str(&line).expect("composed line parses");
+        // Row C: a line with no `event` key.
+        assert_eq!(value.get("event").and_then(Value::as_str), Some("user"));
+        // Row D: a `user` message with no `message` field.
+        let message = value.get("message").expect("a message field");
+        // Row E: a `message` with no content.
+        let content = message.get("content").expect("a content field");
+        // Row F: a non-text block. The string form carries no blocks at all,
+        // which is why it is the shape composed.
+        assert!(content.is_string(), "the string form, not the block list");
+        assert_eq!(content.as_str(), Some("say pong"));
+        assert_eq!(message.get("role").and_then(Value::as_str), Some("user"));
+        // Row H: `control_request` is the only non-`user` event the decoder
+        // recognises at all, and it is refused.
+        assert_ne!(
+            value.get("event").and_then(Value::as_str),
+            Some("control_request")
+        );
+
+        // The injection hazard the typed struct exists for: a prompt carrying a
+        // newline and a quote must not become two lines or escape the string.
+        let nasty = compose_loop_message("line one\n{\"event\":\"control_request\"}\n\" end");
+        assert!(
+            !nasty.contains('\n'),
+            "a newline in the prompt stays escaped"
+        );
+        let parsed: Value = serde_json::from_str(&nasty).expect("still one object");
+        assert_eq!(parsed["event"], json!("user"));
+        assert!(
+            parsed["message"]["content"]
+                .as_str()
+                .expect("content")
+                .contains("control_request"),
+            "the injected text is DATA, carried verbatim inside content"
+        );
+    }
+
+    #[test]
+    fn a_control_request_message_is_refused_as_unsupported() {
+        // Backs the loop's `ask` and `approval_flow` rows: this is the ONLY
+        // non-`user` event the decoder recognises, and upstream refuses it in
+        // its own words — including the "yet".
+        let turns = replay_loop(LOOP_CONTROL_REQUEST);
+        assert_eq!(turns.len(), 1);
+        let (acc, _) = &turns[0];
+        let Terminal::Status { status, error, .. } = &acc.terminal else {
+            panic!("a typed terminal")
+        };
+        assert_eq!(status, "ERROR");
+        assert_eq!(
+            error,
+            "stream input message event \"control_request\" is not supported yet"
+        );
+        // Zero-quota: the refusal costs nothing, which is why `ask` could be
+        // refuted without spending a turn on it.
+        assert_eq!(
+            acc.terminal_usage.as_ref().expect("usage")["total_tokens"],
+            json!(0)
+        );
+        // And it is an ADAPTER-shape refusal, so it is reported as an adapter
+        // defect rather than as a stage failure.
+        assert_eq!(acc.loop_input_rejection(), Some(error.as_str()));
+    }
+
+    #[test]
+    fn a_malformed_input_line_is_reported_as_an_adapter_defect_not_a_stage_failure() {
+        for (fixture, expected) in [
+            (
+                LOOP_MISSING_EVENT,
+                "stream input message is missing the \"event\" field",
+            ),
+            (
+                LOOP_BAD_BLOCK,
+                "stream input content block type \"image\" is not supported (only \"text\")",
+            ),
+        ] {
+            let turns = replay_loop(fixture);
+            let (acc, _) = &turns[0];
+            assert_eq!(acc.loop_input_rejection(), Some(expected));
+            // The classifier still says Failed — the turn did not happen — but
+            // the `loop_input_rejected` phase is what tells a reader the fault
+            // is in this file and not in the stage.
+            assert_eq!(
+                classify_terminal(acc, Some(1), false, ""),
+                TerminalOutcome::Failed {
+                    reason: expected.to_string()
+                }
+            );
+        }
+        // An ordinary harness failure must NOT be mistaken for one.
+        let turns = replay_loop(LOOP_DENIED_TOOL);
+        assert_eq!(turns[0].0.loop_input_rejection(), None);
+    }
+
+    #[test]
+    fn an_unknown_stream_input_event_is_a_warning_the_child_survives() {
+        // W3 P1 row G, the one refusal shape that is NOT fatal: the line is
+        // skipped, the child survives, and there is no `result` at all — which
+        // is why the sixteen candidate reply-event names taught us nothing
+        // except that none of them exists.
+        assert!(
+            LOOP_UNKNOWN_EVENT_WARNING.contains("ignoring unsupported stream input message event"),
+            "the captured warning names the skipped event"
+        );
+        let turns = replay_loop(LOOP_INIT_ONLY);
+        assert!(
+            turns.is_empty(),
+            "an init-only child settles no turn at all"
+        );
+    }
+
+    #[test]
+    fn init_arrives_at_child_start_before_any_message_is_consumed() {
+        // W3 P1 row I, the transport's whole prize: stdin was closed with
+        // NOTHING written and the child still emitted a full identity line.
+        let value: Value =
+            serde_json::from_str(LOOP_INIT_ONLY.lines().next().expect("a line")).expect("parses");
+        let mut acc = TurnAccumulator::new();
+        assert!(acc.ingest_line(&value).is_empty(), "init emits no event");
+        let identity = LoopIdentity::from_accumulator(&acc);
+        assert!(identity.conversation_id.is_some());
+        assert_eq!(identity.model.as_deref(), Some("gemini-3.7-flash-low"));
+        assert_eq!(identity.permission_mode.as_deref(), Some("request-review"));
+        assert_eq!(identity.tool_count, 57);
+        // So the pin verdict — and therefore the LAUNCH refusal — is decidable
+        // here, with zero quota spent.
+        assert_eq!(
+            verify_pin_from_init(Some("gemini-3.7-pro"), identity.model.as_deref()),
+            PinVerdict::Substituted("gemini-3.7-flash-low".to_string())
+        );
+    }
+
+    #[test]
+    fn a_loop_turn_boundary_resets_the_accumulator_but_not_the_conversation() {
+        let turns = replay_loop(LOOP_TWO_TURNS);
+        assert_eq!(turns.len(), 2, "one accumulator per turn, cut at `result`");
+        let (first, _) = &turns[0];
+        let (second, _) = &turns[1];
+        // The conversation survives the cut — one child, one identity, minted
+        // on the single `init` line and never re-minted.
+        assert!(first.conversation_id.is_some());
+        assert_eq!(first.conversation_id, second.conversation_id);
+        assert_eq!(first.init_model, second.init_model);
+        assert_eq!(first.init_permission_mode, second.init_permission_mode);
+        // The per-turn evidence does NOT survive it: turn 2's summary is its
+        // own, and its step counts start from this turn rather than the child.
+        assert_eq!(first.last_response.as_deref(), Some("alpha\n"));
+        assert_eq!(second.last_response.as_deref(), Some("bravo\n"));
+        assert!(second.steps < first.steps || second.steps > 0);
+        assert_eq!(second.tool_steps, 0);
+        // Both are ordinary completions.
+        for (acc, _) in &turns {
+            assert_eq!(
+                classify_terminal(acc, Some(0), false, ""),
+                TerminalOutcome::Completed
+            );
+        }
+    }
+
+    #[test]
+    fn a_conversation_scoped_counter_is_never_assumed_to_start_at_zero() {
+        // W1 delta 8, now also across turn boundaries inside one child: W3 P2
+        // saw step_index 0,1,2 then 3,4, and W3 P3's RESUMED child opened at
+        // step_index 5 with num_turns 3 and a cumulative duration_seconds of
+        // 133.16. Nothing in this decoder keys on any of them starting at zero.
+        let turns = replay_loop(LOOP_TWO_TURNS);
+        let first_indices = step_indices(LOOP_TWO_TURNS);
+        assert!(
+            first_indices.windows(2).all(|w| w[1] >= w[0]),
+            "step_index is monotone across the whole child, not per turn: {first_indices:?}"
+        );
+        assert!(
+            first_indices.iter().any(|index| *index > 2),
+            "turn 2's steps continue the child's numbering: {first_indices:?}"
+        );
+        // num_turns is a conversation counter, carried verbatim into evidence
+        // and never read as an index of this child's turns.
+        let terminal_turns: Vec<u64> = turns
+            .iter()
+            .filter_map(|(acc, _)| {
+                acc.terminal_usage.as_ref()?;
+                None
+            })
+            .collect();
+        assert!(terminal_turns.is_empty(), "nothing derives a turn index");
+        // The resumed capture proves the hazard is real rather than theoretical.
+        let resumed = step_indices(LOOP_RESUME_INIT_ECHO);
+        assert!(
+            resumed.is_empty(),
+            "the resume-echo capture is init only — zero turns spent to check identity"
+        );
+    }
+
+    /// Every `step_index` in a capture, in wire order.
+    fn step_indices(fixture: &str) -> Vec<i64> {
+        fixture
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| {
+                value
+                    .pointer("/step_update/step_index")
+                    .and_then(Value::as_i64)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_subagent_info_payload_becomes_a_typed_tool_event() {
+        // **The `native_subagents` admission, deterministically.** The live test
+        // earns the row; this keeps it honest in CI with no quota, over the
+        // fixture cut from that very run.
+        let turns = replay_loop(LOOP_SUBAGENT);
+        assert_eq!(turns.len(), 2, "define on turn 1, invoke on turn 2");
+        let parent = turns[0].0.conversation_id.clone().expect("a parent id");
+        let (invoke, events) = &turns[1];
+
+        // (1) the step exists and is a subagent step, not merely a tool whose
+        // NAME looks like one.
+        let completed: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == KIND_TOOL_COMPLETED)
+            .filter(|event| event.payload["name"] == json!("subagent:subagent"))
+            .collect();
+        assert_eq!(completed.len(), 1, "exactly one settled subagent record");
+        let children = completed[0].payload["subagent"]
+            .as_array()
+            .expect("the typed child list");
+        assert_eq!(children.len(), 1);
+
+        // (2) a TYPED child conversation_id, distinct from the parent's.
+        let child_id = children[0]["conversation_id"]
+            .as_str()
+            .expect("a child conversation_id — the whole admission");
+        assert!(!child_id.is_empty());
+        assert_ne!(
+            child_id, parent,
+            "a subagent that shares the parent's conversation is not a subagent"
+        );
+        assert_eq!(children[0]["name"], json!("echoer"));
+        assert!(
+            children[0]["log_uri"]
+                .as_str()
+                .expect("a log_uri")
+                .ends_with("transcript.jsonl"),
+            "the child's own trajectory log, carried verbatim so a human can read it"
+        );
+        // (3) a settled outcome for it.
+        assert_eq!(completed[0].payload["state"], json!("DONE"));
+        assert_eq!(completed[0].payload["is_error"], json!(false));
+        assert_eq!(invoke.subagent_conversations, vec![child_id.to_string()]);
+
+        // The ACTIVE step carries no child id at all — which is exactly why the
+        // admission demands a *settled* record and not an in-flight one.
+        let requested: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == KIND_TOOL_REQUESTED)
+            .filter(|event| event.payload["name"] == json!("subagent:subagent"))
+            .collect();
+        assert_eq!(requested.len(), 1, "one request per subagent step, not two");
+
+        // And the negative that keeps the row honest: turn 1 DEFINED a subagent
+        // through an ordinary tool step, and that is not an invocation.
+        assert!(
+            turns[0].0.subagent_conversations.is_empty(),
+            "define_subagent mints no child conversation; only invoking one does"
+        );
+    }
+
+    #[test]
+    fn narration_about_delegating_is_never_a_subagent_record() {
+        // The explicit non-evidence list, made structural: assistant text
+        // saying it delegated must produce no subagent record at all.
+        let mut acc = TurnAccumulator::new();
+        let events = acc.ingest_line(&json!({
+            "event": "step_update",
+            "step_update": {
+                "step_index": 1,
+                "state": "DONE",
+                "step_type": "agent_response",
+                "text_delta": "I have invoked the `echoer` subagent with conversation_id abc-123.",
+            }
+        }));
+        assert!(acc.subagent_conversations.is_empty());
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != KIND_TOOL_COMPLETED
+                    && event.kind != KIND_TOOL_REQUESTED),
+            "prose is never tool evidence"
+        );
+        // And a subagent_info with no child conversation_id is not one either.
+        let mut acc = TurnAccumulator::new();
+        acc.ingest_line(&json!({
+            "event": "step_update",
+            "step_update": {
+                "step_index": 7,
+                "state": "DONE",
+                "step_type": "subagent",
+                "tool_name": "invoke_subagent",
+                "subagent_info": {"subagents": [{"type_name": "echoer", "role": "Word Echoer"}]},
+            }
+        }));
+        assert!(
+            acc.subagent_conversations.is_empty(),
+            "a subagent_info with no child conversation_id admits nothing"
+        );
+    }
+
+    #[test]
+    fn the_loop_schema_fixture_carries_structured_output_on_every_turn() {
+        // W3 A3 closed the open question the good way: `--help`'s "only
+        // applicable to the final result" means the final result of each TURN,
+        // not only of the child. So a None on an intermediate turn would be an
+        // anomaly, not an expectation, and the tier stays NativeSchemaFlag.
+        let turns = replay_loop(LOOP_SCHEMA);
+        assert_eq!(turns.len(), 2);
+        let first = turns[0]
+            .0
+            .structured_output
+            .clone()
+            .expect("turn 1's schema output");
+        let second = turns[1]
+            .0
+            .structured_output
+            .clone()
+            .expect("turn 2's schema output");
+        assert_eq!(first, json!({"word": "alpha", "n": 1}));
+        assert_eq!(second, json!({"word": "bravo", "n": 2}));
+        // Beside the prose response, never instead of it.
+        assert!(
+            turns[0]
+                .0
+                .last_response
+                .as_deref()
+                .expect("a response")
+                .contains("alpha")
+        );
+    }
+
+    #[test]
+    fn a_denied_tool_on_the_loop_is_a_typed_failure_and_the_last_turn_of_its_child() {
+        // **The measurement that inverts W1's, and the reason W1 was right to
+        // keep the packet's typed detector.** On the loop at 1.1.19 a denied
+        // `command` tool resolves ACTIVE->ERROR with the packet's own 1.1.17
+        // typed shape, the terminal is ERROR with the same string, stderr is
+        // EMPTY, and the child exits 1 — where print mode gives
+        // DONE/CANCELED/exit 0/stderr-only.
+        let turns = replay_loop(LOOP_DENIED_TOOL);
+        assert_eq!(turns.len(), 1);
+        let (acc, _) = &turns[0];
+        assert_eq!(acc.denied_tools, vec!["run_command".to_string()]);
+        assert!(
+            !denial_evidence_in_stderr(""),
+            "no stderr notice at all on this transport — the typed detector is the one that fires"
+        );
+        let TerminalOutcome::Failed { reason } = classify_terminal(acc, Some(1), false, "") else {
+            panic!("an explicit, typed failure")
+        };
+        assert!(
+            reason.contains("user denied permission to run command"),
+            "{reason}"
+        );
+        // Not the empty-SUCCESS class and not an ambiguity: the harness said
+        // exactly what went wrong, which is the ONLY route to Failed.
+        assert_eq!(acc.status(), Some("ERROR"));
+    }
+
+    #[test]
+    fn a_timeout_terminal_is_an_interrupt_when_we_asked_and_a_failure_when_we_did_not() {
+        // **Both readings of the IDENTICAL bytes.** [W3 P4] measured a SIGINT
+        // landing mid-turn producing `status: ERROR` with
+        // `error: "timeout waiting for response"` — the very string a
+        // `--print-timeout` expiry produces [W1 P5], which is why the print
+        // transport's own captured timeout fixture is the right bytes to drive
+        // this with: the whole finding is that the two are indistinguishable on
+        // the wire. `status` can never tell them apart, so only this adapter's
+        // own bit can — which is precisely why `classify_terminal` takes it.
+        let (acc, _) = replay(PRINT_TIMEOUT);
+        assert_eq!(acc.status(), Some("ERROR"));
+        assert!(acc.terminal_is_timeout_ambiguous());
+        assert!(acc.terminal_is_signal_shaped());
+        assert_eq!(
+            classify_terminal(&acc, Some(1), true, ""),
+            TerminalOutcome::InterruptedRunning,
+            "we asked for the kill: a stage we interrupted is not a stage that failed, and W3 A7 \
+             measured the conversation staying fully resumable afterwards"
+        );
+        let TerminalOutcome::Failed { reason } = classify_terminal(&acc, Some(1), false, "") else {
+            panic!("nobody asked: the harness's own statement stands")
+        };
+        assert_eq!(reason, "timeout waiting for response");
+
+        // The amendment is narrow on purpose: a DIFFERENT ERROR string is still
+        // a failure even when we did ask, because this adapter may not claim
+        // authorship of an error it did not cause.
+        let denied = replay_loop(LOOP_DENIED_TOOL);
+        assert!(!denied[0].0.terminal_is_signal_shaped());
+        assert!(matches!(
+            classify_terminal(&denied[0].0, Some(1), true, ""),
+            TerminalOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn an_idle_child_sigint_is_an_interrupt_and_never_an_adapter_defect() {
+        // **[W3 A7] corrects the spec's own expectation, and the correction was
+        // load-bearing.** The spec (on W3 P4) expected one SIGINT terminal;
+        // re-measuring found two, split by where the signal lands. An idle
+        // child — blocked reading stdin — answers
+        // `stream input cancelled: context canceled`, which shares its prefix
+        // with the five typed *malformed-message* refusals and means the
+        // opposite. A prefix-only classifier reported a correct interrupt as an
+        // adapter defect; this test is why it does not.
+        let turns = replay_loop(LOOP_SIGINT_CANCELLED);
+        let (acc, _) = turns.last().expect("the cancelled terminal");
+        assert_eq!(acc.status(), Some("ERROR"));
+        assert_eq!(
+            acc.loop_input_rejection(),
+            None,
+            "a cancellation is not a malformed message: nothing this adapter composed was wrong"
+        );
+        assert!(acc.terminal_is_signal_shaped());
+        assert!(
+            !acc.terminal_is_timeout_ambiguous(),
+            "this shape, unlike the timeout one, collides with no deadline expiry"
+        );
+        assert_eq!(
+            classify_terminal(acc, Some(1), true, ""),
+            TerminalOutcome::InterruptedRunning
+        );
+        // And the five real refusals are still caught.
+        for fixture in [LOOP_MISSING_EVENT, LOOP_BAD_BLOCK, LOOP_CONTROL_REQUEST] {
+            assert!(replay_loop(fixture)[0].0.loop_input_rejection().is_some());
+        }
+    }
+
+    #[test]
+    fn the_sandbox_probe_terminal_is_a_mechanism_failure_not_a_permission_denial() {
+        // W3 S1, and the distinction is the whole finding: `proceed-in-sandbox`
+        // with NO allow-rule did not auto-deny — the permission gate lifted —
+        // and the tool then failed at the sandbox MECHANISM. A classifier that
+        // read this as a denial would have reported a working second permission
+        // channel as a broken one.
+        let turns = replay_loop(LOOP_SANDBOX_UNAVAILABLE);
+        let (acc, _) = &turns[0];
+        assert!(
+            acc.denied_tools.is_empty(),
+            "no permission denial anywhere: the gate lifted"
+        );
+        let TerminalOutcome::Failed { reason } = classify_terminal(acc, Some(1), false, "") else {
+            panic!("a typed failure")
+        };
+        assert!(reason.contains("connecting to sandbox server"), "{reason}");
+        // And the retry that resolved DONE with no output must not be mistaken
+        // for a completion: the terminal outranks it.
+        assert!(acc.tool_steps >= 2);
+    }
+
+    #[test]
+    fn the_resume_fork_is_detectable_at_child_start_for_zero_quota() {
+        // Both independent detectors, on the loop, before a turn is spent.
+        let echoed: Value =
+            serde_json::from_str(LOOP_RESUME_INIT_ECHO.lines().next().expect("a line"))
+                .expect("parses");
+        let mut acc = TurnAccumulator::new();
+        acc.ingest_line(&echoed);
+        let identity = LoopIdentity::from_accumulator(&acc);
+        assert_eq!(
+            identity.conversation_id.as_deref(),
+            Some("b3be71a6-fd10-4525-875a-e7789a9811c3"),
+            "the requested id echoed back at child start"
+        );
+        // Detector two, independent of the echo.
+        assert!(resume_fork_warning_in_stderr(LOOP_RESUME_FORK_WARNING));
+        assert!(!resume_fork_warning_in_stderr(""));
+    }
+
+    #[test]
+    fn a_prompt_over_the_loop_cap_is_refused_not_truncated() {
+        // The capability delta, and its honest bound: a prompt print mode
+        // refuses at PREPARE rides the loop fine, and one over the loop's own
+        // cap is still refused rather than silently trimmed.
+        let request = prompt_request(Vec::new());
+        let big = "x".repeat(ARGV_PROMPT_CAP + 1);
+        assert!(
+            check_prompt_budget(Transport::Print, &big, &request).is_err(),
+            "print refuses it"
+        );
+        assert!(
+            check_prompt_budget(Transport::Loop, &big, &request).is_ok(),
+            "the loop carries it: the prompt leaves argv entirely"
+        );
+        let enormous = "x".repeat(LOOP_PROMPT_CAP + 1);
+        let error = check_prompt_budget(Transport::Loop, &enormous, &request)
+            .expect_err("over the loop cap");
+        assert!(error.contains("Nothing is truncated"), "{error}");
+        assert!(
+            error.contains("no measured limit"),
+            "the refusal says why a cap exists at all when nothing measured one: {error}"
+        );
+    }
+
+    #[test]
+    fn the_stderr_log_is_bounded_and_says_what_it_dropped() {
+        let mut log = StderrLog::default();
+        log.push("first".to_string());
+        assert_eq!(log.dropped, 0);
+        log.push("x".repeat(STREAM_MEMORY_CAP));
+        // The older line is evicted and COUNTED — a dropped auto-denial notice
+        // that nobody counted is the hazard this whole structure exists for —
+        // while the newest line survives rather than evicting itself.
+        assert_eq!(log.dropped, 1);
+        let taken = log.take_all();
+        assert_eq!(taken.len(), 1);
+        assert!(taken[0].1.starts_with('x'));
+        assert!(log.take_all().is_empty(), "draining is a move, not a copy");
+        // A single over-cap line is truncated with its loss marked, never
+        // dropped outright.
+        let mut log = StderrLog::default();
+        log.push("y".repeat(STREAM_MEMORY_CAP + 10));
+        let taken = log.take_all();
+        assert_eq!(taken.len(), 1);
+        assert!(taken[0].1.contains("stderr line cap hit"));
+    }
+
     // ------------------------------------------------------- admission rows
 
     /// The structural check that keeps the ledger honest.
     #[test]
     fn admission_rows_agree_with_capabilities() {
-        let capabilities = capabilities_for(Transport::Print);
-        let v1: &[(&str, bool)] = &[
-            ("persistent_sessions", capabilities.persistent_sessions),
-            ("native_background", capabilities.native_background),
-            ("streaming", capabilities.streaming),
-            ("history", capabilities.history),
-            ("resume", capabilities.resume),
-            ("interrupt", capabilities.interrupt),
-            ("model_selection", capabilities.model_selection),
-            ("profiles", capabilities.profiles),
-            ("approval_flow", capabilities.approval_flow),
-            ("human_attach", capabilities.human_attach),
-            ("usage", capabilities.usage),
-            ("native_subagents", capabilities.native_subagents),
-            ("ask", capabilities.ask),
-        ];
-        for (name, claimed) in v1 {
-            let rows: Vec<_> = ADMISSION_ROWS
-                .iter()
-                .filter(|row| row.capability == *name && row.transport == Transport::Print)
-                .collect();
-            assert_eq!(
-                rows.len(),
-                1,
-                "{name}: exactly one row per v1 flag per transport"
-            );
-            assert_eq!(
-                rows[0].claimed, *claimed,
-                "{name}: the ledger and capabilities() must agree"
-            );
+        // Now driven over EVERY transport, so a row added to one and forgotten
+        // on the other fails the build rather than a review.
+        for transport in [Transport::Print, Transport::Loop] {
+            let capabilities = capabilities_for(transport);
+            for (name, claimed) in v1_flags(&capabilities) {
+                let rows: Vec<_> = ADMISSION_ROWS
+                    .iter()
+                    .filter(|row| row.capability == name && row.transport == transport)
+                    .collect();
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "{name} on {}: exactly one row per v1 flag per transport",
+                    transport.as_str()
+                );
+                assert_eq!(
+                    rows[0].claimed,
+                    claimed,
+                    "{name} on {}: the ledger and capabilities_for() must agree",
+                    transport.as_str()
+                );
+            }
         }
 
-        let adapter_local: &[&str] = &[
-            "config_injection",
-            "permission_mode_reported_at_launch",
-            "non_blocking_run",
-            "structured_output",
+        // Adapter-local rows, transport-tagged. The four W1 rows are duplicated
+        // for the loop (they still hold, with their own measured notes) and W3
+        // adds four of its own.
+        let adapter_local: &[(&str, Transport)] = &[
+            ("config_injection", Transport::Print),
+            ("permission_mode_reported_at_launch", Transport::Print),
+            ("non_blocking_run", Transport::Print),
+            ("structured_output", Transport::Print),
+            ("config_injection", Transport::Loop),
+            ("permission_mode_reported_at_launch", Transport::Loop),
+            ("non_blocking_run", Transport::Loop),
+            ("structured_output", Transport::Loop),
+            ("turn_serialization", Transport::Loop),
+            ("identity_before_first_turn", Transport::Loop),
+            ("prompt_channel", Transport::Loop),
+            ("sandbox", Transport::Loop),
         ];
-        for name in adapter_local {
+        for (name, transport) in adapter_local {
             assert_eq!(
                 ADMISSION_ROWS
                     .iter()
-                    .filter(|row| row.capability == *name)
+                    .filter(|row| row.capability == *name && row.transport == *transport)
                     .count(),
                 1,
-                "{name}: exactly one adapter-local row"
+                "{name} on {}: exactly one adapter-local row",
+                transport.as_str()
             );
         }
 
@@ -4530,14 +7265,17 @@ mod tests {
             if row.claimed {
                 assert!(
                     !row.admission_test.is_empty(),
-                    "{}: a claimed capability with no admission test is a claim nothing checks (L8)",
-                    row.capability
+                    "{} on {}: a claimed capability with no admission test is a claim nothing \
+                     checks (L8)",
+                    row.capability,
+                    row.transport.as_str()
                 );
             } else {
                 assert!(
                     row.admission_test.is_empty(),
-                    "{}: an unclaimed capability names no test; the reason lives in `note`",
-                    row.capability
+                    "{} on {}: an unclaimed capability names no test; the reason lives in `note`",
+                    row.capability,
+                    row.transport.as_str()
                 );
             }
             assert!(
@@ -4552,11 +7290,82 @@ mod tests {
             );
         }
 
+        let v1_len = v1_flags(&capabilities_for(Transport::Print)).len();
         assert_eq!(
             ADMISSION_ROWS.len(),
-            v1.len() + adapter_local.len(),
-            "every row is one of the thirteen v1 flags or one of the four adapter-local rows — \
-             an unlisted row is a claim nothing checks"
+            2 * v1_len + adapter_local.len(),
+            "every row is one of the thirteen v1 flags on one of the two transports, or one of \
+             the transport-tagged adapter-local rows — an unlisted row is a claim nothing checks"
+        );
+    }
+
+    /// The v1 contract's flags, paired with what a capability set claims for
+    /// each. One list, used by every structural check, so a flag added to
+    /// `Capabilities` cannot be checked in one test and forgotten in another.
+    fn v1_flags(capabilities: &Capabilities) -> Vec<(&'static str, bool)> {
+        vec![
+            ("persistent_sessions", capabilities.persistent_sessions),
+            ("native_background", capabilities.native_background),
+            ("streaming", capabilities.streaming),
+            ("history", capabilities.history),
+            ("resume", capabilities.resume),
+            ("interrupt", capabilities.interrupt),
+            ("model_selection", capabilities.model_selection),
+            ("profiles", capabilities.profiles),
+            ("approval_flow", capabilities.approval_flow),
+            ("human_attach", capabilities.human_attach),
+            ("usage", capabilities.usage),
+            ("native_subagents", capabilities.native_subagents),
+            ("ask", capabilities.ask),
+        ]
+    }
+
+    /// **New in W3.** `capabilities_for` is exhaustively matched over
+    /// `Transport` and every flag is set explicitly in each arm — no
+    /// `..Default::default()`, no struct-update from the other transport — so a
+    /// future transport cannot inherit a claim it never measured. Checked as
+    /// source text because that is the only place the *absence* of a spread is
+    /// visible.
+    #[test]
+    fn both_transports_answer_every_v1_flag() {
+        let body_start = THIS_MODULE_SOURCE
+            .find("fn capabilities_for(transport: Transport) -> Capabilities {")
+            .expect("capabilities_for");
+        let body_end = body_start
+            + THIS_MODULE_SOURCE[body_start..]
+                .find("\n}\n")
+                .expect("its closing brace");
+        let body = &THIS_MODULE_SOURCE[body_start..body_end];
+        assert!(
+            !body.contains("..Default::default()") && !body.contains("..capabilities"),
+            "capabilities_for must set every flag explicitly in every arm: a spread lets a new \
+             transport inherit a claim nobody measured for it"
+        );
+        for transport in [Transport::Print, Transport::Loop] {
+            let capabilities = capabilities_for(transport);
+            assert_eq!(
+                v1_flags(&capabilities).len(),
+                13,
+                "{}: every v1 flag is answered",
+                transport.as_str()
+            );
+        }
+        // And the two columns are genuinely different, on exactly the one
+        // boolean W3's evidence moved.
+        let print = capabilities_for(Transport::Print);
+        let loop_ = capabilities_for(Transport::Loop);
+        let moved: Vec<_> = v1_flags(&print)
+            .into_iter()
+            .zip(v1_flags(&loop_))
+            .filter(|((_, p), (_, l))| p != l)
+            .map(|((name, _), _)| name)
+            .collect();
+        assert_eq!(
+            moved,
+            vec!["native_subagents"],
+            "exactly one v1 boolean may differ between the transports, and only on W3 A1's typed \
+             subagent record — a wave that flipped booleans to look productive is the defect this \
+             ledger exists to prevent"
         );
     }
 
@@ -4615,14 +7424,36 @@ mod tests {
                 row.capability
             );
         }
-        // And the two rows that ARE live-measured are the two the live tier
-        // actually drives (three turns total).
+        // And the seven rows that ARE live-measured are backed by the four
+        // `live_agy_*` tests the live tier actually drives — SEVEN turns total
+        // (1+2+2+2, per this wave's `live-tier-run.txt`): two rows on print, and
+        // on the loop one test covering resume/model_selection/
+        // identity_before_first_turn and one covering native_subagents/
+        // turn_serialization. This comment states a count the assertion below
+        // enforces; the two move in the same commit.
         let live: Vec<_> = ADMISSION_ROWS
             .iter()
             .filter(|row| row.evidence == Evidence::LiveMeasured)
             .map(|row| row.capability)
             .collect();
-        assert_eq!(live, vec!["resume", "model_selection"]);
+        assert_eq!(
+            live,
+            vec![
+                // print
+                "resume",
+                "model_selection",
+                // loop — five rows, two live tests, and the sharing is
+                // deliberate: one turn that resumes a conversation also proves
+                // the pin echo and the pre-turn identity window.
+                "resume",
+                "model_selection",
+                "native_subagents",
+                "turn_serialization",
+                "identity_before_first_turn",
+            ],
+            "the LiveMeasured set must be exactly the rows this wave's live tier actually drove; \
+             it is updated in the same commit as any row that gains or loses a live test"
+        );
     }
 
     #[test]
@@ -4633,6 +7464,18 @@ mod tests {
         assert!(rendered.contains("capability | transport | claimed | tier | evidence"));
         assert!(rendered.contains("history | print-stream-json | false"));
         assert!(rendered.contains("config_injection | print-stream-json | true"));
+        // A transport that silently stopped being rendered fails here rather
+        // than quietly shrinking the ledger a reader is shown.
+        assert!(
+            rendered
+                .lines()
+                .filter(|line| line.contains("| input-loop-stream-json |"))
+                .count()
+                >= 13,
+            "every v1 flag owes the loop transport a rendered row"
+        );
+        assert!(rendered.contains("native_subagents | input-loop-stream-json | true"));
+        assert!(rendered.contains("ask | input-loop-stream-json | false"));
         assert_eq!(
             rendered.lines().count(),
             ADMISSION_ROWS.len() + 2,
@@ -4661,7 +7504,15 @@ mod tests {
         assert_eq!(backend.name(), AGY_BACKEND_NAME);
         assert_eq!(backend.name(), "agy");
         assert_eq!(backend.runtime_scope(), RuntimeScope::PerExecution);
-        assert_eq!(backend.capabilities(), capabilities_for(Transport::Print));
+        // Deliberately compared against the RESOLVED transport rather than
+        // hardcoded to print: on a host whose installed agy offers
+        // --input-format, `Auto` resolves to the loop and this backend honestly
+        // claims the loop's set. Hardcoding print here would have made the test
+        // pass by asserting the adapter lies about itself.
+        assert_eq!(
+            backend.capabilities(),
+            capabilities_for(backend.transport_resolution().transport)
+        );
     }
 
     #[test]
