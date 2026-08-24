@@ -32,6 +32,13 @@
 //! That separation is §25's "work versus execution" rendered as a type — a
 //! backend cannot complete a stage by exiting, and cannot fail one by dying.
 
+/// The `agy --print --output-format stream-json` adapter (W1 of the *Sergeant
+/// speaks Antigravity* sprint, `docs/proposals/agy-adapter-2026-08-23.md` —
+/// see the module's own doc comment for the measurements it rests on).
+/// Registration in `daemon.rs` and every CLI surface remain W2's gap (K2:
+/// this wave is the adapter and nothing else): this module compiles, is unit-
+/// and contract-tested, and is reachable by nothing yet.
+pub mod agy;
 pub mod claude;
 /// The `codex exec` adapter (W1 of the *Sergeant speaks Codex* sprint,
 /// `knowledge/evidence/resources/h-series/w1-spec.md`, closing deviation D6

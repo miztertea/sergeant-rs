@@ -71,6 +71,10 @@ const PUT_SITES: &[PutSite] = &[
         file: "src/backend/opencode.rs",
         context: "impl TurnReader",
     },
+    PutSite {
+        file: "src/backend/agy.rs",
+        context: "impl TurnReader",
+    },
 ];
 
 /// Every `.put(`/`.put_stream(` call in `file`'s non-test code, as
@@ -548,6 +552,129 @@ fn drive_one_recorded_opencode_turn(data_dir: &Path) -> Event {
 fn opencode_arm_refs_in_event_recovers_the_archived_raw_ref() {
     let data = TempDir::new().expect("tempdir");
     let ended = drive_one_recorded_opencode_turn(data.path());
+
+    let ended_refs = refs_in_event(&ended);
+    assert_eq!(
+        ended_refs.len(),
+        1,
+        "expected exactly one ref in conversation.turn.ended"
+    );
+    let the_ref = ended_refs.iter().next().unwrap();
+
+    let path = data.path().join("blobs").join("b3").join(the_ref.hex());
+    assert!(
+        path.exists(),
+        "the ref's hex must name a real blob file: {path:?}"
+    );
+    let bytes = std::fs::read(&path).expect("read blob");
+    assert_eq!(
+        blake3::hash(&bytes).to_hex().to_string(),
+        the_ref.hex(),
+        "the store's own contract, re-proved from the extractor's side"
+    );
+}
+
+// ------------------------------------------------------------------
+// Layer 2, agy arm: a real recorded turn, through the real adapter (W1)
+// ------------------------------------------------------------------
+
+const AGY_RECORDED_TURN: &str = include_str!("fixtures/agy-1.1.19-minimal-turn.jsonl");
+
+/// A minimal stub `agy`: answers the probe's gates (`--version` on stdout,
+/// `--help` on **stderr**, where the real CLI measurably writes it at 1.1.19,
+/// and the zero-quota `-p "/config"` read), then replays the recorded
+/// transcript on every turn invocation. Deliberately smaller than
+/// `tests/agy_backend.rs`'s own `StubAgy` — this suite needs exactly one
+/// recorded turn through the real adapter, not the full launch-grammar
+/// contract surface.
+fn write_agy_stub(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("agy-stub-a4");
+    let replay = dir.join("agy-replay-a4.jsonl");
+    std::fs::write(&replay, AGY_RECORDED_TURN).expect("write replay fixture");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then echo \"1.1.19\"; exit 0; fi\n\
+         if [ \"$1\" = \"--help\" ]; then echo \"--print --output-format --model --conversation --disable-slash-commands --json-schema\" >&2; exit 0; fi\n\
+         if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"/config\" ]; then echo '{{\"command\":{{\"name\":\"config\",\"data\":{{\"config\":{{\"toolPermission\":\"request-review\",\"permissions\":null,\"allowNonWorkspaceAccess\":true,\"trustedWorkspaces\":[]}}}}}}}}'; exit 0; fi\n\
+         cat \"{}\"\n",
+        replay.display()
+    );
+    std::fs::write(&path, script).expect("write stub");
+    let mut perm = std::fs::metadata(&path).expect("stat").permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&path, perm).expect("chmod");
+    support::wait_until_executable(&path);
+    path
+}
+
+/// Drive one recorded turn through the real `AgyBackend`, over the stub above,
+/// into a real journal + blob store under `data_dir`. Returns the journaled
+/// `conversation.turn.ended` event — the only one this adapter carries the
+/// archived-raw ref on (its `usage.updated` events are per-step native usage
+/// records, emitted while the turn is still streaming and long before there is
+/// a blob to name).
+fn drive_one_recorded_agy_turn(data_dir: &Path) -> Event {
+    let stub_path = write_agy_stub(data_dir);
+    let mut config = sergeant_rs::backend::agy::AgyConfig::new(data_dir);
+    config.executable = stub_path;
+    let backend = sergeant_rs::backend::agy::AgyBackend::new(config);
+    let shared = Arc::new(tokio::sync::Mutex::new(core(data_dir)));
+    backend.set_event_sink(journaling_sink(shared.clone()));
+
+    let handle = backend
+        .start(&sergeant_rs::backend::StartRequest {
+            work_id: "work-a4-agy".to_string(),
+            execution_id: "e-a4-agy".to_string(),
+            stage_id: "00-only".to_string(),
+            attempt: 1,
+            cwd: data_dir.to_path_buf(),
+            intent: "a4 fixture replay".to_string(),
+            context: String::new(),
+            model: None,
+            profile: None,
+            execute: None,
+            instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
+            bindings: Vec::new(),
+        })
+        .expect("start");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let observation = backend.observe(&handle).expect("observe");
+        if observation.native != sergeant_rs::backend::NativeState::Running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "turn did not settle");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let core = shared.blocking_lock();
+        let events: Vec<Event> = core
+            .journal
+            .replay()
+            .expect("replay")
+            .collect::<Result<_, _>>()
+            .expect("events");
+        let ended = events
+            .iter()
+            .find(|e| e.kind == "conversation.turn.ended")
+            .cloned();
+        if let Some(ended) = ended {
+            return ended;
+        }
+        drop(core);
+        assert!(Instant::now() < deadline, "turn.ended never journaled");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn agy_arm_refs_in_event_recovers_the_archived_raw_ref() {
+    let data = TempDir::new().expect("tempdir");
+    let ended = drive_one_recorded_agy_turn(data.path());
 
     let ended_refs = refs_in_event(&ended);
     assert_eq!(

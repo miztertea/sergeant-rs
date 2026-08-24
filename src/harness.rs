@@ -1,5 +1,5 @@
 //! `sgt <harness> -- <args>` (ADR 0006, D2): `claude`, `codex`, `opencode`,
-//! `goose`. Composes an environment, binds the estate, then **exec**s —
+//! `goose`, `agy`. Composes an environment, binds the estate, then **exec**s —
 //! replacing this process image with the harness's, not forking and
 //! supervising it. That boundary is load-bearing (`NORTH-STAR.md`'s "Never"
 //! list: "reconstructed tmux-era supervision"): once the harness starts,

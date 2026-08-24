@@ -102,6 +102,25 @@ cov_stage_begin c2-opencode_routing
 cov_run cargo llvm-cov --no-report --test opencode_routing --locked || cov_fail "opencode_routing failed under instrumentation"
 cov_stage_end 1 "the opencode_routing test binary must write its own profile"
 
+# Added 2026-08-23, in the same commit that adds the suite (the W1 agy wave) --
+# wired at birth rather than recovered later, per the owner's 90-floor ruling
+# and the #231 lesson: a suite absent from every stage list contributes nothing
+# to Gate D however green it runs. Sits in C2, not C3, for codex_backend's and
+# opencode_backend's exact reasons: StubAgy is a shell-script stand-in
+# (uninstrumented, no profile expected), and the suite spawns no `sgt`
+# subprocess. Floor 1.
+cov_stage_begin c2-agy_backend
+cov_run cargo llvm-cov --no-report --test agy_backend --locked || cov_fail "agy_backend failed under instrumentation"
+cov_stage_end 1 "the agy_backend test binary must write its own profile (StubAgy's children are shell-script stand-ins, uninstrumented and no loss, per codex_backend's precedent)"
+
+# Added 2026-08-23, in the same commit that creates the suite (W2, agy
+# registration wave) — codex_routing's/opencode_routing's exact rationale:
+# in-process-only throughout (no StubAgy, no subprocess), so it sits in C2
+# rather than needing C3's ≥2-profile floor. Floor 1.
+cov_stage_begin c2-agy_routing
+cov_run cargo llvm-cov --no-report --test agy_routing --locked || cov_fail "agy_routing failed under instrumentation"
+cov_stage_end 1 "the agy_routing test binary must write its own profile"
+
 # Added 2026-08-23, same commit that creates the suite (W2, opencode
 # registration wave, item 6 / #231(b)): a plain static-scan test, no
 # subprocess, no daemon — sits in C2 for the same reason codex_routing does.
