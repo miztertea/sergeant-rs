@@ -1486,11 +1486,15 @@ impl Backend for FakeBackend {
             });
         }
         // W4 (2026-08-23): agy's own print-transport soft-deny shape, if this
-        // step scripted one — a clean, error-free `tool.*` pair, deliberately
-        // carrying no `error` key at all (see
-        // [`FakeStep::print_soft_denied_tool`] for why: agy's own measured
-        // shape has none either, which is the honesty hazard this exists to
-        // reproduce).
+        // step scripted one — mirrors `agy.rs`'s own `ingest_tool_info`
+        // field-for-field (`tool_use_id`/`name`/`state`/`is_error`/`error`/
+        // `denied`/`has_output`/`output_tail`), not the opencode-flavored
+        // shape above: `state: "DONE"`, `error: null` (the key is always
+        // present, never omitted — `tool_denial_evidence` requires an
+        // `error` *object* to fire, so a null `error` also pins `denied:
+        // false`), no output either (see [`FakeStep::print_soft_denied_tool`]
+        // for why: agy's own measured shape is a clean, error-free
+        // completion, which is the honesty hazard this exists to reproduce).
         if let Some(tool) = &execution.step.soft_denied_tool {
             events.push(NativeEvent {
                 kind: KIND_TOOL_REQUESTED.to_string(),
@@ -1501,14 +1505,23 @@ impl Backend for FakeBackend {
                 payload: json!({
                     "tool_use_id": tool.call_id,
                     "name": tool.name,
+                    "state": "DONE",
                     "is_error": false,
-                    "status": "done",
+                    "error": null,
+                    "denied": false,
+                    "has_output": false,
+                    "output_tail": "",
                 }),
             });
         }
         // W4 (2026-08-23): agy's own loop-transport denied-tool shape, if
-        // this step scripted one — a typed `tool.*` rejection carrying the
-        // harness's own error type and message verbatim (see
+        // this step scripted one — again mirrors `ingest_tool_info`
+        // field-for-field: `state: "ERROR"`, `error` is the **nested**
+        // `{type, message}` object the real decoder passes through
+        // untouched (never flattened to a bare string), and `denied: true`
+        // because `tool_denial_evidence` fires on `type == "TOOL_ERROR"`
+        // plus a `"permission"`-bearing message — exactly what this shape's
+        // measured capture carries (see
         // [`FakeStep::loop_denied_tool_kills_child`]).
         if let Some(tool) = &execution.step.killed_tool {
             events.push(NativeEvent {
@@ -1520,10 +1533,15 @@ impl Backend for FakeBackend {
                 payload: json!({
                     "tool_use_id": tool.call_id,
                     "name": tool.name,
+                    "state": "ERROR",
                     "is_error": true,
-                    "status": "error",
-                    "error_type": tool.error_type,
-                    "error": tool.message,
+                    "error": json!({
+                        "type": tool.error_type,
+                        "message": tool.message,
+                    }),
+                    "denied": true,
+                    "has_output": false,
+                    "output_tail": "",
                 }),
             });
         }
@@ -2418,13 +2436,19 @@ mod tests {
                     payload: json!({
                         "tool_use_id": "step-3",
                         "name": "run_command",
+                        "state": "DONE",
                         "is_error": false,
-                        "status": "done",
+                        "error": null,
+                        "denied": false,
+                        "has_output": false,
+                        "output_tail": "",
                     }),
                 },
             ],
-            "structured evidence alone reads as a clean completion — no error field \
-             anywhere — which is the exact honesty hazard this shape exists to pin"
+            "structured evidence alone reads as a clean completion — `state: DONE`, \
+             `error: null`, `denied: false` — which is the exact honesty hazard this \
+             shape exists to pin; the shape mirrors agy.rs's own `ingest_tool_info` \
+             field-for-field"
         );
     }
 
@@ -2515,14 +2539,22 @@ mod tests {
                 payload: json!({
                     "tool_use_id": "step-3",
                     "name": "run_command",
+                    "state": "ERROR",
                     "is_error": true,
-                    "status": "error",
-                    "error_type": "TOOL_ERROR",
-                    "error": "permission check failed for command \"echo agy-w3-probe\": user \
-                              denied permission to run command:\necho agy-w3-probe",
+                    "error": {
+                        "type": "TOOL_ERROR",
+                        "message": "permission check failed for command \"echo agy-w3-probe\": \
+                                     user denied permission to run command:\necho agy-w3-probe",
+                    },
+                    "denied": true,
+                    "has_output": false,
+                    "output_tail": "",
                 }),
             }),
-            "structured evidence carries the harness's own typed error verbatim"
+            "structured evidence carries the harness's own typed error verbatim as the \
+             nested {{type, message}} object agy.rs's own ingest_tool_info passes through \
+             untouched, and `denied: true` matches tool_denial_evidence firing on a \
+             TOOL_ERROR whose message names permission"
         );
 
         let refused = fake
