@@ -2681,7 +2681,15 @@ async fn a_known_never_forgotten_execution_whose_signal_never_arrives_parks_rath
 
     let (registry, fake) = one_fake([FakeStep::never_arrives().with_native(NativeState::Exited)]);
     let poll = Duration::from_millis(50);
-    let ceiling = Duration::from_millis(150);
+    // 2s, not the sibling tests' 150ms: this test's mid-check asserts the
+    // Work is still `active` "well within the ceiling" after a ~100ms sleep
+    // plus two HTTP round-trips. With a 150ms ceiling that left a ~50ms
+    // margin, which release run 17's instrumented Gate D runner ate — the
+    // ceiling tripped first and the mid-check read `blocked` ("turn ceiling
+    // exceeded (0.15s)"). A 20x margin keeps the mid-check meaningful on the
+    // slowest measured runner; the ceiling-fires wait below stays bounded by
+    // `interrupt_budget`, which already carries CI's jitter allowance.
+    let ceiling = Duration::from_secs(2);
     let handle = daemon::start_with(
         data.path(),
         DaemonConfig {
