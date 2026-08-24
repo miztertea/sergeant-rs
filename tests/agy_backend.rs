@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use sergeant_rs::backend::agy::{AGY_BACKEND_NAME, AgyBackend, AgyConfig};
+use sergeant_rs::backend::agy::{AGY_BACKEND_NAME, AgyBackend, AgyConfig, TransportChoice};
 use sergeant_rs::backend::{
     Backend, BackendError, BackendSignal, BindingSummary, ExecutionHandle, NativeState,
     Observation, ProbeReport, ResumeRequest, StartRequest,
@@ -68,6 +68,18 @@ const INVALID_MODEL: &str = include_str!("fixtures/agy-1.1.19-invalid-model-refu
 const SLASH_COMMAND: &str = include_str!("fixtures/agy-1.1.19-slash-command-result.jsonl");
 const SIGKILL_TRUNCATED: &str = include_str!("fixtures/agy-1.1.19-sigkill-truncated.jsonl");
 const JSON_SCHEMA: &str = include_str!("fixtures/agy-1.1.19-json-schema.jsonl");
+
+// ------------------------------------------------- W3 loop-transport captures
+
+const LOOP_TWO_TURNS: &str = include_str!("fixtures/agy-1.1.19-loop-two-turns.jsonl");
+const LOOP_SUBAGENT: &str = include_str!("fixtures/agy-1.1.19-loop-subagent-info.jsonl");
+const LOOP_DENIED_TOOL: &str =
+    include_str!("fixtures/agy-1.1.19-loop-denied-tool-kills-child.jsonl");
+const LOOP_RESUME_INIT_ECHO: &str = include_str!("fixtures/agy-1.1.19-loop-resume-init-echo.jsonl");
+
+/// The single `init` line a loop child emits at **child start**, before any
+/// stdin line is read — the real capture of W3 P1 row I's empty-stdin child.
+const LOOP_INIT_LINE: &str = include_str!("fixtures/agy-1.1.19-loop-init-only-empty-stdin.jsonl");
 
 /// The conversation id every event of `agy-1.1.19-minimal-turn.jsonl` carries —
 /// the id the adapter is expected to learn from that stream's `init` line.
@@ -126,6 +138,12 @@ struct StubAgy {
     exit_code: PathBuf,
     grandchild: PathBuf,
     grandchild_pid: PathBuf,
+    /// The single `init` line the loop arm emits at child start, before any
+    /// stdin line is read — the shape W3 P1 row I measured.
+    loop_init: PathBuf,
+    /// Prefix for the loop arm's per-turn marker files (`-stderr-<n>`,
+    /// `-stderr-pre-<n>`, `-die-after-<n>`, `-no-init`, `-init-hang`).
+    loop_prefix: PathBuf,
 }
 
 impl StubAgy {
@@ -134,6 +152,8 @@ impl StubAgy {
         let path = dir.join(format!("{name}-stub"));
         let record = dir.join(format!("{name}-launches.txt"));
         let replay = dir.join(format!("{name}-replay.jsonl"));
+        let loop_init = dir.join(format!("{name}-loop-init.jsonl"));
+        let loop_prefix = dir.join(format!("{name}-loop"));
         let config_answer = dir.join(format!("{name}-config.json"));
         let config_hang = dir.join(format!("{name}-config-hang"));
         let hang = dir.join(format!("{name}-hang"));
@@ -142,6 +162,7 @@ impl StubAgy {
         let grandchild = dir.join(format!("{name}-grandchild"));
         let grandchild_pid = dir.join(format!("{name}-grandchild-pid"));
         std::fs::write(&config_answer, DEFAULT_CONFIG_ANSWER).expect("write config answer");
+        std::fs::write(&loop_init, LOOP_INIT_LINE).expect("write loop init");
         // The arms are ordered exactly as the real CLI resolves them: the
         // zero-quota slash-command read is `-p /config`, so it must be
         // recognised before the generic `-p` arm records a turn that never
@@ -154,6 +175,7 @@ impl StubAgy {
                if [ -f \"{config_hang}\" ]; then exec sleep 60; fi\n  \
                cat \"{config_answer}\"; exit 0\n\
              fi\n\
+             if [ \"$1\" = \"--print=\" ]; then\n                 {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n                   env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n                   printf 'cwd %s\\n' \"$(pwd)\"; printf 'end\\n'; }} >> \"{record}\"\n                 if [ ! -f \"{loop_prefix}-no-init\" ]; then cat \"{loop_init}\"; fi\n                 if [ -f \"{grandchild}\" ]; then\n                   ( i=0; while [ \"$i\" -lt 600 ]; do sleep 0.1; i=$((i+1)); done ) &\n                   echo $! > \"{grandchild_pid}\"\n                 fi\n                 if [ -f \"{loop_prefix}-init-hang\" ]; then exec sleep 60; fi\n                 n=0\n                 while IFS= read -r line; do\n                     n=$((n+1))\n                     printf 'stdin %s\\n' \"$line\" >> \"{record}\"\n                     if [ -f \"{loop_prefix}-stderr-pre-$n\" ]; then cat \"{loop_prefix}-stderr-pre-$n\" >&2; fi\n                     if [ -f \"{replay}\" ]; then awk -v n=$n 'BEGIN{{s=1}} /^---turn---$/{{s=s+1;next}} s==n{{print}}' \"{replay}\"; fi\n                     if [ -f \"{loop_prefix}-stderr-$n\" ]; then cat \"{loop_prefix}-stderr-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-die-after-$n\" ]; then exit \"$(cat \"{loop_prefix}-die-after-$n\")\"; fi\n                 done\n                 if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n                 exit 0\n             fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$(printf '%s' \"$arg\" | tr '\\n' '|')\"; done;\n\
              env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
@@ -171,6 +193,8 @@ impl StubAgy {
             help = help,
             config_answer = config_answer.display(),
             config_hang = config_hang.display(),
+            loop_init = loop_init.display(),
+            loop_prefix = loop_prefix.display(),
             record = record.display(),
             replay = replay.display(),
             stderr = stderr.display(),
@@ -195,6 +219,8 @@ impl StubAgy {
             exit_code,
             grandchild,
             grandchild_pid,
+            loop_init,
+            loop_prefix,
         }
     }
 
@@ -230,6 +256,110 @@ impl StubAgy {
     fn hangs_on_config(&self) -> &Self {
         std::fs::write(&self.config_hang, b"hang\n").expect("write config-hang marker");
         self
+    }
+
+    /// Replace the loop child's `init` line (identity, resolved model,
+    /// permission mode).
+    fn loop_init(&self, line: &str) -> &Self {
+        std::fs::write(&self.loop_init, line).expect("write loop init");
+        self
+    }
+
+    /// Emit no `init` line at all, then block: the launch-fails-closed case.
+    fn loop_never_initializes(&self) -> &Self {
+        std::fs::write(format!("{}-no-init", self.loop_prefix.display()), b"x")
+            .expect("write no-init marker");
+        std::fs::write(format!("{}-init-hang", self.loop_prefix.display()), b"x")
+            .expect("write init-hang marker");
+        self
+    }
+
+    /// Emit the `init` line and then block for ever without reading stdin —
+    /// used where a test needs a live child it can kill.
+    fn loop_hangs_after_init(&self) -> &Self {
+        std::fs::write(format!("{}-init-hang", self.loop_prefix.display()), b"x")
+            .expect("write init-hang marker");
+        self
+    }
+
+    /// stderr written *after* turn `n`'s replay segment (inside the turn).
+    fn loop_stderr_after_turn(&self, n: usize, text: &str) -> &Self {
+        std::fs::write(format!("{}-stderr-{n}", self.loop_prefix.display()), text)
+            .expect("write loop stderr");
+        self
+    }
+
+    /// stderr written *before* turn `n`'s replay segment — which, for `n >= 2`,
+    /// lands in the window between two turns and is the `adjacent` attribution
+    /// case §2.6 exists for.
+    fn loop_stderr_before_turn(&self, n: usize, text: &str) -> &Self {
+        std::fs::write(
+            format!("{}-stderr-pre-{n}", self.loop_prefix.display()),
+            text,
+        )
+        .expect("write loop stderr");
+        self
+    }
+
+    /// Exit with `code` immediately after turn `n`'s segment — a child that
+    /// dies between turns (or mid-turn, when segment `n` carries no terminal).
+    fn loop_dies_after_turn(&self, n: usize, code: i32) -> &Self {
+        std::fs::write(
+            format!("{}-die-after-{n}", self.loop_prefix.display()),
+            code.to_string(),
+        )
+        .expect("write loop die marker");
+        self
+    }
+
+    /// Every stdin line this loop child was handed, in order.
+    fn loop_stdin_lines(&self) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(&self.record) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| line.strip_prefix("stdin ").map(str::to_string))
+            .collect()
+    }
+
+    fn wait_for_loop_stdin_lines(&self, count: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let lines = self.loop_stdin_lines();
+            if lines.len() >= count {
+                return lines;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {count} stdin lines recorded",
+                lines.len()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Only the launches that are loop children (argv[0] is `--print=`).
+    fn loop_launches(&self) -> Vec<Launch> {
+        self.launches()
+            .into_iter()
+            .filter(|launch| launch.argv.first().map(String::as_str) == Some("--print="))
+            .collect()
+    }
+
+    fn wait_for_loop_launches(&self, count: usize) -> Vec<Launch> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let launches = self.loop_launches();
+            if launches.len() >= count {
+                return launches;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {count} loop launches recorded",
+                launches.len()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn writes_stderr(&self, text: &str) -> &Self {
@@ -368,15 +498,117 @@ fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// A **print-transport** config. Pinned explicitly rather than left on `Auto`,
+/// and that is the honest wiring: `ALL_HELP` offers `--input-format`, so `Auto`
+/// against this stub resolves to the loop — which would have silently
+/// re-pointed every W1 test at a transport it was never written for. W1's suite
+/// is the print transport's suite and now says so.
 fn config_for(stub: &StubAgy, data_dir: &Path) -> AgyConfig {
     let mut config = AgyConfig::new(data_dir);
     config.executable = stub.path.clone();
+    config.transport = TransportChoice::PrintOnly;
     // Every stub test shrinks the init-line budget: a stub that never emits a
     // line should fail a test in seconds, not in the production thirty.
     // Per-instance, never an environment variable, so one test's budget can
     // never leak into another's `launch()`.
     config.init_line_budget = Some(Duration::from_secs(5));
     config
+}
+
+/// A **loop-transport** config, left on `Auto` on purpose: the resolution
+/// itself is part of what W3's tests exercise, and pinning `LoopOnly`
+/// everywhere would leave the default path untested.
+fn loop_config_for(stub: &StubAgy, data_dir: &Path) -> AgyConfig {
+    let mut config = config_for(stub, data_dir);
+    config.transport = TransportChoice::Auto;
+    config
+}
+
+/// Split a real loop capture into the child's single `init` line and a replay
+/// file whose segments — one per turn, separated by the stub's sentinel — the
+/// loop arm emits one at a time as stdin lines arrive.
+///
+/// Driven off the captures themselves rather than hand-written NDJSON, for the
+/// reason every fixture here is a file: a hand-typed "verbatim" shape drifts.
+fn loop_capture(capture: &str) -> (String, String) {
+    let mut init = String::new();
+    let mut segments: Vec<String> = vec![String::new()];
+    for line in capture.lines().filter(|line| !line.trim().is_empty()) {
+        if init.is_empty() && line.contains("\"event\":\"init\"") {
+            init = format!("{line}\n");
+            continue;
+        }
+        segments
+            .last_mut()
+            .expect("a current segment")
+            .push_str(&format!("{line}\n"));
+        if line.contains("\"event\":\"result\"") {
+            segments.push(String::new());
+        }
+    }
+    while segments.last().is_some_and(|last| last.is_empty()) {
+        segments.pop();
+    }
+    (init, segments.join("---turn---\n"))
+}
+
+/// The conversation id a capture's own `init` line mints. Read out of the
+/// fixture rather than hardcoded per test: a capture swapped for another must
+/// not leave an assertion quietly checking the wrong conversation.
+fn conversation_of(capture: &str) -> String {
+    let init = capture
+        .lines()
+        .find(|line| line.contains(r#""event":"init""#))
+        .expect("a capture with an init line");
+    serde_json::from_str::<Value>(init).expect("init parses")["conversation_id"]
+        .as_str()
+        .expect("a conversation id")
+        .to_string()
+}
+
+/// Wait until at least `count` `conversation.turn.ended` events have landed.
+fn wait_for_turns_ended(events: &Arc<Mutex<Vec<EventDraft>>>, count: usize) -> Vec<EventDraft> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let ended = events_of_kind(events, "conversation.turn.ended");
+        if ended.len() >= count {
+            return ended;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {} of {count} turns ended",
+            ended.len()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// LAUNCH one loop execution against a stub replaying `capture`'s turns.
+fn loop_launched(
+    dir: &TempDir,
+    capture: &str,
+) -> (
+    StubAgy,
+    AgyBackend,
+    ExecutionHandle,
+    Arc<Mutex<Vec<EventDraft>>>,
+) {
+    let stub = StubAgy::passing(dir.path());
+    let (init, replay) = loop_capture(capture);
+    stub.loop_init(&init);
+    stub.replays(&replay);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+    (stub, backend, handle, events)
+}
+
+/// The pin every loop capture's `init` line echoes.
+fn loop_pinned_request(cwd: &Path) -> StartRequest {
+    let mut request = start_request(cwd);
+    request.model = Some(FIXTURE_MODEL.to_string());
+    request
 }
 
 fn start_request(cwd: &Path) -> StartRequest {
@@ -1789,6 +2021,744 @@ fn observe_refuses_an_identity_this_adapter_never_minted() {
     ));
 }
 
+// ------------------------------------------ W3: the input-loop transport
+
+#[test]
+fn an_auto_resolution_picks_the_loop_when_help_offers_input_format() {
+    // §2.8's resolution, and the whole of what `Auto` costs: a substring test
+    // on a `--help` text the probe already read.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let report = backend.probe();
+    assert!(report.available);
+    let detail = report.detail.expect("detail");
+    assert!(
+        detail.contains("transport: input-loop-stream-json (Auto: --help offers --input-format)"),
+        "{detail}"
+    );
+    // The capability set follows the RESOLVED transport, and the one boolean
+    // W3's evidence moved is visible in it.
+    assert!(backend.capabilities().native_subagents);
+    assert!(!backend.capabilities().ask);
+    assert!(!backend.capabilities().approval_flow);
+}
+
+#[test]
+fn an_auto_resolution_falls_back_to_print_when_input_format_is_absent() {
+    // A RESOLUTION, not a downgrade: it happens once, at probe time, before any
+    // execution exists — and an older agy stays fully usable rather than being
+    // refused for a flag the print grammar never needed.
+    let dir = TempDir::new().expect("tempdir");
+    let help = ALL_HELP.replace(" --input-format", "");
+    let stub = StubAgy::new(dir.path(), "agy", PASSING_VERSION, &help);
+    let mut config = config_for(&stub, dir.path());
+    config.transport = TransportChoice::Auto;
+    let backend = AgyBackend::new(config);
+    let report = backend.probe();
+    assert!(report.available, "the build is still perfectly usable");
+    let detail = report.detail.expect("detail");
+    assert!(
+        detail.contains("transport: print-stream-json (Auto: --input-format absent from --help)"),
+        "{detail}"
+    );
+    assert!(detail.contains("RESOLUTION, not a downgrade"), "{detail}");
+    assert!(
+        !backend.capabilities().native_subagents,
+        "the print column's honest claim, not the loop's"
+    );
+}
+
+#[test]
+fn a_loop_only_choice_refuses_a_build_that_cannot_serve_it() {
+    // codex §5.2 rule 2, opencode's `ServeOnly` verbatim: serving a pinned
+    // transport on the other one would serve a different set of measured claims
+    // than the one that was asked for.
+    let dir = TempDir::new().expect("tempdir");
+    let help = ALL_HELP.replace(" --input-format", "");
+    let stub = StubAgy::new(dir.path(), "agy", PASSING_VERSION, &help);
+    let mut config = config_for(&stub, dir.path());
+    config.transport = TransportChoice::LoopOnly;
+    let backend = AgyBackend::new(config);
+    let report = backend.probe();
+    assert!(!report.available);
+    let detail = report.detail.expect("detail");
+    assert!(detail.contains("--input-format"), "{detail}");
+    // And PREPARE refuses too, rather than launching something unmeasured.
+    assert!(matches!(
+        backend.prepare(&start_request(dir.path())),
+        Err(BackendError::Unavailable { .. })
+    ));
+}
+
+#[test]
+fn resolving_capabilities_spawns_no_extra_process() {
+    // **The 0.2.2 daemon-panic lesson (c46152a2), applied by construction.**
+    // opencode's `Auto` had to spawn a serve child and build a blocking HTTP
+    // client to resolve, which is why registration could panic; agy's needs no
+    // process, no port and no client. Asserted against the stub's own launch
+    // record: after `capabilities()`, the recorded launches are exactly the
+    // probe's — and `capabilities()` is called straight from `daemon::start_with`.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let before = stub.launches().len();
+    for _ in 0..5 {
+        let _ = backend.capabilities();
+    }
+    assert_eq!(
+        stub.launches().len(),
+        before,
+        "capabilities() must perform no I/O the probe was not already doing"
+    );
+    assert!(
+        stub.loop_launches().is_empty(),
+        "resolving the transport must not spawn a loop child"
+    );
+}
+
+#[test]
+fn a_loop_launch_composes_print_equals_and_both_stream_formats() {
+    let dir = TempDir::new().expect("tempdir");
+    let (stub, _backend, _handle, _events) = loop_launched(&dir, LOOP_TWO_TURNS);
+    let launches = stub.wait_for_loop_launches(1);
+    assert_eq!(launches.len(), 1, "ONE child for the whole execution");
+    let argv = &launches[0].argv;
+    assert_eq!(argv[0], "--print=");
+    assert!(
+        !argv.iter().any(|arg| arg == "-p"),
+        "a bare -p swallows the next flag and fails rc=2 with no NDJSON at all (W3 P0)"
+    );
+    assert_eq!(
+        launches[0].value_after("--input-format"),
+        Some("stream-json")
+    );
+    assert_eq!(
+        launches[0].value_after("--output-format"),
+        Some("stream-json"),
+        "--input-format REQUIRES --output-format stream-json; composed together or not at all"
+    );
+    assert!(launches[0].has("--disable-slash-commands"));
+    assert_eq!(launches[0].value_after("--model"), Some(FIXTURE_MODEL));
+    assert!(!launches[0].has("--sandbox"));
+    assert!(!launches[0].has("--add-dir"));
+    // The prompt is nowhere on argv — it went down stdin, which is the whole
+    // point of this transport.
+    assert!(
+        !argv.iter().any(|arg| arg.contains("do the agy thing")),
+        "the prompt must not ride argv on this transport: {argv:?}"
+    );
+}
+
+#[test]
+fn a_loop_launch_learns_identity_and_posture_before_any_message_is_written() {
+    // **The transport's real prize.** `init` arrives at child start, so LAUNCH
+    // knows the conversation, the resolved model and the effective permission
+    // mode — and emits the posture notice — with ZERO quota spent. The stub's
+    // own record proves the ordering: the identity landed before the first
+    // stdin line was ever handed over.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let (init, replay) = loop_capture(LOOP_TWO_TURNS);
+    stub.loop_init(&init);
+    stub.replays(&replay);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+
+    assert!(
+        handle.native_id.is_some(),
+        "identity is known at LAUNCH, before any turn"
+    );
+    // The rung-(b) honesty notice, emitted at launch rather than discovered as
+    // a mid-run cancellation — and here, before turn 1 was even written.
+    let notice = wait_for_kind(&events, "conversation.turn.harness_error");
+    assert_eq!(
+        notice.payload["phase"],
+        serde_json::json!("permission_mode_denies_tools")
+    );
+    assert_eq!(
+        notice.payload["effective_mode"],
+        serde_json::json!("request-review")
+    );
+    let user = wait_for_kind(&events, "conversation.user");
+    assert_eq!(
+        user.payload["transport"],
+        serde_json::json!("input-loop-stream-json")
+    );
+    // Exactly one line went down stdin for turn 1.
+    assert_eq!(stub.wait_for_loop_stdin_lines(1).len(), 1);
+}
+
+#[test]
+fn a_substituted_model_refuses_a_loop_launch_before_a_turn_is_spent() {
+    // **What no other adapter in the registry can say.** Print mode must burn
+    // turn 1 to learn which model served it; here the refusal happens before a
+    // single byte of prompt is written.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let (init, replay) = loop_capture(LOOP_TWO_TURNS);
+    stub.loop_init(&init);
+    stub.replays(&replay);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let mut request = start_request(dir.path());
+    request.model = Some("gemini-3.7-pro".to_string());
+    let error = launch_with(&backend, &request).expect_err("a substituted pin refuses the launch");
+    let BackendError::Failed { detail, .. } = error else {
+        panic!("a Failed refusal")
+    };
+    assert!(detail.contains("ZERO quota"), "{detail}");
+    assert!(detail.contains(FIXTURE_MODEL), "{detail}");
+    // Nothing was written down the child's stdin: no turn was spent.
+    assert!(
+        stub.loop_stdin_lines().is_empty(),
+        "a refused launch must not have written a turn"
+    );
+    // And it leaves no phantom execution behind.
+    assert!(backend.tracked_executions().is_empty());
+}
+
+#[test]
+fn a_loop_launch_fails_closed_when_no_init_line_arrives() {
+    // W1's rule verbatim: no identity, no handle, and the child is group-killed
+    // rather than left running.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    stub.loop_never_initializes();
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let error = launch_with(&backend, &loop_pinned_request(dir.path())).expect_err("fails closed");
+    let BackendError::Failed { detail, .. } = error else {
+        panic!("a Failed refusal")
+    };
+    assert!(detail.contains("no `init` line"), "{detail}");
+    assert!(detail.contains("no turn has been spent"), "{detail}");
+    assert!(backend.tracked_executions().is_empty());
+}
+
+#[test]
+fn a_loop_send_writes_exactly_one_ndjson_user_message_per_turn() {
+    let dir = TempDir::new().expect("tempdir");
+    let (stub, backend, handle, _events) = loop_launched(&dir, LOOP_TWO_TURNS);
+    wait_for_settled(&backend, &handle);
+    backend.send(&handle, "turn two please").expect("send");
+    let lines = stub.wait_for_loop_stdin_lines(2);
+    assert_eq!(lines.len(), 2, "one line per turn, no more");
+    // ONE child, not one per turn — that is the transport.
+    assert_eq!(stub.loop_launches().len(), 1);
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line).expect("valid NDJSON");
+        assert_eq!(value["event"], serde_json::json!("user"));
+        assert_eq!(value["message"]["role"], serde_json::json!("user"));
+        assert!(value["message"]["content"].is_string());
+    }
+    assert!(
+        lines[0].contains("do the agy thing"),
+        "turn 1 is the launch prompt"
+    );
+    assert!(lines[1].contains("turn two please"));
+}
+
+#[test]
+fn a_loop_child_streams_each_turns_events_before_the_next_is_written() {
+    // Backs the loop `streaming` row. Two turns through ONE child, each
+    // settling with its own summary and its own raw blob ref — the same decoder
+    // as print, driven turn by turn.
+    let dir = TempDir::new().expect("tempdir");
+    let (_stub, backend, handle, events) = loop_launched(&dir, LOOP_TWO_TURNS);
+    let first = wait_for_settled(&backend, &handle);
+    let BackendSignal::StageCompleted { summary } = first.signal else {
+        panic!("turn 1 completes: {first:?}")
+    };
+    assert_eq!(summary.as_deref(), Some("alpha\n"));
+    backend.send(&handle, "and again").expect("send");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let second = loop {
+        let observation = backend.observe(&handle).expect("observe");
+        if let BackendSignal::StageCompleted {
+            summary: Some(text),
+        } = &observation.signal
+            && text == "bravo\n"
+        {
+            break observation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "turn 2 never settled: {observation:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(second.native, NativeState::Exited);
+
+    let ended = wait_for_turns_ended(&events, 2);
+    assert_eq!(
+        ended.len(),
+        2,
+        "one turn.ended per turn, cut at each result"
+    );
+    for event in &ended {
+        assert_eq!(
+            event.payload["transport"],
+            serde_json::json!("input-loop-stream-json")
+        );
+        assert_eq!(
+            event.payload["conversation_id"],
+            serde_json::json!(conversation_of(LOOP_TWO_TURNS)),
+            "the conversation survives the turn boundary"
+        );
+        assert!(
+            event.payload["raw"].is_string(),
+            "every turn owes its own §20 blob"
+        );
+    }
+    // §2.7: the `init` line is archived exactly ONCE, in turn 1's blob, and
+    // every later turn points at it rather than re-archiving it.
+    assert!(ended[0].payload["init_blob"].is_null());
+    assert_eq!(ended[1].payload["init_blob"], ended[0].payload["raw"]);
+    assert_ne!(ended[0].payload["raw"], ended[1].payload["raw"]);
+}
+
+#[test]
+fn a_subagent_record_reaches_the_journal_with_its_child_conversation() {
+    // The `native_subagents` row, end to end through the adapter rather than
+    // only through the decoder: the typed child conversation id has to survive
+    // all the way into the journal for a human to act on it.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let (init, replay) = loop_capture(LOOP_SUBAGENT);
+    stub.loop_init(&init);
+    stub.replays(&replay);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+    wait_for_settled(&backend, &handle);
+    backend.send(&handle, "now invoke it").expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let completed = loop {
+        let found: Vec<_> = events_of_kind(&events, "tool.completed")
+            .into_iter()
+            .filter(|event| event.payload["name"] == serde_json::json!("subagent:subagent"))
+            .collect();
+        if let Some(event) = found.into_iter().next() {
+            break event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no subagent tool.completed arrived"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let child = completed.payload["subagent"][0].clone();
+    let child_id = child["conversation_id"]
+        .as_str()
+        .expect("a child conversation id");
+    assert_ne!(child_id, conversation_of(LOOP_SUBAGENT));
+    assert_eq!(child["name"], serde_json::json!("echoer"));
+    assert!(
+        child["log_uri"]
+            .as_str()
+            .expect("a log uri")
+            .starts_with("file://")
+    );
+
+    let ended = wait_for_turns_ended(&events, 2);
+    let last = ended.last().expect("turn 2 ended");
+    assert_eq!(
+        last.payload["subagent_conversations"],
+        serde_json::json!([child_id]),
+        "the admission's own evidence is journaled, not merely noted in a ledger row"
+    );
+}
+
+#[test]
+fn a_denied_tool_on_the_loop_kills_the_child_and_the_next_send_is_refused() {
+    // **W3 A2's shape, and §2.5's dead-transport path — routine on this
+    // transport rather than exceptional.** The refusal must be ACTIONABLE: it
+    // names the conversation, which a fresh child resumes perfectly.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let (init, replay) = loop_capture(LOOP_DENIED_TOOL);
+    stub.loop_init(&init);
+    stub.replays(&replay);
+    // The measured behaviour: the child exits 1 the moment the denied turn ends.
+    stub.loop_dies_after_turn(1, 1);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+
+    let settled = wait_for_settled(&backend, &handle);
+    let BackendSignal::Failed { reason } = &settled.signal else {
+        panic!("the harness said exactly what went wrong: {settled:?}")
+    };
+    assert!(
+        reason.contains("user denied permission to run command"),
+        "{reason}"
+    );
+    let ended = wait_for_kind(&events, "conversation.turn.ended");
+    assert_eq!(
+        ended.payload["denied_tools"],
+        serde_json::json!(["run_command"])
+    );
+    assert!(
+        ended.payload["loop_input_rejected"].is_null(),
+        "a denied tool is a stage-visible harness failure, never an adapter defect"
+    );
+
+    // The transport is gone; the next SEND is refused, and refused usefully.
+    let error = backend
+        .send(&handle, "are you still there")
+        .expect_err("the transport is dead");
+    let BackendError::Failed { detail, .. } = error else {
+        panic!("a Failed refusal")
+    };
+    assert!(detail.contains("has exited"), "{detail}");
+    assert!(
+        detail.contains(&conversation_of(LOOP_DENIED_TOOL)),
+        "the refusal must name the conversation that is still resumable: {detail}"
+    );
+    assert!(detail.contains("does not respawn"), "{detail}");
+}
+
+#[test]
+fn a_child_that_dies_mid_turn_is_ambiguous_unless_we_asked_for_it() {
+    // Arms 9/10, reached through the loop's own death path: the child stops
+    // talking with no terminal for the in-flight turn. Failing closed is the
+    // point — a process that merely stopped may not complete or fail a stage.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let (init, _replay) = loop_capture(LOOP_TWO_TURNS);
+    stub.loop_init(&init);
+    // A segment with steps but NO terminal, then the child dies.
+    stub.replays(
+        "{\"event\":\"step_update\",\"step_update\":{\"step_index\":0,\"state\":\"DONE\",\"step_type\":\"user_input\"}}\n",
+    );
+    stub.loop_dies_after_turn(1, 137);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+
+    let settled = wait_for_settled(&backend, &handle);
+    assert_eq!(
+        settled.native,
+        NativeState::Unknown,
+        "§25's ambiguity, failing closed"
+    );
+    assert!(matches!(settled.signal, BackendSignal::Running));
+    let ended = wait_for_kind(&events, "conversation.turn.ended");
+    assert_eq!(
+        ended.payload["outcome"],
+        serde_json::json!("ambiguous_unknown")
+    );
+    assert_eq!(ended.payload["exit_code"], serde_json::json!(137));
+    assert_eq!(ended.payload["interrupted"], serde_json::json!(false));
+}
+
+#[test]
+fn stderr_between_two_turns_is_attributed_adjacent_and_labelled() {
+    // §2.6, the transport's one genuinely new hazard. A line that lands in the
+    // window BETWEEN turns cannot be placed inside one — so it is attached to a
+    // turn anyway and the slice is labelled, because dropping it would make an
+    // auto-denied tool invisible.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let (init, replay) = loop_capture(LOOP_TWO_TURNS);
+    stub.loop_init(&init);
+    stub.replays(&replay);
+    // Inside turn 1; then in the gap before turn 2's segment.
+    stub.loop_stderr_after_turn(1, "a line that belongs to turn one\n");
+    stub.loop_stderr_before_turn(2, &format!("{DENIAL_NOTICE}\n"));
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+    wait_for_settled(&backend, &handle);
+    backend.send(&handle, "again").expect("send");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let ended = loop {
+        let ended = events_of_kind(&events, "conversation.turn.ended");
+        if ended.len() >= 2 {
+            break ended;
+        }
+        assert!(Instant::now() < deadline, "turn 2 never ended");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        ended[0].payload["stderr"]
+            .as_str()
+            .expect("turn 1 stderr")
+            .contains("belongs to turn one"),
+        "an in-turn line is attributed exactly: {:?}",
+        ended[0].payload["stderr"]
+    );
+    assert_eq!(
+        ended[0].payload["stderr_attribution"],
+        serde_json::json!("exact")
+    );
+    // The between-turns line is NOT dropped: it reaches turn 2, labelled.
+    assert_eq!(
+        ended[1].payload["stderr_attribution"],
+        serde_json::json!("adjacent"),
+        "the classifier says out loud that it was not certain"
+    );
+    assert_eq!(
+        ended[1].payload["stderr_denial_notice"],
+        serde_json::json!(true),
+        "the auto-denial notice survives attribution — the whole reason §2.6 fails toward noticing"
+    );
+}
+
+#[test]
+fn closing_stdin_lets_a_queued_turn_finish_then_exits() {
+    // W3 P2: closing stdin does not cancel queued work — the turn runs to
+    // completion and the child then exits 0 with no further event. STOP leans
+    // on that, and only group-kills when the bounded wait expires.
+    let dir = TempDir::new().expect("tempdir");
+    let (stub, backend, handle, events) = loop_launched(&dir, LOOP_TWO_TURNS);
+    wait_for_settled(&backend, &handle);
+    backend.stop(&handle).expect("stop").wait();
+
+    let ended = events_of_kind(&events, "conversation.turn.ended");
+    assert_eq!(
+        ended.len(),
+        1,
+        "the settled turn kept its own clean outcome"
+    );
+    assert_eq!(ended[0].payload["outcome"], serde_json::json!("completed"));
+    // A stopped execution accepts no further input, and says so rather than
+    // writing to a pipe nobody is reading.
+    let error = backend.send(&handle, "one more").expect_err("stopped");
+    let BackendError::Failed { detail, .. } = error else {
+        panic!("a Failed refusal")
+    };
+    assert!(detail.contains("stopped"), "{detail}");
+    assert_eq!(stub.loop_stdin_lines().len(), 1);
+}
+
+#[test]
+fn loop_interrupt_group_kills_the_child_and_its_grandchild() {
+    // The `interrupt` row's test on this transport. The tier is UNCHANGED
+    // (ProcessTreeTermination) and deliberately so: W3 P4 refuted the native
+    // upgrade — SIGINT is fatal and emits a mislabelled terminal — so a
+    // SIGINT-first ladder would trade a measured guarantee for an ambiguity.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let (init, _replay) = loop_capture(LOOP_TWO_TURNS);
+    stub.loop_init(&init);
+    stub.spawns_a_grandchild();
+    stub.loop_hangs_after_init();
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+    let grandchild = stub.wait_for_grandchild_pid();
+    assert!(
+        pid_alive(grandchild),
+        "the grandchild must be running first"
+    );
+
+    backend.interrupt(&handle).expect("interrupt").wait();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pid_alive(grandchild) {
+        assert!(
+            Instant::now() < deadline,
+            "the grandchild survived the group kill (pid {grandchild})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A kill we asked for is not a conclusion about the stage, and W3 A7
+    // measured the conversation staying fully resumable afterwards.
+    let observation = backend.observe(&handle).expect("observe");
+    assert!(matches!(observation.signal, BackendSignal::Running));
+    let ended = wait_for_kind(&events, "conversation.turn.ended");
+    assert_eq!(ended.payload["interrupted"], serde_json::json!(true));
+    assert_eq!(
+        ended.payload["outcome"],
+        serde_json::json!("interrupted_running")
+    );
+}
+
+#[test]
+fn a_prompt_over_the_loop_cap_is_refused_at_prepare_not_truncated() {
+    // PREPARE refuses on the transport this execution will ACTUALLY launch on:
+    // a prompt print mode cannot carry rides the loop fine, and one over the
+    // loop's own cap is still refused rather than silently trimmed.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let mut request = loop_pinned_request(dir.path());
+    // Comfortably past print's measured 120 000-byte argv cap.
+    request.context = "x".repeat(200_000);
+    backend
+        .prepare(&request)
+        .expect("the loop carries a prompt argv could never hold");
+    // The print transport refuses the very same request, which is the delta.
+    let print = AgyBackend::new(config_for(&stub, dir.path()));
+    let error = print.prepare(&request).expect_err("argv cannot carry it");
+    let BackendError::Failed { detail, .. } = error else {
+        panic!("a Failed refusal")
+    };
+    assert!(detail.contains("argv cap"), "{detail}");
+    assert!(detail.contains("Nothing is truncated"), "{detail}");
+}
+
+#[test]
+fn a_profile_executable_and_env_reach_a_loop_child() {
+    // W1's declared divergence, on the loop: the generic axes only, and env now
+    // reaches ONE child rather than one per turn.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let other = StubAgy::new(dir.path(), "other", PASSING_VERSION, ALL_HELP);
+    let (init, replay) = loop_capture(LOOP_TWO_TURNS);
+    other.loop_init(&init);
+    other.replays(&replay);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let mut request = loop_pinned_request(dir.path());
+    request.profile = Some(Profile {
+        name: "p".into(),
+        backend: AGY_BACKEND_NAME.into(),
+        executable: Some(other.path.clone()),
+        config_home: None,
+        env: BTreeMap::from([("PROBE_LOOP".into(), "1".into())]),
+        default_model: None,
+        options: BTreeMap::new(),
+    });
+    let handle = launch_with(&backend, &request).expect("launch");
+    let launches = other.wait_for_loop_launches(1);
+    assert_eq!(
+        launches[0].env.get("PROBE_LOOP").map(String::as_str),
+        Some("1")
+    );
+    assert!(
+        stub.loop_launches().is_empty(),
+        "the profile's executable is the one that ran"
+    );
+    // config_home stays REFUSED, not ignored, on this transport too.
+    let mut refused = loop_pinned_request(dir.path());
+    refused.profile = Some(Profile {
+        name: "p2".into(),
+        backend: AGY_BACKEND_NAME.into(),
+        executable: None,
+        config_home: Some(dir.path().to_path_buf()),
+        env: BTreeMap::new(),
+        default_model: None,
+        options: BTreeMap::new(),
+    });
+    let error = backend
+        .prepare(&refused)
+        .expect_err("config_home is refused");
+    let BackendError::Failed { detail, .. } = error else {
+        panic!("a Failed refusal")
+    };
+    assert!(detail.contains("config_home is not supported"), "{detail}");
+    let _ = handle;
+}
+
+#[test]
+fn a_settings_home_reaches_a_loop_child() {
+    // The measured permission channel (W1 P2), on this transport: HOME is
+    // composed for the child, and every W3 probe that needed a different
+    // permission posture got it exactly this way.
+    let dir = TempDir::new().expect("tempdir");
+    let home = dir.path().join("settings-home");
+    std::fs::create_dir_all(home.join(".gemini/antigravity-cli")).expect("mkdir");
+    std::fs::write(
+        home.join(".gemini/antigravity-cli/settings.json"),
+        r#"{"permissions":{"allow":["command(echo)"]}}"#,
+    )
+    .expect("write settings");
+    let stub = StubAgy::passing(dir.path());
+    let (init, replay) = loop_capture(LOOP_TWO_TURNS);
+    stub.loop_init(&init);
+    stub.replays(&replay);
+    let mut config = loop_config_for(&stub, dir.path());
+    config.settings_home = Some(home.clone());
+    let backend = AgyBackend::new(config);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+    let launches = stub.wait_for_loop_launches(1);
+    assert_eq!(
+        launches[0].env.get("HOME").map(String::as_str),
+        Some(home.to_string_lossy().as_ref())
+    );
+    // And the Work's own surface stays clean: the policy lives in the settings
+    // home, never in the diff.
+    assert!(!dir.path().join("settings.json").exists());
+    let _ = handle;
+}
+
+#[test]
+fn a_resumed_loop_execution_spawns_a_child_naming_the_conversation() {
+    // RESUME never starts a turn; the first subsequent SEND is what needs a
+    // child, and spawning one there is RESUME's own contract rather than the
+    // auto-respawn §2.5 refuses.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    stub.loop_init(LOOP_RESUME_INIT_ECHO);
+    let (_init, replay) = loop_capture(LOOP_TWO_TURNS);
+    stub.replays(&replay);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, _events) = sink();
+    backend.set_event_sink(sink);
+    let conversation = "b3be71a6-fd10-4525-875a-e7789a9811c3";
+    let handle = ExecutionHandle {
+        execution_id: "exec-readopted".to_string(),
+        native_id: Some(conversation.to_string()),
+    };
+    let mut resume_request = ResumeRequest::new("w-agy", dir.path());
+    resume_request.model = Some(FIXTURE_MODEL.to_string());
+    backend.resume(&handle, &resume_request).expect("re-adopt");
+    assert!(
+        stub.loop_launches().is_empty(),
+        "RESUME costs no process and no tokens"
+    );
+    backend.send(&handle, "still there?").expect("send");
+    let launches = stub.wait_for_loop_launches(1);
+    assert_eq!(
+        launches[0].value_after("--conversation"),
+        Some(conversation),
+        "the re-adopted child names the conversation it is resuming"
+    );
+}
+
+#[test]
+fn a_loop_child_whose_init_echoes_a_different_conversation_refuses_the_send() {
+    // W1 P0.6's silent fork, caught on this transport at CHILD START for zero
+    // quota — an unknown id does not refuse, it warns on stderr and starts a
+    // FRESH conversation, so the echo is the whole check.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    // The child mints its own id rather than echoing the requested one.
+    stub.loop_init(LOOP_INIT_LINE);
+    stub.replays("");
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let handle = ExecutionHandle {
+        execution_id: "exec-forked".to_string(),
+        native_id: Some("a-conversation-agy-never-heard-of".to_string()),
+    };
+    let mut resume_request = ResumeRequest::new("w-agy", dir.path());
+    resume_request.model = Some(FIXTURE_MODEL.to_string());
+    backend.resume(&handle, &resume_request).expect("re-adopt");
+    let error = backend
+        .send(&handle, "hello?")
+        .expect_err("a fork is not a resume");
+    let BackendError::Failed { detail, .. } = error else {
+        panic!("a Failed refusal")
+    };
+    assert!(detail.contains("silent fork"), "{detail}");
+    assert!(
+        detail.contains("before a single turn was spent"),
+        "the whole point of checking at child start: {detail}"
+    );
+    assert!(
+        stub.loop_stdin_lines().is_empty(),
+        "no turn may be written into a forked conversation"
+    );
+}
+
 // -------------------------------------------------------------- live suite
 
 /// Gate mirroring `tests/opencode_backend.rs`'s `LiveGate` (the A3 pattern),
@@ -2038,6 +3008,236 @@ fn live_agy_resume_recalls_a_nonce_and_echoes_the_same_conversation_id() {
             .any(|e| e.payload["phase"] == serde_json::json!("resume_identity_mismatch")),
         "a real resume must raise no identity mismatch"
     );
+}
+
+// ------------------------------------------------- W3 live tier (the loop)
+
+/// A live **loop-transport** config. `LoopOnly` rather than `Auto` on purpose:
+/// if the installed build cannot serve this transport, these tests must refuse
+/// loudly rather than quietly measure the print transport and label the result
+/// with the loop's tiers.
+fn live_loop_config(data_dir: &Path) -> AgyConfig {
+    let mut config = AgyConfig::new(data_dir);
+    config.transport = TransportChoice::LoopOnly;
+    config
+}
+
+/// Poll OBSERVE until the turn settles. Separate from `wait_for_settled`
+/// because on this transport `native` does **not** mean "the process exited" —
+/// the child outlives every turn — so the keyed signal is the turn's own
+/// settled outcome.
+fn wait_for_loop_turn(backend: &AgyBackend, handle: &ExecutionHandle) -> Observation {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let observation = backend.observe(handle).expect("observe");
+        if !matches!(observation.signal, BackendSignal::Running)
+            || observation.native == NativeState::Exited
+        {
+            return observation;
+        }
+        assert!(Instant::now() < deadline, "the loop turn never settled");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Backs the loop's `resume`, `model_selection` and `identity_before_first_turn`
+/// rows. **2 live turns.**
+///
+/// One live test for three rows, and the sharing is the finding rather than a
+/// shortcut: on this transport a single `init` line at child start carries the
+/// conversation id, the resolved model *and* the resume echo, so one turn's
+/// worth of quota evidences all three. The *cost* half of the claim — that the
+/// echo is checked before any turn is written — is pinned deterministically by
+/// `a_loop_child_whose_init_echoes_a_different_conversation_refuses_the_send`,
+/// which asserts no stdin line was written at all.
+#[test]
+#[ignore = "opt-in, consumes free-tier quota: SERGEANT_AGY_TESTS=1 cargo test --test agy_backend -- --ignored"]
+fn live_agy_loop_resume_echoes_the_conversation_before_any_turn() {
+    let dir = live_workdir("loop-resume");
+    if !agy_live_enabled(
+        "live_agy_loop_resume_echoes_the_conversation_before_any_turn",
+        dir.path(),
+    ) {
+        return;
+    }
+    let nonce = format!("agy-w3-{}", ulid::Ulid::generate());
+    let backend = AgyBackend::new(live_loop_config(dir.path()));
+    assert!(
+        backend.capabilities().native_subagents,
+        "the loop transport's capability set, not the print one's"
+    );
+    let (event_sink, events) = sink();
+    backend.set_event_sink(event_sink);
+    let handle = launch_with(
+        &backend,
+        &live_request(
+            dir.path(),
+            &format!("Remember this token exactly: {nonce}. Reply with only the word ok."),
+        ),
+    )
+    .expect("launch");
+    // Identity and the RESOLVED model were both known before this turn was
+    // written down the child's stdin.
+    let conversation = handle.native_id.clone().expect("a minted conversation id");
+    assert!(!conversation.is_empty());
+    wait_for_loop_turn(&backend, &handle);
+    let first = wait_for_kind(&events, "conversation.turn.ended");
+    assert_eq!(
+        first.payload["transport"],
+        serde_json::json!("input-loop-stream-json")
+    );
+    assert_eq!(
+        first.payload["init"]["model"],
+        serde_json::json!(LIVE_MODEL)
+    );
+    assert_eq!(
+        first.payload["model_pin"]["verdict"],
+        serde_json::json!("honored")
+    );
+    assert!(
+        first.payload["usage_turn"]["total_tokens"]
+            .as_u64()
+            .expect("a token count")
+            > 0,
+        "a real turn spends real tokens"
+    );
+    backend.stop(&handle).expect("stop").wait();
+
+    // A SEPARATE backend, a separate loop child, `--conversation <id>` — the
+    // re-adoption path a restarted daemon takes.
+    let resumed = AgyBackend::new(live_loop_config(dir.path()));
+    let (resumed_sink, resumed_events) = sink();
+    resumed.set_event_sink(resumed_sink);
+    let mut request = ResumeRequest::new("w-agy", dir.path());
+    request.model = Some(LIVE_MODEL.to_string());
+    resumed.resume(&handle, &request).expect("re-adopt");
+    resumed
+        .send(
+            &handle,
+            "What was the token I asked you to remember? Reply with only the token.",
+        )
+        .expect("send");
+    let observation = wait_for_loop_turn(&resumed, &handle);
+    let BackendSignal::StageCompleted { summary } = observation.signal else {
+        panic!("the resumed turn should complete: {observation:?}")
+    };
+    let summary = summary.expect("a summary");
+    assert!(
+        summary.contains(&nonce),
+        "the conversation must recall the nonce across processes; got {summary:?}"
+    );
+    let ended = events_of_kind(&resumed_events, "conversation.turn.ended");
+    let last = ended.last().expect("the resumed turn ended");
+    assert_eq!(
+        last.payload["conversation_id"],
+        serde_json::json!(conversation),
+        "the init line echoed the id we asked for — the whole InitEchoAtChildStart tier"
+    );
+    assert_eq!(
+        last.payload["model_pin"]["verdict"],
+        serde_json::json!("honored")
+    );
+    assert!(
+        !events_of_kind(&resumed_events, "conversation.turn.harness_error")
+            .iter()
+            .any(|e| e.payload["phase"] == serde_json::json!("resume_identity_mismatch")),
+        "a real resume must raise no identity mismatch"
+    );
+    resumed.stop(&handle).expect("stop").wait();
+}
+
+/// Backs the loop's `native_subagents` and `turn_serialization` rows.
+/// **2 live turns.**
+///
+/// The registry's first `true` for `native_subagents`, and it is admitted on a
+/// **typed record or not at all**: a child `conversation_id` distinct from the
+/// parent's, on a settled `subagent_info` step. Assistant prose claiming a
+/// delegation is explicitly not evidence and would fail this test.
+#[test]
+#[ignore = "opt-in, consumes free-tier quota: SERGEANT_AGY_TESTS=1 cargo test --test agy_backend -- --ignored"]
+fn live_agy_loop_invokes_a_subagent_and_records_its_typed_conversation_id() {
+    let dir = live_workdir("loop-subagent");
+    if !agy_live_enabled(
+        "live_agy_loop_invokes_a_subagent_and_records_its_typed_conversation_id",
+        dir.path(),
+    ) {
+        return;
+    }
+    let backend = AgyBackend::new(live_loop_config(dir.path()));
+    let (event_sink, events) = sink();
+    backend.set_event_sink(event_sink);
+    let handle = launch_with(
+        &backend,
+        &live_request(
+            dir.path(),
+            "Use the define_subagent tool to define a subagent named \"echoer\" whose only job is \
+             to reply with one word. Do not do anything else.",
+        ),
+    )
+    .expect("launch");
+    let parent = handle.native_id.clone().expect("a minted conversation id");
+    wait_for_loop_turn(&backend, &handle);
+
+    // Turn 2 down the SAME child's stdin — which is also the
+    // `turn_serialization` row's own exercise: one conversation, two turns,
+    // strictly one at a time.
+    backend
+        .send(
+            &handle,
+            "Use the invoke_subagent tool to have \"echoer\" reply with exactly the word: delta.",
+        )
+        .expect("send");
+    wait_for_loop_turn(&backend, &handle);
+
+    let ended = events_of_kind(&events, "conversation.turn.ended");
+    assert_eq!(ended.len(), 2, "two turns, one child, one conversation");
+    assert_eq!(
+        ended[1].payload["conversation_id"],
+        serde_json::json!(parent)
+    );
+
+    let subagent_ids: Vec<String> = ended
+        .iter()
+        .flat_map(|event| {
+            event.payload["subagent_conversations"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect();
+    assert!(
+        !subagent_ids.is_empty(),
+        "no typed subagent_info record arrived. The row stays FALSE on anything less than a typed \
+         child conversation_id — assistant text saying it delegated is not evidence. Transcript: \
+         {ended:?}"
+    );
+    for child in &subagent_ids {
+        assert_ne!(
+            child, &parent,
+            "a subagent sharing the parent's conversation is not a subagent"
+        );
+    }
+    // And the same record reached the tool vocabulary, with the child's own log.
+    let completed: Vec<_> = events_of_kind(&events, "tool.completed")
+        .into_iter()
+        .filter(|event| event.payload["subagent"].is_array())
+        .collect();
+    let child = completed
+        .iter()
+        .flat_map(|event| {
+            event.payload["subagent"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        })
+        .find(|child| child["conversation_id"].is_string())
+        .expect("a typed child record on a tool.completed event");
+    assert!(
+        child["log_uri"].is_string(),
+        "the child's own trajectory log"
+    );
+    backend.stop(&handle).expect("stop").wait();
 }
 
 // ------------------------------------------------------- W2 §1.4: registration
