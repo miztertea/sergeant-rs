@@ -1,0 +1,1 @@
+warning: ignoring unsupported stream input message event "bogus"
