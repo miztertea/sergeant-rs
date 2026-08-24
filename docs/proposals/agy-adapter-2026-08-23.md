@@ -375,8 +375,9 @@ the mirror image of opencode's own postscript.** §W3 named `ask` and
 `approval_flow` as candidates "measured or stays false" with no
 stated expectation, and named a SIGINT-based native interrupt tier as
 an upgrade candidate. All three refuted, each with a live transcript:
-sixteen candidate loop reply-event names tried and rejected/ignored
-for `ask`/`approval_flow` (W3 P1), and a SIGINT terminal
+sixteen candidate loop reply-event names tried and skipped, plus a
+seventeenth, `control_request`, refused outright, for
+`ask`/`approval_flow` (W3 P1), and a SIGINT terminal
 byte-identical to a plain `--print-timeout` expiry for the interrupt
 tier (W3 P4). OpenCode's own postscript records both of *its*
 analogous candidates landing `true`; agy's land `false` — two

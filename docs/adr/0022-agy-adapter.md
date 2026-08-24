@@ -345,10 +345,11 @@ a named test, not a paragraph:
   `ask_question`, `ask_permission` and `ask_custom_permission`, and
   `CORTEX_STEP_TYPE_ASK_QUESTION` exists, so a question may well
   *surface* — the refutation is about the **reply channel**. W3 P1
-  wrote sixteen candidate reply-event names into a live loop child;
-  fifteen were skipped with `warning: ignoring unsupported stream input
-  message event`, and the sixteenth, `control_request`, was refused
-  *"not supported yet"* (rc=2, upstream's own words). Print mode's
+  wrote sixteen candidate reply-event names into a live loop child, and
+  all sixteen were skipped with `warning: ignoring unsupported stream
+  input message event`. A separate, seventeenth probe, `control_request`
+  — the loop's own *only* recognised non-`user` event — was refused
+  outright, *"not supported yet"* (rc=2, upstream's own words). Print mode's
   complete 123-name symbol table contains no answer, reply or
   permission handler at all. There is no message the driver may send to
   approve, deny, or answer anything, on either transport. This is the
@@ -580,9 +581,15 @@ RefusedBeforeIdentity`); and `loop_denied_tool_kills_child` (typed
 **no new fidelity at all** and are cited by name in both doc comments
 rather than re-derived: `death_without_terminal` is already agy's
 group-SIGKILL shape (W1 P4), and `with_server_minted_native_ids`
-already generalizes agy's own `native_id: None` at PREPARE. Nine new
-tests, two of which exist specifically to prove the two *reused*
-shapes match agy's own admission rows by name.
+already generalizes agy's own `native_id: None` at PREPARE. Five new
+tests: three exercising the new constructors
+(`print_soft_denied_tool_looks_clean_in_history_but_never_completes`,
+`invalid_model_refusal_mints_no_identity_and_carries_the_catalog`,
+`loop_denied_tool_kills_child_and_the_next_send_is_refused`), plus
+two that exist specifically to prove the two *reused* shapes match
+agy's own admission rows by name
+(`agy_group_sigkill_reports_exited_native_with_no_signal_and_survives_resume`,
+`agy_conversation_id_is_learned_from_the_init_line_not_reserved_at_prepare`).
 
 ### The admission-rows / L8-structural pattern — reused verbatim
 
@@ -785,6 +792,19 @@ recorded here spent none.
   not an oversight: agy documents no export verb, and §15 forbids
   emulating one. OpenCode's `history: true` (ADR 0021) stands alone in
   the registry.
+- **W4's own end-to-end proof and the head PR's un-draft are
+  outstanding, not done.** The plan's W4 section names three concrete
+  proof artifacts for the reserved 5-turn budget — the agy contract
+  suite green against the installed harness on the PR, a daemon-boot
+  e2e with agy on PATH, and a live `sgt run --backend agy` Work against
+  a scratch estate, recorded in the PR body — plus un-drafting head PR
+  #250 once they land. None of the three proofs exist in this branch or
+  in the PR body, and #250 is still a draft. This is the same "spent
+  none" fact the live-turn accounting above already states; it is named
+  here explicitly, in this sprint's own evidence-honesty style, so a
+  reader does not have to infer the gap from the budget line. A future
+  turn (still K1-pinned, still bounded, still flash-low) is the
+  hand-off, not a silent close-out of W4.
 
 ## Alternatives considered
 

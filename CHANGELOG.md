@@ -51,9 +51,10 @@ not survive measurement.
 - **Two refutations, recorded rather than left as silent gaps**: `ask` and
   `approval_flow` are **measured false**, not merely unmeasured, on both
   transports — sixteen candidate loop reply-event names were tried live and
-  every one was rejected or ignored, so a question that surfaces here has no
-  channel to answer it on. OpenCode keeps the registry's only `true` on
-  either flag. A SIGINT-based interrupt upgrade was tried and refuted too:
+  skipped, and a seventeenth, `control_request`, was refused outright, so a
+  question that surfaces here has no channel to answer it on. OpenCode keeps
+  the registry's only `true` on either flag. A SIGINT-based interrupt
+  upgrade was tried and refuted too:
   on the loop transport it produced the same `ERROR`/"timeout waiting for
   response" terminal a plain deadline expiry gives, byte-for-byte
   indistinguishable — so `interrupt` stays `ProcessTreeTermination` on both
