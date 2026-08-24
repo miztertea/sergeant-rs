@@ -2012,6 +2012,56 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     );
 }
 
+/// #262: a `codex` profile that sets `permission_mode` validates fine
+/// (`codex.rs` never reads the option, so nothing about it can be
+/// "unrecognized") but must not be reported as if it took effect —
+/// `codex.rs`'s launch grammar has no `--permission-mode` equivalent at all.
+/// Before this fix `permission_mode_check` rendered every profile's
+/// configured mode identically regardless of backend, which is exactly the
+/// dishonesty issue #262 filed: `sgt doctor` reported the profile healthy
+/// from the string in `sergeant.toml` alone, never from what the adapter
+/// actually does with it.
+#[test]
+fn t3d_doctor_reports_permission_mode_has_no_effect_on_a_codex_profile() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
+    support::init_repo(&estate.path().join("repos").join("solo"));
+    std::fs::write(
+        estate.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"solo\"\n\n\
+         [[profile]]\nname = \"terra\"\nbackend = \"codex\"\n\
+         [profile.options]\npermission_mode = \"bypassPermissions\"\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (_, json, _) = doctor_in(
+        estate.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "permission_mode");
+    let detail = check["detail"].as_str().expect("detail is a string");
+    assert!(
+        detail.contains("terra="),
+        "the detail must name the codex profile: {detail}"
+    );
+    assert!(
+        !detail.contains("terra=bypassPermissions"),
+        "a codex profile must never be rendered as if bypassPermissions took effect: {detail}"
+    );
+    assert!(
+        detail.contains("bypassPermissions") && detail.contains("no effect"),
+        "the configured value must still be named, alongside a plain statement that the codex \
+         backend does not read it: {detail}"
+    );
+}
+
 /// MVP-3: `sgt doctor`'s estate check names a declared-but-missing
 /// repository by name and reports its declared `origin` as the remedy — the
 /// exact fact an operator needs ("clone it from here"), not a generic
