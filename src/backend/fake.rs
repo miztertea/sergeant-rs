@@ -194,6 +194,25 @@ pub struct FakeStep {
     /// the tool call `history()` reports as an auto-rejected
     /// `tool.requested`/`tool.completed` pair. `None` for every other step.
     pub rejected_tool: Option<RejectedTool>,
+    /// W4 (2026-08-23): set by [`FakeStep::print_soft_denied_tool`] — agy's
+    /// own print-transport soft-deny shape (`non_blocking_run`'s
+    /// `DeniedToolCancelsTheTurn` row): the tool call `history()` reports as
+    /// a clean, error-free `tool.requested`/`tool.completed` pair, distinct
+    /// from [`RejectedTool`]'s own always-`is_error:true` shape. `None` for
+    /// every other step.
+    pub soft_denied_tool: Option<RejectedTool>,
+    /// W4 (2026-08-23): set by [`FakeStep::loop_denied_tool_kills_child`] —
+    /// agy's own loop-transport denied-tool shape (`non_blocking_run`'s
+    /// `DeniedToolKillsTheChild` row). `None` for every other step.
+    pub killed_tool: Option<KilledToolCall>,
+    /// W4 (2026-08-23): set by [`FakeStep::invalid_model_refusal`] — agy's
+    /// own typed invalid-model refusal (`model_selection`'s Layer 1 row):
+    /// the LAUNCH itself is refused, before any identity is minted, with
+    /// this text (the whole model catalog, in agy's own measured shape)
+    /// carried verbatim into the [`BackendError::Failed`] detail. `None`
+    /// for every other step, and never consumed by an already-running
+    /// execution the way the other three fields above are.
+    pub launch_refusal: Option<String>,
 }
 
 /// W4 (2026-08-23): the structured fields behind opencode's typed terminal
@@ -212,13 +231,38 @@ pub struct TypedError {
 }
 
 /// W4 (2026-08-23): the tool call opencode's `run` transport auto-rejected
-/// (probe 4) — see [`FakeStep::complete_with_rejected_tool`].
+/// (probe 4) — see [`FakeStep::complete_with_rejected_tool`]. Also the shape
+/// [`FakeStep::print_soft_denied_tool`] identifies its own call by (agy's
+/// print-transport soft-deny carries no error text at all, unlike either of
+/// those two — see that constructor for why the same two-field identity is
+/// enough).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RejectedTool {
     /// The tool's name (e.g. `"bash"`).
     pub name: String,
     /// The rejected call's id.
     pub call_id: String,
+}
+
+/// W4 (2026-08-23): the tool call `history()` reports for
+/// [`FakeStep::loop_denied_tool_kills_child`] — agy's own loop-transport
+/// denied-tool shape (`non_blocking_run`'s `DeniedToolKillsTheChild` row,
+/// W3 A2). Structurally distinct from [`RejectedTool`]: that shape's fixed
+/// "user rejected" text is opencode's own wording; this one carries agy's
+/// measured typed `tool_info.error {type, message}` verbatim, because that
+/// is what a caller reading structured evidence off this shape actually
+/// needs to see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KilledToolCall {
+    /// The tool's name (e.g. `"run_command"`).
+    pub name: String,
+    /// The denied call's id.
+    pub call_id: String,
+    /// The typed error's `type` (agy's own measured `"TOOL_ERROR"`).
+    pub error_type: String,
+    /// The typed error's `message`, carried verbatim into both the rendered
+    /// [`BackendSignal::Failed`] reason and `history()`'s structured event.
+    pub message: String,
 }
 
 impl FakeStep {
@@ -281,6 +325,9 @@ impl FakeStep {
             interrupt_confirmed: false,
             typed_error: None,
             rejected_tool: None,
+            soft_denied_tool: None,
+            killed_tool: None,
+            launch_refusal: None,
         }
     }
 
@@ -327,6 +374,15 @@ impl FakeStep {
     /// itself. Probe 11's separate finding (a *tool* grandchild can survive
     /// the opencode leader's death) is an interrupt/process-tree concern, not
     /// this shape's — see `opencode_interrupt_kills_the_process_group`.
+    ///
+    /// W4 (2026-08-23), reused rather than re-derived (R2): agy's own
+    /// `interrupt`/`ProcessTreeTermination` row measured the identical
+    /// shape independently (W1 P4) — a group SIGKILL truncated the stream
+    /// with no terminal event of any kind, `pgrep -x agy` empty, and the
+    /// conversation left fully resumable. No agy-specific name was added
+    /// for it; `agy.rs`'s own module doc cites the same reuse-not-rederive
+    /// rung for `kill_process_group` that this constructor's name already
+    /// exercises.
     pub fn death_without_terminal() -> Self {
         Self::never_arrives().with_native(NativeState::Exited)
     }
@@ -378,6 +434,71 @@ impl FakeStep {
             name: tool_name.to_string(),
             call_id: call_id.to_string(),
         });
+        step
+    }
+
+    /// W4 (2026-08-23): agy's own print-transport soft-deny shape —
+    /// `non_blocking_run`'s `DeniedToolCancelsTheTurn` row (W1 P2/P3,
+    /// `agy.rs`'s module doc hazard 2). The measured shape inverts
+    /// [`FakeStep::complete_with_rejected_tool`]'s honesty picture rather
+    /// than repeating it: agy's tool step resolves `ACTIVE -> DONE` with
+    /// **no error and no output at all**, so the structured evidence alone
+    /// reads as an ordinary clean completion — the *only* signal anything
+    /// was denied is agy's own out-of-band stderr notice, which this fake
+    /// has no stderr channel to model. What this constructor scripts
+    /// instead is the terminal consequence agy.rs's own `classify_terminal`
+    /// derives from that CANCELED status: fail-closed ambiguous
+    /// (`native: Unknown`, `signal: Running` — arms 5/6, the same shape
+    /// [`FakeStep::death_without_terminal`] already gives OBSERVE), so a
+    /// caller that trusts the innocent-looking tool completion instead of
+    /// the terminal classification is exactly the hazard the real adapter's
+    /// module doc names.
+    pub fn print_soft_denied_tool(tool_name: &str, call_id: &str) -> Self {
+        let mut step = Self::running(BackendSignal::Running).with_native(NativeState::Unknown);
+        step.soft_denied_tool = Some(RejectedTool {
+            name: tool_name.to_string(),
+            call_id: call_id.to_string(),
+        });
+        step
+    }
+
+    /// W4 (2026-08-23): agy's own loop-transport denied-tool shape —
+    /// `non_blocking_run`'s `DeniedToolKillsTheChild` row (W3 A2), and the
+    /// wave's own most operationally important measurement: the SHAPE
+    /// INVERTS [`FakeStep::print_soft_denied_tool`] rather than matching
+    /// it. The tool step resolves `ACTIVE -> ERROR` carrying a typed
+    /// `tool_info.error {type: "TOOL_ERROR", message}` verbatim (unlike the
+    /// print transport's silent DONE), the terminal is a typed `Failed`
+    /// with that same message, and the child process itself exits — so
+    /// [`FakeBackend::send`] on this execution afterward is refused rather
+    /// than queued, matching the measured fact that the second message
+    /// queued behind this one never ran because there was no live child
+    /// left to carry it.
+    pub fn loop_denied_tool_kills_child(tool_name: &str, call_id: &str, message: &str) -> Self {
+        let mut step = Self::fail(message);
+        step.killed_tool = Some(KilledToolCall {
+            name: tool_name.to_string(),
+            call_id: call_id.to_string(),
+            error_type: "TOOL_ERROR".to_string(),
+            message: message.to_string(),
+        });
+        step
+    }
+
+    /// W4 (2026-08-23): agy's own typed invalid-model refusal —
+    /// `model_selection`'s Layer 1 row (`packet 4`, `W1 P0.3 row A`,
+    /// `agy.rs`'s own `FirstTurnSignal::RefusedBeforeIdentity`). The harness
+    /// refuses the whole LAUNCH before minting any conversation identity at
+    /// all, with the error text enumerating the **entire model catalog**
+    /// rather than naming just the bad pin — strictly better evidence than
+    /// a bare exit code. Unlike every other [`FakeStep`] constructor, a step
+    /// built this way is never assigned to a live execution:
+    /// [`FakeBackend::launch`] consumes it and returns `Err` directly,
+    /// leaving no execution behind for a caller to observe, resume, or
+    /// send to — mints no identity, same as the real adapter.
+    pub fn invalid_model_refusal(catalog: &str) -> Self {
+        let mut step = Self::fail(catalog);
+        step.launch_refusal = Some(catalog.to_string());
         step
     }
 
@@ -453,6 +574,9 @@ impl FakeStep {
             interrupt_confirmed: false,
             typed_error: None,
             rejected_tool: None,
+            soft_denied_tool: None,
+            killed_tool: None,
+            launch_refusal: None,
         }
     }
 }
@@ -555,6 +679,12 @@ struct FakeExecution {
     /// evidence string, never by `native`/`signal` themselves, which already
     /// carry the real distinction structurally.
     confirmed_interrupted: bool,
+    /// W4 (2026-08-23): set once a [`FakeStep::loop_denied_tool_kills_child`]
+    /// step is assigned to this execution — agy's own measured fact that the
+    /// loop child process itself exits when a tool is denied, so a
+    /// subsequent `send()` has no live child to queue behind and must be
+    /// refused rather than accepted.
+    transport_dead: bool,
 }
 
 #[derive(Debug)]
@@ -697,6 +827,15 @@ impl FakeBackend {
     /// Default off: every other test in this suite reads PREPARE's eager
     /// `Some(fake-session-<id>)` today, so flipping the default would be a
     /// breaking change to this whole test suite, not a fidelity improvement.
+    ///
+    /// W4 (2026-08-23), reused rather than re-derived (R2): agy's own
+    /// `identity_before_first_turn`/`model_selection` rows measured the
+    /// identical mechanical shape independently — `conversation_id` is
+    /// harness-minted and first appears on the `init` line, so `agy.rs`'s
+    /// own `prepare()` also returns `native_id: None` unconditionally (no
+    /// toggle needed on the real adapter's side; every agy execution IS this
+    /// shape). No agy-specific name was added for it — the flag already
+    /// generalizes past the one adapter its doc comment was written for.
     pub fn with_server_minted_native_ids(mut self) -> Self {
         self.server_minted_native_ids = true;
         self
@@ -1084,6 +1223,20 @@ impl Backend for FakeBackend {
         }
         let step = Self::next_step(&mut state);
         state.starts.push(prepared.request.clone());
+        // W4 (2026-08-23): agy's own typed invalid-model refusal — see
+        // `FakeStep::invalid_model_refusal`. Mints no identity: returned
+        // straight from here, before the execution table gets an entry at
+        // all, matching the real adapter's `FirstTurnSignal::
+        // RefusedBeforeIdentity` arm.
+        if let Some(catalog) = step.launch_refusal.clone() {
+            return Err(BackendError::Failed {
+                backend: self.name.clone(),
+                detail: format!(
+                    "the backend refused this turn before minting a conversation (agy's own \
+                     invalid-model shape, model_selection's Layer 1 admission row): {catalog}"
+                ),
+            });
+        }
         let native_id = prepared
             .native_id
             .clone()
@@ -1093,6 +1246,10 @@ impl Backend for FakeBackend {
             FakeExecution {
                 native_id: native_id.clone(),
                 settle_remaining: step.settle,
+                // W4: agy's own loop-transport denied-tool shape kills the
+                // child on the very turn it names, not only on the send
+                // after it — see `FakeStep::loop_denied_tool_kills_child`.
+                transport_dead: step.killed_tool.is_some(),
                 step,
                 inputs: Vec::new(),
                 stopped: false,
@@ -1120,6 +1277,23 @@ impl Backend for FakeBackend {
         self.send_gate.pass();
         let mut state = self.lock();
         self.resolve(&state, handle)?;
+        // W4 (2026-08-23): agy's own loop-transport denied-tool shape —
+        // `FakeStep::loop_denied_tool_kills_child` — leaves no live child to
+        // queue behind, so a SEND after it is refused rather than accepted,
+        // matching the measured fact that the message queued behind it never
+        // ran.
+        if state.executions[&handle.execution_id].transport_dead {
+            return Err(BackendError::Failed {
+                backend: self.name.clone(),
+                detail: format!(
+                    "execution {} has no live transport: a prior turn's denied tool killed the \
+                     loop child (agy's own non_blocking_run DeniedToolKillsTheChild shape), so \
+                     this send is refused rather than queued behind a process that no longer \
+                     exists",
+                    handle.execution_id
+                ),
+            });
+        }
         // Delivering input advances this execution to the next scripted step:
         // the answer is what unblocks the turn.
         let step = Self::next_step(&mut state);
@@ -1131,6 +1305,9 @@ impl Backend for FakeBackend {
             text: input.to_string(),
             queued: false,
         });
+        if step.killed_tool.is_some() {
+            execution.transport_dead = true;
+        }
         execution.step = step;
         execution.settle_remaining = execution.step.settle;
         Ok(())
@@ -1305,6 +1482,48 @@ impl Backend for FakeBackend {
                     "is_error": true,
                     "status": "error",
                     "error": "The user rejected permission to use this specific tool call.",
+                }),
+            });
+        }
+        // W4 (2026-08-23): agy's own print-transport soft-deny shape, if this
+        // step scripted one — a clean, error-free `tool.*` pair, deliberately
+        // carrying no `error` key at all (see
+        // [`FakeStep::print_soft_denied_tool`] for why: agy's own measured
+        // shape has none either, which is the honesty hazard this exists to
+        // reproduce).
+        if let Some(tool) = &execution.step.soft_denied_tool {
+            events.push(NativeEvent {
+                kind: KIND_TOOL_REQUESTED.to_string(),
+                payload: json!({"id": tool.call_id, "name": tool.name, "input": null}),
+            });
+            events.push(NativeEvent {
+                kind: KIND_TOOL_COMPLETED.to_string(),
+                payload: json!({
+                    "tool_use_id": tool.call_id,
+                    "name": tool.name,
+                    "is_error": false,
+                    "status": "done",
+                }),
+            });
+        }
+        // W4 (2026-08-23): agy's own loop-transport denied-tool shape, if
+        // this step scripted one — a typed `tool.*` rejection carrying the
+        // harness's own error type and message verbatim (see
+        // [`FakeStep::loop_denied_tool_kills_child`]).
+        if let Some(tool) = &execution.step.killed_tool {
+            events.push(NativeEvent {
+                kind: KIND_TOOL_REQUESTED.to_string(),
+                payload: json!({"id": tool.call_id, "name": tool.name, "input": null}),
+            });
+            events.push(NativeEvent {
+                kind: KIND_TOOL_COMPLETED.to_string(),
+                payload: json!({
+                    "tool_use_id": tool.call_id,
+                    "name": tool.name,
+                    "is_error": true,
+                    "status": "error",
+                    "error_type": tool.error_type,
+                    "error": tool.message,
                 }),
             });
         }
@@ -2153,6 +2372,221 @@ mod tests {
             default_prepared.native_id.as_deref(),
             Some("fake-session-first-turn"),
             "the opt-in leaves every other script's eager PREPARE unchanged"
+        );
+    }
+
+    /// W4 fake fidelity shape 5: agy's own print-transport soft-deny (W1
+    /// P2/P3, `non_blocking_run`'s `DeniedToolCancelsTheTurn` row). The
+    /// structured tool evidence alone looks like an ordinary clean
+    /// completion — no `error` key anywhere — and the turn does NOT
+    /// complete: it classifies fail-closed ambiguous, the same
+    /// `(Unknown, Running)` shape `death_without_terminal` reports, so a
+    /// caller that trusted the innocent-looking tool completion instead of
+    /// the terminal classification would be fooled exactly the way agy's
+    /// own module doc warns against.
+    #[test]
+    fn print_soft_denied_tool_looks_clean_in_history_but_never_completes() {
+        let fake = FakeBackend::scripted(
+            "fake",
+            [FakeStep::print_soft_denied_tool("run_command", "step-3")],
+        );
+        let handle = fake.start(&request("denied-command")).expect("start");
+
+        let observed = fake.observe(&handle).expect("observe");
+        assert_eq!(
+            observed.native,
+            NativeState::Unknown,
+            "agy's own CANCELED terminal on this shape classifies fail-closed \
+             ambiguous, never completed"
+        );
+        assert_eq!(
+            observed.signal,
+            BackendSignal::Running,
+            "no explicit Failed/StageCompleted signal — the ambiguity is carried \
+             in `native`, exactly as `agy.rs`'s own classify_terminal arms 5/6 do"
+        );
+
+        assert_eq!(
+            fake.history(&handle).expect("history"),
+            vec![
+                NativeEvent {
+                    kind: "tool.requested".to_string(),
+                    payload: json!({"id": "step-3", "name": "run_command", "input": null}),
+                },
+                NativeEvent {
+                    kind: "tool.completed".to_string(),
+                    payload: json!({
+                        "tool_use_id": "step-3",
+                        "name": "run_command",
+                        "is_error": false,
+                        "status": "done",
+                    }),
+                },
+            ],
+            "structured evidence alone reads as a clean completion — no error field \
+             anywhere — which is the exact honesty hazard this shape exists to pin"
+        );
+    }
+
+    /// W4 fake fidelity shape 6: agy's own typed invalid-model refusal
+    /// (`model_selection`'s Layer 1 row, W1 P0.3 row A). The whole LAUNCH is
+    /// refused before any identity is minted — the catalog travels verbatim
+    /// in the error, and no phantom execution is left behind for a later
+    /// OBSERVE to stumble on.
+    #[test]
+    fn invalid_model_refusal_mints_no_identity_and_carries_the_catalog() {
+        let catalog = "model not-a-real-model is not recognized as a known model or custom \
+                        model in settings\nAvailable models:\n  Gemini 3.7 Flash (Low)";
+        let fake = FakeBackend::scripted("fake", [FakeStep::invalid_model_refusal(catalog)]);
+
+        let err = fake
+            .start(&request("bad-model"))
+            .expect_err("an invalid model pin refuses the whole launch");
+        let BackendError::Failed { detail, .. } = err else {
+            panic!("expected BackendError::Failed, got {err:?}");
+        };
+        assert!(
+            detail.contains("Gemini 3.7 Flash (Low)"),
+            "the whole catalog travels verbatim in the refusal, not just the bad pin's name"
+        );
+
+        // No phantom execution: an OBSERVE against the id the refused start
+        // would have used is an honest UnknownExecution, not a context this
+        // backend actually remembers.
+        let phantom = ExecutionHandle {
+            execution_id: "bad-model".to_string(),
+            native_id: None,
+        };
+        assert!(
+            matches!(
+                fake.observe(&phantom),
+                Err(BackendError::UnknownExecution { .. })
+            ),
+            "a refused LAUNCH mints no identity and leaves no execution behind"
+        );
+    }
+
+    /// W4 fake fidelity shape 7: agy's own loop-transport denied-tool shape
+    /// (`non_blocking_run`'s `DeniedToolKillsTheChild` row, W3 A2) — the
+    /// wave's own most operationally important measurement, and it INVERTS
+    /// shape 5 above rather than repeating it: the tool step carries a
+    /// typed `TOOL_ERROR`, the turn fails outright, and the child process
+    /// itself is gone — so the *next* SEND on the same execution is
+    /// refused, not queued, matching the measured fact that the message
+    /// queued behind this one never ran.
+    #[test]
+    fn loop_denied_tool_kills_child_and_the_next_send_is_refused() {
+        let fake = FakeBackend::scripted(
+            "fake",
+            [
+                FakeStep::complete_with("turn 1 ran fine"),
+                FakeStep::loop_denied_tool_kills_child(
+                    "run_command",
+                    "step-3",
+                    "permission check failed for command \"echo agy-w3-probe\": user denied \
+                     permission to run command:\necho agy-w3-probe",
+                ),
+            ],
+        );
+        let handle = fake.start(&request("loop-turn-1")).expect("start");
+        assert_eq!(
+            fake.observe(&handle).expect("observe").signal,
+            BackendSignal::StageCompleted {
+                summary: Some("turn 1 ran fine".to_string())
+            }
+        );
+
+        fake.send(&handle, "turn 2: run a denied command")
+            .expect("SEND itself succeeds — the child accepted the line before dying");
+        let observed = fake.observe(&handle).expect("observe");
+        assert_eq!(
+            observed.signal,
+            BackendSignal::Failed {
+                reason: "permission check failed for command \"echo agy-w3-probe\": user \
+                         denied permission to run command:\necho agy-w3-probe"
+                    .to_string()
+            },
+            "the denied tool fails the TURN outright — the inverse of shape 5's silent DONE"
+        );
+        assert_eq!(
+            fake.history(&handle).expect("history").last(),
+            Some(&NativeEvent {
+                kind: "tool.completed".to_string(),
+                payload: json!({
+                    "tool_use_id": "step-3",
+                    "name": "run_command",
+                    "is_error": true,
+                    "status": "error",
+                    "error_type": "TOOL_ERROR",
+                    "error": "permission check failed for command \"echo agy-w3-probe\": user \
+                              denied permission to run command:\necho agy-w3-probe",
+                }),
+            }),
+            "structured evidence carries the harness's own typed error verbatim"
+        );
+
+        let refused = fake
+            .send(&handle, "turn 3: this never runs")
+            .expect_err("no live child is left to queue behind");
+        assert!(
+            matches!(refused, BackendError::Failed { .. }),
+            "the dead transport is refused, not silently accepted"
+        );
+    }
+
+    /// W4 fake fidelity shape 8: agy's own `interrupt`/`ProcessTreeTermination`
+    /// row (W1 P4) measured the identical SIGKILL shape
+    /// `death_without_terminal` already gives OBSERVE independently of
+    /// opencode's own probe 10 — reused rather than re-derived (R2), exactly
+    /// as `agy.rs`'s own `kill_process_group` reuses opencode probe 11's
+    /// grandchild lesson without re-arguing it.
+    #[test]
+    fn agy_group_sigkill_reports_exited_native_with_no_signal_and_survives_resume() {
+        let fake = FakeBackend::scripted("fake", [FakeStep::death_without_terminal()]);
+        let handle = fake.start(&request("agy-sigkilled")).expect("start");
+
+        let observed = fake.observe(&handle).expect("observe");
+        assert_eq!(
+            observed.native,
+            NativeState::Exited,
+            "W1 P4: pgrep -x agy came back empty after the group kill"
+        );
+        assert_eq!(
+            observed.signal,
+            BackendSignal::Running,
+            "no terminal event of any kind survived the kill"
+        );
+
+        fake.resume(&handle, &ResumeRequest::new("w", "/anywhere"))
+            .expect(
+                "W1 P4 measured the conversation left fully resumable, with the \
+                 pre-kill content recalled on the next turn",
+            );
+    }
+
+    /// W4 fake fidelity shape 9: agy's own `identity_before_first_turn`/
+    /// `model_selection` rows measured PREPARE reserving nothing —
+    /// `conversation_id` is harness-minted and first appears on the `init`
+    /// line — the identical mechanical shape `with_server_minted_native_ids`
+    /// already generalizes past the one adapter (opencode) its own doc
+    /// comment names. Reused rather than re-derived (R2): no agy-specific
+    /// method was added.
+    #[test]
+    fn agy_conversation_id_is_learned_from_the_init_line_not_reserved_at_prepare() {
+        let fake = FakeBackend::new("fake").with_server_minted_native_ids();
+
+        let prepared = fake.prepare(&request("agy-first-turn")).expect("prepare");
+        assert_eq!(
+            prepared.native_id, None,
+            "agy's own prepare() returns native_id: None unconditionally — \
+             conversation_id does not exist until the child's init line"
+        );
+
+        let handle = fake.launch(&prepared).expect("launch");
+        assert!(
+            handle.native_id.is_some(),
+            "LAUNCH mints the identity once the (simulated) init line actually \
+             carries one"
         );
     }
 }
