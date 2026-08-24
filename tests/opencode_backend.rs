@@ -2590,13 +2590,26 @@ fn serve_question_asked_parks_as_actor_authored_and_the_reply_relays_to_its_endp
         assert!(Instant::now() < deadline, "the gate never cleared");
         std::thread::sleep(Duration::from_millis(20));
     }
-    let replied = events_of_kind(&events, "conversation.turn.harness_error")
-        .into_iter()
-        .find(|e| e.payload["phase"] == "question_replied");
-    assert!(
-        replied.is_some(),
-        "the question.replied SSE frame must have been dispatched and journaled"
-    );
+    // Bounded wait, not an instantaneous read: the gate clearing (the reply
+    // POST landing) and the `question.replied` SSE frame's journaling ride
+    // different paths — the SSE reader journals asynchronously, and release
+    // run 18's instrumented Gate D runner observed the gate clear before the
+    // frame was journaled. The property stays the same (the frame MUST be
+    // dispatched and journaled); only the ordering assumption goes.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let replied = events_of_kind(&events, "conversation.turn.harness_error")
+            .into_iter()
+            .find(|e| e.payload["phase"] == "question_replied");
+        if replied.is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the question.replied SSE frame must have been dispatched and journaled"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     backend.stop(&handle).expect("stop").wait();
 }
 
