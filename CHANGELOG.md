@@ -12,6 +12,125 @@ released before a release can proceed.
 
 (nothing yet)
 
+## [0.2.3] - 2026-08-23
+
+Sergeant speaks Antigravity: a fourth native backend, registered the same
+way Claude, Codex, and OpenCode are, with a new capability first this
+release adds to the registry — typed native subagents — plus a launch-time
+model-pin verification that beats every sibling adapter's own posture, and
+two honestly-recorded refutations where the plan's own headline hopes did
+not survive measurement.
+
+### Agy backend
+
+- **`sgt run --backend agy` and `sgt agy`** are real now — the agy adapter
+  (`src/backend/agy.rs`) is registered in the `BackendRegistry` alongside
+  Claude, Codex, and OpenCode. `sgt agy` is the exact mechanical mirror of
+  the `goose` passthrough block (ADR 0006 D2) — origin-affinity routing has
+  no origin to affine from without it.
+- Two transports, chosen once per registration and never mixed mid-turn:
+  `agy -p <prompt> --output-format stream-json` (one process per turn, the
+  fallback under every capability below) and an adapter-driven
+  `--input-format stream-json` input loop (one child for the whole
+  execution, driven over plain stdio — no new crate, no port, no auth
+  posture to carry, the cheapest second transport any adapter here has had).
+- **Identity, the resolved model, and the effective permission mode all
+  arrive on line 1** (the `init` event), before any model output — the
+  strongest launch-time pin verification in the registry: claude verifies
+  post-hoc from `modelUsage`, opencode post-hoc from `export`, and codex
+  records substitution as undetectable, while agy's `verify_pin_from_init`
+  refuses the LAUNCH itself the instant a substituted model is named, for
+  zero wasted turns. Per-step usage rides every `step_update` too, so usage
+  is known during a turn, not only at its end.
+- **`native_subagents: true` on the loop transport — the first `true` for
+  this flag anywhere in the registry.** A typed `subagent_info` record
+  (`{type_name, role, initial_prompt, conversation_id, log_uri}`) names a
+  child conversation distinct from the parent's, with its own transcript —
+  admitted only on that typed evidence, never on assistant prose claiming a
+  delegation happened.
+- **Two refutations, recorded rather than left as silent gaps**: `ask` and
+  `approval_flow` are **measured false**, not merely unmeasured, on both
+  transports — sixteen candidate loop reply-event names were tried live and
+  every one was rejected or ignored, so a question that surfaces here has no
+  channel to answer it on. OpenCode keeps the registry's only `true` on
+  either flag. A SIGINT-based interrupt upgrade was tried and refuted too:
+  on the loop transport it produced the same `ERROR`/"timeout waiting for
+  response" terminal a plain deadline expiry gives, byte-for-byte
+  indistinguishable — so `interrupt` stays `ProcessTreeTermination` on both
+  transports, and `classify_terminal` gained an `InterruptedRunning`
+  reading for that ambiguous terminal keyed on whether sergeant asked for
+  the kill.
+- **The soft-deny discrepancy, resolved by measurement and by transport.**
+  Docs and an earlier probe pass both described a *hard* deny (typed
+  `TOOL_ERROR`, terminal `ERROR`, exit 1); at the installed 1.1.19 this
+  inverts on **print**: the tool step resolves `DONE` with no error and no
+  output at all, the terminal is `CANCELED`, exit 0, and the *only*
+  evidence anywhere is a plain-text stderr notice — classified fail-closed
+  ambiguous rather than trusted as a clean completion. The **loop**
+  transport instead does the opposite: the tool step carries the typed
+  `TOOL_ERROR` verbatim, the terminal fails outright, and the child process
+  itself exits, so a queued follow-up turn never runs and a subsequent send
+  is refused rather than silently accepted. Two real shapes, both handled,
+  neither guessed at.
+- **No native OS sandbox to claim.** `nsjail` appears nowhere in the
+  installed binary despite the docs' OS-native-mechanism claim, and
+  `--sandbox`/`--add-dir` change nothing observable on the `init` line — so
+  sandbox state is not launch-observable and this adapter does not pretend
+  to report it. One paid probe found `proceed-in-sandbox` genuinely lifts
+  the permission gate as a second, allow-rule-free channel, but the
+  sandbox mechanism itself does not run on this host (a connection-reset
+  failure at the tool layer) — evidenced, not claimed, and neither flag is
+  composed by default on either transport. No NORTH-STAR amendment 4 entry
+  is appended for this adapter, the identical posture ADR 0021 records for
+  opencode: there is nothing here that qualifies as native enforcement to
+  bind one to.
+- **The measured permission-injection channel**: agy reads its settings
+  from `$HOME/.gemini/antigravity-cli/settings.json`, so a per-run `HOME`
+  override (`AgyConfig::settings_home`) is the lever — workspace-scoped
+  settings files and a config-home environment variable were both measured
+  absent. This wave wires the channel and synthesizes no policy: mapping a
+  Work's declared mutation surface onto agy's `permissions` namespaces
+  remains unbuilt, because inventing one here would be a security decision
+  with no measurement behind it. Regardless of whether that channel is
+  configured, the effective `permission_mode` is read off the `init` line
+  and reported at launch — before any tool call, not discovered mid-run —
+  so a tool-bearing Work launching under a denying posture is never a
+  surprise.
+- **Version churn, handled by provenance, not policy.** The installed build
+  auto-updated `1.1.17` → `1.1.19` mid-sprint; `MEASURED_FLOOR` stays
+  `1.1.17`, unconditionally provenance rather than a gate — every fixture
+  here is a 1.1.19 capture, deliberately kept even though R1 would not have
+  refused a build below its own floor either.
+- **Two hardening fixes folded in during registration and finalize**: the
+  zero-quota `/config` probe agy's own capability resolution calls during
+  daemon registration is not always instant — an unauthenticated `agy`
+  answers it with a blocking OAuth prompt — so the probe now carries its own
+  5-second ceiling rather than risking the blocking-registration-call class
+  of regression this project already tracks; and the loop transport's
+  effective permission posture is now computed by the very reader thread
+  that also composes the turn-end event, closing a race where a fast child
+  could otherwise reach turn-end before the posture had been stored.
+- **A recorded operational lesson, not a code defect**: composing
+  `--disable-slash-commands` together with a slash-command prompt turns
+  what looks like a zero-quota introspection call into an ordinary paid
+  turn on the account's default model, not the pinned one — the one live
+  probe this cost is reported rather than quietly absorbed, and this
+  adapter's own zero-quota `/config` probe composes no such flag
+  combination.
+
+### Fake backend
+
+- Five measured agy shapes, for contract-test authors who need to drive the
+  engine against them deterministically: the print-transport soft-deny (a
+  clean-looking tool completion whose turn never completes), the
+  loop-transport denied-tool-kills-the-child shape (a typed tool failure
+  after which the next send is refused), and the typed invalid-model
+  refusal that mints no identity at all. Two more agy shapes reuse fake
+  fidelity opencode's own wave already built rather than re-deriving it —
+  init-first identity and death-without-terminal — each now proven against
+  agy's own admission rows by a dedicated test. All additive: every
+  existing fake-backend test is unchanged.
+
 ## [0.2.2] - 2026-08-23
 
 Sergeant speaks OpenCode: a third native backend, registered the same
