@@ -437,28 +437,53 @@ rather than depending on LAUNCH's own round trip, closed during W1's
 own captain pass — commit `38932727`).
 
 **The K2 "no core changes" ledger is real but not empty, exactly as
-K2's own text anticipated.** Six items across W1–W3 touched something
-outside `src/backend/agy.rs`: the `sgt agy` passthrough itself
-(`src/cli.rs`, `src/harness.rs`, K2's own pre-ratified exception); the
-`"agy"` `BackendRegistry` registration (`src/daemon.rs`); the
-A4-required blob-ref PUT-site/recovery row
-(`tests/a4_blob_ref_pinning.rs`, gate-forced); three pre-existing
-fixtures' registered-backend count/list widened by the registration
-commit itself (mechanical fallout, not a separate decision); the two
-new suites' `c2-suites.sh` wiring (gate-forced by
-`tests/coverage_stage_membership.rs`, built during the opencode
-sprint); and the adapter's own `tests/agy_backend.rs`/
-`tests/agy_routing.rs` files, listed for the ledger's completeness
-rather than because either is a scope question. All six are listed
-with their individual reasons in ADR 0022's own K2 exception ledger
-for owner ratification at the head PR, exactly as this plan's own
-"Ratify-at-review" list promised. Unlike opencode's own sprint, agy
-needed **no** new `Cargo.toml` dependency or feature flag at all —
-the input loop is plain stdio, and W3's own §"input-loop transport
-upgrades" framing ("zero new crates, no ports, no auth posture to
-carry") landed exactly as written.
+K2's own text anticipated — and it is eleven items, not the six a
+W1–W3-only reading gives.** Counted mechanically ("every file outside
+`src/backend/agy.rs` this sprint touched") across all four waves, the
+ledger is: the `pub mod agy;` declaration and its doc comment in
+`src/backend/mod.rs` — the only edit to that file, with the `Backend`
+contract itself byte-unchanged (W1); the A4-required blob-ref
+PUT-site/recovery row (`tests/a4_blob_ref_pinning.rs`, gate-forced,
+W1); the adapter's own `tests/agy_backend.rs`/`tests/agy_routing.rs`
+suites (W1–W3, template-pre-ratified); the 26 fixtures cut at 1.1.19
+(13 print + 13 loop, W1 and W3); the two `c2-suites.sh` stage wirings
+(gate-forced by `tests/coverage_stage_membership.rs`, built during the
+opencode sprint, W1/W2); the `"agy"` `BackendRegistry` registration
+(`src/daemon.rs`, W2); the `sgt agy` passthrough itself (`src/cli.rs`
++17/-9 plus a one-line doc-only verb-list bump in `src/harness.rs` —
+K2's own pre-ratified exception, W2); three pre-existing fixtures'
+registered-backend count/list widened by that registration commit
+itself (`tests/m2_daemon_api.rs`/`m3_execution.rs`/`m4_backends.rs`,
+mechanical fallout, W2); the three-field struct-literal fallout of
+W4's fake-backend fidelity (`tests/m4_backends.rs` again); the K3
+version bump (`Cargo.toml`/`Cargo.lock`, W4); and W4's own release and
+reference documentation (`CHANGELOG.md`, one `README.md` quickstart
+line, the `docs/DEVELOPMENT.md` backend-list sentence, ADR 0022, and
+this postscript). All eleven are listed with their individual reasons
+in ADR 0022's own K2 exception ledger for owner ratification at the
+head PR, exactly as this plan's own "Ratify-at-review" list promised.
+Two facts worth stating positively rather than by omission: unlike the
+opencode sprint, agy needed **no** new `Cargo.toml` dependency and not
+even a feature flag — W3's own §"input-loop transport upgrades"
+framing ("zero new crates, no ports, no auth posture to carry") landed
+exactly as written — and unlike that sprint's W2, agy needed **no**
+`harness.rs` PATH line either, because `~/.local/bin` was already on
+`toolchain_path_dirs`, which this plan's §"Measured facts" predicted
+correctly.
 
-**Coverage held at or above the floor without a dedicated lift wave.**
-W4's own gate rerun found `src/backend/agy.rs` and `src/backend/
-fake.rs` both clear of the 90% floor already; see the gate results
-recorded in this task's own delivery record rather than restated here.
+**Live-turn spend against K1, recorded whole rather than netted.** W1
+spent 9 of 15 budgeted; W2 spent **zero** (stub-driven end to end); W3
+spent 13 of 20 — 5 spec probes, 7 admissions, and 1 accidental (X0),
+the sprint's only unpinned turn, which is on the record in the packet,
+in the W3 PR body and in ADR 0022's own section rather than absorbed
+into a total; W4's own budget is 5, reserved for the end-to-end proof,
+with the fake-fidelity, doctrine and finalize work spending none.
+Every other turn in this sprint pinned `gemini-3.7-flash-low`.
+
+**Coverage held at or above the floor without a dedicated lift wave** —
+the one W4 job this plan budgeted for that turned out not to be needed.
+W3's gate rerun (the full CI sequence) measured TOTAL **91.84%** lines
+against the 90 floor, with `backend/agy.rs` at 94.17%; W4's
+fake-fidelity commit measured `backend/fake.rs` at 98.50% lines, the
+only source file it touched. W4's doctrine and finalize commits change
+no source at all.
