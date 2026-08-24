@@ -1535,6 +1535,37 @@ fn walk_for_marker(dir: &Path) -> bool {
             && content.contains("validated.txt")
             && content.contains("container-produced-evidence")
         {
+            // #234: a retained `.dirty.patch` that merely *contains* the
+            // right text is not enough — the whole point of the bug was a
+            // patch that looked right but `git apply` rejected as corrupt
+            // at end-of-file. Pin the acceptance criteria directly: `git
+            // apply --stat` proves the patch parses at all, and `--check`
+            // (applied into a fresh empty scratch dir, since `validated.txt`
+            // is captured here as a brand-new untracked file) proves it is
+            // actually applicable, not just textually plausible.
+            let scratch = TempDir::new().expect("scratch dir for git apply --check");
+            let stat = Command::new("git")
+                .args(["apply", "--stat", path.to_str().expect("utf8 path")])
+                .current_dir(scratch.path())
+                .output()
+                .expect("git apply --stat");
+            assert!(
+                stat.status.success(),
+                "git apply --stat rejected {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&stat.stderr)
+            );
+            let check = Command::new("git")
+                .args(["apply", "--check", path.to_str().expect("utf8 path")])
+                .current_dir(scratch.path())
+                .output()
+                .expect("git apply --check");
+            assert!(
+                check.status.success(),
+                "git apply --check rejected {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&check.stderr)
+            );
             return true;
         }
     }

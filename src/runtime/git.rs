@@ -163,6 +163,34 @@ pub fn git_verbatim(dir: &Path, args: &[&str]) -> Result<String, GitError> {
         .to_string())
 }
 
+/// [`git`] without any trimming or UTF-8 conversion: stdout exactly as Git
+/// wrote it, byte for byte.
+///
+/// Use this — never [`git`] or [`git_verbatim`], both of which trim a
+/// trailing newline and lossily re-encode non-UTF-8 bytes — whenever the
+/// output's trailing bytes are structurally significant, such as a patch
+/// something downstream will hand to `git apply`: `git diff` always
+/// terminates its output with `\n`, and dropping that byte turns a valid
+/// patch into one `git apply` rejects as corrupt at end-of-file (#234).
+pub fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
+    let output = command(dir, args)
+        .output()
+        .map_err(|source| GitError::Spawn {
+            args: owned(args),
+            dir: dir.display().to_string(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(GitError::Failed {
+            args: owned(args),
+            dir: dir.display().to_string(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(output.stdout)
+}
+
 /// Whether `git <args>` in `dir` exits zero. Used for existence questions
 /// (`is this a work tree?`, `does this branch exist?`) where the failing case
 /// is an answer, not an error.

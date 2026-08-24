@@ -33,8 +33,8 @@ use crate::backend::BindingSummary;
 use crate::domain::estate::RepositorySpec;
 use crate::runtime::fsutil::create_dir_all_durable;
 use crate::runtime::git::{
-    GitError, canonical_git_common_dir, canonical_git_top_level, git, git_submodule_update,
-    git_succeeds,
+    GitError, canonical_git_common_dir, canonical_git_top_level, git, git_bytes,
+    git_submodule_update, git_succeeds,
 };
 use crate::runtime::integrity::{
     DriftAttribution, EstateDriftObservation, IntegrityDisposition, IntegrityFinding, ObservedHead,
@@ -1670,7 +1670,11 @@ fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposit
 /// remove anything, since nothing was actually captured.
 fn capture_dirty_patch(binding: &RepositoryBinding) -> Option<PatchInfo> {
     git(&binding.worktree_path, &["add", "-A"]).ok()?;
-    let diff = git(&binding.worktree_path, &["diff", "--cached", "--binary"]).ok()?;
+    // `git_bytes`, not `git`: `git diff`'s trailing newline is not
+    // cosmetic — `git apply` treats its absence as a corrupt patch at
+    // end-of-file (#234) — so the diff must reach `write_atomic` exactly as
+    // Git wrote it, never round-tripped through a trimmed `String`.
+    let diff = git_bytes(&binding.worktree_path, &["diff", "--cached", "--binary"]).ok()?;
     // Defensive: the caller already confirmed `git status --porcelain` was
     // non-empty, so an empty diff here means something about the capture
     // did not actually see what made the worktree dirty — fail closed
@@ -1682,7 +1686,7 @@ fn capture_dirty_patch(binding: &RepositoryBinding) -> Option<PatchInfo> {
         .worktree_path
         .parent()?
         .join(format!("{}.dirty.patch", binding.repository));
-    crate::runtime::fsutil::write_atomic(&path, diff.as_bytes()).ok()?;
+    crate::runtime::fsutil::write_atomic(&path, &diff).ok()?;
     Some(PatchInfo {
         path,
         bytes: diff.len() as u64,
@@ -4623,6 +4627,119 @@ mod tests {
             errored.bytes, 5,
             "directory_size must measure the stand-in file"
         );
+    }
+
+    /// #234: a captured `.dirty.patch` must be byte-for-byte a patch `git
+    /// apply` accepts, trailing newline included — not merely "looks right
+    /// when printed as a `String`". `git diff` always terminates its output
+    /// with `\n`; `capture_dirty_patch` going through `git()` (which
+    /// unconditionally trims) silently ate that byte, so every retained
+    /// patch failed `git apply` with "corrupt patch at line N", always at
+    /// end-of-file (22/22 real-estate patches, per #234's evidence).
+    ///
+    /// Applied against a *second*, independent clean checkout of the same
+    /// source repository at the same base commit — never the worktree the
+    /// diff came from — so this actually proves the patch is portable, the
+    /// only way it is ever used in practice (`sgt work reap` hands it to an
+    /// operator, not back to the worktree that no longer exists).
+    #[test]
+    fn retain_dirty_writes_a_patch_git_apply_accepts() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        // A tracked file whose last diff line ends in `]` with no trailing
+        // whitespace of its own — the shape #234 pinned as the one that
+        // reliably exposed the missing final newline. Committed into the
+        // *source* repo, before materializing, so the base commit both the
+        // worktree and the independent checkout share already has it.
+        std::fs::write(spec.path.join("data.rs"), "const V: [u8; 1] = [0];\n").expect("tracked");
+        git_as_test_identity(&spec.path, &["add", "data.rs"]);
+        git_as_test_identity(&spec.path, &["commit", "-m", "add data.rs"]);
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01PATCHNL",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+        let base_sha = surface.bindings[0].base_sha.clone();
+
+        std::fs::write(worktree.join("data.rs"), "const V: [u8; 2] = [0, 1]").expect("dirty edit");
+        // Plus an untracked file, #109's other half of the capture.
+        std::fs::write(worktree.join("new.rs"), "fn wanted() {}\n").expect("untracked");
+
+        let report = teardown_of(&surface);
+        let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        let patch = patch.as_ref().expect("must capture a patch");
+
+        let patch_bytes = std::fs::read(&patch.path).expect("read captured patch");
+        assert_eq!(
+            patch_bytes.last().copied(),
+            Some(b'\n'),
+            "a captured .dirty.patch must end with the newline `git diff` always writes, or \
+             `git apply` rejects it as corrupt at end-of-file: {patch_bytes:?}"
+        );
+
+        // A second, independent clean checkout of the same source repo at
+        // the same base commit — the patch must apply there, not just be
+        // well-formed in the abstract.
+        let target = dir.path().join("independent-checkout");
+        git_as_test_identity(
+            dir.path(),
+            &[
+                "clone",
+                spec.path.to_str().expect("utf8 path"),
+                target.to_str().expect("utf8 path"),
+            ],
+        );
+        git_as_test_identity(&target, &["checkout", &base_sha]);
+
+        let check = Command::new("git")
+            .args(["apply", "--check", patch.path.to_str().expect("utf8 path")])
+            .current_dir(&target)
+            .output()
+            .expect("git apply --check");
+        assert!(
+            check.status.success(),
+            "git apply --check rejected the captured patch: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+
+        let apply = Command::new("git")
+            .args(["apply", patch.path.to_str().expect("utf8 path")])
+            .current_dir(&target)
+            .output()
+            .expect("git apply");
+        assert!(
+            apply.status.success(),
+            "git apply rejected the captured patch: {}",
+            String::from_utf8_lossy(&apply.stderr)
+        );
+
+        let applied = std::fs::read(target.join("data.rs")).expect("applied tracked file");
+        let original = std::fs::read(worktree.join("data.rs"));
+        // The worktree directory is already gone (teardown reclaimed it), so
+        // compare against the content we know we wrote into it.
+        assert!(
+            original.is_err(),
+            "sanity: the worktree must actually be gone by now"
+        );
+        assert_eq!(
+            applied,
+            b"const V: [u8; 2] = [0, 1]".to_vec(),
+            "applying the patch must reproduce the dirtied worktree's tracked-file content \
+             byte-for-byte"
+        );
+        let new_file = std::fs::read(target.join("new.rs")).expect("applied untracked file");
+        assert_eq!(new_file, b"fn wanted() {}\n".to_vec());
     }
 
     /// [`reap`]: a captured patch is deleted and its exact size is reported
