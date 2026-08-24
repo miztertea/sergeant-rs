@@ -33,8 +33,8 @@ use crate::backend::BindingSummary;
 use crate::domain::estate::RepositorySpec;
 use crate::runtime::fsutil::create_dir_all_durable;
 use crate::runtime::git::{
-    GitError, canonical_git_common_dir, canonical_git_top_level, git, git_submodule_update,
-    git_succeeds,
+    GitError, canonical_git_common_dir, canonical_git_top_level, git, git_bytes,
+    git_submodule_update, git_succeeds,
 };
 use crate::runtime::integrity::{
     DriftAttribution, EstateDriftObservation, IntegrityDisposition, IntegrityFinding, ObservedHead,
@@ -1670,7 +1670,11 @@ fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposit
 /// remove anything, since nothing was actually captured.
 fn capture_dirty_patch(binding: &RepositoryBinding) -> Option<PatchInfo> {
     git(&binding.worktree_path, &["add", "-A"]).ok()?;
-    let diff = git(&binding.worktree_path, &["diff", "--cached", "--binary"]).ok()?;
+    // `git_bytes`, not `git`: `git diff`'s trailing newline is not
+    // cosmetic — `git apply` treats its absence as a corrupt patch at
+    // end-of-file (#234) — so the diff must reach `write_atomic` exactly as
+    // Git wrote it, never round-tripped through a trimmed `String`.
+    let diff = git_bytes(&binding.worktree_path, &["diff", "--cached", "--binary"]).ok()?;
     // Defensive: the caller already confirmed `git status --porcelain` was
     // non-empty, so an empty diff here means something about the capture
     // did not actually see what made the worktree dirty — fail closed
@@ -1682,7 +1686,7 @@ fn capture_dirty_patch(binding: &RepositoryBinding) -> Option<PatchInfo> {
         .worktree_path
         .parent()?
         .join(format!("{}.dirty.patch", binding.repository));
-    crate::runtime::fsutil::write_atomic(&path, diff.as_bytes()).ok()?;
+    crate::runtime::fsutil::write_atomic(&path, &diff).ok()?;
     Some(PatchInfo {
         path,
         bytes: diff.len() as u64,
@@ -4622,6 +4626,187 @@ mod tests {
         assert_eq!(
             errored.bytes, 5,
             "directory_size must measure the stand-in file"
+        );
+    }
+
+    /// #234: a captured `.dirty.patch` must be byte-for-byte a patch `git
+    /// apply` accepts, trailing newline included — not merely "looks right
+    /// when printed as a `String`". `git diff` always terminates its output
+    /// with `\n`; `capture_dirty_patch` going through `git()` (which
+    /// unconditionally trims) silently ate that byte, so every retained
+    /// patch failed `git apply` with "corrupt patch at line N", always at
+    /// end-of-file (22/22 real-estate patches, per #234's evidence).
+    ///
+    /// Applied against a *second*, independent clean checkout of the same
+    /// source repository at the same base commit — never the worktree the
+    /// diff came from — so this actually proves the patch is portable, the
+    /// only way it is ever used in practice (`sgt work reap` hands it to an
+    /// operator, not back to the worktree that no longer exists).
+    #[test]
+    fn retain_dirty_writes_a_patch_git_apply_accepts() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        // A tracked file whose last diff line ends in `]` with no trailing
+        // whitespace of its own — the shape #234 pinned as the one that
+        // reliably exposed the missing final newline. Committed into the
+        // *source* repo, before materializing, so the base commit both the
+        // worktree and the independent checkout share already has it.
+        std::fs::write(spec.path.join("data.rs"), "const V: [u8; 1] = [0];\n").expect("tracked");
+        git_as_test_identity(&spec.path, &["add", "data.rs"]);
+        git_as_test_identity(&spec.path, &["commit", "-m", "add data.rs"]);
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01PATCHNL",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+        let base_sha = surface.bindings[0].base_sha.clone();
+
+        std::fs::write(worktree.join("data.rs"), "const V: [u8; 2] = [0, 1]").expect("dirty edit");
+        // Plus an untracked file, #109's other half of the capture.
+        std::fs::write(worktree.join("new.rs"), "fn wanted() {}\n").expect("untracked");
+
+        let report = teardown_of(&surface);
+        let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        let patch = patch.as_ref().expect("must capture a patch");
+
+        let patch_bytes = std::fs::read(&patch.path).expect("read captured patch");
+        assert_eq!(
+            patch_bytes.last().copied(),
+            Some(b'\n'),
+            "a captured .dirty.patch must end with the newline `git diff` always writes, or \
+             `git apply` rejects it as corrupt at end-of-file: {patch_bytes:?}"
+        );
+
+        // A second, independent clean checkout of the same source repo at
+        // the same base commit — the patch must apply there, not just be
+        // well-formed in the abstract.
+        let target = dir.path().join("independent-checkout");
+        git_as_test_identity(
+            dir.path(),
+            &[
+                "clone",
+                spec.path.to_str().expect("utf8 path"),
+                target.to_str().expect("utf8 path"),
+            ],
+        );
+        git_as_test_identity(&target, &["checkout", &base_sha]);
+
+        let check = Command::new("git")
+            .args(["apply", "--check", patch.path.to_str().expect("utf8 path")])
+            .current_dir(&target)
+            .output()
+            .expect("git apply --check");
+        assert!(
+            check.status.success(),
+            "git apply --check rejected the captured patch: {}",
+            String::from_utf8_lossy(&check.stderr)
+        );
+
+        let apply = Command::new("git")
+            .args(["apply", patch.path.to_str().expect("utf8 path")])
+            .current_dir(&target)
+            .output()
+            .expect("git apply");
+        assert!(
+            apply.status.success(),
+            "git apply rejected the captured patch: {}",
+            String::from_utf8_lossy(&apply.stderr)
+        );
+
+        let applied = std::fs::read(target.join("data.rs")).expect("applied tracked file");
+        assert_eq!(
+            applied,
+            b"const V: [u8; 2] = [0, 1]".to_vec(),
+            "applying the patch must reproduce the dirtied worktree's tracked-file content \
+             byte-for-byte"
+        );
+        let new_file = std::fs::read(target.join("new.rs")).expect("applied untracked file");
+        assert_eq!(new_file, b"fn wanted() {}\n".to_vec());
+    }
+
+    /// #234 follow-up (`60-re-verify-and-postmortem`, F-SF-04/F-TH-01): the
+    /// fix's stated rationale for switching to `git_bytes` was not only the
+    /// dropped trailing newline but also that a `String::from_utf8_lossy`
+    /// round-trip corrupts non-UTF-8 diff content by substituting the
+    /// 3-byte U+FFFD sequence for any invalid byte — a second, independent
+    /// defect (root-cause H2). No prior regression test exercised it; every
+    /// fixture was pure ASCII. This one dirties a tracked file with a raw
+    /// `0xFF` byte (no `NUL` nearby, so Git still emits a text diff rather
+    /// than switching to `--binary`'s base85 encoding, which is ASCII and
+    /// would not exercise this path) and proves the captured patch is
+    /// byte-identical to Git's own diff output, not merely non-empty.
+    #[test]
+    fn retain_dirty_patch_preserves_non_utf8_bytes_verbatim() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        std::fs::write(spec.path.join("data.rs"), b"const V: u8 = 0;\n").expect("tracked");
+        git_as_test_identity(&spec.path, &["add", "data.rs"]);
+        git_as_test_identity(&spec.path, &["commit", "-m", "add data.rs"]);
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01PATCHUTF8",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        let mut dirtied = b"const V: u8 = ".to_vec();
+        dirtied.push(0xFF);
+        dirtied.extend_from_slice(b";\n");
+        std::fs::write(worktree.join("data.rs"), &dirtied).expect("dirty edit");
+
+        // Ground truth, captured independently of `capture_dirty_patch`:
+        // stage now and read git's own diff bytes before teardown does the
+        // same staging/diffing itself and reclaims the worktree.
+        git_as_test_identity(&worktree, &["add", "-A"]);
+        let raw = Command::new("git")
+            .args(["diff", "--cached", "--binary"])
+            .current_dir(&worktree)
+            .output()
+            .expect("git diff")
+            .stdout;
+        assert!(
+            raw.contains(&0xFFu8),
+            "sanity: the ground-truth diff must actually contain the raw non-UTF-8 byte"
+        );
+
+        let report = teardown_of(&surface);
+        let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        let patch = patch.as_ref().expect("must capture a patch");
+        let patch_bytes = std::fs::read(&patch.path).expect("read captured patch");
+
+        assert_eq!(
+            patch_bytes, raw,
+            "the captured .dirty.patch must be byte-identical to git's own diff output — a \
+             lossy UTF-8 round-trip would replace the raw 0xFF byte with the 3-byte U+FFFD \
+             sequence and change both the content and the length"
+        );
+        assert!(
+            !patch_bytes
+                .windows(3)
+                .any(|window| window == [0xEF, 0xBF, 0xBD]),
+            "the raw non-UTF-8 byte must survive capture unchanged, not be replaced by the \
+             U+FFFD substitution sequence: {patch_bytes:?}"
         );
     }
 
