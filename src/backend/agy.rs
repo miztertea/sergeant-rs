@@ -7401,8 +7401,13 @@ mod tests {
                 row.capability
             );
         }
-        // And the two rows that ARE live-measured are the two the live tier
-        // actually drives (three turns total).
+        // And the seven rows that ARE live-measured are backed by the four
+        // `live_agy_*` tests the live tier actually drives — SEVEN turns total
+        // (1+2+2+2, per this wave's `live-tier-run.txt`): two rows on print, and
+        // on the loop one test covering resume/model_selection/
+        // identity_before_first_turn and one covering native_subagents/
+        // turn_serialization. This comment states a count the assertion below
+        // enforces; the two move in the same commit.
         let live: Vec<_> = ADMISSION_ROWS
             .iter()
             .filter(|row| row.evidence == Evidence::LiveMeasured)
@@ -7414,7 +7419,7 @@ mod tests {
                 // print
                 "resume",
                 "model_selection",
-                // loop — three rows, two live tests, and the sharing is
+                // loop — five rows, two live tests, and the sharing is
                 // deliberate: one turn that resumes a conversation also proves
                 // the pin echo and the pre-turn identity window.
                 "resume",
