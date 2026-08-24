@@ -719,8 +719,7 @@ jobs:
             echo "**Co-versioning note:** this release ships the \`sgt\` binary only."
             echo "v${RELEASE_VERSION} does NOT yet ship an embedded distro — that"
             echo "is Phase 3 scope (reference/proposal-product-workspace-split.md),"
-            echo "not yet tracked by a dedicated open issue. See CHANGELOG.md and"
-            echo "NORTH-STAR.md's \"Not true yet\" note."
+            echo "not yet tracked by a dedicated open issue. See CHANGELOG.md."
             echo
             echo "**Gate F (distro structural validator) did not run in this workflow.**"
             echo "That property is proven continuously by sergeant-rs-workspace's own CI"
