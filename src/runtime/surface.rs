@@ -2409,6 +2409,65 @@ mod tests {
         );
     }
 
+    /// Regression for `common_dir_finding` (this module, above): a linked
+    /// worktree's git common directory still agrees with its source
+    /// checkout's, so teardown's integrity check reports no mismatch. Unlike
+    /// the codex adapter's own fixture of the same underlying git fact
+    /// (`tests/codex_backend.rs`'s
+    /// `the_git_admin_dir_grant_does_not_disturb_the_worktrees_own_common_dir_identity`,
+    /// which never calls this private function and so cannot regress it),
+    /// this test calls `common_dir_finding` directly — a real fix to it
+    /// (wrong comparison, wrong field, always-`Some`) fails this test.
+    #[test]
+    fn common_dir_finding_reports_no_mismatch_for_a_genuine_linked_worktree() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let source = repo(&dir.path().join("source"));
+        let worktree = dir.path().join("worktree");
+        git_as_test_identity(
+            &source.path,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().expect("utf8 path"),
+                "-b",
+                "sergeant/w-common-dir",
+            ],
+        );
+
+        let admitted = canonical_git_common_dir(&source.path).expect("source common dir");
+        let binding = RepositoryBinding {
+            repository: "solo".to_string(),
+            source_path: source.path.clone(),
+            base_branch: Some("main".to_string()),
+            base_sha: "0".repeat(40),
+            worktree_path: worktree.clone(),
+            work_branch: "sergeant/w-common-dir".to_string(),
+            head_sha: "0".repeat(40),
+            origin: BindingOrigin::default(),
+            canonical_top_level: None,
+            canonical_common_dir: Some(admitted),
+            preflight: None,
+        };
+        assert_eq!(
+            common_dir_finding(&binding),
+            None,
+            "a genuine linked worktree's common dir must agree with what was admitted"
+        );
+
+        // And the pre-Phase-B fallback (`canonical_common_dir: None`), which
+        // re-derives the expected side from `source_path` live instead of
+        // trusting a recorded value.
+        let binding_pre_phase_b = RepositoryBinding {
+            canonical_common_dir: None,
+            ..binding
+        };
+        assert_eq!(
+            common_dir_finding(&binding_pre_phase_b),
+            None,
+            "the pre-Phase-B fallback (re-asking the source checkout live) must also agree"
+        );
+    }
+
     /// R-MVP1-1 left the surfaces root free to live anywhere; §9.4's locks
     /// still belong to the daemon's own storage. The two are separate
     /// parameters and this is the test that keeps them separate — every other

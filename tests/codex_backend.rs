@@ -1140,14 +1140,17 @@ fn the_first_turn_grants_the_works_own_git_admin_dir_as_an_add_dir_root() {
     );
 }
 
-/// Regression for `runtime::surface`'s `common_dir_finding` (§1794-1813):
-/// that teardown integrity check compares `canonical_git_common_dir` of the
-/// worktree against the journaled/source-checkout value and flags a
-/// mismatch. #259's grant reads the worktree's `.git` file but writes
-/// nothing and calls no git subprocess, so the common-dir identity teardown
-/// relies on must be exactly what it was before this fix — proven here by
-/// checking the fact directly, independent of `codex.rs`'s own private
-/// resolver.
+/// A fixture-level sanity check, not a regression test for
+/// `runtime::surface`'s private `common_dir_finding` itself (that
+/// function's own regression test,
+/// `common_dir_finding_reports_no_mismatch_for_a_genuine_linked_worktree`,
+/// lives in `src/runtime/surface.rs`'s unit tests, the only place with
+/// access to it). What this test pins is the underlying git fact #259's
+/// grant depends on: a linked worktree's `canonical_git_common_dir` still
+/// agrees with its source checkout's after `real_worktree` creates it. #259's
+/// grant reads the worktree's `.git` file but writes nothing and calls no
+/// git subprocess, so this identity is untouched by the fix — this test
+/// would pass identically whether or not #259 exists.
 #[test]
 fn the_git_admin_dir_grant_does_not_disturb_the_worktrees_own_common_dir_identity() {
     let dir = TempDir::new().expect("tempdir");
@@ -4844,6 +4847,54 @@ fn live_codex_actor_commits_to_the_works_own_branch() {
     assert_eq!(
         head_is_branch, branch,
         "HEAD must still be the work branch, not detached"
+    );
+}
+
+/// #262's own acceptance criterion #1: with the network knob explicitly
+/// set, a real codex actor can bind `127.0.0.1:0` inside the sandbox.
+/// `network_access_is_absent_by_default_and_present_when_configured` (above)
+/// only proves the `-c sandbox_workspace_write.network_access=true` flag is
+/// composed correctly against a stub — this is the measured half: a live
+/// actor actually attempting the bind under codex's real sandbox, so a
+/// codex-cli change to what that flag does (or a mis-wired one here) shows
+/// up as a failing bind, not just a missing argv token.
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_codex_actor_binds_loopback_when_network_access_is_configured() {
+    let data_dir = live_workdir("network");
+    if !codex_live_enabled(
+        "live_codex_actor_binds_loopback_when_network_access_is_configured",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let cwd = data_dir.path().join("cwd");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let result_path = cwd.join("bind_result.txt");
+
+    let mut config = live_exec_config(data_dir.path());
+    config.workspace_write_network_access = true;
+    let backend = CodexBackend::new(config);
+    let mut request = start_request(&cwd);
+    request.model = Some("gpt-5.6-luna".to_string());
+    request.intent = format!(
+        "Run this exact Python one-liner: python3 -c \"import socket; s = socket.socket(socket.\
+         AF_INET, socket.SOCK_STREAM); s.bind(('127.0.0.1', 0)); print('BIND_OK')\" then write \
+         the exact string BIND_OK to a new file at {} (no other content), then report only the \
+         word done when finished.",
+        result_path.display()
+    );
+
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    wait_for_settled(&backend, &handle);
+
+    let result = std::fs::read_to_string(&result_path)
+        .unwrap_or_else(|e| panic!("actor never wrote {}: {e}", result_path.display()));
+    assert_eq!(
+        result.trim(),
+        "BIND_OK",
+        "the actor must have bound 127.0.0.1:0 under the sandbox with network_access configured"
     );
 }
 
