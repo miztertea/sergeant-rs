@@ -329,10 +329,17 @@ pub struct CodexConfig {
     /// #262: composes codex-cli's own documented `-c
     /// sandbox_workspace_write.network_access=true` config override on every
     /// turn 1 this config launches (§ [`first_turn_argv`]'s own doc comment).
-    /// `false` by default and never implied by any other setting — an
-    /// operator opts a profile into this explicitly because a repository's
-    /// own validation needs a loopback listener; it is never daemon-global,
-    /// never default-on, and never `danger-full-access`. Grants sandbox
+    /// `false` by default and never implied by any other setting.
+    ///
+    /// **This is the daemon-global default, not a per-profile setting on its
+    /// own** — one `CodexBackend` (and the `CodexConfig` it was built from)
+    /// is shared by every codex-backed profile in a daemon. A profile that
+    /// sets its own `network_access` option (`"true"`/`"false"`,
+    /// `domain::profile::NETWORK_ACCESS_OPTION`) overrides this field for
+    /// its own launches (`CodexBackend::launch_config` resolves the two, W5
+    /// fix for split-hardening's #262 review finding); a profile that never
+    /// mentions the option falls back to whatever this field is set to.
+    /// Never default-on, and never `danger-full-access`. Grants sandbox
     /// network access only — external egress is not the intent and this
     /// setting does not provide it.
     pub workspace_write_network_access: bool,
@@ -1040,6 +1047,11 @@ struct LaunchConfig {
     executable: PathBuf,
     env: BTreeMap<String, String>,
     codex_home: Option<PathBuf>,
+    /// #262 (per-profile, W5 fix): this execution's resolved
+    /// `sandbox_workspace_write.network_access` — the profile's own
+    /// `network_access` option when it sets one, else `CodexConfig::
+    /// workspace_write_network_access`. See [`CodexBackend::launch_config`].
+    network_access: bool,
 }
 
 /// Turn 1's argv, after `<executable>` (spec §3.2, updated by W3 §3.2/§3.6):
@@ -1086,12 +1098,14 @@ fn first_turn_argv(
         argv.push(path.to_string_lossy().into_owned());
     }
     // #262: codex-cli's own documented `sandbox_workspace_write.network_access`
-    // config override, composed only when a profile/config explicitly asks
-    // for it (`CodexConfig::workspace_write_network_access`) — never the
-    // adapter's default, and scoped to the sandboxed workspace-write child,
-    // never `danger-full-access` or a daemon-global setting. This grants
-    // sandbox network access (e.g. binding `127.0.0.1` for a repository's own
-    // test harness); it is not external egress and does not widen what
+    // config override, composed only when this launch's resolved
+    // `network_access` is true (`CodexBackend::launch_config` — a profile's
+    // own `network_access` option, falling back to `CodexConfig::
+    // workspace_write_network_access` when the profile does not set one) —
+    // never the adapter's default, and scoped to the sandboxed
+    // workspace-write child, never `danger-full-access`. This grants sandbox
+    // network access (e.g. binding `127.0.0.1` for a repository's own test
+    // harness); it is not external egress and does not widen what
     // `--add-dir` above already scopes as writable.
     if network_access {
         argv.push("-c".to_string());
@@ -1188,23 +1202,32 @@ fn bindings_outside_cwd(cwd: &Path, bindings: &[BindingSummary]) -> Vec<PathBuf>
         .collect()
 }
 
-/// #259: the one directory a linked worktree's own `git add`/`git commit`
-/// needs write access to that is not `worktree_path` itself — git's private
-/// per-worktree administrative directory, `<common-dir>/worktrees/<name>`.
-/// `git worktree add` never checks that directory out under `worktree_path`
+/// #259, re-scoped after the independent review of split/w5-codex-commit-path
+/// (findings #259/#262, wave W5) showed the narrower grant was insufficient:
+/// the one directory a linked worktree's own `git add` needs write access to
+/// that is not `worktree_path` itself — git's private per-worktree
+/// administrative directory, `<common-dir>/worktrees/<name>`. `git worktree
+/// add` never checks that directory out under `worktree_path`
 /// (`runtime::surface::add_worktree_no_checkout`); it lives beside the
 /// repository's shared `.git`, which is exactly why a sandbox scoped to the
 /// Work's own surfaces denies `index.lock` there.
+///
+/// This directory alone is **not** enough for `git commit`: measured under a
+/// deny-outside-grants bubblewrap sandbox (grant exactly this directory plus
+/// `worktree_path`, nothing else), `git add` succeeds but `git commit` fails
+/// — first on `.git/objects` (new loose objects), then on
+/// `.git/logs/refs/heads/<branch>` (the reflog) and `.git/refs/heads/<branch>`
+/// (the ref update itself), all of which live in the shared common
+/// directory, never under this per-worktree admin path. See
+/// [`worktree_git_common_dir`], which this function is now a step of rather
+/// than the whole answer.
 ///
 /// Resolved by reading `worktree_path`'s own `.git` file rather than
 /// spawning `git rev-parse` — `Backend::prepare`'s own contract forbids an
 /// external effect (no process, no blocking wait), and every linked worktree
 /// git ever creates has a `.git` **file** (never a directory) whose one line
 /// reads `gitdir: <absolute path>` naming this exact directory [git
-/// worktree(1)]. Grants precisely that path — never `repository.path`, never
-/// the shared `.git` itself — so concurrent Works on the same repository
-/// (serialized only for the `git worktree add` span, `with_repository`'s own
-/// lock) stay isolated from one another's admin state.
+/// worktree(1)].
 fn worktree_git_admin_dir(worktree_path: &Path) -> Result<PathBuf, String> {
     let dot_git = worktree_path.join(".git");
     let contents = std::fs::read_to_string(&dot_git)
@@ -1229,15 +1252,82 @@ fn worktree_git_admin_dir(worktree_path: &Path) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// [`worktree_git_admin_dir`] over every binding this request carries. `Err`
-/// on the first binding whose admin directory cannot be resolved — the
-/// caller (`prepare`/`launch`) turns that into a refusal rather than
+/// Collapse `.` and `..` path components lexically — no filesystem access,
+/// no symlink resolution. Used to turn `<admin-dir>/../..` (the literal
+/// shape [`worktree_git_common_dir`] joins) into a clean absolute path
+/// without canonicalizing it, which would silently change the grant if any
+/// component were a symlink.
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// #259 (re-scoped, W5 fix): the directory a linked worktree's `git
+/// add`/`git commit` actually need write access to — the repository's
+/// **shared** `.git` (its "common directory" [git-worktree(1)],
+/// `git rev-parse --git-common-dir`), not merely the per-worktree admin
+/// subdirectory [`worktree_git_admin_dir`] resolves. Loose objects
+/// (`objects/`), the ref update (`refs/heads/<branch>`), the reflog
+/// (`logs/refs/heads/<branch>`), and — opportunistically, on some commits —
+/// `packed-refs` all live directly under the common dir, never under
+/// `<common-dir>/worktrees/<name>`. Measured empirically (bubblewrap,
+/// deny-outside-grants) before this fix: granting only the admin
+/// subdirectory lets `git add` succeed but `git commit` fail with
+/// `Read-only file system` on `.git/objects`; granting the whole common dir
+/// resolves both.
+///
+/// **This is a wider grant than the admin subdirectory alone, and it is
+/// honest about the isolation cost**: `<common-dir>/worktrees/<name>` is the
+/// admin state for *this* linked worktree only, but the common dir also
+/// holds every other linked worktree's refs, reflogs, and the full object
+/// store for the whole repository. A Work whose codex actor is granted this
+/// path has filesystem-level write access to any other Work's branch ref or
+/// reflog in the *same* repository, if one happens to be checked out
+/// concurrently (`runtime::repolock` only serializes the `git worktree add`
+/// span, not a Work's whole lifetime) — that isolation is no longer sandbox-
+/// enforced, only trust-based (each actor is instructed to touch only its
+/// own worktree, and `common_dir_finding` / branch-tip assertions in the
+/// close pipeline would catch a rewritten ref after the fact, not prevent
+/// it). Isolation **between different repositories** is untouched: each
+/// repository has its own common dir, so this grant never crosses a
+/// repository boundary. `m6_surfaces.rs`'s
+/// `git_worktree_common_dir_grant_is_shared_within_a_repository_but_never_
+/// crosses_repositories` regression records both halves of this trade.
+///
+/// Resolved from the admin dir's own `commondir` file — the same file `git`
+/// itself reads to find its common directory [git-worktree(1)] — rather
+/// than assumed from path shape (`<admin-dir>/../..`), so a future git
+/// layout change is a resolution error here, not a silently wrong grant.
+fn worktree_git_common_dir(worktree_path: &Path) -> Result<PathBuf, String> {
+    let admin_dir = worktree_git_admin_dir(worktree_path)?;
+    let commondir_file = admin_dir.join("commondir");
+    let contents = std::fs::read_to_string(&commondir_file)
+        .map_err(|e| format!("cannot read {}: {e}", commondir_file.display()))?;
+    let relative = contents.trim();
+    if relative.is_empty() {
+        return Err(format!("{} is empty", commondir_file.display()));
+    }
+    Ok(lexically_normalize(&admin_dir.join(relative)))
+}
+
+/// [`worktree_git_common_dir`] over every binding this request carries.
+/// `Err` on the first binding whose common directory cannot be resolved —
+/// the caller (`prepare`/`launch`) turns that into a refusal rather than
 /// launching an actor that can edit files but cannot commit them.
-fn git_worktree_admin_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, String> {
+fn git_worktree_common_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, String> {
     bindings
         .iter()
         .map(|binding| {
-            worktree_git_admin_dir(&binding.worktree_path).map_err(|reason| {
+            worktree_git_common_dir(&binding.worktree_path).map_err(|reason| {
                 format!(
                     "{} ({}): {reason}",
                     binding.repository,
@@ -1249,15 +1339,29 @@ fn git_worktree_admin_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, 
 }
 
 /// The named, actionable refusal text for #259's fail-closed rule: a
-/// mutation-shaped launch (one or more bindings) whose git admin dir grant
+/// mutation-shaped launch (one or more bindings) whose git common-dir grant
 /// cannot be resolved is refused rather than admitted to run and later
 /// retire `completed_dirty` with no durable commit.
+///
+/// Ends in a remedy sentence naming what the operator should actually do
+/// about it — `src/runtime/preflight.rs`'s `PreflightCheck::remedy` and
+/// `src/cli.rs`'s `Check::warn` precedent (§15's "named remedy": a refusal
+/// that only says what failed, with nothing to do about it, is half the
+/// contract). Every reason this function is ever called with traces back to
+/// the same root cause — `worktree_path` is not a linked worktree
+/// `runtime::surface` actually created (its `.git` file is missing, or does
+/// not name a `gitdir`) — so one remedy sentence covers every case, rather
+/// than inventing a different one per parse failure.
 fn git_admin_dir_refusal(reason: &str) -> String {
     format!(
-        "cannot grant this Work's git administrative directory ({reason}); a codex actor \
-         needs write access to its own worktree's git admin dir to `git add`/`git commit` \
-         (sergeant issue #259) — refusing rather than admitting a Work that can edit files but \
-         can never commit them"
+        "cannot grant this Work's git common directory ({reason}); a codex actor needs write \
+         access to its own worktree's shared git directory to `git add`/`git commit` (sergeant \
+         issue #259) — refusing rather than admitting a Work that can edit files but can never \
+         commit them. Remedy: this worktree path was not created by a real `git worktree add` \
+         (or its admin state was since removed) — re-admit the repository through sergeant's \
+         own surface admission so a genuine linked worktree exists at this path, rather than \
+         pointing a binding at a hand-placed or foreign directory; sergeant never repairs one \
+         automatically."
     )
 }
 
@@ -2462,19 +2566,22 @@ struct CodexExecution {
     /// since `--add-dir` is never composed and this is the signal a future
     /// enforcement mapping (W3) would need.
     bindings_outside_cwd: Vec<PathBuf>,
-    /// #259: every binding's own git administrative directory
-    /// ([`git_worktree_admin_dirs`]), resolved once at LAUNCH and granted as
+    /// #259: every binding's own git common (shared `.git`) directory
+    /// ([`git_worktree_common_dirs`]), resolved once at LAUNCH and granted as
     /// additional `--add-dir` roots on turn 1 — the write access a linked
     /// worktree's `git add`/`git commit` needs that `worktree_path` alone
-    /// does not cover.
-    git_worktree_admin_dirs: Vec<PathBuf>,
+    /// does not cover. Wider than just the per-worktree admin subdirectory;
+    /// see [`worktree_git_common_dir`] for why.
+    git_worktree_common_dirs: Vec<PathBuf>,
     /// W3 §3.3: the sandbox policy this execution's turns compose. Resolved
     /// once at LAUNCH/RESUME from `CodexConfig.sandbox` and carried here so
     /// SEND's later turns compose the same policy the first one did (never
     /// re-read from a config that might have changed under a long-lived
     /// daemon).
     sandbox: SandboxChoice,
-    /// #262: `CodexConfig.workspace_write_network_access`, resolved once at
+    /// #262: this execution's resolved `network_access`
+    /// (`CodexBackend::launch_config` — the profile's own option if set,
+    /// else `CodexConfig.workspace_write_network_access`), resolved once at
     /// LAUNCH for the same reason `sandbox` is — never re-read per turn.
     network_access: bool,
     turns: u32,
@@ -3079,6 +3186,19 @@ impl CodexBackend {
     /// turn — a launch decision the human made, quietly dropped by the
     /// adapter. `config_home` (`CODEX_HOME`) is the axis that *does*
     /// re-apply on every turn, and the refusal names it.
+    ///
+    /// #262 (per-profile, W5 fix): `network_access` follows the same
+    /// per-option override pattern as `permission_mode` (#47,
+    /// `domain::profile::PERMISSION_MODE_OPTION`) — a profile's own
+    /// `network_access` option, when set, wins over `CodexConfig::
+    /// workspace_write_network_access`; the daemon-global config value is
+    /// only the fallback for a profile that never mentions it (or no
+    /// profile at all). This is what makes two profiles on one
+    /// `CodexBackend` (one shared adapter per daemon) able to actually
+    /// disagree, closing the gap the independent review of
+    /// split/w5-codex-commit-path named: the field used to be read straight
+    /// off `self.config` at every LAUNCH call site, so no profile could ever
+    /// change it.
     fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
         if let Some(profile) = profile
             && profile.options.contains_key("codex_profile")
@@ -3098,6 +3218,7 @@ impl CodexBackend {
             .unwrap_or_else(|| self.config.executable.clone());
         let mut env = self.config.env.clone();
         let mut codex_home = self.config.codex_home.clone();
+        let mut network_access = self.config.workspace_write_network_access;
         if let Some(profile) = profile {
             for (key, value) in &profile.env {
                 env.insert(key.clone(), value.clone());
@@ -3105,11 +3226,17 @@ impl CodexBackend {
             if let Some(config_home) = &profile.config_home {
                 codex_home = Some(config_home.clone());
             }
+            match profile.network_access() {
+                Ok(Some(value)) => network_access = value,
+                Ok(None) => {}
+                Err(e) => return Err(self.err_failed(format!("profile {:?}: {e}", profile.name))),
+            }
         }
         Ok(LaunchConfig {
             executable,
             env,
             codex_home,
+            network_access,
         })
     }
 
@@ -3120,17 +3247,17 @@ impl CodexBackend {
         }
     }
 
-    /// #259: resolve each binding's git admin dir, or refuse with the named,
+    /// #259: resolve each binding's git common dir, or refuse with the named,
     /// actionable error. Shared by every call site that needs the grant for
     /// real (PREPARE's own preflight, and each transport's LAUNCH) — RESUME
     /// does not call this (see its own comment): the grant is provably inert
     /// there, so resolving it would add a fail-closed check with no
     /// corresponding capability it protects.
-    fn resolve_git_worktree_admin_dirs(
+    fn resolve_git_worktree_common_dirs(
         &self,
         bindings: &[BindingSummary],
     ) -> Result<Vec<PathBuf>, BackendError> {
-        git_worktree_admin_dirs(bindings)
+        git_worktree_common_dirs(bindings)
             .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))
     }
 
@@ -3297,7 +3424,7 @@ impl CodexBackend {
             first_turn,
             work_id,
             bindings_outside_cwd,
-            git_worktree_admin_dirs,
+            git_worktree_common_dirs,
             sandbox,
             network_access,
         ) = {
@@ -3316,7 +3443,7 @@ impl CodexBackend {
                 execution.turns == 0,
                 execution.work_id.clone(),
                 execution.bindings_outside_cwd.clone(),
-                execution.git_worktree_admin_dirs.clone(),
+                execution.git_worktree_common_dirs.clone(),
                 execution.sandbox,
                 execution.network_access,
             )
@@ -3326,7 +3453,7 @@ impl CodexBackend {
         let mut command = Command::new(&executable);
         if first_turn {
             let mut extra_dirs = bindings_outside_cwd.clone();
-            extra_dirs.extend(git_worktree_admin_dirs.iter().cloned());
+            extra_dirs.extend(git_worktree_common_dirs.iter().cloned());
             command.args(first_turn_argv(
                 &cwd,
                 model.as_deref(),
@@ -3499,11 +3626,12 @@ impl CodexBackend {
             executable,
             env,
             codex_home,
+            network_access,
         } = self.launch_config(request.profile.as_ref())?;
         // #259: re-resolved here rather than trusting PREPARE's own check —
         // `launch_config`'s own doc comment states the same rule ("LAUNCH
         // re-resolves it, so the two phases can never disagree").
-        let git_worktree_admin_dirs = self.resolve_git_worktree_admin_dirs(&request.bindings)?;
+        let git_worktree_common_dirs = self.resolve_git_worktree_common_dirs(&request.bindings)?;
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -3517,9 +3645,9 @@ impl CodexBackend {
                     env,
                     codex_home,
                     bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
-                    git_worktree_admin_dirs,
+                    git_worktree_common_dirs,
                     sandbox: self.config.sandbox,
-                    network_access: self.config.workspace_write_network_access,
+                    network_access,
                     turns: 0,
                     turn: TurnState::Unlaunched,
                     turn_pgid: None,
@@ -3558,10 +3686,11 @@ impl CodexBackend {
             executable,
             env,
             codex_home,
+            network_access,
         } = self.launch_config(request.profile.as_ref())?;
         // #259, mirrored from `launch_exec` — resolved fresh here rather
         // than trusted from PREPARE.
-        let git_worktree_admin_dirs = self.resolve_git_worktree_admin_dirs(&request.bindings)?;
+        let git_worktree_common_dirs = self.resolve_git_worktree_common_dirs(&request.bindings)?;
         let budgets = self.config.appserver_budgets.unwrap_or_default();
         let (handshake_budget, thread_start_budget, turn_start_budget) =
             (budgets.handshake, budgets.thread_start, budgets.turn_start);
@@ -3610,7 +3739,7 @@ impl CodexBackend {
         // #259: the app-server's own writable-roots mechanism, granted the
         // same one directory per binding that exec's `--add-dir` is.
         roots.extend(
-            git_worktree_admin_dirs
+            git_worktree_common_dirs
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned()),
         );
@@ -3665,9 +3794,9 @@ impl CodexBackend {
                     env,
                     codex_home,
                     bindings_outside_cwd: extra_roots,
-                    git_worktree_admin_dirs,
+                    git_worktree_common_dirs,
                     sandbox: self.config.sandbox,
-                    network_access: self.config.workspace_write_network_access,
+                    network_access,
                     turns: 0,
                     turn: TurnState::Unlaunched,
                     turn_pgid: None,
@@ -4256,7 +4385,7 @@ impl Backend for CodexBackend {
     ///
     /// #259's fail-closed rule lives here too: a mutation-shaped request
     /// (one or more `bindings` — the only case `compose_launch_prompt` even
-    /// names a mutation surface for) whose git admin dir grant cannot be
+    /// names a mutation surface for) whose git common dir grant cannot be
     /// resolved is refused before LAUNCH ever spawns anything, rather than
     /// admitted to run and mechanically fail to commit. This is a pure local
     /// read (a worktree's own `.git` file, already materialized by the time
@@ -4278,7 +4407,7 @@ impl Backend for CodexBackend {
         // phases can never disagree about it.
         self.launch_config(request.profile.as_ref())?;
         if !request.bindings.is_empty() {
-            self.resolve_git_worktree_admin_dirs(&request.bindings)?;
+            self.resolve_git_worktree_common_dirs(&request.bindings)?;
         }
         Ok(PreparedExecution {
             execution_id: request.execution_id.clone(),
@@ -4493,6 +4622,7 @@ impl Backend for CodexBackend {
             executable,
             env,
             codex_home,
+            network_access,
         } = self.launch_config(request.profile.as_ref())?;
         // #259: NOT resolved here. A re-adopted execution's `turns` starts
         // at 1, so the `execution.turns == 0` gate that reads this field for
@@ -4502,7 +4632,7 @@ impl Backend for CodexBackend {
         // reconnect to a live, already-running turn over a transient read of
         // a `.git` file whose outcome nothing downstream ever consumes), so
         // this field is left empty rather than recomputed.
-        let git_worktree_admin_dirs = Vec::new();
+        let git_worktree_common_dirs = Vec::new();
         let mut state = self.lock();
         if let Some(existing) = state.executions.get(&handle.execution_id) {
             if existing.thread_id.as_deref() != Some(thread_id.as_str()) {
@@ -4521,9 +4651,9 @@ impl Backend for CodexBackend {
                 env,
                 codex_home,
                 bindings_outside_cwd: bindings_outside_cwd(&request.cwd, &request.bindings),
-                git_worktree_admin_dirs,
+                git_worktree_common_dirs,
                 sandbox: self.config.sandbox,
-                network_access: self.config.workspace_write_network_access,
+                network_access,
                 turns: 1,
                 turn: TurnState::Adopted,
                 // A re-adopted thread's turn was spawned by a previous

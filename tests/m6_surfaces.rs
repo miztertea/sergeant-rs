@@ -63,6 +63,7 @@ use sergeant_rs::backend::BackendRegistry;
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::{EventDraft, EventSource};
+use sergeant_rs::runtime::git::canonical_git_common_dir;
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::tui::{self, Action, App, Destination};
 
@@ -4837,4 +4838,113 @@ fn stub_docker(dir: &Path) -> String {
          \x20 *) exit 1;;\n\
          esac\n",
     )
+}
+
+/// Split-hardening W5, review finding #1b (`src/backend/codex.rs`'s
+/// `worktree_git_common_dir` doc comment carries the full reasoning): the
+/// #259 fix now grants a codex actor's linked worktree write access to the
+/// repository's whole shared `.git` common directory, not merely its own
+/// per-worktree admin subdirectory — a real `git commit` needs the wider
+/// grant (see that function and `tests/codex_backend.rs`'s
+/// `the_first_turn_grants_the_works_own_git_common_dir_as_an_add_dir_root`).
+/// This is a strictly *wider* filesystem grant than before, so what it costs
+/// the isolation story needs to be stated as plainly as what the narrower
+/// grant used to promise. This test states both halves in git terms alone —
+/// no codex-specific code is reachable from this integration crate, so it
+/// proves the underlying git facts the grant is built on, not the adapter's
+/// own plumbing (`src/runtime/surface.rs`'s own unit tests are the only
+/// place with access to that).
+///
+/// **Holds, structurally**: two different repositories never share a common
+/// dir. A Work's grant is built only from its own bindings, so this alone is
+/// what keeps a Work confined to the repositories it was actually admitted
+/// into — nothing here depends on trusting the actor.
+///
+/// **No longer holds, structurally**: two Works on the *same* repository —
+/// each in its own linked worktree, on its own distinct branch
+/// (`runtime::surface`'s own admission always cuts a new branch per Work) —
+/// resolve to the exact same common directory. A sandbox scoped to that
+/// grant cannot tell "this Work's own branch ref" from "the other Work's
+/// branch ref, or the object store backing every branch in the repository"
+/// -- both live under the one directory both Works were handed write access
+/// to. `runtime::repolock` only serializes the `git worktree add` span
+/// (proven by `tests/c4_repo_lock.rs`), never a Work's whole lifetime, so
+/// two such Works can legitimately be running concurrently when this
+/// applies. What still keeps them apart is the same-named branch convention
+/// (`runtime::surface` never hands two live Works the same branch) plus
+/// after-the-fact detection (branch-tip assertions, `common_dir_finding`) —
+/// trust and audit, not a filesystem boundary.
+#[test]
+fn git_worktree_common_dir_grant_is_shared_within_a_repository_but_never_crosses_repositories() {
+    let root = TempDir::new().expect("tempdir");
+
+    // Two Works on the same repository: distinct worktrees, distinct
+    // branches, same source.
+    let repo_a = root.path().join("repo-a");
+    support::init_repo(&repo_a);
+    let work_a1 = root.path().join("work-a1");
+    let work_a2 = root.path().join("work-a2");
+    support::git(
+        &repo_a,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "sergeant/work-a1",
+            work_a1.to_str().unwrap(),
+        ],
+    );
+    support::git(
+        &repo_a,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "sergeant/work-a2",
+            work_a2.to_str().unwrap(),
+        ],
+    );
+
+    let grant_a1 = canonical_git_common_dir(&work_a1).expect("work-a1 common dir");
+    let grant_a2 = canonical_git_common_dir(&work_a2).expect("work-a2 common dir");
+    assert_eq!(
+        grant_a1, grant_a2,
+        "two Works on the same repository resolve to the same shared common dir -- the grant \
+         itself no longer distinguishes them; only the branch-naming convention does"
+    );
+
+    // A distinct branch each, still true -- the convention half of the
+    // isolation story, not the filesystem half.
+    let branch_a1 = support::git(&work_a1, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let branch_a2 = support::git(&work_a2, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    assert_ne!(
+        branch_a1.trim(),
+        branch_a2.trim(),
+        "each Work still lands on its own named branch, even though the grant no longer \
+         enforces that separation by itself"
+    );
+
+    // A second, unrelated repository: its common dir must never equal
+    // either of repo-a's Works' grants. This is the half that IS still a
+    // structural (not merely conventional) boundary.
+    let repo_b = root.path().join("repo-b");
+    support::init_repo(&repo_b);
+    let work_b1 = root.path().join("work-b1");
+    support::git(
+        &repo_b,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "sergeant/work-b1",
+            work_b1.to_str().unwrap(),
+        ],
+    );
+    let grant_b1 = canonical_git_common_dir(&work_b1).expect("work-b1 common dir");
+    assert_ne!(
+        grant_a1, grant_b1,
+        "a Work bound only to repo-a must never resolve a grant equal to repo-b's common dir \
+         -- cross-repository isolation is never trust-based, only cross-Work isolation within \
+         one repository is"
+    );
 }

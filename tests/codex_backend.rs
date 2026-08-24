@@ -1088,24 +1088,30 @@ fn real_worktree(source: &Path, worktree: &Path, branch: &str) -> PathBuf {
     )
 }
 
-/// #259: turn 1's `--add-dir` must carry exactly one grant per binding — the
-/// Work's own `.git/worktrees/<name>` admin directory, never
-/// `repository.path` (the source checkout) and never the shared `.git`
-/// itself. Without this grant a codex actor can edit files in its assigned
-/// worktree but `git add`/`git commit` there fails with `Read-only file
-/// system` (five observed Terra Works, issue #259's own evidence).
+/// #259 (re-scoped, W5 fix): turn 1's `--add-dir` must carry exactly one
+/// grant per binding — the repository's shared `.git` (its "common
+/// directory"), never `repository.path` (the source checkout) itself. The
+/// original #259 fix granted only `.git/worktrees/<name>` (the per-worktree
+/// admin subdirectory); the independent review of split/w5-codex-commit-path
+/// showed empirically that this is not enough — `git commit` also writes
+/// loose objects and updates the branch ref under the shared common dir,
+/// outside that narrower grant, so `git add` would succeed and `git commit`
+/// would still fail with `Read-only file system` (five observed Terra
+/// Works, issue #259's own evidence, plus this wave's own bubblewrap
+/// measurement documented on `worktree_git_common_dir`).
 #[test]
-fn the_first_turn_grants_the_works_own_git_admin_dir_as_an_add_dir_root() {
+fn the_first_turn_grants_the_works_own_git_common_dir_as_an_add_dir_root() {
     let dir = TempDir::new().expect("tempdir");
     let source = dir.path().join("source");
     let worktree = dir.path().join("worktree");
     let admin_dir = real_worktree(&source, &worktree, "sergeant/w-codex");
-    // Exactly the one directory, never the repository or the shared `.git`.
+    // Exactly the one directory, never the repository (source checkout).
     assert_eq!(
         admin_dir,
         source.join(".git").join("worktrees").join("worktree"),
         "git's own scheme for a linked worktree's admin dir"
     );
+    let common_dir = source.join(".git");
 
     let stub = StubCodex::passing(dir.path());
     stub.replays(AGENT_MESSAGE_TURN);
@@ -1134,7 +1140,7 @@ fn the_first_turn_grants_the_works_own_git_admin_dir_as_an_add_dir_root() {
         .collect();
     assert_eq!(
         add_dir_values,
-        vec![admin_dir.to_str().unwrap()],
+        vec![common_dir.to_str().unwrap()],
         "argv: {:?}",
         launch.argv
     );
@@ -1205,6 +1211,113 @@ fn network_access_is_absent_by_default_and_present_when_configured() {
     );
 }
 
+/// #262, split-hardening W5 review finding #2: `workspace_write_network_
+/// access` is documented as per-profile, but `CodexConfig` (and the one
+/// `CodexBackend` a daemon shares across every codex-backed profile) had no
+/// plumbing that let two profiles on the same backend actually disagree —
+/// the field was read straight off `self.config` at every launch site,
+/// regardless of which profile was requested. This proves the fix: one
+/// `CodexBackend`, two profiles, opposite `network_access` options, and the
+/// daemon-global config left at its own default (`false`) throughout —
+/// each profile's launch composes (or omits) `-c
+/// sandbox_workspace_write.network_access=true` according to its own
+/// option, not the shared config.
+#[test]
+fn two_profiles_on_one_backend_resolve_network_access_independently() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.replays(AGENT_MESSAGE_TURN);
+    stub.replays(AGENT_MESSAGE_TURN);
+    // Daemon-global default stays false; only the profiles disagree.
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+
+    let mut on_options = BTreeMap::new();
+    on_options.insert("network_access".to_string(), "true".to_string());
+    let profile_on = sergeant_rs::domain::profile::Profile {
+        name: "network-on".to_string(),
+        backend: CODEX_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options: on_options,
+    };
+    let mut off_options = BTreeMap::new();
+    off_options.insert("network_access".to_string(), "false".to_string());
+    let profile_off = sergeant_rs::domain::profile::Profile {
+        name: "network-off".to_string(),
+        backend: CODEX_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options: off_options,
+    };
+
+    let mut request_on = start_request(dir.path());
+    request_on.profile = Some(profile_on);
+    let prepared_on = backend.prepare(&request_on).expect("prepare on");
+    backend.launch(&prepared_on).expect("launch on");
+
+    let mut request_off = start_request(dir.path());
+    request_off.profile = Some(profile_off);
+    let prepared_off = backend.prepare(&request_off).expect("prepare off");
+    backend.launch(&prepared_off).expect("launch off");
+
+    let launches = stub.wait_for_launches(2);
+    assert_eq!(
+        launches[0].value_after("-c"),
+        Some("sandbox_workspace_write.network_access=true"),
+        "the network-on profile's own option must win over the shared config's false default"
+    );
+    assert!(
+        !launches[1].has("-c"),
+        "the network-off profile's own option must win too, on the very same backend"
+    );
+}
+
+/// #262 (W5 fix): an unrecognized `network_access` option value fails
+/// closed at PREPARE, before anything spawns — the same posture
+/// `permission_mode` (#47) already has for its own closed vocabulary.
+#[test]
+fn an_unrecognized_network_access_option_is_refused_before_launch() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let mut options = BTreeMap::new();
+    options.insert("network_access".to_string(), "yes".to_string());
+    let profile = sergeant_rs::domain::profile::Profile {
+        name: "p".to_string(),
+        backend: CODEX_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options,
+    };
+    let mut request = start_request(dir.path());
+    request.profile = Some(profile);
+    let err = backend
+        .prepare(&request)
+        .expect_err("an unrecognized network_access value must be refused");
+    match err {
+        BackendError::Failed { detail, .. } => {
+            assert!(detail.contains("network_access"), "{detail}");
+            assert!(detail.contains("yes"), "{detail}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(stub.launches().is_empty());
+}
+
 /// #259's fail-closed half: a mutation-shaped request (bindings present)
 /// whose git admin dir grant cannot be resolved — here, a `worktree_path`
 /// that was never a linked worktree git created, so it has no `.git` file
@@ -1236,6 +1349,14 @@ fn prepare_refuses_a_mutation_shaped_request_whose_git_admin_dir_is_unresolvable
     match err {
         BackendError::Failed { detail, .. } => {
             assert!(detail.contains("#259"), "{detail}");
+            // Review finding #3, split-hardening W5: the refusal must name
+            // an actionable remedy, not just what failed (§15's "named
+            // remedy" precedent, `src/runtime/preflight.rs`'s
+            // `PreflightCheck::remedy`).
+            assert!(
+                detail.contains("Remedy:") && detail.contains("re-admit"),
+                "the refusal must carry an actionable remedy sentence: {detail}"
+            );
         }
         other => panic!("expected Failed, got {other:?}"),
     }
@@ -2137,19 +2258,15 @@ fn appserver_thread_start_names_exactly_the_works_surfaces() {
             inside_source
                 .path()
                 .join(".git")
-                .join("worktrees")
-                .join("inside-binding")
                 .to_string_lossy()
                 .to_string(),
             outside_source
                 .path()
                 .join(".git")
-                .join("worktrees")
-                .join("outside-binding")
                 .to_string_lossy()
                 .to_string(),
         ],
-        "cwd, the one outside binding, then #259's git admin dir grants for every binding \
+        "cwd, the one outside binding, then #259's git common-dir grants for every binding \
          in order -- never the estate root, never anything fabricated"
     );
 

@@ -53,6 +53,15 @@ pub struct Profile {
 /// The `permission_mode` option key inside [`Profile::options`] (#47).
 pub const PERMISSION_MODE_OPTION: &str = "permission_mode";
 
+/// The `network_access` option key inside [`Profile::options`] — the codex
+/// adapter's per-profile override of `CodexConfig::workspace_write_network_
+/// access` (#262, split-hardening W5 review finding #2). Follows the same
+/// "closed vocabulary, structured refusal" shape as [`PERMISSION_MODE_OPTION`]
+/// rather than a bespoke boolean parse, so a typo (`"tru"`, `"1"`) fails
+/// loudly at profile load instead of silently resolving to the daemon's
+/// default.
+pub const NETWORK_ACCESS_OPTION: &str = "network_access";
+
 /// The claude CLI's own `--permission-mode` vocabulary, as far as this
 /// adapter passes it through (§14, #47). Nothing here is invented: each
 /// variant is one value the CLI accepts for `--permission-mode`, plus
@@ -160,6 +169,30 @@ impl fmt::Display for UnknownPermissionMode {
 
 impl std::error::Error for UnknownPermissionMode {}
 
+/// A profile named a `network_access` value that is neither `"true"` nor
+/// `"false"` (#262, split-hardening W5 review finding #2).
+///
+/// Fails closed for the same reason [`UnknownPermissionMode`] does: a typo
+/// here is a token-spending, launch-time surprise unless it is caught at
+/// profile load instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownNetworkAccess {
+    /// The value that was neither `"true"` nor `"false"`.
+    pub value: String,
+}
+
+impl fmt::Display for UnknownNetworkAccess {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown network_access {:?}; expected one of: true, false",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for UnknownNetworkAccess {}
+
 impl Profile {
     /// This profile's validated `permission_mode` (#47).
     ///
@@ -174,6 +207,20 @@ impl Profile {
         match self.options.get(PERMISSION_MODE_OPTION) {
             None => Ok(None),
             Some(raw) => PermissionMode::parse(raw).map(Some),
+        }
+    }
+
+    /// This profile's validated `network_access` override (#262). `Ok(None)`
+    /// means unset — the caller (the codex adapter's `launch_config`) falls
+    /// back to `CodexConfig::workspace_write_network_access` in that case,
+    /// so two profiles on the same codex backend can genuinely disagree
+    /// instead of both being bound to one daemon-global flag.
+    pub fn network_access(&self) -> Result<Option<bool>, UnknownNetworkAccess> {
+        match self.options.get(NETWORK_ACCESS_OPTION) {
+            None => Ok(None),
+            Some(raw) if raw == "true" => Ok(Some(true)),
+            Some(raw) if raw == "false" => Ok(Some(false)),
+            Some(raw) => Err(UnknownNetworkAccess { value: raw.clone() }),
         }
     }
 }
@@ -307,5 +354,51 @@ mod tests {
                 "the diagnostic must list the valid vocabulary ({known}): {err}"
             );
         }
+    }
+
+    /// #262, split-hardening W5 review finding #2: `network_access` parses
+    /// unset as `None` (the caller falls back to the daemon-global default),
+    /// `"true"`/`"false"` as themselves, and anything else as a structured
+    /// refusal — the same three-way shape `permission_mode` has above.
+    #[test]
+    fn network_access_is_unset_true_false_or_a_structured_refusal() {
+        let base = Profile {
+            name: "n".to_string(),
+            backend: "codex".to_string(),
+            executable: None,
+            config_home: None,
+            env: BTreeMap::new(),
+            default_model: None,
+            options: BTreeMap::new(),
+        };
+        assert_eq!(
+            base.network_access().expect("unset is not an error"),
+            None,
+            "unspecified must not silently become true or false"
+        );
+
+        for (raw, expected) in [("true", true), ("false", false)] {
+            let mut profile = base.clone();
+            profile
+                .options
+                .insert(NETWORK_ACCESS_OPTION.to_string(), raw.to_string());
+            assert_eq!(
+                profile.network_access().expect("a listed value parses"),
+                Some(expected),
+                "{raw:?} must parse as {expected}"
+            );
+        }
+
+        let mut bad = base;
+        bad.options
+            .insert(NETWORK_ACCESS_OPTION.to_string(), "yes".to_string());
+        let err = bad
+            .network_access()
+            .expect_err("an unrecognized value must be refused");
+        assert_eq!(err.value, "yes");
+        assert!(
+            err.to_string().contains("yes"),
+            "the diagnostic must name the offending value: {err}"
+        );
     }
 }
