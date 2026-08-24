@@ -698,6 +698,19 @@ pub enum EstateError {
         /// The underlying vocabulary mismatch.
         source: crate::domain::profile::UnknownPermissionMode,
     },
+    /// A profile's `network_access` option is neither `"true"` nor `"false"`
+    /// (#262, split-hardening W5 review finding #2). Refused at parse time,
+    /// mirroring [`Self::InvalidPermissionMode`]: a typo here must fail
+    /// loudly at estate load, not silently at launch.
+    #[error("{file} declares profile {profile:?} with {source}")]
+    InvalidNetworkAccess {
+        /// Config file that declared it.
+        file: String,
+        /// The profile naming the bad value.
+        profile: String,
+        /// The underlying vocabulary mismatch.
+        source: crate::domain::profile::UnknownNetworkAccess,
+    },
     /// `sergeant.toml` declares no repositories at all.
     #[error("{file} declares no repositories")]
     NoRepositories {
@@ -1280,6 +1293,16 @@ impl Estate {
                     source,
                 });
             }
+            // #262: an unrecognized network_access is refused here, at
+            // config load, rather than surfacing later as a lazy PREPARE-time
+            // failure — same shape as permission_mode above.
+            if let Err(source) = profile.network_access() {
+                return Err(EstateError::InvalidNetworkAccess {
+                    file,
+                    profile: profile.name.clone(),
+                    source,
+                });
+            }
         }
 
         let declared_repo_names: Vec<&str> = repositories.iter().map(|r| r.name.as_str()).collect();
@@ -1409,6 +1432,16 @@ impl Estate {
             }
             if let Err(source) = profile.permission_mode() {
                 return Err(EstateError::InvalidPermissionMode {
+                    file,
+                    profile: profile.name.clone(),
+                    source,
+                });
+            }
+            // #262: an unrecognized network_access is refused here, at
+            // config load, rather than surfacing later as a lazy PREPARE-time
+            // failure — same shape as permission_mode above.
+            if let Err(source) = profile.network_access() {
+                return Err(EstateError::InvalidNetworkAccess {
                     file,
                     profile: profile.name.clone(),
                     source,
@@ -2128,6 +2161,50 @@ mod tests {
                 .expect("validated at load")
                 .map(|m| m.as_cli_value()),
             Some("plan")
+        );
+    }
+
+    /// #262: a `network_access` value that is neither `"true"` nor `"false"`
+    /// is refused at config load, mirroring `permission_mode` above — a typo
+    /// here must fail loudly and immediately, not lazily at PREPARE.
+    #[test]
+    fn a_profile_with_an_unknown_network_access_is_refused_at_load() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+
+        let err = parse(
+            root,
+            "[estate]\nname = \"w\"\n\n\
+             [[repo]]\nname = \"solo\"\n\n\
+             [[profile]]\nname = \"reckless\"\nbackend = \"codex\"\n\
+             [profile.options]\nnetwork_access = \"yes\"\n",
+        )
+        .expect_err("an unrecognized network_access must be refused");
+        match &err {
+            EstateError::InvalidNetworkAccess {
+                profile, source, ..
+            } => {
+                assert_eq!(profile, "reckless");
+                assert_eq!(source.value, "yes");
+            }
+            other => panic!("expected InvalidNetworkAccess, got {other}"),
+        }
+
+        // Both booleans, plus unspecified, all still parse.
+        let estate = parse(
+            root,
+            "[estate]\nname = \"w\"\n\n\
+             [[repo]]\nname = \"solo\"\n\n\
+             [[profile]]\nname = \"careful\"\nbackend = \"codex\"\n\
+             [profile.options]\nnetwork_access = \"true\"\n",
+        )
+        .expect("a listed network_access value parses");
+        assert_eq!(
+            estate.profiles[0]
+                .network_access()
+                .expect("validated at load"),
+            Some(true)
         );
     }
 

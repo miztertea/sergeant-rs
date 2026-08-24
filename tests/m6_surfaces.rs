@@ -1489,6 +1489,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // immediately above them rather than beside `estate`.
             "estate_root",
             "permission_mode",
+            // #262: the per-profile `network_access` override, right beside
+            // `permission_mode` — same estate-root threading, same
+            // fail-closed-at-load guarantee.
+            "network_access",
             // MVP-3: manifest health beyond "it parses" — declared repos
             // missing on disk (origin as the remedy) and directories under
             // `repos/` the manifest never declared. Green here because the
@@ -2010,6 +2014,105 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     assert!(
         !detail.contains("quiet=plan") && !detail.contains("careful=unspecified"),
         "the two profiles' effective modes must not be swapped or constant-folded: {detail}"
+    );
+}
+
+/// #262: `sgt doctor` reports the effective `network_access` override per
+/// profile, mirroring `t3b_doctor_reports_the_effective_permission_mode_
+/// per_profile` above — same reason: a misconfigured `network_access` must
+/// be visible before any launch, not just refused at load.
+#[test]
+fn t3e_doctor_reports_the_effective_network_access_per_profile() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
+    support::init_repo(&estate.path().join("repos").join("solo"));
+    std::fs::write(
+        estate.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"solo\"\n\n\
+         [[profile]]\nname = \"quiet\"\nbackend = \"codex\"\n\n\
+         [[profile]]\nname = \"careful\"\nbackend = \"codex\"\n\
+         [profile.options]\nnetwork_access = \"true\"\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (code, stdout, _) = doctor_in(
+        estate.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
+    assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
+    let (_, json, _) = doctor_in(
+        estate.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "network_access");
+    assert_eq!(check["status"], "ok", "{check}");
+    let detail = check["detail"].as_str().expect("detail is a string");
+    assert!(
+        detail.contains("quiet") && detail.contains("careful"),
+        "the detail must name every profile, not just count them: {detail}"
+    );
+    assert!(
+        detail.contains("careful=true"),
+        "the profile with an explicit override must report that value: {detail}"
+    );
+    assert!(
+        detail.contains("quiet=unspecified"),
+        "the unspecified profile must be reported as unspecified, \
+         never silently folded into a value it never chose: {detail}"
+    );
+}
+
+/// #262: a `claude` profile that sets `network_access` validates fine
+/// (`claude.rs` never reads the option, so nothing about it can be
+/// "unrecognized") but must not be reported as if it took effect —
+/// `claude.rs`'s launch grammar has no sandbox network knob at all.
+#[test]
+fn t3e_doctor_reports_network_access_has_no_effect_on_a_claude_profile() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
+    support::init_repo(&estate.path().join("repos").join("solo"));
+    std::fs::write(
+        estate.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"solo\"\n\n\
+         [[profile]]\nname = \"terra\"\nbackend = \"claude\"\n\
+         [profile.options]\nnetwork_access = \"false\"\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (_, json, _) = doctor_in(
+        estate.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "network_access");
+    let detail = check["detail"].as_str().expect("detail is a string");
+    assert!(
+        detail.contains("terra="),
+        "the detail must name the claude profile: {detail}"
+    );
+    assert!(
+        !detail.contains("terra=false"),
+        "a claude profile must never be rendered as if network_access took effect: {detail}"
+    );
+    assert!(
+        detail.contains("false") && detail.contains("no effect"),
+        "the configured value must still be named, alongside a plain statement that the claude \
+         backend does not read it: {detail}"
     );
 }
 
