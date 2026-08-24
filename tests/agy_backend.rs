@@ -144,9 +144,16 @@ struct StubAgy {
     /// stdin line is read — the shape W3 P1 row I measured.
     loop_init: PathBuf,
     /// Prefix for the loop arm's per-turn marker files (`-stderr-<n>`,
-    /// `-stderr-pre-<n>`, `-die-after-<n>`, `-no-init`, `-init-hang`,
-    /// `-preinit-err`, `-preinit-out`, `-exit-now`).
+    /// `-stderr-pre-<n>`, `-delay-<n>`, `-die-after-<n>`, `-no-init`,
+    /// `-init-hang`, `-preinit-out`, `-exit-now`).
     loop_prefix: PathBuf,
+    /// One line per invocation of the stub, written by the script's **first**
+    /// statement — before any arm can return. Deliberately a second ledger and
+    /// not `record`: the probe's `--version`/`--help`/`-p /config` arms all exit
+    /// before the recording block, so `launches()` cannot see them at all, and a
+    /// test that wants to prove the probe ran *once* (rather than once per
+    /// `capabilities()` call) has nothing to count without this.
+    invocations: PathBuf,
 }
 
 impl StubAgy {
@@ -164,6 +171,7 @@ impl StubAgy {
         let exit_code = dir.join(format!("{name}-exit-code"));
         let grandchild = dir.join(format!("{name}-grandchild"));
         let grandchild_pid = dir.join(format!("{name}-grandchild-pid"));
+        let invocations = dir.join(format!("{name}-invocations.txt"));
         std::fs::write(&config_answer, DEFAULT_CONFIG_ANSWER).expect("write config answer");
         std::fs::write(&loop_init, LOOP_INIT_LINE).expect("write loop init");
         // The arms are ordered exactly as the real CLI resolves them: the
@@ -172,13 +180,14 @@ impl StubAgy {
         // happened.
         let script = format!(
             "#!/bin/sh\n\
+             printf 'invocation %s\\n' \"$1\" >> \"{invocations}\"\n\
              if [ \"$1\" = \"--version\" ]; then echo \"{version}\"; exit 0; fi\n\
              if [ \"$1\" = \"--help\" ]; then printf '%s\\n' \"{help}\" >&2; exit 0; fi\n\
              if [ \"$1\" = \"-p\" ] && [ \"$2\" = \"/config\" ]; then\n  \
                if [ -f \"{config_hang}\" ]; then exec sleep 60; fi\n  \
                cat \"{config_answer}\"; exit 0\n\
              fi\n\
-             if [ \"$1\" = \"--print=\" ]; then\n                 {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n                   env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n                   printf 'cwd %s\\n' \"$(pwd)\"; printf 'end\\n'; }} >> \"{record}\"\n                 if [ ! -f \"{loop_prefix}-no-init\" ]; then cat \"{loop_init}\"; fi\n                 if [ -f \"{loop_prefix}-preinit-err\" ]; then cat \"{loop_prefix}-preinit-err\" >&2; fi\n                 if [ -f \"{loop_prefix}-preinit-out\" ]; then cat \"{loop_prefix}-preinit-out\"; fi\n                 if [ -f \"{loop_prefix}-exit-now\" ]; then exit \"$(cat \"{loop_prefix}-exit-now\")\"; fi\n                 if [ -f \"{grandchild}\" ]; then\n                   ( i=0; while [ \"$i\" -lt 600 ]; do sleep 0.1; i=$((i+1)); done ) &\n                   echo $! > \"{grandchild_pid}\"\n                 fi\n                 if [ -f \"{loop_prefix}-init-hang\" ]; then exec sleep 60; fi\n                 n=0\n                 while IFS= read -r line; do\n                     n=$((n+1))\n                     printf 'stdin %s\\n' \"$line\" >> \"{record}\"\n                     if [ -f \"{loop_prefix}-stderr-pre-$n\" ]; then cat \"{loop_prefix}-stderr-pre-$n\" >&2; fi\n                     if [ -f \"{replay}\" ]; then awk -v n=$n 'BEGIN{{s=1}} /^---turn---$/{{s=s+1;next}} s==n{{print}}' \"{replay}\"; fi\n                     if [ -f \"{loop_prefix}-stderr-$n\" ]; then cat \"{loop_prefix}-stderr-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-die-after-$n\" ]; then exit \"$(cat \"{loop_prefix}-die-after-$n\")\"; fi\n                 done\n                 if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n                 exit 0\n             fi\n\
+             if [ \"$1\" = \"--print=\" ]; then\n                 {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n                   env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n                   printf 'cwd %s\\n' \"$(pwd)\"; printf 'end\\n'; }} >> \"{record}\"\n                 if [ ! -f \"{loop_prefix}-no-init\" ]; then cat \"{loop_init}\"; fi\n                 if [ -f \"{loop_prefix}-preinit-err\" ]; then cat \"{loop_prefix}-preinit-err\" >&2; fi\n                 if [ -f \"{loop_prefix}-preinit-out\" ]; then cat \"{loop_prefix}-preinit-out\"; fi\n                 if [ -f \"{loop_prefix}-exit-now\" ]; then exit \"$(cat \"{loop_prefix}-exit-now\")\"; fi\n                 if [ -f \"{grandchild}\" ]; then\n                   ( i=0; while [ \"$i\" -lt 600 ]; do sleep 0.1; i=$((i+1)); done ) &\n                   echo $! > \"{grandchild_pid}\"\n                 fi\n                 if [ -f \"{loop_prefix}-init-hang\" ]; then exec sleep 60; fi\n                 n=0\n                 while IFS= read -r line; do\n                     n=$((n+1))\n                     printf 'stdin %s\\n' \"$line\" >> \"{record}\"\n                     if [ -f \"{loop_prefix}-stderr-pre-$n\" ]; then cat \"{loop_prefix}-stderr-pre-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-delay-$n\" ]; then sleep \"$(cat \"{loop_prefix}-delay-$n\")\"; fi\n                     if [ -f \"{replay}\" ]; then awk -v n=$n 'BEGIN{{s=1}} /^---turn---$/{{s=s+1;next}} s==n{{print}}' \"{replay}\"; fi\n                     if [ -f \"{loop_prefix}-stderr-$n\" ]; then cat \"{loop_prefix}-stderr-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-die-after-$n\" ]; then exit \"$(cat \"{loop_prefix}-die-after-$n\")\"; fi\n                 done\n                 if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n                 exit 0\n             fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$(printf '%s' \"$arg\" | tr '\\n' '|')\"; done;\n\
              env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
@@ -205,12 +214,18 @@ impl StubAgy {
             grandchild_pid = grandchild_pid.display(),
             hang = hang.display(),
             exit_code = exit_code.display(),
+            invocations = invocations.display(),
         );
         std::fs::write(&path, script).expect("write stub");
         let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod stub");
         support::wait_until_executable(&path);
+        // `wait_until_executable` runs `--version` itself (possibly more than
+        // once, on a filesystem still settling), so the ledger is zeroed here:
+        // it counts what the *adapter under test* invoked, not what building
+        // the stub did.
+        std::fs::write(&invocations, b"").expect("zero the invocation ledger");
         Self {
             path,
             record,
@@ -224,6 +239,7 @@ impl StubAgy {
             grandchild_pid,
             loop_init,
             loop_prefix,
+            invocations,
         }
     }
 
@@ -316,6 +332,29 @@ impl StubAgy {
         )
         .expect("write exit-now marker");
         self
+    }
+
+    /// Hold turn `n`'s reply for `seconds` before emitting its replay segment —
+    /// the only way to have a turn *genuinely in flight* at the moment a test
+    /// calls STOP or INTERRUPT.
+    fn loop_delays_turn(&self, n: usize, seconds: f32) -> &Self {
+        std::fs::write(
+            format!("{}-delay-{n}", self.loop_prefix.display()),
+            seconds.to_string(),
+        )
+        .expect("write loop delay");
+        self
+    }
+
+    /// Every invocation of the stub, in order, keyed by argv[1] — including the
+    /// probe's `--version`/`--help`/`-p` calls, which never reach `launches()`.
+    fn invocations(&self) -> Vec<String> {
+        let Ok(text) = std::fs::read_to_string(&self.invocations) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|line| line.strip_prefix("invocation ").map(str::to_string))
+            .collect()
     }
 
     /// Emit the `init` line and then block for ever without reading stdin —
@@ -468,7 +507,9 @@ impl StubAgy {
     /// Only the launches that are actually *turns*. Nothing else reaches the
     /// recording arm today (the probe's `--version`/`--help`/`-p /config` all
     /// return before it), but saying which children a test means keeps the
-    /// assertion honest if that ever changes.
+    /// assertion honest if that ever changes. A test that needs to count the
+    /// probe's own invocations wants [`Self::invocations`], which is written
+    /// before any arm can return.
     fn turn_launches(&self) -> Vec<Launch> {
         self.launches()
             .into_iter()
@@ -2147,9 +2188,38 @@ fn resolving_capabilities_spawns_no_extra_process() {
     let stub = StubAgy::passing(dir.path());
     let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
     let before = stub.launches().len();
-    for _ in 0..5 {
+    assert!(
+        stub.invocations().is_empty(),
+        "construction alone probes nothing — the OnceLocks are still empty"
+    );
+
+    let _ = backend.capabilities();
+    // The probe's own three zero-quota calls, counted where they can actually
+    // be seen: each of these arms `exit`s before the script's recording block,
+    // so `launches()` is structurally blind to them and an assertion built on
+    // it alone stays true whether the probe runs once or five times — which is
+    // exactly the repeated-I/O-during-registration regression this test is
+    // named for.
+    let after_first = stub.invocations();
+    assert_eq!(
+        after_first,
+        vec![
+            "--version".to_string(),
+            "--help".to_string(),
+            "-p".to_string()
+        ],
+        "the first capabilities() resolves through the probe's fixed, zero-quota call set"
+    );
+
+    for _ in 0..4 {
         let _ = backend.capabilities();
     }
+    assert_eq!(
+        stub.invocations(),
+        after_first,
+        "capabilities() is memoized: five calls must invoke `agy` exactly as many times as one \
+         did, or registration is doing repeated I/O again (the 0.2.2 daemon-panic shape)"
+    );
     assert_eq!(
         stub.launches().len(),
         before,
@@ -2649,6 +2719,90 @@ fn closing_stdin_lets_a_queued_turn_finish_then_exits() {
     };
     assert!(detail.contains("stopped"), "{detail}");
     assert_eq!(stub.loop_stdin_lines().len(), 1);
+}
+
+#[test]
+fn stop_waits_for_a_turn_that_is_still_in_flight_and_lets_it_finish() {
+    // The half of §2.5's graceful shutdown the test above cannot reach: it
+    // settles its turn *before* calling STOP, so `await_loop_settle` returns on
+    // its first check having waited on nothing. Here the turn is genuinely
+    // `InFlight` when STOP is called — the stub holds turn 1's `result` back —
+    // so the bounded wait is the thing under test, and the turn must be allowed
+    // to finish with its own clean outcome rather than be killed under it.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let (init, replay) = loop_capture(LOOP_TWO_TURNS);
+    stub.loop_init(&init);
+    stub.replays(&replay);
+    stub.loop_delays_turn(1, 1.5);
+    let backend = AgyBackend::new(loop_config_for(&stub, dir.path()));
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+
+    // The precondition this test exists for, asserted rather than assumed.
+    assert!(
+        events_of_kind(&events, "conversation.turn.ended").is_empty(),
+        "turn 1 must still be in flight when STOP is called, or the bounded wait is untested"
+    );
+    assert!(matches!(
+        backend.observe(&handle).expect("observe").native,
+        NativeState::Running
+    ));
+
+    backend.stop(&handle).expect("stop").wait();
+
+    let ended = events_of_kind(&events, "conversation.turn.ended");
+    assert_eq!(ended.len(), 1, "the in-flight turn settled, once");
+    assert_eq!(
+        ended[0].payload["outcome"],
+        serde_json::json!("completed"),
+        "STOP waited the turn out; it was not killed mid-flight"
+    );
+    assert_eq!(ended[0].payload["interrupted"], serde_json::json!(false));
+}
+
+#[test]
+fn stop_group_kills_when_the_drain_budget_expires_on_an_in_flight_turn() {
+    // The other half: a turn that will NOT settle inside the budget. STOP must
+    // fall through to the same group kill INTERRUPT uses rather than block on
+    // the child, and the outcome must say `interrupted_running` — we asked —
+    // not pretend the turn completed. The budget is shrunk per-instance, the
+    // same knob shape `init_line_budget` already uses, so no test can leak its
+    // budget into another's.
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let (init, replay) = loop_capture(LOOP_TWO_TURNS);
+    stub.loop_init(&init);
+    stub.replays(&replay);
+    stub.loop_delays_turn(1, 60.0);
+    let mut config = loop_config_for(&stub, dir.path());
+    config.stop_drain_budget = Some(Duration::from_millis(200));
+    let backend = AgyBackend::new(config);
+    let (sink, events) = sink();
+    backend.set_event_sink(sink);
+    let handle = launch_with(&backend, &loop_pinned_request(dir.path())).expect("launch");
+    assert!(
+        events_of_kind(&events, "conversation.turn.ended").is_empty(),
+        "turn 1 must still be in flight when STOP is called"
+    );
+
+    let started = Instant::now();
+    backend.stop(&handle).expect("stop").wait();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "STOP honoured the *configured* 200ms drain budget and fell through to the group kill — \
+         neither waiting out the 60s child nor the hardcoded 10s default: {elapsed:?}"
+    );
+
+    let ended = wait_for_turns_ended(&events, 1);
+    assert_eq!(
+        ended[0].payload["outcome"],
+        serde_json::json!("interrupted_running"),
+        "the budget expired into the group kill, and the turn says so"
+    );
+    assert_eq!(ended[0].payload["interrupted"], serde_json::json!(true));
 }
 
 #[test]

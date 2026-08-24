@@ -526,6 +526,13 @@ pub struct AgyConfig {
     /// `launch()` — no process-global mutable state, no `--test-threads`
     /// ordering hazard, no `unsafe { std::env::set_var }` to serialize.
     pub init_line_budget: Option<Duration>,
+    /// Override for [`LOOP_STOP_DRAIN_BUDGET`], `None` in every production
+    /// path. Same per-instance shape, and for the same reason, as
+    /// [`AgyConfig::init_line_budget`]: STOP's bounded graceful shutdown has two
+    /// outcomes — the in-flight turn settles, or the budget expires into the
+    /// group kill — and the second is only testable deterministically if a test
+    /// can shrink the budget below the turn it is racing.
+    pub stop_drain_budget: Option<Duration>,
     /// Which transport to run on (W3). `Auto` — the default — resolves from the
     /// `--help` text the probe already read, spawning nothing extra.
     pub transport: TransportChoice,
@@ -549,6 +556,7 @@ impl std::fmt::Debug for AgyConfig {
             )
             .field("settings_home", &self.settings_home)
             .field("init_line_budget", &self.init_line_budget)
+            .field("stop_drain_budget", &self.stop_drain_budget)
             .field("transport", &self.transport)
             .finish()
     }
@@ -566,6 +574,7 @@ impl AgyConfig {
             json_schema: None,
             settings_home: None,
             init_line_budget: None,
+            stop_drain_budget: None,
             transport: TransportChoice::default(),
         }
     }
@@ -5389,7 +5398,11 @@ impl Backend for AgyBackend {
         // the group kill — where print mode has nothing to close and goes
         // straight there.
         if self.close_loop_stdin(&handle.execution_id) {
-            self.await_loop_settle(&handle.execution_id, LOOP_STOP_DRAIN_BUDGET);
+            let budget = self
+                .config
+                .stop_drain_budget
+                .unwrap_or(LOOP_STOP_DRAIN_BUDGET);
+            self.await_loop_settle(&handle.execution_id, budget);
         }
         self.interrupt(handle)?.wait();
         let reader = {
