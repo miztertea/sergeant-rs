@@ -44,7 +44,7 @@ mkdir -p ~/estates/my-product
 cd ~/estates/my-product
 sgt init
 sgt claude
-# or: sgt codex / sgt opencode / sgt goose
+# or: sgt codex / sgt opencode / sgt agy / sgt goose
 ```
 
 Then talk to Captain:

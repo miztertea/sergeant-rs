@@ -346,3 +346,145 @@ a launch-time permission-mode check; the empty-SUCCESS completeness
 check given its fail-closed classification consequence and fixture;
 `profiles` added so all 13 contract booleans are accounted; the
 NORTH-STAR amendment-4 outcome assigned to W4 as a writing task.
+
+## As-landed postscript (2026-08-23, appended by W4)
+
+This plan's own open questions and candidate framings did not all
+land the way they were written above; recorded here rather than left
+for a reader to reconcile against `docs/adr/0022-agy-adapter.md`
+silently.
+
+**The soft-deny discrepancy resolved inverted from the packet on
+print, and split by transport in a way this plan did not
+anticipate.** §W1 framed the discrepancy as "resolves with a recorded
+probe" and hedged only one direction: "if soft-deny manifests
+anywhere… the terminal classifier must not trust `status` alone." It
+manifested — print mode at the installed 1.1.19 is soft-deny, exactly
+inverting the packet's own hard-deny hypothesis, `CANCELED`/exit
+0/stderr-only, classified fail-closed ambiguous. What this plan's own
+§W1 did not predict is that §W3's loop transport would measure the
+*opposite* shape on the identical stimulus: a typed `TOOL_ERROR`, a
+failed terminal, and the **child process itself exiting** — the
+wave's own "most operationally important measurement," per the
+admission row's own words, and a genuine argument (recorded, not
+acted on) for `PrintOnly` as an operator default until a per-Work
+allow-rule policy exists.
+
+**Both W3 refutation candidates this plan hedged resolved negative,
+the mirror image of opencode's own postscript.** §W3 named `ask` and
+`approval_flow` as candidates "measured or stays false" with no
+stated expectation, and named a SIGINT-based native interrupt tier as
+an upgrade candidate. All three refuted, each with a live transcript:
+sixteen candidate loop reply-event names tried and skipped, plus a
+seventeenth, `control_request`, refused outright, for
+`ask`/`approval_flow` (W3 P1), and a SIGINT terminal
+byte-identical to a plain `--print-timeout` expiry for the interrupt
+tier (W3 P4). OpenCode's own postscript records both of *its*
+analogous candidates landing `true`; agy's land `false` — two
+adjacent adapters, two different measured answers to structurally
+similar questions, neither forced to match the other.
+
+**`native_subagents` landed exactly as this plan's own §W3 framed
+it** — "the headline candidate," admitted only "on a typed record" —
+and closed the good way: `true` on the loop transport, the first
+`true` for this flag anywhere in the registry, on all three pieces of
+evidence the spec demanded (a typed `step_type "subagent"` step, a
+typed `subagent_info` payload naming a distinct child
+`conversation_id`, and that step reaching `DONE`).
+
+**`profiles` landed as a declared divergence, not the plan's own
+either/or framing.** §W1's panel amendment asked for `true` only if a
+W1 admission test measured a defined agent altering the launch, else
+`false` with the probe recorded. What actually shipped is a third
+outcome the plan did not name: `true`, but on generic sergeant axes
+only (executable + env reaching every turn), with agy's own `--agent`
+mechanism itself measured unreachable on this host (`agy agents`
+printed an empty list; the documented workspace mechanism for
+defining one did not work either, W1 P6) — a distinction recorded in
+`agy.rs`'s own admission row as a DECLARED DIVERGENCE, and carried
+into ADR 0022's own open-questions section as a hand-off rather than
+silently resolved.
+
+**Sandbox landed as honest silence, as this plan's own §W3 already
+said it would if nothing measured** — but not *nothing* was measured:
+W3 S1 found `proceed-in-sandbox` genuinely lifts the permission gate
+as a real second channel, on a host where the sandbox server itself
+does not run (a connection-reset failure at the tool layer). The plan
+asked for "codex's own tier at most, or honest silence" and got
+honest silence with a corroborating negative (`nsjail` absent from
+the binary's own strings) plus one adjacent positive fact recorded
+for a future wave rather than promoted into a claim this host cannot
+back. No NORTH-STAR amendment 4 entry was appended, identically to
+ADR 0021's own reasoning for opencode.
+
+**One version-attribution correction, made because a build-version
+argument is exactly what R1's fail-closed rules exist to resist**:
+this plan and the probe packet both attributed the empty-SUCCESS
+stream-drop fix to agy 1.1.16; the CLI's own bundled changelog names
+it **1.1.18**. This changes nothing about the classifier — the panel's
+empty-SUCCESS rule is fail-closed by construction and
+version-independent — but is recorded rather than silently corrected
+without a trace, per this plan's own §1.1 framing of the two version
+numbers.
+
+**Two fixes this plan's own W1/W2 sections did not anticipate,
+folded in as they were found**: the zero-quota `/config` probe is not
+always zero-interaction (an unauthenticated `agy` blocks on an
+interactive OAuth prompt for up to 60s; `CONFIG_PROBE_BUDGET` now
+bounds it, found during W2's registration wave, not W1's own probe
+pass), and a turn-end posture race on the loop transport (the reader
+thread now computes `PermissionPosture` itself at init-parse time
+rather than depending on LAUNCH's own round trip, closed during W1's
+own captain pass — commit `38932727`).
+
+**The K2 "no core changes" ledger is real but not empty, exactly as
+K2's own text anticipated — and it is eleven items, not the six a
+W1–W3-only reading gives.** Counted mechanically ("every file outside
+`src/backend/agy.rs` this sprint touched") across all four waves, the
+ledger is: the `pub mod agy;` declaration and its doc comment in
+`src/backend/mod.rs` — the only edit to that file, with the `Backend`
+contract itself byte-unchanged (W1); the A4-required blob-ref
+PUT-site/recovery row (`tests/a4_blob_ref_pinning.rs`, gate-forced,
+W1); the adapter's own `tests/agy_backend.rs`/`tests/agy_routing.rs`
+suites (W1–W3, template-pre-ratified); the 26 fixtures cut at 1.1.19
+(13 print + 13 loop, W1 and W3); the two `c2-suites.sh` stage wirings
+(gate-forced by `tests/coverage_stage_membership.rs`, built during the
+opencode sprint, W1/W2); the `"agy"` `BackendRegistry` registration
+(`src/daemon.rs`, W2); the `sgt agy` passthrough itself (`src/cli.rs`
++17/-9 plus a one-line doc-only verb-list bump in `src/harness.rs` —
+K2's own pre-ratified exception, W2); three pre-existing fixtures'
+registered-backend count/list widened by that registration commit
+itself (`tests/m2_daemon_api.rs`/`m3_execution.rs`/`m4_backends.rs`,
+mechanical fallout, W2); the three-field struct-literal fallout of
+W4's fake-backend fidelity (`tests/m4_backends.rs` again); the K3
+version bump (`Cargo.toml`/`Cargo.lock`, W4); and W4's own release and
+reference documentation (`CHANGELOG.md`, one `README.md` quickstart
+line, the `docs/DEVELOPMENT.md` backend-list sentence, ADR 0022, and
+this postscript). All eleven are listed with their individual reasons
+in ADR 0022's own K2 exception ledger for owner ratification at the
+head PR, exactly as this plan's own "Ratify-at-review" list promised.
+Two facts worth stating positively rather than by omission: unlike the
+opencode sprint, agy needed **no** new `Cargo.toml` dependency and not
+even a feature flag — W3's own §"input-loop transport upgrades"
+framing ("zero new crates, no ports, no auth posture to carry") landed
+exactly as written — and unlike that sprint's W2, agy needed **no**
+`harness.rs` PATH line either, because `~/.local/bin` was already on
+`toolchain_path_dirs`, which this plan's §"Measured facts" predicted
+correctly.
+
+**Live-turn spend against K1, recorded whole rather than netted.** W1
+spent 9 of 15 budgeted; W2 spent **zero** (stub-driven end to end); W3
+spent 13 of 20 — 5 spec probes, 7 admissions, and 1 accidental (X0),
+the sprint's only unpinned turn, which is on the record in the packet,
+in the W3 PR body and in ADR 0022's own section rather than absorbed
+into a total; W4's own budget is 5, reserved for the end-to-end proof,
+with the fake-fidelity, doctrine and finalize work spending none.
+Every other turn in this sprint pinned `gemini-3.7-flash-low`.
+
+**Coverage held at or above the floor without a dedicated lift wave** —
+the one W4 job this plan budgeted for that turned out not to be needed.
+W3's gate rerun (the full CI sequence) measured TOTAL **91.84%** lines
+against the 90 floor, with `backend/agy.rs` at 94.17%; W4's
+fake-fidelity commit measured `backend/fake.rs` at 98.50% lines, the
+only source file it touched. W4's doctrine and finalize commits change
+no source at all.

@@ -4580,6 +4580,9 @@ fn r1_worker_reports_done_but_native_session_stays_alive() {
         interrupt_confirmed: false,
         typed_error: None,
         rejected_tool: None,
+        soft_denied_tool: None,
+        killed_tool: None,
+        launch_refusal: None,
     };
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [step]);
     let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
