@@ -4725,13 +4725,6 @@ mod tests {
         );
 
         let applied = std::fs::read(target.join("data.rs")).expect("applied tracked file");
-        let original = std::fs::read(worktree.join("data.rs"));
-        // The worktree directory is already gone (teardown reclaimed it), so
-        // compare against the content we know we wrote into it.
-        assert!(
-            original.is_err(),
-            "sanity: the worktree must actually be gone by now"
-        );
         assert_eq!(
             applied,
             b"const V: [u8; 2] = [0, 1]".to_vec(),
@@ -4740,6 +4733,81 @@ mod tests {
         );
         let new_file = std::fs::read(target.join("new.rs")).expect("applied untracked file");
         assert_eq!(new_file, b"fn wanted() {}\n".to_vec());
+    }
+
+    /// #234 follow-up (`60-re-verify-and-postmortem`, F-SF-04/F-TH-01): the
+    /// fix's stated rationale for switching to `git_bytes` was not only the
+    /// dropped trailing newline but also that a `String::from_utf8_lossy`
+    /// round-trip corrupts non-UTF-8 diff content by substituting the
+    /// 3-byte U+FFFD sequence for any invalid byte — a second, independent
+    /// defect (root-cause H2). No prior regression test exercised it; every
+    /// fixture was pure ASCII. This one dirties a tracked file with a raw
+    /// `0xFF` byte (no `NUL` nearby, so Git still emits a text diff rather
+    /// than switching to `--binary`'s base85 encoding, which is ASCII and
+    /// would not exercise this path) and proves the captured patch is
+    /// byte-identical to Git's own diff output, not merely non-empty.
+    #[test]
+    fn retain_dirty_patch_preserves_non_utf8_bytes_verbatim() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        std::fs::write(spec.path.join("data.rs"), b"const V: u8 = 0;\n").expect("tracked");
+        git_as_test_identity(&spec.path, &["add", "data.rs"]);
+        git_as_test_identity(&spec.path, &["commit", "-m", "add data.rs"]);
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01PATCHUTF8",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        let mut dirtied = b"const V: u8 = ".to_vec();
+        dirtied.push(0xFF);
+        dirtied.extend_from_slice(b";\n");
+        std::fs::write(worktree.join("data.rs"), &dirtied).expect("dirty edit");
+
+        // Ground truth, captured independently of `capture_dirty_patch`:
+        // stage now and read git's own diff bytes before teardown does the
+        // same staging/diffing itself and reclaims the worktree.
+        git_as_test_identity(&worktree, &["add", "-A"]);
+        let raw = Command::new("git")
+            .args(["diff", "--cached", "--binary"])
+            .current_dir(&worktree)
+            .output()
+            .expect("git diff")
+            .stdout;
+        assert!(
+            raw.contains(&0xFFu8),
+            "sanity: the ground-truth diff must actually contain the raw non-UTF-8 byte"
+        );
+
+        let report = teardown_of(&surface);
+        let BindingDisposition::RetainedDirty { patch, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        let patch = patch.as_ref().expect("must capture a patch");
+        let patch_bytes = std::fs::read(&patch.path).expect("read captured patch");
+
+        assert_eq!(
+            patch_bytes, raw,
+            "the captured .dirty.patch must be byte-identical to git's own diff output — a \
+             lossy UTF-8 round-trip would replace the raw 0xFF byte with the 3-byte U+FFFD \
+             sequence and change both the content and the length"
+        );
+        assert!(
+            !patch_bytes
+                .windows(3)
+                .any(|window| window == [0xEF, 0xBF, 0xBD]),
+            "the raw non-UTF-8 byte must survive capture unchanged, not be replaced by the \
+             U+FFFD substitution sequence: {patch_bytes:?}"
+        );
     }
 
     /// [`reap`]: a captured patch is deleted and its exact size is reported

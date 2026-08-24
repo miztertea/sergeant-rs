@@ -112,8 +112,14 @@ pub fn canonical_git_top_level(dir: &Path) -> Result<std::path::PathBuf, GitErro
     Ok(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
-/// Run `git <args>` in `dir` and return trimmed stdout, or a [`GitError`].
-pub fn git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
+/// Run `git <args>` in `dir` and return the raw [`std::process::Output`], or
+/// a [`GitError`] built from Git's own diagnostic on a nonzero exit.
+///
+/// The single spawn/status-check/error-construction block [`git`],
+/// [`git_verbatim`], and [`git_bytes`] each need — factored out so those
+/// three differ only in how they convert a successful `output.stdout`, not
+/// in how they spawn or report failure.
+fn run(dir: &Path, args: &[&str]) -> Result<std::process::Output, GitError> {
     let output = command(dir, args)
         .output()
         .map_err(|source| GitError::Spawn {
@@ -129,6 +135,12 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
+    Ok(output)
+}
+
+/// Run `git <args>` in `dir` and return trimmed stdout, or a [`GitError`].
+pub fn git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
+    let output = run(dir, args)?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
@@ -143,21 +155,7 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, GitError> {
 /// Only the trailing newline Git terminates its last record with is dropped,
 /// so a clean tree still answers with an empty string.
 pub fn git_verbatim(dir: &Path, args: &[&str]) -> Result<String, GitError> {
-    let output = command(dir, args)
-        .output()
-        .map_err(|source| GitError::Spawn {
-            args: owned(args),
-            dir: dir.display().to_string(),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(GitError::Failed {
-            args: owned(args),
-            dir: dir.display().to_string(),
-            status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
+    let output = run(dir, args)?;
     Ok(String::from_utf8_lossy(&output.stdout)
         .trim_end_matches('\n')
         .to_string())
@@ -173,22 +171,7 @@ pub fn git_verbatim(dir: &Path, args: &[&str]) -> Result<String, GitError> {
 /// terminates its output with `\n`, and dropping that byte turns a valid
 /// patch into one `git apply` rejects as corrupt at end-of-file (#234).
 pub fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, GitError> {
-    let output = command(dir, args)
-        .output()
-        .map_err(|source| GitError::Spawn {
-            args: owned(args),
-            dir: dir.display().to_string(),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(GitError::Failed {
-            args: owned(args),
-            dir: dir.display().to_string(),
-            status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(output.stdout)
+    Ok(run(dir, args)?.stdout)
 }
 
 /// Whether `git <args>` in `dir` exits zero. Used for existence questions
