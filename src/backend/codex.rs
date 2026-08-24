@@ -3120,6 +3120,20 @@ impl CodexBackend {
         }
     }
 
+    /// #259: resolve each binding's git admin dir, or refuse with the named,
+    /// actionable error. Shared by every call site that needs the grant for
+    /// real (PREPARE's own preflight, and each transport's LAUNCH) — RESUME
+    /// does not call this (see its own comment): the grant is provably inert
+    /// there, so resolving it would add a fail-closed check with no
+    /// corresponding capability it protects.
+    fn resolve_git_worktree_admin_dirs(
+        &self,
+        bindings: &[BindingSummary],
+    ) -> Result<Vec<PathBuf>, BackendError> {
+        git_worktree_admin_dirs(bindings)
+            .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))
+    }
+
     fn err_unknown(&self, execution_id: &str) -> BackendError {
         BackendError::UnknownExecution {
             backend: CODEX_BACKEND_NAME.to_string(),
@@ -3489,8 +3503,7 @@ impl CodexBackend {
         // #259: re-resolved here rather than trusting PREPARE's own check —
         // `launch_config`'s own doc comment states the same rule ("LAUNCH
         // re-resolves it, so the two phases can never disagree").
-        let git_worktree_admin_dirs = git_worktree_admin_dirs(&request.bindings)
-            .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))?;
+        let git_worktree_admin_dirs = self.resolve_git_worktree_admin_dirs(&request.bindings)?;
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -3548,8 +3561,7 @@ impl CodexBackend {
         } = self.launch_config(request.profile.as_ref())?;
         // #259, mirrored from `launch_exec` — resolved fresh here rather
         // than trusted from PREPARE.
-        let git_worktree_admin_dirs = git_worktree_admin_dirs(&request.bindings)
-            .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))?;
+        let git_worktree_admin_dirs = self.resolve_git_worktree_admin_dirs(&request.bindings)?;
         let budgets = self.config.appserver_budgets.unwrap_or_default();
         let (handshake_budget, thread_start_budget, turn_start_budget) =
             (budgets.handshake, budgets.thread_start, budgets.turn_start);
@@ -4266,8 +4278,7 @@ impl Backend for CodexBackend {
         // phases can never disagree about it.
         self.launch_config(request.profile.as_ref())?;
         if !request.bindings.is_empty() {
-            git_worktree_admin_dirs(&request.bindings)
-                .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))?;
+            self.resolve_git_worktree_admin_dirs(&request.bindings)?;
         }
         Ok(PreparedExecution {
             execution_id: request.execution_id.clone(),
@@ -4483,13 +4494,15 @@ impl Backend for CodexBackend {
             env,
             codex_home,
         } = self.launch_config(request.profile.as_ref())?;
-        // #259, mirrored from `launch_exec`/`launch_appserver`: a re-adopted
-        // execution's `turns` starts at 1, so `first_turn_argv` never runs
-        // for it again and this grant is inert here — resolved anyway so
-        // the record stays honest and a future re-launch path (if one ever
-        // reads `turns` differently) does not silently regress #259.
-        let git_worktree_admin_dirs = git_worktree_admin_dirs(&request.bindings)
-            .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))?;
+        // #259: NOT resolved here. A re-adopted execution's `turns` starts
+        // at 1, so the `execution.turns == 0` gate that reads this field for
+        // argv construction never fires for it — the grant is provably dead
+        // on this path. Resolving it anyway would add a fail-closed check
+        // that protects nothing (daemon-restart reattach would refuse to
+        // reconnect to a live, already-running turn over a transient read of
+        // a `.git` file whose outcome nothing downstream ever consumes), so
+        // this field is left empty rather than recomputed.
+        let git_worktree_admin_dirs = Vec::new();
         let mut state = self.lock();
         if let Some(existing) = state.executions.get(&handle.execution_id) {
             if existing.thread_id.as_deref() != Some(thread_id.as_str()) {
