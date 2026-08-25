@@ -1067,6 +1067,84 @@ fn declared_output_artifact_from_readme(text: &str) -> Option<String> {
     parse_declared_artifact_line(line)
 }
 
+/// Amendment 10d (#260): read one stage's declared **structural** shape for
+/// its output artifact — `**Required columns:** `<col>`, `<col>`, ...` —
+/// out of the same `output/README.md` [`declared_output_artifact`] reads.
+/// Empty (never `None`) when the stage declares no such line: "no shape
+/// declared" and "declared, satisfied trivially" are the same thing to the
+/// gate that consumes this — it only ever checks that every name in this
+/// list is present, so an empty list is vacuously satisfied.
+///
+/// This is engine-general the same way [`declared_output_artifact`] is: any
+/// stage in any package may declare `Required columns`, not only
+/// `remediate-findings`' `00-ingest` — the engine parses one more line of
+/// the same convention, never a `remediate-findings`-specific check.
+pub(crate) fn declared_required_columns(package_dir: &Path, stage_id: &str) -> Vec<String> {
+    let readme = package_dir.join(stage_id).join("output").join("README.md");
+    let Ok(text) = std::fs::read_to_string(readme) else {
+        return Vec::new();
+    };
+    declared_required_columns_from_readme(&text)
+}
+
+fn declared_required_columns_from_readme(text: &str) -> Vec<String> {
+    let Some(line) = text
+        .lines()
+        .find(|line| line.trim().starts_with("**Required columns:**"))
+    else {
+        return Vec::new();
+    };
+    // Every backtick-quoted token on the line, in order — `**Required
+    // columns:** `id`, `axis`, `claim` — trailing prose` yields
+    // `["id", "axis", "claim"]`; prose between/after the quoted tokens
+    // (the em-dash explanation every shipped line carries) is simply text
+    // that never falls between a pair of backticks, so it is never picked
+    // up as a column name.
+    let mut columns = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('`') else {
+            break;
+        };
+        let name = after_open[..close].trim();
+        if !name.is_empty() {
+            columns.push(name.to_string());
+        }
+        rest = &after_open[close + 1..];
+    }
+    columns
+}
+
+/// Whether `text` contains a markdown table row (`| a | b | c |`) whose
+/// cells cover every name in `required`, case-insensitively — the
+/// structural half of Amendment 10d's gate, checked against the *produced*
+/// artifact rather than the README that declared the requirement. An empty
+/// `required` is vacuously satisfied (see [`declared_required_columns`]).
+///
+/// One row must carry every required name together, deliberately: a header
+/// row split across two lines, or names that merely appear somewhere in the
+/// document's prose, are not the "this is a typed table" evidence Amendment
+/// 10d asks for.
+pub(crate) fn has_required_table_columns(text: &str, required: &[String]) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    let wanted: Vec<String> = required.iter().map(|c| c.to_ascii_lowercase()).collect();
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            return false;
+        }
+        let cells: Vec<String> = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim().trim_matches('`').to_ascii_lowercase())
+            .collect();
+        wanted.iter().all(|col| cells.contains(col))
+    })
+}
+
 /// One `**Expected artifact:** \`<file>\` — ...` line, parsed strictly:
 /// `None` unless it names a bare backtick-quoted filename with no path
 /// separators (the exact shape every shipped `output/README.md` uses).
@@ -1501,6 +1579,58 @@ mod tests {
             Some("implementation.md".to_string())
         );
         assert_eq!(declared_output_artifact(dir.path(), "20-other"), None);
+    }
+
+    /// Amendment 10d: the exact line `remediate-findings/00-ingest/output/
+    /// README.md` carries.
+    #[test]
+    fn declared_required_columns_parses_the_shipped_ingest_readme_shape() {
+        let readme = "**Expected artifact:** `ingest.md` — the accepted finding set.\n\n\
+             **Required columns:** `id`, `axis`, `claim`, `evidence`, `severity`, `status`, \
+             `refutation` — #260's structural gate.\n\n\
+             **Disposition:** `evidence`\n";
+        assert_eq!(
+            declared_required_columns_from_readme(readme),
+            vec![
+                "id",
+                "axis",
+                "claim",
+                "evidence",
+                "severity",
+                "status",
+                "refutation"
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_required_columns_is_empty_without_the_line() {
+        assert_eq!(
+            declared_required_columns_from_readme("**Expected artifact:** `x.md`\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn has_required_table_columns_finds_a_case_insensitive_header_row() {
+        let required = vec!["id".to_string(), "axis".to_string(), "claim".to_string()];
+        let typed = "some prose\n\n| ID | Axis | Claim | Evidence |\n|---|---|---|---|\n| 1 | \
+                     correctness | x | y |\n";
+        assert!(has_required_table_columns(typed, &required));
+    }
+
+    #[test]
+    fn has_required_table_columns_refuses_prose_with_no_table() {
+        let required = vec!["id".to_string(), "axis".to_string()];
+        let untyped = "Findings:\n- id: 1, axis: correctness, this is prose not a table\n";
+        assert!(!has_required_table_columns(untyped, &required));
+    }
+
+    #[test]
+    fn has_required_table_columns_refuses_a_table_missing_one_column() {
+        let required = vec!["id".to_string(), "refutation".to_string()];
+        let partial = "| id | axis |\n|---|---|\n| 1 | correctness |\n";
+        assert!(!has_required_table_columns(partial, &required));
     }
 
     #[test]

@@ -171,6 +171,35 @@ fn write_two_stage_workflow(root: &Path) {
 }
 
 /// [`write_two_stage_workflow`], but `00-first` declares an `output/
+/// README.md` with both an expected artifact and Amendment 10d's
+/// `**Required columns:**` line — the shape `remediate-findings/00-ingest`
+/// itself carries — so the gate's structural check has something to
+/// enforce for a stage that ships an artifact that exists but is not a
+/// typed table.
+fn write_two_stage_workflow_with_required_columns(
+    root: &Path,
+    expected_artifact: &str,
+    columns: &[&str],
+) {
+    write_two_stage_workflow(root);
+    let output_dir = root
+        .join(".sergeant/workflows/tiny/00-first")
+        .join("output");
+    std::fs::create_dir_all(&output_dir).expect("output dir");
+    let quoted: Vec<String> = columns.iter().map(|c| format!("`{c}`")).collect();
+    std::fs::write(
+        output_dir.join("README.md"),
+        format!(
+            "# Output — `00-first`\n\n**Expected artifact:** `{expected_artifact}` — proof of \
+             work.\n\n**Required columns:** {} — a typed set, not prose.\n\n**Disposition:** \
+             `evidence`\n",
+            quoted.join(", ")
+        ),
+    )
+    .expect("output/README.md");
+}
+
+/// [`write_two_stage_workflow`], but `00-first` declares an `output/
 /// README.md` (#260 Q3's shape, `docs/icm/convention.md` Rule 4) naming
 /// `expected_artifact` as its expected artifact — so the hard stage-output
 /// gate has something to enforce against a `StageCompleted` signal for that
@@ -1406,6 +1435,110 @@ async fn t10_a_stage_completed_without_its_declared_output_is_reprompted_then_ne
     assert_eq!(
         events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING).len(),
         1
+    );
+
+    handle.shutdown().await;
+}
+
+/// Amendment 10d (#260's remaining criterion): a stage whose declared
+/// artifact exists but is untyped prose — present, but missing the
+/// declared `**Required columns:**` as a markdown table row — must be
+/// refused the identical `stage_output_missing`-class way an altogether
+/// absent artifact is, per mechanism 1's gate, not a bespoke parser. This
+/// is the generic engine mechanism `remediate-findings/00-ingest` opts
+/// into by declaring `Required columns`, exercised here on a throwaway
+/// `tiny` workflow so the test is not tied to that specific package's
+/// prose.
+#[tokio::test]
+async fn t11_a_present_but_untyped_declared_artifact_is_refused_the_same_way_as_a_missing_one() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (mount, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow_with_required_columns(&estate, "ingest.md", &["id", "axis"]);
+
+    // The artifact must exist *before* the stage ever launches — the fake
+    // actor cannot write files itself — so it is seeded into the source
+    // repository's own history, the same way any other pre-existing
+    // tracked file would be: present in the worktree from the moment it is
+    // materialized, exactly as if a prior (buggy) turn had committed
+    // untyped prose instead of a typed table.
+    std::fs::create_dir_all(mount.join("00-first/output")).expect("output dir");
+    std::fs::write(
+        mount.join("00-first/output/ingest.md"),
+        "Findings: one about id 1, axis correctness. No table here.\n",
+    )
+    .expect("seed untyped artifact");
+    support::git(&mount, &["add", "-A"]);
+    support::git(&mount, &["commit", "-m", "seed untyped artifact"]);
+
+    let (registry, _fake) = one_fake([
+        FakeStep::complete(), // 00-first launch: the untyped artifact is already there
+        FakeStep::complete(), // the one bounded re-prompt: still untyped
+        FakeStep::complete(), // the human's answer, delivered after it is retyped
+        FakeStep::complete(), // 10-second launch: completes the work
+    ]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "finish with untyped prose instead of a typed table",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    assert_eq!(
+        body["work"]["state"], "needs_input",
+        "a present-but-untyped artifact must be refused, not accepted: {body}"
+    );
+    let reprompts = events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING);
+    assert_eq!(
+        reprompts.len(),
+        1,
+        "exactly one bounded re-prompt: {reprompts:?}"
+    );
+    let parked = events_of(data.path(), &work_id, "work.needs_input");
+    assert_eq!(parked.len(), 1);
+    assert_eq!(
+        parked[0].payload["reason_code"], REASON_STAGE_OUTPUT_MISSING,
+        "the same named reason as an altogether-missing artifact: {parked:?}"
+    );
+    assert_eq!(parked[0].payload["path"], "ingest.md");
+    assert!(events_of(data.path(), &work_id, KIND_STAGE_COMPLETED).is_empty());
+
+    // Recoverable the same way: retype the artifact as a real table and
+    // answer — the gate then lets the run proceed.
+    std::fs::write(
+        worktree.join("00-first/output/ingest.md"),
+        "| id | axis |\n|---|---|\n| 1 | correctness |\n",
+    )
+    .expect("retype the artifact");
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "retyped it as a table"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    assert_eq!(
+        body["work"]["state"], "completed_dirty",
+        "a typed table now satisfies the gate: {body}"
     );
 
     handle.shutdown().await;

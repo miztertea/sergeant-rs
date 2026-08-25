@@ -52,6 +52,7 @@ use crate::domain::workflow::{
     KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
     REASON_STAGE_OUTPUT_MISSING, SOURCE_EMBEDDED, StageBinding, StageDefinition, StageKind,
     StageRecord, StageStatus, WorkflowDefinition, WorkflowError, declared_output_artifact,
+    declared_required_columns, has_required_table_columns,
 };
 use crate::runtime::preflight::{self, GitPreflight, PreflightRefusal};
 use crate::runtime::projection::{WorkRegistry, WorkRun, is_absorbing};
@@ -2715,13 +2716,25 @@ impl Engine {
         let Some(surface) = run.surface.as_ref() else {
             return Ok(None);
         };
+        // Amendment 10d: a stage may additionally declare the artifact's
+        // required table columns (`declared_required_columns`) — a typed
+        // set, not merely a file that exists. `produced` folds both checks
+        // into one boolean deliberately: a present-but-untyped artifact and
+        // an altogether-absent one get the identical bounded-re-prompt/
+        // needs_input treatment below, per Amendment 10d's own text
+        // ("malformed = stage_output_missing-class refusal").
+        let required_columns =
+            declared_required_columns(Path::new(&workflow.source), &stage.stage_id);
         let produced = surface.bindings.iter().any(|binding| {
-            binding
+            let path = binding
                 .worktree_path
                 .join(&stage.stage_id)
                 .join("output")
-                .join(&expected)
-                .is_file()
+                .join(&expected);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return false;
+            };
+            has_required_table_columns(&text, &required_columns)
         });
         if produced {
             return Ok(None);
