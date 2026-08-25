@@ -269,6 +269,17 @@ pub struct StageDefinition {
     /// backend cannot honour it (§17.5's preflight, `Engine::bind_stages`).
     #[serde(default)]
     pub requires_ask: bool,
+    /// Amendment 9 Q5 / #260 mechanism 3: this stage opts in to having the
+    /// engine's own commits-on-branch-since-base fact
+    /// ([`crate::runtime::surface::commits_on_branch_since_base`], the same
+    /// computation `stranded_completion` reads from a completed teardown)
+    /// injected into its `CONTEXT.md` when it is entered. `false` (the
+    /// default) is silent for every workflow that never declares it, the
+    /// same no-table-default posture `requires_ask` already has. The engine
+    /// still learns no output vocabulary — it shares a fact it already
+    /// computes, never a workflow's own disposition language.
+    #[serde(default)]
+    pub receives_branch_status: bool,
     /// The pinned container specification, present exactly when
     /// `kind == StageKind::Execute` (§12.3, §13.1). `None` for every actor
     /// stage — the same tagged-by-`kind` shape `harness`/`profile` already
@@ -609,6 +620,9 @@ struct StageTable {
     /// default every other tagged field already uses.
     #[serde(default)]
     requires_ask: bool,
+    /// Amendment 9 Q5 / #260 mechanism 3's opt-in declaration.
+    #[serde(default)]
+    receives_branch_status: bool,
     // --- execute-only (§12.3) ---
     #[serde(default)]
     image: Option<String>,
@@ -740,6 +754,7 @@ impl WorkflowDefinition {
                 harness: tag.harness,
                 profile: tag.profile,
                 requires_ask: tag.requires_ask,
+                receives_branch_status: tag.receives_branch_status,
                 execute: tag.execute,
             });
         }
@@ -789,6 +804,7 @@ impl WorkflowDefinition {
                 harness: tag.harness,
                 profile: tag.profile,
                 requires_ask: tag.requires_ask,
+                receives_branch_status: tag.receives_branch_status,
                 execute: tag.execute,
             });
         }
@@ -1326,6 +1342,7 @@ struct ResolvedStageTag {
     harness: Option<String>,
     profile: Option<String>,
     requires_ask: bool,
+    receives_branch_status: bool,
     execute: Option<ExecuteSpec>,
 }
 
@@ -1352,6 +1369,7 @@ fn resolve_stage_tag(
             harness: None,
             profile: None,
             requires_ask: false,
+            receives_branch_status: false,
             execute: None,
         });
     };
@@ -1401,6 +1419,7 @@ fn resolve_stage_tag(
                 harness: table.harness.clone(),
                 profile: table.profile.clone(),
                 requires_ask: table.requires_ask,
+                receives_branch_status: table.receives_branch_status,
                 execute: None,
             })
         }
@@ -1413,6 +1432,9 @@ fn resolve_stage_tag(
             }
             if table.requires_ask {
                 return Err(actor_field_on_execute("requires_ask"));
+            }
+            if table.receives_branch_status {
+                return Err(actor_field_on_execute("receives_branch_status"));
             }
             let missing = |field: &str| WorkflowError::MissingExecuteField {
                 path: path.to_string(),
@@ -1454,6 +1476,7 @@ fn resolve_stage_tag(
                 harness: None,
                 profile: None,
                 requires_ask: false,
+                receives_branch_status: false,
                 execute: Some(ExecuteSpec {
                     image,
                     command,
@@ -1481,6 +1504,10 @@ struct ContentIdentityStage<'a> {
     /// it is a different workflow for content-identity purposes, same as a
     /// changed `harness` or `profile` is.
     requires_ask: bool,
+    /// Amendment 9 Q5 / #260 mechanism 3's opt-in declaration is
+    /// execution-relevant for the same reason `requires_ask` is: flipping it
+    /// changes what gets injected into the stage's actual context.
+    receives_branch_status: bool,
     /// The pinned container spec (N4, §12.3): image, command, workdir,
     /// access and network policy, and env are all execution-relevant —
     /// changing any of them must change the hash the same way editing a
@@ -1515,6 +1542,7 @@ fn compute_content_hash(name: &str, version: &str, stages: &[StageDefinition]) -
                 profile: s.profile.as_deref(),
                 context: &s.context,
                 requires_ask: s.requires_ask,
+                receives_branch_status: s.receives_branch_status,
                 execute: s.execute.as_ref(),
             })
             .collect(),
@@ -2337,6 +2365,100 @@ mod tests {
         assert_ne!(
             workflow.content_hash, unrequired.content_hash,
             "requires_ask must be execution-relevant to the content-identity hash"
+        );
+    }
+
+    /// Amendment 9 Q5 / #260 mechanism 3: `receives_branch_status` parses to
+    /// `true` when declared and defaults `false` for every stage that never
+    /// mentions it — the same no-table-means-untagged shape `requires_ask`
+    /// already has, and it participates in the content-identity hash too.
+    #[test]
+    fn receives_branch_status_parses_true_and_defaults_false() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "closes");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"closes\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-open\", \"10-close\"]\n",
+                "\n",
+                "[stage.\"10-close\"]\n",
+                "receives_branch_status = true\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-open", "open context");
+        write_stage(&wf, "10-close", "close context");
+
+        let workflow = WorkflowDefinition::resolve(root, "closes").expect("resolve");
+        assert!(
+            !workflow.stages[0].receives_branch_status,
+            "untagged stage defaults false"
+        );
+        assert!(workflow.stages[1].receives_branch_status);
+
+        // Flipping the declaration is a different workflow (§22.3).
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"closes\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-open\", \"10-close\"]\n",
+            ),
+        )
+        .expect("descriptor");
+        let opted_out = WorkflowDefinition::resolve(root, "closes").expect("resolve");
+        assert_ne!(
+            workflow.content_hash, opted_out.content_hash,
+            "receives_branch_status must be execution-relevant to the content-identity hash"
+        );
+    }
+
+    /// §22.3's actor/execute field split applies to `receives_branch_status`
+    /// exactly as it does to `requires_ask`: an execute stage has no actor
+    /// turn to inject a fact into, so declaring it there is refused rather
+    /// than silently ignored.
+    #[test]
+    fn receives_branch_status_on_an_execute_stage_fails_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "bad-execute-fact");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"bad-execute-fact\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-run\"]\n",
+                "\n",
+                "[stage.\"00-run\"]\n",
+                "kind = \"execute\"\n",
+                "image = \"alpine\"\n",
+                "command = [\"true\"]\n",
+                "workdir = \"/work\"\n",
+                "workspace_access = \"read_only\"\n",
+                "network = \"none\"\n",
+                "receives_branch_status = true\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-run", "");
+
+        let err =
+            WorkflowDefinition::resolve(root, "bad-execute-fact").expect_err("must refuse");
+        assert!(
+            matches!(
+                &err,
+                WorkflowError::ActorFieldOnExecuteStage { field, .. }
+                    if field == "receives_branch_status"
+            ),
+            "expected a refusal naming receives_branch_status, got {err}"
         );
     }
 

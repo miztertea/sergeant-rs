@@ -3402,8 +3402,18 @@ impl Engine {
             cwd: surface.execution_cwd(),
             intent,
             // §12: procedure is data. The stage's CONTEXT.md is carried to
-            // the actor verbatim; sergeant never interprets it.
-            context: stage.context.clone(),
+            // the actor verbatim; sergeant never interprets it — except for
+            // Amendment 9 Q5 / #260 mechanism 3's opt-in wire, where a stage
+            // that declared `receives_branch_status = true` gets the
+            // engine's own commits-on-branch-since-base fact appended. The
+            // engine still shares no output vocabulary: this is a fact it
+            // already computes ([`WorkSurface::commits_since_base`]), not an
+            // interpretation of the stage's procedure.
+            context: if stage.receives_branch_status {
+                branch_status_context(&stage.context, &surface)
+            } else {
+                stage.context.clone()
+            },
             // §24.8: the profile carries the model, so the stage's profile
             // carries the stage's model. There is no per-stage model field.
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
@@ -4531,6 +4541,21 @@ fn handle_of(execution: &ExecutionRecord) -> ExecutionHandle {
         execution_id: execution.execution_id.clone(),
         native_id: execution.native_id.clone(),
     }
+}
+
+/// Amendment 9 Q5 / #260 mechanism 3: append the engine's own
+/// commits-on-branch-since-base fact ([`WorkSurface::commits_since_base`])
+/// to a stage's `CONTEXT.md`, for a stage that declared
+/// `receives_branch_status = true`. Appended rather than templated into the
+/// procedure text itself — the stage's authored content is untouched, and a
+/// reader can tell at a glance which part sergeant added.
+fn branch_status_context(context: &str, surface: &WorkSurface) -> String {
+    let count = surface.commits_since_base();
+    let commits_on_branch_since_base = if count > 0 { "yes" } else { "no" };
+    format!(
+        "{context}\n\n## Engine-computed branch status\n\n\
+         commits_on_branch_since_base: {commits_on_branch_since_base} ({count})\n"
+    )
 }
 
 #[cfg(test)]

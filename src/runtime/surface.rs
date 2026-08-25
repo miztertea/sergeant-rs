@@ -415,6 +415,34 @@ impl WorkSurface {
             })
             .collect()
     }
+
+    /// Amendment 9 Q5 / #260 mechanism 3: how many commits each binding's
+    /// worktree HEAD carries past its own `base_sha`, summed across bindings.
+    ///
+    /// The same underlying question [`TeardownReport::stranded_completion`]
+    /// answers from a completed teardown's `final_sha` — but the opt-in wire
+    /// injects this into a *closing stage's own context*, before that stage
+    /// has even run, so there is no `BindingTeardown` yet to read. This reads
+    /// the worktree live instead, one `git rev-list --count` per binding —
+    /// the same "ask the worktree, not the journal" posture [`observe_head`]
+    /// already takes for HEAD itself. A binding whose count git cannot answer
+    /// (a vanished worktree, an unreadable `base_sha`) contributes `0` rather
+    /// than failing the whole sum: the engine sharing "no commits observed"
+    /// is the fail-closed answer for a fact a workflow only ever reads
+    /// advisory, never gates on.
+    pub fn commits_since_base(&self) -> u64 {
+        self.bindings
+            .iter()
+            .filter_map(|b| {
+                git(
+                    &b.worktree_path,
+                    &["rev-list", "--count", &format!("{}..HEAD", b.base_sha)],
+                )
+                .ok()
+            })
+            .filter_map(|out| out.trim().parse::<u64>().ok())
+            .sum()
+    }
 }
 
 /// Where #109's captured dirty-state patch was written, and how large it

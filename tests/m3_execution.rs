@@ -3775,6 +3775,98 @@ async fn a_run_that_ends_on_the_wrong_branch_completes_dirty_and_keeps_both_bran
     handle.shutdown().await;
 }
 
+/// Amendment 9 Q5 / #260 mechanism 3: a stage that declares
+/// `receives_branch_status = true` gets the engine's own
+/// commits-on-branch-since-base fact appended to its `CONTEXT.md`; a stage
+/// that never declares it reaches the backend byte-for-byte unchanged (§12:
+/// procedure is data, except for this one named, opt-in exception).
+///
+/// `00-first` parks on `waiting` so the fixture can commit into the
+/// worktree before `10-second` — the one stage that opted in — is entered,
+/// making "yes (1)" the only honest fact the engine could report.
+#[tokio::test]
+async fn a_stage_that_opts_in_receives_the_branch_status_fact_others_do_not() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (_repo, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_workflow_with_tables(
+        &estate,
+        "tiny",
+        &[
+            ("00-first", "first stage context"),
+            ("10-second", "second stage context"),
+        ],
+        "\n[stage.\"10-second\"]\nreceives_branch_status = true\n",
+    );
+
+    let (registry, fake) = one_fake([
+        FakeStep::waiting("parks so the fixture can commit into the worktree"),
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "opt in to the branch status fact",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    // One real commit on the run's own branch, before the opted-in stage is
+    // ever entered.
+    std::fs::write(worktree.join("output.rs"), "fn main() {}\n").expect("write output");
+    git(&worktree, &["add", "."]);
+    git(&worktree, &["commit", "-m", "the fact 10-second should see"]);
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "retry rejected: {body}");
+    assert_eq!(body["work"]["state"], "completed", "{body}");
+
+    // Three executions consumed the three-step script: 00-first's parked
+    // attempt, its retried (completing) attempt, then 10-second.
+    let starts = fake.starts();
+    assert_eq!(starts.len(), 3, "{starts:?}");
+    assert_eq!(
+        starts[0].context, "first stage context",
+        "00-first never declared receives_branch_status: its context is untouched"
+    );
+    assert_eq!(
+        starts[1].context, "first stage context",
+        "the retried attempt is still 00-first — untouched either way"
+    );
+    assert_eq!(
+        starts[2].context,
+        "second stage context\n\n## Engine-computed branch status\n\n\
+         commits_on_branch_since_base: yes (1)\n",
+        "10-second opted in: the engine's own commit count is appended, not substituted"
+    );
+
+    handle.shutdown().await;
+}
+
 /// A multi-repository submission where a later repository cannot be
 /// materialized: the earlier ones already have a real branch and worktree in
 /// the user's own checkouts. Those are rolled back and the report is
