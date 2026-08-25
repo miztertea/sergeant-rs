@@ -249,6 +249,32 @@ fn embedded_skills_carry_the_real_root_and_preflight_remedies() {
     );
 }
 
+/// #232: a literal-reading actor that finished a correct fix retired
+/// `completed_dirty` because no shared closing-stage context ever told it
+/// to commit — the `BindingSummary` names `work_branch`, but nothing said
+/// to land the work there. `@@fix-confirmed` is the stage context that
+/// instructs an actor to *do* fix work (as opposed to `@@close` /
+/// `@@evidence-requirements`, which only report on fixes already made),
+/// so it is the one this test pins the commit imperative in.
+#[test]
+fn fix_confirmed_context_states_the_commit_imperative() {
+    let fix_confirmed =
+        std::fs::read_to_string(repo_root().join(".sergeant/common/contexts/fix-confirmed.md"))
+            .expect("read fix-confirmed.md");
+    assert!(
+        fix_confirmed.contains("git commit") && fix_confirmed.contains("git add"),
+        "fix-confirmed.md must literally instruct the actor to `git add`/`git commit` its \
+         fix — the gap #232 found, where a literal-reading actor finishes a correct fix and \
+         retires it uncommitted because nothing ever said to commit"
+    );
+    assert!(
+        fix_confirmed.contains("work_branch"),
+        "fix-confirmed.md's commit imperative must name `work_branch` — the field the \
+         BindingSummary already hands every actor — so the instruction says *where* to commit, \
+         not just that a commit must happen"
+    );
+}
+
 // -------------------------------------------------- 2. embedded distro skew
 
 /// No `CONTEXT.md` under the embedded `.sergeant/workflows/` distro source

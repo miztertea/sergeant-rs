@@ -27,6 +27,12 @@ Fix exactly what survived attack. Nothing else.
 - **Re-run the targeted validation** after the last fix commit and record
   the real output, so whatever attacks the fixes next starts from a known
   state.
+- **Commit the fix.** `git add` and `git commit` each fix on the binding's
+  own `work_branch` (the `BindingSummary` handed to this stage already
+  names it). A fix that is correct but never committed is not fixed —
+  nothing downstream (`@@re-verify`, `@@close`, `@@evidence-requirements`)
+  can find or verify work that was never landed. Do not stop at a
+  described or staged-but-uncommitted change.
 
 ## What this context contributes when loaded inside a stage
 
