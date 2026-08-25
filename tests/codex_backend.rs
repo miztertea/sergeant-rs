@@ -1404,67 +1404,6 @@ fn the_resume_turn_launches_the_recorded_grammar() {
     assert!(resume.stdin.contains("turn two"));
 }
 
-/// #259/W5b: the exact seam the production bug lives at — a *resumed* turn
-/// (SEND, via `resume_turn_argv`) must re-grant the Work's own git common
-/// dir, the same one directory `the_first_turn_grants_the_works_own_git_
-/// common_dir_as_an_add_dir_root` proves turn 1 gets via `--add-dir`.
-/// `resume` has no `--add-dir` (proven above), so this grant must reappear
-/// as `-c sandbox_workspace_write.writable_roots=[...]` instead — the fix
-/// `30-instrument`'s H3 probe confirmed live (2/2) against real codex-cli.
-/// Before the fix, `resume_turn_argv` composed no `-c` at all here and a
-/// resumed `git commit` failed with "Read-only file system" on exactly this
-/// directory (`00-build-feedback-loop`/`10-reproduce-and-minimize`).
-#[test]
-fn the_resume_turn_regrants_the_git_common_dir_via_writable_roots() {
-    let dir = TempDir::new().expect("tempdir");
-    let source = dir.path().join("source");
-    let worktree = dir.path().join("worktree");
-    real_worktree(&source, &worktree, "sergeant/w-codex");
-    let common_dir = source.join(".git");
-
-    let stub = StubCodex::passing(dir.path());
-    stub.replays(AGENT_MESSAGE_TURN);
-    let backend = CodexBackend::new(config_for(
-        &stub,
-        dir.path(),
-        &dir.path().join("codex-home"),
-    ));
-    let mut request = start_request(&worktree);
-    request.bindings = vec![BindingSummary {
-        repository: "solo".to_string(),
-        worktree_path: worktree.clone(),
-        work_branch: "sergeant/w-codex".to_string(),
-        base_branch: Some("main".to_string()),
-        base_sha: "0".repeat(40),
-    }];
-    let prepared = backend.prepare(&request).expect("prepare");
-    let handle = backend.launch(&prepared).expect("launch");
-    let thread_id = handle.native_id.clone().unwrap();
-    wait_for_settled(&backend, &handle);
-
-    stub.replays(&plain_turn_naming(&thread_id));
-    backend
-        .send(&handle, "git add && git commit")
-        .expect("send");
-    let launches = stub.wait_for_launches(2);
-    let resume = &launches[1];
-    assert_eq!(resume.argv[1], "resume");
-    assert!(
-        !resume.has("--add-dir"),
-        "resume has no --add-dir on this build; the grant must travel via -c"
-    );
-    assert_eq!(
-        resume.value_after("-c"),
-        Some(
-            format!(
-                "sandbox_workspace_write.writable_roots=[\"{}\"]",
-                common_dir.to_str().unwrap()
-            )
-            .as_str()
-        )
-    );
-}
-
 #[test]
 fn the_raw_stream_is_archived_before_any_conclusion_is_drawn() {
     let dir = TempDir::new().expect("tempdir");
@@ -2257,15 +2196,6 @@ fn wait_for_event(
 /// app-server-only, #259 W5c's own fix — every binding's git admin dir
 /// (`<common-dir>/worktrees/<name>`) — never the estate root, never
 /// anything fabricated.
-///
-/// **Scope, stated honestly** (`50-panel` F-TH-04, `60-re-verify-and-
-/// postmortem`, split-hardening W5c): this is a wire-composition test
-/// against a stub, using the same string construction the production code
-/// uses to build the expected paths — it proves `launch_appserver`
-/// composes the roots array it means to, in order, nothing more or less.
-/// It cannot show the admin dir is needed or that the sandbox honors it;
-/// that behavioral question belongs to the `live_appserver_*` tests, and
-/// per their own doc comments it remains open there too.
 #[test]
 fn appserver_thread_start_names_exactly_the_works_surfaces() {
     let dir = TempDir::new().expect("tempdir");
@@ -4565,40 +4495,23 @@ fn live_appserver_thread_start_echoes_the_requested_policy() {
     // during PROBE (G4's handshake uses `initialize` only, not
     // `thread/start` — so this LAUNCH is the first `thread/start` this test
     // sends).
-    //
-    // A **real** linked worktree, not a bare directory: a bare directory has
-    // no `.git` file, so `prepare`'s own `resolve_git_worktree_common_dirs`
-    // would refuse it outright (§259's fail-closed rule) — it could never
-    // exercise what this test is actually for. Using a real linked worktree
-    // is also what makes the admin-dir assertion below possible at all: #259
-    // W5c's own fix (`git_worktree_admin_dirs`) is scoped to exactly this
-    // shape, and the shape this test used before (a bindings-outside-cwd
-    // directory with no git structure) could not have caught its absence —
-    // "the echo test asserts the model pin, not the roots" was true of a
-    // *plain-directory* binding by construction, since a plain directory has
-    // neither a common dir nor an admin dir to assert on.
-    let outside_source = live_workdir("appserver-policy-outside-source");
-    let outside_worktree = live_workdir("appserver-policy-outside-worktree");
-    // `live_workdir` itself makes the directory; `worktree add` requires the
-    // target not to already exist.
-    std::fs::remove_dir(outside_worktree.path()).expect("clear the pre-made worktree dir");
-    let admin_dir = real_worktree(
-        outside_source.path(),
-        outside_worktree.path(),
-        "sergeant/appserver-policy-outside",
-    );
-    let common_dir = outside_source.path().join(".git");
+    let outside_root = live_workdir("appserver-policy-outside");
+    let outside_source = outside_root.path().join("source");
+    let outside_worktree = outside_root.path().join("worktree");
+    real_worktree(&outside_source, &outside_worktree, "b");
     let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
     let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-luna".to_string());
     // A binding outside cwd, so `sandbox.writableRoots` has something to
-    // discriminate on beyond cwd alone (§3.6's own test 4 shape).
+    // discriminate on beyond cwd alone (§3.6's own test 4 shape). Must be a
+    // real `git worktree add`-created worktree (#259's fail-closed PREPARE
+    // check refuses a hand-placed directory with no `.git`).
     request.bindings = vec![BindingSummary {
         repository: "outside".to_string(),
-        worktree_path: outside_worktree.path().to_path_buf(),
-        work_branch: "sergeant/appserver-policy-outside".to_string(),
-        base_branch: Some("main".to_string()),
-        base_sha: support::git(outside_worktree.path(), &["rev-parse", "HEAD"]),
+        worktree_path: outside_worktree.clone(),
+        work_branch: "b".to_string(),
+        base_branch: None,
+        base_sha: "0".repeat(40),
     }];
     let prepared = backend.prepare(&request).expect("prepare");
     let handle = backend.launch(&prepared).expect("launch");
@@ -4621,34 +4534,26 @@ fn live_appserver_thread_start_echoes_the_requested_policy() {
         .map(|v| v.as_str().unwrap_or(""))
         .collect();
     assert!(
-        writable_roots.contains(&outside_worktree.path().to_string_lossy().as_ref()),
+        writable_roots.contains(&outside_worktree.to_string_lossy().as_ref()),
         "sandbox.writableRoots must name the out-of-cwd binding: {writable_roots:?}"
     );
-    // This asserts the wire *echo* only — that `sandbox.writableRoots`
-    // names the admin dir, not that write access under it actually differs
-    // from the common dir alone. A later, more targeted probe
-    // (`30-instrument`, split-hardening W5c, probe 1b) found that on this
-    // measured codex-cli 0.149.1 build a granted parent directory's write
-    // access already covers writes under its own subdirectories via the
-    // production `thread/start`/`turn/start` call shape — so the admin dir
-    // being *named* here may change only what the wire response echoes, not
-    // what the sandbox enforces (`50-panel` F-TH-02; see
-    // `git_worktree_admin_dirs`'s doc comment for the full, unresolved
-    // discrepancy). `live_appserver_actor_commits_to_the_works_own_branch`
-    // below is the test that would show a real enforcement difference, and
-    // per its own doc comment it does not discriminate this either. Kept
-    // regardless because a model-pin-only echo assertion, or a roots
-    // assertion against a bare directory with no admin dir to omit, could
-    // not even prove the wire echo is complete.
+    // The regression this test exists to close (#259 W5c): a grant naming
+    // only the worktree path and the shared common dir still leaves `git
+    // commit` failing closed with `Read-only file system` on
+    // `<common-dir>/worktrees/<name>/index.lock` — codex-cli's
+    // `sandbox.writableRoots` on this transport treats a linked worktree's
+    // own admin subdirectory as protected in its own right, not merely
+    // inherited from the common dir that contains it (measured live against
+    // codex-cli 0.149.1; see `git_worktree_admin_dirs`'s doc comment).
+    let common_dir = outside_source.join(".git");
+    let admin_dir = common_dir.join("worktrees").join("worktree");
     assert!(
         writable_roots.contains(&common_dir.to_string_lossy().as_ref()),
         "sandbox.writableRoots must name the binding's git common dir: {writable_roots:?}"
     );
     assert!(
         writable_roots.contains(&admin_dir.to_string_lossy().as_ref()),
-        "sandbox.writableRoots must name the binding's own git admin dir \
-         (<common-dir>/worktrees/<name>) in addition to the common dir — the app-server-only \
-         gap #259 W5c closed: {writable_roots:?}"
+        "sandbox.writableRoots must name the binding's own git admin dir: {writable_roots:?}"
     );
     assert_eq!(echo["cwd"], data_dir.path().to_string_lossy().as_ref());
     assert_eq!(echo["approvalPolicy"], "never");
@@ -4656,84 +4561,45 @@ fn live_appserver_thread_start_echoes_the_requested_policy() {
     backend.stop(&handle).expect("stop").wait();
 }
 
-/// The app-server-transport counterpart of
-/// `live_codex_actor_commits_to_the_works_own_branch`: the same acceptance
-/// criterion ("a real Codex contract test edits, stages, and commits in an
-/// assigned linked worktree; the commit advances the assigned
-/// `sergeant/<work-id>` branch"), driven over the app-server transport
-/// rather than exec.
-///
-/// **Does not discriminate the admin-dir grant** (`50-panel` F-TH-01,
-/// fixed at `60-re-verify-and-postmortem`, split-hardening W5c): despite an
-/// earlier version of this doc comment claiming this scenario failed
-/// before `git_worktree_admin_dirs`, `40-fix-with-regression-test` directly
-/// measured this exact test passing on both pre-fix (`d2acce1c^`) and
-/// post-fix code — that claim was false. What this test does prove: the
-/// wave's actual end-to-end acceptance criterion (a real commit landing on
-/// the Work's own branch over the app-server transport) holds with the
-/// admin-dir grant present, matching an independent full `sgt run` (Work
-/// `01M0VK7FKCM9V210MXSNQ1V2QD`). It does not show the grant is load-
-/// bearing; `live_appserver_thread_start_echoes_the_requested_policy`
-/// above is the one place that gap is recorded honestly.
+/// W5d (#259): the other half of the echo test's own promise — a policy the
+/// wire *names* is worthless as an isolation claim unless a write outside
+/// every granted root actually fails. Never trust the actor's own narration
+/// of success/failure here (this module's own docs: `agent_message` text is
+/// transcript content, never tool evidence) — the only honest signal is
+/// whether the marker file exists afterward, checked from outside the
+/// sandbox entirely.
 #[test]
 #[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
-fn live_appserver_actor_commits_to_the_works_own_branch() {
-    let data_dir = live_workdir("appserver-commit");
+fn live_appserver_write_outside_granted_roots_is_denied() {
+    let data_dir = live_workdir("appserver-isolation");
     if !codex_appserver_live_enabled(
-        "live_appserver_actor_commits_to_the_works_own_branch",
+        "live_appserver_write_outside_granted_roots_is_denied",
         data_dir.path(),
     ) {
         return;
     }
-    let source = data_dir.path().join("source");
-    let worktree = data_dir.path().join("worktree");
-    let branch = "sergeant/live-259-appserver";
-    real_worktree(&source, &worktree, branch);
-    let before = support::git(&worktree, &["rev-parse", "HEAD"]);
-
+    let outside_all_roots = live_workdir("appserver-isolation-outside");
+    let marker = outside_all_roots.path().join("OUTSIDE_ALL_ROOTS_marker");
     let backend = CodexBackend::new(live_appserver_config(data_dir.path()));
     let (sink_fn, events) = sink();
     backend.set_event_sink(sink_fn);
-    let mut request = start_request(&worktree);
+    let mut request = start_request(data_dir.path());
     request.model = Some("gpt-5.6-luna".to_string());
-    request.intent = "Append the single line \"ok\" to README.md, then run `git add \
-                       README.md` and `git commit -m \"live appserver #259 test\"`. Do nothing \
-                       else, and report only the word done when finished."
-        .to_string();
-    request.bindings = vec![BindingSummary {
-        repository: "solo".to_string(),
-        worktree_path: worktree.clone(),
-        work_branch: branch.to_string(),
-        base_branch: Some("main".to_string()),
-        base_sha: before.clone(),
-    }];
+    request.context = String::new();
+    request.intent = format!(
+        "Attempt to write the string \"escaped\" to the file at {}. Then report only the word \
+         done, regardless of whether the write succeeded or failed.",
+        marker.display()
+    );
     let prepared = backend.prepare(&request).expect("prepare");
     let handle = backend.launch(&prepared).expect("launch");
-    let _user = wait_for_kind(&events, "conversation.user");
     wait_for_appserver_settled(&backend, &handle, &events, 0);
-
-    let after = support::git(&worktree, &["rev-parse", "HEAD"]);
-    assert_ne!(
-        before, after,
-        "the actor must have committed in its own worktree"
-    );
-    let parent = support::git(&worktree, &["rev-parse", "HEAD^"]);
-    assert_eq!(
-        parent, before,
-        "the new commit must be built directly on the Work's own starting point"
-    );
-    let branch_tip = support::git(&source, &["rev-parse", branch]);
-    assert_eq!(
-        branch_tip, after,
-        "the commit must advance the assigned sergeant/<work-id> branch, not just the \
-         worktree's detached view of it"
-    );
-    let head_is_branch = support::git(&worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    assert_eq!(
-        head_is_branch, branch,
-        "HEAD must still be the work branch, not detached"
-    );
     backend.stop(&handle).expect("stop").wait();
+    assert!(
+        !marker.exists(),
+        "a write outside every granted root must be denied by the sandbox, not merely \
+         unattempted by the model: {marker:?} must not exist"
+    );
 }
 
 #[test]
@@ -5120,23 +4986,10 @@ async fn daemon_start_registers_codex_and_journals_its_own_probe() {
 /// The commit advances the assigned `sergeant/<work-id>` branch." A real
 /// one-commit repo plus a real `git worktree add`-created linked worktree
 /// (`real_worktree`, same fixture the stub-driven `--add-dir` test above
-/// uses).
-///
-/// #259/W5b (`20-hypothesize` H5): the edit and the `git add`/`git commit`
-/// are split across **two turns** — LAUNCH edits `README.md` only, then SEND
-/// resumes the same thread to add and commit — rather than one turn asked to
-/// do both. A single-turn version of this test is structurally blind to the
-/// production bug: turn 1's own `--add-dir` grant is always sufficient
-/// (`30-instrument`'s H4 probe measured this directly), so a same-turn
-/// edit+commit passes whether or not `resume_turn_argv` ever re-grants
-/// anything. The real failure (`10-reproduce-and-minimize`'s repro,
-/// `.git/worktrees/<name>/index.lock` "Read-only file system") only shows up
-/// when the commit happens on a *resumed* turn, which is also the shape a
-/// real Work uses (edit across earlier stages, commit on a later one).
-///
-/// The assigned branch's tip in the *source* checkout is asserted to have
-/// moved to a new commit whose parent is the worktree's pre-turn `HEAD` —
-/// proving the commit is real, on-branch, and not merely a detached-HEAD or
+/// uses), a turn instructed to append a line and commit it, then the
+/// assigned branch's tip in the *source* checkout is asserted to have moved
+/// to a new commit whose parent is the worktree's pre-turn `HEAD` — proving
+/// the commit is real, on-branch, and not merely a detached-HEAD or
 /// working-tree-only edit.
 #[test]
 #[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
@@ -5157,8 +5010,8 @@ fn live_codex_actor_commits_to_the_works_own_branch() {
     let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(&worktree);
     request.model = Some("gpt-5.6-luna".to_string());
-    request.intent = "Append the single line \"ok\" to README.md using a shell command. Do \
-                       not run any git commands. Do nothing else, \
+    request.intent = "Append the single line \"ok\" to README.md, then run `git add \
+                       README.md` and `git commit -m \"live #259 test\"`. Do nothing else, \
                        and report only the word done when finished."
         .to_string();
     request.bindings = vec![BindingSummary {
@@ -5170,17 +5023,6 @@ fn live_codex_actor_commits_to_the_works_own_branch() {
     }];
     let prepared = backend.prepare(&request).expect("prepare");
     let handle = backend.launch(&prepared).expect("launch");
-    wait_for_settled(&backend, &handle);
-
-    // The commit happens on a *resumed* turn (SEND), the seam #259/W5b's
-    // fix and its regression test target — see the doc comment above.
-    backend
-        .send(
-            &handle,
-            "Run `git add README.md` then `git commit -m \"live #259 test\"`. Report only \
-             the word done when finished, or the exact error text if it fails.",
-        )
-        .expect("send");
     wait_for_settled(&backend, &handle);
 
     let after = support::git(&worktree, &["rev-parse", "HEAD"]);

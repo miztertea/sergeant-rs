@@ -853,12 +853,9 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         // second function under the spec's literal name. Naming the real
         // function here keeps this citation resolvable.
         admission_test: "first_turn_argv_carries_the_measured_shape",
-        note: "turn-1 grants --add-dir directly; exec resume has neither -s nor --add-dir on \
-               this build, but #259/W5b re-composes --add-dir's writable-roots effect via \
-               `-c sandbox_workspace_write.writable_roots` on resume, so only -s/network_access \
-               remains turn-1-only -- the composed-flags handshake is proven, enforcement itself \
-               is not (bwrap cannot initialize a network namespace on Cerberus, H0 §C.3 finding \
-               4)",
+        note: "turn-1-only: exec resume has neither -s nor --add-dir on this build -- the \
+               composed-flags handshake is proven, enforcement itself is not (bwrap cannot \
+               initialize a network namespace on Cerberus, H0 §C.3 finding 4)",
     },
     AdmissionRow {
         capability: "sandbox_enforcement",
@@ -1062,15 +1059,13 @@ struct LaunchConfig {
 /// <value>] [--add-dir <path> ...]`. Prompt travels on stdin, no positional
 /// argument — see the module docs for why.
 ///
-/// `sandbox`/`network_access` are **turn-1-only** — `exec resume` has
-/// neither `-s`/`--sandbox` nor `-C`/`--add-dir` on this build
-/// (`resume_turn_argv` below), so those two lapse on turn 2 of an
-/// exec-transport conversation. `extra_dirs` is different: #259/W5b
-/// found `resume` *does* accept `-c key=value` (measured live against
-/// codex-cli 0.149.1's own `--help`, correcting an earlier "nor `-c`"
-/// claim here), and `sandbox_workspace_write.writable_roots` mirrors what
-/// `--add-dir` grants on turn 1 — so `resume_turn_argv` recomposes the
-/// same directories via that override instead of dropping them.
+/// `sandbox`/`extra_dirs`/`network_access` are **turn-1-only** — `exec
+/// resume` has neither `-s`/`--add-dir` nor `-c` on this build
+/// (`resume_turn_argv` below), so enforcement lapses on turn 2 of an
+/// exec-transport conversation. That asymmetry is recorded, not routed
+/// around (W3 spec §3.2): a first turn is where a Work does most of its
+/// damage, and it is itself an argument for app-server as the resolved
+/// transport, where the policy is thread-scoped and holds for every turn.
 fn first_turn_argv(
     cwd: &Path,
     model: Option<&str>,
@@ -1120,35 +1115,22 @@ fn first_turn_argv(
 }
 
 /// Turn N >= 2's argv, after `<executable>` (spec §3.2): `exec resume
-/// <thread_id> --json --skip-git-repo-check [-m <model>] [-c
-/// sandbox_workspace_write.writable_roots=[...]]`. The thread id sits
+/// <thread_id> --json --skip-git-repo-check [-m <model>]`. The thread id sits
 /// immediately after `resume`, before any flag — what makes §5.4's liveness
 /// rule an adjacency check rather than a substring search. `-C` is never
 /// passed here: `exec resume` has no such flag on this build
 /// [measured-negative]; `Command::current_dir` is the only mechanism left,
 /// and is set on every spawn regardless of turn number.
 ///
-/// `output_schema_path` **does** re-apply here, unlike `sandbox`/`-C` above:
-/// `exec resume --help` on 0.149.0 lists `--output-schema` (and
+/// `output_schema_path` **does** re-apply here, unlike `sandbox`/`extra_dirs`
+/// above: `exec resume --help` on 0.149.0 lists `--output-schema` (and
 /// `-o`/`--output-last-message`) — re-measured while implementing W3, and a
 /// correction to W1's own "verify at implementation time" placeholder
 /// (spec §4.2). So `structured_output`'s exec row is **not** turn-1-only.
-///
-/// `extra_dirs` (#259/W5b): the same paths `first_turn_argv` grants via
-/// `--add-dir` — `bindings_outside_cwd` plus each binding's
-/// `worktree_git_common_dir` — re-granted here as a single `-c
-/// sandbox_workspace_write.writable_roots=["<dir>", ...]` override, since
-/// `resume` has no `--add-dir` of its own. Measured live (W5b `30-instrument`
-/// probe, codex-cli 0.149.1, 2/2 runs): a resumed turn's `git commit`, which
-/// fails identically to the unmodified baseline's "Read-only file system" on
-/// the worktree's git common dir, succeeds once this override carries that
-/// directory. Omitted entirely when `extra_dirs` is empty, so a
-/// non-mutation-shaped resume (no bindings) composes no `-c` at all.
 fn resume_turn_argv(
     thread_id: &str,
     model: Option<&str>,
     output_schema_path: Option<&Path>,
-    extra_dirs: &[PathBuf],
 ) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
@@ -1164,15 +1146,6 @@ fn resume_turn_argv(
     if let Some(path) = output_schema_path {
         argv.push("--output-schema".to_string());
         argv.push(path.to_string_lossy().into_owned());
-    }
-    if !extra_dirs.is_empty() {
-        let roots = extra_dirs
-            .iter()
-            .map(|dir| format!("\"{}\"", dir.to_string_lossy()))
-            .collect::<Vec<_>>()
-            .join(",");
-        argv.push("-c".to_string());
-        argv.push(format!("sandbox_workspace_write.writable_roots=[{roots}]"));
     }
     argv
 }
@@ -1346,22 +1319,15 @@ fn worktree_git_common_dir(worktree_path: &Path) -> Result<PathBuf, String> {
     Ok(lexically_normalize(&admin_dir.join(relative)))
 }
 
-/// Shared shape behind [`git_worktree_common_dirs`] and
-/// [`git_worktree_admin_dirs`]: run `resolve_one` over every binding this
-/// request carries, `Err` on the first binding whose directory cannot be
-/// resolved — the caller (`prepare`/`launch`) turns that into a refusal
-/// rather than launching an actor that can edit files but cannot commit
-/// them. (Collapses what were two structurally identical free functions —
-/// `50-panel` F-SI-01, fixed at `60-re-verify-and-postmortem`, split-
-/// hardening W5c.)
-fn git_worktree_dirs(
-    bindings: &[BindingSummary],
-    resolve_one: fn(&Path) -> Result<PathBuf, String>,
-) -> Result<Vec<PathBuf>, String> {
+/// [`worktree_git_common_dir`] over every binding this request carries.
+/// `Err` on the first binding whose common directory cannot be resolved —
+/// the caller (`prepare`/`launch`) turns that into a refusal rather than
+/// launching an actor that can edit files but cannot commit them.
+fn git_worktree_common_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, String> {
     bindings
         .iter()
         .map(|binding| {
-            resolve_one(&binding.worktree_path).map_err(|reason| {
+            worktree_git_common_dir(&binding.worktree_path).map_err(|reason| {
                 format!(
                     "{} ({}): {reason}",
                     binding.repository,
@@ -1372,56 +1338,42 @@ fn git_worktree_dirs(
         .collect()
 }
 
-/// [`worktree_git_common_dir`] over every binding this request carries.
-fn git_worktree_common_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, String> {
-    git_worktree_dirs(bindings, worktree_git_common_dir)
-}
-
 /// [`worktree_git_admin_dir`] over every binding this request carries —
 /// the app-server-only companion to [`git_worktree_common_dirs`].
 ///
-/// **Provenance, and an unresolved discrepancy recorded honestly
-/// (`60-re-verify-and-postmortem`, split-hardening W5c, 2026-08-25).** This
-/// grant was added in `d2acce1c` on the strength of a manual probe driven
-/// over `command/exec` — a JSON-RPC method `launch_appserver`/
-/// `appserver_send_turn` never call; the production path is `thread/start`
-/// then `turn/start` — plus an end-to-end `sgt run` against a scratch
-/// estate that blocked on the admin dir's `index.lock` without this grant.
-/// A later, more targeted probe (`30-instrument`, same date, probe 1b)
-/// drove the *exact* production call shape (`thread/start` with
-/// `runtimeWorkspaceRoots`, then a `turn/start` carrying no
-/// `sandboxPolicy` at all — today's literal code) against a real linked
-/// worktree and found `git add`/`git commit` succeed with the common dir
-/// alone, no admin dir, no denial at any step — contradicting the claim
-/// above. Neither measurement was reconciled against the other before
-/// `d2acce1c` merged.
-///
-/// This grant is kept regardless, on narrower grounds than the original
-/// claim: it is measured harmless (it does not break anything, and it
-/// makes `thread/start`'s echoed policy more complete), and a full live
-/// `sgt run` Work on today's code — carrying this grant — independently
-/// retired `completed` end to end (Work `01M0VK7FKCM9V210MXSNQ1V2QD`,
-/// 2026-08-25), which is this wave's actual acceptance criterion.
-/// Whether the grant is *necessary* on the `thread/start`/`turn/start`
-/// path is still open — removing it on this evidence alone would be a
-/// scope change this stage does not make. Reconciling the `command/exec`-
-/// vs-`turn/start` discrepancy, and removing this grant if it proves
-/// redundant with the common dir, is recommended to Captain as a follow-up
-/// investigation, not undertaken here.
+/// **Measured 2026-08-25 against codex-cli 0.149.1's `app-server`**: unlike
+/// `exec`'s `--add-dir` (whose grant of the common dir alone already covers
+/// `git add`/`git commit`), `thread/start.runtimeWorkspaceRoots` resolves
+/// into a `sandbox.writableRoots` grant that treats each linked worktree's
+/// private admin subdirectory (`<common-dir>/worktrees/<name>`) as protected
+/// in its own right, not merely inherited from a parent directory's grant.
+/// Reproduced end-to-end through a real Work (`sgt run` against a scratch
+/// estate on the `codex-terra` profile, app-server transport): `git commit`
+/// fails closed with `Read-only file system` on this exact admin
+/// subdirectory's `index.lock` even though the common dir that contains it
+/// was granted. Granting this directory *in addition to* the common dir —
+/// both, not either — resolves it; that combination is what this function
+/// adds to `launch_appserver`'s `runtimeWorkspaceRoots`, on top of (never
+/// instead of) [`git_worktree_common_dirs`].
 fn git_worktree_admin_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, String> {
-    git_worktree_dirs(bindings, worktree_git_admin_dir)
+    bindings
+        .iter()
+        .map(|binding| {
+            worktree_git_admin_dir(&binding.worktree_path).map_err(|reason| {
+                format!(
+                    "{} ({}): {reason}",
+                    binding.repository,
+                    binding.worktree_path.display()
+                )
+            })
+        })
+        .collect()
 }
 
 /// The named, actionable refusal text for #259's fail-closed rule: a
-/// mutation-shaped launch (one or more bindings) whose git directory grant
+/// mutation-shaped launch (one or more bindings) whose git common-dir grant
 /// cannot be resolved is refused rather than admitted to run and later
 /// retire `completed_dirty` with no durable commit.
-///
-/// `kind` names which grant failed (`"common"` or `"admin"`) so the
-/// message identifies the actual resolver that errored rather than always
-/// attributing it to the common-dir grant — before `60-re-verify-and-
-/// postmortem` (split-hardening W5c) this text was hardcoded to "common
-/// directory" and misreported admin-dir failures (`50-panel` F-IN-01).
 ///
 /// Ends in a remedy sentence naming what the operator should actually do
 /// about it — `src/runtime/preflight.rs`'s `PreflightCheck::remedy` and
@@ -1432,9 +1384,9 @@ fn git_worktree_admin_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, 
 /// `runtime::surface` actually created (its `.git` file is missing, or does
 /// not name a `gitdir`) — so one remedy sentence covers every case, rather
 /// than inventing a different one per parse failure.
-fn git_dir_refusal(kind: &str, reason: &str) -> String {
+fn git_admin_dir_refusal(reason: &str) -> String {
     format!(
-        "cannot grant this Work's git {kind} directory ({reason}); a codex actor needs write \
+        "cannot grant this Work's git common directory ({reason}); a codex actor needs write \
          access to its own worktree's shared git directory to `git add`/`git commit` (sergeant \
          issue #259) — refusing rather than admitting a Work that can edit files but can never \
          commit them. Remedy: this worktree path was not created by a real `git worktree add` \
@@ -3327,33 +3279,18 @@ impl CodexBackend {
         }
     }
 
-    /// Shared shape behind [`Self::resolve_git_worktree_common_dirs`] and
-    /// [`Self::resolve_git_worktree_admin_dirs`]: resolve every binding's
-    /// git directory via `resolver`, or refuse with the named, actionable
-    /// error naming which grant (`kind`) failed. Shared by every call site
-    /// that needs a grant for real (PREPARE's own preflight, and each
-    /// transport's LAUNCH) — RESUME does not call either (see their own
-    /// comments): the grant is provably inert there, so resolving it would
-    /// add a fail-closed check with no corresponding capability it
-    /// protects. (Collapses two structurally identical methods — `50-panel`
-    /// F-SI-02, fixed at `60-re-verify-and-postmortem`, split-hardening
-    /// W5c.)
-    fn resolve_git_dirs(
-        &self,
-        bindings: &[BindingSummary],
-        kind: &str,
-        resolver: fn(&[BindingSummary]) -> Result<Vec<PathBuf>, String>,
-    ) -> Result<Vec<PathBuf>, BackendError> {
-        resolver(bindings).map_err(|reason| self.err_failed(git_dir_refusal(kind, &reason)))
-    }
-
-    /// #259: resolve each binding's git common dir, or refuse with the
-    /// named, actionable error.
+    /// #259: resolve each binding's git common dir, or refuse with the named,
+    /// actionable error. Shared by every call site that needs the grant for
+    /// real (PREPARE's own preflight, and each transport's LAUNCH) — RESUME
+    /// does not call this (see its own comment): the grant is provably inert
+    /// there, so resolving it would add a fail-closed check with no
+    /// corresponding capability it protects.
     fn resolve_git_worktree_common_dirs(
         &self,
         bindings: &[BindingSummary],
     ) -> Result<Vec<PathBuf>, BackendError> {
-        self.resolve_git_dirs(bindings, "common", git_worktree_common_dirs)
+        git_worktree_common_dirs(bindings)
+            .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))
     }
 
     /// The app-server-only companion to [`Self::resolve_git_worktree_common_dirs`]
@@ -3363,7 +3300,8 @@ impl CodexBackend {
         &self,
         bindings: &[BindingSummary],
     ) -> Result<Vec<PathBuf>, BackendError> {
-        self.resolve_git_dirs(bindings, "admin", git_worktree_admin_dirs)
+        git_worktree_admin_dirs(bindings)
+            .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))
     }
 
     fn err_unknown(&self, execution_id: &str) -> BackendError {
@@ -3555,10 +3493,10 @@ impl CodexBackend {
         };
 
         let output_schema_path = self.output_schema_path();
-        let mut extra_dirs = bindings_outside_cwd.clone();
-        extra_dirs.extend(git_worktree_common_dirs.iter().cloned());
         let mut command = Command::new(&executable);
         if first_turn {
+            let mut extra_dirs = bindings_outside_cwd.clone();
+            extra_dirs.extend(git_worktree_common_dirs.iter().cloned());
             command.args(first_turn_argv(
                 &cwd,
                 model.as_deref(),
@@ -3575,7 +3513,6 @@ impl CodexBackend {
                 &thread_id,
                 model.as_deref(),
                 output_schema_path,
-                &extra_dirs,
             ));
         }
         command
@@ -3797,8 +3734,9 @@ impl CodexBackend {
         // #259, mirrored from `launch_exec` — resolved fresh here rather
         // than trusted from PREPARE.
         let git_worktree_common_dirs = self.resolve_git_worktree_common_dirs(&request.bindings)?;
-        // #259 (W5c fix): app-server-only, on top of the common dir above —
-        // see `git_worktree_admin_dirs` for the measurement that shows the
+        // #259 (W5c fix, live-reproduced 2026-08-25 on this branch): app-
+        // server-only, on top of the common dir above — see
+        // `git_worktree_admin_dirs` for the measurement that shows the
         // common dir alone is not enough on this transport.
         let git_worktree_admin_dirs = self.resolve_git_worktree_admin_dirs(&request.bindings)?;
         let budgets = self.config.appserver_budgets.unwrap_or_default();
@@ -5281,7 +5219,6 @@ mod tests {
             "thread-y",
             None,
             Some(Path::new("/data/codex-output-schema.json")),
-            &[],
         );
         assert_eq!(
             resume_with_schema.last().unwrap(),
@@ -5316,7 +5253,7 @@ mod tests {
 
     #[test]
     fn resume_turn_argv_omits_cd_and_places_the_thread_id_right_after_resume() {
-        let argv = resume_turn_argv("01a02508-5880-7980-95b7-1d8bc22d5139", None, None, &[]);
+        let argv = resume_turn_argv("01a02508-5880-7980-95b7-1d8bc22d5139", None, None);
         assert_eq!(
             argv,
             vec![
@@ -5334,7 +5271,7 @@ mod tests {
         let resume_idx = argv.iter().position(|a| a == "resume").unwrap();
         assert_eq!(argv[resume_idx + 1], "01a02508-5880-7980-95b7-1d8bc22d5139");
 
-        let pinned = resume_turn_argv("thread-x", Some("gpt-5.6-luna"), None, &[]);
+        let pinned = resume_turn_argv("thread-x", Some("gpt-5.6-luna"), None);
         assert!(pinned.contains(&"-m".to_string()));
         assert_eq!(pinned.last().unwrap(), "gpt-5.6-luna");
 
@@ -5354,37 +5291,6 @@ mod tests {
                 "{absent} must never appear on resume"
             );
         }
-        assert!(
-            !argv.contains(&"-c".to_string()),
-            "no -c override when extra_dirs is empty"
-        );
-    }
-
-    /// #259/W5b: `resume` has no `--add-dir`, but it does accept `-c
-    /// key=value` (measured live, `30-instrument`'s H3 probe) — the same
-    /// git-common-dir grant `first_turn_argv` sends via `--add-dir` must
-    /// reappear here as `sandbox_workspace_write.writable_roots`, or a
-    /// resumed turn's `git commit` hits the exact "Read-only file system"
-    /// symptom #259 was filed about.
-    #[test]
-    fn resume_turn_argv_regrants_extra_dirs_via_writable_roots() {
-        let argv = resume_turn_argv(
-            "thread-z",
-            None,
-            None,
-            &[
-                PathBuf::from("/estate/repos/solo/.git"),
-                PathBuf::from("/other/outside"),
-            ],
-        );
-        let c_idx = argv
-            .iter()
-            .position(|a| a == "-c")
-            .expect("-c must be present when extra_dirs is non-empty");
-        assert_eq!(
-            argv[c_idx + 1],
-            "sandbox_workspace_write.writable_roots=[\"/estate/repos/solo/.git\",\"/other/outside\"]"
-        );
     }
 
     // ------------------------------------------------------------ §3.4 prompt
