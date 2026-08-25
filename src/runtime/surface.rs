@@ -1969,7 +1969,7 @@ fn copy_declared_output_artifacts_at(
     bytes
 }
 
-/// #260 Q4 / Amendment 9's general finalize sweep, `docs/icm/convention.md`
+/// #260 Q4 / Amendment 9's general finalize sweep, the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md)
 /// §1a's "merge-back semantics": run once per binding at Work close,
 /// **before** [`teardown`]'s own dirty check, so a promote-class deliverable
 /// ships in the branch's history and an evidence-class `output/` never does.

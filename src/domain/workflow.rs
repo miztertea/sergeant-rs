@@ -1055,7 +1055,7 @@ fn root_catalog_names(text: &str) -> Vec<String> {
 }
 
 /// #260 Q3: read one stage's declared output artifact — the filename
-/// `docs/icm/convention.md` Rule 4's `**Expected artifact:** `<file>` —
+/// the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) Rule 4's `**Expected artifact:** `<file>` —
 /// description.` line names, out of its authored `output/README.md`.
 ///
 /// `None` when the stage's package directory has no `output/README.md`, or
@@ -1162,7 +1162,7 @@ pub(crate) fn has_required_table_columns(text: &str, required: &[String]) -> boo
 }
 
 /// #260 Q4 / Amendment 9's general finalize sweep: a stage's declared
-/// `**Disposition:**` (`docs/icm/convention.md` §1a's "merge-back
+/// `**Disposition:**` (the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) §1a's "merge-back
 /// semantics") — `promote` survives the sweep into the Work branch's
 /// shipped history, `evidence` is retained as Work evidence and removed
 /// from the worktree in the finalize commit.
@@ -1600,12 +1600,12 @@ mod tests {
     use super::*;
 
     /// #260 Q3: every shipped `output/README.md` uses this exact shape
-    /// (`docs/icm/convention.md` Rule 4) — the line the hard gate's parser
+    /// (the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) Rule 4) — the line the hard gate's parser
     /// must actually recognize.
     #[test]
     fn declared_output_artifact_parses_the_shipped_readme_shape() {
         let readme = "# Output — `10-implement`\n\n\
-             Layer 4 (per-run artifact), per `docs/icm/convention.md` §1a.\n\n\
+             Layer 4 (per-run artifact), per the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) §1a.\n\n\
              **Expected artifact:** `implementation.md` — the commits produced.\n\n\
              **Disposition:** `evidence`\n";
         assert_eq!(
