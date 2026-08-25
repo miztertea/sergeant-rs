@@ -1655,7 +1655,10 @@ async fn the_finalize_sweep_removes_evidence_class_output_and_keeps_promote_clas
     assert_eq!(
         git(
             &mount,
-            &["show", &format!("{branch}:10-promote/output/deliverable.md")]
+            &[
+                "show",
+                &format!("{branch}:10-promote/output/deliverable.md")
+            ]
         ),
         "the actual deliverable"
     );
@@ -3956,7 +3959,10 @@ async fn a_stage_that_opts_in_receives_the_branch_status_fact_others_do_not() {
     // ever entered.
     std::fs::write(worktree.join("output.rs"), "fn main() {}\n").expect("write output");
     git(&worktree, &["add", "."]);
-    git(&worktree, &["commit", "-m", "the fact 10-second should see"]);
+    git(
+        &worktree,
+        &["commit", "-m", "the fact 10-second should see"],
+    );
 
     let (status, body) = post(
         &client,

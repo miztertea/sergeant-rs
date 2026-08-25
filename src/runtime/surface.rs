@@ -1954,7 +1954,10 @@ fn copy_declared_output_artifacts_at(
 /// before removal was attempted, and the ordinary teardown that runs
 /// immediately after still inspects the worktree fresh and still fails
 /// closed on whatever it actually finds.
-pub fn finalize_sweep(binding: &RepositoryBinding, workflow_source: Option<&Path>) -> FinalizeSweepReport {
+pub fn finalize_sweep(
+    binding: &RepositoryBinding,
+    workflow_source: Option<&Path>,
+) -> FinalizeSweepReport {
     let mut report = FinalizeSweepReport::default();
     let Some(workflow_source) = workflow_source else {
         return report;

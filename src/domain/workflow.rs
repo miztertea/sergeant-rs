@@ -2548,8 +2548,7 @@ mod tests {
         .expect("descriptor");
         write_stage(&wf, "00-run", "");
 
-        let err =
-            WorkflowDefinition::resolve(root, "bad-execute-fact").expect_err("must refuse");
+        let err = WorkflowDefinition::resolve(root, "bad-execute-fact").expect_err("must refuse");
         assert!(
             matches!(
                 &err,
