@@ -1403,6 +1403,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // have a reachable Docker Engine (N4.md's own probe-gating rule for
     // Docker facts on the GH runner / cloud container).
     let docker = stub_docker(bin.path());
+    // W4c: same treatment for `host_service_manager` — this test's "every
+    // check must be ok" assertion must not depend on whether *this host*
+    // happens to have a reachable native service manager either.
+    let service_manager = stub_service_manager(bin.path());
     // Same treatment for the `environment` check's own `$HOME`: a fixture
     // dir with neither `.cargo/bin` nor `.local/bin` on disk, so it reads a
     // deterministic "ok" regardless of what toolchain directories the
@@ -1435,6 +1439,8 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         &[
             ("SGT_CLAUDE_BIN", &claude),
             ("SGT_DOCKER_BIN", &docker),
+            ("SGT_SYSTEMCTL_BIN", &service_manager),
+            ("SGT_LAUNCHCTL_BIN", &service_manager),
             ("HOME", &home),
         ],
         false,
@@ -1446,6 +1452,8 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         &[
             ("SGT_CLAUDE_BIN", &claude),
             ("SGT_DOCKER_BIN", &docker),
+            ("SGT_SYSTEMCTL_BIN", &service_manager),
+            ("SGT_LAUNCHCTL_BIN", &service_manager),
             ("HOME", &home),
         ],
         true,
@@ -1481,6 +1489,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             "journal",
             "projection",
             "daemon",
+            // H1 §2/#276, W4c: is a native per-user service manager
+            // reachable at all — a distinct question from `daemon`'s own
+            // per-data-dir descriptor health above.
+            "host_service_manager",
             // Estate-root §4.2/§4.4: is the directory this `sgt doctor` was
             // run from an estate root at all? It is the row the three
             // beneath it read their answer from — a single admission,
@@ -1488,6 +1500,12 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // three independent searches — which is also why it sits
             // immediately above them rather than beside `estate`.
             "estate_root",
+            // H1 §6, W4c: the cutover gate — daemon.lock/runtime.json/
+            // journal/ still present under this estate's own
+            // `.sergeant/data` from before a host runtime root existed.
+            // Threaded off `estate_root` the same way `permission_mode`
+            // below it is.
+            "legacy_estate_runtime",
             "permission_mode",
             // #262: the per-profile `network_access` override, right beside
             // `permission_mode` — same estate-root threading, same
@@ -4911,6 +4929,17 @@ fn stub_claude(dir: &Path) -> String {
              --help) echo '{flags}';;\n  *) cat >/dev/null;;\nesac\n"
         ),
     )
+}
+
+/// A stand-in `systemctl`/`launchctl` that always reports success — same
+/// reasoning as `stub_docker`/`stub_claude`: `host_service_manager`'s
+/// "every check must be green on a healthy install" assertion below must
+/// not depend on whether *this host* happens to have a reachable native
+/// service manager (W4c, following TH-02's own probe-gating precedent).
+/// Wired in through `SGT_SYSTEMCTL_BIN`/`SGT_LAUNCHCTL_BIN`
+/// (`platform::service`'s injection points, the `SGT_GIT_BIN` precedent).
+fn stub_service_manager(dir: &Path) -> String {
+    write_script(dir, "service-manager-stub", "#!/bin/sh\nexit 0\n")
 }
 
 /// A stand-in `docker` that passes both `DockerBackend::probe`'s cheap
