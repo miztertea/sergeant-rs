@@ -2653,6 +2653,7 @@ pub(crate) mod doctor {
         let (estate_root_check, admitted) = estate_root_check(root);
         checks.push(estate_root_check);
         checks.push(permission_mode_check(admitted.as_deref()));
+        checks.push(network_access_check(admitted.as_deref()));
         checks.push(estate_check(admitted.as_deref()));
         checks.push(workflows_check(admitted.as_deref()));
         // §12.2: cheap, bounded — journal plus retained-artifact filesystem
@@ -2764,11 +2765,32 @@ pub(crate) mod doctor {
                     .map(|p| {
                         // Already validated at load (#47): from_config would
                         // have refused the estate before this ran.
-                        let effective = match p.permission_mode().ok().flatten() {
-                            Some(mode) => mode.as_cli_value().to_string(),
-                            None => "unspecified -> no flag (CLI default)".to_string(),
-                        };
-                        format!("{}={effective}", p.name)
+                        let configured = p.permission_mode().ok().flatten();
+                        match configured {
+                            None => {
+                                format!("{}=unspecified -> no flag (CLI default)", p.name)
+                            }
+                            Some(mode) if backend_consumes_permission_mode(&p.backend) => {
+                                format!("{}={}", p.name, mode.as_cli_value())
+                            }
+                            // #262: a configured mode whose backend never
+                            // reads it must not be rendered as if it took
+                            // effect — `sgt doctor` reported this profile
+                            // "healthy" purely from the string in
+                            // sergeant.toml, never from anything the adapter
+                            // actually does with it. Deliberately never
+                            // written as `name=mode` here (even indirectly
+                            // via string interpolation): that shape is the
+                            // one that reads as "in effect" and is reserved
+                            // for the branch above.
+                            Some(mode) => format!(
+                                "{}=<configured: {}, but the {:?} backend does not read \
+                                 permission_mode -> no effect>",
+                                p.name,
+                                mode.as_cli_value(),
+                                p.backend
+                            ),
+                        }
                     })
                     .collect();
                 Check::ok("permission_mode", modes.join(", "))
@@ -2779,6 +2801,81 @@ pub(crate) mod doctor {
                 "fix sergeant.toml at the location the error names",
             ),
         }
+    }
+
+    /// Whether the named backend's adapter reads `Profile::permission_mode()`
+    /// at launch. Only `claude.rs`'s `launch_config` does today
+    /// (`backend/claude.rs`'s own module docs, "Permission mode is profile
+    /// configuration (#47)"); `codex.rs` never reads the option at all (#262
+    /// — its own launch grammar has no `--permission-mode` equivalent, and
+    /// `SandboxChoice`/the workspace-write network knob are what govern its
+    /// actor's capability instead). Kept here, matched on each adapter's own
+    /// `_BACKEND_NAME` constant, rather than as a new `Backend` trait method:
+    /// this wave's change set is scoped to the codex adapter and must not
+    /// touch `claude.rs`/`opencode.rs`/`agy.rs` to add one.
+    fn backend_consumes_permission_mode(backend: &str) -> bool {
+        backend == crate::backend::claude::CLAUDE_BACKEND_NAME
+    }
+
+    /// #262: the effective `network_access` override each declared profile
+    /// launches with, surfaced the same way [`permission_mode_check`]
+    /// surfaces `permission_mode` — same estate-root threading, same
+    /// already-validated-at-load assumption (a bad value would have refused
+    /// the estate before this ran, per [`crate::domain::estate::EstateError::
+    /// InvalidNetworkAccess`]), same "configured but the backend doesn't
+    /// read it" distinction so a row never reads as "in effect" when it
+    /// is not.
+    fn network_access_check(estate_root: Option<&Path>) -> Check {
+        use crate::domain::estate::Estate;
+
+        let Some(estate_root) = estate_root else {
+            return Check::ok("network_access", "not an estate root — nothing to report");
+        };
+        match Estate::from_config_allow_empty(&estate_root.join(MANIFEST_FILE)) {
+            Ok(estate) if estate.profiles.is_empty() => Check::ok(
+                "network_access",
+                "no profiles declared — every execution falls back to the backend's own \
+                 default network access",
+            ),
+            Ok(estate) => {
+                let overrides: Vec<String> = estate
+                    .profiles
+                    .iter()
+                    .map(|p| {
+                        // Already validated at load (#262): from_config
+                        // would have refused the estate before this ran.
+                        let configured = p.network_access().ok().flatten();
+                        match configured {
+                            None => {
+                                format!("{}=unspecified -> backend default", p.name)
+                            }
+                            Some(access) if backend_consumes_network_access(&p.backend) => {
+                                format!("{}={access}", p.name)
+                            }
+                            Some(access) => format!(
+                                "{}=<configured: {access}, but the {:?} backend does not read \
+                                 network_access -> no effect>",
+                                p.name, p.backend
+                            ),
+                        }
+                    })
+                    .collect();
+                Check::ok("network_access", overrides.join(", "))
+            }
+            Err(e) => Check::warn(
+                "network_access",
+                format!("cannot read this estate's profiles: {e}"),
+                "fix sergeant.toml at the location the error names",
+            ),
+        }
+    }
+
+    /// Whether the named backend's adapter reads
+    /// `Profile::network_access()` at launch. Only `codex.rs`'s
+    /// `launch_config` does today (#262) — `claude.rs`/`opencode.rs`/`agy.rs`
+    /// have no equivalent sandbox network knob.
+    fn backend_consumes_network_access(backend: &str) -> bool {
+        backend == crate::backend::codex::CODEX_BACKEND_NAME
     }
 
     /// MVP-3: the estate manifest's own health, beyond whether it merely

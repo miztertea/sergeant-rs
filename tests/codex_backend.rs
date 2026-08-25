@@ -41,6 +41,7 @@ use sergeant_rs::backend::{
 use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::estate::InstructionPolicy;
 use sergeant_rs::domain::event::EventDraft;
+use sergeant_rs::runtime::git::canonical_git_common_dir;
 use sergeant_rs::runtime::journal::Journal;
 
 mod support;
@@ -1065,6 +1066,306 @@ fn the_first_turn_launches_the_recorded_grammar() {
     assert!(launch.stdin.contains("context body"));
 }
 
+/// A real linked worktree at `worktree`, cut from a fresh one-commit repo at
+/// `source`, plus the git admin directory git itself recorded for it — read
+/// straight from the worktree's own `.git` file rather than importing
+/// `src/backend/codex.rs`'s private `worktree_git_admin_dir`, so this
+/// fixture and the adapter under test independently agree on where that
+/// directory lives.
+fn real_worktree(source: &Path, worktree: &Path, branch: &str) -> PathBuf {
+    support::init_repo(source);
+    support::git(
+        source,
+        &["worktree", "add", "-b", branch, worktree.to_str().unwrap()],
+    );
+    let dot_git = std::fs::read_to_string(worktree.join(".git")).expect("worktree .git file");
+    PathBuf::from(
+        dot_git
+            .trim()
+            .strip_prefix("gitdir:")
+            .expect("a linked worktree's .git file names a gitdir")
+            .trim(),
+    )
+}
+
+/// #259 (re-scoped, W5 fix): turn 1's `--add-dir` must carry exactly one
+/// grant per binding — the repository's shared `.git` (its "common
+/// directory"), never `repository.path` (the source checkout) itself. The
+/// original #259 fix granted only `.git/worktrees/<name>` (the per-worktree
+/// admin subdirectory); the independent review of split/w5-codex-commit-path
+/// showed empirically that this is not enough — `git commit` also writes
+/// loose objects and updates the branch ref under the shared common dir,
+/// outside that narrower grant, so `git add` would succeed and `git commit`
+/// would still fail with `Read-only file system` (five observed Terra
+/// Works, issue #259's own evidence, plus this wave's own bubblewrap
+/// measurement documented on `worktree_git_common_dir`).
+#[test]
+fn the_first_turn_grants_the_works_own_git_common_dir_as_an_add_dir_root() {
+    let dir = TempDir::new().expect("tempdir");
+    let source = dir.path().join("source");
+    let worktree = dir.path().join("worktree");
+    let admin_dir = real_worktree(&source, &worktree, "sergeant/w-codex");
+    // Exactly the one directory, never the repository (source checkout).
+    assert_eq!(
+        admin_dir,
+        source.join(".git").join("worktrees").join("worktree"),
+        "git's own scheme for a linked worktree's admin dir"
+    );
+    let common_dir = source.join(".git");
+
+    let stub = StubCodex::passing(dir.path());
+    stub.replays(AGENT_MESSAGE_TURN);
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let mut request = start_request(&worktree);
+    request.bindings = vec![BindingSummary {
+        repository: "solo".to_string(),
+        worktree_path: worktree.clone(),
+        work_branch: "sergeant/w-codex".to_string(),
+        base_branch: Some("main".to_string()),
+        base_sha: "0".repeat(40),
+    }];
+    let prepared = backend.prepare(&request).expect("prepare");
+    backend.launch(&prepared).expect("launch");
+    let launches = stub.wait_for_launches(1);
+    let launch = &launches[0];
+    let add_dir_values: Vec<&str> = launch
+        .argv
+        .windows(2)
+        .filter(|pair| pair[0] == "--add-dir")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    assert_eq!(
+        add_dir_values,
+        vec![common_dir.to_str().unwrap()],
+        "argv: {:?}",
+        launch.argv
+    );
+}
+
+/// A fixture-level sanity check, not a regression test for
+/// `runtime::surface`'s private `common_dir_finding` itself (that
+/// function's own regression test,
+/// `common_dir_finding_reports_no_mismatch_for_a_genuine_linked_worktree`,
+/// lives in `src/runtime/surface.rs`'s unit tests, the only place with
+/// access to it). What this test pins is the underlying git fact #259's
+/// grant depends on: a linked worktree's `canonical_git_common_dir` still
+/// agrees with its source checkout's after `real_worktree` creates it. #259's
+/// grant reads the worktree's `.git` file but writes nothing and calls no
+/// git subprocess, so this identity is untouched by the fix — this test
+/// would pass identically whether or not #259 exists.
+#[test]
+fn the_git_admin_dir_grant_does_not_disturb_the_worktrees_own_common_dir_identity() {
+    let dir = TempDir::new().expect("tempdir");
+    let source = dir.path().join("source");
+    let worktree = dir.path().join("worktree");
+    let _admin_dir = real_worktree(&source, &worktree, "sergeant/w-codex");
+
+    let expected = canonical_git_common_dir(&source).expect("source common dir");
+    let observed = canonical_git_common_dir(&worktree).expect("worktree common dir");
+    assert_eq!(
+        expected, observed,
+        "a linked worktree's common dir must still agree with its source checkout's"
+    );
+}
+
+/// #262: codex-cli's own documented `-c
+/// sandbox_workspace_write.network_access=true` override is composed only
+/// when a profile/config explicitly opts in — never by default, and never
+/// implied by anything else this adapter composes.
+#[test]
+fn network_access_is_absent_by_default_and_present_when_configured() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.replays(AGENT_MESSAGE_TURN);
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let request = start_request(dir.path());
+    let prepared = backend.prepare(&request).expect("prepare");
+    backend.launch(&prepared).expect("launch");
+    let launches = stub.wait_for_launches(1);
+    assert!(
+        !launches[0].has("-c"),
+        "the network override must never compose unless explicitly configured"
+    );
+
+    let dir2 = TempDir::new().expect("tempdir");
+    let stub2 = StubCodex::passing(dir2.path());
+    stub2.replays(AGENT_MESSAGE_TURN);
+    let mut config = config_for(&stub2, dir2.path(), &dir2.path().join("codex-home"));
+    config.workspace_write_network_access = true;
+    let backend2 = CodexBackend::new(config);
+    let request2 = start_request(dir2.path());
+    let prepared2 = backend2.prepare(&request2).expect("prepare");
+    backend2.launch(&prepared2).expect("launch");
+    let launches2 = stub2.wait_for_launches(1);
+    assert_eq!(
+        launches2[0].value_after("-c"),
+        Some("sandbox_workspace_write.network_access=true")
+    );
+}
+
+/// #262, split-hardening W5 review finding #2: `workspace_write_network_
+/// access` is documented as per-profile, but `CodexConfig` (and the one
+/// `CodexBackend` a daemon shares across every codex-backed profile) had no
+/// plumbing that let two profiles on the same backend actually disagree —
+/// the field was read straight off `self.config` at every launch site,
+/// regardless of which profile was requested. This proves the fix: one
+/// `CodexBackend`, two profiles, opposite `network_access` options, and the
+/// daemon-global config left at its own default (`false`) throughout —
+/// each profile's launch composes (or omits) `-c
+/// sandbox_workspace_write.network_access=true` according to its own
+/// option, not the shared config.
+#[test]
+fn two_profiles_on_one_backend_resolve_network_access_independently() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.replays(AGENT_MESSAGE_TURN);
+    stub.replays(AGENT_MESSAGE_TURN);
+    // Daemon-global default stays false; only the profiles disagree.
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+
+    let mut on_options = BTreeMap::new();
+    on_options.insert("network_access".to_string(), "true".to_string());
+    let profile_on = sergeant_rs::domain::profile::Profile {
+        name: "network-on".to_string(),
+        backend: CODEX_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options: on_options,
+    };
+    let mut off_options = BTreeMap::new();
+    off_options.insert("network_access".to_string(), "false".to_string());
+    let profile_off = sergeant_rs::domain::profile::Profile {
+        name: "network-off".to_string(),
+        backend: CODEX_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options: off_options,
+    };
+
+    let mut request_on = start_request(dir.path());
+    request_on.profile = Some(profile_on);
+    let prepared_on = backend.prepare(&request_on).expect("prepare on");
+    backend.launch(&prepared_on).expect("launch on");
+
+    let mut request_off = start_request(dir.path());
+    request_off.profile = Some(profile_off);
+    let prepared_off = backend.prepare(&request_off).expect("prepare off");
+    backend.launch(&prepared_off).expect("launch off");
+
+    let launches = stub.wait_for_launches(2);
+    assert_eq!(
+        launches[0].value_after("-c"),
+        Some("sandbox_workspace_write.network_access=true"),
+        "the network-on profile's own option must win over the shared config's false default"
+    );
+    assert!(
+        !launches[1].has("-c"),
+        "the network-off profile's own option must win too, on the very same backend"
+    );
+}
+
+/// #262 (W5 fix): an unrecognized `network_access` option value fails
+/// closed at PREPARE, before anything spawns — the same posture
+/// `permission_mode` (#47) already has for its own closed vocabulary.
+#[test]
+fn an_unrecognized_network_access_option_is_refused_before_launch() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let mut options = BTreeMap::new();
+    options.insert("network_access".to_string(), "yes".to_string());
+    let profile = sergeant_rs::domain::profile::Profile {
+        name: "p".to_string(),
+        backend: CODEX_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::new(),
+        default_model: None,
+        options,
+    };
+    let mut request = start_request(dir.path());
+    request.profile = Some(profile);
+    let err = backend
+        .prepare(&request)
+        .expect_err("an unrecognized network_access value must be refused");
+    match err {
+        BackendError::Failed { detail, .. } => {
+            assert!(detail.contains("network_access"), "{detail}");
+            assert!(detail.contains("yes"), "{detail}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(stub.launches().is_empty());
+}
+
+/// #259's fail-closed half: a mutation-shaped request (bindings present)
+/// whose git admin dir grant cannot be resolved — here, a `worktree_path`
+/// that was never a linked worktree git created, so it has no `.git` file
+/// naming a `gitdir` — is refused at PREPARE, before anything is spawned.
+/// Admitting the Work anyway would let it edit files and then mechanically
+/// fail to commit them, retiring `completed_dirty` with no durable branch
+/// commit (issue #259's own acceptance criteria).
+#[test]
+fn prepare_refuses_a_mutation_shaped_request_whose_git_admin_dir_is_unresolvable() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let not_a_worktree = dir.path().join("not-a-worktree");
+    std::fs::create_dir_all(&not_a_worktree).expect("dir");
+
+    let mut request = start_request(&not_a_worktree);
+    request.bindings = vec![BindingSummary {
+        repository: "solo".to_string(),
+        worktree_path: not_a_worktree.clone(),
+        work_branch: "b".to_string(),
+        base_branch: None,
+        base_sha: "0".repeat(40),
+    }];
+    let err = backend.prepare(&request).expect_err("must refuse");
+    match err {
+        BackendError::Failed { detail, .. } => {
+            assert!(detail.contains("#259"), "{detail}");
+            // Review finding #3, split-hardening W5: the refusal must name
+            // an actionable remedy, not just what failed (§15's "named
+            // remedy" precedent, `src/runtime/preflight.rs`'s
+            // `PreflightCheck::remedy`).
+            assert!(
+                detail.contains("Remedy:") && detail.contains("re-admit"),
+                "the refusal must carry an actionable remedy sentence: {detail}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(
+        stub.launches().is_empty(),
+        "a refused prepare must spawn nothing"
+    );
+}
+
 #[test]
 fn the_resume_turn_launches_the_recorded_grammar() {
     let dir = TempDir::new().expect("tempdir");
@@ -1897,6 +2198,17 @@ fn wait_for_event(
 fn appserver_thread_start_names_exactly_the_works_surfaces() {
     let dir = TempDir::new().expect("tempdir");
     let outside = TempDir::new().expect("tempdir outside");
+    // #259: `prepare` now resolves every binding's git admin dir and
+    // refuses if it cannot, so both bindings here must be real linked
+    // worktrees (`real_worktree`, the same fixture the #259 tests use) --
+    // not bare paths with no `.git` file.
+    let inside_source = TempDir::new().expect("tempdir inside source");
+    let outside_source = TempDir::new().expect("tempdir outside source");
+    let inside_worktree = dir.path().join("inside-binding");
+    let outside_worktree = outside.path().join("outside-binding");
+    real_worktree(inside_source.path(), &inside_worktree, "b1");
+    real_worktree(outside_source.path(), &outside_worktree, "b2");
+
     let stub = StubCodex::passing(dir.path());
     stub.supports_appserver();
     script_appserver_launch(&stub);
@@ -1907,14 +2219,14 @@ fn appserver_thread_start_names_exactly_the_works_surfaces() {
     request.bindings = vec![
         BindingSummary {
             repository: "inside".to_string(),
-            worktree_path: dir.path().join("inside-binding"),
+            worktree_path: inside_worktree,
             work_branch: "b1".to_string(),
             base_branch: None,
             base_sha: "0".repeat(40),
         },
         BindingSummary {
             repository: "outside".to_string(),
-            worktree_path: outside.path().to_path_buf(),
+            worktree_path: outside_worktree.clone(),
             work_branch: "b2".to_string(),
             base_branch: None,
             base_sha: "0".repeat(40),
@@ -1942,10 +2254,20 @@ fn appserver_thread_start_names_exactly_the_works_surfaces() {
         roots,
         vec![
             dir.path().to_string_lossy().to_string(),
-            outside.path().to_string_lossy().to_string(),
+            outside_worktree.to_string_lossy().to_string(),
+            inside_source
+                .path()
+                .join(".git")
+                .to_string_lossy()
+                .to_string(),
+            outside_source
+                .path()
+                .join(".git")
+                .to_string_lossy()
+                .to_string(),
         ],
-        "exactly cwd + the one outside binding, nothing else -- not the inside binding \
-         (already covered by cwd), not the estate root, not repos/"
+        "cwd, the one outside binding, then #259's git common-dir grants for every binding \
+         in order -- never the estate root, never anything fabricated"
     );
 
     backend.stop(&handle).expect("stop").wait();
@@ -4575,6 +4897,121 @@ async fn daemon_start_registers_codex_and_journals_its_own_probe() {
     assert_eq!(
         codex_probed.payload["capabilities"]["native_subagents"],
         false
+    );
+}
+
+/// Issue #259's own acceptance criterion, driven live: "A real Codex
+/// contract test edits, stages, and commits in an assigned linked worktree.
+/// The commit advances the assigned `sergeant/<work-id>` branch." A real
+/// one-commit repo plus a real `git worktree add`-created linked worktree
+/// (`real_worktree`, same fixture the stub-driven `--add-dir` test above
+/// uses), a turn instructed to append a line and commit it, then the
+/// assigned branch's tip in the *source* checkout is asserted to have moved
+/// to a new commit whose parent is the worktree's pre-turn `HEAD` — proving
+/// the commit is real, on-branch, and not merely a detached-HEAD or
+/// working-tree-only edit.
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_codex_actor_commits_to_the_works_own_branch() {
+    let data_dir = live_workdir("commit");
+    if !codex_live_enabled(
+        "live_codex_actor_commits_to_the_works_own_branch",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let source = data_dir.path().join("source");
+    let worktree = data_dir.path().join("worktree");
+    let branch = "sergeant/live-259";
+    real_worktree(&source, &worktree, branch);
+    let before = support::git(&worktree, &["rev-parse", "HEAD"]);
+
+    let backend = CodexBackend::new(live_exec_config(data_dir.path()));
+    let mut request = start_request(&worktree);
+    request.model = Some("gpt-5.6-luna".to_string());
+    request.intent = "Append the single line \"ok\" to README.md, then run `git add \
+                       README.md` and `git commit -m \"live #259 test\"`. Do nothing else, \
+                       and report only the word done when finished."
+        .to_string();
+    request.bindings = vec![BindingSummary {
+        repository: "solo".to_string(),
+        worktree_path: worktree.clone(),
+        work_branch: branch.to_string(),
+        base_branch: Some("main".to_string()),
+        base_sha: before.clone(),
+    }];
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    wait_for_settled(&backend, &handle);
+
+    let after = support::git(&worktree, &["rev-parse", "HEAD"]);
+    assert_ne!(
+        before, after,
+        "the actor must have committed in its own worktree"
+    );
+    let parent = support::git(&worktree, &["rev-parse", "HEAD^"]);
+    assert_eq!(
+        parent, before,
+        "the new commit must be built directly on the Work's own starting point"
+    );
+    let branch_tip = support::git(&source, &["rev-parse", branch]);
+    assert_eq!(
+        branch_tip, after,
+        "the commit must advance the assigned sergeant/<work-id> branch, not just the \
+         worktree's detached view of it"
+    );
+    let head_is_branch = support::git(&worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    assert_eq!(
+        head_is_branch, branch,
+        "HEAD must still be the work branch, not detached"
+    );
+}
+
+/// #262's own acceptance criterion #1: with the network knob explicitly
+/// set, a real codex actor can bind `127.0.0.1:0` inside the sandbox.
+/// `network_access_is_absent_by_default_and_present_when_configured` (above)
+/// only proves the `-c sandbox_workspace_write.network_access=true` flag is
+/// composed correctly against a stub — this is the measured half: a live
+/// actor actually attempting the bind under codex's real sandbox, so a
+/// codex-cli change to what that flag does (or a mis-wired one here) shows
+/// up as a failing bind, not just a missing argv token.
+#[test]
+#[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
+fn live_codex_actor_binds_loopback_when_network_access_is_configured() {
+    let data_dir = live_workdir("network");
+    if !codex_live_enabled(
+        "live_codex_actor_binds_loopback_when_network_access_is_configured",
+        data_dir.path(),
+    ) {
+        return;
+    }
+    let cwd = data_dir.path().join("cwd");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let result_path = cwd.join("bind_result.txt");
+
+    let mut config = live_exec_config(data_dir.path());
+    config.workspace_write_network_access = true;
+    let backend = CodexBackend::new(config);
+    let mut request = start_request(&cwd);
+    request.model = Some("gpt-5.6-luna".to_string());
+    request.intent = format!(
+        "Run this exact Python one-liner: python3 -c \"import socket; s = socket.socket(socket.\
+         AF_INET, socket.SOCK_STREAM); s.bind(('127.0.0.1', 0)); print('BIND_OK')\" then write \
+         the exact string BIND_OK to a new file at {} (no other content), then report only the \
+         word done when finished.",
+        result_path.display()
+    );
+
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    wait_for_settled(&backend, &handle);
+
+    let result = std::fs::read_to_string(&result_path)
+        .unwrap_or_else(|e| panic!("actor never wrote {}: {e}", result_path.display()));
+    assert_eq!(
+        result.trim(),
+        "BIND_OK",
+        "the actor must have bound 127.0.0.1:0 under the sandbox with network_access configured"
     );
 }
 
