@@ -128,3 +128,13 @@ cov_stage_end 1 "the agy_routing test binary must write its own profile"
 cov_stage_begin c2-coverage_stage_membership
 cov_run cargo llvm-cov --no-report --test coverage_stage_membership --locked || cov_fail "coverage_stage_membership failed under instrumentation"
 cov_stage_end 1 "the coverage_stage_membership test binary must write its own profile"
+
+# Added 2026-08-25, in the same commit that creates the suite (the docs/
+# product-manual wave, #231(b)): the CLI-reference test spawns the `sgt`
+# binary once for `--help`, the same one-subprocess shape as m3/m5/
+# estate_routes/t2_workflow_catalog above; the link-soundness, catalog-
+# coverage, and skill-reference tests are plain static scans, no subprocess
+# at all. Floor 1.
+cov_stage_begin c2-docs_contract
+cov_run cargo llvm-cov --no-report --test docs_contract --locked || cov_fail "docs_contract failed under instrumentation"
+cov_stage_end 1 "the docs_contract test binary must write its own profile"
