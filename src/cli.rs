@@ -2501,20 +2501,37 @@ fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
 /// `spawn_daemon` already opened, so the reason survives even when nothing
 /// interactive is watching stderr (a systemd-launched daemon has no such
 /// terminal at all — the exact gap this deliverable closes).
-fn spawn_daemon_error(e: std::io::Error, mut log: std::fs::File) -> CliError {
+fn spawn_daemon_error(e: std::io::Error, log: std::fs::File) -> CliError {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = std::env::var_os("PATH");
+    spawn_daemon_error_with(e, log, home.as_deref(), path.as_ref(), |d| d.exists())
+}
+
+/// The injectable core of [`spawn_daemon_error`] — real `HOME`/`PATH` and a
+/// real filesystem `exists` check in production, a controlled `home`/`path`/
+/// `exists` in tests, the same injection shape as
+/// [`crate::harness::dirs_missing_from_path`] itself. Both halves of #275's
+/// deliverable live here together — the diagnostic appended to the returned
+/// message, and the identical reason written to `log` — so a test calling
+/// this once and reading `log` back afterward can assert the two stayed in
+/// sync, exactly the gap that used to let a spawn failure vanish for a
+/// systemd-launched daemon with no terminal to print to.
+fn spawn_daemon_error_with(
+    e: std::io::Error,
+    mut log: std::fs::File,
+    home: Option<&Path>,
+    path: Option<&OsString>,
+    exists: impl Fn(&Path) -> bool,
+) -> CliError {
     use std::io::Write;
 
     let path_diagnostic = if matches!(
         e.kind(),
         std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
     ) {
-        std::env::var_os("HOME").and_then(|home| {
-            let dirs = crate::harness::toolchain_path_dirs(Path::new(&home));
-            let missing = crate::harness::dirs_missing_from_path(
-                std::env::var_os("PATH").as_ref(),
-                &dirs,
-                |d| d.exists(),
-            );
+        home.and_then(|home| {
+            let dirs = crate::harness::toolchain_path_dirs(home);
+            let missing = crate::harness::dirs_missing_from_path(path, &dirs, exists);
             if missing.is_empty() {
                 None
             } else {
@@ -5898,5 +5915,78 @@ mod tests {
         let (dir, source) = resolve_host_runtime_dir(None, probe).unwrap();
         assert_eq!(source, DataDirSource::PlatformFallback);
         assert_eq!(dir, crate::platform::data_dir::fallback_dir(probe).unwrap());
+    }
+
+    /// W4c panel finding: `spawn_daemon_error` used to have no test proving
+    /// either half of #275's own deliverable actually happens. This drives
+    /// [`spawn_daemon_error_with`] — the injectable core — with a `NotFound`
+    /// error and a `home` whose `.cargo/bin` exists but is absent from
+    /// `path`, then checks *both* halves against the one call: the returned
+    /// message names the missing dir (the diagnostic half), and the exact
+    /// same reason is what landed in the log file (the logging half).
+    /// Deleting the `path_diagnostic` computation (reverting it to always
+    /// `None`) fails the first assertion; deleting the `writeln!` in
+    /// `spawn_daemon_error_with` (reverting the logging half) fails the
+    /// second — each half is independently revert-sensitive.
+    #[test]
+    fn spawn_daemon_error_names_missing_path_dirs_in_both_message_and_log() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".cargo").join("bin")).expect("mk .cargo/bin");
+        let log_path = tmp.path().join("daemon.log");
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open log");
+
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let err = spawn_daemon_error_with(
+            e,
+            log,
+            Some(&home),
+            None, // PATH carries none of the toolchain dirs
+            |d| d.exists(),
+        );
+
+        let message = err.to_string();
+        assert!(
+            message.contains(".cargo/bin") && message.contains("not on PATH"),
+            "message must name the missing PATH dir: {message}"
+        );
+
+        let logged = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            logged.contains("spawn failed:") && logged.contains(".cargo/bin"),
+            "log must carry the same named reason: {logged}"
+        );
+        assert!(
+            logged.contains(&message),
+            "log's reason must match the returned message exactly: log={logged} message={message}"
+        );
+    }
+
+    /// The counterpart to the test above: when none of the toolchain dirs
+    /// exist on disk, `spawn_daemon_error_with` must not fabricate a
+    /// diagnostic — the plain `io::Error` text is the whole message, and
+    /// that same plain text is still what reaches the log.
+    #[test]
+    fn spawn_daemon_error_adds_no_diagnostic_when_no_toolchain_dirs_exist() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home-without-toolchain-dirs");
+        let log_path = tmp.path().join("daemon.log");
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open log");
+
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let err = spawn_daemon_error_with(e, log, Some(&home), None, |d| d.exists());
+
+        let message = err.to_string();
+        assert_eq!(message, "cannot spawn daemon: No such file or directory");
+        let logged = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(logged.contains(&message), "log must match: {logged}");
     }
 }
