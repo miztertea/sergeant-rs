@@ -2501,11 +2501,15 @@ async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) 
     Json(json!({"work_id": id, "turns": turns})).into_response()
 }
 
-/// The pure decode: filter `events` to `work_id`'s `conversation.*` kinds and
-/// turn each into a `{seq, ts, role, text, source}` entry, in the journal's
-/// own causal (seq) order — factored out of the handler above so the
-/// role/source mapping and the blob-decode fallback can be pinned by a
-/// direct test without spinning up a daemon.
+/// The pure decode: filter `events` to `work_id`'s `conversation.*` and
+/// `tool.*` (#240) kinds and turn each into a `{seq, ts, role, text,
+/// source}` entry, in the journal's own causal (seq) order — factored out
+/// of the handler above so the role/source mapping and the blob-decode
+/// fallback can be pinned by a direct test without spinning up a daemon.
+/// `tool.*` events carry `role: "tool_use"` plus a `phase`
+/// (`"requested"`/`"completed"`) — previously these fell into the
+/// catch-all below and vanished, so a degraded run that silently invoked
+/// zero tools read identically to one that made real progress.
 fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Path) -> Vec<Value> {
     let mut turns = Vec::new();
     // Per-`execution_id` count of `conversation.assistant.completed` events
@@ -2556,6 +2560,44 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
                 "text": event.payload["question"].as_str().unwrap_or(""),
                 "source": "event",
             })),
+            // #240: `tool.*` events were previously falling into the
+            // catch-all below and vanishing from the transcript entirely —
+            // a degraded run that silently skipped every tool call read
+            // identically to one that made real progress. Surfaced as
+            // `role: "tool_use"` with a `phase` distinguishing the request
+            // from its result, so a reader (or `render_transcript`) can
+            // tell the two apart without a second lookup.
+            KIND_TOOL_REQUESTED => {
+                let name = event.payload["name"].as_str().unwrap_or("tool");
+                let input = &event.payload["input"];
+                turns.push(json!({
+                    "seq": event.seq,
+                    "ts": event.timestamp,
+                    "role": "tool_use",
+                    "phase": "requested",
+                    "tool_use_id": event.payload["id"].as_str().unwrap_or(""),
+                    "name": name,
+                    "input": input,
+                    "text": format!("{name} {input}"),
+                    "source": "event",
+                }));
+            }
+            KIND_TOOL_COMPLETED => {
+                let is_error = event.payload["is_error"].as_bool().unwrap_or(false);
+                let name = event.payload["name"].as_str().unwrap_or("tool");
+                let outcome = if is_error { "error" } else { "ok" };
+                turns.push(json!({
+                    "seq": event.seq,
+                    "ts": event.timestamp,
+                    "role": "tool_use",
+                    "phase": "completed",
+                    "tool_use_id": event.payload["tool_use_id"].as_str().unwrap_or(""),
+                    "name": name,
+                    "is_error": is_error,
+                    "text": format!("{name} -> {outcome}"),
+                    "source": "event",
+                }));
+            }
             KIND_CONVERSATION_TURN_ENDED => {
                 // This turn's own boundary: whatever `assistant.completed`
                 // this execution emitted belongs to *this* turn (the two are
@@ -5678,6 +5720,56 @@ mod tests {
             ],
             "w2's event must be excluded and the rest must decode in seq order: {turns:?}"
         );
+    }
+
+    /// #240: `tool.requested`/`tool.completed` used to fall into
+    /// `transcript_turns`'s catch-all and vanish from the transcript
+    /// entirely — a degraded run that silently invoked zero tools read
+    /// identically to one that made real progress. Both kinds must now
+    /// decode as `role: "tool_use"` entries, distinguished by `phase`, in
+    /// the same causal order as every other turn kind.
+    #[test]
+    fn transcript_turns_surfaces_tool_requested_and_completed_events() {
+        let events = vec![
+            ev(
+                1,
+                "w1",
+                KIND_CONVERSATION_USER,
+                json!({"text": "run the tests"}),
+            ),
+            ev(
+                2,
+                "w1",
+                KIND_TOOL_REQUESTED,
+                json!({"id": "call-1", "name": "bash", "input": {"command": "cargo test"}}),
+            ),
+            ev(
+                3,
+                "w1",
+                KIND_TOOL_COMPLETED,
+                json!({"tool_use_id": "call-1", "name": "bash", "is_error": false}),
+            ),
+        ];
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let turns = transcript_turns("w1", events, data_dir.path());
+
+        let requested = turns
+            .iter()
+            .find(|t| t["seq"] == 2)
+            .expect("tool.requested must decode into a turn");
+        assert_eq!(requested["role"], "tool_use");
+        assert_eq!(requested["phase"], "requested");
+        assert_eq!(requested["tool_use_id"], "call-1");
+        assert_eq!(requested["name"], "bash");
+
+        let completed = turns
+            .iter()
+            .find(|t| t["seq"] == 3)
+            .expect("tool.completed must decode into a turn");
+        assert_eq!(completed["role"], "tool_use");
+        assert_eq!(completed["phase"], "completed");
+        assert_eq!(completed["tool_use_id"], "call-1");
+        assert_eq!(completed["is_error"], false);
     }
 
     /// The "minimal blob decode" itself, end to end through

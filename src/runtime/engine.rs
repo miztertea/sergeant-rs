@@ -5574,6 +5574,7 @@ mod tests {
                 BindingDisposition::RetainedDirty {
                     changes: "M solo/wip.rs".to_string(),
                     patch: None,
+                    outputs: Vec::new(),
                 }
             };
             TeardownReport {
