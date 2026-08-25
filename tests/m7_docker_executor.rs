@@ -1625,6 +1625,126 @@ fn assert_patch_is_git_applyable(path: &Path) {
     );
 }
 
+/// F-TH-02 (carried from W4's panel, commit 9d0deae5): the "every patch"
+/// loop added there (`collect_dirty_patches` + the per-patch
+/// `assert_patch_is_git_applyable` loop above) was only ever exercised
+/// against [`mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forward`]'s
+/// single-repository estate, which produces exactly one `.dirty.patch` —
+/// so a regression that silently went back to checking only the first
+/// entry (`.next()`/`[0]` instead of iterating the whole `Vec`) would not
+/// fail any test in this file. This variant scaffolds a **two-repository**
+/// estate (`scope.all`, so both bind), dirties both worktrees, and cancels
+/// once — producing two independent `.dirty.patch` files under the same
+/// surface root — so the loop actually has a second item to iterate past.
+/// No Docker container is involved (both stages are plain fake actors);
+/// this lives here rather than in `tests/m3_execution.rs` because it is
+/// the direct regression test for the `collect_dirty_patches`/
+/// `assert_patch_is_git_applyable` pair that commit 9d0deae5 fixed and
+/// that lives in this file.
+#[tokio::test]
+async fn cancel_of_a_dirty_multi_repo_estate_retains_a_patch_per_binding() {
+    let data = support::DataDir::new();
+    let estate = TempDir::new().expect("estate");
+    support::scaffold_estate(estate.path(), "multi-patch", &["repo-a", "repo-b"]);
+
+    let workflow_dir = estate.path().join(".sergeant/workflows/tiny");
+    std::fs::create_dir_all(workflow_dir.join("00-first")).expect("stage dir");
+    std::fs::create_dir_all(workflow_dir.join("10-second")).expect("stage dir");
+    std::fs::write(workflow_dir.join("00-first/CONTEXT.md"), "first").expect("context");
+    std::fs::write(workflow_dir.join("10-second/CONTEXT.md"), "second").expect("context");
+    std::fs::write(
+        workflow_dir.join("workflow.toml"),
+        concat!(
+            "[workflow]\n",
+            "name = \"tiny\"\n",
+            "version = \"1\"\n",
+            "stages = [\"00-first\", \"10-second\"]\n",
+        ),
+    )
+    .expect("workflow.toml");
+
+    let fake = Arc::new(FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]));
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            estate_root: Some(estate.path().to_path_buf()),
+            backends: Arc::new(BackendRegistry::new().with(fake)),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+
+    let http = reqwest::Client::new();
+    let submitted: serde_json::Value = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid::Ulid::generate().to_string(),
+            "intent": "dirty two worktrees at once",
+            "workflow": "tiny",
+            "origin": {"client": "cli", "cwd": estate.path()},
+            "scope": {"all": true},
+        }))
+        .send()
+        .await
+        .expect("submit")
+        .json()
+        .await
+        .expect("json");
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    let bindings = submitted["surface"]["bindings"]
+        .as_array()
+        .expect("bindings");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "scope.all over a two-repo estate must bind both: {submitted}"
+    );
+    for binding in bindings {
+        let worktree = Path::new(binding["worktree_path"].as_str().expect("worktree_path"));
+        std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n")
+            .expect("dirty this binding's worktree");
+    }
+
+    let (status, _body): (_, serde_json::Value) = {
+        let resp = http
+            .post(format!("{}/v1/work/{work_id}/cancel", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid::Ulid::generate().to_string()}))
+            .send()
+            .await
+            .expect("cancel");
+        let status = resp.status();
+        (status, resp.json().await.expect("json"))
+    };
+    assert_eq!(status, 200, "cancel of a work with two dirty bindings");
+
+    let mut patches = Vec::new();
+    for entry in std::fs::read_dir(data.path().join("surfaces"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        collect_dirty_patches(&entry.path(), &mut patches);
+    }
+    assert_eq!(
+        patches.len(),
+        2,
+        "expected one retained .dirty.patch per dirtied binding under {:?} for {work_id}: {patches:?}",
+        data.path().join("surfaces")
+    );
+    for patch in &patches {
+        assert_patch_is_git_applyable(patch);
+    }
+
+    handle.shutdown().await;
+}
+
 /// Poll OBSERVE until the container has exited, panicking on timeout.
 fn wait_for_exit(
     backend: &DockerBackend,

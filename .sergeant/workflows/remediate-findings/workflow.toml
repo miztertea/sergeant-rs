@@ -20,3 +20,10 @@
 name = "remediate-findings"
 version = "1"
 stages = ["00-ingest", "10-verify-against-current-state", "20-dispose", "30-implement-accepted", "35-re-verify", "40-disposition-matrix"]
+
+# Amendment 9 Q5 / #260 mechanism 3: the closing stage opts in to the
+# engine's own commits-on-branch-since-base fact, so its disposition matrix
+# can no longer honestly write "no blockers found" over a branch that never
+# moved (the 40-disposition-matrix CONTEXT.md's own J0 line names this).
+[stage."40-disposition-matrix"]
+receives_branch_status = true
