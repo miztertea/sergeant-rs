@@ -291,15 +291,45 @@ const DRIVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// journaling `daemon.stopped` and going.
 ///
 /// The walk is joined at all — rather than dropped — for the same reason the
-/// completion driver is: it commits events, and `daemon.stopped` must be the
-/// last one this daemon writes. It gets its own, longer grace because what it
-/// is waiting on is a different thing: not someone else's git checkout, but a
-/// bounded set of local `--version`/`--help` subprocess runs whose worst
-/// measured total on a fully-provisioned host is ~6.4s serial (#293, Cerberus
-/// 2026-08-25) and roughly the slowest single adapter concurrently. Thirty
-/// seconds is that with room, and it is still a bound: a daemon that will not
-/// die is a lock nobody can take.
-const PROBE_WALK_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// completion driver is: it commits events, and `daemon.stopped` should be
+/// the last one this daemon writes. It gets the same grace for the same
+/// reason too, and makes the same trade past it, stated rather than hidden: a
+/// probe still inside a child process when the grace runs out may journal its
+/// `backend.probed` after `daemon.stopped`. That is tolerable exactly where
+/// the driver's version is — the journal is append-only and crash-tolerant
+/// per append, `daemon.stopped` is a lifecycle record nothing reconciles
+/// against, and `backend.probed` is on `prune::NON_WORK_ALLOWLIST` as a kind
+/// with *no registry effect at all*, so a replay cannot tell the two orders
+/// apart.
+///
+/// Why it is bounded at all, measured (#293, Cerberus 2026-08-25): a probe is
+/// a real CLI invocation, and under `m6`'s own parallel load the walk ran past
+/// ten seconds — long enough that a rig SIGTERMing a fresh daemon escalated to
+/// SIGKILL, which flushes nothing at exit. Waiting that out unbounded would
+/// put "how loaded is this box" on the shutdown path, and a daemon that will
+/// not die is a lock nobody can take.
+const PROBE_WALK_SHUTDOWN_GRACE: Duration = DRIVER_SHUTDOWN_GRACE;
+
+/// How many backend probes the startup walk runs at once.
+///
+/// **Bounded rather than "all of them", and the number has provenance.**
+/// Measured on Cerberus, 2026-08-25, with all five adapters installed: one
+/// cold daemon alone completes its walk in ~2.5s, and **twenty cold daemons
+/// started simultaneously take 13.8-14.7s each** — 20 × 6 unbounded lanes is
+/// 120 concurrent third-party CLI startups on a 20-core box, and every one of
+/// them gets slower. That is not a hypothetical: it is `m6`'s own suite at
+/// default parallelism, where a daemon SIGTERMed the instant its descriptor
+/// appeared could not finish its walk inside the rig's ten-second grace and
+/// was escalated to SIGKILL, flushing nothing at exit.
+///
+/// Two lanes, not more, because the walk's floor is its slowest single
+/// adapter either way: opencode alone is +3.24s of a ~2.5s-to-3.3s walk, and
+/// the four fast adapters together are +0.74s, so two lanes finish in the
+/// same time one unbounded fan-out does while forking a third as many
+/// children. Raise it only against a measurement showing the *fast* adapters'
+/// sum has overtaken the slowest one's time — that is the condition under
+/// which a lane cap starts costing something, and nothing else is.
+const PROBE_WALK_LANES: usize = 2;
 
 /// Handle to a running in-process daemon. Dropping it does NOT stop the
 /// daemon; call [`DaemonHandle::shutdown`] for a clean stop (journals
@@ -400,6 +430,28 @@ pub struct DaemonConfig {
     /// replay, and write a fresh one. `false` — the default and every
     /// auto-spawn — uses the cache when it verifies.
     pub rebuild_cache: bool,
+    /// W2fix (#293): whether [`start_with`] returns only after the backend
+    /// probe walk has finished.
+    ///
+    /// The descriptor is published before the walk either way — that is the
+    /// fix, and it is not negotiable by this flag. What the flag decides is
+    /// what the *caller* of `start_with` is waiting for, and the two callers
+    /// genuinely want different things:
+    ///
+    /// - `true`, the default, for an in-process embedder. Every rig in
+    ///   `tests/` holds a [`DaemonHandle`] and reads it as "this daemon has
+    ///   started"; one that snapshots the journal on the next line must not
+    ///   race a startup append.
+    /// - `false`, set by [`run_until_signal`], for the daemon binary. Its
+    ///   caller is a signal loop, and a process that cannot answer SIGTERM
+    ///   until its slowest adapter has finished printing `--help` is exactly
+    ///   the "daemon that will not die is a lock nobody can take" this file
+    ///   already refuses elsewhere. Measured on Cerberus 2026-08-25: with the
+    ///   wait in place, a SIGTERM arriving the instant the descriptor
+    ///   appeared took 3.27s to be answered on an idle host, and over ten
+    ///   seconds under `m6`'s own parallel load — long enough that the rig
+    ///   escalated to SIGKILL and the daemon flushed nothing at exit.
+    pub await_probe_walk: bool,
     /// Segment rotation threshold for this daemon's journal. `None` is
     /// [`DEFAULT_SEGMENT_MAX_BYTES`] (8 MiB) — production, always.
     ///
@@ -450,6 +502,7 @@ impl Default for DaemonConfig {
             surfaces_root: None,
             turn_cap: None,
             rebuild_cache: false,
+            await_probe_walk: true,
             segment_max_bytes: None,
             retention: None,
         }
@@ -1015,10 +1068,12 @@ pub async fn start_with(
     // first request axum takes off it is therefore handled by a routing path
     // that already knows what evidence is outstanding.
     probe_gate.expect(probe_backends.names());
+    let probe_lanes = Arc::new(tokio::sync::Semaphore::new(PROBE_WALK_LANES));
     let probes = tokio::spawn(probe_walk(
         state.core.clone(),
         probe_backends,
         probe_gate.clone(),
+        probe_lanes.clone(),
     ));
 
     let app = router(state.clone());
@@ -1062,28 +1117,43 @@ pub async fn start_with(
         // crash-tolerant per append, and `daemon.stopped` is a lifecycle
         // record that nothing reconciles against — whereas a daemon that will
         // not die is a lock nobody can take.
-        match tokio::time::timeout(DRIVER_SHUTDOWN_GRACE, completions).await {
-            Ok(Err(e)) => tracing::warn!(error = %e, "the completion driver panicked"),
-            Err(_) => tracing::warn!(
-                grace = ?DRIVER_SHUTDOWN_GRACE,
-                "the completion driver was still inside an external effect at shutdown; \
-                 stopping anyway"
-            ),
-            Ok(Ok(())) => {}
-        }
-        // The probe walk is the other non-request writer (#293), and the same
-        // rule binds it: `daemon.stopped` is the last event this daemon
-        // writes, so a walk still forking `--help` at shutdown is joined
-        // rather than raced. Bounded for the same reason the driver's join is
-        // — see `PROBE_WALK_SHUTDOWN_GRACE`.
-        match tokio::time::timeout(PROBE_WALK_SHUTDOWN_GRACE, probes).await {
-            Ok(Err(e)) => tracing::warn!(error = %e, "the backend probe walk panicked"),
-            Err(_) => tracing::warn!(
-                grace = ?PROBE_WALK_SHUTDOWN_GRACE,
-                "the backend probe walk was still running at shutdown; stopping anyway"
-            ),
-            Ok(Ok(())) => {}
-        }
+        //
+        // The probe walk (#293) is the other non-request writer and the same
+        // rule binds it, so it is joined here too — **concurrently, not after**.
+        // Two graces run one after the other add up, and their sum was
+        // measured to be the whole budget a rig gives a SIGTERMed daemon: with
+        // the joins sequential, `m6`'s
+        // `the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown`
+        // still escalated to SIGKILL under its own parallel load (Cerberus,
+        // 2026-08-25). Neither wait needs the other's answer, so neither
+        // should wait for it.
+        let driver = async {
+            match tokio::time::timeout(DRIVER_SHUTDOWN_GRACE, completions).await {
+                Ok(Err(e)) => tracing::warn!(error = %e, "the completion driver panicked"),
+                Err(_) => tracing::warn!(
+                    grace = ?DRIVER_SHUTDOWN_GRACE,
+                    "the completion driver was still inside an external effect at shutdown; \
+                     stopping anyway"
+                ),
+                Ok(Ok(())) => {}
+            }
+        };
+        // A stopping daemon starts no probe it has not already started: the
+        // in-flight ones are uninterruptible child processes it must wait out,
+        // but the queued ones are free to drop, and `PROBE_WALK_LANES` is what
+        // bounds how many can be in the first category.
+        probe_lanes.close();
+        let walk = async {
+            match tokio::time::timeout(PROBE_WALK_SHUTDOWN_GRACE, probes).await {
+                Ok(Err(e)) => tracing::warn!(error = %e, "the backend probe walk panicked"),
+                Err(_) => tracing::warn!(
+                    grace = ?PROBE_WALK_SHUTDOWN_GRACE,
+                    "the backend probe walk was still running at shutdown; stopping anyway"
+                ),
+                Ok(Ok(())) => {}
+            }
+        };
+        tokio::join!(driver, walk);
         // Clean shutdown: journal the stop, then retire the descriptor.
         let mut core = CoreGuard::acquire(&state.core).await;
         if let Err(e) = core.commit(EventDraft::new(
@@ -1104,32 +1174,21 @@ pub async fn start_with(
         }
     });
 
-    // The handle is handed back only once startup is *complete* — descriptor
-    // published, listener accepting, recovery settled, and the probe walk
-    // done — while everything a client waits for happened at the top of that
-    // list. This is the one place the two audiences differ, and the
-    // difference is deliberate (#293, R2):
+    // Whether the handle is handed back mid-walk or after it is the one
+    // question `await_probe_walk` answers — see its doc for why the two
+    // callers want different things. What a *client* waits on is settled
+    // either way and much earlier: the descriptor was published above, before
+    // this walk was even armed.
     //
-    // - a **client** waits on the descriptor file, which is published before
-    //   the walk starts and is the thing #293 measured at ~6.4s and now
-    //   measures in the low hundreds of milliseconds. Nothing about this wait
-    //   delays it, and the pending window between publish and walk-completion
-    //   is real, served, and covered by `ProbeGate`;
-    // - an **in-process embedder** (every test rig in `tests/`, and any
-    //   future library user) holds a `DaemonHandle` and reasonably reads it
-    //   as "this daemon has started". Handing it back mid-walk would make
-    //   every journal read taken straight after `start_with` race a startup
-    //   append — which is a rig contract quietly changing under ~65 call
-    //   sites, not a property anyone asked for.
-    //
-    // Waiting on the gate rather than the `probes` join handle is what lets
-    // the serve task keep that handle and join it at shutdown, so
-    // `daemon.stopped` stays last even if this future is dropped mid-await.
-    // The gate is a `Condvar`, so the wait goes on the blocking pool where
-    // blocking waits belong.
-    let settled = probe_gate.clone();
-    if let Err(e) = tokio::task::spawn_blocking(move || settled.wait_all()).await {
-        tracing::warn!(error = %e, "waiting for the backend probe walk failed");
+    // Waiting on the gate rather than on the `probes` join handle is what
+    // lets the serve task keep that handle and join it at shutdown. The gate
+    // is a `Condvar`, so the wait goes on the blocking pool, where blocking
+    // waits belong.
+    if config.await_probe_walk {
+        let settled = probe_gate.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || settled.wait_all()).await {
+            tracing::warn!(error = %e, "waiting for the backend probe walk failed");
+        }
     }
 
     Ok(DaemonHandle {
@@ -1182,34 +1241,48 @@ async fn probe_walk(
     core: Arc<tokio::sync::Mutex<Core>>,
     backends: Arc<BackendRegistry>,
     gate: Arc<ProbeGate>,
+    lanes: Arc<tokio::sync::Semaphore>,
 ) {
     let mut walking = tokio::task::JoinSet::new();
     for name in backends.names() {
         let backends = backends.clone();
-        walking.spawn_blocking(move || {
-            let Some(backend) = backends.get(&name) else {
-                return (name, None);
+        let lanes = lanes.clone();
+        walking.spawn(async move {
+            // The lane permit is held across the blocking probe and released
+            // when it returns — see `PROBE_WALK_LANES` for why the fan-out is
+            // bounded at all. A closed semaphore means shutdown began before
+            // this probe ever started one: skip it rather than fork a child
+            // the stopping daemon would then have to wait out.
+            let Ok(_lane) = lanes.acquire_owned().await else {
+                return Ok((name, None));
             };
-            let report = backend.probe();
-            // `capabilities()` is read here, inside the blocking task, and
-            // not on the runtime: for the opencode and agy adapters it
-            // resolves the transport, which is itself a subprocess gate, and
-            // for Claude it reads a claim the probe may have withdrawn.
-            let payload = json!({
-                "backend": name,
-                "available": report.available,
-                "detail": report.detail,
-                "capabilities": backend.capabilities(),
-                // §17: the adapter's declared runtime scope, recorded with
-                // the probe because it is a claim about the adapter, and the
-                // core is forbidden from assuming one.
-                "runtime_scope": backend.runtime_scope(),
-            });
-            (name, Some(payload))
+            tokio::task::spawn_blocking(move || {
+                let Some(backend) = backends.get(&name) else {
+                    return (name, None);
+                };
+                let report = backend.probe();
+                // `capabilities()` is read here, inside the blocking task,
+                // and not on the runtime: for the opencode and agy adapters
+                // it resolves the transport, which is itself a subprocess
+                // gate, and for Claude it reads a claim the probe may have
+                // withdrawn.
+                let payload = json!({
+                    "backend": name,
+                    "available": report.available,
+                    "detail": report.detail,
+                    "capabilities": backend.capabilities(),
+                    // §17: the adapter's declared runtime scope, recorded
+                    // with the probe because it is a claim about the adapter,
+                    // and the core is forbidden from assuming one.
+                    "runtime_scope": backend.runtime_scope(),
+                });
+                (name, Some(payload))
+            })
+            .await
         });
     }
     while let Some(joined) = walking.join_next().await {
-        let (name, payload) = match joined {
+        let (name, payload) = match joined.and_then(|probed| probed) {
             Ok(probed) => probed,
             Err(e) => {
                 // A panicked probe takes its own name with it, so nothing
@@ -1220,10 +1293,12 @@ async fn probe_walk(
             }
         };
         let Some(payload) = payload else {
-            // The backend left the registry between scheduling and running,
-            // which nothing does today — but a name owed a record and never
-            // getting one must not wedge a submission.
-            tracing::warn!(backend = %name, "backend vanished from the registry before its probe");
+            // Either shutdown closed the lanes before this probe started, or
+            // the backend left the registry between scheduling and running
+            // (which nothing does today). Both leave a name owed a record it
+            // will never get, and neither may wedge a submission waiting on
+            // it — so the gate is released without one.
+            tracing::debug!(backend = %name, "backend probe skipped; no evidence recorded");
             gate.mark(&name);
             continue;
         };
@@ -1469,6 +1544,9 @@ pub async fn run_until_signal(data_dir: &Path, rebuild_cache: bool) -> Result<()
             surfaces_root,
             turn_cap,
             rebuild_cache,
+            // The signal loop below must be able to answer SIGTERM while the
+            // probe walk is still running — see the field's own doc (#293).
+            await_probe_walk: false,
             ..DaemonConfig::default()
         },
     )

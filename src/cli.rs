@@ -621,7 +621,26 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(dispatch(sgt)) {
+    let outcome = runtime.block_on(dispatch(sgt));
+    // Dropping a runtime waits, unboundedly, for every blocking task that has
+    // started — and `dispatch` has already returned, so anything still inside
+    // one is a straggler whose answer nothing is left to read. That was
+    // harmless until #293 put the daemon's backend probe walk on the blocking
+    // pool: a daemon SIGTERMed inside its startup window has already journaled
+    // `daemon.stopped` and retired its descriptor (`daemon::start_with`'s
+    // shutdown tail bounds that) but could not *exit* until its in-flight
+    // `--help` child processes returned — measured on Cerberus 2026-08-25 at
+    // 13.7s under an eighteen-daemon burst, well past the ten seconds a
+    // supervisor gives a SIGTERMed process before escalating to SIGKILL.
+    //
+    // The bound introduces no hazard that was not already there, which is what
+    // makes it the right lever rather than a shortcut: the thing it gives up —
+    // a probe child still running when its parent goes — is precisely what the
+    // SIGKILL it replaces already did, and this way the process leaves by
+    // itself, with its exit code intact and everything registered at exit
+    // (coverage profiles included) actually flushed.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(CliError(message)) if message.is_empty() => ExitCode::FAILURE,
         Err(e) => {
