@@ -477,6 +477,16 @@ pub struct RetainedStageOutput {
     pub path: PathBuf,
     /// Total bytes copied.
     pub bytes: u64,
+    /// The stage's declared disposition (F-IN-02): the *same* ground truth
+    /// [`finalize_sweep`]'s clean-teardown path reads via
+    /// [`crate::domain::workflow::declared_output_disposition`], so a
+    /// `Promote`-class stage this copy is preserving because the worktree is
+    /// about to be force-removed reads as `Promote` here too, rather than
+    /// being silently folded into the `Evidence` label every stage used to
+    /// get regardless of what it actually declared. `Evidence` when no
+    /// workflow package was available to read a disposition from at all
+    /// (`workflow_source: None`), matching §1a's "silence promotes nothing".
+    pub disposition: crate::domain::workflow::OutputDisposition,
 }
 
 /// What happened to one binding at teardown.
@@ -853,7 +863,7 @@ fn materialize_with(
                     root,
                     bindings,
                 };
-                let report = teardown(data_dir, &partial);
+                let report = teardown(data_dir, &partial, None);
                 return Err(SurfaceError::PartialFailure {
                     source: Box::new(err),
                     teardown: report,
@@ -1207,7 +1217,7 @@ pub fn attach(
                     root,
                     bindings,
                 };
-                let report = teardown(data_dir, &partial);
+                let report = teardown(data_dir, &partial, None);
                 return Err(SurfaceError::PartialFailure {
                     source: Box::new(err),
                     teardown: report,
@@ -1312,7 +1322,11 @@ fn attach_one(
 ///
 /// `data_dir` locates the interprocess repository locks, exactly as in
 /// [`materialize`].
-pub fn teardown(data_dir: &Path, surface: &WorkSurface) -> TeardownReport {
+pub fn teardown(
+    data_dir: &Path,
+    surface: &WorkSurface,
+    workflow_source: Option<&Path>,
+) -> TeardownReport {
     let mut bindings = Vec::with_capacity(surface.bindings.len());
     let mut drift = Vec::new();
     for binding in &surface.bindings {
@@ -1320,7 +1334,7 @@ pub fn teardown(data_dir: &Path, surface: &WorkSurface) -> TeardownReport {
         // touches anything, so `observed` is the estate as the Work left it
         // rather than as teardown left it.
         drift.extend(observe_estate_drift(binding));
-        let outcome = teardown_binding(data_dir, binding);
+        let outcome = teardown_binding(data_dir, binding, workflow_source);
         bindings.push(BindingTeardown {
             repository: binding.repository.clone(),
             worktree_path: binding.worktree_path.clone(),
@@ -1364,9 +1378,11 @@ pub struct RetainedBinding {
     /// `retained_dirty` or `retained_error` — the same bare-tag spelling
     /// `sgt work show`'s output pointer already uses, so a client never has
     /// to reconcile two vocabularies for the same fact. `retained_output`
-    /// (#240) is the one tag with no such counterpart: it names a
-    /// per-stage `output/` artifact copy, not a teardown disposition on
-    /// its own.
+    /// (#240) and `retained_promote` (F-IN-02) are the two tags with no such
+    /// counterpart: both name a per-stage `output/` artifact copy rather
+    /// than a teardown disposition on its own, split by the stage's own
+    /// declared `Evidence`/`Promote` disposition so a `Promote`-class copy
+    /// is never mistaken for mere evidence.
     pub reason: &'static str,
     /// The evidence teardown recorded: `git status --porcelain` output for
     /// `retained_dirty`, Git's own diagnostic for `retained_error`.
@@ -1471,6 +1487,13 @@ fn retained_bindings_for(b: &BindingTeardown) -> Vec<RetainedBinding> {
 /// `reason: "retained_output"` — a distinct tag from `"retained_dirty"`
 /// so a reader (or `sgt work retained`'s own rendering) can tell a
 /// per-stage evidence copy apart from the flat patch it sits alongside.
+///
+/// F-IN-02: a `Promote`-class stage gets its own `"retained_promote"` tag
+/// rather than sharing `"retained_output"` with `Evidence`-class stages —
+/// this copy exists only because the worktree that would otherwise have
+/// carried it on the branch was force-removed, and a reader must be able to
+/// tell "this is evidence" from "this is the deliverable that would have
+/// shipped" without cross-referencing the workflow package itself.
 fn retained_output_bindings(
     b: &BindingTeardown,
     outputs: &[RetainedStageOutput],
@@ -1481,7 +1504,10 @@ fn retained_output_bindings(
         .map(|o| RetainedBinding {
             repository: b.repository.clone(),
             path: o.path.clone(),
-            reason: "retained_output",
+            reason: match o.disposition {
+                crate::domain::workflow::OutputDisposition::Promote => "retained_promote",
+                crate::domain::workflow::OutputDisposition::Evidence => "retained_output",
+            },
             detail: format!("stage {} declared output/ artifacts", o.stage),
             bytes: o.bytes,
         })
@@ -1738,7 +1764,11 @@ fn prune_stale_worktrees(source: &Path) {
 /// disk does this remove the worktree, and only with `--force` — safe here
 /// specifically because everything `git status --porcelain` just reported
 /// has already been captured.
-fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposition {
+fn retain_dirty(
+    binding: &RepositoryBinding,
+    changes: String,
+    workflow_source: Option<&Path>,
+) -> BindingDisposition {
     if binding.worktree_path.join(".gitmodules").exists() {
         return BindingDisposition::RetainedDirty {
             changes,
@@ -1757,7 +1787,7 @@ fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposit
     // worktree in this same before-removal window the patch capture just
     // used — the worktree's files are still on disk (git add/diff never
     // remove anything), and this is the last point at which they are.
-    let outputs = retain_stage_outputs(binding);
+    let outputs = retain_stage_outputs(binding, workflow_source);
     let path = binding.worktree_path.display().to_string();
     // The patch is already durable regardless of what happens next, so
     // nothing captured can be lost. But if the worktree removal below fails,
@@ -1807,7 +1837,21 @@ fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposit
 /// one [`RetainedStageOutput`] per stage directory that actually had a
 /// real (non-`README.md`) file to copy; a stage whose `output/` is empty
 /// or holds only its own declaration is not reported.
-fn retain_stage_outputs(binding: &RepositoryBinding) -> Vec<RetainedStageOutput> {
+///
+/// F-IN-02: `workflow_source` is read here for the *same* reason
+/// [`finalize_sweep`] reads it on the clean-teardown path — a stage's
+/// declared `**Disposition:**` (`Promote` vs `Evidence`) governs what this
+/// copy means, not just whether one is made. A dirty teardown still forces
+/// the worktree itself away (`git worktree remove --force` in
+/// [`retain_dirty`]), so a `Promote`-class stage's artifacts are copied out
+/// here exactly like an `Evidence`-class stage's — there is nowhere else
+/// for them to survive — but the returned [`RetainedStageOutput`] carries
+/// its real disposition so a caller never reads a promoted deliverable back
+/// as mere evidence (never "silently demoted").
+fn retain_stage_outputs(
+    binding: &RepositoryBinding,
+    workflow_source: Option<&Path>,
+) -> Vec<RetainedStageOutput> {
     let Some(surface_root) = binding.worktree_path.parent() else {
         return Vec::new();
     };
@@ -1831,10 +1875,16 @@ fn retain_stage_outputs(binding: &RepositoryBinding) -> Vec<RetainedStageOutput>
         let dest = dest_root.join(stage_name);
         let bytes = copy_declared_output_artifacts(&output_dir, &dest, &binding.worktree_path);
         if bytes > 0 {
+            let disposition = workflow_source
+                .map(|source| {
+                    crate::domain::workflow::declared_output_disposition(source, stage_name)
+                })
+                .unwrap_or(crate::domain::workflow::OutputDisposition::Evidence);
             outputs.push(RetainedStageOutput {
                 stage: stage_name.to_string(),
                 path: dest,
                 bytes,
+                disposition,
             });
         } else {
             // Nothing real was copied (empty dir, or only README.md) —
@@ -1997,6 +2047,7 @@ pub fn finalize_sweep(
             stage: stage_name.to_string(),
             path: dest,
             bytes,
+            disposition: crate::domain::workflow::OutputDisposition::Evidence,
         });
         swept_stage_dirs.push(output_dir);
     }
@@ -2234,7 +2285,11 @@ fn observe_estate_drift(binding: &RepositoryBinding) -> Option<EstateDriftObserv
     })
 }
 
-fn teardown_binding(data_dir: &Path, binding: &RepositoryBinding) -> BindingOutcome {
+fn teardown_binding(
+    data_dir: &Path,
+    binding: &RepositoryBinding,
+    workflow_source: Option<&Path>,
+) -> BindingOutcome {
     // One lock identity for this whole teardown, resolved before any span
     // opens — from the binding's own admission record when it has one, so the
     // lock released here is the lock materialization took.
@@ -2388,10 +2443,11 @@ fn teardown_binding(data_dir: &Path, binding: &RepositoryBinding) -> BindingOutc
             // rewriting this registry right now. Fail closed exactly as an
             // unanswerable `git status` does below — retained, with the
             // refusal itself as the recorded evidence.
-            let disposition = with_repository(&gate, || retain_dirty(binding, changes))
-                .unwrap_or_else(|e| BindingDisposition::RetainedError {
-                    detail: e.to_string(),
-                });
+            let disposition =
+                with_repository(&gate, || retain_dirty(binding, changes, workflow_source))
+                    .unwrap_or_else(|e| BindingDisposition::RetainedError {
+                        detail: e.to_string(),
+                    });
             return BindingOutcome {
                 disposition,
                 final_sha,
@@ -2602,7 +2658,7 @@ mod tests {
 
     /// [`teardown`] against the data dir this fixture surface belongs to.
     fn teardown_of(surface: &WorkSurface) -> TeardownReport {
-        teardown(fixture_data_dir(surface), surface)
+        teardown(fixture_data_dir(surface), surface, None)
     }
 
     /// [`rematerialize`] against the data dir this fixture surface belongs to.
@@ -2674,7 +2730,7 @@ mod tests {
                                 std::slice::from_ref(&spec),
                             )
                             .unwrap_or_else(|e| panic!("materialize {work_id}: {e}"));
-                            teardown(&data, &surface)
+                            teardown(&data, &surface, None)
                         })
                     })
                     .collect();
@@ -2898,7 +2954,7 @@ mod tests {
             "and never inside the user's checkout (§6.2 / surface doctrine)"
         );
 
-        let report = teardown(&data, &surface);
+        let report = teardown(&data, &surface, None);
         assert!(report.clean, "teardown across split roots: {report:?}");
     }
 
@@ -3985,7 +4041,7 @@ mod tests {
         assert_eq!(replayed.bindings[0].canonical_common_dir, None);
         assert_eq!(replayed.bindings[0].origin, BindingOrigin::Cut);
 
-        let report = teardown(data.path(), &replayed);
+        let report = teardown(data.path(), &replayed, None);
         assert!(
             report.clean,
             "a surface replayed from an old payload still tears down cleanly: {report:?}"
@@ -5264,6 +5320,112 @@ mod tests {
         assert!(
             bindings.iter().any(|b| b.reason == "retained_dirty"),
             "the flat patch must still be reported alongside it: {bindings:?}"
+        );
+    }
+
+    /// F-IN-02: `retain_dirty`/`retain_stage_outputs` must read the same
+    /// declared `Promote`/`Evidence` disposition the clean-path
+    /// `finalize_sweep` already honors, not copy every stage's output into
+    /// the same undifferentiated "evidence" bucket. A dirty teardown with
+    /// one `evidence`-class artifact and one explicit `promote`-class
+    /// artifact must retain both, each labeled by its own real disposition
+    /// — the promote-class one never silently demoted to evidence.
+    #[test]
+    fn dirty_teardown_labels_promote_class_output_distinctly_from_evidence() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01DISPOSITION",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        // `20-panel` never declares a disposition in the workflow package
+        // below — §1a's default applies (`evidence`).
+        let panel_output = worktree.join("20-panel").join("output");
+        std::fs::create_dir_all(&panel_output).expect("panel output dir");
+        std::fs::write(panel_output.join("findings.md"), "four-axis findings")
+            .expect("panel artifact");
+
+        // `30-ship` is declared `promote` in the workflow package.
+        let ship_output = worktree.join("30-ship").join("output");
+        std::fs::create_dir_all(&ship_output).expect("ship output dir");
+        std::fs::write(ship_output.join("deliverable.md"), "the actual deliverable")
+            .expect("ship artifact");
+
+        let workflow_source = dir.path().join("workflow-package");
+        let ship_readme_dir = workflow_source.join("30-ship").join("output");
+        std::fs::create_dir_all(&ship_readme_dir).expect("declared output dir");
+        std::fs::write(
+            ship_readme_dir.join("README.md"),
+            "**Expected artifact:** `deliverable.md` — ships with the Work.\n\n\
+             **Disposition:** `promote`\n",
+        )
+        .expect("output/README.md");
+
+        // Also touch a tracked file so the worktree is dirty and teardown
+        // takes the `RetainedDirty` path at all.
+        std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
+
+        let report = teardown(fixture_data_dir(&surface), &surface, Some(&workflow_source));
+        let BindingDisposition::RetainedDirty { outputs, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        assert_eq!(outputs.len(), 2, "{outputs:?}");
+
+        let panel = outputs
+            .iter()
+            .find(|o| o.stage == "20-panel")
+            .expect("panel output retained");
+        assert_eq!(
+            panel.disposition,
+            crate::domain::workflow::OutputDisposition::Evidence
+        );
+        let ship = outputs
+            .iter()
+            .find(|o| o.stage == "30-ship")
+            .expect("ship output retained");
+        assert_eq!(
+            ship.disposition,
+            crate::domain::workflow::OutputDisposition::Promote,
+            "F-IN-02: a Promote-class stage's dirty-teardown copy must carry its real \
+             disposition, never be silently demoted to evidence: {outputs:?}"
+        );
+
+        // Both are retrievable, byte for byte.
+        assert_eq!(
+            std::fs::read_to_string(panel.path.join("findings.md")).expect("panel artifact"),
+            "four-axis findings"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ship.path.join("deliverable.md")).expect("ship artifact"),
+            "the actual deliverable"
+        );
+
+        // The read side (`sgt work retained`) must label them distinctly
+        // too — the promote-class copy tagged apart from ordinary evidence.
+        let bindings = retained_bindings(&report);
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.reason == "retained_output" && b.path == panel.path),
+            "the evidence-class copy must be tagged retained_output: {bindings:?}"
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.reason == "retained_promote" && b.path == ship.path),
+            "the promote-class copy must be tagged retained_promote, distinct from \
+             evidence: {bindings:?}"
         );
     }
 

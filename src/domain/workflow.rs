@@ -1166,7 +1166,8 @@ pub(crate) fn has_required_table_columns(text: &str, required: &[String]) -> boo
 /// semantics") — `promote` survives the sweep into the Work branch's
 /// shipped history, `evidence` is retained as Work evidence and removed
 /// from the worktree in the finalize commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OutputDisposition {
     /// Ships: left in the worktree, part of what the Work branch merges.
     Promote,

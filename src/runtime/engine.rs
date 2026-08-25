@@ -711,7 +711,7 @@ impl PendingSurface {
                     .iter()
                     .map(|binding| finalize_sweep(binding, source))
                     .collect();
-                SurfaceOutcome::TornDown(teardown(&self.data_dir, surface), sweeps)
+                SurfaceOutcome::TornDown(teardown(&self.data_dir, surface, source), sweeps)
             }
         }
     }
@@ -2731,6 +2731,18 @@ impl Engine {
     /// attempt) or a `needs_input` park named `stage_output_missing`
     /// (second miss), recoverable through the ordinary respond/retry/cancel
     /// surface exactly like any other `needs_input`.
+    ///
+    /// F-SF-05: the second-miss refusal below calls `self.commit` then
+    /// `self.transition` directly — not a distinct gate-only path, but the
+    /// exact pair every `BackendSignal` arm in `drive` above already uses.
+    /// `self.transition` is what enforces the §10 transition table (see
+    /// `the_transition_table_is_consulted_before_anything_is_appended`), so
+    /// this refusal is table-validated the same way `NeedsInput`/`Waiting`/
+    /// `Blocked`/`Failed` are, not a bypass of that mechanism. The
+    /// first-miss re-prompt below only calls `self.commit`, with no
+    /// `self.transition` — deliberately: it re-prompts the same actor
+    /// without leaving `active`, so there is no state change for the table
+    /// to validate.
     ///
     /// Deliberately reads the *current* `output/README.md` off disk rather
     /// than anything pinned in `workflow.bound` — the same filesystem-is-
