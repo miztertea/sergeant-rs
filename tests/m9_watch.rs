@@ -12,11 +12,20 @@
 //! test.
 //!
 //! **Every invocation in this suite runs from an estate root** (estate-root
-//! §4.1/§4.2). `watch`, `run`, `respond`, `cancel`, `work show` and `daemon`
-//! are all estate-scoped, and §4.3 puts the exact-root check ahead of
-//! descriptor lookup — so a test whose cwd is merely a git repository no
-//! longer reaches the behavior it means to pin at all; it collects §4.4's
-//! refusal instead. The fixtures are therefore [`support::scaffold_estate`]
+//! §4.1/§4.2), even though H1 (sprint-plan D6, brief deliverable 2) moved
+//! `watch` and `work show` into the host-scoped bucket alongside `daemon
+//! stop` — none of the three requires one any more
+//! (`r_watch_3_watch_against_a_dataless_dir_refuses_and_spawns_nothing`
+//! pins that directly). `run`/`respond`/`cancel` stay estate-scoped
+//! (H1 §11.3), and §4.3 puts their exact-root check ahead of descriptor
+//! lookup — so a test of *those* verbs whose cwd is merely a git repository
+//! no longer reaches the behavior it means to pin; it collects §4.4's
+//! refusal instead. Running host-scoped verbs from an estate root anyway is
+//! not wrong, just no longer required — cwd is still meaningful for
+//! `watch`'s own D6 default (an estate-wide watch inside an estate stays
+//! scoped to it, `--all` widens it), which is exactly why this suite keeps
+//! its estates rather than switching to bare directories. The fixtures are
+//! therefore [`support::scaffold_estate`]
 //! estates with derived `repos/<name>` mounts (§6.1), never bare
 //! `init_repo`'d temp dirs, and the daemon a `run` auto-spawns is bound to
 //! that one estate (§5.1) — which is why the scenarios below that need two
@@ -111,13 +120,16 @@ impl Output {
 /// work submitted, no state transitions to race a freshly attached watch
 /// against) has to start it this way instead.
 ///
-/// `-C <estate>` is what binds it (§5.1): `sgt daemon` is itself
-/// estate-scoped, and a daemon started with no estate would plan against
-/// nothing — but more to the point here, the client that later attaches
-/// checks `descriptor.estate_root` against its own resolved root, so a
-/// daemon bound to a different estate (or to none) is refused rather than
-/// used. `-C` names it explicitly instead of relying on this child's cwd,
-/// exactly as `spawn_daemon` in `src/cli.rs` does.
+/// **`-C <estate>` is now purely informational (H1, `is_host_scoped`).**
+/// Before H1 this named the one estate the daemon would ever serve, and a
+/// later client's own resolved root was checked against exactly that
+/// binding. A v3 descriptor carries no estate at all (D3): every estate a
+/// daemon started this way ever serves is admitted per-request, over the
+/// wire, the first time a client addresses it — `-C` here does nothing a
+/// bare `sgt daemon --data-dir <dir> daemon` would not also do. It is kept
+/// only because several call sites below reuse `estate` for the `sgt`
+/// helper's own admitted-root arguments elsewhere in this file, not because
+/// this spawn needs it.
 ///
 /// `DataDir`'s own Drop reaps this by /proc scan (SIGTERM, then SIGKILL) —
 /// never by waiting on this `Child`.
@@ -983,17 +995,23 @@ fn r_watch_2_a_repeated_identical_question_does_not_re_emit() {
 // ---------------------------------------------------------------------------
 
 /// R-WATCH-3: inverse of `m2_daemon_api.rs`'s
-/// `t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed` — a data
-/// dir with zero daemons gets a refusal naming the remedy, exit nonzero, and
-/// the process table proves nothing was spawned.
+/// `t7_cli_end_to_end_a_second_estate_is_admitted_and_a_second_process_fails_closed`
+/// — a data dir with zero daemons gets a refusal naming the remedy, exit
+/// nonzero, and the process table proves nothing was spawned.
 ///
-/// Both refusal *causes* are pinned here, because §4.3 reorders them and the
-/// no-spawn promise has to survive either one. From a valid estate root the
-/// refusal is still `observe_connect`'s: there is no descriptor, and an
-/// observation verb declines to make one. From a directory that is not an
-/// estate root the refusal comes even earlier — root admission precedes
-/// descriptor lookup, so `sgt watch` never even learns whether a daemon
-/// exists — and the process table must be just as empty afterward.
+/// **Re-scoped for H1 (sprint-plan D6, brief deliverable 2): `watch` moved
+/// into the host-scoped bucket.** Before H1 this pinned *two different*
+/// refusal causes at two different gates — root admission (§4.3, before any
+/// descriptor lookup) from a non-estate directory, and `observe_connect`'s
+/// own "no daemon" from a valid one — because `watch` required an exact
+/// estate root to even attempt daemon discovery. `is_host_scoped` retires
+/// that requirement for exactly this verb: `sgt watch` never admits a root
+/// at all now, so both directories below reach the *same* gate
+/// (`observe_connect`) and the *same* refusal. What survives unchanged is
+/// the property this test actually exists to prove — the no-spawn
+/// guarantee — and it is stronger evidence of it than before: two cwds that
+/// used to fail closed for two unrelated reasons now fail closed for the
+/// identical one, which is what "host-scoped, no estate required" means.
 #[test]
 fn r_watch_3_watch_against_a_dataless_dir_refuses_and_spawns_nothing() {
     let data = DataDir::new();
@@ -1022,23 +1040,23 @@ fn r_watch_3_watch_against_a_dataless_dir_refuses_and_spawns_nothing() {
         "sgt watch must never have spawned a daemon"
     );
 
-    // §4.3/§4.4: the same no-spawn guarantee one gate earlier. `repos/solo`
-    // is a real git checkout *inside* a real estate — precisely what the
-    // deleted upward walk and git fallback used to admit — and it is refused
-    // with §4.4's first line, having touched no descriptor.
+    // H1 §5: `repos/solo` — a real git checkout *inside* a real estate, not
+    // itself an estate root — no longer hits the root gate at all for this
+    // host-scoped verb. It reaches exactly the same daemon-discovery
+    // refusal the estate root above did, having admitted no root and
+    // consulted no `sergeant.toml`.
     let mount = estate.path().join("repos").join("solo");
     let outside = sgt(&mount, &data, &["watch", "01SOMENONEXISTENTWORKID000"]);
     assert_ne!(outside.code, Some(0), "must exit nonzero: {outside:?}");
     assert!(
-        outside
-            .stderr
-            .contains("no estate found in the current directory"),
-        "§4.4's own first line, not a daemon diagnostic: {}",
+        outside.stderr.contains("no daemon is running for"),
+        "host-scoped: a non-estate cwd must reach the same daemon-discovery refusal as an \
+         estate root, never §4.4's root-gate text: {}",
         outside.stderr
     );
     assert!(
         data.daemon_pids().is_empty(),
-        "a root refusal must spawn nothing either — it happens before descriptor lookup"
+        "a non-estate cwd must spawn nothing either — `watch` never auto-spawns, root or not"
     );
 
     data.reap();

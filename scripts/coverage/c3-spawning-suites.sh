@@ -31,6 +31,15 @@ cov_run cargo llvm-cov --no-report --test m6_surfaces --locked || cov_fail "m6_s
 cov_stage_end 2 "m6 spawns daemons (TUI, doctor) and runs scripts/demo.sh; more than the test \
 binary's own profile must arrive, or no subprocess flushed"
 
+# Added with H1 W3 (lazy admission + host-scoped verbs): every test in this
+# suite spawns a real daemon (and, for the watch tests, a second `sgt watch`
+# client left running concurrently) — it belongs beside m2/m6, not in C2's
+# no-daemon-of-its-own bucket.
+cov_stage_begin c3-w3_client_surface
+cov_run cargo llvm-cov --no-report --test w3_client_surface --locked || cov_fail "w3_client_surface failed under instrumentation"
+cov_stage_end 2 "w3_client_surface spawns a daemon (and, in the watch tests, a second sgt client) \
+in every test; more than the test binary's own profile must arrive, or no subprocess flushed"
+
 # Added 2026-08-19 alongside C2's five, closing the same accounting gap: this
 # suite existed but no stage script invoked it, so backend/docker.rs's real
 # coverage never reached the report.

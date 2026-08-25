@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -248,13 +249,23 @@ fn normalize_whitespace(s: &str) -> String {
 // The watch loop
 // ---------------------------------------------------------------------------
 
-/// `sgt watch [WORK_ID] [--follow]`'s parsed options (proposal §13.1).
+/// `sgt watch [WORK_ID] [--follow] [--all]`'s parsed options (proposal
+/// §13.1; `estate_root` added by H1 sprint-plan D6, brief deliverable 3).
 #[derive(Debug, Clone)]
 pub struct WatchOptions {
     /// The Work to scope to, or `None` for an estate-wide watch.
     pub work_id: Option<String>,
     /// Whether to remain attached after a nonterminal match (§6.4).
     pub follow: bool,
+    /// D6: restrict the SSE stream to one estate's events, by canonical
+    /// exact root — matched server-side against each event's own
+    /// `workspace_id` coordinate (D1). `None` is host-wide: every admitted
+    /// estate's events, the only meaning this field could have before H1
+    /// (a single-estate daemon's journal held nothing else). The CLI is
+    /// what decides *which* this is for a given invocation (cwd/`-C`
+    /// default, `--all` override) — this module only carries the already-
+    /// decided filter through to the stream.
+    pub estate_root: Option<PathBuf>,
 }
 
 /// Why a completed [`watch`] call returned.
@@ -333,7 +344,13 @@ pub async fn watch(
     let head = system["journal_head"].as_u64().unwrap_or(0);
 
     // 2. Attach the stream before any Work read (§8.1 step 2, §8.2 step 2).
-    let mut stream = client.stream_events(head).await?;
+    // D6: the estate filter rides the same request as `head` — never
+    // client-side post-filtering, which would require every event to carry
+    // an estate coordinate the pre-envelope journal does not (recon-api-
+    // clients touch point 6).
+    let mut stream = client
+        .stream_events(head, options.estate_root.as_deref())
+        .await?;
 
     // R-WATCH-6's test-only rendezvous — zero-cost no-op unless the test
     // process set SGT_WATCH_TEST_HOLD.

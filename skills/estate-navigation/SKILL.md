@@ -55,9 +55,12 @@ group", "set up this estate", "file a ticket for a missing prerequisite").
    permission mode, and — inside an estate — the manifest's own health, the
    declared workflow catalog, a cheap Git-surface summary of active and
    retained worktrees/patches and terminal-dirty Works, and disk pressure).
-   It is one of the four surfaces that work outside an estate at all
-   (`sgt --help`, `--version`, `sgt init`, `sgt doctor`), so it can also
-   answer "am I anywhere near an estate?" before anything else is tried.
+   It is one of the surfaces that work outside an estate at all
+   (`sgt --help`, `--version`, `sgt init`, `sgt doctor`, plus the
+   host-scoped bucket — `sgt status`, `sgt tui`, `sgt work show`/`list`/
+   `transcript`, `sgt watch`, every `sgt daemon` verb — H1 §5), so it can
+   also answer "am I anywhere near an estate?" before anything else is
+   tried.
 3. `sgt repo list` — every declared `[[repo]]`: name, local path, instruction
    policy, origin, and upstream.
 4. `sgt group list` — every declared `[group.<name>]` and its members, if the
