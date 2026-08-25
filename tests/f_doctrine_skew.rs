@@ -581,16 +581,40 @@ fn agents_md_states_the_ratified_mutation_surface_contract() {
 // ------------------------------------------------ 7. citation-integrity skew
 //
 // split-hardening W2c made this repo product-documents-only: NORTH-STAR.md,
-// GAUNTLET.md, LESSONS.md, and the docs/ tree (except the handful of items
-// re-homed into assets/ and CONTRIBUTING.md) are gone, their content already
-// verified and pushed to the sergeant-rs-workspace knowledge library. A
-// leftover path-like reference to any of them is a dangling citation, not
-// live doctrine — this sweeps the surfaces a contributor or an agent
-// actually reads for exactly that. Excludes `CHANGELOG.md` (an append-only
-// ledger this wave does not edit).
+// GAUNTLET.md, LESSONS.md, and the internal-process docs/ tree that had
+// accumulated (ADRs-as-working-notes, proposals, perf baselines, coverage
+// dumps, ICM convention drafts, handoff checklists — except the handful of
+// items re-homed into assets/ and CONTRIBUTING.md) are gone, their content
+// already verified and pushed to the sergeant-rs-workspace knowledge
+// library. A leftover path-like reference to any of them is a dangling
+// citation, not live doctrine.
+//
+// docs/ itself has since been reintroduced as the product manual (a
+// getting-started/concepts/guides/reference tree, not a development-process
+// archive) — a bare `docs/` needle would now misfire on every legitimate
+// citation to it, so this checks the specific removed-content subpaths
+// instead, mirroring `no_embedded_skill_or_workflow_file_cites_a_removed_
+// or_workspace_only_path`'s already-narrow needle set below. Excludes
+// `CHANGELOG.md` (an append-only ledger this wave does not edit).
 #[test]
 fn no_readme_contributing_src_test_or_workflow_file_cites_a_removed_path() {
-    const NEEDLES: &[&str] = &["NORTH-STAR.md", "GAUNTLET.md", "LESSONS.md", "docs/"];
+    const NEEDLES: &[&str] = &[
+        "NORTH-STAR.md",
+        "GAUNTLET.md",
+        "LESSONS.md",
+        "docs/icm/",
+        "docs/adr/",
+        "docs/DEVELOPMENT.md",
+        "docs/environments/",
+        "docs/proposals/",
+        "docs/perf/",
+        "docs/coverage/",
+        "docs/handoff/",
+        "docs/measure-dist",
+        "docs/gauntlet/",
+        "docs/glossary.md",
+        "docs/version-policy.md",
+    ];
 
     let mut roots = vec![
         repo_root().join("README.md"),

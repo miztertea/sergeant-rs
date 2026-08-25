@@ -25,10 +25,9 @@ every Work its own git worktree and a declared mutation surface —
 authorization, not a seal — and runs submitted intents to completion
 against it, journaling what it can prove happened outside that surface
 as dirty evidence at retirement rather than silently absorbing it
-(the North Star ruling's amended destination text, #180). The full
-destination and the rulings behind it are the North Star ruling, now kept
-kept in this project's private development record — read it before changing
-anything here.
+(the North Star ruling's amended destination text, #180). This public
+constitution is the complete operating contract; historical rationale may
+live elsewhere, but no private record is required to apply it.
 
 Sergeant is designed for one developer per installation: adoption by a
 larger organization means each developer clones and installs
@@ -38,8 +37,8 @@ service.
 Documentation is layered by ownership: this file owns always-on operating
 policy for any harness acting in an estate; `.sergeant/workflows/*/index.md`
 and `SKILL.md` files own trigger-specific procedure; `CONTRIBUTING.md`
-owns the rules for changing sergeant-rs's own code; `README.md` owns
-install/quickstart. When two sources disagree about a behavior, the one
+owns the rules for changing sergeant-rs's own code; `README.md` owns the
+product front door; `docs/` owns the human product manual. When two sources disagree about a behavior, the one
 that owns that topic wins.
 
 ## Session start

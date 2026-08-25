@@ -80,12 +80,11 @@ A handful of terms this repo's docs and code use precisely:
 - **Integrity Disposition** — the `clean`/`dirty` axis riding beside a
   terminal Work's state, reported and never blocking a transition.
 
-## Where the deeper rules live
+## Documentation ownership
 
-This file is deliberately small: build, test, gate, and pin at the depth a
-new contributor needs on day one. The full architecture invariants, session
-conduct notes, per-host environment records, deviation register, and
-glossary this repo used to carry directly now live in the
-`sergeant-rs-workspace` knowledge library (`knowledge/rulings/` and
-`knowledge/evidence/`) — read there for the complete history and rationale
-behind any rule summarized above.
+This file is the complete normative build, test, gate, and pull-request
+contract for public contributors. [Product documentation](docs/index.md)
+owns released behavior and extension contracts; `AGENTS.md` owns Captain's
+estate policy. Maintainer history and experimental evidence may exist
+elsewhere, but no contribution may be rejected for violating an inaccessible
+or undocumented rule.
