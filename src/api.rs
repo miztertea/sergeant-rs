@@ -1669,6 +1669,15 @@ async fn submit_work(
     let work_id = work.id.clone();
     let mut draft = EventDraft::new(api_source(), KIND_WORK_SUBMITTED, json!({"work": work}))
         .with_work_id(&work_id);
+    // H1 touch point #4: `work.submitted` is the other emission point
+    // outside `Engine::commit` (`begin_start`'s later events go through
+    // that chokepoint and pick it up there). `plan` carries the estate this
+    // submission actually resolved against — `None` (no repository
+    // context offered) leaves the field absent, same as a Work that never
+    // reaches an estate at all.
+    if let Some(plan) = &plan {
+        draft = draft.with_workspace_id(plan.estate.root.to_string_lossy().into_owned());
+    }
     draft.correlation_id = Some(req.command_id.clone());
     if let Err(e) = core.commit(draft) {
         return internal_error(e);
@@ -5651,6 +5660,10 @@ mod tests {
             id: format!("evt-{seq}"),
             timestamp: rfc3339_utc_now(),
             source: EventSource::new("backend", "test"),
+            // Audited (H1 touch point #4): this fixture exercises
+            // `transcript_turns`, which reads only `work_id`/`kind`/
+            // `payload` — never estate-bound, so there is nothing to
+            // populate here.
             workspace_id: None,
             work_id: Some(work_id.to_string()),
             execution_id: execution_id.map(str::to_string),
@@ -6071,6 +6084,12 @@ mod tests {
                     id: format!("evt-{seq}"),
                     timestamp: rfc3339_utc_now(),
                     source: draft.source,
+                    // Audited (H1 touch point #4): mirrors whatever the
+                    // backend's own draft carried rather than hardcoding
+                    // `None` — backend-emitted conversation events are
+                    // outside this chokepoint's scope (`Engine::commit`),
+                    // so nothing here should invent a value the adapter
+                    // never set.
                     workspace_id: draft.workspace_id,
                     work_id: draft.work_id,
                     execution_id: draft.execution_id,
