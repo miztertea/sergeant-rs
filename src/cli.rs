@@ -1295,6 +1295,8 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         "distro_files_written": distro_outcome.written.len(),
                         "distro_files_already_present": distro_outcome.skipped.len(),
                         "distro_files_removed": distro_outcome.removed.len(),
+                        "distro_files_removed_paths": distro_outcome.removed,
+                        "distro_symlink_unavailable": distro_outcome.symlink_unavailable,
                         "changed": outcome.changed() || distro_outcome.changed(),
                     },
                     "doctor": report.to_json(),
@@ -1324,9 +1326,15 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         if !distro_outcome.removed.is_empty() {
                             println!(
                                 "  removed {} retired distro file(s) no longer shipped by this \
-                                 binary",
+                                 binary:",
                                 distro_outcome.removed.len()
                             );
+                            for path in &distro_outcome.removed {
+                                println!("    {}", path.display());
+                            }
+                        }
+                        if let Some(reason) = &distro_outcome.symlink_unavailable {
+                            println!("  CLAUDE.md symlink not created: {reason}");
                         }
                     }
                 } else {

@@ -44,7 +44,7 @@
 //! every init from the workflow packages actually written, rather than
 //! embedded as a fifth static copy that could itself drift (#261).
 
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -107,6 +107,13 @@ pub struct DistroWriteOutcome {
     /// sgt-owned tree but are not part of the current embed
     /// (retired-package cleanup, #241), relative to the estate root.
     pub removed: Vec<PathBuf>,
+    /// Set when creating the `CLAUDE.md -> AGENTS.md` symlink failed and
+    /// was swallowed (#241/#261 F-INV-06) — the underlying `io::Error`'s
+    /// message, so a caller (`sgt init`'s own report, doctor) can surface
+    /// *why* `CLAUDE.md` is absent instead of the failure disappearing
+    /// silently. `None` means the symlink was created, already existed, or
+    /// was never attempted.
+    pub symlink_unavailable: Option<String>,
 }
 
 impl DistroWriteOutcome {
@@ -188,36 +195,35 @@ fn write_agents_md(
     let full_path = estate_root.join(rel_path);
 
     let existing = match std::fs::read_to_string(&full_path) {
+        // An empty file has nothing to lose by treating it as absent — the
+        // `UnmanagedAgentsMd` guard exists to protect real hand-authored
+        // content, and `DistroError::UnmanagedAgentsMd`'s own doc says this
+        // fires when `AGENTS.md` "exists, is not empty" (#241/#261
+        // F-INV-05).
+        Ok(text) if text.is_empty() => None,
         Ok(text) => Some(text),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
 
-    let Some(existing) = existing else {
-        let managed = format!("{MANAGED_BEGIN}\n{AGENTS_MD}{MANAGED_END}\n");
-        write_atomic(&full_path, managed.as_bytes())?;
-        outcome.written.push(rel_path.to_path_buf());
-        return Ok(());
+    let rewritten = match existing {
+        None => format!("{MANAGED_BEGIN}\n{AGENTS_MD}{MANAGED_END}\n"),
+        Some(existing) => {
+            let (Some(begin_at), Some(end_at)) =
+                (existing.find(MANAGED_BEGIN), existing.find(MANAGED_END))
+            else {
+                return Err(DistroError::UnmanagedAgentsMd);
+            };
+            if end_at < begin_at {
+                return Err(DistroError::UnmanagedAgentsMd);
+            }
+            let before = &existing[..begin_at];
+            let after = &existing[end_at + MANAGED_END.len()..];
+            format!("{before}{MANAGED_BEGIN}\n{AGENTS_MD}{MANAGED_END}{after}")
+        }
     };
 
-    let (Some(begin_at), Some(end_at)) = (existing.find(MANAGED_BEGIN), existing.find(MANAGED_END))
-    else {
-        return Err(DistroError::UnmanagedAgentsMd);
-    };
-    if end_at < begin_at {
-        return Err(DistroError::UnmanagedAgentsMd);
-    }
-
-    let before = &existing[..begin_at];
-    let after = &existing[end_at + MANAGED_END.len()..];
-    let rewritten = format!("{before}{MANAGED_BEGIN}\n{AGENTS_MD}{MANAGED_END}{after}");
-
-    if rewritten == existing {
-        outcome.skipped.push(rel_path.to_path_buf());
-        return Ok(());
-    }
-    write_atomic(&full_path, rewritten.as_bytes())?;
-    outcome.written.push(rel_path.to_path_buf());
+    write_if_changed(&full_path, rel_path, rewritten.as_bytes(), outcome)?;
     Ok(())
 }
 
@@ -244,12 +250,15 @@ fn symlink_claude_md(estate_root: &Path, outcome: &mut DistroWriteOutcome) -> io
         Err(e) => return Err(e),
     }
 
-    if create_symlink(Path::new("AGENTS.md"), &full_path).is_ok() {
-        outcome.written.push(rel_path.to_path_buf());
+    match create_symlink(Path::new("AGENTS.md"), &full_path) {
+        Ok(()) => outcome.written.push(rel_path.to_path_buf()),
+        // Symlinks unsupported on this platform/filesystem (or any other
+        // symlink-creation fault): skip gracefully, per the owner ruling
+        // ("if the platform doesn't support symlinks, skip gracefully —
+        // don't fail init") — but record why, rather than swallowing it
+        // where nothing can see it (#241/#261 F-INV-06).
+        Err(e) => outcome.symlink_unavailable = Some(e.to_string()),
     }
-    // Symlinks unsupported on this platform/filesystem: skip gracefully,
-    // per the owner ruling ("if the platform doesn't support symlinks,
-    // skip gracefully — don't fail init").
     Ok(())
 }
 
@@ -281,7 +290,7 @@ fn sync_owned_dir(
     dir: &Dir<'static>,
     outcome: &mut DistroWriteOutcome,
 ) -> io::Result<()> {
-    let mut embedded_rel: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut embedded_rel: HashSet<PathBuf> = HashSet::new();
     write_owned_files(estate_root, prefix, dir, &mut embedded_rel, outcome)?;
     remove_retired_files(estate_root, prefix, &embedded_rel, outcome)?;
     Ok(())
@@ -297,7 +306,7 @@ fn write_owned_files(
     estate_root: &Path,
     prefix: &Path,
     dir: &Dir<'static>,
-    embedded_rel: &mut BTreeSet<PathBuf>,
+    embedded_rel: &mut HashSet<PathBuf>,
     outcome: &mut DistroWriteOutcome,
 ) -> io::Result<()> {
     for file in dir.files() {
@@ -337,8 +346,24 @@ fn write_owned_file(
         contents
     };
 
-    if let Ok(existing) = std::fs::read(&full_path)
-        && existing == final_bytes
+    write_if_changed(&full_path, rel_path, final_bytes, outcome)
+}
+
+/// Write `contents` to `full_path` (recorded under `rel_path` in `outcome`)
+/// only if it differs from what is already there byte for byte — creating
+/// any missing parent directories first when it does. Shared tail for
+/// `write_agents_md`, `write_owned_file`, and `write_index_md`, which each
+/// independently hand-duplicated this same
+/// read-existing/compare/write-if-different/record-outcome shape
+/// (#241/#261 F-SI-01).
+fn write_if_changed(
+    full_path: &Path,
+    rel_path: &Path,
+    contents: &[u8],
+    outcome: &mut DistroWriteOutcome,
+) -> io::Result<()> {
+    if let Ok(existing) = std::fs::read(full_path)
+        && existing == contents
     {
         outcome.skipped.push(rel_path.to_path_buf());
         return Ok(());
@@ -346,7 +371,7 @@ fn write_owned_file(
     if let Some(parent) = full_path.parent() {
         create_dir_all_durable(parent)?;
     }
-    write_atomic(&full_path, final_bytes)?;
+    write_atomic(full_path, contents)?;
     outcome.written.push(rel_path.to_path_buf());
     Ok(())
 }
@@ -363,60 +388,56 @@ fn write_owned_file(
 fn remove_retired_files(
     estate_root: &Path,
     prefix: &Path,
-    embedded_rel: &BTreeSet<PathBuf>,
+    embedded_rel: &HashSet<PathBuf>,
     outcome: &mut DistroWriteOutcome,
 ) -> io::Result<()> {
     let owned_root = estate_root.join(prefix);
-    let mut on_disk = Vec::new();
-    walk_files(&owned_root, &mut on_disk);
+    remove_retired_and_prune(&owned_root, estate_root, embedded_rel, outcome)
+}
 
-    for full_path in on_disk {
-        let rel_path = match full_path.strip_prefix(estate_root) {
+/// One combined post-order pass over `dir`: delete every file not present
+/// in `embedded_rel`, then remove any subdirectory (including `dir`
+/// itself) left with nothing in it — previously two independent full
+/// recursive `read_dir` traversals of the same tree (`walk_files` then
+/// `prune_empty_dirs`), now one (#241/#261 F-SI-02). Directory pruning is
+/// cosmetic (an empty directory is harmless), but a retired package's
+/// directory disappearing along with its files is the less surprising
+/// result.
+fn remove_retired_and_prune(
+    dir: &Path,
+    estate_root: &Path,
+    embedded_rel: &HashSet<PathBuf>,
+    outcome: &mut DistroWriteOutcome,
+) -> io::Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            remove_retired_and_prune(&path, estate_root, embedded_rel, outcome)?;
+            if std::fs::read_dir(&path).is_ok_and(|mut e| e.next().is_none()) {
+                let _ = std::fs::remove_dir(&path);
+            }
+            continue;
+        }
+        let rel_path = match path.strip_prefix(estate_root) {
             Ok(rel) => rel.to_path_buf(),
             Err(_) => continue,
         };
         if !embedded_rel.contains(&rel_path) {
-            std::fs::remove_file(&full_path)?;
-            outcome.removed.push(rel_path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => outcome.removed.push(rel_path),
+                // A concurrent `sgt init` already removed this same retired
+                // file — benign race, not a fault (#241/#261 F-INV-04): the
+                // end state either process wants (the file gone) already
+                // holds.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
     }
-
-    prune_empty_dirs(&owned_root);
     Ok(())
-}
-
-/// Recursively list every file (never a directory) under `dir`.
-fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_files(&path, out);
-        } else {
-            out.push(path);
-        }
-    }
-}
-
-/// Remove `dir` and every subdirectory left with nothing in it after
-/// [`remove_retired_files`] deleted its files — cosmetic (an empty
-/// directory is harmless), but a retired package's directory disappearing
-/// along with its files is the less surprising result.
-fn prune_empty_dirs(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            prune_empty_dirs(&path);
-        }
-    }
-    if std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_none()) {
-        let _ = std::fs::remove_dir(dir);
-    }
 }
 
 /// Generate `.sergeant/index.md` from the workflow packages actually on
@@ -467,18 +488,7 @@ fn write_index_md(estate_root: &Path, outcome: &mut DistroWriteOutcome) -> io::R
 
     let rel_path = Path::new(ROOT_CATALOG_FILE);
     let full_path = estate_root.join(rel_path);
-    if let Ok(existing) = std::fs::read_to_string(&full_path)
-        && existing == body
-    {
-        outcome.skipped.push(rel_path.to_path_buf());
-        return Ok(());
-    }
-    if let Some(parent) = full_path.parent() {
-        create_dir_all_durable(parent)?;
-    }
-    write_atomic(&full_path, body.as_bytes())?;
-    outcome.written.push(rel_path.to_path_buf());
-    Ok(())
+    write_if_changed(&full_path, rel_path, body.as_bytes(), outcome)
 }
 
 /// Replace the value of an `edition:` line inside the leading `---`
@@ -694,6 +704,33 @@ mod tests {
     }
 
     #[test]
+    fn write_distro_never_overwrites_a_pre_existing_regular_claude_md() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let claude_md = tmp.path().join("CLAUDE.md");
+        std::fs::write(&claude_md, "this estate's own hand-authored CLAUDE.md")
+            .expect("plant a pre-existing regular CLAUDE.md");
+
+        let outcome = write_distro(tmp.path()).expect("write");
+
+        let meta = std::fs::symlink_metadata(&claude_md).expect("CLAUDE.md must still exist");
+        assert!(
+            !meta.file_type().is_symlink(),
+            "a pre-existing regular CLAUDE.md must never be replaced with a symlink"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&claude_md).expect("read CLAUDE.md"),
+            "this estate's own hand-authored CLAUDE.md",
+            "a pre-existing regular CLAUDE.md's content must survive byte-for-byte"
+        );
+        assert!(
+            outcome.skipped.iter().any(|p| p == Path::new("CLAUDE.md")),
+            "the pre-existing CLAUDE.md must be reported (skipped), not silently ignored, got \
+             {:?}",
+            outcome.skipped
+        );
+    }
+
+    #[test]
     fn write_distro_generates_the_index_catalog() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         write_distro(tmp.path()).expect("write");
@@ -744,6 +781,19 @@ mod tests {
         assert!(text.contains("Custom text after."));
         assert!(text.contains(AGENTS_MD));
         assert!(!text.contains("stale body"));
+    }
+
+    #[test]
+    fn write_agents_md_treats_an_existing_empty_file_as_absent() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let agents_md = tmp.path().join("AGENTS.md");
+        std::fs::write(&agents_md, "").expect("plant an empty AGENTS.md");
+
+        write_distro(tmp.path()).expect("an empty AGENTS.md must not fail closed");
+
+        let text = std::fs::read_to_string(&agents_md).expect("read AGENTS.md");
+        assert!(text.starts_with(MANAGED_BEGIN));
+        assert!(text.contains(AGENTS_MD));
     }
 
     #[test]

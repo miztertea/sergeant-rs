@@ -9,21 +9,27 @@
 
   Rather than leave ~90 shipped files citing a path that resolves nowhere
   outside this one repository's working tree, this context carries the
-  handful of sections the shipped corpus actually cites — §1, §1a, §3, §4,
-  and §6.3 — verbatim, with the source document's own section numbering
-  preserved unchanged, so an existing citation like "§1 rule 4" or
-  "§6.3" still names the same rule it always did. It is not the full
-  convention document (that stays a dev-corpus artifact); it is the
+  sections the shipped corpus actually cites — §1, §1a, §3, §4, §6.3,
+  §7.4, and §7.5 — verbatim, with the source documents' own section
+  numbering preserved unchanged, so an existing citation like "§1 rule 4"
+  or "§6.3" still names the same rule it always did. §1, §1a, §3, §4, and
+  §6.3 are numbered as in the ICM filesystem convention document; §7.4 and
+  §7.5 are numbered as in that convention's own governing document (the
+  ICM proposal, referenced below) — that source numbering is the one the
+  shipped corpus's own "§7.4"/"§7.5" citations already assume. It is not
+  either full document (those stay dev-corpus artifacts); it is the
   consumed subset, embedded so it ships with the binary and resolves in
   every estate `sgt init` produces.
 
-  Source: sergeant-rs's own ICM filesystem convention document
-  (pre-relocation), kept in this project's private development record.
-  Internal
-  cross-references to sections not carried here (e.g. §2, §5, §6.1, §6.2,
-  §7.x) are prose pointers into that fuller source document, not paths this
-  file resolves — they are left as-is because renumbering would break the
-  very citations this file exists to keep valid.
+  Sources: sergeant-rs's own ICM filesystem convention document
+  (pre-relocation) for §1/§1a/§3/§4/§6.3, and the ICM proposal document
+  (reference/proposal-next-iteration-icm-workflows.md, §7.4/§7.5 — the
+  convention document's own governing document) for §7.4/§7.5 — both kept
+  in this project's private development record. Internal cross-references
+  to sections not carried here (e.g. §2, §5, §6.1, §6.2, §7.1-7.3, §7.6,
+  §7.7) are prose pointers into that fuller source, not paths this file
+  resolves — they are left as-is because renumbering would break the very
+  citations this file exists to keep valid.
 -->
 
 # ICM Filesystem Convention — embedded policy excerpt
@@ -265,3 +271,61 @@ when it has a fresh execution, explicit inputs (not inherited conversation
 state), a review-only contract, and no authority to edit the subject it
 reviews. Independence lives in the execution boundary, not in whether the
 reviewer happens to share a workflow wrapper with the work it reviews.
+
+## 7.4. Authored metadata and observed telemetry remain separate
+
+Authored files may contain:
+
+```text
+name
+version
+status
+owner
+description
+tags
+intended inputs and outputs
+publication state
+```
+
+Run counts, completion rates, last execution, blocked time, cost, token
+use, duration, retry frequency, and failure modes belong in the journal
+and DuckDB projection.
+
+The future discovery response may join them:
+
+```text
+diagnose-bug v3
+  authored status     published
+  tags                debugging, defect, investigation
+  observed runs       184
+  completion rate     87.5%
+  median duration     14m22s
+  last measured       2026-08-04
+```
+
+It should never write those mutable measurements back into the workflow's
+front matter.
+
+## 7.5. Shared context works now as an authoring convention
+
+A stage context can contain:
+
+```markdown
+Apply @@adversarial-review to the current change.
+```
+
+The stable agent instructions define that token as:
+
+```text
+.sergeant/common/contexts/adversarial-review.md
+```
+
+The current actor receives the stage context and runs in the worktree, so
+it can read that file without engine support.
+
+This is **context composition**, not workflow composition. Sergeant pins
+the textual reference in `CONTEXT.md`, but today it does not pin the
+transitive contents of the referenced file. That is acceptable for the
+measurement phase because Git preserves the source revision and the work
+surface records its base SHA, but the exact replay semantics of transitive
+workflow dependencies should remain an explicit future design question.
