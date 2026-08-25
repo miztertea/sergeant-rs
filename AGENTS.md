@@ -50,8 +50,15 @@ Sergeant does not search parent directories for an estate and does not
 fall back to a plain Git checkout; every estate-scoped command refuses
 outright anywhere else, before daemon contact, naming the same remedy:
 `cd` to the estate root, `sgt -C <estate-root>` to name it without moving,
-or `sgt init` if this directory should become one. Only `sgt --help`,
-`--version`, `sgt init`, and `sgt doctor` work outside an estate at all.
+or `sgt init` if this directory should become one. `sgt --help`,
+`--version`, `sgt init`, `sgt doctor`, and the host-scoped bucket — `sgt
+tui`, `sgt status`, `sgt work show`/`list`/`transcript`, `sgt watch`, and
+every `sgt daemon` verb — all work outside an estate too: the daemon they
+reach is host-scoped (one process serving every estate ever admitted to
+it), so none of them needs a root to find it. `sgt watch` still consults
+`-C`/cwd opportunistically — inside a valid estate root it defaults to
+that estate's events, `--all` or a non-estate cwd watches every admitted
+estate. Nothing else works outside an estate at all.
 
 ## Estate and Git model
 

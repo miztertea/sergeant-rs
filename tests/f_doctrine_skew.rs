@@ -61,10 +61,11 @@ fn bare_dir() -> tempfile::TempDir {
     tempfile::TempDir::new().expect("bare temp dir")
 }
 
-/// AGENTS.md's "Session start" section names exactly the unscoped command
-/// set `is_estate_scoped` (`src/cli.rs`) computes, and the real refusal an
-/// estate-scoped command gives outside an estate carries the exact wording
-/// AGENTS.md quotes for it.
+/// AGENTS.md's "Session start" section names exactly the unscoped-plus-
+/// host-scoped command set `is_estate_scoped`/`is_host_scoped`
+/// (`src/cli.rs`) compute, and the real refusal an estate-scoped command
+/// gives outside an estate carries the exact wording AGENTS.md quotes for
+/// it.
 #[test]
 fn agents_md_session_start_matches_the_real_root_gate() {
     let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
@@ -73,16 +74,18 @@ fn agents_md_session_start_matches_the_real_root_gate() {
     // its logical text rather than its accidental line layout.
     let agents_md_flat = agents_md.split_whitespace().collect::<Vec<_>>().join(" ");
 
-    // The claim, quoted verbatim from `is_estate_scoped`'s own doc comment
-    // ("Unscoped: bare `sgt`, `--help`, `--version`, `init`, `doctor` —
-    // nothing else") in AGENTS.md's own voice.
+    // The claim, quoted verbatim from `is_estate_scoped`/`is_host_scoped`'s
+    // own doc comments (H1 sprint plan, W3 brief deliverable 2) in
+    // AGENTS.md's own voice.
     assert!(
         agents_md_flat.contains(
-            "Only `sgt --help`, `--version`, `sgt init`, and `sgt doctor` work outside an \
-             estate at all."
+            "`sgt --help`, `--version`, `sgt init`, `sgt doctor`, and the host-scoped bucket \
+             — `sgt tui`, `sgt status`, `sgt work show`/`list`/`transcript`, `sgt watch`, and \
+             every `sgt daemon` verb — all work outside an estate too"
         ),
-        "AGENTS.md's Session start section no longer states the unscoped command set — \
-         update this test and the claim together, from `is_estate_scoped`'s own doc comment"
+        "AGENTS.md's Session start section no longer states the unscoped-plus-host-scoped \
+         command set — update this test and the claim together, from is_estate_scoped's and \
+         is_host_scoped's own doc comments"
     );
 
     // The refusal wording AGENTS.md quotes must be the real one
@@ -95,8 +98,8 @@ fn agents_md_session_start_matches_the_real_root_gate() {
 
     let dir = bare_dir();
 
-    // The four commands AGENTS.md claims work outside an estate must
-    // actually run there — none of them the root-gate refusal.
+    // The four fully unscoped commands AGENTS.md claims work outside an
+    // estate must actually run there — none of them the root-gate refusal.
     for args in [
         vec!["--help"],
         vec!["--version"],
@@ -112,16 +115,48 @@ fn agents_md_session_start_matches_the_real_root_gate() {
     }
 
     // `sgt init` above already turned `dir` into an estate — re-run the
-    // refusal checks from a second, still-bare directory so they test the
+    // remaining checks from a second, still-bare directory so they test the
     // "no estate at all" case, not "estate exists but I'm not at its root".
+    // `--data-dir` names a fresh, guaranteed-empty directory for every host-
+    // scoped invocation below: none of them may hit the root gate, but
+    // without an isolated data dir they could instead attach to whatever
+    // real host daemon this machine happens to be running — the wrong
+    // failure mode for a test that means to pin "no root gate", not "no
+    // daemon either".
     let refused = bare_dir();
-    for args in [
-        vec!["status"],
-        vec!["work", "list"],
-        vec!["watch"],
-        vec!["analytics"],
-        vec!["repo", "list"],
-    ] {
+
+    // H1 §5 / brief deliverable 2: the host-scoped bucket. Each of these
+    // must reach past the root gate — refusing, if at all, only on "no
+    // daemon is running", never on "does not search parent directories".
+    for args in [vec!["status"], vec!["work", "list"], vec!["watch"]] {
+        let host_data_dir = bare_dir();
+        let mut full = vec![
+            "--data-dir".to_string(),
+            host_data_dir.path().display().to_string(),
+        ];
+        full.extend(args.iter().map(|s| s.to_string()));
+        let full: Vec<&str> = full.iter().map(String::as_str).collect();
+        let output = run(refused.path(), &full);
+        assert!(
+            !output.status.success(),
+            "{args:?} must refuse (no daemon at a fresh data dir): {}",
+            stderr(&output)
+        );
+        assert!(
+            !stderr(&output).contains("does not search parent directories for an estate"),
+            "{args:?} is host-scoped and must never hit the root gate outside an estate: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("no daemon is running for"),
+            "{args:?} must refuse for the host-scoped reason (no daemon), not something else: {}",
+            stderr(&output)
+        );
+    }
+
+    // Estate-scoped verbs (H1 §11.3, unchanged) still refuse with the
+    // root-gate diagnostic AGENTS.md quotes.
+    for args in [vec!["analytics"], vec!["repo", "list"]] {
         let output = run(refused.path(), &args);
         assert!(
             !output.status.success(),
@@ -176,9 +211,13 @@ fn embedded_skills_carry_the_real_root_and_preflight_remedies() {
             .expect("read skills/estate-navigation/SKILL.md");
 
     // 1. The root-gate refusal a real estate-scoped command gives outside an
-    //    estate — every remedy it names must be one `sergeant-help` names too.
+    //    estate — every remedy it names must be one `sergeant-help` names
+    //    too. `analytics`, not `status`: H1 (sprint plan D6, brief
+    //    deliverable 2) moved `status` into the host-scoped bucket, so it no
+    //    longer hits this gate at all — `analytics` stays estate-scoped
+    //    (H1 §11.3).
     let refused = bare_dir();
-    let refusal = stderr(&run(refused.path(), &["status"]));
+    let refusal = stderr(&run(refused.path(), &["analytics"]));
     for quoted in [
         "no estate found in",
         "does not search parent directories",
