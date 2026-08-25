@@ -20,7 +20,7 @@
 //! exactly one test has no sibling thread to leak into. A second test added
 //! here reintroduces the race; give it its own file instead.
 
-use sergeant_rs::runtime::git::{GIT_BIN_ENV, git};
+use sergeant_rs::runtime::git::{GIT_BIN_ENV, git, git_bytes};
 
 #[test]
 fn the_git_binary_is_overridable_via_env() {
@@ -44,11 +44,21 @@ fn the_git_binary_is_overridable_via_env() {
     // script it points at.
     unsafe { std::env::set_var(GIT_BIN_ENV, &script) };
     let out = git(dir.path(), &["status"]);
+    let bytes_out = git_bytes(dir.path(), &["status"]);
     unsafe { std::env::remove_var(GIT_BIN_ENV) };
 
     let out = out.expect("the scripted binary must run in place of git and exit zero");
     assert!(
         out.contains("--no-pager") && out.contains("status"),
         "expected the scripted binary to echo the real invocation, got {out:?}"
+    );
+
+    // git_bytes shares `command`'s spawn path with `git` (#234 follow-up:
+    // F-IV-05) — assert the override reaches it too, not just `git`.
+    let bytes_out = bytes_out.expect("the scripted binary must run in place of git and exit zero");
+    let bytes_out = String::from_utf8(bytes_out).expect("scripted stub only ever emits ASCII");
+    assert!(
+        bytes_out.contains("--no-pager") && bytes_out.contains("status"),
+        "expected the scripted binary to echo the real invocation, got {bytes_out:?}"
     );
 }

@@ -2,7 +2,7 @@
 
 Resolved as `@@model-assignment` from
 `.sergeant/common/contexts/model-assignment.md` per
-`docs/icm/convention.md` §4. Policy context (Placement Ladder PL-3). The
+`.sergeant/common/contexts/icm-policy.md` §4. Policy context (Placement Ladder PL-3). The
 homeless policy, homed at last (F.11 of the distro content rebuild's
 design record): this file and `@@test-first` are the two canonical homes
 this wave gives content that previously had none. Self-contained —

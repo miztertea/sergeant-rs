@@ -24,7 +24,7 @@ the fix commits with a root-cause postmortem. Use when: a defect needs
 diagnosis and a fix, and the fix should get the same review chain a
 feature change gets (a fix is code).
 
-See `CONTEXT.md` for workflow orientation, `workflow.toml` for the pinned
-stage order, and
-`sergeant-rs-workspace/knowledge/evidence/resources/distro-content-series/design-proposal-2026-08-22.md`
-for this package's derivation and the owner rulings behind it.
+See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
+pinned stage order. This package's derivation and the owner rulings
+behind it are dev-corpus provenance, kept in this project's private
+development record, not shipped here.

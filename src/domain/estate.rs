@@ -64,7 +64,7 @@ pub fn mount_path(estate_root: &Path, name: &str) -> PathBuf {
 /// user` (`backend/claude.rs`), which does not read this file; this repo's
 /// own north-star arbitration record confirms it empirically ("CLAUDE.md and
 /// AGENTS.md are invisible to the actor by design"). MVP-2 measured `local`
-/// too (`docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`)
+/// too (`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`)
 /// and found the same thing for a different reason: `--setting-sources`
 /// governs `.claude/settings*.json` configuration, not memory-file reading,
 /// for *any* value — there is no native mechanism tied to the filename
@@ -128,7 +128,7 @@ pub enum InstructionPolicy {
     /// The wider of the two launch grammars this build can produce for a
     /// bound repository. MVP-2 D2 item 1 measured what it actually
     /// translates to for the Claude adapter (L1,
-    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`):
+    /// `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`):
     /// **not** "the actor natively consumes the repository's own instruction
     /// file", the original design intent this variant was named for — that
     /// mechanism does not exist for a file named `AGENTS.md` under any
@@ -698,6 +698,19 @@ pub enum EstateError {
         /// The underlying vocabulary mismatch.
         source: crate::domain::profile::UnknownPermissionMode,
     },
+    /// A profile's `network_access` option is neither `"true"` nor `"false"`
+    /// (#262, split-hardening W5 review finding #2). Refused at parse time,
+    /// mirroring [`Self::InvalidPermissionMode`]: a typo here must fail
+    /// loudly at estate load, not silently at launch.
+    #[error("{file} declares profile {profile:?} with {source}")]
+    InvalidNetworkAccess {
+        /// Config file that declared it.
+        file: String,
+        /// The profile naming the bad value.
+        profile: String,
+        /// The underlying vocabulary mismatch.
+        source: crate::domain::profile::UnknownNetworkAccess,
+    },
     /// `sergeant.toml` declares no repositories at all.
     #[error("{file} declares no repositories")]
     NoRepositories {
@@ -1170,7 +1183,7 @@ impl Estate {
     /// pen would refuse *every* subsequent edit, including ones that never
     /// touch the missing repository, contradicting the design capture's own
     /// wrongness contract ("a broken repo blocks works targeting it, not the
-    /// estate", `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`).
+    /// estate", `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/estate-manifest-design-2026-08-11.md`).
     /// A repository an edit itself populates or verifies (`sgt repo add`'s
     /// `populate_or_verify`) is already checked on disk by that caller,
     /// directly — this validator does not need to repeat it.
@@ -1275,6 +1288,16 @@ impl Estate {
             // argument failure at launch time.
             if let Err(source) = profile.permission_mode() {
                 return Err(EstateError::InvalidPermissionMode {
+                    file,
+                    profile: profile.name.clone(),
+                    source,
+                });
+            }
+            // #262: an unrecognized network_access is refused here, at
+            // config load, rather than surfacing later as a lazy PREPARE-time
+            // failure — same shape as permission_mode above.
+            if let Err(source) = profile.network_access() {
+                return Err(EstateError::InvalidNetworkAccess {
                     file,
                     profile: profile.name.clone(),
                     source,
@@ -1409,6 +1432,16 @@ impl Estate {
             }
             if let Err(source) = profile.permission_mode() {
                 return Err(EstateError::InvalidPermissionMode {
+                    file,
+                    profile: profile.name.clone(),
+                    source,
+                });
+            }
+            // #262: an unrecognized network_access is refused here, at
+            // config load, rather than surfacing later as a lazy PREPARE-time
+            // failure — same shape as permission_mode above.
+            if let Err(source) = profile.network_access() {
+                return Err(EstateError::InvalidNetworkAccess {
                     file,
                     profile: profile.name.clone(),
                     source,
@@ -2131,6 +2164,50 @@ mod tests {
         );
     }
 
+    /// #262: a `network_access` value that is neither `"true"` nor `"false"`
+    /// is refused at config load, mirroring `permission_mode` above — a typo
+    /// here must fail loudly and immediately, not lazily at PREPARE.
+    #[test]
+    fn a_profile_with_an_unknown_network_access_is_refused_at_load() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(root);
+
+        let err = parse(
+            root,
+            "[estate]\nname = \"w\"\n\n\
+             [[repo]]\nname = \"solo\"\n\n\
+             [[profile]]\nname = \"reckless\"\nbackend = \"codex\"\n\
+             [profile.options]\nnetwork_access = \"yes\"\n",
+        )
+        .expect_err("an unrecognized network_access must be refused");
+        match &err {
+            EstateError::InvalidNetworkAccess {
+                profile, source, ..
+            } => {
+                assert_eq!(profile, "reckless");
+                assert_eq!(source.value, "yes");
+            }
+            other => panic!("expected InvalidNetworkAccess, got {other}"),
+        }
+
+        // Both booleans, plus unspecified, all still parse.
+        let estate = parse(
+            root,
+            "[estate]\nname = \"w\"\n\n\
+             [[repo]]\nname = \"solo\"\n\n\
+             [[profile]]\nname = \"careful\"\nbackend = \"codex\"\n\
+             [profile.options]\nnetwork_access = \"true\"\n",
+        )
+        .expect("a listed network_access value parses");
+        assert_eq!(
+            estate.profiles[0]
+                .network_access()
+                .expect("validated at load"),
+            Some(true)
+        );
+    }
+
     // ---- R-MVP1-3: schema rename-with-refusal ----------------------------
 
     /// The legacy `[workspace]` table raises the named migration refusal,
@@ -2768,7 +2845,7 @@ mod tests {
     /// grep across every doc and note: several already-committed notes
     /// discuss the legacy vocabulary in prose while describing the
     /// migration itself, which is not the live-config leak this pin is
-    /// about (docs/gauntlet/notes and docs/gauntlet/runs are historical
+    /// about (sergeant-rs-workspace's knowledge/evidence/gauntlet/notes and sergeant-rs-workspace's knowledge/evidence/gauntlet/runs are historical
     /// records, not configuration this codebase reads).
     #[test]
     fn no_committed_sergeant_toml_outside_reference_carries_legacy_vocabulary() {

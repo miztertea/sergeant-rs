@@ -1,5 +1,5 @@
 //! W3: the prune engine — bounded retention made real (issue #17's rulings
-//! record, `docs/proposals/foundation-2026-08-21.md` W3 section).
+//! record, `sergeant-rs-workspace's knowledge/evidence/reference/foundation-2026-08-21.md` W3 section).
 //!
 //! W2 (`runtime::startup`) made the daemon able to *ignore* old history; this
 //! module makes it able to *delete* it. A policy in `sergeant.toml` names how

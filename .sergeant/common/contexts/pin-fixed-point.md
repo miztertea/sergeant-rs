@@ -1,8 +1,8 @@
 # Pin fixed point
 
 Resolved as `@@pin-fixed-point` from `.sergeant/common/contexts/pin-fixed-point.md`
-per `docs/icm/convention.md` §4. Shared stage context — two or more
-consumers across the distro's packages (`docs/icm/convention.md` §1 rule
+per `.sergeant/common/contexts/icm-policy.md` §4. Shared stage context — two or more
+consumers across the distro's packages (`.sergeant/common/contexts/icm-policy.md` §1 rule
 2): `implement-change/00-orient`, `review-change/00-pin-fixed-point`,
 `investigate/00-frame`.
 
@@ -31,7 +31,7 @@ just produces an empty, silently-passing report.
 
 ## What this context contributes when loaded inside a stage
 
-Per `docs/icm/convention.md` §7.4: this file does not claim authority
+Per `.sergeant/common/contexts/icm-policy.md` §7.4: this file does not claim authority
 independently of its caller; it names the J0 the caller must honor and the
 J2/J1 the caller keeps.
 

@@ -21,14 +21,15 @@
 # constraint below (human-dispatch-only, no tag watcher/push/cron) — it
 # only widens which ref a *provably non-durable* dry-run may run from.
 #
-# CO-VERSIONING CONSTRAINT (ADR 0014 decision 2, NORTH-STAR "Not true yet"
-# note): v0.x.y is supposed to name ONE artifact identity — the `sgt` binary
-# AND the embedded distro it writes via `sgt init`. That embedding does not
-# exist yet: `sgt init` today writes only `sergeant.toml`, `repos/`, and
-# `.gitignore`. This workflow therefore packages and ships the binary alone
-# and says so in the draft release body — it does NOT claim to ship an
-# embedded distro it cannot produce. NORTH-STAR's "Not true yet" note is the
-# standing record of this gap; nothing here weakens or removes it.
+# CO-VERSIONING CONSTRAINT (ADR 0014 decision 2, the workspace knowledge
+# library's North Star ruling's "Not true yet" note): v0.x.y is supposed to
+# name ONE artifact identity — the `sgt` binary AND the embedded distro it
+# writes via `sgt init`. That embedding does not exist yet: `sgt init` today
+# writes only `sergeant.toml`, `repos/`, and `.gitignore`. This workflow
+# therefore packages and ships the binary alone and says so in the draft
+# release body — it does NOT claim to ship an embedded distro it cannot
+# produce. The North Star ruling's "Not true yet" note is the standing
+# record of this gap; nothing here weakens or removes it.
 #
 # Issue #165 (the originally-cited tracker for this) closed 2026-08-17 via
 # rung R2 — it made the gap visible (`sgt doctor` now reports a zero-package
@@ -64,10 +65,10 @@
 # has succeeded — dist's build mechanics never see or create that tag
 # themselves; they take it as an input (`--tag`) once we already know we
 # are publishing. Confirmed by measurement, not merely asserted:
-# docs/measure-dist-conditions-2026-08-18.md condition 4 directly exercised
+# sergeant-rs-workspace's knowledge/evidence/measure-dist-conditions-2026-08-18.md condition 4 directly exercised
 # `dist build --artifacts=local` from a branch push with no `v*` tag in the
 # repository at all, and found `dist`'s packaging mechanics indifferent to
-# how they are triggered. See also docs/measure-dist-2026-08-18.md
+# how they are triggered. See also sergeant-rs-workspace's knowledge/evidence/measure-dist-2026-08-18.md
 # (condition 1 / bundled-DuckDB build feasibility) for the sibling
 # measurement this workflow's `package` job is based on.
 name: release
@@ -253,13 +254,13 @@ jobs:
 
   # ── Package ─────────────────────────────────────────────────────────────
   # Only after A-F. Measured on real GitHub-hosted runners, both targets,
-  # 2026-08-18 (docs/measure-dist-2026-08-18.md, proposal §10 condition 1):
+  # 2026-08-18 (sergeant-rs-workspace's knowledge/evidence/measure-dist-2026-08-18.md, proposal §10 condition 1):
   # `dist build` successfully builds sgt with bundled DuckDB and packages it
   # on both ubuntu-24.04 (897s cold build) and macos-26 (1002s cold
   # build), with no disk or cache pressure on either. Binary behavioral
   # equivalence and the generated installer's correctness (conditions 2-3)
   # were additionally measured against a real archive on ubuntu-24.04
-  # (docs/measure-dist-conditions-2026-08-18.md) and found identical to an
+  # (sergeant-rs-workspace's knowledge/evidence/measure-dist-conditions-2026-08-18.md) and found identical to an
   # ordinary `cargo build --release` binary, including the embedded distro.
   # (ubuntu-24.04/macos-26 are the exact images the prior floating-alias
   # runner labels served on the 2026-08-18 measurement date — the runner
@@ -268,7 +269,7 @@ jobs:
   #
   # aarch64-apple-darwin per ADR 0001's measured-target set: the *build*
   # succeeded on a real macos-26 runner (above), but binary equivalence
-  # and installer correctness were not re-measured on macOS — see docs/adr/
+  # and installer correctness were not re-measured on macOS — see sergeant-rs-workspace's knowledge/rulings/adr/
   # 0018-measured-vocabulary-obligation-clean-build-not-full-validation.md,
   # which clarifies ADR 0001 D8's "measured" vocabulary. Per that ruling,
   # "unmeasured" on macOS means the code is written and should be right but
@@ -412,7 +413,7 @@ jobs:
   #
   # Before 0.1.2 the manifests were never passed forward, so the installer's
   # verification branch was unreachable and every install printed "no checksums
-  # to verify" (docs/measure-dist-conditions-2026-08-18.md, condition 3, and its
+  # to verify" (sergeant-rs-workspace's knowledge/evidence/measure-dist-conditions-2026-08-18.md, condition 3, and its
   # 2026-08-19 amendment — an accurate record of the behavior on that date, not
   # of the behavior now). The two steps after the global build below are what
   # keep that from silently regressing: one asserts every released target's arm
@@ -719,8 +720,7 @@ jobs:
             echo "**Co-versioning note:** this release ships the \`sgt\` binary only."
             echo "v${RELEASE_VERSION} does NOT yet ship an embedded distro — that"
             echo "is Phase 3 scope (reference/proposal-product-workspace-split.md),"
-            echo "not yet tracked by a dedicated open issue. See CHANGELOG.md and"
-            echo "NORTH-STAR.md's \"Not true yet\" note."
+            echo "not yet tracked by a dedicated open issue. See CHANGELOG.md."
             echo
             echo "**Gate F (distro structural validator) did not run in this workflow.**"
             echo "That property is proven continuously by sergeant-rs-workspace's own CI"

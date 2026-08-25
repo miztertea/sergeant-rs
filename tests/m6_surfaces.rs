@@ -1,4 +1,4 @@
-//! M6 acceptance tests (docs/gauntlet/contracts/M6.md).
+//! M6 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M6.md).
 //!
 //! Acceptance 2 (the embedded dashboard) and its tests are gone: ADR 0011
 //! (D7) deletes `src/web.rs`, `web/`, and the `sgt web` verb outright — a
@@ -63,6 +63,7 @@ use sergeant_rs::backend::BackendRegistry;
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::{EventDraft, EventSource};
+use sergeant_rs::runtime::git::canonical_git_common_dir;
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::tui::{self, Action, App, Destination};
 
@@ -1488,6 +1489,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // immediately above them rather than beside `estate`.
             "estate_root",
             "permission_mode",
+            // #262: the per-profile `network_access` override, right beside
+            // `permission_mode` — same estate-root threading, same
+            // fail-closed-at-load guarantee.
+            "network_access",
             // MVP-3: manifest health beyond "it parses" — declared repos
             // missing on disk (origin as the remedy) and directories under
             // `repos/` the manifest never declared. Green here because the
@@ -1498,6 +1503,13 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // here because the fixture estate declares one; an estate with
             // none reads `warn`, which is `t3f`'s subject.
             "workflows",
+            // #261: the installed corpus (AGENTS.md, skills/*/SKILL.md,
+            // .sergeant/workflows/**, .sergeant/common/contexts/*.md)
+            // cites only routes that resolve inside this estate.
+            "doc_routes",
+            // #261 owner ruling point 5: the installed distro's own
+            // `edition` front matter agrees with the running binary.
+            "distro_edition",
             // estate-root §12.2: the cheap Git-surface summary — journal
             // plus retained-artifact filesystem metadata only, never a
             // per-branch git walk. Green here because the fixture estate
@@ -2012,6 +2024,155 @@ fn t3b_doctor_reports_the_effective_permission_mode_per_profile() {
     );
 }
 
+/// #262: `sgt doctor` reports the effective `network_access` override per
+/// profile, mirroring `t3b_doctor_reports_the_effective_permission_mode_
+/// per_profile` above — same reason: a misconfigured `network_access` must
+/// be visible before any launch, not just refused at load.
+#[test]
+fn t3e_doctor_reports_the_effective_network_access_per_profile() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
+    support::init_repo(&estate.path().join("repos").join("solo"));
+    std::fs::write(
+        estate.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"solo\"\n\n\
+         [[profile]]\nname = \"quiet\"\nbackend = \"codex\"\n\n\
+         [[profile]]\nname = \"careful\"\nbackend = \"codex\"\n\
+         [profile.options]\nnetwork_access = \"true\"\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (code, stdout, _) = doctor_in(
+        estate.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        false,
+    );
+    assert_eq!(code, Some(0), "a healthy install must exit 0:\n{stdout}");
+    let (_, json, _) = doctor_in(
+        estate.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "network_access");
+    assert_eq!(check["status"], "ok", "{check}");
+    let detail = check["detail"].as_str().expect("detail is a string");
+    assert!(
+        detail.contains("quiet") && detail.contains("careful"),
+        "the detail must name every profile, not just count them: {detail}"
+    );
+    assert!(
+        detail.contains("careful=true"),
+        "the profile with an explicit override must report that value: {detail}"
+    );
+    assert!(
+        detail.contains("quiet=unspecified"),
+        "the unspecified profile must be reported as unspecified, \
+         never silently folded into a value it never chose: {detail}"
+    );
+}
+
+/// #262: a `claude` profile that sets `network_access` validates fine
+/// (`claude.rs` never reads the option, so nothing about it can be
+/// "unrecognized") but must not be reported as if it took effect —
+/// `claude.rs`'s launch grammar has no sandbox network knob at all.
+#[test]
+fn t3e_doctor_reports_network_access_has_no_effect_on_a_claude_profile() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
+    support::init_repo(&estate.path().join("repos").join("solo"));
+    std::fs::write(
+        estate.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"solo\"\n\n\
+         [[profile]]\nname = \"terra\"\nbackend = \"claude\"\n\
+         [profile.options]\nnetwork_access = \"false\"\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (_, json, _) = doctor_in(
+        estate.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "network_access");
+    let detail = check["detail"].as_str().expect("detail is a string");
+    assert!(
+        detail.contains("terra="),
+        "the detail must name the claude profile: {detail}"
+    );
+    assert!(
+        !detail.contains("terra=false"),
+        "a claude profile must never be rendered as if network_access took effect: {detail}"
+    );
+    assert!(
+        detail.contains("false") && detail.contains("no effect"),
+        "the configured value must still be named, alongside a plain statement that the claude \
+         backend does not read it: {detail}"
+    );
+}
+
+/// #262: a `codex` profile that sets `permission_mode` validates fine
+/// (`codex.rs` never reads the option, so nothing about it can be
+/// "unrecognized") but must not be reported as if it took effect —
+/// `codex.rs`'s launch grammar has no `--permission-mode` equivalent at all.
+/// Before this fix `permission_mode_check` rendered every profile's
+/// configured mode identically regardless of backend, which is exactly the
+/// dishonesty issue #262 filed: `sgt doctor` reported the profile healthy
+/// from the string in `sergeant.toml` alone, never from what the adapter
+/// actually does with it.
+#[test]
+fn t3d_doctor_reports_permission_mode_has_no_effect_on_a_codex_profile() {
+    let bin = TempDir::new().expect("tempdir");
+    let claude = stub_claude(bin.path());
+    let docker = stub_docker(bin.path());
+    let data = TempDir::new().expect("tempdir");
+    let estate = TempDir::new().expect("tempdir");
+    support::init_repo(&estate.path().join("repos").join("solo"));
+    std::fs::write(
+        estate.path().join("sergeant.toml"),
+        "[estate]\nname = \"w\"\n\n\
+         [[repo]]\nname = \"solo\"\n\n\
+         [[profile]]\nname = \"terra\"\nbackend = \"codex\"\n\
+         [profile.options]\npermission_mode = \"bypassPermissions\"\n",
+    )
+    .expect("write sergeant.toml");
+
+    let (_, json, _) = doctor_in(
+        estate.path(),
+        data.path(),
+        &[("SGT_CLAUDE_BIN", &claude), ("SGT_DOCKER_BIN", &docker)],
+        true,
+    );
+    let report: Value = serde_json::from_str(&json).expect("doctor --json is json");
+    let check = named_check(&report, "permission_mode");
+    let detail = check["detail"].as_str().expect("detail is a string");
+    assert!(
+        detail.contains("terra="),
+        "the detail must name the codex profile: {detail}"
+    );
+    assert!(
+        !detail.contains("terra=bypassPermissions"),
+        "a codex profile must never be rendered as if bypassPermissions took effect: {detail}"
+    );
+    assert!(
+        detail.contains("bypassPermissions") && detail.contains("no effect"),
+        "the configured value must still be named, alongside a plain statement that the codex \
+         backend does not read it: {detail}"
+    );
+}
+
 /// MVP-3: `sgt doctor`'s estate check names a declared-but-missing
 /// repository by name and reports its declared `origin` as the remedy — the
 /// exact fact an operator needs ("clone it from here"), not a generic
@@ -2396,7 +2557,7 @@ fn t3f_doctor_names_an_unwritable_parent_as_one_remedy_row() {
     }
     let _restore = RestorePerms(parent.path().to_path_buf());
 
-    // Environment probe (docs/DEVELOPMENT.md's testing rules): the root dev
+    // Environment probe (CONTRIBUTING.md's testing rules): the root dev
     // container silently ignores permission-bit restrictions, so this
     // fixture cannot be armed there — skip loudly rather than assert
     // something that cannot hold in that environment.
@@ -4047,7 +4208,7 @@ fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
 /// guard-map: MVP-3's admission drain flag (`sgt daemon stop`, scoped
 /// exactly to that use) — one journaled `admission.paused`/
 /// `admission.resumed` event pair plus a submit refusal while paused — and
-/// the L6 crash window docs/DEVELOPMENT.md names explicitly for this class of
+/// the L6 crash window CONTRIBUTING.md names explicitly for this class of
 /// mechanism: a daemon killed *after* `admission.paused` is durable but
 /// *before* it ever gets to stop must not leave the data dir stuck refusing
 /// work forever.
@@ -4540,7 +4701,7 @@ fn the_perf_clock_guard_fails_loudly_instead_of_a_malformed_timestamp() {
 /// onto it; when a checkout was cut from that same tip, the resulting diff
 /// is genuinely empty and no-mistakes silently fast-paths to `outcome:
 /// passed` without running review/test/document/lint. The fix (this repo's
-/// own `docs/gauntlet/runs/t-series-build-2026-08-16/plan.md` names it
+/// own `sergeant-rs-workspace's knowledge/evidence/gauntlet/runs/t-series-build-2026-08-16/plan.md` names it
 /// explicitly) is a pre-flight guard in `scripts/gate.sh` that replicates
 /// that same base detection and refuses loudly instead. Same pattern as the
 /// coverage harness and perf clock guard self-tests above: a shell script
@@ -4787,4 +4948,113 @@ fn stub_docker(dir: &Path) -> String {
          \x20 *) exit 1;;\n\
          esac\n",
     )
+}
+
+/// Split-hardening W5, review finding #1b (`src/backend/codex.rs`'s
+/// `worktree_git_common_dir` doc comment carries the full reasoning): the
+/// #259 fix now grants a codex actor's linked worktree write access to the
+/// repository's whole shared `.git` common directory, not merely its own
+/// per-worktree admin subdirectory — a real `git commit` needs the wider
+/// grant (see that function and `tests/codex_backend.rs`'s
+/// `the_first_turn_grants_the_works_own_git_common_dir_as_an_add_dir_root`).
+/// This is a strictly *wider* filesystem grant than before, so what it costs
+/// the isolation story needs to be stated as plainly as what the narrower
+/// grant used to promise. This test states both halves in git terms alone —
+/// no codex-specific code is reachable from this integration crate, so it
+/// proves the underlying git facts the grant is built on, not the adapter's
+/// own plumbing (`src/runtime/surface.rs`'s own unit tests are the only
+/// place with access to that).
+///
+/// **Holds, structurally**: two different repositories never share a common
+/// dir. A Work's grant is built only from its own bindings, so this alone is
+/// what keeps a Work confined to the repositories it was actually admitted
+/// into — nothing here depends on trusting the actor.
+///
+/// **No longer holds, structurally**: two Works on the *same* repository —
+/// each in its own linked worktree, on its own distinct branch
+/// (`runtime::surface`'s own admission always cuts a new branch per Work) —
+/// resolve to the exact same common directory. A sandbox scoped to that
+/// grant cannot tell "this Work's own branch ref" from "the other Work's
+/// branch ref, or the object store backing every branch in the repository"
+/// -- both live under the one directory both Works were handed write access
+/// to. `runtime::repolock` only serializes the `git worktree add` span
+/// (proven by `tests/c4_repo_lock.rs`), never a Work's whole lifetime, so
+/// two such Works can legitimately be running concurrently when this
+/// applies. What still keeps them apart is the same-named branch convention
+/// (`runtime::surface` never hands two live Works the same branch) plus
+/// after-the-fact detection (branch-tip assertions, `common_dir_finding`) —
+/// trust and audit, not a filesystem boundary.
+#[test]
+fn git_worktree_common_dir_grant_is_shared_within_a_repository_but_never_crosses_repositories() {
+    let root = TempDir::new().expect("tempdir");
+
+    // Two Works on the same repository: distinct worktrees, distinct
+    // branches, same source.
+    let repo_a = root.path().join("repo-a");
+    support::init_repo(&repo_a);
+    let work_a1 = root.path().join("work-a1");
+    let work_a2 = root.path().join("work-a2");
+    support::git(
+        &repo_a,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "sergeant/work-a1",
+            work_a1.to_str().unwrap(),
+        ],
+    );
+    support::git(
+        &repo_a,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "sergeant/work-a2",
+            work_a2.to_str().unwrap(),
+        ],
+    );
+
+    let grant_a1 = canonical_git_common_dir(&work_a1).expect("work-a1 common dir");
+    let grant_a2 = canonical_git_common_dir(&work_a2).expect("work-a2 common dir");
+    assert_eq!(
+        grant_a1, grant_a2,
+        "two Works on the same repository resolve to the same shared common dir -- the grant \
+         itself no longer distinguishes them; only the branch-naming convention does"
+    );
+
+    // A distinct branch each, still true -- the convention half of the
+    // isolation story, not the filesystem half.
+    let branch_a1 = support::git(&work_a1, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    let branch_a2 = support::git(&work_a2, &["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    assert_ne!(
+        branch_a1.trim(),
+        branch_a2.trim(),
+        "each Work still lands on its own named branch, even though the grant no longer \
+         enforces that separation by itself"
+    );
+
+    // A second, unrelated repository: its common dir must never equal
+    // either of repo-a's Works' grants. This is the half that IS still a
+    // structural (not merely conventional) boundary.
+    let repo_b = root.path().join("repo-b");
+    support::init_repo(&repo_b);
+    let work_b1 = root.path().join("work-b1");
+    support::git(
+        &repo_b,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "sergeant/work-b1",
+            work_b1.to_str().unwrap(),
+        ],
+    );
+    let grant_b1 = canonical_git_common_dir(&work_b1).expect("work-b1 common dir");
+    assert_ne!(
+        grant_a1, grant_b1,
+        "a Work bound only to repo-a must never resolve a grant equal to repo-b's common dir \
+         -- cross-repository isolation is never trust-based, only cross-Work isolation within \
+         one repository is"
+    );
 }

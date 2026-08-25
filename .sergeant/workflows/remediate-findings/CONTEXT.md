@@ -2,7 +2,7 @@
 
 Layer 1 orientation only — never delivered as a stage's instructions;
 each stage's own `CONTEXT.md` (Layer 2) is the actor's contract
-(`docs/icm/convention.md` §1a rule 5).
+(`.sergeant/common/contexts/icm-policy.md` §1a rule 5).
 
 ## Purpose
 

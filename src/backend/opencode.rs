@@ -1,6 +1,6 @@
 //! OpenCode adapter: `opencode run --format json` non-interactive turns over
 //! a durable, **server-minted** session (W1 of the *Sergeant speaks OpenCode*
-//! sprint, `docs/proposals/opencode-adapter-2026-08-23.md`), **plus** (W3)
+//! sprint, `sergeant-rs-workspace's knowledge/evidence/reference/opencode-adapter-2026-08-23.md`), **plus** (W3)
 //! an adapter-owned `opencode serve` HTTP+SSE child, one per execution,
 //! driven from [`opencode_serve`] — a protocol client that knows HTTP/SSE
 //! and opencode's serve operation names and nothing else, declared via the

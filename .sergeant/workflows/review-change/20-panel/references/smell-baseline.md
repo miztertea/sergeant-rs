@@ -2,7 +2,7 @@
 
 Workflow-local Layer-3 reference for `review-change`'s simplicity axis.
 Single consumer (`20-panel`) — authored here directly per
-`docs/icm/convention.md` §4 rule 1 rather than under `.sergeant/common/
+`.sergeant/common/contexts/icm-policy.md` §4 rule 1 rather than under `.sergeant/common/
 contexts/`, since no second workflow shares this contract. Carried
 forward from the retired `code-review` package's Standards axis
 (`code-review/references/smell-baseline.md`) — the only Layer-3 file this

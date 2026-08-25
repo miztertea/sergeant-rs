@@ -18,7 +18,7 @@
 //! Linux underneath, so it needs no third arm). macOS arms that have been
 //! verified on a real host carry a "Verified YYYY-MM-DD" note; those still
 //! unmeasured carry "UNVERIFIED". As of 2026-08-15 (Apple M3 Pro arrival,
-//! `docs/environments/macbook.md`): `process.rs`, `disk.rs`, and `data_dir.rs`
+//! `sergeant-rs-workspace's knowledge/evidence/host-measurements/macbook.md`): `process.rs`, `disk.rs`, and `data_dir.rs`
 //! are **verified** (#18, #81, #82 closed); `fs_locking.rs`'s macOS detection
 //! arm remains **UNVERIFIED** and reports `Reliability::Unknown` until #85 is
 //! measured there.

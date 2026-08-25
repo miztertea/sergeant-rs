@@ -20,12 +20,12 @@
 # follow-up scope rather than shipped half-working — see the PR/commit note.
 #
 # Every job publishes ADR 0001's D8 "measured" skip count: the number of
-# `SKIPPED-ENV` probe-gated skips (docs/DEVELOPMENT.md's two-environment
+# `SKIPPED-ENV` probe-gated skips (CONTRIBUTING.md's two-environment
 # rule) a run hit on that host, via `cargo test -- --nocapture` (plain
 # `cargo test` swallows stdout/stderr for passing tests, which is where
 # `SKIPPED-ENV` lines live). This is the count; it does not by itself make a
 # target "measured" under ADR 0001 — that also needs `scripts/probe-env.sh`'s
-# output recorded in `docs/environments/<host>.md`, a documentation step this
+# output recorded in `sergeant-rs-workspace's knowledge/evidence/host-measurements/<host>.md`, a documentation step this
 # workflow does not do for the runner's own transient host.
 name: matrix
 
@@ -88,5 +88,5 @@ jobs:
           count=$(grep -o 'SKIPPED-ENV' test-output.log | wc -l | tr -d ' ') || count=0
           {
             echo "## Skip count — ${{ matrix.os }}"
-            echo "$count SKIPPED-ENV probe-gated skips this run (docs/DEVELOPMENT.md's two-environment rule)."
+            echo "$count SKIPPED-ENV probe-gated skips this run (CONTRIBUTING.md's two-environment rule)."
           } >> "$GITHUB_STEP_SUMMARY"

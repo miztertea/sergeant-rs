@@ -1,4 +1,4 @@
-//! M4 acceptance tests (docs/gauntlet/contracts/M4.md), counted against the
+//! M4 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M4.md), counted against the
 //! contract's own list — **six items**: acceptance 5 (Codex fixture tests)
 //! was dropped with deviation D6, along with the adapter it tested.
 //!
@@ -1566,7 +1566,7 @@ async fn a_turn_that_dies_without_an_envelope_blocks_the_stage_with_its_stderr()
     let data = support::DataDir::new();
     let estate = TempDir::new().expect("estate");
     let (repo, _head) = support::scaffold_solo_estate(estate.path(), "solo");
-    // Attempt 1's verbatim refusal, from `docs/gauntlet/runs/runB/run-manifest.md`.
+    // Attempt 1's verbatim refusal, from `sergeant-rs-workspace's knowledge/evidence/gauntlet/runs/runB/run-manifest.md`.
     let refusal = "--dangerously-skip-permissions cannot be used with root/sudo privileges for \
          security reasons\n";
     let stub = StubClaude::passing(data.path());
@@ -2295,7 +2295,7 @@ fn a_start_that_cannot_spawn_leaves_no_phantom_execution() {
 /// D2 *is* this argv. Every element below is a measured decision recorded in
 /// `backend::claude`'s module docs, and each one is silently reversible
 /// without an assertion on what the adapter actually launched:
-/// `--setting-sources user` (LESSONS L2's project-memory capture hazard),
+/// `--setting-sources user` (the workspace knowledge library's Lesson L2's project-memory capture hazard),
 /// the `--session-id`-then-`--resume` progression (one durable conversation,
 /// not a new one per turn), the removal of an inherited
 /// `CLAUDE_CODE_SESSION_ID` (the nested-session hazard), and the permission
@@ -2477,7 +2477,7 @@ fn adr_0006_and_0007a_both_contracts_reach_the_first_turn_together() {
 /// keeps today's argv unchanged, and the newly-unrefused
 /// `InstructionPolicy::Local` launches with the wider setting-sources value
 /// `ClaudeBackend::setting_sources_args` measured
-/// (`docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`) — not
+/// (`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`) — not
 /// with some other guess that would silently drift from the measurement.
 #[test]
 fn d2_instruction_policy_translates_to_the_measured_setting_sources_value() {
@@ -4562,8 +4562,8 @@ fn a7_version_gate_fails_closed_naming_the_probe() {
 /// §37: "worker reports completion but native session remains alive".
 /// Origin: the background-harness spike's motivating defect — a live, idle
 /// `claude` found 4h25m after its task completed, still burning CPU
-/// (docs/research/claude-background-harness-spike.md, "The defect this
-/// spike is scoped to fix"); also docs/troubleshooting.md "Worker says
+/// (sergeant-rs-workspace's knowledge/evidence/research/claude-background-harness-spike.md, "The defect this
+/// spike is scoped to fix"); also sergeant-rs-workspace's knowledge/evidence/troubleshooting.md "Worker says
 /// in_progress but is not moving" ("a live parent process is
 /// insufficient"). The work completes on the explicit signal; the deathless
 /// native context changes nothing.
@@ -4617,7 +4617,7 @@ fn r1_worker_reports_done_but_native_session_stays_alive() {
 }
 
 /// §37: "daemon dies during delivery". Origin: Sergeant's response
-/// generation/acknowledgement machinery (docs/troubleshooting.md "Response
+/// generation/acknowledgement machinery (sergeant-rs-workspace's knowledge/evidence/troubleshooting.md "Response
 /// already pending" — a response could be recorded but not yet applied,
 /// and recovery must not lose or double it). Here: the daemon journals the
 /// received input and dies before the backend SEND; restart finds the work
@@ -4675,7 +4675,7 @@ fn r2_daemon_dies_during_delivery_fails_closed_with_the_input_preserved() {
 }
 
 /// §37: "native process dies after work is preserved". Origin:
-/// docs/troubleshooting.md "Worker became orphaned after blocking" — "it
+/// sergeant-rs-workspace's knowledge/evidence/troubleshooting.md "Worker became orphaned after blocking" — "it
 /// is not an orphan merely because the process ended". A native context
 /// that finished its stage and exited while the daemon was down resumes to
 /// completion; a dead process is not a failure.
@@ -4717,7 +4717,7 @@ fn r3_native_dies_after_work_preserved_is_not_a_failure() {
 
 /// §37: "same command delivered twice". Origin: Sergeant's nonce files and
 /// duplicate-delivery protection (proposal §26 names them; upstream
-/// docs/troubleshooting.md "Repeated notifications" — "do not create
+/// sergeant-rs-workspace's knowledge/evidence/troubleshooting.md "Repeated notifications" — "do not create
 /// duplicate tasks or send duplicate responses"). A repeated command_id
 /// replays the recorded outcome; exactly one work exists.
 #[tokio::test]
@@ -4755,7 +4755,7 @@ async fn r4_duplicate_command_delivery_replays_instead_of_re_executing() {
 }
 
 /// §37: "old execution identity reused". Origin: Sergeant's pane-identity
-/// discipline (docs/troubleshooting.md "Worker says in_progress...", which
+/// discipline (sergeant-rs-workspace's knowledge/evidence/troubleshooting.md "Worker says in_progress...", which
 /// demands "exact recorded tmux pane identity", and "Pane is missing" —
 /// identity mismatch is orphan evidence, not a target to guess at). A
 /// journaled execution whose native identity does not match what the
@@ -4881,7 +4881,7 @@ async fn r6_client_disconnect_mid_run_has_no_consequence() {
 
 /// §37: "work waits for input for hours". Origin: upstream's own doctrine
 /// that waiting is a durable state, not a liveness failure —
-/// docs/troubleshooting.md "Worker became orphaned after blocking" ("an
+/// sergeant-rs-workspace's knowledge/evidence/troubleshooting.md "Worker became orphaned after blocking" ("an
 /// expected dependency-blocked exit must remain blocked") and the
 /// spike-era monitoring rules that treat `blocked` as re-read-state, not
 /// timeout. Sergeant has no timeout that kills state: a parked work passes
@@ -6085,7 +6085,7 @@ fn n5_a_stop_naming_another_execution_does_not_latch_the_current_one() {
 // N2's grammar-pressure report found exactly one confirmed engine gap: a live
 // actor had no way to say "I cannot proceed without a human decision". The
 // state it needs already existed (`needs_input`, resumable by `respond` on the
-// same execution — U1, docs/gauntlet/notes/n2-fake-backend-semantics.md); what
+// same execution — U1, sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/n2-fake-backend-semantics.md); what
 // was missing was a pathway from the harness's own output into it, and any way
 // to tell the actor's question apart from a gate's.
 
@@ -6257,7 +6257,7 @@ fn n9_the_ask_capability_is_paired_with_what_the_backend_can_actually_report() {
     let claude = ClaudeBackend::new(ClaudeConfig::new(Path::new("/nonexistent")));
     assert!(
         claude.capabilities().ask,
-        "measured on 2.1.226: see docs/gauntlet/notes/n3-claude-ask-measurement.md"
+        "measured on 2.1.226: see sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/n3-claude-ask-measurement.md"
     );
 }
 
@@ -6438,7 +6438,7 @@ fn n27_the_ask_claim_is_withdrawn_when_the_stream_stops_carrying_its_evidence() 
     let stub = StubClaude::passing(data.path());
     // A build that completes turns and no longer emits the line: the exact
     // shape "post_turn_summary changes subtype or drops needs_action" leaves
-    // behind (docs/gauntlet/notes/n3-claude-ask-measurement.md, "re-measure
+    // behind (sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/n3-claude-ask-measurement.md, "re-measure
     // when").
     stub.replays(RECORDED_TURN);
     let mut config = ClaudeConfig::new(data.path());
@@ -6498,7 +6498,7 @@ fn n27_the_ask_claim_is_withdrawn_when_the_stream_stops_carrying_its_evidence() 
 /// real adapter.
 ///
 /// **Probe-gated per disposition 2**
-/// (`docs/gauntlet/notes/cerberus-ask-grammar-remeasurement-2026-08-11.md`):
+/// (`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/cerberus-ask-grammar-remeasurement-2026-08-11.md`):
 /// the ask affordance (`system/post_turn_summary`) was measured present on
 /// 2.1.226 in the cloud container and measured **absent** on this host/
 /// account's 2.1.227 — conditional on something outside the version string
@@ -6583,7 +6583,7 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
         eprintln!(
             "SKIPPED-ENV: a5's NeedsInput-mapping assertion — this host/account's claude CLI \
              emitted no post_turn_summary line for this driven turn (see \
-             docs/gauntlet/notes/cerberus-ask-grammar-remeasurement-2026-08-11.md); the \
+             sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/cerberus-ask-grammar-remeasurement-2026-08-11.md); the \
              adapter's runtime withdrawal path fired instead, which is what this arm asserts."
         );
         assert_eq!(
@@ -8404,7 +8404,7 @@ fn n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_han
 
 // --------------- R-MVP1-7: the turn envelope (cap + per-turn ceiling)
 //
-// Lane B (docs/gauntlet/contracts/MVP-1.md). The cap gates `launch` and
+// Lane B (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/MVP-1.md). The cap gates `launch` and
 // `send` — the engine's two turn-spawning seams (`Engine::reserve_stage`,
 // `Engine::begin_input`) — and counts from the journal
 // (`WorkRun::turns_spawned`, folded from `execution.started`/
@@ -8654,7 +8654,7 @@ fn r_mvp1_7_a_send_that_internally_retries_through_resume_counts_one_turn() {
 /// the ruling's own admitted workflow." `grilling` retired at MVP-5 F2's
 /// execution-surface re-triage (North Star ruling R-NS-6 dissolves the
 /// WORKFLOW-IF-E3 category grilling-class packages sat in; re-homed to
-/// `skills/grilling/SKILL.md`; see `docs/icm/re-homing-record-2026-08-12.md`).
+/// `skills/grilling/SKILL.md`; see `sergeant-rs-workspace's knowledge/rulings/icm/re-homing-record-2026-08-12.md`).
 /// No package under `.sergeant/workflows/` declares `requires_ask = true`
 /// today — an honest consequence of that ruling, not a regression to paper
 /// over — so this test now proves the parse contract against

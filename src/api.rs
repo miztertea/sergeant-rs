@@ -51,8 +51,9 @@ use crate::domain::work::{
 };
 use crate::domain::workflow::{
     self, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
-    KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED,
-    KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, WorkflowDefinition,
+    KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
+    KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
+    WorkflowDefinition,
 };
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::engine::{
@@ -302,7 +303,7 @@ impl Core {
 /// (`surface.materialized`, `workflow.bound`, `work.started`,
 /// `stage.entered`, `execution.reserved`) — several holds per work, not one,
 /// and the two-phase boundary added two of those events per work
-/// (`docs/perf/n3-two-phase-boundary-2026-08-10.md`); at one fsync each, on a
+/// (`sergeant-rs-workspace's knowledge/evidence/perf/n3-two-phase-boundary-2026-08-10.md`); at one fsync each, on a
 /// single-writer path, that volume *is* the cost. Sharing the fsync is legal
 /// because **almost nothing outside the core runs during a hold**: the mutex
 /// is held, no response has been rendered, no SSE frame sent, and §22.6
@@ -1905,8 +1906,9 @@ fn integrity_view(run: &WorkRun) -> Option<Value> {
 /// outcome must not be reported as plain `completed` when the branch never
 /// advanced and the worktree was left dirty — the safety net for when an
 /// actor guesses wrong about its own runtime model anyway
-/// (`docs/adr/0007-actor-runtime-contract.md`). The engine still learns
-/// nothing about what a commit *is* (NORTH-STAR: "the engine learns no
+/// (`ADR 0007`). The engine still learns
+/// nothing about what a commit *is* (the workspace knowledge library's
+/// North Star ruling: "the engine learns no
 /// output vocabulary; only the pointer is core"): this reads two facts the
 /// pointer already computes — a binding's teardown disposition, and whether
 /// its finalize commit ever moved past the surface's own base SHA — rather
@@ -2501,11 +2503,15 @@ async fn work_transcript(State(state): State<ApiState>, Path(id): Path<String>) 
     Json(json!({"work_id": id, "turns": turns})).into_response()
 }
 
-/// The pure decode: filter `events` to `work_id`'s `conversation.*` kinds and
-/// turn each into a `{seq, ts, role, text, source}` entry, in the journal's
-/// own causal (seq) order — factored out of the handler above so the
-/// role/source mapping and the blob-decode fallback can be pinned by a
-/// direct test without spinning up a daemon.
+/// The pure decode: filter `events` to `work_id`'s `conversation.*` and
+/// `tool.*` (#240) kinds and turn each into a `{seq, ts, role, text,
+/// source}` entry, in the journal's own causal (seq) order — factored out
+/// of the handler above so the role/source mapping and the blob-decode
+/// fallback can be pinned by a direct test without spinning up a daemon.
+/// `tool.*` events carry `role: "tool_use"` plus a `phase`
+/// (`"requested"`/`"completed"`) — previously these fell into the
+/// catch-all below and vanished, so a degraded run that silently invoked
+/// zero tools read identically to one that made real progress.
 fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Path) -> Vec<Value> {
     let mut turns = Vec::new();
     // Per-`execution_id` count of `conversation.assistant.completed` events
@@ -2516,7 +2522,7 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
     // assistant_lines`) produces the same count of entries in the same
     // order. The blob-decode fallback below skips that many leading lines
     // from the archive rather than an all-or-nothing flag, so a crash that
-    // lands between two of a turn's own assistant-line appends (docs/DEVELOPMENT.md's
+    // lands between two of a turn's own assistant-line appends (CONTRIBUTING.md's
     // "adjacent-append crash window") still recovers the lines that never
     // reached the journal, instead of either double-reporting the ones that
     // did or silently dropping the ones that didn't. Removed on consumption
@@ -2556,6 +2562,44 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
                 "text": event.payload["question"].as_str().unwrap_or(""),
                 "source": "event",
             })),
+            // #240: `tool.*` events were previously falling into the
+            // catch-all below and vanishing from the transcript entirely —
+            // a degraded run that silently skipped every tool call read
+            // identically to one that made real progress. Surfaced as
+            // `role: "tool_use"` with a `phase` distinguishing the request
+            // from its result, so a reader (or `render_transcript`) can
+            // tell the two apart without a second lookup.
+            KIND_TOOL_REQUESTED => {
+                let name = event.payload["name"].as_str().unwrap_or("tool");
+                let input = &event.payload["input"];
+                turns.push(json!({
+                    "seq": event.seq,
+                    "ts": event.timestamp,
+                    "role": "tool_use",
+                    "phase": "requested",
+                    "tool_use_id": event.payload["id"].as_str().unwrap_or(""),
+                    "name": name,
+                    "input": input,
+                    "text": format!("{name} {input}"),
+                    "source": "event",
+                }));
+            }
+            KIND_TOOL_COMPLETED => {
+                let is_error = event.payload["is_error"].as_bool().unwrap_or(false);
+                let name = event.payload["name"].as_str().unwrap_or("tool");
+                let outcome = if is_error { "error" } else { "ok" };
+                turns.push(json!({
+                    "seq": event.seq,
+                    "ts": event.timestamp,
+                    "role": "tool_use",
+                    "phase": "completed",
+                    "tool_use_id": event.payload["tool_use_id"].as_str().unwrap_or(""),
+                    "name": name,
+                    "is_error": is_error,
+                    "text": format!("{name} -> {outcome}"),
+                    "source": "event",
+                }));
+            }
             KIND_CONVERSATION_TURN_ENDED => {
                 // This turn's own boundary: whatever `assistant.completed`
                 // this execution emitted belongs to *this* turn (the two are
@@ -4062,6 +4106,7 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_STAGE_BLOCKED,
     KIND_STAGE_FAILED,
     KIND_STAGE_CANCELED,
+    KIND_STAGE_OUTPUT_MISSING,
     KIND_EXECUTION_RESERVED,
     KIND_EXECUTION_STARTED,
     KIND_EXECUTION_STOPPED,
@@ -5680,6 +5725,56 @@ mod tests {
         );
     }
 
+    /// #240: `tool.requested`/`tool.completed` used to fall into
+    /// `transcript_turns`'s catch-all and vanish from the transcript
+    /// entirely — a degraded run that silently invoked zero tools read
+    /// identically to one that made real progress. Both kinds must now
+    /// decode as `role: "tool_use"` entries, distinguished by `phase`, in
+    /// the same causal order as every other turn kind.
+    #[test]
+    fn transcript_turns_surfaces_tool_requested_and_completed_events() {
+        let events = vec![
+            ev(
+                1,
+                "w1",
+                KIND_CONVERSATION_USER,
+                json!({"text": "run the tests"}),
+            ),
+            ev(
+                2,
+                "w1",
+                KIND_TOOL_REQUESTED,
+                json!({"id": "call-1", "name": "bash", "input": {"command": "cargo test"}}),
+            ),
+            ev(
+                3,
+                "w1",
+                KIND_TOOL_COMPLETED,
+                json!({"tool_use_id": "call-1", "name": "bash", "is_error": false}),
+            ),
+        ];
+        let data_dir = tempfile::TempDir::new().expect("tempdir");
+        let turns = transcript_turns("w1", events, data_dir.path());
+
+        let requested = turns
+            .iter()
+            .find(|t| t["seq"] == 2)
+            .expect("tool.requested must decode into a turn");
+        assert_eq!(requested["role"], "tool_use");
+        assert_eq!(requested["phase"], "requested");
+        assert_eq!(requested["tool_use_id"], "call-1");
+        assert_eq!(requested["name"], "bash");
+
+        let completed = turns
+            .iter()
+            .find(|t| t["seq"] == 3)
+            .expect("tool.completed must decode into a turn");
+        assert_eq!(completed["role"], "tool_use");
+        assert_eq!(completed["phase"], "completed");
+        assert_eq!(completed["tool_use_id"], "call-1");
+        assert_eq!(completed["is_error"], false);
+    }
+
     /// The "minimal blob decode" itself, end to end through
     /// `transcript_turns`: a `conversation.turn.ended` with
     /// `result_envelope: false` and a `raw` blob ref recovers whatever
@@ -5926,7 +6021,7 @@ mod tests {
     /// `partial_turn` fixture models). The event sink here converts every
     /// `EventDraft` into a real journaled `Event`, exactly as the daemon's
     /// own `journaling_sink` does, **except** it drops
-    /// `conversation.assistant.completed` — modeling docs/DEVELOPMENT.md's own
+    /// `conversation.assistant.completed` — modeling CONTRIBUTING.md's own
     /// "adjacent-append crash window" (an event handed to the sink but
     /// never durably committed before the process holding it dies), which is
     /// this module's own doc comment's stated reason `decode_partial_

@@ -249,6 +249,32 @@ fn embedded_skills_carry_the_real_root_and_preflight_remedies() {
     );
 }
 
+/// #232: a literal-reading actor that finished a correct fix retired
+/// `completed_dirty` because no shared closing-stage context ever told it
+/// to commit — the `BindingSummary` names `work_branch`, but nothing said
+/// to land the work there. `@@fix-confirmed` is the stage context that
+/// instructs an actor to *do* fix work (as opposed to `@@close` /
+/// `@@evidence-requirements`, which only report on fixes already made),
+/// so it is the one this test pins the commit imperative in.
+#[test]
+fn fix_confirmed_context_states_the_commit_imperative() {
+    let fix_confirmed =
+        std::fs::read_to_string(repo_root().join(".sergeant/common/contexts/fix-confirmed.md"))
+            .expect("read fix-confirmed.md");
+    assert!(
+        fix_confirmed.contains("git commit") && fix_confirmed.contains("git add"),
+        "fix-confirmed.md must literally instruct the actor to `git add`/`git commit` its \
+         fix — the gap #232 found, where a literal-reading actor finishes a correct fix and \
+         retires it uncommitted because nothing ever said to commit"
+    );
+    assert!(
+        fix_confirmed.contains("work_branch"),
+        "fix-confirmed.md's commit imperative must name `work_branch` — the field the \
+         BindingSummary already hands every actor — so the instruction says *where* to commit, \
+         not just that a commit must happen"
+    );
+}
+
 // -------------------------------------------------- 2. embedded distro skew
 
 /// No `CONTEXT.md` under the embedded `.sergeant/workflows/` distro source
@@ -378,48 +404,50 @@ fn no_shipped_workflow_or_skill_quotes_the_removed_workspace_flag() {
 
 // ------------------------------------------------- 3. manifest example skew
 
-/// The estate-root proposal's own canonical manifest shape (§13.1,
-/// `docs/proposals/estate-root-git.md`) still parses under the current
-/// schema — structurally (`Estate::from_config_structural`, which validates
+/// §13.1's canonical manifest shape, carried verbatim from
+/// `sergeant-rs-workspace's knowledge/evidence/reference/estate-root-git.md` §13.1 as of 2026-08-24, ahead of
+/// that file's relocation to the workspace knowledge library
+/// (split-hardening series, sprint-plan-2026-08-24.md, W1). Fixture, not a
+/// live read, so this test no longer depends on the doc surviving in this
+/// repo.
+const PROPOSAL_MANIFEST_EXAMPLE: &str = r#"[estate]
+name = "payments"
+data_dir = ".sergeant/data"
+surfaces_dir = ".sergeant/data/surfaces"
+
+[[repo]]
+name = "payments-api"
+origin = "git@github.com:company/payments-api.git"
+instructions = "suppress"
+
+[[repo]]
+name = "auth"
+origin = "git@github.com:company/auth.git"
+instructions = "suppress"
+
+[[repo]]
+name = "payments-knowledge"
+origin = "git@github.com:company/payments-knowledge.git"
+instructions = "suppress"
+
+[group.payments]
+repos = ["payments-api", "auth", "payments-knowledge"]
+brief = "Payment authorization, settlement, and governing team knowledge."
+
+[[profile]]
+name = "sonnet"
+backend = "claude"
+default_model = "sonnet""#;
+
+/// The estate-root proposal's own canonical manifest shape (§13.1) still
+/// parses under the current schema — structurally
+/// (`Estate::from_config_structural`, which validates
 /// names/duplicates/groups/profiles without requiring `repos/<name>` to be
 /// real git checkouts on disk, exactly right for a doc example that names
 /// no real repository).
 #[test]
 fn the_proposals_canonical_manifest_example_parses_under_the_current_schema() {
-    let proposal = std::fs::read_to_string(repo_root().join("docs/proposals/estate-root-git.md"))
-        .expect("read estate-root-git.md");
-
-    let anchor = proposal
-        .find("13.1 Proposed manifest shape")
-        .expect("proposal must still have a §13.1 'Proposed manifest shape' heading");
-    let after_anchor = &proposal[anchor..];
-    let fence_start = after_anchor
-        .find("```toml")
-        .expect("§13.1 must be followed by a ```toml fence");
-    let block_start = fence_start + "```toml".len();
-    let block_end = after_anchor[block_start..]
-        .find("```")
-        .expect("the §13.1 toml fence must close");
-    let toml_text = after_anchor[block_start..block_start + block_end].trim();
-
-    // Structural sanity: this is the specific example this test means to
-    // pin, not whatever now happens to follow the same heading text.
-    assert!(
-        toml_text.contains("[estate]"),
-        "unexpected block: {toml_text}"
-    );
-    assert!(
-        toml_text.contains("[[repo]]"),
-        "unexpected block: {toml_text}"
-    );
-    assert!(
-        toml_text.contains("[group."),
-        "unexpected block: {toml_text}"
-    );
-    assert!(
-        toml_text.contains("[[profile]]"),
-        "unexpected block: {toml_text}"
-    );
+    let toml_text = PROPOSAL_MANIFEST_EXAMPLE;
 
     let dir = tempfile::TempDir::new().expect("scratch dir");
     let manifest_path = dir.path().join("sergeant.toml");
@@ -478,7 +506,7 @@ fn close_out_completion_boundary_covers_external_pipeline_runs() {
 // mechanism with no on-demand sync verb (#167), and the absence of any
 // leftover "Engine gap" note. Both tests are removed here because the
 // package they pinned, `dispatch`, was retired by the 2026-08-22 distro
-// content rebuild (docs/proposals/distro-content-2026-08-22.md, W2;
+// content rebuild (sergeant-rs-workspace's knowledge/evidence/reference/distro-content-2026-08-22.md, W2;
 // design proposal §4.1) — the kickoff ruling cut it outright rather than
 // keeping it alive as a transitional package, and neither file exists
 // under `.sergeant/workflows/` any more for a test to read.
@@ -509,33 +537,23 @@ fn agents_md_carries_the_intent_section() {
 
 // --------------------------------------------------------- 6. #180 wording
 
-/// NORTH-STAR.md's live destination text states the ratified #180 contract
-/// — a declared mutation surface, observed and journaled, never an
-/// enforced one — and AGENTS.md's mirror sentence says the same thing.
-/// Quoted verbatim, same house pattern as above.
+/// AGENTS.md's mirror sentence states the ratified #180 contract — a
+/// declared mutation surface, observed and journaled, never an enforced
+/// one. Quoted verbatim, same house pattern as above.
+///
+/// This test used to also pin the North Star ruling's own copy of the same
+/// sentence; that document left this repo for the sergeant-rs-workspace
+/// knowledge library under the split-hardening series (W1 relocated it,
+/// W2c removed the local file), so AGENTS.md is now the sole doctrine
+/// surface this repo's build and tests depend on.
 #[test]
-fn north_star_states_the_ratified_mutation_surface_contract() {
-    let north_star =
-        std::fs::read_to_string(repo_root().join("NORTH-STAR.md")).expect("read NORTH-STAR.md");
+fn agents_md_states_the_ratified_mutation_surface_contract() {
     let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
-    // Both files soft-wrap; collapse whitespace so a sentence spanning a
+    // AGENTS.md soft-wraps; collapse whitespace so a sentence spanning a
     // line break still matches a `contains` check on its logical text
     // rather than its accidental line layout (same trick
     // `agents_md_session_start_matches_the_real_root_gate` uses above).
-    let north_star_flat = north_star.split_whitespace().collect::<Vec<_>>().join(" ");
     let agents_md_flat = agents_md.split_whitespace().collect::<Vec<_>>().join(" ");
-
-    assert!(
-        north_star_flat.contains(
-            "carried by a durable intent-execution engine that gives every Work its own \
-             worktree and a declared mutation surface — authorization, not a seal — runs \
-             intents to completion against it, and journals what core can prove happened \
-             outside that surface as dirty evidence at retirement rather than silently \
-             absorbing it."
-        ),
-        "NORTH-STAR.md's destination text no longer states the ratified #180 mutation-surface \
-         contract — update this test and the doctrine text together"
-    );
 
     assert!(
         agents_md_flat.contains(
@@ -545,22 +563,116 @@ fn north_star_states_the_ratified_mutation_surface_contract() {
              can prove happened outside that surface as dirty evidence at retirement rather \
              than silently absorbing it"
         ),
-        "AGENTS.md's mirror sentence no longer states the same #180 contract — update this \
+        "AGENTS.md's mirror sentence no longer states the ratified #180 contract — update this \
          test and the doctrine text together"
     );
 
     // Factual-not-exhortative framing (MUTATION_SURFACE_HEADER's own rule,
     // src/backend/claude.rs): the destination text must never claim the
     // mutation surface itself is enforced.
-    for (name, text) in [
-        ("NORTH-STAR.md", &north_star_flat),
-        ("AGENTS.md", &agents_md_flat),
-    ] {
-        assert!(
-            !text.contains("enforces the mutation surface")
-                && !text.contains("enforced mutation surface")
-                && !text.contains("mutation surface is enforced"),
-            "{name} must state the mutation surface as declared and observed, never enforced"
-        );
+    assert!(
+        !agents_md_flat.contains("enforces the mutation surface")
+            && !agents_md_flat.contains("enforced mutation surface")
+            && !agents_md_flat.contains("mutation surface is enforced"),
+        "AGENTS.md must state the mutation surface as declared and observed, never enforced"
+    );
+}
+
+// ------------------------------------------------ 7. citation-integrity skew
+//
+// split-hardening W2c made this repo product-documents-only: NORTH-STAR.md,
+// GAUNTLET.md, LESSONS.md, and the docs/ tree (except the handful of items
+// re-homed into assets/ and CONTRIBUTING.md) are gone, their content already
+// verified and pushed to the sergeant-rs-workspace knowledge library. A
+// leftover path-like reference to any of them is a dangling citation, not
+// live doctrine — this sweeps the surfaces a contributor or an agent
+// actually reads for exactly that. Excludes `CHANGELOG.md` (an append-only
+// ledger this wave does not edit).
+#[test]
+fn no_readme_contributing_src_test_or_workflow_file_cites_a_removed_path() {
+    const NEEDLES: &[&str] = &["NORTH-STAR.md", "GAUNTLET.md", "LESSONS.md", "docs/"];
+
+    let mut roots = vec![
+        repo_root().join("README.md"),
+        repo_root().join("CONTRIBUTING.md"),
+    ];
+    for dir in ["src", "tests", ".github"] {
+        roots.extend(walk(&repo_root().join(dir)));
     }
+
+    let self_path = repo_root().join("tests/f_doctrine_skew.rs");
+    let mut offenders = Vec::new();
+    for path in roots {
+        // This test's own source necessarily spells out the needles it
+        // checks for (and describes, in its doc comment, what it excludes)
+        // — comparing it against itself would be a tautological failure.
+        if !path.is_file() || path == self_path {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for needle in NEEDLES {
+            if text.contains(needle) {
+                offenders.push(format!("{}: still cites {needle:?}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "dangling citation(s) to a path removed by split-hardening W2c:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// split-hardening W3 (#261) extended the sweep above onto `skills/` and
+/// `.sergeant/` — the embedded distro content `sgt init` actually ships —
+/// now that those stale routes are fixed. This is a separate test rather
+/// than folding into the one above because the embedded corpus
+/// legitimately uses a bare `docs/` as a placeholder for *a consumer
+/// repository's own* docs directory (e.g. `review-change/10-identify-spec-
+/// source/CONTEXT.md`'s "a PRD/spec file under `docs/`, `specs/`, or
+/// `.scratch/`"), so the needle set here is the specific stale-route
+/// fragments split-hardening actually removed or re-pointed, not a bare
+/// `docs/` substring that would misfire on that legitimate generic usage.
+#[test]
+fn no_embedded_skill_or_workflow_file_cites_a_removed_or_workspace_only_path() {
+    const NEEDLES: &[&str] = &[
+        "NORTH-STAR.md",
+        "GAUNTLET.md",
+        "LESSONS.md",
+        "docs/icm/",
+        "docs/adr/",
+        "docs/DEVELOPMENT.md",
+        "docs/environments/",
+        "docs/proposals/",
+        "sergeant-rs-workspace",
+    ];
+
+    let mut roots = walk(&repo_root().join("skills"));
+    roots.extend(walk(&repo_root().join(".sergeant")));
+    roots.push(repo_root().join("AGENTS.md"));
+
+    let mut offenders = Vec::new();
+    for path in roots {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for needle in NEEDLES {
+            if text.contains(needle) {
+                offenders.push(format!("{}: still cites {needle:?}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "dangling citation(s) to a path removed by split-hardening W2c, or to the private \
+         workspace repo, in the embedded distro:\n{}",
+        offenders.join("\n")
+    );
 }

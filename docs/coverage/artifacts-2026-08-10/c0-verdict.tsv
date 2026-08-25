@@ -1,4 +1,0 @@
-pattern	/home/user/sergeant-rs/target/sergeant-rs-%p-%4m.profraw
-absolute	absolute
-per_process	yes
-managed_collection_dir	/home/user/sergeant-rs/target/llvm-cov-target

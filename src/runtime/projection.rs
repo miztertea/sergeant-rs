@@ -26,8 +26,9 @@ use crate::domain::work::{
 };
 use crate::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
-    KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_RESUMED, KIND_STAGE_WAITING,
-    KIND_WORKFLOW_BOUND, StageBinding, StageRecord, StageStatus, WorkflowDefinition,
+    KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED,
+    KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageRecord, StageStatus,
+    WorkflowDefinition,
 };
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::integrity::IntegrityDisposition;
@@ -1050,6 +1051,7 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                     attempt: event.payload["attempt"].as_u64().unwrap_or(1) as u32,
                     status: StageStatus::Active,
                     detail: None,
+                    output_reprompts: 0,
                 });
             }
         }
@@ -1080,6 +1082,23 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                     stage.status = status;
                     stage.detail = detail;
                 }
+            }
+        }
+        KIND_STAGE_OUTPUT_MISSING => {
+            // #260 Q3: the hard stage-output gate spent this attempt's one
+            // bounded re-prompt. The stage stays `Active` — this is not a
+            // status change, only the count `Engine`'s gate reads back on
+            // the next `StageCompleted` to tell "already re-prompted" from
+            // "first time" (see `StageRecord::output_reprompts`).
+            if let (Some(work_id), Some(stage_id)) =
+                (event.work_id.as_ref(), event.payload["stage_id"].as_str())
+                && let Some(stage) = state
+                    .runs
+                    .entry(work_id.clone())
+                    .or_default()
+                    .last_stage_mut(stage_id)
+            {
+                stage.output_reprompts += 1;
             }
         }
         KIND_STAGE_RESUMED => {
@@ -1660,9 +1679,9 @@ mod rule_a_eviction_tests {
     /// unbounded climb lived in — stays flat across many completed works,
     /// never one entry per work submitted. TH-08: the daemon-level half of
     /// this claim (real RSS, real fds, real hygiene, not a struct field
-    /// count) is `docs/perf/s2-churn-mvp1-fixer-2026-08-12.md` — run against
+    /// count) is `sergeant-rs-workspace's knowledge/evidence/perf/s2-churn-mvp1-fixer-2026-08-12.md` — run against
     /// this same fix, decelerating per-wave slope, not the pre-eviction
-    /// monotonic climb `docs/perf/baseline-cerberus-2026-08-11.md` measured.
+    /// monotonic climb `sergeant-rs-workspace's knowledge/evidence/perf/baseline-cerberus-2026-08-11.md` measured.
     ///
     /// Mutation this kills: removing the eviction call (or narrowing
     /// `is_absorbing` to nothing) turns `runs.len()` into `N`, not `0`.

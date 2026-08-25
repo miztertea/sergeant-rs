@@ -22,7 +22,7 @@ deterministic §20/§27 tests replay.
 
 One verbatim `system`/`post_turn_summary` line, recorded 2026-08-10 against the
 same 2.1.226 build during the N3 ask measurement
-(`docs/gauntlet/notes/n3-claude-ask-measurement.md`, "prompt B"): a turn that
+(`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/n3-claude-ask-measurement.md`, "prompt B"): a turn that
 was told to answer and ask nothing, so `needs_action` is the empty string.
 
 It is kept separately, and named separately, because it is **not** from the
@@ -47,8 +47,8 @@ recorded fixture of the substitution envelope", and no such recording can
 exist here: print-mode substitution cannot be provoked on this account (it is
 entitled to every model the pin would ask for), and the spike's actual
 substitution evidence is a *TUI transcript warning line*, not a print-mode
-result envelope (`reference/sergeant-upstream/docs/research/
-claude-background-harness-spike.md`, "the warning"). Recording it would
+result envelope (the spike write-up under sergeant-rs-workspace's
+`reference/sergeant-upstream/` tree, "the warning"). Recording it would
 require an unentitled account, which is an environment, not a test.
 
 So this fixture is *derived* from the recorded envelope above by exactly

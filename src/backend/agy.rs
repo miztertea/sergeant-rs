@@ -1,7 +1,7 @@
 //! Antigravity (`agy`) adapter: `agy -p <prompt> --output-format stream-json`
 //! non-interactive turns over a **harness-minted, server-side durable
 //! conversation** (W1 of the *Sergeant speaks Antigravity* sprint,
-//! `docs/proposals/agy-adapter-2026-08-23.md`, including its panel
+//! `sergeant-rs-workspace's knowledge/evidence/reference/agy-adapter-2026-08-23.md`, including its panel
 //! amendments). One OS process per turn; this is W1's only transport.
 //! `--input-format stream-json` (a persistent stdin turn loop) is W3's and is
 //! deliberately out of scope here.

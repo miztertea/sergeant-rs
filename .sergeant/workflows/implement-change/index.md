@@ -24,7 +24,7 @@ and closes with an evidence packet tied to acceptance. Use when: a change
 to a registered repository is specified well enough to build, and the
 Work should end with reviewed, evidence-backed commits.
 
-See `CONTEXT.md` for workflow orientation, `workflow.toml` for the pinned
-stage order, and
-`sergeant-rs-workspace/knowledge/evidence/resources/distro-content-series/design-proposal-2026-08-22.md`
-for this package's derivation and the owner rulings behind it.
+See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
+pinned stage order. This package's derivation and the owner rulings
+behind it are dev-corpus provenance, kept in this project's private
+development record, not shipped here.

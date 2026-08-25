@@ -72,8 +72,8 @@ struct Sgt {
     #[arg(long, global = true)]
     json: bool,
     /// Subcommand to run. Omitted, `sgt` prints the homepage (ADR 0010,
-    /// deviation from proposal §30 — see `GAUNTLET.md`'s deviation
-    /// register): a logo and a condensed quickstart, touching no daemon.
+    /// deviation from proposal §30 — see the workspace knowledge library's
+    /// deviation register): a logo and a condensed quickstart, touching no daemon.
     /// The TUI is `sgt tui`, an explicit verb like any other.
     #[command(subcommand)]
     command: Option<Command>,
@@ -224,7 +224,7 @@ enum Command {
     },
     /// Block until a Work needs attention or reaches a terminal state, then
     /// print the current snapshot and exit — the harness's return path after
-    /// `sgt run` (`docs/gauntlet/contracts/WATCH.md`), replacing
+    /// `sgt run` (`sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/WATCH.md`), replacing
     /// `sgt work show` polling with one call. With no `WORK_ID`, watches
     /// future matching transitions across the whole estate instead of one
     /// Work (WATCH-02); either way this is silent until a match — no
@@ -558,6 +558,12 @@ impl From<crate::domain::workflow::WorkflowForkError> for CliError {
     }
 }
 
+impl From<crate::domain::distro::DistroError> for CliError {
+    fn from(e: crate::domain::distro::DistroError) -> Self {
+        Self(e.to_string())
+    }
+}
+
 impl From<std::io::Error> for CliError {
     fn from(e: std::io::Error) -> Self {
         Self(e.to_string())
@@ -738,7 +744,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
     let (root, root_source) = effective_root(sgt.chdir.as_deref())?;
     let Some(command) = sgt.command else {
         // ADR 0010 (D6, deviation from proposal §30 registered in
-        // `GAUNTLET.md`): bare `sgt` is a homepage, not the TUI, and it
+        // the workspace knowledge library's deviation register): bare `sgt` is a homepage, not the TUI, and it
         // contacts no daemon at all — that is what dissolves ADR 0009's
         // hardest case (a human-facing surface with nothing to reconnect
         // to) rather than answering it. `sgt tui` is the explicit verb.
@@ -1260,12 +1266,17 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         Command::Init { name } => {
             let cwd = root.clone();
             let outcome = crate::domain::manifest::init_estate(&cwd, name.as_deref())?;
-            // ADR 0014 decision 1: the distro (AGENTS.md, skills/,
-            // .sergeant/common/contexts/, .sergeant/workflows/) is embedded
-            // in the binary and written here, not cloned. Per-file
-            // idempotent (`domain::distro::write_distro`), so this never
-            // turns a second `sgt init` on an already-initialized estate
-            // into anything but a no-op, and it writes only within `cwd`.
+            // ADR 0014 decision 1: the distro (AGENTS.md, CLAUDE.md, skills/,
+            // .sergeant/common/contexts/, .sergeant/workflows/,
+            // .sergeant/index.md) is embedded in the binary and written
+            // here, not cloned. `skills/`, `.sergeant/common/contexts/`, and
+            // `.sergeant/workflows/` are atomically sgt-owned
+            // (`domain::distro::write_distro`): they are made to match the
+            // embed exactly on every call, so a second `sgt init` on an
+            // already-initialized estate with the same binary is a true
+            // no-op, and a retired package or drifted file is corrected
+            // rather than left behind (#241). It writes only within `cwd`,
+            // and never inside `.sergeant/local/`.
             let distro_outcome = crate::domain::distro::write_distro(&cwd)?;
             // Re-resolve now that `sergeant.toml` exists: the `data_dir`
             // computed above ran before `init_estate` created it, so on a
@@ -1283,6 +1294,11 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         "gitignore_updated": outcome.gitignore_updated,
                         "distro_files_written": distro_outcome.written.len(),
                         "distro_files_already_present": distro_outcome.skipped.len(),
+                        "distro_files_removed": distro_outcome.removed.len(),
+                        "distro_files_removed_paths": distro_outcome.removed,
+                        "distro_files_overwritten_modified": distro_outcome.overwritten_modified.len(),
+                        "distro_files_overwritten_modified_paths": distro_outcome.overwritten_modified,
+                        "distro_symlink_unavailable": distro_outcome.symlink_unavailable,
                         "changed": outcome.changed() || distro_outcome.changed(),
                     },
                     "doctor": report.to_json(),
@@ -1304,10 +1320,35 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     }
                     if distro_outcome.changed() {
                         println!(
-                            "  wrote {} distro file(s) (AGENTS.md, skills/, \
-                             .sergeant/common/contexts/, .sergeant/workflows/)",
+                            "  wrote {} distro file(s) (AGENTS.md, CLAUDE.md, skills/, \
+                             .sergeant/common/contexts/, .sergeant/workflows/, \
+                             .sergeant/index.md)",
                             distro_outcome.written.len()
                         );
+                        if !distro_outcome.removed.is_empty() {
+                            println!(
+                                "  removed {} retired distro file(s) no longer shipped by this \
+                                 binary:",
+                                distro_outcome.removed.len()
+                            );
+                            for path in &distro_outcome.removed {
+                                println!("    {}", path.display());
+                            }
+                        }
+                        if !distro_outcome.overwritten_modified.is_empty() {
+                            println!(
+                                "  replaced (had local modifications) — {} file(s) inside a \
+                                 sgt-owned tree were edited outside `sgt init` since the last \
+                                 run; those edits are now lost:",
+                                distro_outcome.overwritten_modified.len()
+                            );
+                            for path in &distro_outcome.overwritten_modified {
+                                println!("    {}", path.display());
+                            }
+                        }
+                        if let Some(reason) = &distro_outcome.symlink_unavailable {
+                            println!("  CLAUDE.md symlink not created: {reason}");
+                        }
                     }
                 } else {
                     println!(
@@ -1683,6 +1724,8 @@ fn render_transcript(result: &Value) -> String {
             "user" => "User",
             "assistant" => "Assistant",
             "ask" => "Ask",
+            "tool_use" if turn["phase"].as_str() == Some("requested") => "Tool call",
+            "tool_use" => "Tool result",
             other => other,
         };
         let recovered = if turn["source"].as_str() == Some("blob_decode") {
@@ -2002,8 +2045,8 @@ const LOGO: &str = r"
 ";
 
 /// Bare `sgt` (no subcommand): a homepage, not the TUI (ADR 0010, D6 —
-/// deviation from proposal §30, registered in `GAUNTLET.md`'s deviation
-/// register).
+/// deviation from proposal §30, registered in the workspace knowledge
+/// library's deviation register).
 ///
 /// Touches no daemon at all, which is the point: this is what dissolves ADR
 /// 0009's TUI carve-out debate instead of answering it — there is no daemon
@@ -2529,7 +2572,8 @@ pub(crate) mod doctor {
         /// scaffolding plus the estate-fundamental checks (`data_dir`,
         /// `journal`, `projection`) — succeed. Harness rows (`claude`,
         /// `docker`) are advisory at init time: §17.5's degraded-daemon
-        /// doctrine and NORTH-STAR's day-one loop both say a missing harness
+        /// doctrine and the workspace knowledge library's North Star ruling's
+        /// day-one loop both say a missing harness
         /// narrows which backends can run work later, it must not brick
         /// estate setup. A colleague without the `claude` CLI installed must
         /// still be able to `sgt init` — the row still prints as `FAIL` with
@@ -2651,8 +2695,14 @@ pub(crate) mod doctor {
         let (estate_root_check, admitted) = estate_root_check(root);
         checks.push(estate_root_check);
         checks.push(permission_mode_check(admitted.as_deref()));
+        checks.push(network_access_check(admitted.as_deref()));
         checks.push(estate_check(admitted.as_deref()));
         checks.push(workflows_check(admitted.as_deref()));
+        // #261: the installed corpus must cite only routes that actually
+        // resolve — deliberately not exempted from `healthy_for_init`, see
+        // `doc_routes_check`'s own doc comment.
+        checks.push(doc_routes_check(admitted.as_deref()));
+        checks.push(distro_edition_check(admitted.as_deref()));
         // §12.2: cheap, bounded — journal plus retained-artifact filesystem
         // metadata, never a per-branch git walk. Same estate-root threading
         // as the two rows above.
@@ -2762,11 +2812,32 @@ pub(crate) mod doctor {
                     .map(|p| {
                         // Already validated at load (#47): from_config would
                         // have refused the estate before this ran.
-                        let effective = match p.permission_mode().ok().flatten() {
-                            Some(mode) => mode.as_cli_value().to_string(),
-                            None => "unspecified -> no flag (CLI default)".to_string(),
-                        };
-                        format!("{}={effective}", p.name)
+                        let configured = p.permission_mode().ok().flatten();
+                        match configured {
+                            None => {
+                                format!("{}=unspecified -> no flag (CLI default)", p.name)
+                            }
+                            Some(mode) if backend_consumes_permission_mode(&p.backend) => {
+                                format!("{}={}", p.name, mode.as_cli_value())
+                            }
+                            // #262: a configured mode whose backend never
+                            // reads it must not be rendered as if it took
+                            // effect — `sgt doctor` reported this profile
+                            // "healthy" purely from the string in
+                            // sergeant.toml, never from anything the adapter
+                            // actually does with it. Deliberately never
+                            // written as `name=mode` here (even indirectly
+                            // via string interpolation): that shape is the
+                            // one that reads as "in effect" and is reserved
+                            // for the branch above.
+                            Some(mode) => format!(
+                                "{}=<configured: {}, but the {:?} backend does not read \
+                                 permission_mode -> no effect>",
+                                p.name,
+                                mode.as_cli_value(),
+                                p.backend
+                            ),
+                        }
                     })
                     .collect();
                 Check::ok("permission_mode", modes.join(", "))
@@ -2777,6 +2848,81 @@ pub(crate) mod doctor {
                 "fix sergeant.toml at the location the error names",
             ),
         }
+    }
+
+    /// Whether the named backend's adapter reads `Profile::permission_mode()`
+    /// at launch. Only `claude.rs`'s `launch_config` does today
+    /// (`backend/claude.rs`'s own module docs, "Permission mode is profile
+    /// configuration (#47)"); `codex.rs` never reads the option at all (#262
+    /// — its own launch grammar has no `--permission-mode` equivalent, and
+    /// `SandboxChoice`/the workspace-write network knob are what govern its
+    /// actor's capability instead). Kept here, matched on each adapter's own
+    /// `_BACKEND_NAME` constant, rather than as a new `Backend` trait method:
+    /// this wave's change set is scoped to the codex adapter and must not
+    /// touch `claude.rs`/`opencode.rs`/`agy.rs` to add one.
+    fn backend_consumes_permission_mode(backend: &str) -> bool {
+        backend == crate::backend::claude::CLAUDE_BACKEND_NAME
+    }
+
+    /// #262: the effective `network_access` override each declared profile
+    /// launches with, surfaced the same way [`permission_mode_check`]
+    /// surfaces `permission_mode` — same estate-root threading, same
+    /// already-validated-at-load assumption (a bad value would have refused
+    /// the estate before this ran, per [`crate::domain::estate::EstateError::
+    /// InvalidNetworkAccess`]), same "configured but the backend doesn't
+    /// read it" distinction so a row never reads as "in effect" when it
+    /// is not.
+    fn network_access_check(estate_root: Option<&Path>) -> Check {
+        use crate::domain::estate::Estate;
+
+        let Some(estate_root) = estate_root else {
+            return Check::ok("network_access", "not an estate root — nothing to report");
+        };
+        match Estate::from_config_allow_empty(&estate_root.join(MANIFEST_FILE)) {
+            Ok(estate) if estate.profiles.is_empty() => Check::ok(
+                "network_access",
+                "no profiles declared — every execution falls back to the backend's own \
+                 default network access",
+            ),
+            Ok(estate) => {
+                let overrides: Vec<String> = estate
+                    .profiles
+                    .iter()
+                    .map(|p| {
+                        // Already validated at load (#262): from_config
+                        // would have refused the estate before this ran.
+                        let configured = p.network_access().ok().flatten();
+                        match configured {
+                            None => {
+                                format!("{}=unspecified -> backend default", p.name)
+                            }
+                            Some(access) if backend_consumes_network_access(&p.backend) => {
+                                format!("{}={access}", p.name)
+                            }
+                            Some(access) => format!(
+                                "{}=<configured: {access}, but the {:?} backend does not read \
+                                 network_access -> no effect>",
+                                p.name, p.backend
+                            ),
+                        }
+                    })
+                    .collect();
+                Check::ok("network_access", overrides.join(", "))
+            }
+            Err(e) => Check::warn(
+                "network_access",
+                format!("cannot read this estate's profiles: {e}"),
+                "fix sergeant.toml at the location the error names",
+            ),
+        }
+    }
+
+    /// Whether the named backend's adapter reads
+    /// `Profile::network_access()` at launch. Only `codex.rs`'s
+    /// `launch_config` does today (#262) — `claude.rs`/`opencode.rs`/`agy.rs`
+    /// have no equivalent sandbox network knob.
+    fn backend_consumes_network_access(backend: &str) -> bool {
+        backend == crate::backend::codex::CODEX_BACKEND_NAME
     }
 
     /// MVP-3: the estate manifest's own health, beyond whether it merely
@@ -3101,6 +3247,313 @@ pub(crate) mod doctor {
         }
     }
 
+    /// #261: does the *installed* corpus — `AGENTS.md`, every `skills/*/
+    /// SKILL.md`, every `.sergeant/workflows/**/*.md`, and every
+    /// `.sergeant/common/contexts/*.md` — cite only paths that actually
+    /// resolve in this estate? Scans the corpus actually on disk rather
+    /// than hand-listing expected paths (the same anti-pattern
+    /// `domain::distro` itself rejects for the embed mechanism), so this
+    /// check cannot go stale the way the embed it watches over would.
+    ///
+    /// Two unconditional severities:
+    /// - The literal substring `sergeant-rs-workspace` anywhere in the
+    ///   installed corpus is always a `Fail` — a route into a private,
+    ///   unshipped repository is wrong in principle for a consumer estate.
+    /// - A dead `AGENTS.md ... step N` anchor cited anywhere when
+    ///   `AGENTS.md` itself has no matching `step N` text.
+    ///
+    /// Every other extracted `.md`-shaped path is resolved relative to
+    /// `estate_root`: unresolved and inside one of the three sgt-owned
+    /// trees (`skills/`, `.sergeant/common/contexts/`, `.sergeant/
+    /// workflows/`) is a `Fail` — that content is entirely this binary's
+    /// own doing. Unresolved and outside them (a bare `README.md`, a
+    /// template placeholder like `<host>.md`, a provenance footnote) is a
+    /// `Warn` — sgt does not own writing those, so a consumer estate
+    /// legitimately might not have one.
+    ///
+    /// Deliberately **not** exempted in [`Report::healthy_for_init`] — a
+    /// fresh `sgt init` that writes a distro citing paths it did not
+    /// itself write is this binary's own defect, not an external fact
+    /// like `claude`/`docker`.
+    fn doc_routes_check(estate_root: Option<&Path>) -> Check {
+        let Some(estate_root) = estate_root else {
+            return Check::ok("doc_routes", "not an estate root — nothing to check");
+        };
+
+        let mut sources: Vec<PathBuf> = vec![estate_root.join("AGENTS.md")];
+        for base in [
+            estate_root.join("skills"),
+            estate_root.join(".sergeant/workflows"),
+            estate_root.join(".sergeant/common/contexts"),
+        ] {
+            walk_markdown(&base, &mut sources);
+        }
+
+        let mut fails: Vec<String> = Vec::new();
+        let mut warns: Vec<String> = Vec::new();
+        let mut agents_md_has_step_anchor = false;
+        let mut step_citations: Vec<String> = Vec::new();
+
+        for path in &sources {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let rel = path.strip_prefix(estate_root).unwrap_or(path);
+
+            if text.contains("sergeant-rs-workspace") {
+                fails.push(format!(
+                    "{} cites `sergeant-rs-workspace` — a private, unshipped repository \
+                     path",
+                    rel.display()
+                ));
+            }
+
+            if *path == estate_root.join("AGENTS.md") && contains_step_pattern(&text) {
+                agents_md_has_step_anchor = true;
+            }
+            if let Some(cite) = find_agents_md_step_citation(&text) {
+                step_citations.push(format!("{} cites {cite:?}", rel.display()));
+            }
+
+            for candidate in extract_md_paths(&text) {
+                let normalized = candidate.trim_start_matches('/');
+                if normalized.is_empty() {
+                    continue;
+                }
+                let target = estate_root.join(normalized);
+                if target.exists() {
+                    continue;
+                }
+                let owned = normalized.starts_with(".sergeant/")
+                    || normalized.starts_with("skills/")
+                    || normalized == "AGENTS.md";
+                let entry = format!(
+                    "{} cites `{normalized}`, which does not resolve",
+                    rel.display()
+                );
+                if owned {
+                    fails.push(entry);
+                } else {
+                    warns.push(entry);
+                }
+            }
+        }
+
+        if !agents_md_has_step_anchor && !step_citations.is_empty() {
+            fails.push(format!(
+                "AGENTS.md has no `step N` anchor, but it is cited by: {}",
+                step_citations.join("; ")
+            ));
+        }
+
+        fails.sort();
+        fails.dedup();
+        warns.sort();
+        warns.dedup();
+
+        if !fails.is_empty() {
+            let mut detail = format!("{} route problem(s) in the installed distro:", fails.len());
+            for f in &fails {
+                detail.push_str("\n  ");
+                detail.push_str(f);
+            }
+            if !warns.is_empty() {
+                detail.push_str(&format!(
+                    "\n({} provenance-only warning(s) also found)",
+                    warns.len()
+                ));
+            }
+            return Check::fail(
+                "doc_routes",
+                detail,
+                "fix the citing file(s) named above so every cited path resolves inside this \
+                 estate, or points at an embedded/CLI-accessible surface instead of a \
+                 dev-corpus or workspace-only path",
+            );
+        }
+
+        if !warns.is_empty() {
+            let mut detail = format!(
+                "{} provenance-only route(s) do not resolve in this estate (not sgt-owned \
+                 content, so this is informational):",
+                warns.len()
+            );
+            for w in &warns {
+                detail.push_str("\n  ");
+                detail.push_str(w);
+            }
+            return Check::warn(
+                "doc_routes",
+                detail,
+                "these paths are outside sgt's own owned trees (README.md, template \
+                 placeholders, provenance footnotes) — resolve them yourself if this estate \
+                 should have one",
+            );
+        }
+
+        Check::ok(
+            "doc_routes",
+            format!(
+                "{} installed document(s) cite only resolvable routes",
+                sources.len()
+            ),
+        )
+    }
+
+    /// Recursively collect every `.md` file under `dir` into `out`.
+    fn walk_markdown(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_markdown(&path, out);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Scan `text` for backtick-quoted, repo-relative-looking `.md` paths —
+    /// stdlib-only (Ponytail R2/R3: no new dependency for a narrow,
+    /// well-bounded scan), no general Markdown/regex parser. A soft line
+    /// wrap *inside* an open backtick span (a path citation broken across
+    /// two lines, e.g. `skills/estate-navigation/SKILL.md`'s own historical
+    /// citations) is normalized by treating the newline and any following
+    /// indentation as zero characters rather than a break, so the wrapped
+    /// halves are still read as one path.
+    fn extract_md_paths(text: &str) -> Vec<String> {
+        let mut paths = Vec::new();
+        let mut current = String::new();
+        let mut in_backticks = false;
+        let mut chars = text.chars().peekable();
+
+        fn flush(current: &mut String, paths: &mut Vec<String>) {
+            if current.len() > 3 && current.ends_with(".md") {
+                paths.push(current.clone());
+            }
+            current.clear();
+        }
+
+        while let Some(c) = chars.next() {
+            if c == '`' {
+                in_backticks = !in_backticks;
+                flush(&mut current, &mut paths);
+                continue;
+            }
+            if in_backticks && c == '\n' {
+                while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                    chars.next();
+                }
+                continue;
+            }
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-') {
+                current.push(c);
+            } else {
+                flush(&mut current, &mut paths);
+            }
+        }
+        flush(&mut current, &mut paths);
+        paths
+    }
+
+    /// Whether `text` contains a `step N` anchor (digits following the
+    /// literal word "step") — the real referent an `AGENTS.md step N`
+    /// citation would need to land on.
+    fn contains_step_pattern(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        text.match_indices("step ")
+            .any(|(i, _)| bytes.get(i + 5).is_some_and(|b| b.is_ascii_digit()))
+    }
+
+    /// Find a `AGENTS.md ... step N`-shaped citation (the dead-anchor
+    /// pattern #261 found) within up to 10 characters of slack between
+    /// `AGENTS.md` and `step N`, and return the matched text for the
+    /// failure message.
+    fn find_agents_md_step_citation(text: &str) -> Option<String> {
+        let bytes = text.as_bytes();
+        for (i, _) in text.match_indices("AGENTS.md") {
+            let start = i + "AGENTS.md".len();
+            let window_end = (start + 10).min(text.len());
+            let Some(window) = text.get(start..window_end) else {
+                continue;
+            };
+            if let Some(step_at) = window.find("step ") {
+                let digit_at = start + step_at + "step ".len();
+                if bytes.get(digit_at).is_some_and(|b| b.is_ascii_digit()) {
+                    let end = (digit_at + 2).min(text.len());
+                    return text.get(i..end).map(str::to_string);
+                }
+            }
+        }
+        None
+    }
+
+    /// #261 owner ruling point 5's edition-agreement row: the installed
+    /// distro's own `edition` front matter (read off the stock
+    /// `.sergeant/workflows/*/index.md` packages actually on disk) against
+    /// the running binary's own version. A mismatch means this estate's
+    /// distro was written by a different `sgt` build than the one running
+    /// `doctor` now — content and behavior can disagree with what
+    /// `--help`/doctor itself describes until it is refreshed.
+    fn distro_edition_check(estate_root: Option<&Path>) -> Check {
+        use crate::domain::workflow::{WORKFLOW_ROOT, read_index_front_matter};
+
+        let Some(estate_root) = estate_root else {
+            return Check::ok("distro_edition", "not an estate root — nothing to check");
+        };
+
+        let workflows_dir = estate_root.join(WORKFLOW_ROOT);
+        let mut names: Vec<String> = match std::fs::read_dir(&workflows_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                .filter(|entry| entry.path().join("index.md").is_file())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        names.sort();
+
+        if names.is_empty() {
+            return Check::ok("distro_edition", "no installed distro content to check yet");
+        }
+
+        let current_edition = env!("CARGO_PKG_VERSION");
+        let mut mismatched: Vec<String> = Vec::new();
+        for name in &names {
+            let edition =
+                read_index_front_matter(&workflows_dir.join(name)).and_then(|fm| fm.edition);
+            if edition.as_deref() != Some(current_edition) {
+                mismatched.push(format!(
+                    "{name} ({})",
+                    edition.as_deref().unwrap_or("no edition")
+                ));
+            }
+        }
+
+        if mismatched.is_empty() {
+            Check::ok(
+                "distro_edition",
+                format!(
+                    "installed distro matches the running binary's edition {current_edition:?}"
+                ),
+            )
+        } else {
+            Check::fail(
+                "distro_edition",
+                format!(
+                    "installed distro edition disagrees with the running binary \
+                     {current_edition:?}: {}",
+                    mismatched.join(", ")
+                ),
+                "re-run `sgt init` — it overwrites every sgt-owned distro file to match the \
+                 running binary's edition",
+            )
+        }
+    }
+
     /// estate-root proposal §12.2: a cheap, bounded Git-surface summary
     /// derived from the journal and retained-artifact filesystem metadata
     /// only — never a per-branch `git` ancestry walk (§12.3's expensive
@@ -3218,6 +3671,7 @@ pub(crate) mod doctor {
 
         let mut retained_worktrees = 0u64;
         let mut retained_patches = 0u64;
+        let mut retained_outputs = 0u64;
         let mut retained_bytes = 0u64;
         let mut terminal_dirty_works = 0u64;
 
@@ -3226,6 +3680,11 @@ pub(crate) mod doctor {
                 retained_bytes += binding.bytes;
                 if binding.reason == "retained_dirty" && binding.path.is_file() {
                     retained_patches += 1;
+                } else if binding.reason == "retained_output" {
+                    // #240: a per-stage output copy, not a worktree — kept
+                    // out of `retained_worktrees` so that count still means
+                    // what its label says.
+                    retained_outputs += 1;
                 } else {
                     retained_worktrees += 1;
                 }
@@ -3241,6 +3700,7 @@ pub(crate) mod doctor {
             format!("  active linked worktrees:   {active_worktrees}"),
             format!("  retained worktrees:        {retained_worktrees}"),
             format!("  retained patches:          {retained_patches}"),
+            format!("  retained stage outputs:    {retained_outputs}"),
             format!(
                 "  retained artifact size:    {}",
                 human_bytes(retained_bytes)
@@ -4484,6 +4944,129 @@ pub(crate) mod doctor {
                 "{:?}",
                 check.detail
             );
+        }
+
+        /// #261: a fresh `sgt init` writes a distro whose own citations all
+        /// resolve — `doc_routes` must read `ok` (or, at worst, `warn` for
+        /// provenance-only footnotes outside the owned trees), never `fail`.
+        #[test]
+        fn doc_routes_is_clean_on_a_freshly_initialized_estate() {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            crate::domain::distro::write_distro(tmp.path()).expect("write distro");
+
+            let check = doc_routes_check(Some(tmp.path()));
+            assert_ne!(
+                check.status,
+                Status::Fail,
+                "a freshly initialized estate must not fail doc_routes: {}",
+                check.detail
+            );
+        }
+
+        /// The literal substring `sergeant-rs-workspace` anywhere in the
+        /// installed corpus is always `Fail`, regardless of whether the
+        /// path happens to exist on this machine.
+        #[test]
+        fn doc_routes_fails_on_a_workspace_only_citation() {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            crate::domain::distro::write_distro(tmp.path()).expect("write distro");
+            std::fs::write(
+                tmp.path().join("AGENTS.md"),
+                "see `sergeant-rs-workspace/knowledge/evidence/whatever.md` for more\n",
+            )
+            .expect("plant a workspace-only citation");
+
+            let check = doc_routes_check(Some(tmp.path()));
+            assert_eq!(check.status, Status::Fail);
+            assert!(check.detail.contains("sergeant-rs-workspace"));
+        }
+
+        /// An unresolved path cited *inside* one of the three sgt-owned
+        /// trees is `Fail` — that content is entirely this binary's own
+        /// doing, unlike a bare `README.md` or similar outside them.
+        #[test]
+        fn doc_routes_fails_on_an_unresolved_owned_tree_citation() {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            crate::domain::distro::write_distro(tmp.path()).expect("write distro");
+            std::fs::write(
+                tmp.path().join("AGENTS.md"),
+                "see `.sergeant/workflows/does-not-exist/index.md` for more\n",
+            )
+            .expect("plant an unresolved owned-tree citation");
+
+            let check = doc_routes_check(Some(tmp.path()));
+            assert_eq!(check.status, Status::Fail);
+            assert!(check.detail.contains("does-not-exist"));
+        }
+
+        /// The dead-anchor sub-check: an `AGENTS.md ... step N`-shaped
+        /// citation with no matching `step N` text anywhere in `AGENTS.md`
+        /// itself is `Fail`, naming the citing file.
+        #[test]
+        fn doc_routes_fails_on_a_dead_agents_md_step_anchor() {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            crate::domain::distro::write_distro(tmp.path()).expect("write distro");
+            let skill_dir = tmp.path().join("skills/a-test-skill");
+            std::fs::create_dir_all(&skill_dir).expect("mkdir");
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: a-test-skill\ndescription: x\n---\n\nSee `AGENTS.md` step 6.\n",
+            )
+            .expect("plant a dead step anchor");
+
+            let check = doc_routes_check(Some(tmp.path()));
+            assert_eq!(check.status, Status::Fail);
+            assert!(check.detail.contains("step"));
+        }
+
+        /// Not an estate root: nothing to check, `Ok`.
+        #[test]
+        fn doc_routes_is_ok_outside_any_estate() {
+            let check = doc_routes_check(None);
+            assert_eq!(check.status, Status::Ok);
+        }
+
+        /// #261 owner ruling point 5: the installed distro's edition
+        /// disagrees with the running binary — `Fail`, naming `sgt init` as
+        /// the remedy.
+        #[test]
+        fn distro_edition_fails_when_installed_content_predates_the_binary() {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            crate::domain::distro::write_distro(tmp.path()).expect("write distro");
+
+            let mut checked_one = false;
+            for entry in std::fs::read_dir(tmp.path().join(".sergeant/workflows"))
+                .expect("read_dir")
+                .flatten()
+            {
+                let index = entry.path().join("index.md");
+                if index.is_file() {
+                    let text = std::fs::read_to_string(&index).expect("read index.md");
+                    let downgraded = text.replace(
+                        &format!("edition: {}", env!("CARGO_PKG_VERSION")),
+                        "edition: 0.0.0-stale",
+                    );
+                    std::fs::write(&index, downgraded).expect("write stale edition");
+                    checked_one = true;
+                }
+            }
+            assert!(checked_one, "expected at least one stock index.md");
+
+            let check = distro_edition_check(Some(tmp.path()));
+            assert_eq!(check.status, Status::Fail);
+            let remedy = check.remedy.expect("a failing check must name its remedy");
+            assert!(remedy.contains("sgt init"));
+        }
+
+        /// A freshly initialized estate's distro edition matches the
+        /// running binary — `Ok`.
+        #[test]
+        fn distro_edition_is_ok_on_a_freshly_initialized_estate() {
+            let tmp = tempfile::TempDir::new().expect("tempdir");
+            crate::domain::distro::write_distro(tmp.path()).expect("write distro");
+
+            let check = distro_edition_check(Some(tmp.path()));
+            assert_eq!(check.status, Status::Ok);
         }
     }
 }

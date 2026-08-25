@@ -2,7 +2,7 @@
 
 Resolved as `@@evidence-requirements` from
 `.sergeant/common/contexts/evidence-requirements.md` per
-`docs/icm/convention.md` §4. Policy context (Placement Ladder PL-3).
+`.sergeant/common/contexts/icm-policy.md` §4. Policy context (Placement Ladder PL-3).
 Consumers: `implement-change/40-close`, `investigate/40-close`,
 `review-change/40-report`, and every other closing stage that cites
 `@@close`.

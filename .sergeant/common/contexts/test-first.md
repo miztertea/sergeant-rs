@@ -1,7 +1,7 @@
 # Test-first
 
 Resolved as `@@test-first` from `.sergeant/common/contexts/test-first.md`
-per `docs/icm/convention.md` §4. Policy context (Placement Ladder PL-3).
+per `.sergeant/common/contexts/icm-policy.md` §4. Policy context (Placement Ladder PL-3).
 **Consolidates the retired `tdd.md` and `test-quality.md` into one file;
 both are deleted.** Consumers: `implement-change/10-implement`,
 `fix-defect/40-fix-with-regression-test`, and any package's own stage
@@ -86,8 +86,9 @@ your own classes, internal collaborators, or anything you control.
 ## The policy sentence this estate keeps restating
 
 **A builder's own read of its diff is panel input, never a substitute for
-independent review** (`docs/DEVELOPMENT.md`:50, R-S0-12: "a builder's
-self-probe is panel input, never a substitute"). Passing your own tests is
+independent review** (R-S0-12: "a builder's self-probe is panel input,
+never a substitute" — see `DEVELOPMENT.md` for the rules governing this
+repository's own code). Passing your own tests is
 evidence for the panel to weigh, not a completion claim on its own.
 
 ## What this context contributes when loaded inside a stage

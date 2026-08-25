@@ -23,7 +23,7 @@ answer — or an honest "not yet known." Use when: a topic needs research,
 or docs/API/codebase facts need gathering, and the reading legwork is
 delegated rather than done in the current conversation.
 
-See `CONTEXT.md` for workflow orientation, `workflow.toml` for the pinned
-stage order, and
-`sergeant-rs-workspace/knowledge/evidence/resources/distro-content-series/design-proposal-2026-08-22.md`
-for this package's derivation and the owner rulings behind it.
+See `CONTEXT.md` for workflow orientation and `workflow.toml` for the
+pinned stage order. This package's derivation and the owner rulings
+behind it are dev-corpus provenance, kept in this project's private
+development record, not shipped here.

@@ -1,4 +1,4 @@
-//! M3 acceptance tests (docs/gauntlet/contracts/M3.md).
+//! M3 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M3.md).
 //!
 //! 1. Single-repository estate: submit against the estate the daemon is bound
 //!    to → a real worktree on a work branch cut from the mount's HEAD, with a
@@ -50,7 +50,8 @@ use sergeant_rs::domain::work::{
 };
 use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED,
-    KIND_STAGE_INPUT_RECEIVED, KIND_WORKFLOW_BOUND, WorkflowDefinition,
+    KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_OUTPUT_MISSING, KIND_WORKFLOW_BOUND,
+    REASON_STAGE_OUTPUT_MISSING, WorkflowDefinition,
 };
 use sergeant_rs::runtime::engine::{Engine, KIND_TURN_CEILING_INTERRUPTED, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
@@ -167,6 +168,56 @@ fn write_two_stage_workflow(root: &Path) {
             ("10-second", "second stage context"),
         ],
     );
+}
+
+/// [`write_two_stage_workflow`], but `00-first` declares an `output/
+/// README.md` with both an expected artifact and Amendment 10d's
+/// `**Required columns:**` line — the shape `remediate-findings/00-ingest`
+/// itself carries — so the gate's structural check has something to
+/// enforce for a stage that ships an artifact that exists but is not a
+/// typed table.
+fn write_two_stage_workflow_with_required_columns(
+    root: &Path,
+    expected_artifact: &str,
+    columns: &[&str],
+) {
+    write_two_stage_workflow(root);
+    let output_dir = root
+        .join(".sergeant/workflows/tiny/00-first")
+        .join("output");
+    std::fs::create_dir_all(&output_dir).expect("output dir");
+    let quoted: Vec<String> = columns.iter().map(|c| format!("`{c}`")).collect();
+    std::fs::write(
+        output_dir.join("README.md"),
+        format!(
+            "# Output — `00-first`\n\n**Expected artifact:** `{expected_artifact}` — proof of \
+             work.\n\n**Required columns:** {} — a typed set, not prose.\n\n**Disposition:** \
+             `evidence`\n",
+            quoted.join(", ")
+        ),
+    )
+    .expect("output/README.md");
+}
+
+/// [`write_two_stage_workflow`], but `00-first` declares an `output/
+/// README.md` (#260 Q3's shape, the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) Rule 4) naming
+/// `expected_artifact` as its expected artifact — so the hard stage-output
+/// gate has something to enforce against a `StageCompleted` signal for that
+/// stage.
+fn write_two_stage_workflow_with_declared_output(root: &Path, expected_artifact: &str) {
+    write_two_stage_workflow(root);
+    let output_dir = root
+        .join(".sergeant/workflows/tiny/00-first")
+        .join("output");
+    std::fs::create_dir_all(&output_dir).expect("output dir");
+    std::fs::write(
+        output_dir.join("README.md"),
+        format!(
+            "# Output — `00-first`\n\n**Expected artifact:** `{expected_artifact}` — proof of \
+             work.\n\n**Disposition:** `evidence`\n"
+        ),
+    )
+    .expect("output/README.md");
 }
 
 /// Start a daemon bound to `estate_root`, with a scripted registry.
@@ -720,7 +771,7 @@ async fn r_mvp1_4_mixed_instructions_policy_refuses_at_submit_naming_both_repos(
 
 /// R-MVP1-4 + MVP-2 D2 item 1: `instructions = "local"` parses, pins, and —
 /// now that its launch-side translation is measured
-/// (`docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`,
+/// (`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`,
 /// `ClaudeBackend::setting_sources_args`) — is accepted at submit and
 /// reaches the backend's `StartRequest` intact. This is the plumbing pin the
 /// un-refusal needs: MVP-1's sibling test above already proved a *mixed*
@@ -1278,6 +1329,455 @@ async fn t4_needs_input_parks_the_run_and_input_resumes_it() {
     .await;
     assert_eq!(status, 404);
     assert_eq!(body["error"]["code"], "work_not_found");
+
+    handle.shutdown().await;
+}
+
+/// #260 Q3: a stage whose `output/README.md` declares an expected artifact
+/// completes without ever writing it. First `StageCompleted` signal: the
+/// engine spends its one bounded re-prompt (a SEND to the same execution,
+/// `stage.output_missing` journaled, work stays `active`, no human
+/// involved). Second `StageCompleted` still missing: the Work lands
+/// `needs_input`, named `stage_output_missing`, naming the stage and the
+/// declared path — recoverable through the ordinary `respond` verb exactly
+/// like any other `needs_input`, proven here by actually producing the
+/// artifact and responding, which lets the run complete normally.
+#[tokio::test]
+async fn t10_a_stage_completed_without_its_declared_output_is_reprompted_then_needs_input() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow_with_declared_output(&estate, "proof.md");
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete(), // 00-first launch: "done", but proof.md absent
+        FakeStep::complete(), // the gate's one bounded re-prompt: still absent
+        FakeStep::complete(), // the human's answer, delivered after proof.md exists
+        FakeStep::complete(), // 10-second launch: completes the work
+    ]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "finish without the declared output",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    assert_eq!(
+        body["work"]["state"], "needs_input",
+        "the second StageCompleted with the artifact still missing must park: {body}"
+    );
+    assert_eq!(body["stage"]["stage_id"], "00-first");
+    let reprompts = events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING);
+    assert_eq!(
+        reprompts.len(),
+        1,
+        "exactly one bounded re-prompt, not unlimited: {reprompts:?}"
+    );
+    assert_eq!(reprompts[0].payload["stage_id"], "00-first");
+    assert_eq!(reprompts[0].payload["path"], "proof.md");
+    let execution_id = fake.starts()[0].execution_id.clone();
+    assert_eq!(
+        fake.inputs(&execution_id),
+        vec!["declared output proof.md missing — produce it or state what you need".to_string()],
+        "the bounded re-prompt must actually reach the same execution"
+    );
+    let parked = events_of(data.path(), &work_id, "work.needs_input");
+    assert_eq!(parked.len(), 1);
+    assert_eq!(
+        parked[0].payload["reason_code"], REASON_STAGE_OUTPUT_MISSING,
+        "the second failure must carry the named reason: {parked:?}"
+    );
+    assert_eq!(parked[0].payload["stage_id"], "00-first");
+    assert_eq!(parked[0].payload["path"], "proof.md");
+    // Never advanced past the stage that failed to produce its output.
+    assert!(events_of(data.path(), &work_id, KIND_STAGE_COMPLETED).is_empty());
+
+    // Recoverable through the ordinary respond verb: the actor (a human, in
+    // this fixture) produces the declared artifact and answers.
+    std::fs::create_dir_all(worktree.join("00-first/output")).expect("output dir");
+    std::fs::write(worktree.join("00-first/output/proof.md"), "did it\n").expect("write artifact");
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "there, done"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    // This fixture never runs `git commit` (the fake actor has no shell),
+    // so the now-present artifact would leave the worktree dirty on its
+    // own — but `00-first`'s declared `evidence` disposition means #260
+    // Q4's finalize sweep copies `proof.md` out as retained evidence and
+    // removes it from the worktree in its own commit before teardown's
+    // dirty check ever runs, so the run reaches plain `completed`. The
+    // claim this proves is narrower than that plumbing detail: the gate let
+    // the run *advance past* 00-first and reach the end at all, which it
+    // refused to do twice above.
+    assert_eq!(
+        body["work"]["state"], "completed",
+        "the artifact is now present, so the gate must let the run complete: {body}"
+    );
+    // Still exactly one re-prompt ever, across the whole run.
+    assert_eq!(
+        events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING).len(),
+        1
+    );
+
+    handle.shutdown().await;
+}
+
+/// Amendment 10d (#260's remaining criterion): a stage whose declared
+/// artifact exists but is untyped prose — present, but missing the
+/// declared `**Required columns:**` as a markdown table row — must be
+/// refused the identical `stage_output_missing`-class way an altogether
+/// absent artifact is, per mechanism 1's gate, not a bespoke parser. This
+/// is the generic engine mechanism `remediate-findings/00-ingest` opts
+/// into by declaring `Required columns`, exercised here on a throwaway
+/// `tiny` workflow so the test is not tied to that specific package's
+/// prose.
+#[tokio::test]
+async fn t11_a_present_but_untyped_declared_artifact_is_refused_the_same_way_as_a_missing_one() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (mount, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow_with_required_columns(&estate, "ingest.md", &["id", "axis"]);
+
+    // The artifact must exist *before* the stage ever launches — the fake
+    // actor cannot write files itself — so it is seeded into the source
+    // repository's own history, the same way any other pre-existing
+    // tracked file would be: present in the worktree from the moment it is
+    // materialized, exactly as if a prior (buggy) turn had committed
+    // untyped prose instead of a typed table.
+    std::fs::create_dir_all(mount.join("00-first/output")).expect("output dir");
+    std::fs::write(
+        mount.join("00-first/output/ingest.md"),
+        "Findings: one about id 1, axis correctness. No table here.\n",
+    )
+    .expect("seed untyped artifact");
+    support::git(&mount, &["add", "-A"]);
+    support::git(&mount, &["commit", "-m", "seed untyped artifact"]);
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete(), // 00-first launch: the untyped artifact is already there
+        FakeStep::complete(), // the one bounded re-prompt: still untyped
+        FakeStep::complete(), // the human's answer, delivered after it is retyped
+        FakeStep::complete(), // 10-second launch: completes the work
+    ]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "finish with untyped prose instead of a typed table",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    assert_eq!(
+        body["work"]["state"], "needs_input",
+        "a present-but-untyped artifact must be refused, not accepted: {body}"
+    );
+    let reprompts = events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING);
+    assert_eq!(
+        reprompts.len(),
+        1,
+        "exactly one bounded re-prompt: {reprompts:?}"
+    );
+    let execution_id = fake.starts()[0].execution_id.clone();
+    assert_eq!(
+        fake.inputs(&execution_id),
+        vec!["declared output ingest.md missing — produce it or state what you need".to_string()],
+        "the bounded re-prompt must actually reach the same execution"
+    );
+    let parked = events_of(data.path(), &work_id, "work.needs_input");
+    assert_eq!(parked.len(), 1);
+    assert_eq!(
+        parked[0].payload["reason_code"], REASON_STAGE_OUTPUT_MISSING,
+        "the same named reason as an altogether-missing artifact: {parked:?}"
+    );
+    assert_eq!(parked[0].payload["path"], "ingest.md");
+    assert!(events_of(data.path(), &work_id, KIND_STAGE_COMPLETED).is_empty());
+
+    // Recoverable the same way: retype the artifact as a real table and
+    // answer — the gate then lets the run proceed.
+    std::fs::write(
+        worktree.join("00-first/output/ingest.md"),
+        "| id | axis |\n|---|---|\n| 1 | correctness |\n",
+    )
+    .expect("retype the artifact");
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "retyped it as a table"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    // The retype above is uncommitted, same as t10's — but `00-first`'s
+    // declared `evidence` disposition means #260 Q4's finalize sweep
+    // removes it (retained as evidence) in its own commit before teardown's
+    // dirty check runs, so this reaches plain `completed` too.
+    assert_eq!(
+        body["work"]["state"], "completed",
+        "a typed table now satisfies the gate: {body}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// #260 Q4 / Amendment 9's general finalize sweep, end to end: a run with
+/// two stage outputs — one silent on disposition (§1a's default: "silence
+/// promotes nothing", so `evidence`) and one explicit `promote` — completes
+/// clean, with the evidence-class output gone from the branch but retained
+/// on disk, and the promote-class output shipped in the branch's own
+/// history untouched.
+///
+/// Both files are seeded committed into the source repository before
+/// submit (the fake actor cannot write files itself), so the worktree is
+/// clean the moment each stage completes — proving the sweep runs
+/// unconditionally, for the ordinary "the actor already committed its own
+/// work" case, not only as dirty-worktree recovery.
+#[tokio::test]
+async fn the_finalize_sweep_removes_evidence_class_output_and_keeps_promote_class() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (mount, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_workflow(
+        &estate,
+        "sweep",
+        &[
+            ("00-evidence", "first stage context"),
+            ("10-promote", "second stage context"),
+        ],
+    );
+    // `00-evidence` declares nothing at all — §1a's default applies.
+    // `10-promote` explicitly opts its output out of the sweep.
+    let promote_readme = estate.join(".sergeant/workflows/sweep/10-promote/output");
+    std::fs::create_dir_all(&promote_readme).expect("output dir");
+    std::fs::write(
+        promote_readme.join("README.md"),
+        "**Expected artifact:** `deliverable.md` — ships with the Work.\n\n\
+         **Disposition:** `promote`\n",
+    )
+    .expect("output/README.md");
+
+    std::fs::create_dir_all(mount.join("00-evidence/output")).expect("output dir");
+    std::fs::write(
+        mount.join("00-evidence/output/notes.md"),
+        "scratch working notes\n",
+    )
+    .expect("seed evidence artifact");
+    std::fs::create_dir_all(mount.join("10-promote/output")).expect("output dir");
+    std::fs::write(
+        mount.join("10-promote/output/deliverable.md"),
+        "the actual deliverable\n",
+    )
+    .expect("seed promote artifact");
+    support::git(&mount, &["add", "-A"]);
+    support::git(&mount, &["commit", "-m", "seed both stage outputs"]);
+
+    let (registry, _fake) = one_fake([FakeStep::complete(), FakeStep::complete()]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "sweep evidence, keep promote",
+        json!({"workflow": "sweep"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let surface_root = PathBuf::from(body["surface"]["root"].as_str().expect("surface root"));
+
+    let final_body = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(
+        final_body["work"]["state"], "completed",
+        "the sweep's own commit leaves the worktree clean: {final_body}"
+    );
+    let branch = format!("sergeant/{work_id}");
+
+    // Evidence-class: gone from the branch's own history...
+    let evidence_still_present = Command::new("git")
+        .args(["show", &format!("{branch}:00-evidence/output/notes.md")])
+        .current_dir(&mount)
+        .output()
+        .expect("run git")
+        .status
+        .success();
+    assert!(
+        !evidence_still_present,
+        "evidence-class output must not survive in the branch the sweep committed to"
+    );
+    // ...but retained on disk, byte for byte.
+    let retained = surface_root.join("solo.output/00-evidence/notes.md");
+    assert_eq!(
+        std::fs::read_to_string(&retained).expect("retained evidence"),
+        "scratch working notes\n"
+    );
+
+    // Promote-class: still exactly what was seeded, still on the branch.
+    assert_eq!(
+        git(
+            &mount,
+            &[
+                "show",
+                &format!("{branch}:10-promote/output/deliverable.md")
+            ]
+        ),
+        "the actual deliverable"
+    );
+    assert!(
+        !surface_root.join("solo.output/10-promote").exists(),
+        "promote-class output is never copied out as evidence — it ships as-is"
+    );
+
+    handle.shutdown().await;
+}
+
+/// F-IN-01: the finalize sweep's commit must be scoped to the `output/`
+/// dirs it actually swept, not the whole worktree (`git add -A`) — else
+/// stray dirty/untracked content the actor left *elsewhere* in the
+/// worktree gets silently folded into the engine's own finalize commit and
+/// laundered clean before `teardown`'s dirty-worktree check ever runs,
+/// defeating `retained_dirty` detection for that content. This combines a
+/// real evidence-class output (which is what makes the sweep actually
+/// commit) with unrelated dirty content in the same worktree — the
+/// compound path neither `a_dirty_worktree_is_retained_and_recorded_at_teardown`
+/// nor `the_finalize_sweep_removes_evidence_class_output_and_keeps_promote_class`
+/// exercises on its own.
+#[tokio::test]
+async fn a_finalize_sweep_never_launders_unrelated_dirty_content_into_its_own_commit() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (mount, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_workflow(&estate, "sweep", &[("00-evidence", "first stage context")]);
+
+    // `00-evidence` declares nothing — §1a's default (`evidence`) applies,
+    // so the sweep actually has something to commit.
+    std::fs::create_dir_all(mount.join("00-evidence/output")).expect("output dir");
+    std::fs::write(
+        mount.join("00-evidence/output/notes.md"),
+        "scratch working notes\n",
+    )
+    .expect("seed evidence artifact");
+    support::git(&mount, &["add", "-A"]);
+    support::git(&mount, &["commit", "-m", "seed evidence output"]);
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "evidence plus a stray mess",
+        json!({"workflow": "sweep"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+    let surface_root = PathBuf::from(body["surface"]["root"].as_str().expect("surface root"));
+
+    // Content wholly unrelated to any stage's declared output — the sweep
+    // must never touch this.
+    std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty the worktree");
+
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1);
+    let report = &torn[0].payload["report"];
+    assert_eq!(
+        report["clean"], false,
+        "the stray file must still be seen as dirty — not absorbed into \
+         the finalize commit: {report}"
+    );
+    assert_eq!(report["bindings"][0]["disposition"], "retained_dirty");
+    assert!(
+        report["bindings"][0]["changes"]
+            .as_str()
+            .expect("changes recorded")
+            .contains("half-done.rs"),
+        "the stray content must be what teardown found dirty: {report}"
+    );
+    let patch_path = PathBuf::from(
+        report["bindings"][0]["patch"]["path"]
+            .as_str()
+            .expect("a captured patch path"),
+    );
+    let patch_text = std::fs::read_to_string(&patch_path).expect("read the captured patch");
+    assert!(
+        patch_text.contains("half-done.rs") && patch_text.contains("fn main()"),
+        "the captured patch must hold the stray content, not be silently \
+         dropped by an over-broad finalize commit: {patch_text}"
+    );
+
+    // The evidence sweep still did its own job: retained on disk...
+    let retained = surface_root.join("solo.output/00-evidence/notes.md");
+    assert_eq!(
+        std::fs::read_to_string(&retained).expect("retained evidence"),
+        "scratch working notes\n"
+    );
 
     handle.shutdown().await;
 }
@@ -3255,7 +3755,7 @@ async fn retained_lists_a_dirty_teardown_and_reap_disposes_of_it_only_when_confi
 /// backend never runs `git commit`, so the branch never advances past its
 /// base SHA either. The engine still learns nothing about what a commit
 /// *is*: the check only ever compares a teardown disposition and a SHA the
-/// pointer already computed (`docs/adr/0007-actor-runtime-contract.md`).
+/// pointer already computed (`ADR 0007`).
 #[tokio::test]
 async fn a_stranded_completion_is_not_reported_as_plain_completed() {
     let repos = TempDir::new().expect("tempdir");
@@ -3508,6 +4008,101 @@ async fn a_run_that_ends_on_the_wrong_branch_completes_dirty_and_keeps_both_bran
         git(&repo, &["rev-parse", "refs/heads/renegade"]),
         renegade_sha,
         "and it still points at the run's output"
+    );
+
+    handle.shutdown().await;
+}
+
+/// Amendment 9 Q5 / #260 mechanism 3: a stage that declares
+/// `receives_branch_status = true` gets the engine's own
+/// commits-on-branch-since-base fact appended to its `CONTEXT.md`; a stage
+/// that never declares it reaches the backend byte-for-byte unchanged (§12:
+/// procedure is data, except for this one named, opt-in exception).
+///
+/// `00-first` parks on `waiting` so the fixture can commit into the
+/// worktree before `10-second` — the one stage that opted in — is entered,
+/// making "yes (1)" the only honest fact the engine could report.
+#[tokio::test]
+async fn a_stage_that_opts_in_receives_the_branch_status_fact_others_do_not() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (_repo, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_workflow_with_tables(
+        &estate,
+        "tiny",
+        &[
+            ("00-first", "first stage context"),
+            ("10-second", "second stage context"),
+        ],
+        "\n[stage.\"10-second\"]\nreceives_branch_status = true\n",
+    );
+
+    let (registry, fake) = one_fake([
+        FakeStep::waiting("parks so the fixture can commit into the worktree"),
+        FakeStep::complete_with("first done"),
+        FakeStep::complete_with("second done"),
+    ]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "opt in to the branch status fact",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    // One real commit on the run's own branch, before the opted-in stage is
+    // ever entered.
+    std::fs::write(worktree.join("output.rs"), "fn main() {}\n").expect("write output");
+    git(&worktree, &["add", "."]);
+    git(
+        &worktree,
+        &["commit", "-m", "the fact 10-second should see"],
+    );
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "retry rejected: {body}");
+    assert_eq!(body["work"]["state"], "completed", "{body}");
+
+    // Three executions consumed the three-step script: 00-first's parked
+    // attempt, its retried (completing) attempt, then 10-second.
+    let starts = fake.starts();
+    assert_eq!(starts.len(), 3, "{starts:?}");
+    assert_eq!(
+        starts[0].context, "first stage context",
+        "00-first never declared receives_branch_status: its context is untouched"
+    );
+    assert_eq!(
+        starts[1].context, "first stage context",
+        "the retried attempt is still 00-first — untouched either way"
+    );
+    assert_eq!(
+        starts[2].context,
+        "second stage context\n\n## Engine-computed branch status\n\n\
+         commits_on_branch_since_base: yes (1)\n",
+        "10-second opted in: the engine's own commit count is appended, not substituted"
     );
 
     handle.shutdown().await;
@@ -5061,7 +5656,7 @@ async fn a_malformed_workspace_file_fails_closed() {
 
 // ------------------------------------------ #22: repository-topology edges
 // beyond R-MVP1-12's own fixtures (`src/domain/estate.rs`'s `#22:`-tagged
-// tests). These were the "remaining edges" `docs/gauntlet/contracts/MVP-1.md`
+// tests). These were the "remaining edges" `sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/MVP-1.md`
 // named and deferred: one table-driven-in-spirit test per shape, through the
 // real daemon/API, asserting the issue's own three things — correct binding
 // record, work completes, teardown clean.

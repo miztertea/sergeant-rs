@@ -1,10 +1,10 @@
 //! N4 acceptance: the Docker executor (`kind = "execute"`), against a real
 //! local Docker Engine (§22.7-§22.10).
 //!
-//! **Environment posture (docs/DEVELOPMENT.md's testing rules, `docs/environments/`).**
+//! **Environment posture (CONTRIBUTING.md's testing rules, `sergeant-rs-workspace's knowledge/evidence/host-measurements/`).**
 //! Every test in this file probe-gates on [`docker_unavailable`] and skips
 //! loudly (`SKIPPED-ENV`) rather than failing hard when the host cannot
-//! express the shape — Cerberus (`docs/environments/cerberus.md`) runs the
+//! express the shape — Cerberus (`sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md`) runs the
 //! full matrix; a host with no Docker reachable does not fail these.
 //!
 //! Every test that creates a container cleans it up itself and additionally
@@ -41,14 +41,14 @@ use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::workflow::{ExecuteSpec, NetworkPolicy, WorkspaceAccess};
 
 /// A small, always-present image every measured environment can pull or
-/// already has (`docs/environments/cerberus.md`'s Docker probes use
+/// already has (`sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md`'s Docker probes use
 /// `alpine`). Kept as one named constant so a future environment that needs
 /// a different probe image changes one line.
 const PROBE_IMAGE: &str = "alpine:3.24";
 
 /// Whether the local Docker Engine answers at all. Every test in this file
 /// calls this first and returns early (with a loud, named skip) when it does
-/// not — the docs/DEVELOPMENT.md/environments convention for a shape a hosted runner
+/// not — the CONTRIBUTING.md/environments convention for a shape a hosted runner
 /// may not be able to express, distinct from a locally-fixable precondition.
 fn docker_unavailable() -> Option<&'static str> {
     match Command::new("docker").arg("version").output() {
@@ -492,7 +492,7 @@ fn network_none_has_no_usable_external_path() {
 
     // TH-12 (MVP-2 D3 fixer pass): this test only discriminates on a host
     // with working egress — on an egress-blocked host (the cloud
-    // container's measured posture, `docs/environments/`) the isolated
+    // container's measured posture, `sergeant-rs-workspace's knowledge/evidence/host-measurements/`) the isolated
     // container's `wget` fails for the same reason a *non*-isolated one
     // would, and the assertion below is a guaranteed false green that
     // proves nothing about `--network none`. A positive control: the exact
@@ -1503,6 +1503,26 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
          materialized surface for {work_id}"
     );
 
+    // W4-carried minor (#234's own "every patch" claim, commit 56927a14):
+    // the marker check above may stop at the first satisfying entry, but
+    // *every* retained `.dirty.patch` under the surface — not just
+    // whichever one `walk_for_marker` happened to reach first — must
+    // actually be `git apply`-able. Collected separately so a second
+    // binding's corrupt patch cannot hide behind the first binding's good
+    // one.
+    let mut patches = Vec::new();
+    for entry in &branch_worktrees {
+        collect_dirty_patches(&entry.path(), &mut patches);
+    }
+    assert!(
+        !patches.is_empty(),
+        "expected at least one retained .dirty.patch under {:?} for {work_id}",
+        data.path().join("surfaces")
+    );
+    for patch in &patches {
+        assert_patch_is_git_applyable(patch);
+    }
+
     handle.shutdown().await;
     assert_no_containers_for_work(&work_id);
 }
@@ -1515,6 +1535,14 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
 /// evidence this test is proving survives teardown now travels in that
 /// form. Either way the evidence handed to the following actor was not
 /// lost, which is the actual N4/§21.5 claim this test pins.
+///
+/// Only decides *whether the marker exists somewhere* — `.any()`'s short-
+/// circuit here is fine, since finding it in one binding's patch says
+/// nothing about whether a *different* binding's patch is well-formed.
+/// That question belongs to [`collect_dirty_patches`]/
+/// [`assert_patch_is_git_applyable`] below, which do not stop at the first
+/// one (the W4-carried minor this pair fixes: #234's "every patch" claim
+/// was not actually checked against every patch).
 fn walk_for_marker(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -1530,7 +1558,7 @@ fn walk_for_marker(dir: &Path) -> bool {
             && content.trim() == "container-produced-evidence"
         {
             return true;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("patch")
+        } else if is_dirty_patch(&path)
             && let Ok(content) = std::fs::read_to_string(&path)
             && content.contains("validated.txt")
             && content.contains("container-produced-evidence")
@@ -1539,6 +1567,182 @@ fn walk_for_marker(dir: &Path) -> bool {
         }
     }
     false
+}
+
+fn is_dirty_patch(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".dirty.patch"))
+}
+
+/// Every `*.dirty.patch` file anywhere under `dir`, recursively — the full
+/// set `walk_for_marker`'s short-circuiting `.any()` caller used to leave
+/// unexamined past the first one that satisfied it.
+fn collect_dirty_patches(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dirty_patches(&path, out);
+        } else if is_dirty_patch(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// #234: a retained `.dirty.patch` that merely *contains* the right text is
+/// not enough — the whole point of the bug was a patch that looked right
+/// but `git apply` rejected as corrupt at end-of-file. Pin the acceptance
+/// criteria directly: `git apply --stat` proves the patch parses at all,
+/// and `--check` (applied into a fresh empty scratch dir, since
+/// `validated.txt` is captured here as a brand-new untracked file) proves
+/// it is actually applicable, not just textually plausible.
+fn assert_patch_is_git_applyable(path: &Path) {
+    let scratch = TempDir::new().expect("scratch dir for git apply --check");
+    let stat = Command::new("git")
+        .args(["apply", "--stat", path.to_str().expect("utf8 path")])
+        .current_dir(scratch.path())
+        .output()
+        .expect("git apply --stat");
+    assert!(
+        stat.status.success(),
+        "git apply --stat rejected {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&stat.stderr)
+    );
+    let check = Command::new("git")
+        .args(["apply", "--check", path.to_str().expect("utf8 path")])
+        .current_dir(scratch.path())
+        .output()
+        .expect("git apply --check");
+    assert!(
+        check.status.success(),
+        "git apply --check rejected {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+/// F-TH-02 (carried from W4's panel, commit 9d0deae5): the "every patch"
+/// loop added there (`collect_dirty_patches` + the per-patch
+/// `assert_patch_is_git_applyable` loop above) was only ever exercised
+/// against [`mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forward`]'s
+/// single-repository estate, which produces exactly one `.dirty.patch` —
+/// so a regression that silently went back to checking only the first
+/// entry (`.next()`/`[0]` instead of iterating the whole `Vec`) would not
+/// fail any test in this file. This variant scaffolds a **two-repository**
+/// estate (`scope.all`, so both bind), dirties both worktrees, and cancels
+/// once — producing two independent `.dirty.patch` files under the same
+/// surface root — so the loop actually has a second item to iterate past.
+/// No Docker container is involved (both stages are plain fake actors);
+/// this lives here rather than in `tests/m3_execution.rs` because it is
+/// the direct regression test for the `collect_dirty_patches`/
+/// `assert_patch_is_git_applyable` pair that commit 9d0deae5 fixed and
+/// that lives in this file.
+#[tokio::test]
+async fn cancel_of_a_dirty_multi_repo_estate_retains_a_patch_per_binding() {
+    let data = support::DataDir::new();
+    let estate = TempDir::new().expect("estate");
+    support::scaffold_estate(estate.path(), "multi-patch", &["repo-a", "repo-b"]);
+
+    let workflow_dir = estate.path().join(".sergeant/workflows/tiny");
+    std::fs::create_dir_all(workflow_dir.join("00-first")).expect("stage dir");
+    std::fs::create_dir_all(workflow_dir.join("10-second")).expect("stage dir");
+    std::fs::write(workflow_dir.join("00-first/CONTEXT.md"), "first").expect("context");
+    std::fs::write(workflow_dir.join("10-second/CONTEXT.md"), "second").expect("context");
+    std::fs::write(
+        workflow_dir.join("workflow.toml"),
+        concat!(
+            "[workflow]\n",
+            "name = \"tiny\"\n",
+            "version = \"1\"\n",
+            "stages = [\"00-first\", \"10-second\"]\n",
+        ),
+    )
+    .expect("workflow.toml");
+
+    let fake = Arc::new(FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]));
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            estate_root: Some(estate.path().to_path_buf()),
+            backends: Arc::new(BackendRegistry::new().with(fake)),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+
+    let http = reqwest::Client::new();
+    let submitted: serde_json::Value = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({
+            "command_id": ulid::Ulid::generate().to_string(),
+            "intent": "dirty two worktrees at once",
+            "workflow": "tiny",
+            "origin": {"client": "cli", "cwd": estate.path()},
+            "scope": {"all": true},
+        }))
+        .send()
+        .await
+        .expect("submit")
+        .json()
+        .await
+        .expect("json");
+    let work_id = submitted["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    let bindings = submitted["surface"]["bindings"]
+        .as_array()
+        .expect("bindings");
+    assert_eq!(
+        bindings.len(),
+        2,
+        "scope.all over a two-repo estate must bind both: {submitted}"
+    );
+    for binding in bindings {
+        let worktree = Path::new(binding["worktree_path"].as_str().expect("worktree_path"));
+        std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n")
+            .expect("dirty this binding's worktree");
+    }
+
+    let (status, _body): (_, serde_json::Value) = {
+        let resp = http
+            .post(format!("{}/v1/work/{work_id}/cancel", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid::Ulid::generate().to_string()}))
+            .send()
+            .await
+            .expect("cancel");
+        let status = resp.status();
+        (status, resp.json().await.expect("json"))
+    };
+    assert_eq!(status, 200, "cancel of a work with two dirty bindings");
+
+    let mut patches = Vec::new();
+    for entry in std::fs::read_dir(data.path().join("surfaces"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        collect_dirty_patches(&entry.path(), &mut patches);
+    }
+    assert_eq!(
+        patches.len(),
+        2,
+        "expected one retained .dirty.patch per dirtied binding under {:?} for {work_id}: {patches:?}",
+        data.path().join("surfaces")
+    );
+    for patch in &patches {
+        assert_patch_is_git_applyable(patch);
+    }
+
+    handle.shutdown().await;
 }
 
 /// Poll OBSERVE until the container has exited, panicking on timeout.

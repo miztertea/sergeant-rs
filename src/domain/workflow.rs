@@ -64,11 +64,11 @@ pub const CONTEXT_FILE: &str = "CONTEXT.md";
 pub const DEFAULT_WORKFLOW: &str = "software-change";
 /// Source marker for the embedded built-in workflow.
 pub const SOURCE_EMBEDDED: &str = "embedded";
-/// A workflow directory's own OKF front-matter file (`docs/icm/
+/// A workflow directory's own OKF front-matter file (`sergeant-rs-workspace's knowledge/rulings/icm/
 /// record-shapes.md` §1) — distinct from the root catalog below.
 pub const INDEX_FILE: &str = "index.md";
-/// The root workflow catalog (`docs/icm/record-shapes.md` §1 rule 2,
-/// `docs/icm/convention.md` §1 rule 1): "the list, not an entry". Lists every
+/// The root workflow catalog (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 rule 2,
+/// `sergeant-rs-workspace's knowledge/rulings/icm/convention.md` §1 rule 1): "the list, not an entry". Lists every
 /// `status: published` workflow under [`WORKFLOW_ROOT`]; drafts and
 /// unindexed directories are never in it (§11.1's Decision T2-39).
 pub const ROOT_CATALOG_FILE: &str = ".sergeant/index.md";
@@ -100,6 +100,24 @@ pub const KIND_STAGE_BLOCKED: &str = "stage.blocked";
 pub const KIND_STAGE_FAILED: &str = "stage.failed";
 /// Event kind: a stage was canceled.
 pub const KIND_STAGE_CANCELED: &str = "stage.canceled";
+/// Event kind: #260 Q3's hard stage-output gate found a `StageCompleted`
+/// signal whose stage declares an expected `output/` artifact (per its
+/// `output/README.md`) that is not on disk, and spent this stage attempt's
+/// one bounded re-prompt asking the same actor to produce it. Distinct from
+/// [`KIND_STAGE_NEEDS_INPUT`]: the stage stays `Active` (the actor is being
+/// asked again, not parked for a human), and this is the marker
+/// [`crate::runtime::projection::WorkRun`]'s reducer reads to tell "already
+/// re-prompted once this attempt" from "first time seeing this" without
+/// re-deriving it from raw journal replay at every `StageCompleted`.
+pub const KIND_STAGE_OUTPUT_MISSING: &str = "stage.output_missing";
+/// The named `needs_input` reason #260 Q3 requires when a stage's declared
+/// `output/` artifact is still missing after its one bounded re-prompt:
+/// carried in the `stage.needs_input`/`work.needs_input` payload's
+/// `reason_code` key, alongside the existing free-text `detail`/`prompt`
+/// (research finding: this event family has no structured reason today —
+/// see the payload's `stage_id`/`path` fields for the rest of the named
+/// evidence).
+pub const REASON_STAGE_OUTPUT_MISSING: &str = "stage_output_missing";
 
 /// What kind of executor performs a stage (§11, §12.2, §13.1).
 ///
@@ -251,6 +269,17 @@ pub struct StageDefinition {
     /// backend cannot honour it (§17.5's preflight, `Engine::bind_stages`).
     #[serde(default)]
     pub requires_ask: bool,
+    /// Amendment 9 Q5 / #260 mechanism 3: this stage opts in to having the
+    /// engine's own commits-on-branch-since-base fact
+    /// ([`crate::runtime::surface::commits_on_branch_since_base`], the same
+    /// computation `stranded_completion` reads from a completed teardown)
+    /// injected into its `CONTEXT.md` when it is entered. `false` (the
+    /// default) is silent for every workflow that never declares it, the
+    /// same no-table-default posture `requires_ask` already has. The engine
+    /// still learns no output vocabulary — it shares a fact it already
+    /// computes, never a workflow's own disposition language.
+    #[serde(default)]
+    pub receives_branch_status: bool,
     /// The pinned container specification, present exactly when
     /// `kind == StageKind::Execute` (§12.3, §13.1). `None` for every actor
     /// stage — the same tagged-by-`kind` shape `harness`/`profile` already
@@ -364,6 +393,15 @@ pub struct StageRecord {
     /// Reason, prompt or summary carried by the last status change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// #260 Q3: how many bounded re-prompts the hard stage-output gate has
+    /// already spent on *this* attempt (`stage.output_missing`, folded by
+    /// the reducer). Always `0` for a freshly entered attempt — `retry`
+    /// enters a new attempt via `stage.entered`, which is a fresh
+    /// [`StageRecord`], so this never carries a stale count across attempts
+    /// the way a Work-wide counter would. The gate is bounded to exactly
+    /// one re-prompt per attempt, so this only ever reads `0` or `1`.
+    #[serde(default)]
+    pub output_reprompts: u32,
 }
 
 /// Failure loading a workflow.
@@ -582,6 +620,9 @@ struct StageTable {
     /// default every other tagged field already uses.
     #[serde(default)]
     requires_ask: bool,
+    /// Amendment 9 Q5 / #260 mechanism 3's opt-in declaration.
+    #[serde(default)]
+    receives_branch_status: bool,
     // --- execute-only (§12.3) ---
     #[serde(default)]
     image: Option<String>,
@@ -713,6 +754,7 @@ impl WorkflowDefinition {
                 harness: tag.harness,
                 profile: tag.profile,
                 requires_ask: tag.requires_ask,
+                receives_branch_status: tag.receives_branch_status,
                 execute: tag.execute,
             });
         }
@@ -762,6 +804,7 @@ impl WorkflowDefinition {
                 harness: tag.harness,
                 profile: tag.profile,
                 requires_ask: tag.requires_ask,
+                receives_branch_status: tag.receives_branch_status,
                 execute: tag.execute,
             });
         }
@@ -783,7 +826,7 @@ impl WorkflowDefinition {
 }
 
 /// Authored fields from a workflow's own `index.md` front matter
-/// (`docs/icm/record-shapes.md` §1) — the part of a [`CatalogEntry`] that
+/// (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1) — the part of a [`CatalogEntry`] that
 /// `workflow.toml` does not carry. `tags` is `None` when the front matter
 /// declares no `tags:` key at all, never an empty list standing in for
 /// "none" (§11.2's CatalogEntry table).
@@ -796,7 +839,7 @@ pub struct WorkflowIndexFrontMatter {
     pub description: String,
     /// `tags:` verbatim, or `None` if the front matter never declared the key.
     pub tags: Option<Vec<String>>,
-    /// `edition:` verbatim (`docs/icm/record-shapes.md` §1, ADR 0016): the
+    /// `edition:` verbatim (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1, ADR 0016): the
     /// distro version that wrote this file as stock content. `None` if the
     /// front matter never declared the key — pre-ADR-0016 content, or a
     /// malformed fork.
@@ -982,7 +1025,7 @@ pub fn catalog(root: &Path) -> Vec<CatalogEntry> {
 
 /// Parse [`ROOT_CATALOG_FILE`]'s Markdown table for the `Workflow` names
 /// whose `Status` column reads exactly `published`. `.sergeant/index.md`'s
-/// own text (`docs/icm/record-shapes.md` §1 rule 2) is the example shape:
+/// own text (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 rule 2) is the example shape:
 ///
 /// ```text
 /// | Workflow | Status | Index |
@@ -1011,8 +1054,171 @@ fn root_catalog_names(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// #260 Q3: read one stage's declared output artifact — the filename
+/// the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) Rule 4's `**Expected artifact:** `<file>` —
+/// description.` line names, out of its authored `output/README.md`.
+///
+/// `None` when the stage's package directory has no `output/README.md`, or
+/// the README has no `Expected artifact:` line, or the declared artifact is
+/// not the exact `` `<file>` `` shape every shipped package uses (a bare
+/// backtick-quoted filename, no path separators) — any of those means the
+/// hard gate this feeds (`Engine`'s `StageCompleted` handling) has nothing
+/// to enforce, which is a stage's own choice not to declare one, never an
+/// error a run should fail on. Rule 4 is filesystem-shape ground truth, the
+/// same posture [`crate::runtime::surface::retain_stage_outputs`] already
+/// takes toward `output/`: no manifest, no catalog, just this one line.
+pub(crate) fn declared_output_artifact(package_dir: &Path, stage_id: &str) -> Option<String> {
+    let readme = package_dir.join(stage_id).join("output").join("README.md");
+    let text = std::fs::read_to_string(readme).ok()?;
+    declared_output_artifact_from_readme(&text)
+}
+
+/// The parsing half of [`declared_output_artifact`], pulled apart so it can
+/// be unit-tested directly against README text rather than through a
+/// temp-directory fixture for every case.
+fn declared_output_artifact_from_readme(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .find(|line| line.trim().starts_with("**Expected artifact:**"))?;
+    parse_declared_artifact_line(line)
+}
+
+/// Amendment 10d (#260): read one stage's declared **structural** shape for
+/// its output artifact — `**Required columns:** `<col>`, `<col>`, ...` —
+/// out of the same `output/README.md` [`declared_output_artifact`] reads.
+/// Empty (never `None`) when the stage declares no such line: "no shape
+/// declared" and "declared, satisfied trivially" are the same thing to the
+/// gate that consumes this — it only ever checks that every name in this
+/// list is present, so an empty list is vacuously satisfied.
+///
+/// This is engine-general the same way [`declared_output_artifact`] is: any
+/// stage in any package may declare `Required columns`, not only
+/// `remediate-findings`' `00-ingest` — the engine parses one more line of
+/// the same convention, never a `remediate-findings`-specific check.
+pub(crate) fn declared_required_columns(package_dir: &Path, stage_id: &str) -> Vec<String> {
+    let readme = package_dir.join(stage_id).join("output").join("README.md");
+    let Ok(text) = std::fs::read_to_string(readme) else {
+        return Vec::new();
+    };
+    declared_required_columns_from_readme(&text)
+}
+
+fn declared_required_columns_from_readme(text: &str) -> Vec<String> {
+    let Some(line) = text
+        .lines()
+        .find(|line| line.trim().starts_with("**Required columns:**"))
+    else {
+        return Vec::new();
+    };
+    // Every backtick-quoted token on the line, in order — `**Required
+    // columns:** `id`, `axis`, `claim` — trailing prose` yields
+    // `["id", "axis", "claim"]`; prose between/after the quoted tokens
+    // (the em-dash explanation every shipped line carries) is simply text
+    // that never falls between a pair of backticks, so it is never picked
+    // up as a column name.
+    let mut columns = Vec::new();
+    let mut rest = line;
+    while let Some(open) = rest.find('`') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('`') else {
+            break;
+        };
+        let name = after_open[..close].trim();
+        if !name.is_empty() {
+            columns.push(name.to_string());
+        }
+        rest = &after_open[close + 1..];
+    }
+    columns
+}
+
+/// Whether `text` contains a markdown table row (`| a | b | c |`) whose
+/// cells cover every name in `required`, case-insensitively — the
+/// structural half of Amendment 10d's gate, checked against the *produced*
+/// artifact rather than the README that declared the requirement. An empty
+/// `required` is vacuously satisfied (see [`declared_required_columns`]).
+///
+/// One row must carry every required name together, deliberately: a header
+/// row split across two lines, or names that merely appear somewhere in the
+/// document's prose, are not the "this is a typed table" evidence Amendment
+/// 10d asks for.
+pub(crate) fn has_required_table_columns(text: &str, required: &[String]) -> bool {
+    if required.is_empty() {
+        return true;
+    }
+    let wanted: Vec<String> = required.iter().map(|c| c.to_ascii_lowercase()).collect();
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('|') {
+            return false;
+        }
+        let cells: Vec<String> = trimmed
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim().trim_matches('`').to_ascii_lowercase())
+            .collect();
+        wanted.iter().all(|col| cells.contains(col))
+    })
+}
+
+/// #260 Q4 / Amendment 9's general finalize sweep: a stage's declared
+/// `**Disposition:**` (the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) §1a's "merge-back
+/// semantics") — `promote` survives the sweep into the Work branch's
+/// shipped history, `evidence` is retained as Work evidence and removed
+/// from the worktree in the finalize commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputDisposition {
+    /// Ships: left in the worktree, part of what the Work branch merges.
+    Promote,
+    /// Working record only: copied out as retained Work evidence, then
+    /// removed from the worktree by the finalize sweep.
+    Evidence,
+}
+
+/// #260 Q4: read one stage's declared disposition out of its authored
+/// `output/README.md`, the same file [`declared_output_artifact`] reads.
+///
+/// `Evidence` — never a third "undeclared" state — for every case that
+/// is not an explicit `` **Disposition:** `promote` `` line: no
+/// `output/README.md`, no `**Disposition:**` line, or a value other than
+/// `promote`. §1a's own text: "silence promotes nothing" — a package that
+/// never named its output's fate does not get to have that silence read as
+/// permission to ship it.
+pub(crate) fn declared_output_disposition(package_dir: &Path, stage_id: &str) -> OutputDisposition {
+    let readme = package_dir.join(stage_id).join("output").join("README.md");
+    let Ok(text) = std::fs::read_to_string(readme) else {
+        return OutputDisposition::Evidence;
+    };
+    declared_output_disposition_from_readme(&text)
+}
+
+fn declared_output_disposition_from_readme(text: &str) -> OutputDisposition {
+    let promotes = text
+        .lines()
+        .any(|line| line.trim().starts_with("**Disposition:**") && line.contains("`promote`"));
+    if promotes {
+        OutputDisposition::Promote
+    } else {
+        OutputDisposition::Evidence
+    }
+}
+
+/// One `**Expected artifact:** \`<file>\` — ...` line, parsed strictly:
+/// `None` unless it names a bare backtick-quoted filename with no path
+/// separators (the exact shape every shipped `output/README.md` uses).
+fn parse_declared_artifact_line(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("**Expected artifact:**")?;
+    let after_open = rest.trim().strip_prefix('`')?;
+    let file = after_open.split('`').next().unwrap_or("").trim();
+    if file.is_empty() || file.contains('/') || file.contains('\\') {
+        return None;
+    }
+    Some(file.to_string())
+}
+
 /// Read and parse one workflow directory's own `index.md` front matter
-/// (`docs/icm/record-shapes.md` §1). `None` on any I/O failure, missing
+/// (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1). `None` on any I/O failure, missing
 /// closing delimiter, or missing required field (`status`/`description`) —
 /// [`catalog`] treats that the same as the workflow not existing. `pub(crate)`
 /// so `sgt doctor`'s edition-drift check (R2 — an existing surface, not a new
@@ -1026,14 +1232,14 @@ pub(crate) fn read_index_front_matter(workflow_dir: &Path) -> Option<WorkflowInd
 /// front matter.
 ///
 /// No general YAML parser is pulled in for this: the shape
-/// `docs/icm/record-shapes.md` §1 normatively fixes is fixed and narrow — a
+/// `sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 normatively fixes is fixed and narrow — a
 /// `---`-delimited block of `key: value` lines, an optional `>-`/`|-` folded
 /// or literal block scalar for `description`, and an optional `- item` list
 /// for `tags` — so a parser scoped to exactly that shape is the tiny local
 /// composition R6 asks for over a heavyweight dependency for three known
 /// fields. `kind`, `name`, and `version` are deliberately not read here:
 /// [`CatalogEntry`] takes `name`/`version` from `workflow.toml` (§11.2's
-/// table), and `kind`/`name` agreement is `docs/icm/record-shapes.md`'s own
+/// table), and `kind`/`name` agreement is `sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md`'s own
 /// authoring-time invariant, not something this read-only projection checks.
 fn parse_index_front_matter(text: &str) -> Option<WorkflowIndexFrontMatter> {
     let mut lines = text.lines();
@@ -1179,6 +1385,7 @@ struct ResolvedStageTag {
     harness: Option<String>,
     profile: Option<String>,
     requires_ask: bool,
+    receives_branch_status: bool,
     execute: Option<ExecuteSpec>,
 }
 
@@ -1205,6 +1412,7 @@ fn resolve_stage_tag(
             harness: None,
             profile: None,
             requires_ask: false,
+            receives_branch_status: false,
             execute: None,
         });
     };
@@ -1254,6 +1462,7 @@ fn resolve_stage_tag(
                 harness: table.harness.clone(),
                 profile: table.profile.clone(),
                 requires_ask: table.requires_ask,
+                receives_branch_status: table.receives_branch_status,
                 execute: None,
             })
         }
@@ -1266,6 +1475,9 @@ fn resolve_stage_tag(
             }
             if table.requires_ask {
                 return Err(actor_field_on_execute("requires_ask"));
+            }
+            if table.receives_branch_status {
+                return Err(actor_field_on_execute("receives_branch_status"));
             }
             let missing = |field: &str| WorkflowError::MissingExecuteField {
                 path: path.to_string(),
@@ -1307,6 +1519,7 @@ fn resolve_stage_tag(
                 harness: None,
                 profile: None,
                 requires_ask: false,
+                receives_branch_status: false,
                 execute: Some(ExecuteSpec {
                     image,
                     command,
@@ -1334,6 +1547,10 @@ struct ContentIdentityStage<'a> {
     /// it is a different workflow for content-identity purposes, same as a
     /// changed `harness` or `profile` is.
     requires_ask: bool,
+    /// Amendment 9 Q5 / #260 mechanism 3's opt-in declaration is
+    /// execution-relevant for the same reason `requires_ask` is: flipping it
+    /// changes what gets injected into the stage's actual context.
+    receives_branch_status: bool,
     /// The pinned container spec (N4, §12.3): image, command, workdir,
     /// access and network policy, and env are all execution-relevant —
     /// changing any of them must change the hash the same way editing a
@@ -1368,6 +1585,7 @@ fn compute_content_hash(name: &str, version: &str, stages: &[StageDefinition]) -
                 profile: s.profile.as_deref(),
                 context: &s.context,
                 requires_ask: s.requires_ask,
+                receives_branch_status: s.receives_branch_status,
                 execute: s.execute.as_ref(),
             })
             .collect(),
@@ -1380,6 +1598,167 @@ fn compute_content_hash(name: &str, version: &str, stages: &[StageDefinition]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #260 Q3: every shipped `output/README.md` uses this exact shape
+    /// (the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) Rule 4) — the line the hard gate's parser
+    /// must actually recognize.
+    #[test]
+    fn declared_output_artifact_parses_the_shipped_readme_shape() {
+        let readme = "# Output — `10-implement`\n\n\
+             Layer 4 (per-run artifact), per the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) §1a.\n\n\
+             **Expected artifact:** `implementation.md` — the commits produced.\n\n\
+             **Disposition:** `evidence`\n";
+        assert_eq!(
+            declared_output_artifact_from_readme(readme),
+            Some("implementation.md".to_string())
+        );
+    }
+
+    #[test]
+    fn declared_output_artifact_is_none_without_the_expected_artifact_line() {
+        assert_eq!(
+            declared_output_artifact_from_readme("# Output\n\nnothing declared\n"),
+            None
+        );
+        assert_eq!(declared_output_artifact_from_readme(""), None);
+    }
+
+    /// A declared artifact naming a path rather than a bare filename is not
+    /// the shape Rule 4 documents — the gate must not enforce something it
+    /// cannot confidently have parsed.
+    #[test]
+    fn declared_output_artifact_refuses_a_path_shaped_declaration() {
+        assert_eq!(
+            declared_output_artifact_from_readme("**Expected artifact:** `sub/dir/file.md`\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn declared_output_artifact_reads_the_readme_off_disk_for_the_named_stage() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stage_output = dir.path().join("10-implement").join("output");
+        std::fs::create_dir_all(&stage_output).expect("output dir");
+        std::fs::write(
+            stage_output.join("README.md"),
+            "**Expected artifact:** `implementation.md` — the commits.\n",
+        )
+        .expect("readme");
+
+        assert_eq!(
+            declared_output_artifact(dir.path(), "10-implement"),
+            Some("implementation.md".to_string())
+        );
+        assert_eq!(declared_output_artifact(dir.path(), "20-other"), None);
+    }
+
+    /// #260 Q4: an explicit `` **Disposition:** `promote` `` line, and
+    /// nothing else, reads as [`OutputDisposition::Promote`].
+    #[test]
+    fn declared_output_disposition_parses_an_explicit_promote_line() {
+        let readme = "**Expected artifact:** `implementation.md` — the commits.\n\n\
+             **Disposition:** `promote`\n";
+        assert_eq!(
+            declared_output_disposition_from_readme(readme),
+            OutputDisposition::Promote
+        );
+    }
+
+    /// #260 Q4 / §1a: "silence promotes nothing" — an explicit `evidence`
+    /// line, an absent `**Disposition:**` line, and an empty README all read
+    /// as [`OutputDisposition::Evidence`] identically.
+    #[test]
+    fn declared_output_disposition_defaults_to_evidence() {
+        assert_eq!(
+            declared_output_disposition_from_readme(
+                "**Expected artifact:** `x.md`\n\n**Disposition:** `evidence`\n"
+            ),
+            OutputDisposition::Evidence
+        );
+        assert_eq!(
+            declared_output_disposition_from_readme("**Expected artifact:** `x.md`\n"),
+            OutputDisposition::Evidence
+        );
+        assert_eq!(
+            declared_output_disposition_from_readme(""),
+            OutputDisposition::Evidence
+        );
+    }
+
+    #[test]
+    fn declared_output_disposition_reads_the_readme_off_disk_for_the_named_stage() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stage_output = dir.path().join("10-implement").join("output");
+        std::fs::create_dir_all(&stage_output).expect("output dir");
+        std::fs::write(
+            stage_output.join("README.md"),
+            "**Expected artifact:** `implementation.md`\n\n**Disposition:** `promote`\n",
+        )
+        .expect("readme");
+
+        assert_eq!(
+            declared_output_disposition(dir.path(), "10-implement"),
+            OutputDisposition::Promote
+        );
+        // No `output/README.md` at all for this stage — the fail-closed
+        // default, not a panic or an `Option`.
+        assert_eq!(
+            declared_output_disposition(dir.path(), "20-other"),
+            OutputDisposition::Evidence
+        );
+    }
+
+    /// Amendment 10d: the exact line `remediate-findings/00-ingest/output/
+    /// README.md` carries.
+    #[test]
+    fn declared_required_columns_parses_the_shipped_ingest_readme_shape() {
+        let readme = "**Expected artifact:** `ingest.md` — the accepted finding set.\n\n\
+             **Required columns:** `id`, `axis`, `claim`, `evidence`, `severity`, `status`, \
+             `refutation` — #260's structural gate.\n\n\
+             **Disposition:** `evidence`\n";
+        assert_eq!(
+            declared_required_columns_from_readme(readme),
+            vec![
+                "id",
+                "axis",
+                "claim",
+                "evidence",
+                "severity",
+                "status",
+                "refutation"
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_required_columns_is_empty_without_the_line() {
+        assert_eq!(
+            declared_required_columns_from_readme("**Expected artifact:** `x.md`\n"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn has_required_table_columns_finds_a_case_insensitive_header_row() {
+        let required = vec!["id".to_string(), "axis".to_string(), "claim".to_string()];
+        let typed = "some prose\n\n| ID | Axis | Claim | Evidence |\n|---|---|---|---|\n| 1 | \
+                     correctness | x | y |\n";
+        assert!(has_required_table_columns(typed, &required));
+    }
+
+    #[test]
+    fn has_required_table_columns_refuses_prose_with_no_table() {
+        let required = vec!["id".to_string(), "axis".to_string()];
+        let untyped = "Findings:\n- id: 1, axis: correctness, this is prose not a table\n";
+        assert!(!has_required_table_columns(untyped, &required));
+    }
+
+    #[test]
+    fn has_required_table_columns_refuses_a_table_missing_one_column() {
+        let required = vec!["id".to_string(), "refutation".to_string()];
+        let partial = "| id | axis |\n|---|---|\n| 1 | correctness |\n";
+        assert!(!has_required_table_columns(partial, &required));
+    }
 
     #[test]
     fn embedded_default_parses_with_its_stage_contexts() {
@@ -2088,6 +2467,99 @@ mod tests {
         );
     }
 
+    /// Amendment 9 Q5 / #260 mechanism 3: `receives_branch_status` parses to
+    /// `true` when declared and defaults `false` for every stage that never
+    /// mentions it — the same no-table-means-untagged shape `requires_ask`
+    /// already has, and it participates in the content-identity hash too.
+    #[test]
+    fn receives_branch_status_parses_true_and_defaults_false() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "closes");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"closes\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-open\", \"10-close\"]\n",
+                "\n",
+                "[stage.\"10-close\"]\n",
+                "receives_branch_status = true\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-open", "open context");
+        write_stage(&wf, "10-close", "close context");
+
+        let workflow = WorkflowDefinition::resolve(root, "closes").expect("resolve");
+        assert!(
+            !workflow.stages[0].receives_branch_status,
+            "untagged stage defaults false"
+        );
+        assert!(workflow.stages[1].receives_branch_status);
+
+        // Flipping the declaration is a different workflow (§22.3).
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"closes\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-open\", \"10-close\"]\n",
+            ),
+        )
+        .expect("descriptor");
+        let opted_out = WorkflowDefinition::resolve(root, "closes").expect("resolve");
+        assert_ne!(
+            workflow.content_hash, opted_out.content_hash,
+            "receives_branch_status must be execution-relevant to the content-identity hash"
+        );
+    }
+
+    /// §22.3's actor/execute field split applies to `receives_branch_status`
+    /// exactly as it does to `requires_ask`: an execute stage has no actor
+    /// turn to inject a fact into, so declaring it there is refused rather
+    /// than silently ignored.
+    #[test]
+    fn receives_branch_status_on_an_execute_stage_fails_closed() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        let wf = workflow_dir(root, "bad-execute-fact");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            concat!(
+                "[workflow]\n",
+                "name = \"bad-execute-fact\"\n",
+                "version = \"1\"\n",
+                "stages = [\"00-run\"]\n",
+                "\n",
+                "[stage.\"00-run\"]\n",
+                "kind = \"execute\"\n",
+                "image = \"alpine\"\n",
+                "command = [\"true\"]\n",
+                "workdir = \"/work\"\n",
+                "workspace_access = \"read_only\"\n",
+                "network = \"none\"\n",
+                "receives_branch_status = true\n",
+            ),
+        )
+        .expect("descriptor");
+        write_stage(&wf, "00-run", "");
+
+        let err = WorkflowDefinition::resolve(root, "bad-execute-fact").expect_err("must refuse");
+        assert!(
+            matches!(
+                &err,
+                WorkflowError::ActorFieldOnExecuteStage { field, .. }
+                    if field == "receives_branch_status"
+            ),
+            "expected a refusal naming receives_branch_status, got {err}"
+        );
+    }
+
     /// §22.3: an unrecognized key inside a `[stage."<id>"]` table is a parse
     /// failure, not a silently ignored typo — the same discipline
     /// `malformed_workflows_fail_closed` already pins for `[workflow]`.
@@ -2392,7 +2864,7 @@ mod tests {
 
     // --------------------------------------------- T2: catalog / front matter
 
-    /// The concrete shape `docs/icm/record-shapes.md` §1 gives as its
+    /// The concrete shape `sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 gives as its
     /// canonical example: a folded `>-` description and a bulleted `tags`
     /// list, both parsed out alongside the plain `status` scalar.
     #[test]

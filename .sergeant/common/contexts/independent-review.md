@@ -2,7 +2,7 @@
 
 Resolved as `@@independent-review` from
 `.sergeant/common/contexts/independent-review.md` per
-`docs/icm/convention.md` §4. Policy context (Placement Ladder PL-3).
+`.sergeant/common/contexts/icm-policy.md` §4. Policy context (Placement Ladder PL-3).
 Consumers: `validate-and-ship/40-drive-gates`, `validate-and-ship/60-close-out`
 (in place of the scattered restatements of the never-edit rule this
 package previously carried inline), and every panel-bearing package's own
@@ -15,7 +15,7 @@ refuted (`@@refute`). **The validating actor never edits the code.**
 
 ## Where independence actually lives
 
-`docs/icm/convention.md` §6.3: a later stage in the *same* workflow may
+`.sergeant/common/contexts/icm-policy.md` §6.3: a later stage in the *same* workflow may
 qualify as independent review when it has a fresh execution, explicit
 inputs (not inherited conversation state), a review-only contract, and no
 authority to edit the subject it reviews. Independence lives in the

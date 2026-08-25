@@ -49,8 +49,10 @@ use crate::domain::work::{
 use crate::domain::workflow::{
     DEFAULT_WORKFLOW, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
     KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
-    KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition,
-    StageKind, StageStatus, WorkflowDefinition, WorkflowError,
+    KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
+    REASON_STAGE_OUTPUT_MISSING, SOURCE_EMBEDDED, StageBinding, StageDefinition, StageKind,
+    StageRecord, StageStatus, WorkflowDefinition, WorkflowError, declared_output_artifact,
+    declared_required_columns, has_required_table_columns,
 };
 use crate::runtime::preflight::{self, GitPreflight, PreflightRefusal};
 use crate::runtime::projection::{WorkRegistry, WorkRun, is_absorbing};
@@ -58,7 +60,7 @@ use crate::runtime::router::{Route, RouteError, RouteInputs, route, route_stage}
 use crate::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
     RepositoryBinding, SURFACES_DIR, SurfaceError, SurfacePlan, TeardownReport, WorkSurface,
-    materialize_admitted, rematerialize, teardown,
+    finalize_sweep, materialize_admitted, rematerialize, teardown,
 };
 
 /// Everything a submission says about how it wants to run.
@@ -155,7 +157,7 @@ pub struct StartPlan {
 
 /// Why `target_work_id`'s branch cannot (yet) be taken over by a gate Work
 /// attaching to it (§8.6 investigation, Mechanism A —
-/// `docs/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`). Every
+/// `sergeant-rs-workspace's knowledge/evidence/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`). Every
 /// variant is a fail-closed refusal named with a reason: dispatch must never
 /// guess or race the target's own teardown (ADR 0005 §4.3, "ambiguity fails
 /// closed").
@@ -635,6 +637,12 @@ pub enum SurfaceEffect {
         surface: WorkSurface,
         /// Whether a restart, rather than the run itself, is what recorded it.
         recovered: bool,
+        /// #260 Q4: the resolved workflow's own `source` directory, so
+        /// [`crate::runtime::surface::finalize_sweep`] can read each
+        /// stage's declared disposition before teardown's dirty check runs.
+        /// `None` for the embedded default (no package directory to read)
+        /// or a run that never resolved a workflow at all.
+        workflow_source: Option<String>,
     },
 }
 
@@ -686,8 +694,24 @@ impl PendingSurface {
                 }
                 SurfaceOutcome::Rematerialized(rematerialize(&self.data_dir, surface).map(Some))
             }
-            SurfaceEffect::Teardown { surface, .. } => {
-                SurfaceOutcome::TornDown(teardown(&self.data_dir, surface))
+            SurfaceEffect::Teardown {
+                surface,
+                workflow_source,
+                ..
+            } => {
+                // #260 Q4: sweep evidence-class stage output *before*
+                // teardown's own dirty check — a clean, promote-only
+                // worktree the sweep leaves behind is what makes the
+                // ordinary `Removed` disposition below the honest answer,
+                // exactly as it already is for a Work that never declared
+                // any output at all.
+                let source = workflow_source.as_deref().map(Path::new);
+                let sweeps = surface
+                    .bindings
+                    .iter()
+                    .map(|binding| finalize_sweep(binding, source))
+                    .collect();
+                SurfaceOutcome::TornDown(teardown(&self.data_dir, surface, source), sweeps)
             }
         }
     }
@@ -701,7 +725,12 @@ pub enum SurfaceOutcome {
     /// A re-attached surface, `None` when nothing needed re-attaching.
     Rematerialized(Result<Option<WorkSurface>, SurfaceError>),
     /// Teardown never fails: it reports what it found (§11 fails closed).
-    TornDown(TeardownReport),
+    /// The second element is #260 Q4's finalize-sweep report, one per
+    /// binding in the same order as `surface.bindings`.
+    TornDown(
+        TeardownReport,
+        Vec<crate::runtime::surface::FinalizeSweepReport>,
+    ),
 }
 
 /// What the engine needs before it can crank again.
@@ -1071,10 +1100,10 @@ pub const KIND_TURN_ENVELOPE_EXTENDED: &str = "execution.turn_envelope_extended"
 /// helper was built for, included. 12 covers every admitted workflow's
 /// stage count (max 11) with margin for at least one retry inside any
 /// single stage, without inventing an unrelated round number.
-/// L16 arithmetic still holds at the new value: the largest measured
-/// single turn on this build's evidence is Run B2's $3.21
-/// (`GAUNTLET.md`'s N-series close-out), so a 12-turn cap is a ~$38 bound,
-/// never a $2.50 one.
+/// The turn cap is an arbitrary operator-set budget, not a cost bound —
+/// no dollar figure is claimed or implied by this number; 12 was chosen
+/// for stage-count and retry-margin coverage alone (above), not for any
+/// economics derived from it.
 ///
 /// Structurally grounded, still not live-measured: a real N-series run
 /// (or the opt-in Claude suite, `SERGEANT_CLAUDE_TESTS=1`) is what would
@@ -1459,7 +1488,7 @@ impl Engine {
     ///
     /// `local` no longer refuses here (MVP-2 D2 item 1): its launch-side
     /// translation is measured (`setting_sources_args`,
-    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`),
+    /// `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`),
     /// so the L1 gate this refusal existed to enforce is satisfied. The
     /// conflict rule is unchanged — mixing policies within one bind is still
     /// refused, because "one process, one `--setting-sources`" is a fact
@@ -1489,7 +1518,7 @@ impl Engine {
         // more than its name suggests — hooks, tool permissions, MCP
         // servers from the repository's own `.claude/settings*.json`, not
         // just "reads a text file" (measured,
-        // `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`).
+        // `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`).
         // The submit-time refusal that gated this on an unmeasured claim
         // was correctly removed once the value was measured (D2 item 1),
         // but nothing replaced it as an operator-visible signal — no
@@ -1542,7 +1571,7 @@ impl Engine {
     /// adapter's launch grammar (`suppress` or the newly-unrefused `local`)
     /// never reads this file natively, so "the file the actor will read is
     /// the one we recorded" does not hold for either — see
-    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`.
+    /// `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`.
     /// What ships is a correctly-computed, correctly-pinned identity for a
     /// file this adapter does not currently read under any policy — honest
     /// bookkeeping for a mechanism the manifest schema anticipates but this
@@ -1858,7 +1887,10 @@ impl Engine {
                 },
                 SurfaceOutcome::Rematerialized(result),
             ) => self.settle_rematerialize(core, &work_id, &surface, index, attempt, result),
-            (SurfaceEffect::Teardown { recovered, .. }, SurfaceOutcome::TornDown(report)) => {
+            (
+                SurfaceEffect::Teardown { recovered, .. },
+                SurfaceOutcome::TornDown(report, sweeps),
+            ) => {
                 // §11.5's orthogonal axis, computed at the one point every
                 // terminal path converges on: cancel (`begin_retire_run`),
                 // failure and completion (`settle_stage`'s signal arms), and
@@ -1879,6 +1911,16 @@ impl Engine {
                 let mut payload = json!({"report": report, "integrity": integrity});
                 if recovered {
                     payload["recovered"] = Value::Bool(true);
+                }
+                // F-SI-01: the finalize sweep's own report — evidence
+                // retained and whether it committed — was previously
+                // computed then discarded (`let _ = finalize_sweep(...)`),
+                // leaving no journal/domain record of what it did. Recorded
+                // as a sibling key for the same additive-payload reason as
+                // `recovered` above; omitted when every binding's sweep was
+                // a no-op so an ordinary teardown's payload is unchanged.
+                if sweeps.iter().any(|s| !s.evidence.is_empty() || s.committed) {
+                    payload["finalize_sweep"] = json!(sweeps);
                 }
                 self.commit(core, &work_id, KIND_SURFACE_TORN_DOWN, payload)?;
                 Ok(Step::parked())
@@ -2648,6 +2690,11 @@ impl Engine {
                 Ok(self.teardown_next(core, work_id, false))
             }
             BackendSignal::StageCompleted { summary } => {
+                if let Some(gated) =
+                    self.check_stage_output_gate(core, work_id, &run, &workflow, &stage)?
+                {
+                    return Ok(gated);
+                }
                 let mut payload = json!({"stage_id": stage.stage_id, "index": stage.index});
                 if let Some(summary) = summary {
                     payload["detail"] = Value::String(summary);
@@ -2671,6 +2718,140 @@ impl Engine {
                 Ok(self.teardown_next(core, work_id, false))
             }
         }
+    }
+
+    /// #260 Q3's hard stage-output gate: a `StageCompleted` signal for a
+    /// stage whose package declares an `output/` artifact
+    /// ([`declared_output_artifact`]) that is not actually on disk in any
+    /// bound worktree must not be accepted at face value the way `drive`'s
+    /// `StageCompleted` arm otherwise would. Returns `Ok(None)` to let that
+    /// arm proceed exactly as before — no declared artifact, or the
+    /// artifact is present — and `Ok(Some(next))` to short-circuit it with
+    /// either a bounded re-prompt of the same actor (first miss this
+    /// attempt) or a `needs_input` park named `stage_output_missing`
+    /// (second miss), recoverable through the ordinary respond/retry/cancel
+    /// surface exactly like any other `needs_input`.
+    ///
+    /// F-SF-05: the second-miss refusal below calls `self.commit` then
+    /// `self.transition` directly — not a distinct gate-only path, but the
+    /// exact pair every `BackendSignal` arm in `drive` above already uses.
+    /// `self.transition` is what enforces the §10 transition table (see
+    /// `the_transition_table_is_consulted_before_anything_is_appended`), so
+    /// this refusal is table-validated the same way `NeedsInput`/`Waiting`/
+    /// `Blocked`/`Failed` are, not a bypass of that mechanism. The
+    /// first-miss re-prompt below only calls `self.commit`, with no
+    /// `self.transition` — deliberately: it re-prompts the same actor
+    /// without leaving `active`, so there is no state change for the table
+    /// to validate.
+    ///
+    /// Deliberately reads the *current* `output/README.md` off disk rather
+    /// than anything pinned in `workflow.bound` — the same filesystem-is-
+    /// ground-truth posture `retain_stage_outputs` already takes toward
+    /// `output/` (Rule 4: "no engine collection, no artifact manifest
+    /// machinery"), and `WorkflowDefinition::content_hash` deliberately
+    /// excludes `source` for the same reason.
+    fn check_stage_output_gate(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        run: &WorkRun,
+        workflow: &WorkflowDefinition,
+        stage: &StageRecord,
+    ) -> Result<Option<Next>, EngineError> {
+        if workflow.source == SOURCE_EMBEDDED {
+            return Ok(None);
+        }
+        let Some(expected) = declared_output_artifact(Path::new(&workflow.source), &stage.stage_id)
+        else {
+            return Ok(None);
+        };
+        let Some(surface) = run.surface.as_ref() else {
+            return Ok(None);
+        };
+        // Amendment 10d: a stage may additionally declare the artifact's
+        // required table columns (`declared_required_columns`) — a typed
+        // set, not merely a file that exists. `produced` folds both checks
+        // into one boolean deliberately: a present-but-untyped artifact and
+        // an altogether-absent one get the identical bounded-re-prompt/
+        // needs_input treatment below, per Amendment 10d's own text
+        // ("malformed = stage_output_missing-class refusal").
+        let required_columns =
+            declared_required_columns(Path::new(&workflow.source), &stage.stage_id);
+        let produced = surface.bindings.iter().any(|binding| {
+            let path = binding
+                .worktree_path
+                .join(&stage.stage_id)
+                .join("output")
+                .join(&expected);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return false;
+            };
+            has_required_table_columns(&text, &required_columns)
+        });
+        if produced {
+            return Ok(None);
+        }
+        if stage.output_reprompts == 0 {
+            if !self.check_turn_envelope(core, work_id, &stage.stage_id)? {
+                // Already committed `stage.blocked`/`work.blocked` with its
+                // own reason; nothing more for the gate to say.
+                return Ok(Some(Next::Parked));
+            }
+            self.commit(
+                core,
+                work_id,
+                KIND_STAGE_OUTPUT_MISSING,
+                json!({
+                    "stage_id": stage.stage_id,
+                    "path": expected,
+                    "attempt": stage.attempt,
+                }),
+            )?;
+            let execution = run.execution.clone().ok_or_else(|| EngineError::NoRun {
+                work_id: work_id.to_string(),
+            })?;
+            let backend = self.backend_for(work_id, &execution.backend)?;
+            let prompt =
+                format!("declared output {expected} missing — produce it or state what you need");
+            return Ok(Some(Next::Send(Box::new(PendingSend {
+                work_id: work_id.to_string(),
+                stage_id: stage.stage_id.clone(),
+                index: stage.index,
+                attempt: stage.attempt,
+                execution,
+                backend,
+                input: prompt,
+                resume: self.resume_request(run, work_id),
+            }))));
+        }
+        let detail = format!(
+            "stage {} completed without producing its declared output {expected}, even after \
+             one re-prompt",
+            stage.stage_id
+        );
+        self.commit(
+            core,
+            work_id,
+            KIND_STAGE_NEEDS_INPUT,
+            json!({
+                "stage_id": stage.stage_id,
+                "detail": detail,
+                "reason_code": REASON_STAGE_OUTPUT_MISSING,
+                "path": expected,
+            }),
+        )?;
+        self.transition(
+            core,
+            work_id,
+            KIND_WORK_NEEDS_INPUT,
+            json!({
+                "prompt": detail,
+                "stage_id": stage.stage_id,
+                "reason_code": REASON_STAGE_OUTPUT_MISSING,
+                "path": expected,
+            }),
+        )?;
+        Ok(Some(Next::Parked))
     }
 
     /// Reattach, resume, classify one in-flight execution after a daemon
@@ -3273,8 +3454,18 @@ impl Engine {
             cwd: surface.execution_cwd(),
             intent,
             // §12: procedure is data. The stage's CONTEXT.md is carried to
-            // the actor verbatim; sergeant never interprets it.
-            context: stage.context.clone(),
+            // the actor verbatim; sergeant never interprets it — except for
+            // Amendment 9 Q5 / #260 mechanism 3's opt-in wire, where a stage
+            // that declared `receives_branch_status = true` gets the
+            // engine's own commits-on-branch-since-base fact appended. The
+            // engine still shares no output vocabulary: this is a fact it
+            // already computes ([`WorkSurface::commits_since_base`]), not an
+            // interpretation of the stage's procedure.
+            context: if stage.receives_branch_status {
+                branch_status_context(&stage.context, &surface)
+            } else {
+                stage.context.clone()
+            },
             // §24.8: the profile carries the model, so the stage's profile
             // carries the stage's model. There is no per-stage model field.
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
@@ -4208,10 +4399,19 @@ impl Engine {
         if run.teardown.is_some() {
             return Next::Parked; // already retired
         }
+        let workflow_source = run
+            .workflow
+            .as_ref()
+            .filter(|w| w.source != SOURCE_EMBEDDED)
+            .map(|w| w.source.clone());
         Next::Surface(Box::new(PendingSurface {
             work_id: work_id.to_string(),
             data_dir: self.data_dir.clone(),
-            effect: SurfaceEffect::Teardown { surface, recovered },
+            effect: SurfaceEffect::Teardown {
+                surface,
+                recovered,
+                workflow_source,
+            },
         }))
     }
 
@@ -4402,6 +4602,21 @@ fn handle_of(execution: &ExecutionRecord) -> ExecutionHandle {
         execution_id: execution.execution_id.clone(),
         native_id: execution.native_id.clone(),
     }
+}
+
+/// Amendment 9 Q5 / #260 mechanism 3: append the engine's own
+/// commits-on-branch-since-base fact ([`WorkSurface::commits_since_base`])
+/// to a stage's `CONTEXT.md`, for a stage that declared
+/// `receives_branch_status = true`. Appended rather than templated into the
+/// procedure text itself — the stage's authored content is untouched, and a
+/// reader can tell at a glance which part sergeant added.
+fn branch_status_context(context: &str, surface: &WorkSurface) -> String {
+    let count = surface.commits_since_base();
+    let commits_on_branch_since_base = if count > 0 { "yes" } else { "no" };
+    format!(
+        "{context}\n\n## Engine-computed branch status\n\n\
+         commits_on_branch_since_base: {commits_on_branch_since_base} ({count})\n"
+    )
 }
 
 #[cfg(test)]
@@ -5574,6 +5789,7 @@ mod tests {
                 BindingDisposition::RetainedDirty {
                     changes: "M solo/wip.rs".to_string(),
                     patch: None,
+                    outputs: Vec::new(),
                 }
             };
             TeardownReport {
