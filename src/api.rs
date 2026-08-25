@@ -4931,18 +4931,35 @@ impl ApiClient {
         self.get("/v1/estates").await
     }
 
-    /// Open the SSE live tail at `GET /v1/events/stream?from=N`.
+    /// Open the SSE live tail at
+    /// `GET /v1/events/stream?from=N[&estate_root=R]`.
+    ///
+    /// `estate_root` (H1 sprint-plan D4/D6) is a parameter of this call, not
+    /// of the client itself: `sgt watch`'s filter (`WatchOptions`,
+    /// `src/watch.rs`) is a separate decision from what estate this client
+    /// otherwise addresses (`Self::with_estate_root`) — `--all` must be able
+    /// to ask for every estate's events even from a client that *does*
+    /// address one for its other requests. `None` is host-wide: every
+    /// admitted estate's events, unfiltered.
     ///
     /// A separate reqwest client is built with no total timeout: the response
     /// body of a live tail is *supposed* to stay open, and the per-request
     /// timeout that keeps a stuck command honest would kill it on schedule.
-    pub async fn stream_events(&self, from: u64) -> Result<EventStream, ClientError> {
+    pub async fn stream_events(
+        &self,
+        from: u64,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<EventStream, ClientError> {
         let http = reqwest::Client::builder().build()?;
-        let response = http
-            .get(format!("{}/v1/events/stream?from={from}", self.endpoint))
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
+        let url = match estate_root {
+            Some(root) => format!(
+                "{}/v1/events/stream?from={from}&estate_root={}",
+                self.endpoint,
+                urlencode(&root.to_string_lossy())
+            ),
+            None => format!("{}/v1/events/stream?from={from}", self.endpoint),
+        };
+        let response = http.get(url).bearer_auth(&self.token).send().await?;
         let status = response.status();
         if !status.is_success() {
             let body: Value = response.json().await.unwrap_or(Value::Null);
@@ -5454,7 +5471,7 @@ mod tests {
 
         let client = ApiClient::new(&format!("http://{addr}"), "unused-token").expect("client");
         let mut stream = client
-            .stream_events(0)
+            .stream_events(0, None)
             .await
             .expect("connect to the stand-in server");
         let outcome = stream.next_event().await;

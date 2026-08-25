@@ -424,7 +424,7 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
 
     // --- an SSE event drives a re-render ------------------------------------
     let mut stream = client
-        .stream_events(app.last_seq)
+        .stream_events(app.last_seq, None)
         .await
         .expect("live tail attaches");
     let fresh = submit(

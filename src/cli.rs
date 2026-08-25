@@ -249,6 +249,15 @@ enum Command {
         /// one-shot mode and re-arms.
         #[arg(long)]
         follow: bool,
+        /// D6: watch every admitted estate's events, even when the current
+        /// directory (or `-C`) happens to be a valid estate root. Without
+        /// this, `sgt watch` inside an estate defaults to that estate's
+        /// events only (estate-wide meaning preserved) — the same default
+        /// this verb has always had, now made explicit rather than implicit
+        /// in a single-estate daemon's binding. Outside any estate root the
+        /// watch is already host-wide with no flag needed.
+        #[arg(long)]
+        all: bool,
     },
     /// Ask the daemon one of the canned §22 analytical questions.
     ///
@@ -821,15 +830,57 @@ fn resolve_host_runtime_dir(
         .map_err(CliError::new)
 }
 
-/// §4.2: which commands require an exact estate root, and which are
-/// deliberately usable outside one.
+/// §4.2/H1 §5: which commands require an exact estate root before any
+/// daemon contact is even attempted, and which are deliberately usable
+/// outside one.
 ///
-/// Estate-scoped: `run`, `status`, `work *`, `respond`/`retry`/`extend`/
-/// `cancel`, `watch`, `analytics`, `tui`, `daemon`(+`stop`), `repo *`,
-/// `group *`, `workflow *`, and the five harnesses. Unscoped: bare `sgt`,
-/// `--help`, `--version`, `init`, `doctor` — nothing else.
+/// Estate-scoped: `run`, `respond`/`retry`/`extend`/`cancel`,
+/// `work reap`/`sweep`/`retained`, `analytics`, `repo *`, `group *`,
+/// `workflow *`, and the five harnesses — H1 §11.3, preserved verbatim
+/// (brief deliverable 2). Unscoped: bare `sgt`, `--help`, `--version`,
+/// `init`, `doctor`. **Host-scoped** ([`is_host_scoped`]) is the third
+/// bucket H1 §5 adds: `tui`, `status`, `work show`/`list`/`transcript`,
+/// `watch`, and every `daemon` verb — no estate root is required, but one
+/// addressed via `-C`/cwd is still validated where the command actually
+/// consults it (`watch`'s D6 default, `daemon stop`'s ordinary directory
+/// check).
 fn is_estate_scoped(command: &Command) -> bool {
-    !matches!(command, Command::Doctor | Command::Init { .. })
+    !matches!(command, Command::Doctor | Command::Init { .. }) && !is_host_scoped(command)
+}
+
+/// H1 §5's host-scoped bucket (brief deliverable 2): exactly the existing
+/// no-spawn set (ADR 0009) plus the two `daemon` variants that never
+/// consulted an estate to begin with — `sgt daemon` (foreground) serves
+/// every estate admitted to it later, and `sgt daemon install-service`
+/// touches no daemon and no estate at all. `-C`/cwd is never *required* for
+/// any of these; [`dispatch`] never calls [`admit_root`] on their account,
+/// so a directory mistake here is not a root-gate refusal — it is simply
+/// not consulted.
+fn is_host_scoped(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Tui
+            | Command::Status
+            | Command::Watch { .. }
+            | Command::Work {
+                command: WorkCommand::List
+            }
+            | Command::Work {
+                command: WorkCommand::Show { .. }
+            }
+            | Command::Work {
+                command: WorkCommand::Transcript { .. }
+            }
+            | Command::Daemon { command: None, .. }
+            | Command::Daemon {
+                command: Some(DaemonCommand::Stop),
+                ..
+            }
+            | Command::Daemon {
+                command: Some(DaemonCommand::InstallService { .. }),
+                ..
+            }
+    )
 }
 
 async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
@@ -857,24 +908,25 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         sgt.data_dir.clone(),
         estate.as_ref().map(|e| e.path.as_path()).unwrap_or(&root),
     )?;
-    // W1b's caller classification, W2 consuming the first of it. The HOST
-    // bucket — daemon discovery/spawn/stop and `exec_harness`'s adapter
-    // state — is what `resolve_host_runtime_dir` is for; the ESTATE bucket
-    // (`doctor::run`'s journal-replay-derived checks) keeps
-    // `resolve_data_dir`.
+    // W1b's caller classification, W2/W3 consuming it fully. The HOST bucket
+    // — daemon discovery/spawn/stop and the foreground daemon start that
+    // creates the runtime root — is what `resolve_host_runtime_dir` is for;
+    // the ESTATE bucket (`doctor::run`'s journal-replay-derived checks,
+    // `exec_harness`'s adapter state) keeps `resolve_data_dir`.
     //
-    // **This wave wires exactly one caller: the foreground daemon**, which
-    // is the one that actually *creates* the runtime root and therefore the
-    // one that has to name it correctly for `daemon.lock`, the journal, the
-    // blob store and the descriptor to live where D2 says. The client-side
-    // discovery/spawn callers (`ensure_daemon`/`observe_connect`/
-    // `daemon_stop`/`spawn_daemon`) are W3's, per this wave's brief, and
-    // still resolve as they did — which stays consistent because
-    // `spawn_daemon` passes `--data-dir` explicitly, so the child it starts
-    // takes the flag rung and lands in the same directory its parent looked
-    // in. The two ladders only diverge for a `sgt daemon` typed by hand with
-    // no flag and no `SGT_DATA_DIR`, which is exactly the case that *should*
-    // now be the host root.
+    // **W3 wires every remaining client-side daemon-contact caller onto the
+    // host root**: `ensure_daemon`/`observe_connect`/`daemon_stop` (and
+    // through it, `spawn_daemon`) all take `host_root` below, never the
+    // estate-derived `data_dir` above — brief deliverable 1's whole point
+    // is that a second estate's client must discover the *same* running
+    // daemon a first estate's client found, which is only true once both
+    // resolve to one path regardless of which estate admitted them. This
+    // stays consistent with `--data-dir`/`SGT_DATA_DIR` (both resolvers'
+    // top two rungs are identical, D2) and only actually diverges from the
+    // old estate-derived path for an operator who relied on neither flag
+    // nor env — exactly the case D2 moves to the host runtime root.
+    let (host_root, _host_root_source) =
+        resolve_host_runtime_dir(data_dir_flag.clone(), |name| std::env::var_os(name))?;
     match command {
         Command::Daemon {
             command: None,
@@ -885,9 +937,9 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // convention, with no estate rung at all. `-C` on this verb
             // named the estate this invocation addresses; it does not bind
             // the process (deliverable 8), and the daemon it starts serves
-            // every estate admitted to it later.
-            let (host_root, _) =
-                resolve_host_runtime_dir(sgt.data_dir.clone(), |name| std::env::var_os(name))?;
+            // every estate admitted to it later. Host-scoped
+            // ([`is_host_scoped`]): no root was admitted above, so this
+            // never required one to begin with.
             daemon::run_until_signal(&host_root, rebuild_cache).await?;
             Ok(())
         }
@@ -905,7 +957,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                      `sgt daemon stop` does not start a daemon",
                 ));
             }
-            daemon_stop(&data_dir, &estate_root(&estate), sgt.json).await
+            daemon_stop(&host_root, estate_root_opt(&estate), sgt.json).await
         }
         Command::Daemon {
             command: Some(DaemonCommand::InstallService { print }),
@@ -920,7 +972,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             install_service(data_dir_flag, print, sgt.json)
         }
         Command::Status => {
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
             let system = client.get("/v1/system").await?;
             let works = client.get("/v1/work").await?;
             let mut counts = std::collections::BTreeMap::<String, u64>::new();
@@ -1019,7 +1071,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     ));
                 }
             };
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let envelope = if turns.is_some() || ceiling_secs.is_some() {
                 Some(json!({"turn_cap": turns, "ceiling_secs": ceiling_secs}))
             } else {
@@ -1057,7 +1109,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Respond { id, input } => {
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "input": input,
@@ -1071,7 +1123,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Retry { id } => {
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
             let result = client.post(&format!("/v1/work/{id}/retry"), &body).await?;
             if sgt.json {
@@ -1085,7 +1137,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             id,
             additional_turns,
         } => {
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "additional_turns": additional_turns,
@@ -1109,7 +1161,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // `retained` (ADR 0009: observation must not materialize the
             // thing observed) rather than auto-spawning a daemon.
             if !yes {
-                let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+                let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
                 let retained = client.retained().await?;
                 let mine: Vec<&Value> = retained["retained"]
                     .as_array()
@@ -1136,7 +1188,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 }
                 return Ok(());
             }
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let result = client.reap(&id, true).await?;
             if sgt.json {
                 print_json(&result);
@@ -1157,9 +1209,9 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // observed). Only the confirmed deletion joins `reap`'s bucket
             // and may spawn a daemon.
             let client = if delete_redundant && yes {
-                ensure_daemon(&data_dir, &estate_root(&estate)).await?
+                ensure_daemon(&host_root, &estate_root(&estate)).await?
             } else {
-                observe_connect(&data_dir, &estate_root(&estate)).await?
+                observe_connect(&host_root, estate_root_opt(&estate)).await?
             };
             let report = client.sweep().await?;
             if !delete_redundant {
@@ -1206,7 +1258,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Work { command } => {
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
             match command {
                 WorkCommand::List => {
                     let result = client.get("/v1/work").await?;
@@ -1315,7 +1367,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
         }
         Command::Analytics { name } => {
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
             let result = match &name {
                 Some(name) => client.get(&format!("/v1/analytics/{name}")).await?,
                 None => client.get("/v1/analytics").await?,
@@ -1330,7 +1382,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Cancel { id } => {
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
             let result = client.post(&format!("/v1/work/{id}/cancel"), &body).await?;
             if sgt.json {
@@ -1344,13 +1396,29 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Watch { id, follow } => {
+        Command::Watch { id, follow, all } => {
             // R-WATCH-3 / ADR 0009: never `ensure_daemon` — this verb
-            // refuses rather than spawns.
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+            // refuses rather than spawns. Host-scoped (H1 §5): connection
+            // itself never requires or addresses an estate — `estate` is
+            // always `None` here (`is_host_scoped`).
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            // D6, brief deliverable 3: cwd is consulted **only** to default
+            // the watch filter, never to gate the connection above (H1 §5's
+            // "opportunistic filter" — the one case this wave itself owns,
+            // distinct from the TUI's own screens, W4d). `--all` always
+            // wins; otherwise an exact-root cwd/`-C` scopes the watch to
+            // that one estate, silently falling back to host-wide when it
+            // is not one — never a refusal, because this verb never
+            // required an estate to begin with.
+            let watch_estate = if all {
+                None
+            } else {
+                Estate::admit(&root).ok().map(|admitted| admitted.path)
+            };
             let options = crate::watch::WatchOptions {
                 work_id: id,
                 follow,
+                estate_root: watch_estate,
             };
             let json = sgt.json;
             crate::watch::watch(&client, &options, |notice| {
@@ -1373,7 +1441,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // ADR 0009/0010: the TUI never auto-spawns — it is in the
             // no-spawn set like every other observation surface, and bare
             // `sgt` no longer falls into it by default.
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
             crate::tui::run(client).await.map_err(CliError::from)
         }
         Command::Doctor => {
@@ -1586,6 +1654,20 @@ fn estate_root(estate: &Option<EstateRoot>) -> PathBuf {
         .expect("dispatch admits the root for every estate-scoped command")
         .path
         .clone()
+}
+
+/// The addressed root, for [`observe_connect`]/[`daemon_stop`] call sites
+/// shared by the estate-scoped and host-scoped buckets (H1 §5, brief
+/// deliverable 2).
+///
+/// Never panics, unlike [`estate_root`]: `estate` is `Some` exactly when
+/// [`dispatch`] admitted a root ([`is_estate_scoped`] answered `true`), and
+/// `None` exactly when the command is host-scoped or unscoped — which this
+/// simply forwards as the `Option` those two functions' host-scoped shape
+/// already expects, so a single call site works unchanged whichever bucket
+/// the matched command turned out to be in.
+fn estate_root_opt(estate: &Option<EstateRoot>) -> Option<&Path> {
+    estate.as_ref().map(|e| e.path.as_path())
 }
 
 /// The most an `--intent-file` may hold (#166).
@@ -2271,13 +2353,25 @@ fn print_homepage(root: &Path) {
     println!("sgt <command> --help for the full verb list");
 }
 
-/// Connect to the daemon for `data_dir`, auto-spawning one if needed.
+/// Connect to the host daemon at `data_dir` (the **host runtime root**,
+/// [`resolve_host_runtime_dir`] — never a per-estate data dir under H1),
+/// auto-spawning one if needed, then address it at `estate_root` (D4).
 ///
 /// This is the CLI's half of the client contract — descriptor discovery,
 /// staleness judgement, detached spawn — and it hands back the crate's one
 /// API client ([`ApiClient`], defined next to the router it speaks to). Only
 /// the mutating verbs (ADR 0009) come through here; every observation verb,
 /// TUI included, goes through [`observe_connect`] instead.
+///
+/// **Deliverable 1's second-estate case.** A second estate's first mutating
+/// command reaches this same function. Because `data_dir` is now the host
+/// root regardless of which estate is addressed, its descriptor read finds
+/// the *same* already-running daemon the first estate's client found —
+/// [`spawn_daemon`] is only ever reached when no host daemon answers at
+/// all, never to compete with one that already admitted a different
+/// estate. The addressed estate is validated and sent on every request
+/// (`check_binding`, `client_for`); nothing here re-spawns to "fix" a
+/// binding, because a v3 host daemon has none to fix.
 async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient, CliError> {
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -2319,7 +2413,7 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
         None
     };
 
-    spawn_daemon(data_dir, estate_root)?;
+    spawn_daemon(data_dir)?;
 
     // Wait for a healthy descriptor. It may be written by our child or by a
     // concurrently racing client's child — either is fine; the daemon lock
@@ -2412,7 +2506,19 @@ fn check_binding(estate_root: &Path, operation: &str) -> Result<(), CliError> {
 /// 3. A descriptor naming a live PID that does not answer `/healthz` → the
 ///    same ambiguous, fail-closed refusal `ensure_daemon` gives, spawn
 ///    nothing.
-async fn observe_connect(data_dir: &Path, estate_root: &Path) -> Result<ApiClient, CliError> {
+///
+/// **`estate_root: None` (H1 §5, brief deliverable 2) is the host-scoped
+/// shape.** `tui`, `status`, `work show`/`list`/`transcript` and `watch`
+/// reach this with no estate at all — connection to the host daemon must
+/// succeed regardless, because none of them needs one. `check_binding` is
+/// skipped entirely rather than called with a fabricated root: there is
+/// nothing to validate when the command addressed nothing, and
+/// `check_estate_root(None, ..)` would otherwise manufacture exactly the
+/// `NoEstateAddressed` refusal a host-scoped verb must never hit.
+async fn observe_connect(
+    data_dir: &Path,
+    estate_root: Option<&Path>,
+) -> Result<ApiClient, CliError> {
     let path = daemon::descriptor_path(data_dir);
     let Some(descriptor) = daemon::read_descriptor(data_dir)? else {
         return Err(CliError::new(format!(
@@ -2423,13 +2529,16 @@ async fn observe_connect(data_dir: &Path, estate_root: &Path) -> Result<ApiClien
         )));
     };
     // D4, before the endpoint is touched at all — the same gate
-    // `ensure_daemon` applies, for the same reason.
-    check_binding(estate_root, "this command")?;
+    // `ensure_daemon` applies, for the same reason. Only when an estate was
+    // actually addressed: see the host-scoped note above.
+    if let Some(root) = estate_root {
+        check_binding(root, "this command")?;
+    }
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
     if healthz_ok(&http, &descriptor.endpoint).await {
-        return client_for(&descriptor, Some(estate_root));
+        return client_for(&descriptor, estate_root);
     }
     if daemon::pid_alive(descriptor.pid) {
         return Err(CliError::new(format!(
@@ -2473,11 +2582,24 @@ async fn healthz_ok(http: &reqwest::Client, endpoint: &str) -> bool {
     )
 }
 
-/// Spawn a detached `sgt daemon` for `data_dir`: own process group, stdio to
-/// `daemon.log` in the data dir. The child is *not* waited on — it outlives
-/// this client by design; losing the daemon-lock race makes it exit on its
-/// own.
-fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
+/// Spawn a detached `sgt daemon` for `data_dir` (H1: the **host runtime
+/// root**, never a per-estate data dir — see [`resolve_host_runtime_dir`]):
+/// own process group, stdio to `daemon.log` in the data dir. The child is
+/// *not* waited on — it outlives this client by design; losing the
+/// daemon-lock race makes it exit on its own.
+///
+/// **No `-C <estate_root>` scalar (H1 §4, brief deliverable 1).** Before H1
+/// the spawned daemon was bound to exactly the one estate this client had
+/// already admitted, named explicitly with `-C` because a detached child
+/// does not reliably keep the parent's cwd. A host daemon serves every
+/// estate admitted to it *later*, over the wire (D4) — baking one estate
+/// into the child's argv would make a second estate's first `sgt run`
+/// either hit this same estate's binding (wrong) or spawn a second,
+/// competing host process (exactly what H1 §2 rules out: "one long-lived
+/// daemon per Sergeant user installation"). The child therefore addresses
+/// no estate at all; every estate it ever serves is admitted per-request
+/// once it is already running.
+fn spawn_daemon(data_dir: &Path) -> Result<(), CliError> {
     std::fs::create_dir_all(data_dir)?;
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new()
@@ -2485,12 +2607,7 @@ fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
         .append(true)
         .open(data_dir.join("daemon.log"))?;
     let mut command = std::process::Command::new(exe);
-    // §5.1, C10: the spawned daemon is bound to the estate this client
-    // already admitted — named explicitly with `-C` rather than inherited
-    // from a cwd the detached child does not reliably keep.
     command
-        .arg("-C")
-        .arg(estate_root)
         .arg("--data-dir")
         .arg(data_dir)
         .arg("daemon")
@@ -2623,7 +2740,18 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// Deliberately does **not** auto-spawn a daemon — asking to stop something
 /// that is not running is answered "already stopped", never "let me start
 /// one so I can stop it", mirroring `sgt doctor`'s own no-auto-spawn rule.
-async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<(), CliError> {
+///
+/// `estate_root: None` (H1 §5, brief deliverable 2): `sgt daemon stop` is a
+/// host-scoped verb — it works from any cwd, because it addresses no
+/// estate at all (it stops the host daemon, D5, not "my estate's"). When
+/// `estate_root` is `Some` (cwd happened to be a valid root), it is
+/// validated the ordinary way; when it is `None`, there is nothing to
+/// validate and nothing is skipped by skipping it.
+async fn daemon_stop(
+    data_dir: &Path,
+    estate_root: Option<&Path>,
+    json: bool,
+) -> Result<(), CliError> {
     let Some(descriptor) = daemon::read_descriptor(data_dir)? else {
         report_daemon_stop(
             json,
@@ -2634,9 +2762,12 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
     };
     // D4/D5, before the endpoint is touched: `sgt daemon stop` stops the
     // *host* daemon — every admitted estate's — so the estate this
-    // invocation stands in is validated for the ordinary reason (a directory
-    // mistake must not reach a daemon), not because it owns the daemon.
-    check_binding(estate_root, "sgt daemon stop")?;
+    // invocation stands in (if any) is validated for the ordinary reason (a
+    // directory mistake must not reach a daemon), not because it owns the
+    // daemon.
+    if let Some(root) = estate_root {
+        check_binding(root, "sgt daemon stop")?;
+    }
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
@@ -2661,7 +2792,7 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
         );
         return Ok(());
     }
-    let client = client_for(&descriptor, Some(estate_root))?;
+    let client = client_for(&descriptor, estate_root)?;
 
     // 0. D5: **say what is about to stop.** `sgt daemon stop` stops the
     // *host* daemon — every admitted estate's, not just the one this
