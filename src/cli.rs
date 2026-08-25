@@ -355,6 +355,28 @@ enum DaemonCommand {
     /// Idempotent: stopping a daemon that is not running, or one already
     /// mid-drain from an earlier `sgt daemon stop`, is not an error.
     Stop,
+    /// Generate the native per-user service unit for the host daemon (H1
+    /// §2, #275/#276): a systemd user unit on Linux, a macOS LaunchAgent
+    /// elsewhere — pointed at [`resolve_host_runtime_dir`]'s host runtime
+    /// root, with `harness::toolchain_path_dirs`' PATH enrichment baked
+    /// into the unit's own `Environment=`/`EnvironmentVariables` at
+    /// generation time (#275's fix — never an inline prefix on the start
+    /// command, `scripts/gate.sh`'s own measured Cerberus hazard).
+    ///
+    /// Without `--print`: writes the unit/plist to its native per-user
+    /// location and, when a service manager is reachable, enables it
+    /// (`systemctl --user daemon-reload && enable`,
+    /// `launchctl bootstrap`). A manager that is not reachable is not an
+    /// error — the files are still written, and the check names the
+    /// remedy (H1-05: no silent linger enabling). Idempotent: re-running
+    /// against an unchanged binary/PATH writes nothing and does not
+    /// restart an already-enabled unit.
+    InstallService {
+        /// Write the generated unit/plist to stdout instead of the native
+        /// per-user location. Never attempts enablement.
+        #[arg(long)]
+        print: bool,
+    },
 }
 
 /// `sgt repo ...` subcommands (MVP-3).
@@ -775,14 +797,12 @@ fn resolve_data_dir(
 /// (`Manifest`/`EstateDefault` simply never occur here — there is no
 /// estate rung on this ladder at all).
 ///
-/// `#[allow(dead_code)]`: not yet a caller's problem. This wave (W1b) lands
-/// the resolver and its own unit tests only — no `cli.rs` caller is
-/// rewired onto it, by design (see the doc comment above and the brief's
-/// "zero behavior change"). W2/W3 are the waves that call this from
-/// `dispatch`/`ensure_daemon`'s host-scoped paths; the same
-/// production-dead-until-wired shape [`crate::platform::data_dir`]'s own
-/// `FREEDESKTOP`/`MACOS` constants already use.
-#[allow(dead_code)]
+/// W1b landed this resolver with no caller (`#[allow(dead_code)]`,
+/// "zero behavior change" by design). **W4c is this seat's first caller**:
+/// [`install_service`] resolves the host runtime root a generated unit
+/// points at through this exact function, not a second copy of the ladder
+/// — W2/W3 remain the waves that rewire `dispatch`/`ensure_daemon`'s own
+/// host-scoped paths onto it.
 fn resolve_host_runtime_dir(
     flag: Option<PathBuf>,
     env: impl Fn(&str) -> Option<OsString>,
@@ -884,6 +904,18 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 ));
             }
             daemon_stop(&data_dir, &estate_root(&estate), sgt.json).await
+        }
+        Command::Daemon {
+            command: Some(DaemonCommand::InstallService { print }),
+            rebuild_cache,
+        } => {
+            if rebuild_cache {
+                return Err(CliError::new(
+                    "--rebuild-cache applies only to `sgt daemon` (foreground start); \
+                     `sgt daemon install-service` does not start a daemon",
+                ));
+            }
+            install_service(data_dir_flag, print, sgt.json)
         }
         Command::Status => {
             let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
@@ -1369,6 +1401,35 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // rather than left behind (#241). It writes only within `cwd`,
             // and never inside `.sergeant/local/`.
             let distro_outcome = crate::domain::distro::write_distro(&cwd)?;
+            // H1 recon risk 2: `sgt init` had zero concept of a host-level,
+            // cross-estate bootstrap step — no service-unit generation, no
+            // host data-dir creation, no "is this the first estate on this
+            // host" branch anywhere in this path. This is that branch, kept
+            // to exactly what the risk note asks for and no more: create
+            // the host runtime root the *first* time it is missing, and
+            // point at `sgt daemon install-service` — never install a
+            // service, never touch a live daemon, so a second/Nth estate's
+            // `sgt init` on an already-bootstrapped host is a true no-op
+            // here (idempotent: `host_runtime_dir.exists()` is the whole
+            // guard).
+            // Resolution failure (no flag/env and `$HOME` unset — the same
+            // last rung `resolve_data_dir`'s own pre-estate fallback can
+            // hit) must not turn into an `sgt init` regression on a host
+            // with no host-runtime concept available: this step degrades
+            // to "nothing to bootstrap" rather than failing the whole
+            // command, the same advisory posture `claude`/`docker`'s rows
+            // already take at init time.
+            let host_bootstrap: Option<(PathBuf, bool)> =
+                resolve_host_runtime_dir(data_dir_flag.clone(), |name| std::env::var_os(name))
+                    .ok()
+                    .map(|(host_runtime_dir, _source)| {
+                        let created = if host_runtime_dir.exists() {
+                            false
+                        } else {
+                            std::fs::create_dir_all(&host_runtime_dir).is_ok()
+                        };
+                        (host_runtime_dir, created)
+                    });
             // Re-resolve now that `sergeant.toml` exists: the `data_dir`
             // computed above ran before `init_estate` created it, so on a
             // fresh estate estate discovery had nothing to find yet and
@@ -1396,6 +1457,10 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         "distro_symlink_unavailable": distro_outcome.symlink_unavailable,
                         "changed": outcome.changed() || distro_outcome.changed(),
                     },
+                    "host_bootstrap": host_bootstrap.as_ref().map(|(dir, created)| json!({
+                        "host_runtime_dir": dir,
+                        "created": created,
+                    })),
                     "doctor": report.to_json(),
                 }));
             } else {
@@ -1449,6 +1514,17 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     println!(
                         "estate at {} is already initialized — nothing to do",
                         cwd.display()
+                    );
+                }
+                if let Some((host_runtime_dir, true)) = &host_bootstrap {
+                    println!();
+                    println!(
+                        "host runtime root created at {}",
+                        host_runtime_dir.display()
+                    );
+                    println!(
+                        "  run `sgt daemon install-service` to install the native per-user \
+                         service unit for the host daemon (H1 §2) — not done automatically"
                     );
                 }
                 println!();
@@ -2389,7 +2465,7 @@ fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log.try_clone()?))
-        .stderr(std::process::Stdio::from(log));
+        .stderr(std::process::Stdio::from(log.try_clone()?));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -2397,8 +2473,73 @@ fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
         // and not receive the client's signals.
         command.process_group(0);
     }
-    command.spawn()?;
+    // #275's cli-side share: a bare `e?` here used to vanish the spawn
+    // failure into a generic message with no PATH diagnostic and nothing
+    // logged for a caller with no terminal (systemd) to ever see it.
+    // `spawn_daemon_error` prints *and* logs a named reason instead.
+    //
+    // W2 seam: the daemon-side half of #275 — journaling a `NotFound`/
+    // PATH-shaped backend-spawn failure (`Command::new(claude_cli).spawn()`
+    // and friends inside `src/daemon.rs`) as a Work-visible reason at the
+    // actual call site — is W2's file to change, not this one. It can reuse
+    // this same `harness::dirs_missing_from_path` diagnostic.
+    if let Err(e) = command.spawn() {
+        return Err(spawn_daemon_error(e, log));
+    }
     Ok(())
+}
+
+/// #275's cli-side share: a spawn failure that used to vanish into a bare
+/// `io::Error` message now prints *and* logs a named reason. `NotFound`/
+/// `PermissionDenied` are exactly #60's failure shape — the same fact
+/// `doctor::environment_check` already surfaces (a toolchain dir exists on
+/// disk but is not on `PATH`, so an exec that depends on it reads as a
+/// permissions fault) — so this reuses that check's exact underlying
+/// diagnostic ([`crate::harness::dirs_missing_from_path`], the identical
+/// list `doctor` prints) rather than inventing a second copy that could
+/// silently disagree with it. `log` is the same `daemon.log` handle
+/// `spawn_daemon` already opened, so the reason survives even when nothing
+/// interactive is watching stderr (a systemd-launched daemon has no such
+/// terminal at all — the exact gap this deliverable closes).
+fn spawn_daemon_error(e: std::io::Error, mut log: std::fs::File) -> CliError {
+    use std::io::Write;
+
+    let path_diagnostic = if matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    ) {
+        std::env::var_os("HOME").and_then(|home| {
+            let dirs = crate::harness::toolchain_path_dirs(Path::new(&home));
+            let missing = crate::harness::dirs_missing_from_path(
+                std::env::var_os("PATH").as_ref(),
+                &dirs,
+                |d| d.exists(),
+            );
+            if missing.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "; {} exist{} on disk but {} not on PATH (#60/#275's failure shape) — \
+                     this is likely why the exec failed",
+                    missing
+                        .iter()
+                        .map(|d| d.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if missing.len() == 1 { "s" } else { "" },
+                    if missing.len() == 1 { "is" } else { "are" },
+                ))
+            }
+        })
+    } else {
+        None
+    };
+    let message = format!(
+        "cannot spawn daemon: {e}{}",
+        path_diagnostic.as_deref().unwrap_or("")
+    );
+    let _ = writeln!(log, "spawn failed: {message}");
+    CliError::new(message)
 }
 
 /// How long `sgt daemon stop` waits for `active` work to settle before
@@ -2539,6 +2680,236 @@ fn report_daemon_stop(json: bool, status: &str, message: &str) {
         print_json(&json!({"status": status, "message": message}));
     } else {
         println!("{message}");
+    }
+}
+
+/// `sgt daemon install-service` (H1 §2, #275/#276): generate the native
+/// per-user service unit for the host daemon and, unless `--print`, write
+/// it and attempt enablement.
+///
+/// `--print` is a pure dry run: generate, print to stdout, touch nothing on
+/// disk, attempt no enablement — the golden-file content a test or an
+/// operator inspecting before installing sees is exactly what this
+/// function would otherwise write. Otherwise: the unit/plist is written to
+/// its native per-user location via [`crate::runtime::fsutil::write_atomic`]
+/// (the same idempotent-write discipline `domain::distro::write_distro`
+/// already uses — unchanged content is not rewritten), and enablement is
+/// attempted only when [`enable_service`]'s manager probe says one is
+/// reachable (the `docker_check` degradation pattern: an absent/unreachable
+/// manager is a named, non-fatal fact). Exit 0 whenever the unit/plist is
+/// written; nonzero only on an actual write failure — a skipped enablement
+/// is reported, never turned into a command failure (H1-05: no silent
+/// linger enabling means the *absence* must stay visible, not that this
+/// command must fail because of it).
+fn install_service(
+    data_dir_flag: Option<PathBuf>,
+    print: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    // The host runtime root, not the estate-scoped `data_dir` — H1 §3's
+    // whole point is that the daemon a unit supervises is decoupled from
+    // any one estate (W1b's seam; see `resolve_host_runtime_dir`'s own doc
+    // comment).
+    let (host_runtime_dir, _source) =
+        resolve_host_runtime_dir(data_dir_flag, |name| std::env::var_os(name))?;
+    let binary_path = std::env::current_exe()?;
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        CliError::new(
+            "cannot compose the service unit's PATH enrichment: $HOME is not set — set HOME \
+             and retry",
+        )
+    })?;
+    let home = PathBuf::from(home);
+    let dirs = crate::harness::toolchain_path_dirs(&home);
+    // #275's fix, baked in here rather than left to the manager's own
+    // inherited environment (`scripts/gate.sh`'s measured Cerberus hazard,
+    // see `platform::service`'s module doc): the composed PATH becomes part
+    // of the generated content itself.
+    let path =
+        crate::harness::compose_path(std::env::var_os("PATH").as_ref(), &dirs, |d| d.exists())
+            .to_string_lossy()
+            .into_owned();
+    let spec = crate::platform::service::ServiceSpec {
+        binary_path,
+        host_runtime_dir,
+        path,
+    };
+
+    #[cfg(target_os = "macos")]
+    let (content, install_path) = (
+        crate::platform::service::launchd_plist(&spec),
+        crate::platform::service::launchd_plist_path(&home),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (content, install_path) = (
+        crate::platform::service::systemd_unit(&spec),
+        crate::platform::service::systemd_unit_path(&home),
+    );
+
+    if print {
+        print!("{content}");
+        return Ok(());
+    }
+
+    if let Some(parent) = install_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::runtime::fsutil::write_atomic(&install_path, content.as_bytes())?;
+
+    let enable = enable_service(&install_path);
+    report_install_service(json, &install_path, &enable);
+    Ok(())
+}
+
+/// What happened when [`install_service`] tried to enable the just-written
+/// unit/plist.
+enum EnableOutcome {
+    /// The manager was reachable and both the reload/bootstrap and the
+    /// enable step succeeded.
+    Enabled,
+    /// No attempt was made — the manager is not reachable from this
+    /// session. Never a command failure (H1-05): the files are already
+    /// written, and `remedy` names what to do next.
+    Skipped { remedy: String },
+    /// The manager was reachable but the enable attempt itself failed.
+    /// Also never a command failure by itself — the files are already
+    /// written and stand on their own; `detail` is the evidence.
+    Failed { detail: String },
+}
+
+/// Linux arm: probe `systemctl --user`, and only on [`ManagerStatus::
+/// Reachable`] run `daemon-reload` then `enable --now` against the unit
+/// just written. `unit_path`'s file name (not the whole path — `systemctl
+/// --user enable` resolves unit names against its own search path, which
+/// already includes [`crate::platform::service::systemd_user_unit_dir`])
+/// is what gets enabled.
+#[cfg(not(target_os = "macos"))]
+fn enable_service(unit_path: &Path) -> EnableOutcome {
+    use crate::platform::service::ManagerStatus;
+
+    match crate::platform::service::detect_systemd_status() {
+        ManagerStatus::Reachable => {
+            let unit_name = unit_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(crate::platform::service::SYSTEMD_UNIT_NAME);
+            let reload = std::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status();
+            let enable = std::process::Command::new("systemctl")
+                .args(["--user", "enable", "--now", unit_name])
+                .status();
+            match (reload, enable) {
+                (Ok(r), Ok(e)) if r.success() && e.success() => EnableOutcome::Enabled,
+                (reload, enable) => EnableOutcome::Failed {
+                    detail: format!(
+                        "systemctl --user daemon-reload/enable --now {unit_name} did not both \
+                         succeed: daemon-reload={reload:?}, enable={enable:?}"
+                    ),
+                },
+            }
+        }
+        ManagerStatus::PresentNoUserSession { detail } => EnableOutcome::Skipped {
+            remedy: format!(
+                "a systemd user manager is installed but not reachable from this session \
+                 ({detail}) — this is the common bare SSH/cron shape (no user D-Bus session); \
+                 run `loginctl enable-linger $USER` and start a session with one (a desktop \
+                 login, or `machinectl shell`/`systemd-run --user` from an already-lingering \
+                 session), then re-run `sgt daemon install-service`"
+            ),
+        },
+        ManagerStatus::Absent => EnableOutcome::Skipped {
+            remedy: "no systemd user manager was found on PATH — the unit file has been \
+                      written at the path above; install one and re-run `sgt daemon \
+                      install-service`, or continue running `sgt daemon` in the foreground as \
+                      the development/diagnostic path (H1 §2)"
+                .to_string(),
+        },
+    }
+}
+
+/// macOS arm: probe `launchctl print gui/$UID`, and only on
+/// [`ManagerStatus::Reachable`] run `launchctl bootstrap`. `$UID` is read
+/// via `id -u` rather than a new libc/nix dependency for one syscall's
+/// worth of value (R2/R6: `daemon_stop`'s SIGTERM path already shells out
+/// to `kill` for the identical reason).
+#[cfg(target_os = "macos")]
+fn enable_service(plist_path: &Path) -> EnableOutcome {
+    use crate::platform::service::ManagerStatus;
+
+    let Some(uid) = macos_uid() else {
+        return EnableOutcome::Skipped {
+            remedy: "could not determine this user's UID (`id -u` failed) — the plist has \
+                      been written at the path above; run `launchctl bootstrap gui/$(id -u) \
+                      <path>` yourself, or continue running `sgt daemon` in the foreground as \
+                      the development/diagnostic path (H1 §2)"
+                .to_string(),
+        };
+    };
+    match crate::platform::service::detect_launchd_status(uid) {
+        ManagerStatus::Reachable => {
+            let bootstrap = std::process::Command::new("launchctl")
+                .args(["bootstrap", &format!("gui/{uid}")])
+                .arg(plist_path)
+                .status();
+            match bootstrap {
+                Ok(status) if status.success() => EnableOutcome::Enabled,
+                other => EnableOutcome::Failed {
+                    detail: format!(
+                        "launchctl bootstrap gui/{uid} {}: {other:?}",
+                        plist_path.display()
+                    ),
+                },
+            }
+        }
+        ManagerStatus::PresentNoUserSession { detail } => EnableOutcome::Skipped {
+            remedy: format!(
+                "launchd is present but this session's GUI/user domain is not reachable \
+                 ({detail}) — this typically means no GUI session (bare SSH); log in \
+                 interactively, then re-run `sgt daemon install-service`"
+            ),
+        },
+        ManagerStatus::Absent => EnableOutcome::Skipped {
+            remedy: "launchctl was not found on PATH — the plist file has been written at the \
+                      path above; install one and re-run `sgt daemon install-service`, or \
+                      continue running `sgt daemon` in the foreground as the \
+                      development/diagnostic path (H1 §2)"
+                .to_string(),
+        },
+    }
+}
+
+/// `id -u`, the one-syscall value `enable_service`'s macOS arm needs
+/// without a new dependency.
+#[cfg(target_os = "macos")]
+fn macos_uid() -> Option<u32> {
+    let output = std::process::Command::new("id").arg("-u").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// `sgt daemon install-service`'s one report shape, human or `--json`.
+fn report_install_service(json: bool, install_path: &Path, enable: &EnableOutcome) {
+    let (enabled, remedy_or_detail) = match enable {
+        EnableOutcome::Enabled => (true, None),
+        EnableOutcome::Skipped { remedy } => (false, Some(remedy.clone())),
+        EnableOutcome::Failed { detail } => (false, Some(detail.clone())),
+    };
+    if json {
+        print_json(&json!({
+            "written": install_path,
+            "enabled": enabled,
+            "remedy": remedy_or_detail,
+        }));
+    } else {
+        println!("wrote {}", install_path.display());
+        match enable {
+            EnableOutcome::Enabled => println!("enabled and started"),
+            EnableOutcome::Skipped { remedy } => println!("not enabled: {remedy}"),
+            EnableOutcome::Failed { detail } => println!("enable attempt failed: {detail}"),
+        }
     }
 }
 
@@ -2780,6 +3151,12 @@ pub(crate) mod doctor {
         checks.push(journal_check);
         checks.push(projection_check(journal_ok, journal_events.as_deref()));
         checks.push(daemon_check(data_dir).await);
+        // H1 §2/#276: "is a native per-user service manager reachable at
+        // all" — a distinct question from `daemon_check`'s per-data-dir
+        // descriptor health above, and the prerequisite `sgt daemon
+        // install-service`'s enablement step probes identically (never a
+        // second, disagreeing probe).
+        checks.push(host_service_manager_check());
         // §4.2: `sgt doctor` is usable outside an estate and never searches
         // upward. The estate-root row is the one that says out loud whether
         // this directory is an estate root at all — a failing row with the
@@ -2789,6 +3166,11 @@ pub(crate) mod doctor {
         // by name instead of each re-deriving the same answer.
         let (estate_root_check, admitted) = estate_root_check(root);
         checks.push(estate_root_check);
+        // H1 §6's cutover gate: is this estate still carrying daemon state
+        // under its own `.sergeant/data` from before a host runtime root
+        // existed. Threaded off `admitted` the same way the rows below it
+        // are — never a second, independent estate-root search.
+        checks.push(legacy_estate_runtime_check(admitted.as_deref()));
         checks.push(permission_mode_check(admitted.as_deref()));
         checks.push(network_access_check(admitted.as_deref()));
         checks.push(estate_check(admitted.as_deref()));
@@ -4637,6 +5019,135 @@ pub(crate) mod doctor {
                 "harmless: a mutating verb (`run`, `respond`, `retry`, `extend`, `cancel`) or \
                  `sgt daemon` spawns a fresh daemon, which republishes it — observation verbs \
                  refuse instead rather than spawning one just to observe it (ADR 0009)",
+            )
+        }
+    }
+
+    /// H1 §2/#276: "if a supported Linux environment has no usable native
+    /// user service manager, `sgt doctor` names that missing host
+    /// prerequisite" — and macOS's `launchctl` gets the equivalent probe.
+    /// Reuses [`crate::platform::service::detect_systemd_status`]/
+    /// [`detect_launchd_status`] — the identical probe `sgt daemon
+    /// install-service`'s own enablement step runs, so the two can never
+    /// disagree about whether a manager is reachable. `Warn`, never `Fail`,
+    /// in every non-`Reachable` case: a dev host with no service manager is
+    /// legal (§17.5's degraded-daemon doctrine, the same posture `docker`'s
+    /// row already takes for a missing capability).
+    fn host_service_manager_check() -> Check {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(uid) = super::macos_uid() else {
+                return Check::warn(
+                    "host_service_manager",
+                    "could not determine this user's UID (`id -u` failed)",
+                    "run `id -u` manually to see why the probe cannot run; without it launchd \
+                     reachability cannot be checked",
+                );
+            };
+            host_service_manager_report(
+                crate::platform::service::detect_launchd_status(uid),
+                "launchd",
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            host_service_manager_report(
+                crate::platform::service::detect_systemd_status(),
+                "a systemd user manager",
+            )
+        }
+    }
+
+    /// The three-way report shape [`host_service_manager_check`]'s two
+    /// platform arms share — so the wording (and the "dev hosts are legal"
+    /// posture) can never drift between them.
+    fn host_service_manager_report(
+        status: crate::platform::service::ManagerStatus,
+        name: &str,
+    ) -> Check {
+        use crate::platform::service::ManagerStatus;
+
+        match status {
+            ManagerStatus::Reachable => Check::ok(
+                "host_service_manager",
+                format!(
+                    "{name} is reachable — `sgt daemon install-service` can enable the \
+                     generated unit"
+                ),
+            ),
+            ManagerStatus::PresentNoUserSession { detail } => Check::warn(
+                "host_service_manager",
+                format!("{name} is present but not reachable from this session: {detail}"),
+                "the common bare SSH/cron shape (no user D-Bus/GUI session) — dev hosts are \
+                 legal without one; `sgt daemon install-service` still writes the unit/plist, \
+                 it just cannot enable it until a reachable session exists",
+            ),
+            ManagerStatus::Absent => Check::warn(
+                "host_service_manager",
+                format!("no {name} was found on PATH"),
+                "dev hosts are legal without one — `sgt daemon` in the foreground remains the \
+                 development/diagnostic path (H1 §2); `sgt daemon install-service` still writes \
+                 the unit/plist for later",
+            ),
+        }
+    }
+
+    /// H1 §6's cutover gate: does this estate still carry daemon state
+    /// under its own `.sergeant/data` from before a host runtime root
+    /// existed — `daemon.lock`/`runtime.json`/`journal/`, the exact three
+    /// markers [`daemon`]'s own module owns the names of. `Warn`, not
+    /// `Fail`, in this wave: cutover is not flipped until W2/W3 land (this
+    /// row exists and is tested ahead of that, per the brief).
+    fn legacy_estate_runtime_check(estate_root: Option<&Path>) -> Check {
+        let Some(estate_root) = estate_root else {
+            return Check::ok(
+                "legacy_estate_runtime",
+                "not an estate root — nothing to check",
+            );
+        };
+        // The cutover gate only makes sense once a host runtime root
+        // concept resolves at all on this host — reuses the exact same
+        // ladder `sgt daemon install-service` resolves against, never a
+        // second copy.
+        if super::resolve_host_runtime_dir(None, |name| std::env::var_os(name)).is_err() {
+            return Check::ok(
+                "legacy_estate_runtime",
+                "host runtime root does not resolve on this host (see the `environment` check \
+                 above) — nothing to compare against",
+            );
+        }
+        let legacy_dir = estate_root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR);
+        let mut found = Vec::new();
+        if legacy_dir.join(daemon::DAEMON_LOCK_FILE).exists() {
+            found.push(daemon::DAEMON_LOCK_FILE.to_string());
+        }
+        if legacy_dir.join(daemon::DESCRIPTOR_FILE).exists() {
+            found.push(daemon::DESCRIPTOR_FILE.to_string());
+        }
+        if legacy_dir.join("journal").is_dir() {
+            found.push("journal/".to_string());
+        }
+        if found.is_empty() {
+            Check::ok(
+                "legacy_estate_runtime",
+                format!(
+                    "no estate-local daemon state found at {}",
+                    legacy_dir.display()
+                ),
+            )
+        } else {
+            Check::warn(
+                "legacy_estate_runtime",
+                format!(
+                    "estate-local daemon state still present at {}: {}",
+                    legacy_dir.display(),
+                    found.join(", "),
+                ),
+                "H1 §6's cutover gate — reconcile or abandon before relying on host mode: stop \
+                 any daemon still running against this estate-local data dir (`sgt daemon stop \
+                 --data-dir <that dir>`), let non-terminal Work drain or explicitly abandon it, \
+                 then re-submit under host mode once it is available; this row stays a warning, \
+                 not a failure, until cutover itself is flipped (W2/W3)",
             )
         }
     }
