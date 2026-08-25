@@ -35,9 +35,8 @@
 /// The `agy --print --output-format stream-json` adapter (W1 of the *Sergeant
 /// speaks Antigravity* sprint, `sergeant-rs-workspace's knowledge/evidence/reference/agy-adapter-2026-08-23.md` —
 /// see the module's own doc comment for the measurements it rests on).
-/// Registration in `daemon.rs` and every CLI surface remain W2's gap (K2:
-/// this wave is the adapter and nothing else): this module compiles, is unit-
-/// and contract-tested, and is reachable by nothing yet.
+/// Registered in `daemon.rs` (the agy-adapter sprint's W2) and reachable via
+/// `sgt agy` and `--backend agy`.
 pub mod agy;
 pub mod claude;
 /// The `codex exec` adapter (W1 of the *Sergeant speaks Codex* sprint,
