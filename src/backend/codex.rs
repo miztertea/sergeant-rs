@@ -1346,15 +1346,22 @@ fn worktree_git_common_dir(worktree_path: &Path) -> Result<PathBuf, String> {
     Ok(lexically_normalize(&admin_dir.join(relative)))
 }
 
-/// [`worktree_git_common_dir`] over every binding this request carries.
-/// `Err` on the first binding whose common directory cannot be resolved —
-/// the caller (`prepare`/`launch`) turns that into a refusal rather than
-/// launching an actor that can edit files but cannot commit them.
-fn git_worktree_common_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, String> {
+/// Shared shape behind [`git_worktree_common_dirs`] and
+/// [`git_worktree_admin_dirs`]: run `resolve_one` over every binding this
+/// request carries, `Err` on the first binding whose directory cannot be
+/// resolved — the caller (`prepare`/`launch`) turns that into a refusal
+/// rather than launching an actor that can edit files but cannot commit
+/// them. (Collapses what were two structurally identical free functions —
+/// `50-panel` F-SI-01, fixed at `60-re-verify-and-postmortem`, split-
+/// hardening W5c.)
+fn git_worktree_dirs(
+    bindings: &[BindingSummary],
+    resolve_one: fn(&Path) -> Result<PathBuf, String>,
+) -> Result<Vec<PathBuf>, String> {
     bindings
         .iter()
         .map(|binding| {
-            worktree_git_common_dir(&binding.worktree_path).map_err(|reason| {
+            resolve_one(&binding.worktree_path).map_err(|reason| {
                 format!(
                     "{} ({}): {reason}",
                     binding.repository,
@@ -1363,50 +1370,58 @@ fn git_worktree_common_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>,
             })
         })
         .collect()
+}
+
+/// [`worktree_git_common_dir`] over every binding this request carries.
+fn git_worktree_common_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, String> {
+    git_worktree_dirs(bindings, worktree_git_common_dir)
 }
 
 /// [`worktree_git_admin_dir`] over every binding this request carries —
 /// the app-server-only companion to [`git_worktree_common_dirs`].
 ///
-/// **Measured 2026-08-25 against codex-cli 0.149.1's `app-server`**: unlike
-/// `exec`'s `--add-dir` (whose grant of the common dir alone already covers
-/// `git add`/`git commit`, confirmed live via `codex exec --add-dir
-/// <common-dir>` against a real linked worktree — issue #259's exec-side fix
-/// stands unchanged), `thread/start.runtimeWorkspaceRoots` resolves into a
-/// `sandbox.writableRoots` grant that treats each linked worktree's private
-/// admin subdirectory (`<common-dir>/worktrees/<name>`) as protected in its
-/// own right, not merely inherited from a parent directory's grant. Driven
-/// by hand over the real JSON-RPC wire (`initialize` with
-/// `capabilities.experimentalApi: true`, then `command/exec` with
-/// `sandboxPolicy.writableRoots` set to the common dir alone): `git add`
-/// then fails with `Read-only file system` on this exact admin
-/// subdirectory's `index.lock`, even though the common dir that contains it
-/// was granted. Reproduced end-to-end through a real Work (`sgt run` against
-/// a scratch estate on the `codex-terra` profile, app-server transport):
-/// stage `30-close` blocked on the identical `index.lock` failure. Granting
-/// this directory *in addition to* the common dir — both, not either —
-/// resolves it; that combination is what this function adds to
-/// `launch_appserver`'s `runtimeWorkspaceRoots`, on top of (never instead
-/// of) [`git_worktree_common_dirs`].
+/// **Provenance, and an unresolved discrepancy recorded honestly
+/// (`60-re-verify-and-postmortem`, split-hardening W5c, 2026-08-25).** This
+/// grant was added in `d2acce1c` on the strength of a manual probe driven
+/// over `command/exec` — a JSON-RPC method `launch_appserver`/
+/// `appserver_send_turn` never call; the production path is `thread/start`
+/// then `turn/start` — plus an end-to-end `sgt run` against a scratch
+/// estate that blocked on the admin dir's `index.lock` without this grant.
+/// A later, more targeted probe (`30-instrument`, same date, probe 1b)
+/// drove the *exact* production call shape (`thread/start` with
+/// `runtimeWorkspaceRoots`, then a `turn/start` carrying no
+/// `sandboxPolicy` at all — today's literal code) against a real linked
+/// worktree and found `git add`/`git commit` succeed with the common dir
+/// alone, no admin dir, no denial at any step — contradicting the claim
+/// above. Neither measurement was reconciled against the other before
+/// `d2acce1c` merged.
+///
+/// This grant is kept regardless, on narrower grounds than the original
+/// claim: it is measured harmless (it does not break anything, and it
+/// makes `thread/start`'s echoed policy more complete), and a full live
+/// `sgt run` Work on today's code — carrying this grant — independently
+/// retired `completed` end to end (Work `01M0VK7FKCM9V210MXSNQ1V2QD`,
+/// 2026-08-25), which is this wave's actual acceptance criterion.
+/// Whether the grant is *necessary* on the `thread/start`/`turn/start`
+/// path is still open — removing it on this evidence alone would be a
+/// scope change this stage does not make. Reconciling the `command/exec`-
+/// vs-`turn/start` discrepancy, and removing this grant if it proves
+/// redundant with the common dir, is recommended to Captain as a follow-up
+/// investigation, not undertaken here.
 fn git_worktree_admin_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, String> {
-    bindings
-        .iter()
-        .map(|binding| {
-            worktree_git_admin_dir(&binding.worktree_path).map_err(|reason| {
-                format!(
-                    "{} ({}): {reason}",
-                    binding.repository,
-                    binding.worktree_path.display()
-                )
-            })
-        })
-        .collect()
+    git_worktree_dirs(bindings, worktree_git_admin_dir)
 }
 
 /// The named, actionable refusal text for #259's fail-closed rule: a
-/// mutation-shaped launch (one or more bindings) whose git common-dir grant
+/// mutation-shaped launch (one or more bindings) whose git directory grant
 /// cannot be resolved is refused rather than admitted to run and later
 /// retire `completed_dirty` with no durable commit.
+///
+/// `kind` names which grant failed (`"common"` or `"admin"`) so the
+/// message identifies the actual resolver that errored rather than always
+/// attributing it to the common-dir grant — before `60-re-verify-and-
+/// postmortem` (split-hardening W5c) this text was hardcoded to "common
+/// directory" and misreported admin-dir failures (`50-panel` F-IN-01).
 ///
 /// Ends in a remedy sentence naming what the operator should actually do
 /// about it — `src/runtime/preflight.rs`'s `PreflightCheck::remedy` and
@@ -1417,9 +1432,9 @@ fn git_worktree_admin_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, 
 /// `runtime::surface` actually created (its `.git` file is missing, or does
 /// not name a `gitdir`) — so one remedy sentence covers every case, rather
 /// than inventing a different one per parse failure.
-fn git_admin_dir_refusal(reason: &str) -> String {
+fn git_dir_refusal(kind: &str, reason: &str) -> String {
     format!(
-        "cannot grant this Work's git common directory ({reason}); a codex actor needs write \
+        "cannot grant this Work's git {kind} directory ({reason}); a codex actor needs write \
          access to its own worktree's shared git directory to `git add`/`git commit` (sergeant \
          issue #259) — refusing rather than admitting a Work that can edit files but can never \
          commit them. Remedy: this worktree path was not created by a real `git worktree add` \
@@ -3312,18 +3327,33 @@ impl CodexBackend {
         }
     }
 
-    /// #259: resolve each binding's git common dir, or refuse with the named,
-    /// actionable error. Shared by every call site that needs the grant for
-    /// real (PREPARE's own preflight, and each transport's LAUNCH) — RESUME
-    /// does not call this (see its own comment): the grant is provably inert
-    /// there, so resolving it would add a fail-closed check with no
-    /// corresponding capability it protects.
+    /// Shared shape behind [`Self::resolve_git_worktree_common_dirs`] and
+    /// [`Self::resolve_git_worktree_admin_dirs`]: resolve every binding's
+    /// git directory via `resolver`, or refuse with the named, actionable
+    /// error naming which grant (`kind`) failed. Shared by every call site
+    /// that needs a grant for real (PREPARE's own preflight, and each
+    /// transport's LAUNCH) — RESUME does not call either (see their own
+    /// comments): the grant is provably inert there, so resolving it would
+    /// add a fail-closed check with no corresponding capability it
+    /// protects. (Collapses two structurally identical methods — `50-panel`
+    /// F-SI-02, fixed at `60-re-verify-and-postmortem`, split-hardening
+    /// W5c.)
+    fn resolve_git_dirs(
+        &self,
+        bindings: &[BindingSummary],
+        kind: &str,
+        resolver: fn(&[BindingSummary]) -> Result<Vec<PathBuf>, String>,
+    ) -> Result<Vec<PathBuf>, BackendError> {
+        resolver(bindings).map_err(|reason| self.err_failed(git_dir_refusal(kind, &reason)))
+    }
+
+    /// #259: resolve each binding's git common dir, or refuse with the
+    /// named, actionable error.
     fn resolve_git_worktree_common_dirs(
         &self,
         bindings: &[BindingSummary],
     ) -> Result<Vec<PathBuf>, BackendError> {
-        git_worktree_common_dirs(bindings)
-            .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))
+        self.resolve_git_dirs(bindings, "common", git_worktree_common_dirs)
     }
 
     /// The app-server-only companion to [`Self::resolve_git_worktree_common_dirs`]
@@ -3333,8 +3363,7 @@ impl CodexBackend {
         &self,
         bindings: &[BindingSummary],
     ) -> Result<Vec<PathBuf>, BackendError> {
-        git_worktree_admin_dirs(bindings)
-            .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))
+        self.resolve_git_dirs(bindings, "admin", git_worktree_admin_dirs)
     }
 
     fn err_unknown(&self, execution_id: &str) -> BackendError {

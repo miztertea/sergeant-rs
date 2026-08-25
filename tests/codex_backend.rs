@@ -2257,6 +2257,15 @@ fn wait_for_event(
 /// app-server-only, #259 W5c's own fix — every binding's git admin dir
 /// (`<common-dir>/worktrees/<name>`) — never the estate root, never
 /// anything fabricated.
+///
+/// **Scope, stated honestly** (`50-panel` F-TH-04, `60-re-verify-and-
+/// postmortem`, split-hardening W5c): this is a wire-composition test
+/// against a stub, using the same string construction the production code
+/// uses to build the expected paths — it proves `launch_appserver`
+/// composes the roots array it means to, in order, nothing more or less.
+/// It cannot show the admin dir is needed or that the sandbox honors it;
+/// that behavioral question belongs to the `live_appserver_*` tests, and
+/// per their own doc comments it remains open there too.
 #[test]
 fn appserver_thread_start_names_exactly_the_works_surfaces() {
     let dir = TempDir::new().expect("tempdir");
@@ -4615,16 +4624,22 @@ fn live_appserver_thread_start_echoes_the_requested_policy() {
         writable_roots.contains(&outside_worktree.path().to_string_lossy().as_ref()),
         "sandbox.writableRoots must name the out-of-cwd binding: {writable_roots:?}"
     );
-    // The regression this stage exists to close: #259's app-server grant
-    // shipped naming only the worktree path and the shared common dir —
-    // `git commit` still failed with `Read-only file system` on
-    // `<common-dir>/worktrees/<name>/index.lock`, because codex-cli's
-    // `sandbox.writableRoots` on this transport treats a linked worktree's
-    // own admin subdirectory as protected in its own right, not merely
-    // inherited from the common dir that contains it (measured live against
-    // codex-cli 0.149.1, see `git_worktree_admin_dirs`'s doc comment). A
-    // model-pin-only echo assertion, or a roots assertion against a bare
-    // directory with no admin dir to omit, could not have caught this ship.
+    // This asserts the wire *echo* only — that `sandbox.writableRoots`
+    // names the admin dir, not that write access under it actually differs
+    // from the common dir alone. A later, more targeted probe
+    // (`30-instrument`, split-hardening W5c, probe 1b) found that on this
+    // measured codex-cli 0.149.1 build a granted parent directory's write
+    // access already covers writes under its own subdirectories via the
+    // production `thread/start`/`turn/start` call shape — so the admin dir
+    // being *named* here may change only what the wire response echoes, not
+    // what the sandbox enforces (`50-panel` F-TH-02; see
+    // `git_worktree_admin_dirs`'s doc comment for the full, unresolved
+    // discrepancy). `live_appserver_actor_commits_to_the_works_own_branch`
+    // below is the test that would show a real enforcement difference, and
+    // per its own doc comment it does not discriminate this either. Kept
+    // regardless because a model-pin-only echo assertion, or a roots
+    // assertion against a bare directory with no admin dir to omit, could
+    // not even prove the wire echo is complete.
     assert!(
         writable_roots.contains(&common_dir.to_string_lossy().as_ref()),
         "sandbox.writableRoots must name the binding's git common dir: {writable_roots:?}"
@@ -4646,12 +4661,20 @@ fn live_appserver_thread_start_echoes_the_requested_policy() {
 /// criterion ("a real Codex contract test edits, stages, and commits in an
 /// assigned linked worktree; the commit advances the assigned
 /// `sergeant/<work-id>` branch"), driven over the app-server transport
-/// rather than exec. Where the echo test above proves the *wire policy*
-/// names the right roots, this proves the roots actually work end to end —
-/// an echoed grant the server does not in fact honor would still fail here.
-/// #259 W5c's own regression: before `git_worktree_admin_dirs`, this exact
-/// scenario failed `git commit` with `Read-only file system` on
-/// `<common-dir>/worktrees/<name>/index.lock`.
+/// rather than exec.
+///
+/// **Does not discriminate the admin-dir grant** (`50-panel` F-TH-01,
+/// fixed at `60-re-verify-and-postmortem`, split-hardening W5c): despite an
+/// earlier version of this doc comment claiming this scenario failed
+/// before `git_worktree_admin_dirs`, `40-fix-with-regression-test` directly
+/// measured this exact test passing on both pre-fix (`d2acce1c^`) and
+/// post-fix code — that claim was false. What this test does prove: the
+/// wave's actual end-to-end acceptance criterion (a real commit landing on
+/// the Work's own branch over the app-server transport) holds with the
+/// admin-dir grant present, matching an independent full `sgt run` (Work
+/// `01M0VK7FKCM9V210MXSNQ1V2QD`). It does not show the grant is load-
+/// bearing; `live_appserver_thread_start_echoes_the_requested_policy`
+/// above is the one place that gap is recorded honestly.
 #[test]
 #[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
 fn live_appserver_actor_commits_to_the_works_own_branch() {
