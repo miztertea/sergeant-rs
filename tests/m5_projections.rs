@@ -114,7 +114,7 @@ fn estate() -> (TempDir, PathBuf, String) {
 /// sit at `pending` forever.
 async fn start_fake(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     script: impl IntoIterator<Item = FakeStep>,
 ) -> (DaemonHandle, FakeBackend) {
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
@@ -124,7 +124,6 @@ async fn start_fake(
         DaemonConfig {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -168,14 +167,19 @@ async fn get_status(handle: &DaemonHandle, path: &str) -> (reqwest::StatusCode, 
     (status, resp.json().await.expect("json body"))
 }
 
-/// Submit work. `cwd` is §13.3 recorded evidence and nothing else — since
-/// §5.2 the plan is made against the estate the daemon was *bound* to, so
-/// this argument decides nothing about topology; it is passed the estate root
-/// only so `origin.cwd` in the journal names something real.
+/// Submit work addressed at `estate_root` (D4), which every call site here
+/// also passes as `cwd`.
+///
+/// `cwd` is still §13.3 recorded evidence and nothing else: §5.2 gave it no
+/// authority over topology, and H1 does not give it any back — what decides
+/// is the addressed root, which the daemon then admits. `extra` can override
+/// `estate_root` (a `null` addresses none), which is how the no-topology
+/// cases in this file stay reachable.
 async fn submit(handle: &DaemonHandle, cwd: &Path, intent: &str, extra: Value) -> Value {
     let mut body = json!({
         "command_id": ulid(),
         "intent": intent,
+        "estate_root": cwd,
         "origin": {"client": "cli", "cwd": cwd},
     });
     if let Some(fields) = extra.as_object() {
@@ -1365,7 +1369,6 @@ async fn t5_enabled_export_emits_the_span_tree_and_metrics() {
             // §5.1, spelled out here rather than through `start_fake`: this
             // rig needs its own `telemetry` field, and an unbound daemon
             // would export a `work` span with no stages under it.
-            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -2028,7 +2031,7 @@ fn stub_claude(dir: &Path) -> PathBuf {
 /// adapter itself, so nothing here is a fake wearing the adapter's name.
 async fn start_claude(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     telemetry: Option<Arc<Telemetry>>,
 ) -> DaemonHandle {
     let mut claude = ClaudeConfig::new(data_dir);
@@ -2040,7 +2043,6 @@ async fn start_claude(
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
             telemetry,
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )

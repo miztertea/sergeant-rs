@@ -66,7 +66,7 @@ async fn start(dir: &Path) -> DaemonHandle {
 /// `tests/w3_prune_engine.rs::start_with_retention` uses.
 async fn start_with_retention(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     retention: u32,
     script: impl IntoIterator<Item = FakeStep>,
 ) -> DaemonHandle {
@@ -77,7 +77,6 @@ async fn start_with_retention(
         DaemonConfig {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: Some(estate_root.to_path_buf()),
             segment_max_bytes: Some(256),
             retention: Some(retention),
             ..DaemonConfig::default()
@@ -100,6 +99,9 @@ async fn submit(
         .json(&json!({
             "command_id": command_id,
             "intent": intent,
+            // D4: the estate this submission addresses. `cwd` stays §13.3
+            // recorded evidence, deciding nothing.
+            "estate_root": root,
             "origin": {"client": "cli", "cwd": root},
         }))
         .send()

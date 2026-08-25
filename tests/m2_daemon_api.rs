@@ -74,10 +74,28 @@ async fn submit(
     command_id: &str,
     intent: &str,
 ) -> (reqwest::StatusCode, Vec<u8>, Value) {
+    submit_addressed(http, handle, None, command_id, intent).await
+}
+
+/// [`submit`] addressing an estate (D4). `None` is the captured-intent
+/// shape — no repository context offered — which is what most of this
+/// file's daemon-lifecycle rigs want, since they are about the daemon, not
+/// about an estate.
+async fn submit_addressed(
+    http: &reqwest::Client,
+    handle: &DaemonHandle,
+    estate_root: Option<&std::path::Path>,
+    command_id: &str,
+    intent: &str,
+) -> (reqwest::StatusCode, Vec<u8>, Value) {
     let resp = http
         .post(format!("{}/v1/work", handle.endpoint))
         .bearer_auth(&handle.token)
-        .json(&json!({"command_id": command_id, "intent": intent}))
+        .json(&json!({
+            "command_id": command_id,
+            "intent": intent,
+            "estate_root": estate_root,
+        }))
         .send()
         .await
         .expect("submit request");
@@ -324,7 +342,7 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     let path = daemon::descriptor_path(dir.path());
     let bytes = std::fs::read(&path).expect("descriptor readable");
     let descriptor: RuntimeDescriptor = serde_json::from_slice(&bytes).expect("descriptor json");
-    assert_eq!(descriptor.schema, "sergeant.runtime/v2");
+    assert_eq!(descriptor.schema, "sergeant.runtime/v3");
     assert!(
         descriptor.endpoint.starts_with("http://127.0.0.1:"),
         "loopback endpoint, got {}",
@@ -334,14 +352,25 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     assert_eq!(descriptor.api_revision, "v1");
     assert_eq!(descriptor.token, handle.token);
     assert_token_plausible(&descriptor.token);
-    // estate-root §5.1: `v2` exists for these two fields. This daemon was
-    // started against no estate (`DaemonConfig::estate_root` is `None` — the
-    // shape most of this file's in-process rigs use), and the descriptor has
-    // to *say so* rather than omit the question: a client comparing its own
-    // exact root against `None` gets the mismatch refusal, which is the only
-    // safe answer when the daemon would plan against nothing.
-    assert_eq!(descriptor.estate_root, None);
-    assert_eq!(descriptor.manifest_path, None);
+    // D3: a v3 descriptor carries **no** estate fields at all. The admitted-
+    // estate set is dynamic daemon state (`GET /v1/estates`); baking a set
+    // into a file written once, atomically, at startup would contradict lazy
+    // admission. The serialized keys are asserted exactly, so a re-added
+    // estate field is a test failure rather than a silent re-narrowing of
+    // what the descriptor means.
+    let raw: Value = serde_json::from_slice(&bytes).expect("descriptor json");
+    let mut keys: Vec<&str> = raw
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["api_revision", "endpoint", "pid", "schema", "token"],
+        "D3: descriptor v3 is schema/endpoint/pid/api_revision/token — nothing else"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -382,34 +411,34 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     );
     successor.shutdown().await;
 
-    // The other half of §5.1: a daemon started *against* an estate publishes
-    // the canonical root and its manifest, because that is what every client
-    // compares its own exact root to before using the endpoint. Recorded, not
-    // reconstructed — a reader must never have to re-derive
-    // `<root>/sergeant.toml` (or, worse, walk for it).
+    // D3's other half, re-scoped from the retired "the descriptor publishes
+    // the one bound root" assertion: a daemon that has an estate in play
+    // publishes exactly the same five-key descriptor. The estate is not a
+    // property of the process any more, so it cannot be a property of the
+    // file the process writes once at startup.
     let estate = TempDir::new().expect("tempdir");
     support::scaffold_estate(estate.path(), "descriptor-lifecycle", &["solo"]);
-    let root = std::fs::canonicalize(estate.path()).expect("canonical estate root");
-    let bound_dir = TempDir::new().expect("tempdir");
-    let bound = daemon::start_with(
-        bound_dir.path(),
-        DaemonConfig {
-            estate_root: Some(estate.path().to_path_buf()),
-            ..DaemonConfig::default()
-        },
+    let host_dir = TempDir::new().expect("tempdir");
+    let host = daemon::start_with(host_dir.path(), DaemonConfig::default())
+        .await
+        .expect("daemon start");
+    let raw: Value = serde_json::from_slice(
+        &std::fs::read(daemon::descriptor_path(host_dir.path())).expect("descriptor readable"),
     )
-    .await
-    .expect("daemon start");
-    let descriptor = daemon::read_descriptor(bound_dir.path())
-        .expect("read descriptor")
-        .expect("descriptor published");
-    assert_eq!(descriptor.estate_root.as_deref(), Some(root.as_path()));
+    .expect("descriptor json");
+    let mut keys: Vec<&str> = raw
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
     assert_eq!(
-        descriptor.manifest_path,
-        Some(root.join("sergeant.toml")),
-        "the manifest path travels with the root, so no client reconstructs it"
+        keys,
+        vec!["api_revision", "endpoint", "pid", "schema", "token"],
+        "D3: no estate ever reaches the descriptor, however many are in play"
     );
-    bound.shutdown().await;
+    host.shutdown().await;
 }
 
 /// A bearer token must be long, high-entropy-looking, and safe to put in a
@@ -590,18 +619,23 @@ async fn t3_submit_lists_pending_journals_and_survives_restart() {
     handle.shutdown().await;
 }
 
-/// H1 touch point #4/#5: `work.submitted` carries the daemon's bound
-/// estate — its canonical root, not the `[estate] name` — end to end
-/// through a real submission, not a hand-fabricated `Event`.
+/// H1 touch point #4/#5, re-scoped by D4/D10: `work.submitted` carries the
+/// estate the submission **addressed** — its canonical root, not the
+/// `[estate] name` — end to end through a real submission, not a
+/// hand-fabricated `Event`.
+///
+/// W1a wrote this against the daemon's *bound* estate. There is no binding
+/// left to read, and the fact is stronger for it: the root recorded is the
+/// one this request named and this daemon then admitted, so a second estate
+/// submitting to the same daemon records its own.
 #[tokio::test]
-async fn work_submitted_carries_the_bound_estate_root() {
+async fn work_submitted_carries_the_addressed_estate_root() {
     let estate_dir = TempDir::new().expect("estate tempdir");
     scaffold_solo_estate(estate_dir.path(), "target");
     let data_dir = TempDir::new().expect("data dir tempdir");
     let handle = daemon::start_with(
         data_dir.path(),
         DaemonConfig {
-            estate_root: Some(estate_dir.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -609,7 +643,14 @@ async fn work_submitted_carries_the_bound_estate_root() {
     .expect("daemon start");
     let http = client();
 
-    let (status, _, body) = submit(&http, &handle, &ulid(), "carry the estate root").await;
+    let (status, _, body) = submit_addressed(
+        &http,
+        &handle,
+        Some(estate_dir.path()),
+        &ulid(),
+        "carry the estate root",
+    )
+    .await;
     assert_eq!(status, 201, "submit must accept: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
 
@@ -625,7 +666,7 @@ async fn work_submitted_carries_the_bound_estate_root() {
     assert_eq!(
         submitted.workspace_id.as_deref(),
         Some(canonical_root.to_string_lossy().as_ref()),
-        "work.submitted must carry the daemon's bound estate root"
+        "work.submitted must carry the estate root the submission addressed"
     );
 }
 
@@ -1468,6 +1509,36 @@ fn estate_data_dir() -> DataDir {
     dir
 }
 
+/// H1's two-estate fixture: a **second** estate root, elsewhere on disk, that
+/// addresses the *same* host runtime dir.
+///
+/// Additive on purpose (brief deliverable 10): [`estate_data_dir`] and every
+/// test built on it stay exactly as they were, because single-estate is a
+/// special case of host mode, not a removed mode. The second estate is a
+/// plain `TempDir` rather than a `DataDir` — nothing runs a daemon *for* it;
+/// its Work runs on the host daemon the first estate already spawned, which
+/// is the whole point.
+fn second_estate(name: &str) -> TempDir {
+    let dir = TempDir::new().expect("second estate tempdir");
+    support::scaffold_estate(dir.path(), name, &["solo"]);
+    dir
+}
+
+/// [`sgt_env`] run against `estate_root` with `-C`, while still pointing at
+/// `data_dir` as the host runtime root — the shape a second estate uses to
+/// reach a daemon it did not spawn.
+fn sgt_in(data_dir: &DataDir, estate_root: &Path, args: &[&str]) -> Output {
+    let mut command = std::process::Command::new(SGT);
+    command
+        .current_dir(estate_root)
+        .arg("-C")
+        .arg(estate_root)
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .args(args);
+    command.output().expect("run sgt")
+}
+
 /// Run the sgt binary with args against a data dir; capture output.
 ///
 /// The child runs in the data dir, not in whatever directory `cargo test` was
@@ -1740,9 +1811,29 @@ fn a_data_dir_defaults_onto_disk_not_the_hosts_tmpfs() {
     );
 }
 
+/// **The H1 pair**, replacing `t7_cli_end_to_end_auto_spawn_and_second_
+/// daemon_fails_closed`.
+///
+/// That test asserted one thing twice over: a second *anything* on this data
+/// dir fails closed. H1 splits it, because the two halves now have opposite
+/// answers and both matter:
+///
+/// - a second **estate** is *admitted* into the running daemon and its Work
+///   runs there (H1 §11 criterion 1: two exact-root estates submit Work to
+///   one daemon). This is the invariant H1 inverts, and the old test was its
+///   direct contradiction;
+/// - a second **process** over the host runtime root still fails closed on
+///   `daemon.lock` (H1 §2: one long-lived daemon per user installation).
+///   This is the invariant H1 keeps, and it is *load-bearing* precisely
+///   because the first half now shares one journal between estates.
+///
+/// Both halves live in one test so neither can be quietly dropped: proving
+/// only the first would leave a host that races two journals, and proving
+/// only the second would be the pre-H1 world.
 #[test]
-fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
+fn t7_cli_end_to_end_a_second_estate_is_admitted_and_a_second_process_fails_closed() {
     let dir = estate_data_dir();
+    let other = second_estate("m2-second");
 
     // No daemon running: `sgt run` auto-spawns one and submits.
     let output = sgt(&dir, &["run", "ship the M2 milestone"]);
@@ -1752,7 +1843,26 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // `sgt work list --json` shows it.
+    // --- Half one: a second estate, same daemon, no second process. ---
+    //
+    // This client never spawns: the descriptor is already there and healthy,
+    // so it connects to the daemon the *first* estate started and addresses
+    // its own root. Before H1 this was the `EstateBindingMismatch` refusal.
+    let before = daemon_pids(dir.path());
+    assert_eq!(before.len(), 1, "exactly one daemon so far: {before:?}");
+    let output = sgt_in(&dir, other.path(), &["run", "ship the second estate"]);
+    assert!(
+        output.status.success(),
+        "a second estate must be admitted, not refused: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        daemon_pids(dir.path()),
+        before,
+        "the second estate must reuse the running daemon, never start another"
+    );
+
+    // `sgt work list --json` shows both — one fleet, one daemon, two estates.
     let output = sgt(&dir, &["work", "list", "--json"]);
     assert!(
         output.status.success(),
@@ -1762,32 +1872,192 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
     let listed: Value =
         serde_json::from_slice(&output.stdout).expect("work list --json must print JSON");
     let works = listed["works"].as_array().expect("works array");
-    assert_eq!(works.len(), 1);
-    assert_eq!(works[0]["intent"], "ship the M2 milestone");
-    // §5.2: the auto-spawned daemon is bound to the estate this client
-    // admitted (`spawn_daemon` names it with `-C`), so the submission is
-    // planned and run rather than parked. `completed` is the fake backend's
-    // deterministic answer — every stage settles inside the submit call — and
-    // asserting it is what proves the spawned daemon really adopted *this*
-    // estate: a daemon bound to nothing would have left this `pending`.
-    assert_eq!(works[0]["state"], "completed");
-    assert_eq!(works[0]["repositories"], json!(["solo"]));
-    assert_eq!(works[0]["created_by"], "cli");
+    assert_eq!(
+        works.len(),
+        2,
+        "both estates' Work is on one daemon: {listed}"
+    );
+    let by_intent = |intent: &str| {
+        works
+            .iter()
+            .find(|w| w["intent"] == intent)
+            .unwrap_or_else(|| panic!("{intent} missing from {listed}"))
+            .clone()
+    };
+    for intent in ["ship the M2 milestone", "ship the second estate"] {
+        let work = by_intent(intent);
+        // `completed` is the fake backend's deterministic answer — every
+        // stage settles inside the submit call — and asserting it is what
+        // proves the daemon really planned against *that* submission's
+        // estate: an unaddressed submission would have stayed `pending`.
+        assert_eq!(work["state"], "completed", "{intent}: {work}");
+        assert_eq!(work["repositories"], json!(["solo"]));
+        assert_eq!(work["created_by"], "cli");
+    }
 
-    // A second daemon on the same data dir fails closed.
+    // H1 §11 criterion 5, on the same rig: **one journal reconstructs both
+    // estates.** Every Work's own canonical estate root is on the envelope
+    // (D1), so a replay can tell them apart without a second journal, a
+    // second projection, or an estate UUID.
+    let mut roots: Vec<String> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == KIND_WORK_SUBMITTED)
+        .map(|e| {
+            e.workspace_id
+                .clone()
+                .expect("submitted carries its estate")
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let mut expected = vec![
+        std::fs::canonicalize(dir.path())
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned(),
+        std::fs::canonicalize(other.path())
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    expected.sort();
+    assert_eq!(
+        roots, expected,
+        "one journal must reconstruct both estates by their own coordinates"
+    );
+
+    // And the registry says so out loud (H1 §4): both roots admitted,
+    // observationally, because both were addressed.
+    let output = sgt(&dir, &["daemon", "stop", "--json"]);
+    assert!(
+        output.status.success(),
+        "daemon stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stopped: Value =
+        serde_json::from_slice(&output.stdout).expect("daemon stop --json prints JSON");
+    // D5: the blast radius is stated, not left for the operator to infer —
+    // `sgt daemon stop` stops the *host* daemon, every admitted estate's.
+    let message = stopped["message"].as_str().expect("message");
+    assert!(
+        message.contains("host daemon") && message.contains("2 admitted estates"),
+        "daemon stop must name its blast radius: {message}"
+    );
+
+    // --- Half two: a second *process* still fails closed on the host lock. ---
+    let output = sgt(&dir, &["run", "restart the daemon"]);
+    assert!(
+        output.status.success(),
+        "sgt run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let output = sgt(&dir, &["daemon"]);
     assert!(
         !output.status.success(),
-        "second daemon must fail closed, got: {}",
+        "a second daemon process must fail closed, got: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("another daemon"),
-        "second daemon should explain the lock, got: {stderr}"
+        "the second process should explain the lock, got: {stderr}"
     );
 
     stop_daemon(dir.path());
+}
+
+/// §26 outranks D4's admission check, and the crash window is where that
+/// actually bites.
+///
+/// A daemon that dies between `work.submitted` and `command.accepted` leaves
+/// a durable Work with no recorded outcome; `command_works` is the index that
+/// lets the retry answer for the command that already ran instead of running
+/// a second one (`crash_between_mutation_and_command_record_still_replays`
+/// pins that on its own). H1 adds a step *before* planning — admit the
+/// addressed estate — and if that step answered first, a retry landing in
+/// exactly this window after the estate broke would be told `422 the estate
+/// is invalid` while its Work sat in the journal. The client would conclude
+/// nothing happened. §26's promise is about what already happened, not about
+/// whether it could happen again now, so admission is deliberately behind
+/// both replay checks.
+#[tokio::test]
+async fn a_crash_window_retry_replays_even_after_its_estate_stops_admitting() {
+    let dir = TempDir::new().expect("tempdir");
+    let estate = second_estate("crash-window");
+    let handle = start(dir.path()).await;
+    let command_id = ulid();
+    let (status, _, body) = submit_addressed(
+        &client(),
+        &handle,
+        Some(estate.path()),
+        &command_id,
+        "accepted, then the estate vanished",
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    handle.shutdown().await;
+
+    // The exact crash image: the durable `work.submitted`, its
+    // `command.accepted` never written.
+    let events = journal_events(dir.path());
+    let submitted_at = events
+        .iter()
+        .position(|e| e.kind == KIND_WORK_SUBMITTED)
+        .expect("work.submitted journaled");
+    truncate_journal(dir.path(), submitted_at + 1);
+
+    // ...and by the time anyone retries, the estate is gone.
+    std::fs::remove_file(estate.path().join("sergeant.toml")).expect("break the estate");
+
+    let handle = start(dir.path()).await;
+    let http = client();
+    let (retry_status, _, retry_body) = submit_addressed(
+        &http,
+        &handle,
+        Some(estate.path()),
+        &command_id,
+        "accepted, then the estate vanished",
+    )
+    .await;
+    assert_eq!(
+        retry_status, status,
+        "the retry must answer for the command that already ran: {retry_body}"
+    );
+    assert_eq!(
+        retry_body["work"]["id"].as_str(),
+        Some(work_id.as_str()),
+        "and for the same Work: {retry_body}"
+    );
+    // Deliberately not byte-equality with the first response, unlike
+    // `crash_between_mutation_and_command_record_still_replays`: that rig's
+    // daemon plans nothing, so its Work never moves past `pending` and the
+    // two bodies are identical. Here the first submission really ran, and the
+    // truncation cut every event after `work.submitted` away — so the
+    // re-derived view honestly describes the journal as it now stands. What
+    // this test is about is *which* answer the retry gives (the recorded
+    // command's, not a refusal), not how much of the run survived surgery.
+    assert!(
+        retry_body["error"].is_null(),
+        "the retry must not be an error at all: {retry_body}"
+    );
+
+    // A genuinely new submission against the same broken estate is still
+    // refused — the exemption is for the command that already ran, not for
+    // the estate.
+    let (fresh_status, _, fresh_body) = submit_addressed(
+        &http,
+        &handle,
+        Some(estate.path()),
+        &ulid(),
+        "a new one, after the break",
+    )
+    .await;
+    assert_eq!(fresh_status, 422, "{fresh_body}");
+    assert_eq!(fresh_body["error"]["code"], "invalid_estate");
+
+    handle.shutdown().await;
 }
 
 /// The rest of the contracted CLI surface through the spawned binary:
@@ -1951,26 +2221,21 @@ fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
     stop_daemon(dir.path());
 }
 
-/// Hand-write a `sergeant.runtime/v2` descriptor into `dir`, bound to `dir`
-/// itself as its estate root.
+/// Hand-write a `sergeant.runtime/v3` descriptor into `dir`.
 ///
-/// The binding matters even for a descriptor whose whole point is to be
-/// dead: §5.1 has clients verify `estate_root` **before** they judge
-/// staleness or probe the endpoint, so a fabricated descriptor naming some
-/// other root would get the mismatch refusal and the staleness path under
-/// test would never run. The canonical form is what
-/// [`Estate::admit`](sergeant_rs::domain::estate::Estate::admit)
-/// puts in the descriptor, so it is what a fixture must reproduce.
+/// D3: no estate fields. The fixture used to have to reproduce the exact
+/// canonical bound root, because §5.1 had clients compare it *before* they
+/// judged staleness — a fabricated descriptor naming any other root got the
+/// mismatch refusal and the staleness path under test never ran. That
+/// refusal class is retired; a v3 descriptor says nothing about estates, so
+/// the staleness path is reached on its own terms.
 fn write_fabricated_descriptor(dir: &DataDir, endpoint: &str, pid: u32, token: &str) {
-    let root = std::fs::canonicalize(dir.path()).expect("canonical estate root");
     let descriptor = json!({
-        "schema": "sergeant.runtime/v2",
+        "schema": "sergeant.runtime/v3",
         "endpoint": endpoint,
         "pid": pid,
         "api_revision": "v1",
         "token": token,
-        "estate_root": root,
-        "manifest_path": root.join("sergeant.toml"),
     });
     std::fs::write(
         daemon::descriptor_path(dir.path()),
@@ -2019,21 +2284,24 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
 /// Half-interpreting it could mean talking to the wrong process, or spawning
 /// a second daemon on a data dir that already has an owner.
 ///
-/// **Both directions, since estate-root §5.1 bumped the schema to
-/// `sergeant.runtime/v2`.** A newer build's descriptor was always the
-/// forward case; `sergeant.runtime/v1` is now the backward one, and it is not
-/// hypothetical — it is what a daemon from the previous release leaves on
-/// disk. There is deliberately no compatibility shim: a v1 descriptor carries
-/// no `estate_root`, so a client could not verify §5.1's binding against it
-/// at all, and reading it half-way is exactly the "talking to the wrong
-/// process" failure above. Both refusals must also carry the *remedy* (stop
-/// the old daemon and let a restarted one republish), because an operator
-/// staring at a live-but-unusable daemon has no other way to know what to do.
+/// **Both directions, and now one release deeper.** H1's D3 bumped the
+/// schema to `sergeant.runtime/v3` (no estate fields at all), so
+/// `sergeant.runtime/v2` — an estate-*bound* daemon from the previous
+/// release, still running on a developer's machine at cutover — joins the
+/// backward cases beside v1, and `v4` stands in for the forward one. There
+/// is deliberately no compatibility shim in either direction: a v2
+/// descriptor names one bound estate this build no longer believes in, and
+/// half-reading it is exactly the "talking to the wrong process" failure
+/// above. Every refusal must also carry the *remedy* (stop the old daemon
+/// and let a restarted one republish), because an operator staring at a
+/// live-but-unusable daemon has no other way to know what to do — that
+/// remedy is H1 §6's cutover story with a real backstop under it.
 #[test]
 fn descriptor_with_an_unknown_schema_fails_closed() {
     for (label, schema) in [
-        ("from the future", "sergeant.runtime/v3"),
-        ("from the previous release", "sergeant.runtime/v1"),
+        ("from the future", "sergeant.runtime/v4"),
+        ("from the previous release", "sergeant.runtime/v2"),
+        ("from two releases back", "sergeant.runtime/v1"),
     ] {
         let dir = estate_data_dir();
         let unreadable = json!({
@@ -2893,14 +3161,13 @@ async fn start_with_fake(data_dir: &Path, fake: &FakeBackend) -> DaemonHandle {
 async fn start_with_fake_bound(
     data_dir: &Path,
     fake: &FakeBackend,
-    estate_root: Option<&Path>,
+    _estate_root: Option<&Path>,
 ) -> DaemonHandle {
     daemon::start_with(
         data_dir,
         DaemonConfig {
             backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: estate_root.map(Path::to_path_buf),
             ..DaemonConfig::default()
         },
     )
@@ -3829,6 +4096,7 @@ async fn t12_submission_throughput_has_an_automated_floor() {
         let endpoint = handle.endpoint.clone();
         let token = handle.token.clone();
         let repo = repo.clone();
+        let estate_root = estate.path().to_path_buf();
         inflight.push(tokio::spawn(async move {
             let response = http
                 .post(format!("{endpoint}/v1/work"))
@@ -3837,6 +4105,8 @@ async fn t12_submission_throughput_has_an_automated_floor() {
                     "command_id": ulid(),
                     "intent": "throughput floor",
                     "backend": FAKE_BACKEND_NAME,
+                    // D4: `cwd` is the mount; the addressed estate is its root.
+                    "estate_root": estate_root,
                     "origin": {"client": "cli", "cwd": repo},
                 }))
                 .send()
@@ -4117,6 +4387,7 @@ async fn scope_all_combined_with_repos_refuses_with_conflicting_scope() {
         .json(&json!({
             "command_id": ulid(),
             "intent": "everything and also just this one",
+            "estate_root": estate.path(),
             "scope": {"repos": ["solo"], "all": true},
         }))
         .send()
@@ -4441,7 +4712,7 @@ async fn r_mvp1_10_start(
     data_dir: &Path,
     registry: BackendRegistry,
     completion_poll: Duration,
-    estate_root: &Path,
+    _estate_root: &Path,
 ) -> DaemonHandle {
     daemon::start_with(
         data_dir,
@@ -4449,7 +4720,6 @@ async fn r_mvp1_10_start(
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll,
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -4461,9 +4731,9 @@ async fn r_mvp1_10_start(
 ///
 /// `cwd` is sent because §13.3 still records it as origin evidence, and
 /// leaving it out would stop exercising the field — but since §5.2 it decides
-/// nothing: the daemon plans against the estate it was started against. It is
-/// passed the estate root here so the recorded evidence matches where the
-/// run actually happened.
+/// nothing. What decides is `estate_root` (D4), which every call site here
+/// passes as the same path: these tests run one estate, and the recorded
+/// evidence should match where the run actually happened.
 async fn r_mvp1_10_submit(
     http: &reqwest::Client,
     handle: &DaemonHandle,
@@ -4474,6 +4744,7 @@ async fn r_mvp1_10_submit(
     let mut req = json!({
         "command_id": ulid(),
         "intent": intent,
+        "estate_root": cwd,
         "origin": {"client": "cli", "cwd": cwd},
     });
     if let Some(name) = workflow {

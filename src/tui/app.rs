@@ -960,6 +960,16 @@ impl App {
     pub async fn execute(&mut self, client: &ApiClient, action: Action) -> Action {
         match action {
             Action::Submit(body) => {
+                // D4: the composer builds the submission; the client is what
+                // knows which estate this session addresses, so the address
+                // is stamped here rather than threaded through every screen.
+                // A client addressing no estate sends none, and the daemon
+                // answers exactly as it does for any submission with no
+                // repository context.
+                let mut body = body;
+                if let (Some(root), Some(map)) = (client.estate_root(), body.as_object_mut()) {
+                    map.insert("estate_root".to_string(), serde_json::json!(root));
+                }
                 match client.post("/v1/work", &body).await {
                     Ok(result) => {
                         let id = result["work"]["id"].as_str().unwrap_or("?").to_string();

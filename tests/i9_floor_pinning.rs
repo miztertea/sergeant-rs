@@ -512,7 +512,7 @@ fn plan_full_leaves_core_floor_ledger_empty() {
 
 async fn start_fake_tiny_segments(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     script: impl IntoIterator<Item = FakeStep>,
 ) -> (DaemonHandle, FakeBackend) {
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
@@ -522,7 +522,6 @@ async fn start_fake_tiny_segments(
         DaemonConfig {
             backends: std::sync::Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: Some(estate_root.to_path_buf()),
             // Tiny threshold (§5.4): reaching a >16-segment journal by
             // shrinking this, never by shrinking the window.
             segment_max_bytes: Some(256),
@@ -568,6 +567,7 @@ async fn the_real_daemon_journal_pins() {
             .json(&json!({
                 "command_id": ulid(),
                 "intent": "i9 acceptance work",
+                "estate_root": root.path(),
                 "origin": {"client": "cli", "cwd": root.path()},
             }))
             .send()
@@ -883,6 +883,7 @@ async fn a_below_window_command_id_is_refused_by_name_through_a_real_http_retry(
     let submit_body = json!({
         "command_id": early_command_id,
         "intent": "below-window refusal fixture",
+        "estate_root": root.path(),
         "origin": {"client": "cli", "cwd": root.path()},
     });
     let early_work_id;

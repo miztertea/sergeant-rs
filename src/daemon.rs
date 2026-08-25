@@ -42,7 +42,6 @@ use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::opencode::{OPENCODE_BACKEND_NAME, OpencodeBackend, OpencodeConfig};
 use crate::backend::{BackendRegistry, EventSink};
-use crate::domain::estate::Estate;
 use crate::domain::event::{EventDraft, EventSource};
 use crate::platform::fs_locking::{self, Reliability};
 use crate::runtime::analytics::{Analytics, AnalyticsError};
@@ -59,7 +58,18 @@ pub const DESCRIPTOR_FILE: &str = "runtime.json";
 /// Exclusive daemon lock file name inside the data dir.
 pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
 /// Schema identifier for the runtime descriptor.
-pub const DESCRIPTOR_SCHEMA: &str = "sergeant.runtime/v2";
+///
+/// **v3 (H1, sprint-plan D3):** no estate fields. v2 published the one
+/// estate root the process was bound to, because that binding *was* the
+/// client-side safety check; a host daemon has no such binding, and the
+/// admitted-estate set is dynamic state served live by `GET /v1/estates`
+/// rather than something a file written once, atomically, at startup could
+/// honestly describe. A v2 descriptor therefore fails closed through
+/// [`DaemonError::UnknownDescriptorSchema`] like any other unknown schema —
+/// no shim, deliberately: "the daemon you are talking to is from another
+/// build" is exactly the fact a client must not paper over, and here it also
+/// means "that daemon believes it owns one estate."
+pub const DESCRIPTOR_SCHEMA: &str = "sergeant.runtime/v3";
 
 /// Event kind: the daemon came up and owns the journal.
 pub const KIND_DAEMON_STARTED: &str = "daemon.started";
@@ -97,17 +107,23 @@ pub const KIND_ADMISSION_PAUSED: &str = "admission.paused";
 /// recovery (§25), there is no ambiguous case here to fail closed on.
 pub const KIND_ADMISSION_RESUMED: &str = "admission.resumed";
 
-/// The runtime descriptor published for clients (proposal §6, estate-root
-/// §5.1): endpoint, PID, API revision, the bearer token, and — since
-/// `sergeant.runtime/v2` — **the estate this daemon is bound to**, protected
-/// by owner-only file permissions.
+/// The runtime descriptor published for clients (proposal §6, H1 §3):
+/// endpoint, PID, API revision, and the bearer token, protected by
+/// owner-only file permissions. Five fields, and — since
+/// [`DESCRIPTOR_SCHEMA`]'s v3 bump — **nothing about estates** (D3).
 ///
-/// §5.1: "A client validates that the descriptor's root matches its exact
-/// current root before using the endpoint. A live daemon bound to another
-/// estate is a named refusal, never a reusable global service." That check
-/// is [`RuntimeDescriptor::check_estate_root`], and every client path
-/// (`ensure_daemon`, `observe_connect`) runs it before the endpoint is used
-/// for anything.
+/// **What the retired v2 fields did, and what replaced them.** v2 carried
+/// `estate_root`/`manifest_path`, and §5.1's client gate compared the
+/// caller's exact root against them: "a live daemon bound to another estate
+/// is a named refusal, never a reusable global service." H1 makes one daemon
+/// serving many estates the normal case, so that comparison has no object.
+/// The property it protected — nothing is ever served for an estate nobody
+/// validated — is now kept where the validation actually happens: the
+/// admitted-estate registry ([`crate::runtime::estates::EstateRegistry`]),
+/// re-checked per request, with
+/// [`crate::runtime::estates::check_estate_root`] as its client-side half.
+/// The set is dynamic, so it is answered live by `GET /v1/estates` rather
+/// than frozen into a file written once at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeDescriptor {
     /// Descriptor schema identifier.
@@ -119,76 +135,11 @@ pub struct RuntimeDescriptor {
     /// API revision the daemon serves.
     pub api_revision: String,
     /// Random bearer token required on all `/v1/*` routes.
-    pub token: String,
-    /// §5.1: the canonical estate root this daemon was started against.
-    /// `None` only for a daemon bound to no estate at all — a test rig, or
-    /// `sgt daemon` run somewhere that is not an estate root.
-    #[serde(default)]
-    pub estate_root: Option<PathBuf>,
-    /// §5.1: `<estate_root>/sergeant.toml`, recorded alongside the root so a
-    /// reader never has to reconstruct it.
-    #[serde(default)]
-    pub manifest_path: Option<PathBuf>,
-}
-
-/// A live daemon bound to a different estate than the client's own exact
-/// root (§5.1, §15): named refusal, never a connection, and never a second
-/// daemon over the same data dir.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "the daemon running for {data_dir} is bound to a different estate\n\n\
-     This estate root:\n  {wanted}\n\n\
-     Daemon's estate root:\n  {found}\n\n\
-     Refusing to connect, and refusing to start a second daemon over the same data dir.\n\
-     Stop the running daemon and retry, or point this estate at its own data dir:\n  \
-     sgt -C {found} daemon stop\n  \
-     sgt --data-dir <dir> <command>"
-)]
-pub struct EstateBindingMismatch {
-    /// Data dir both would own.
-    pub data_dir: String,
-    /// The root the client resolved.
-    pub wanted: String,
-    /// The root the running daemon is bound to, or the fact that it has
-    /// none.
-    pub found: String,
-}
-
-impl RuntimeDescriptor {
-    /// §5.1's client-side gate: does this descriptor's estate root match the
-    /// caller's own exact root?
     ///
-    /// Both directions are refusals, deliberately: a daemon bound to estate
-    /// A cannot serve a client standing in estate B, **and** a daemon bound
-    /// to no estate cannot serve a client that has one (its engine would
-    /// plan against nothing, so every submission would silently land
-    /// `pending`). A client with no estate root of its own — no such client
-    /// exists on the estate-scoped paths, since §4.3 admits the root first —
-    /// is the only case that passes without comparison.
-    pub fn check_estate_root(
-        &self,
-        data_dir: &Path,
-        wanted: Option<&Path>,
-    ) -> Result<(), EstateBindingMismatch> {
-        let Some(wanted) = wanted else {
-            return Ok(());
-        };
-        let matches = self
-            .estate_root
-            .as_deref()
-            .is_some_and(|bound| bound == wanted);
-        if matches {
-            return Ok(());
-        }
-        Err(EstateBindingMismatch {
-            data_dir: data_dir.display().to_string(),
-            wanted: wanted.display().to_string(),
-            found: match &self.estate_root {
-                Some(root) => root.display().to_string(),
-                None => "(none — this daemon was started outside any estate)".to_string(),
-            },
-        })
-    }
+    /// D8: one token spans every admitted estate — the ratified single-user
+    /// trust model. The widened blast radius of a leaked token is stated,
+    /// not silently inherited.
+    pub token: String,
 }
 
 /// Errors from daemon startup and shutdown.
@@ -257,13 +208,17 @@ pub enum DaemonError {
     /// mean something else entirely, and acting on them could mean talking
     /// to the wrong process — or spawning a second daemon.
     ///
-    /// **0.1.0, estate-root Phase D:** `sergeant.runtime/v1` descriptors are
-    /// exactly this case. A v1 descriptor carries no `estate_root`, so a
-    /// client could not verify §5.1's binding against it at all — it fails
-    /// closed here rather than being read half-way, and the remedy is to
-    /// stop the old daemon and let a v2 one publish. There is deliberately no
-    /// compatibility shim: at 0.1.0, "the daemon you are talking to is from
-    /// another build" is exactly the fact a client must not paper over.
+    /// **Every superseded schema is exactly this case, in both directions.**
+    /// A `sergeant.runtime/v1` descriptor carried no estate binding at all;
+    /// a `sergeant.runtime/v2` one carried a binding to exactly one estate,
+    /// which a host daemon does not have (D3). Neither can be read half-way
+    /// — the v2 case is the sharper of the two, because its fields still
+    /// *parse*, and acting on them would mean addressing a daemon that
+    /// believes it owns one estate as though it served many. There is
+    /// deliberately no compatibility shim in either direction; the remedy is
+    /// H1 §6's cutover, and this refusal is its backstop: stop the old
+    /// daemon and let a restarted one republish in the schema this build
+    /// reads.
     #[error(
         "runtime descriptor {path} declares unknown schema {found:?} (this build understands {expected:?}); \
          refusing to use it. If a daemon from an older build is still running, stop it \
@@ -398,23 +353,19 @@ pub struct DaemonConfig {
     /// alternative — shrinking the window instead — would mean the tests
     /// prove a window nothing ships.
     pub segment_max_bytes: Option<u64>,
-    /// §5.1: the estate root this daemon is bound to, for its whole life.
-    ///
-    /// [`start_with`] admits it (§4.1's exact-root check —
-    /// [`Estate::admit`]) before the data dir is created, the journal
-    /// opened, or the descriptor published, so a daemon can never come up
-    /// bound to something that is not an estate. The canonical form is
-    /// pinned into the engine and published in the runtime descriptor, where
-    /// every client verifies it against its own root before use.
-    ///
-    /// `None` is a daemon bound to no estate: `Engine::plan` answers "no
-    /// repository context" and every submission stays `pending`. That is the
-    /// test rigs' shape — never a silent fallback to discovery, of which
-    /// there is none left.
-    pub estate_root: Option<PathBuf>,
     /// W3: retention cap for this daemon's journal, overriding `[estate]
-    /// retention`. `None` — production, always — takes the manifest's value
-    /// or [`crate::domain::estate::DEFAULT_RETENTION`].
+    /// retention`. `None` — production, always — takes
+    /// [`crate::domain::estate::DEFAULT_RETENTION`].
+    ///
+    /// **H1:** a host daemon has no one estate whose manifest could supply
+    /// this, so the `Manifest` rung is gone from the *process-wide* policy.
+    /// Each admitted estate's own `[estate] retention` is read at admission
+    /// ([`crate::runtime::estates::AdmittedEstate::retention`]); partitioning
+    /// the retention *decision* by estate is W4a's deliverable (D7 keeps the
+    /// blob-reference scan journal-wide either way). Until then the
+    /// process-wide policy is the explicit override or the built-in default,
+    /// which is a widening — never a silent narrowing — of what any one
+    /// estate declared.
     ///
     /// Configurable for the same reason `segment_max_bytes`/`completion_poll`
     /// are: a prune test has to stand on the far side of the cap, and
@@ -443,7 +394,6 @@ impl Default for DaemonConfig {
             turn_cap: None,
             rebuild_cache: false,
             segment_max_bytes: None,
-            estate_root: None,
             retention: None,
         }
     }
@@ -477,15 +427,18 @@ pub async fn start_with(
     data_dir: &Path,
     config: DaemonConfig,
 ) -> Result<DaemonHandle, DaemonError> {
-    // 0a. §4.1/§5.1: admit the estate root **first**, before the data dir is
-    // even created. A daemon that cannot name its estate must not come up at
-    // all — §4.3's ordering applies to the daemon's own startup exactly as
-    // it does to a client's dispatch, and the canonical root admitted here
-    // is what the descriptor publishes and every client verifies against.
-    let estate = match &config.estate_root {
-        Some(root) => Some(Estate::admit(root)?),
-        None => None,
-    };
+    // 0a. **Estate admission is no longer a startup step.** It used to be the
+    // first thing this function did — `Estate::admit(config.estate_root)`,
+    // before the data dir was even created, refusing the whole start when it
+    // failed. H1 moves it out: a host daemon starts bound to **zero** estates
+    // (the normal state, not a rig edge case) and admits each one lazily on
+    // the first request that addresses it
+    // ([`crate::runtime::estates::EstateRegistry`]). Keeping the old step
+    // would mean one estate's broken `sergeant.toml` refusing to start the
+    // daemon every *other* estate's Work depends on — which is precisely why
+    // admission failure is now an estate-specific refusal to the caller that
+    // asked for it, and never process death.
+    let estates = Arc::new(crate::runtime::estates::EstateRegistry::new());
 
     create_dir_all_durable(data_dir)?;
 
@@ -495,6 +448,12 @@ pub async fn start_with(
     // two daemons are racing the same data dir. An inconclusive probe (e.g.
     // today's always-Unknown macOS arm) does not refuse — see
     // `refuse_if_unreliable`.
+    //
+    // H1: `data_dir` is now the **host runtime root**, so this is the host
+    // half of a check that has become two. The estate half runs per estate
+    // root at admission (`estates::admit_root`), because an estate on a
+    // network share and a host root on local disk is a real shape, and one
+    // probe at one path can no longer answer for both.
     refuse_if_unreliable(data_dir, fs_locking::detect_for_path(data_dir))?;
 
     // 1. Exclusive daemon lock: a second daemon on the same data dir fails
@@ -622,46 +581,31 @@ pub async fn start_with(
         .with_floor_ledger(Arc::new(floor_ledger))
         .with_first_seq_index(first_seq_by_work);
 
-    // W3 §1.2: resolve the retention policy once, for this process's whole
-    // life — `config.retention` (test rigs only) -> `[estate] retention` ->
-    // the built-in default. Journaled on every prune event so the record
-    // names the authorization, not just the number (A1).
+    // W3 §1.2, as H1 leaves it: resolve the *process-wide* retention policy
+    // once — `config.retention` (test rigs only) -> the built-in default.
+    // Journaled on every prune event so the record names the authorization,
+    // not just the number (A1).
     //
-    // `estate` above is only an `EstateRoot` (path + manifest_path admitted
-    // by §4.1's exact-root check) — it never parsed `[estate] retention`, so
-    // it is re-read here through the *structural* parser: schema-level
-    // checks in full, no per-repository git validation (`Estate::admit`
-    // never did that either, so this cannot newly refuse a daemon start that
-    // used to succeed). A failure here — unreachable in practice, since
-    // `admit` already parsed the same file successfully — falls back to the
-    // default rather than turning a policy-resolution nicety into a new
-    // startup failure mode.
-    let estate_retention = estate.as_ref().and_then(|estate_root| {
-        match Estate::from_config_structural(&estate_root.manifest_path) {
-            Ok(full) => full.retention,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "could not re-read the estate manifest for [estate] retention; using the default"
-                );
-                None
-            }
-        }
-    });
+    // The `[estate] retention` rung is gone from **this** resolution, and
+    // that is a deliberate, named change rather than an omission. It used to
+    // re-read the one bound estate's manifest here; a host journal holds
+    // many estates' Works, so "the manifest" has no referent at startup.
+    // Each admitted estate's own declaration is read at admission
+    // (`estates::admit_root` -> `AdmittedEstate::retention`) and W4a owns
+    // partitioning the retention *decision* by estate — D7 keeps the
+    // blob-reference scan journal-wide regardless, precisely so a per-estate
+    // decision can never condemn another estate's live blobs. Until W4a
+    // lands, the process-wide number is the explicit override or the
+    // default: a widening of what any one estate declared, never a silent
+    // narrowing.
     let prune_policy = match config.retention {
         Some(retention) => crate::runtime::prune::PrunePolicy {
             retention,
             source: crate::runtime::prune::PolicySource::Config,
         },
-        None => match estate_retention {
-            Some(retention) => crate::runtime::prune::PrunePolicy {
-                retention,
-                source: crate::runtime::prune::PolicySource::Manifest,
-            },
-            None => crate::runtime::prune::PrunePolicy {
-                retention: crate::domain::estate::DEFAULT_RETENTION,
-                source: crate::runtime::prune::PolicySource::Default,
-            },
+        None => crate::runtime::prune::PrunePolicy {
+            retention: crate::domain::estate::DEFAULT_RETENTION,
+            source: crate::runtime::prune::PolicySource::Default,
         },
     };
 
@@ -906,11 +850,9 @@ pub async fn start_with(
     // harness) are never left unsynced while unbounded — see its doc.
     let mut engine = Engine::new(backends, config.default_backend.clone(), data_dir)
         .with_turn_ceiling(config.turn_ceiling);
-    // §5.2: the engine's one topology authority for the life of this
-    // process. Nothing downstream ever re-derives it from a request cwd.
-    if let Some(estate) = &estate {
-        engine = engine.with_estate_root(estate.path.clone());
-    }
+    // D10: no `with_estate_root` here any more. The engine holds no estate;
+    // each `plan` call is handed the one its request addressed, after the
+    // registry admitted it.
     if let Some(surfaces_root) = config.surfaces_root.clone() {
         engine = engine.with_surfaces_root(surfaces_root);
     }
@@ -918,7 +860,7 @@ pub async fn start_with(
         engine = engine.with_turn_cap(turn_cap);
     }
     let engine = Arc::new(engine);
-    let reconciled = recovery::reconcile(&engine, &mut core)?;
+    let reconciled = recovery::reconcile(&engine, &estates, &mut core)?;
     // Backstop, not load-bearing: `reconcile` already leaves nothing open on
     // its own account, but a future edit there that forgets a flush must not
     // be able to publish the descriptor over an unsynced group. Free when
@@ -965,8 +907,6 @@ pub async fn start_with(
         pid: std::process::id(),
         api_revision: API_REVISION.to_string(),
         token: token.clone(),
-        estate_root: estate.as_ref().map(|e| e.path.clone()),
-        manifest_path: estate.as_ref().map(|e| e.manifest_path.clone()),
     };
     let descriptor_path = data_dir.join(DESCRIPTOR_FILE);
     write_atomic_secret(&descriptor_path, &serde_json::to_vec_pretty(&descriptor)?)?;
@@ -981,6 +921,7 @@ pub async fn start_with(
         data_dir: data_dir.to_path_buf(),
         closing: closing_rx,
         engine,
+        estates,
         analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
         prune_policy,
     };
@@ -1242,13 +1183,16 @@ async fn export_events(
 /// Run the daemon in the foreground until SIGINT/SIGTERM, then shut down
 /// cleanly. This is what `sgt daemon` (and therefore auto-spawn) executes.
 ///
+/// `data_dir` is the **host runtime root** (D2): journal, projections, blob
+/// store, `daemon.lock` and the descriptor all live beneath it, and it is
+/// resolved from `--data-dir` / `SGT_DATA_DIR` / the platform convention —
+/// never from an estate. There is deliberately no estate parameter any more
+/// (deliverable 8): `-C` on a `daemon` verb names the estate the invocation
+/// is *addressing*, not one this process binds itself to for life.
+///
 /// This is the one place §28 export is configured from the environment, and
 /// [`TelemetryConfig::from_env`] answers "off" unless explicitly switched on.
-pub async fn run_until_signal(
-    data_dir: &Path,
-    estate_root: Option<&Path>,
-    rebuild_cache: bool,
-) -> Result<(), DaemonError> {
+pub async fn run_until_signal(data_dir: &Path, rebuild_cache: bool) -> Result<(), DaemonError> {
     // **Handlers first, before anything makes this daemon reachable.**
     //
     // Publishing the runtime descriptor is what tells the world "there is a
@@ -1314,10 +1258,6 @@ pub async fn run_until_signal(
             telemetry: telemetry.clone(),
             surfaces_root,
             turn_cap,
-            // §5.1: the estate this daemon is bound to for its whole life,
-            // handed down from the invocation that already admitted it
-            // (`sgt -C <root> daemon`, or `sgt daemon` from the root).
-            estate_root: estate_root.map(Path::to_path_buf),
             rebuild_cache,
             ..DaemonConfig::default()
         },
@@ -1470,97 +1410,103 @@ mod tests {
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use std::time::Duration;
 
-    /// A `sergeant.runtime/v2` descriptor bound to `estate_root`.
-    fn descriptor_bound_to(estate_root: Option<&str>) -> RuntimeDescriptor {
-        RuntimeDescriptor {
+    /// **Re-scoped, not deleted** (brief deliverable 4): this test used to be
+    /// `a_descriptor_is_usable_only_from_the_estate_it_is_bound_to`, proving
+    /// the strict-equality binding gate in both directions. That refusal
+    /// class is retired with H1, so the negative it protected is re-pointed
+    /// rather than dropped: a descriptor no longer *says* anything about
+    /// estates, and what refuses an unvalidated estate is the admission
+    /// check that replaced it.
+    #[test]
+    fn a_v3_descriptor_says_nothing_about_estates_and_admission_is_what_refuses() {
+        let descriptor = RuntimeDescriptor {
             schema: DESCRIPTOR_SCHEMA.to_string(),
             endpoint: "http://127.0.0.1:1".to_string(),
             pid: 1,
             api_revision: API_REVISION.to_string(),
             token: "t".to_string(),
-            estate_root: estate_root.map(PathBuf::from),
-            manifest_path: estate_root.map(|r| PathBuf::from(r).join("sergeant.toml")),
-        }
-    }
-
-    /// §5.1: a descriptor whose estate root matches the client's own exact
-    /// root is usable; one bound elsewhere is a refusal naming **both**
-    /// roots, in both directions.
-    #[test]
-    fn a_descriptor_is_usable_only_from_the_estate_it_is_bound_to() {
-        let data_dir = Path::new("/data");
-        let here = descriptor_bound_to(Some("/estates/payments"));
-
-        here.check_estate_root(data_dir, Some(Path::new("/estates/payments")))
-            .expect("the daemon's own estate may use it");
-
-        let err = here
-            .check_estate_root(data_dir, Some(Path::new("/estates/billing")))
-            .expect_err("another estate must be refused");
-        let message = err.to_string();
-        assert!(
-            message.contains("/estates/billing") && message.contains("/estates/payments"),
-            "§15: the refusal names both roots: {message}"
-        );
-        assert!(
-            message.contains("refusing to start a second daemon"),
-            "§5.1: never a second daemon over the same data dir: {message}"
+        };
+        let serialized = serde_json::to_value(&descriptor).expect("descriptor json");
+        let mut keys: Vec<&str> = serialized
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["api_revision", "endpoint", "pid", "schema", "token"],
+            "D3: a v3 descriptor carries no estate binding to compare against"
         );
 
-        // The other direction: a daemon bound to nothing cannot serve a
-        // client that has an estate — its engine would plan against nothing.
-        let unbound = descriptor_bound_to(None);
-        let err = unbound
-            .check_estate_root(data_dir, Some(Path::new("/estates/payments")))
-            .expect_err("an unbound daemon must be refused too");
-        assert!(
-            err.to_string().contains("started outside any estate"),
-            "got {err}"
-        );
+        // What refuses instead: the admission check, per estate, on its own
+        // evidence rather than on what some file said at startup.
+        let err = crate::runtime::estates::check_estate_root(
+            Some(Path::new("/estates/definitely-not-one")),
+            "sgt run",
+        )
+        .expect_err("an unvalidated root must still be refused");
+        assert_eq!(err.code(), "invalid_estate", "got {err}");
     }
 
     /// The v1→v2 bump has no compatibility shim: a descriptor written by an
     /// older build fails closed as an unknown schema, and the diagnostic
     /// names the stop/restart remedy rather than leaving an operator staring
     /// at a schema string.
+    ///
+    /// **v2 joins v1 here at the D3 bump** — and it is the case that actually
+    /// happens at cutover, since a v2 daemon is what every developer has
+    /// running the moment before they install a host-mode build. Its fields
+    /// still parse, which is precisely why it must be refused rather than
+    /// read: they describe a process that believes it owns exactly one
+    /// estate.
     #[test]
-    fn a_v1_descriptor_fails_closed_with_a_restart_remedy() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        std::fs::write(
-            dir.path().join(DESCRIPTOR_FILE),
-            serde_json::json!({
-                "schema": "sergeant.runtime/v1",
-                "endpoint": "http://127.0.0.1:1",
-                "pid": 1,
-                "api_revision": API_REVISION,
-                "token": "t",
-            })
-            .to_string(),
-        )
-        .expect("write v1 descriptor");
+    fn a_superseded_descriptor_fails_closed_with_a_restart_remedy() {
+        for superseded in ["sergeant.runtime/v1", "sergeant.runtime/v2"] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            std::fs::write(
+                dir.path().join(DESCRIPTOR_FILE),
+                serde_json::json!({
+                    "schema": superseded,
+                    "endpoint": "http://127.0.0.1:1",
+                    "pid": 1,
+                    "api_revision": API_REVISION,
+                    "token": "t",
+                    "estate_root": "/estates/payments",
+                })
+                .to_string(),
+            )
+            .expect("write superseded descriptor");
 
-        let err = read_descriptor(dir.path()).expect_err("v1 must fail closed");
-        let message = err.to_string();
-        assert!(
-            matches!(err, DaemonError::UnknownDescriptorSchema { .. }),
-            "got {message}"
-        );
-        assert!(
-            message.contains("sergeant.runtime/v1") && message.contains("sergeant.runtime/v2"),
-            "both schemas must be named: {message}"
-        );
-        assert!(
-            message.contains("sgt daemon stop"),
-            "the remedy must tell the operator to restart the daemon: {message}"
-        );
+            let err =
+                read_descriptor(dir.path()).expect_err("a superseded schema must fail closed");
+            let message = err.to_string();
+            assert!(
+                matches!(err, DaemonError::UnknownDescriptorSchema { .. }),
+                "got {message}"
+            );
+            assert!(
+                message.contains(superseded) && message.contains(DESCRIPTOR_SCHEMA),
+                "both schemas must be named: {message}"
+            );
+            assert!(
+                message.contains("sgt daemon stop"),
+                "the remedy must tell the operator to restart the daemon: {message}"
+            );
+        }
     }
 
-    /// Complements `a_v1_descriptor_fails_closed_with_a_restart_remedy` above:
+    /// Complements `a_superseded_descriptor_fails_closed_with_a_restart_remedy`:
     /// the positive case for the *current* schema, going through the same
-    /// on-disk file-write → `read_descriptor` path (not the in-memory
-    /// `descriptor_bound_to()` helper, which never touches disk).
+    /// on-disk file-write → `read_descriptor` path.
+    ///
+    /// It also pins the half of D3 a struct definition cannot: a v3
+    /// descriptor that someone has *added* estate fields to still reads back
+    /// as the five fields this build knows, so no code path can start
+    /// depending on an out-of-band estate binding smuggled through the file.
     #[test]
-    fn a_v2_descriptor_round_trips_through_read_descriptor() {
+    fn a_v3_descriptor_round_trips_through_read_descriptor_ignoring_estate_fields() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         std::fs::write(
             dir.path().join(DESCRIPTOR_FILE),
@@ -1575,7 +1521,7 @@ mod tests {
             })
             .to_string(),
         )
-        .expect("write v2 descriptor");
+        .expect("write v3 descriptor");
 
         let descriptor = read_descriptor(dir.path())
             .expect("read must succeed")
@@ -1585,13 +1531,11 @@ mod tests {
         assert_eq!(descriptor.pid, 1);
         assert_eq!(descriptor.api_revision, API_REVISION);
         assert_eq!(descriptor.token, "t");
-        assert_eq!(
-            descriptor.estate_root.as_deref(),
-            Some(Path::new("/estates/payments"))
-        );
-        assert_eq!(
-            descriptor.manifest_path.as_deref(),
-            Some(Path::new("/estates/payments/sergeant.toml"))
+        let round_tripped = serde_json::to_value(&descriptor).expect("descriptor json");
+        assert!(
+            round_tripped.get("estate_root").is_none()
+                && round_tripped.get("manifest_path").is_none(),
+            "D3: nothing in this build carries an estate on the descriptor, got {round_tripped}"
         );
     }
 

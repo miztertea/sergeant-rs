@@ -797,12 +797,15 @@ fn resolve_data_dir(
 /// (`Manifest`/`EstateDefault` simply never occur here — there is no
 /// estate rung on this ladder at all).
 ///
-/// W1b landed this resolver with no caller (`#[allow(dead_code)]`,
-/// "zero behavior change" by design). **W4c is this seat's first caller**:
-/// [`install_service`] resolves the host runtime root a generated unit
-/// points at through this exact function, not a second copy of the ladder
-/// — W2/W3 remain the waves that rewire `dispatch`/`ensure_daemon`'s own
-/// host-scoped paths onto it.
+/// W1b landed this resolver caller-less ("zero behavior change" by
+/// design). Two callers own it now: W4c's [`install_service`] resolves
+/// the host runtime root a generated unit points at, and W2 wires the
+/// foreground `sgt daemon` verb (the one that creates the runtime root)
+/// onto it. W3 rewires the remaining client paths
+/// (`ensure_daemon`/`observe_connect`/`spawn_daemon`) — until then those
+/// still resolve per-estate, which stays consistent because
+/// `spawn_daemon` passes `--data-dir` explicitly (the flag rung wins on
+/// both ladders).
 fn resolve_host_runtime_dir(
     flag: Option<PathBuf>,
     env: impl Fn(&str) -> Option<OsString>,
@@ -851,42 +854,41 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         None
     };
     let (data_dir, data_dir_source) = resolve_data_dir(
-        sgt.data_dir,
+        sgt.data_dir.clone(),
         estate.as_ref().map(|e| e.path.as_path()).unwrap_or(&root),
     )?;
-    // W1b caller classification (this wave tags, does not rewire — W2/W3
-    // consume it): every downstream use of this one `data_dir` below, by
-    // where it actually gets used rather than by `Command` variant (several
-    // variants reach more than one):
-    //   HOST   — daemon discovery/spawn/stop: `ensure_daemon`/
-    //            `observe_connect`/`daemon_stop`/`spawn_daemon` (every
-    //            match arm that constructs a client or calls `daemon::
-    //            run_until_signal`), plus `exec_harness`'s adapter-state
-    //            directory (`DaemonConfig`'s per-adapter config already
-    //            documents "`None` = system binary + adapter state under
-    //            `data_dir`" — daemon-owned state, not estate-owned).
-    //   ESTATE — `doctor::run`'s journal-replay-derived checks specifically
-    //            (`journal_check`, `projection_check`, `git_surfaces_check`,
-    //            `journal_growth_check` — all read *this estate's* journal
-    //            events); everything else `doctor::run` checks about the
-    //            directory itself (existence/writability/locking/disk
-    //            pressure/adapter probes) is HOST today because `data_dir`
-    //            *is* the one directory in play, but is slated to move
-    //            under `resolve_host_runtime_dir` once W2 splits journal
-    //            ownership from estate-local state (see `resolve_data_dir`'s
-    //            doc comment above).
+    // W1b's caller classification, W2 consuming the first of it. The HOST
+    // bucket — daemon discovery/spawn/stop and `exec_harness`'s adapter
+    // state — is what `resolve_host_runtime_dir` is for; the ESTATE bucket
+    // (`doctor::run`'s journal-replay-derived checks) keeps
+    // `resolve_data_dir`.
+    //
+    // **This wave wires exactly one caller: the foreground daemon**, which
+    // is the one that actually *creates* the runtime root and therefore the
+    // one that has to name it correctly for `daemon.lock`, the journal, the
+    // blob store and the descriptor to live where D2 says. The client-side
+    // discovery/spawn callers (`ensure_daemon`/`observe_connect`/
+    // `daemon_stop`/`spawn_daemon`) are W3's, per this wave's brief, and
+    // still resolve as they did — which stays consistent because
+    // `spawn_daemon` passes `--data-dir` explicitly, so the child it starts
+    // takes the flag rung and lands in the same directory its parent looked
+    // in. The two ladders only diverge for a `sgt daemon` typed by hand with
+    // no flag and no `SGT_DATA_DIR`, which is exactly the case that *should*
+    // now be the host root.
     match command {
         Command::Daemon {
             command: None,
             rebuild_cache,
         } => {
             tracing_subscriber::fmt().init();
-            daemon::run_until_signal(
-                &data_dir,
-                estate.as_ref().map(|e| e.path.as_path()),
-                rebuild_cache,
-            )
-            .await?;
+            // D2 (J3): `--data-dir` -> `SGT_DATA_DIR` -> the platform
+            // convention, with no estate rung at all. `-C` on this verb
+            // named the estate this invocation addresses; it does not bind
+            // the process (deliverable 8), and the daemon it starts serves
+            // every estate admitted to it later.
+            let (host_root, _) =
+                resolve_host_runtime_dir(sgt.data_dir.clone(), |name| std::env::var_os(name))?;
+            daemon::run_until_signal(&host_root, rebuild_cache).await?;
             Ok(())
         }
         Command::Daemon {
@@ -1026,6 +1028,10 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "intent": intent,
+                // D4: the submission *addresses* this estate — the exact
+                // root §4.3 already admitted above, sent explicitly rather
+                // than left to a daemon binding that no longer exists.
+                "estate_root": estate_root(&estate),
                 "workflow": workflow,
                 "backend": backend,
                 "profile": profile,
@@ -2278,13 +2284,13 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
         .build()?;
 
     let stale = if let Some(descriptor) = daemon::read_descriptor(data_dir)? {
-        // §5.1: verify the binding **before** the endpoint is used for
-        // anything, and before any decision that could spawn. A daemon bound
-        // to another estate is a named refusal — never a connection, and
-        // never a second daemon over the same data dir.
-        check_binding(&descriptor, data_dir, estate_root)?;
+        // D4: validate the addressed estate **before** the endpoint is used
+        // for anything, and before any decision that could spawn. The
+        // refusal is now about the estate ("not an estate", "admission
+        // failed"), never about which estate some descriptor was bound to.
+        check_binding(estate_root, "this command")?;
         if healthz_ok(&http, &descriptor.endpoint).await {
-            return client_for(&descriptor);
+            return client_for(&descriptor, Some(estate_root));
         }
         if daemon::pid_alive(descriptor.pid) {
             // Ambiguous: something with that PID is alive but the endpoint
@@ -2326,12 +2332,13 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
         if let Ok(Some(descriptor)) = daemon::read_descriptor(data_dir)
             && !is_stale_descriptor(stale.as_ref(), &descriptor)
         {
-            // The winner of the spawn race may be another client's child,
-            // and §5.1 applies to it exactly as it did above: a daemon bound
-            // elsewhere is refused, not adopted.
-            check_binding(&descriptor, data_dir, estate_root)?;
+            // The winner of the spawn race may be another client's child.
+            // Under H1 that is fine — it is the *host* daemon either way —
+            // but the addressed estate is re-validated exactly as above,
+            // because a manifest can break inside the spawn window.
+            check_binding(estate_root, "this command")?;
             if healthz_ok(&http, &descriptor.endpoint).await {
-                return client_for(&descriptor);
+                return client_for(&descriptor, Some(estate_root));
             }
         }
         tokio::time::sleep(SPAWN_POLL).await;
@@ -2344,21 +2351,45 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
     )))
 }
 
-fn client_for(descriptor: &RuntimeDescriptor) -> Result<ApiClient, CliError> {
-    ApiClient::new(&descriptor.endpoint, &descriptor.token).map_err(CliError::from)
+/// Build the API client for a descriptor, addressed at the estate this
+/// invocation already admitted (D4).
+///
+/// `None` is the host-scoped shape: a client that names no estate, whose
+/// estate-scoped requests the daemon refuses by name rather than guessing
+/// for. W3 is what actually routes verbs into that bucket; the client can
+/// already express it.
+fn client_for(
+    descriptor: &RuntimeDescriptor,
+    estate_root: Option<&Path>,
+) -> Result<ApiClient, CliError> {
+    let client = ApiClient::new(&descriptor.endpoint, &descriptor.token)?;
+    Ok(match estate_root {
+        Some(root) => client.with_estate_root(root),
+        None => client,
+    })
 }
 
-/// §5.1/§15: refuse a descriptor bound to a different estate, naming both
-/// roots. Runs before the endpoint is probed, connected to, or used to
-/// decide whether to spawn — "never connect, never a second daemon on the
-/// same data dir" is only true if the check comes first.
-fn check_binding(
-    descriptor: &RuntimeDescriptor,
-    data_dir: &Path,
-    estate_root: &Path,
-) -> Result<(), CliError> {
-    descriptor
-        .check_estate_root(data_dir, Some(estate_root))
+/// The client gate, rewritten for H1 (sprint-plan D4, brief deliverable 4).
+///
+/// **What it used to be.** `check_binding` compared the client's exact root
+/// against the one root the v2 descriptor published, refusing in both
+/// directions — "this daemon is bound to a different estate", "this daemon
+/// is bound to no estate". That class is retired, not silently deleted: a
+/// host daemon serving an estate it was never started from is H1's whole
+/// point, so the comparison has no object left to make.
+///
+/// **What it is now.** The one thing that was ever load-bearing: does the
+/// estate this command addresses actually validate, right now, as an estate
+/// (§4.1's exact-root check, plus this root's own filesystem reliability)?
+/// The taxonomy is [`crate::runtime::estates::EstateAdmissionError`]'s —
+/// (a) not an estate, (b) admission failed, (c) no estate addressed at all.
+///
+/// It still runs *before* the endpoint is probed, connected to, or used to
+/// decide whether to spawn, for the same reason it always did: a directory
+/// mistake must not be able to reach a daemon at all.
+fn check_binding(estate_root: &Path, operation: &str) -> Result<(), CliError> {
+    crate::runtime::estates::check_estate_root(Some(estate_root), operation)
+        .map(|_| ())
         .map_err(|e| CliError::new(e.to_string()))
 }
 
@@ -2391,14 +2422,14 @@ async fn observe_connect(data_dir: &Path, estate_root: &Path) -> Result<ApiClien
             data_dir.display(),
         )));
     };
-    // §5.1, before the endpoint is touched at all — the same gate
+    // D4, before the endpoint is touched at all — the same gate
     // `ensure_daemon` applies, for the same reason.
-    check_binding(&descriptor, data_dir, estate_root)?;
+    check_binding(estate_root, "this command")?;
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
     if healthz_ok(&http, &descriptor.endpoint).await {
-        return client_for(&descriptor);
+        return client_for(&descriptor, Some(estate_root));
     }
     if daemon::pid_alive(descriptor.pid) {
         return Err(CliError::new(format!(
@@ -2601,10 +2632,11 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
         );
         return Ok(());
     };
-    // §5.1, before the endpoint is touched: stopping is *using* a daemon,
-    // and a daemon bound to another estate is no more this estate's to stop
-    // than it is this estate's to submit to.
-    check_binding(&descriptor, data_dir, estate_root)?;
+    // D4/D5, before the endpoint is touched: `sgt daemon stop` stops the
+    // *host* daemon — every admitted estate's — so the estate this
+    // invocation stands in is validated for the ordinary reason (a directory
+    // mistake must not reach a daemon), not because it owns the daemon.
+    check_binding(estate_root, "sgt daemon stop")?;
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
@@ -2629,7 +2661,23 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
         );
         return Ok(());
     }
-    let client = client_for(&descriptor)?;
+    let client = client_for(&descriptor, Some(estate_root))?;
+
+    // 0. D5: **say what is about to stop.** `sgt daemon stop` stops the
+    // *host* daemon — every admitted estate's, not just the one this
+    // invocation happens to stand in. Before H1 those were the same
+    // sentence; now they are not, and a stop whose blast radius the operator
+    // has to infer is exactly the kind of silent behavior carryover the
+    // recon flagged. The count is read live from `GET /v1/estates` rather
+    // than assumed, and a daemon that cannot answer is reported as an
+    // unknown count rather than a comfortable zero.
+    let affected = match client.estates().await {
+        Ok(body) => body["estates"].as_array().map(Vec::len),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not read the admitted-estate registry");
+            None
+        }
+    };
 
     // 1. Pause admission — MVP-3's drain flag, scoped exactly to this verb.
     // Idempotent: a retry against a still-live, already-paused daemon
@@ -2687,8 +2735,23 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
             descriptor.pid,
         )));
     }
-    report_daemon_stop(json, "stopped", "daemon stopped");
+    report_daemon_stop(json, "stopped", &stopped_message(affected));
     Ok(())
+}
+
+/// D5's blast-radius sentence: what was stopped, and how much it covered.
+///
+/// `None` is an honest "the registry could not be read", never a silent 0 —
+/// telling an operator that no estates were affected when nobody actually
+/// asked is worse than telling them the count is unknown.
+fn stopped_message(affected: Option<usize>) -> String {
+    match affected {
+        Some(1) => "stopped the host daemon; 1 admitted estate affected".to_string(),
+        Some(n) => format!("stopped the host daemon; {n} admitted estates affected"),
+        None => {
+            "stopped the host daemon; the number of admitted estates could not be read".to_string()
+        }
+    }
 }
 
 /// `sgt daemon stop`'s one report shape, human or `--json`.

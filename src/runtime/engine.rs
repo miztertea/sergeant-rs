@@ -1150,20 +1150,6 @@ pub struct Engine {
     /// completion driver alongside [`Self::due_observations`] (see
     /// [`Self::due_interrupts`]).
     pub turn_ceiling: Duration,
-    /// §5.1/§5.2: the one estate this daemon is bound to, admitted at
-    /// startup ([`crate::domain::estate::Estate::admit`]) and pinned
-    /// here for the process's whole life.
-    ///
-    /// **This is the only topology authority.** [`Self::plan`] reads the
-    /// manifest at *this* root; a submission's `origin.cwd` is recorded
-    /// evidence only (§13.3) and can never move it. That is what removes the
-    /// recursion hazard §5.2 names — a child command launched from a Work
-    /// surface rediscovering that linked worktree as a new estate.
-    ///
-    /// `None` only for a daemon started with no estate at all (test rigs and
-    /// the intent-capture path): [`Self::plan`] answers `Ok(None)` there,
-    /// exactly as "no repository context" always has.
-    pub estate_root: Option<PathBuf>,
     /// When each Work's current turn was last (re-)spawned, for the ceiling
     /// sweep. Deliberately **not** journaled or durable: a restart forgets
     /// it, which is acceptable for a soak-test hang bound (never an
@@ -1190,17 +1176,8 @@ impl Engine {
             data_dir: data_dir.to_path_buf(),
             turn_cap: DEFAULT_TURN_CAP,
             turn_ceiling: DEFAULT_TURN_CEILING,
-            estate_root: None,
             turn_started: Arc::new(Mutex::new(BTreeMap::new())),
         }
-    }
-
-    /// Bind this engine to one estate root (§5.1). The daemon calls this
-    /// once at startup with the canonical root it was started against; every
-    /// later [`Self::plan`] reads that estate and no other.
-    pub fn with_estate_root(mut self, estate_root: PathBuf) -> Self {
-        self.estate_root = Some(estate_root);
-        self
     }
 
     /// Override the daemon-wide turn cap (R-MVP1-7). Wired from
@@ -1263,16 +1240,31 @@ impl Engine {
 
     /// Resolve everything a run needs, without touching anything.
     ///
-    /// **§5.2: the request's cwd has no authority here.** Topology comes from
-    /// [`Self::estate_root`] — the one estate this daemon was started
-    /// against — and from nowhere else. `context.cwd` survives only as
-    /// `origin.cwd`, recorded evidence for diagnostics (§13.3).
+    /// **D10: the estate is a per-call parameter, not a field.** The engine
+    /// held one `estate_root` pinned for the process's whole life while a
+    /// daemon served exactly one estate. A host daemon serves many, so the
+    /// estate this submission resolved against is handed in per call — by
+    /// the handler, from the *request*, after the admitted-estate registry
+    /// validated it ([`crate::runtime::estates::EstateRegistry::admit`]).
+    /// The field and `with_estate_root` are removed rather than left
+    /// vestigially in place: a second, stale topology authority sitting
+    /// beside the real one is exactly how estate B's Work gets planned
+    /// against estate A's manifest.
     ///
-    /// `Ok(None)` means "this daemon is bound to no estate": the intent is
-    /// accepted and stays `pending` rather than being rejected, exactly as
-    /// "no repository context" always has. Every *other* failure (a
-    /// `sergeant.toml` that no longer resolves, an unroutable backend, a
-    /// missing workflow) is a real error and is returned as one.
+    /// **§5.2 still holds, and is now the caller's to keep.** The request's
+    /// cwd has no authority here: `context.cwd` survives only as
+    /// `origin.cwd`, recorded evidence for diagnostics (§13.3). What may
+    /// name `estate_root` is an *addressed* root the daemon then validates
+    /// by admission — never a cwd it infers one from, and never a parent
+    /// search. That is what keeps §5.2's recursion hazard closed (a child
+    /// command launched from a Work surface rediscovering that linked
+    /// worktree as a new estate).
+    ///
+    /// `None` means the submission offered no repository context at all: the
+    /// intent is accepted and stays `pending` rather than being rejected,
+    /// exactly as it always has. Every *other* failure (a `sergeant.toml`
+    /// that no longer resolves, an unroutable backend, a missing workflow)
+    /// is a real error and is returned as one.
     ///
     /// "No surface" does not mean "no §13". A submission that *names* a
     /// backend has asked for something, and §13's terminal state for a
@@ -1282,11 +1274,16 @@ impl Engine {
     /// tolerated here, because a captured intent with no repository has
     /// nothing to route yet and no default to disappoint.
     ///
-    /// The manifest is re-read from the pinned root on every plan rather
-    /// than cached from startup, so `sgt repo add` reaches a running daemon
-    /// — the *root* is what startup fixes, and the root is what §5 binds.
-    pub fn plan(&self, context: &SubmitContext<'_>) -> Result<Option<StartPlan>, EngineError> {
-        let estate = match &self.estate_root {
+    /// The manifest is re-read from the addressed root on every plan rather
+    /// than cached, so `sgt repo add` reaches a running daemon — that
+    /// discipline is untouched by D10; only *which* root is re-read changes,
+    /// and it changes per call rather than never.
+    pub fn plan(
+        &self,
+        estate_root: Option<&Path>,
+        context: &SubmitContext<'_>,
+    ) -> Result<Option<StartPlan>, EngineError> {
+        let estate = match estate_root {
             None => None,
             Some(root) => Some(Estate::resolve(root)?),
         };
@@ -4553,13 +4550,28 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let mut draft = EventDraft::new(EventSource::new("daemon", "engine"), kind, payload)
             .with_work_id(work_id);
-        // H1 touch point #4: the one chokepoint every engine-emitted event
-        // goes through, so this is the one place that stamps the pinned
-        // estate root — never the display name (`self.estate_root` is
-        // already canonicalized, `Estate::admit`'s doc). `None` (a daemon
-        // bound to no estate) leaves the field absent, exactly as before.
-        if let Some(root) = &self.estate_root {
-            draft = draft.with_workspace_id(root.to_string_lossy().into_owned());
+        // H1 touch point #4, now per Work rather than per process (D10).
+        //
+        // W1a stamped this from the engine's own pinned `estate_root`, which
+        // was correct while a daemon had exactly one. A host daemon has
+        // none, and reading "the engine's estate" for a Work belonging to
+        // some *other* estate is precisely the silent mis-stamping D10
+        // exists to remove — so the coordinate comes from the Work itself:
+        // the canonical root its `work.submitted` envelope recorded
+        // (`WorkIndexRow::estate_root`), folded from the journal and
+        // therefore identical across a restart and a replay.
+        //
+        // Absent (a Work submitted with no repository context, or a journal
+        // line older than the envelope field) leaves the field absent,
+        // exactly as before — never a guess, and never the display name.
+        if let Some(root) = core
+            .registry
+            .state()
+            .work_index
+            .get(work_id)
+            .and_then(|row| row.estate_root.clone())
+        {
+            draft = draft.with_workspace_id(root);
         }
         core.commit(draft)?;
         Ok(())
@@ -4693,29 +4705,45 @@ mod tests {
         );
     }
 
-    /// H1 touch point #4: `Engine::commit` is the one chokepoint every
-    /// engine-emitted event goes through, so the pinned estate root must
-    /// land in the envelope from there, not from each individual caller —
-    /// and an engine with no estate (test rigs, the intent-capture path)
-    /// must leave the field absent rather than invent a coordinate. Both
-    /// branches live in one test so the `None` half is pinned by a test
-    /// that still fails when the stamping is reverted.
+    /// H1 touch point #4 as D10 leaves it: `Engine::commit` is still the one
+    /// chokepoint every engine-emitted event goes through, but the
+    /// coordinate it stamps is now the **Work's own**, not the engine's.
+    ///
+    /// This is W1a's test evolved, not reverted. W1a proved the stamping
+    /// happens at the chokepoint against an engine pinned to one estate;
+    /// there is no pinned estate any more, and the fact that matters is
+    /// sharper: **one engine, two Works, two different estates, each event
+    /// stamped with its own Work's root.** Under the pinned field this could
+    /// not even be expressed — every event would have carried the same root,
+    /// which is exactly the silent mis-stamping D10 removes. The `None` half
+    /// is kept in the same test, so a revert of the stamping still fails.
     #[test]
-    fn engine_committed_events_stamp_workspace_id_only_when_an_estate_is_pinned() {
+    fn engine_committed_events_stamp_each_works_own_estate_root() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut core = testing::core(dir.path());
-        let estate_root = dir.path().join("estate");
-        let pinned = engine(dir.path()).with_estate_root(estate_root.clone());
-        let unpinned = engine(dir.path()); // no `.with_estate_root(..)`
+        let payments = dir.path().join("estates/payments");
+        let billing = dir.path().join("estates/billing");
+        // One engine — a host daemon has exactly one, serving every estate.
+        let engine = engine(dir.path());
 
-        testing::submit(&mut core, "01PINNED", "carry the estate root");
-        testing::submit(&mut core, "01NOESTATE", "no estate here");
-        pinned
-            .block(&mut core, "01PINNED", "prove workspace_id travels", None)
-            .expect("block pinned");
-        unpinned
-            .block(&mut core, "01NOESTATE", "no estate pinned", None)
-            .expect("block unpinned");
+        testing::submit_in(
+            &mut core,
+            "01PAYMENTS",
+            "carry payments' root",
+            Some(payments.to_string_lossy().as_ref()),
+        );
+        testing::submit_in(
+            &mut core,
+            "01BILLING",
+            "carry billing's root",
+            Some(billing.to_string_lossy().as_ref()),
+        );
+        testing::submit(&mut core, "01NOESTATE", "no repository context at all");
+        for work_id in ["01PAYMENTS", "01BILLING", "01NOESTATE"] {
+            engine
+                .block(&mut core, work_id, "prove workspace_id travels", None)
+                .expect("block");
+        }
 
         let blocked: Vec<_> = core
             .journal
@@ -4731,9 +4759,14 @@ mod tests {
                 .expect("work.blocked journaled")
         };
         assert_eq!(
-            by_work("01PINNED").workspace_id.as_deref(),
-            Some(estate_root.to_string_lossy().as_ref()),
-            "an engine-committed event must carry the daemon's pinned estate root"
+            by_work("01PAYMENTS").workspace_id.as_deref(),
+            Some(payments.to_string_lossy().as_ref()),
+            "each event carries its own Work's estate, not the engine's"
+        );
+        assert_eq!(
+            by_work("01BILLING").workspace_id.as_deref(),
+            Some(billing.to_string_lossy().as_ref()),
+            "the second estate is not the first estate"
         );
         assert_eq!(by_work("01NOESTATE").workspace_id, None);
     }
@@ -6066,6 +6099,7 @@ mod tests {
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
                     last_seq: 1,
+                    estate_root: None,
                 },
             );
             registry.terminal_runs.insert(

@@ -1175,7 +1175,6 @@ async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() 
     let handle = daemon::start_with(
         data.path(),
         DaemonConfig {
-            estate_root: Some(estate.path().to_path_buf()),
             backends: Arc::new(BackendRegistry::new().with(fake.clone())),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             docker: Some(DockerConfig {
@@ -1195,6 +1194,8 @@ async fn a_kind_execute_stage_is_refused_at_submit_when_docker_is_unavailable() 
         .json(&json!({
             "command_id": ulid::Ulid::generate().to_string(),
             "intent": "must be refused before anything exists",
+            // D4: the estate this submission addresses.
+            "estate_root": estate.path(),
             "workflow": "execute-only",
             "origin": {"client": "cli", "cwd": mount},
         }))
@@ -1414,7 +1415,6 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
     let handle = daemon::start_with(
         data.path(),
         DaemonConfig {
-            estate_root: Some(estate.path().to_path_buf()),
             backends: Arc::new(BackendRegistry::new().with(fake)),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             docker: Some(DockerConfig::new(data.path())),
@@ -1431,6 +1431,8 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
         .json(&json!({
             "command_id": ulid::Ulid::generate().to_string(),
             "intent": "prove actor -> execute -> actor",
+            // D4: the estate this submission addresses.
+            "estate_root": estate.path(),
             "workflow": "mixed-proof",
             "origin": {"client": "cli", "cwd": mount},
         }))
@@ -1667,7 +1669,6 @@ async fn cancel_of_a_dirty_multi_repo_estate_retains_a_patch_per_binding() {
     let handle = daemon::start_with(
         data.path(),
         DaemonConfig {
-            estate_root: Some(estate.path().to_path_buf()),
             backends: Arc::new(BackendRegistry::new().with(fake)),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             ..DaemonConfig::default()
@@ -1683,6 +1684,8 @@ async fn cancel_of_a_dirty_multi_repo_estate_retains_a_patch_per_binding() {
         .json(&json!({
             "command_id": ulid::Ulid::generate().to_string(),
             "intent": "dirty two worktrees at once",
+            // D4: the estate this submission addresses.
+            "estate_root": estate.path(),
             "workflow": "tiny",
             "origin": {"client": "cli", "cwd": estate.path()},
             "scope": {"all": true},

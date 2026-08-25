@@ -97,13 +97,15 @@ async fn a_whole_sweep_reads_refs_and_deletes_nothing_but_a_redundant_sergeant_b
         DaemonConfig {
             backends: Arc::new(BackendRegistry::new().with(Arc::new(fake))),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
     .await
     .expect("daemon start");
-    let client = ApiClient::new(&handle.endpoint, &handle.token).expect("client");
+    // D4: the sweep addresses the estate whose `sergeant/*` refs it means.
+    let client = ApiClient::new(&handle.endpoint, &handle.token)
+        .expect("client")
+        .with_estate_root(estate.path());
 
     // A real Work, under the real git, so the branch the sweep classifies is
     // one a materialization actually left behind.
@@ -114,6 +116,7 @@ async fn a_whole_sweep_reads_refs_and_deletes_nothing_but_a_redundant_sergeant_b
                 "command_id": ulid::Ulid::generate().to_string(),
                 "intent": "leave a branch behind",
                 "workflow": "solo",
+                "estate_root": estate.path(),
                 "origin": {"client": "cli", "cwd": estate.path()},
             }),
         )

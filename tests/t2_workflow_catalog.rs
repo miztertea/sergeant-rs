@@ -68,11 +68,10 @@ fn init_estate(path: &Path) {
     .expect("write sergeant.toml");
 }
 
-async fn start_bound(data_dir: &Path, estate_root: &Path) -> DaemonHandle {
+async fn start_bound(data_dir: &Path, _estate_root: &Path) -> DaemonHandle {
     daemon::start_with(
         data_dir,
         daemon::DaemonConfig {
-            estate_root: Some(estate_root.to_path_buf()),
             ..daemon::DaemonConfig::default()
         },
     )
@@ -169,10 +168,13 @@ async fn a_published_workflow_is_listed_fully_described() {
     let handle = start_bound(data.path(), repo.path()).await;
     let (status, body) = get_status(
         &handle,
-        &format!("/v1/workflows?cwd={}", {
+        &format!(
+            // D4: `cwd` is evidence; `estate_root` is what the catalog's
+            // estate-local half is read from, once admitted.
+            "/v1/workflows?cwd={0}&estate_root={0}",
             // Deliberately the same encoding the production client uses.
             urlencoding_stub(&repo.path().display().to_string())
-        }),
+        ),
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK, "{body}");
@@ -270,7 +272,7 @@ async fn unindexed_directories_and_draft_rows_are_excluded() {
     let (status, body) = get_status(
         &handle,
         &format!(
-            "/v1/workflows?cwd={}",
+            "/v1/workflows?cwd={0}&estate_root={0}",
             urlencoding_stub(&repo.path().display().to_string())
         ),
     )
@@ -321,7 +323,7 @@ async fn the_route_appends_no_event() {
     let (status, _) = get_status(
         &handle,
         &format!(
-            "/v1/workflows?cwd={}",
+            "/v1/workflows?cwd={0}&estate_root={0}",
             urlencoding_stub(&repo.path().display().to_string())
         ),
     )
