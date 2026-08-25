@@ -1509,6 +1509,36 @@ fn estate_data_dir() -> DataDir {
     dir
 }
 
+/// H1's two-estate fixture: a **second** estate root, elsewhere on disk, that
+/// addresses the *same* host runtime dir.
+///
+/// Additive on purpose (brief deliverable 10): [`estate_data_dir`] and every
+/// test built on it stay exactly as they were, because single-estate is a
+/// special case of host mode, not a removed mode. The second estate is a
+/// plain `TempDir` rather than a `DataDir` — nothing runs a daemon *for* it;
+/// its Work runs on the host daemon the first estate already spawned, which
+/// is the whole point.
+fn second_estate(name: &str) -> TempDir {
+    let dir = TempDir::new().expect("second estate tempdir");
+    support::scaffold_estate(dir.path(), name, &["solo"]);
+    dir
+}
+
+/// [`sgt_env`] run against `estate_root` with `-C`, while still pointing at
+/// `data_dir` as the host runtime root — the shape a second estate uses to
+/// reach a daemon it did not spawn.
+fn sgt_in(data_dir: &DataDir, estate_root: &Path, args: &[&str]) -> Output {
+    let mut command = std::process::Command::new(SGT);
+    command
+        .current_dir(estate_root)
+        .arg("-C")
+        .arg(estate_root)
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .args(args);
+    command.output().expect("run sgt")
+}
+
 /// Run the sgt binary with args against a data dir; capture output.
 ///
 /// The child runs in the data dir, not in whatever directory `cargo test` was
@@ -1781,9 +1811,29 @@ fn a_data_dir_defaults_onto_disk_not_the_hosts_tmpfs() {
     );
 }
 
+/// **The H1 pair**, replacing `t7_cli_end_to_end_auto_spawn_and_second_
+/// daemon_fails_closed`.
+///
+/// That test asserted one thing twice over: a second *anything* on this data
+/// dir fails closed. H1 splits it, because the two halves now have opposite
+/// answers and both matter:
+///
+/// - a second **estate** is *admitted* into the running daemon and its Work
+///   runs there (H1 §11 criterion 1: two exact-root estates submit Work to
+///   one daemon). This is the invariant H1 inverts, and the old test was its
+///   direct contradiction;
+/// - a second **process** over the host runtime root still fails closed on
+///   `daemon.lock` (H1 §2: one long-lived daemon per user installation).
+///   This is the invariant H1 keeps, and it is *load-bearing* precisely
+///   because the first half now shares one journal between estates.
+///
+/// Both halves live in one test so neither can be quietly dropped: proving
+/// only the first would leave a host that races two journals, and proving
+/// only the second would be the pre-H1 world.
 #[test]
-fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
+fn t7_cli_end_to_end_a_second_estate_is_admitted_and_a_second_process_fails_closed() {
     let dir = estate_data_dir();
+    let other = second_estate("m2-second");
 
     // No daemon running: `sgt run` auto-spawns one and submits.
     let output = sgt(&dir, &["run", "ship the M2 milestone"]);
@@ -1793,7 +1843,26 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // `sgt work list --json` shows it.
+    // --- Half one: a second estate, same daemon, no second process. ---
+    //
+    // This client never spawns: the descriptor is already there and healthy,
+    // so it connects to the daemon the *first* estate started and addresses
+    // its own root. Before H1 this was the `EstateBindingMismatch` refusal.
+    let before = daemon_pids(dir.path());
+    assert_eq!(before.len(), 1, "exactly one daemon so far: {before:?}");
+    let output = sgt_in(&dir, other.path(), &["run", "ship the second estate"]);
+    assert!(
+        output.status.success(),
+        "a second estate must be admitted, not refused: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        daemon_pids(dir.path()),
+        before,
+        "the second estate must reuse the running daemon, never start another"
+    );
+
+    // `sgt work list --json` shows both — one fleet, one daemon, two estates.
     let output = sgt(&dir, &["work", "list", "--json"]);
     assert!(
         output.status.success(),
@@ -1803,29 +1872,96 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
     let listed: Value =
         serde_json::from_slice(&output.stdout).expect("work list --json must print JSON");
     let works = listed["works"].as_array().expect("works array");
-    assert_eq!(works.len(), 1);
-    assert_eq!(works[0]["intent"], "ship the M2 milestone");
-    // §5.2: the auto-spawned daemon is bound to the estate this client
-    // admitted (`spawn_daemon` names it with `-C`), so the submission is
-    // planned and run rather than parked. `completed` is the fake backend's
-    // deterministic answer — every stage settles inside the submit call — and
-    // asserting it is what proves the spawned daemon really adopted *this*
-    // estate: a daemon bound to nothing would have left this `pending`.
-    assert_eq!(works[0]["state"], "completed");
-    assert_eq!(works[0]["repositories"], json!(["solo"]));
-    assert_eq!(works[0]["created_by"], "cli");
+    assert_eq!(
+        works.len(),
+        2,
+        "both estates' Work is on one daemon: {listed}"
+    );
+    let by_intent = |intent: &str| {
+        works
+            .iter()
+            .find(|w| w["intent"] == intent)
+            .unwrap_or_else(|| panic!("{intent} missing from {listed}"))
+            .clone()
+    };
+    for intent in ["ship the M2 milestone", "ship the second estate"] {
+        let work = by_intent(intent);
+        // `completed` is the fake backend's deterministic answer — every
+        // stage settles inside the submit call — and asserting it is what
+        // proves the daemon really planned against *that* submission's
+        // estate: an unaddressed submission would have stayed `pending`.
+        assert_eq!(work["state"], "completed", "{intent}: {work}");
+        assert_eq!(work["repositories"], json!(["solo"]));
+        assert_eq!(work["created_by"], "cli");
+    }
 
-    // A second daemon on the same data dir fails closed.
+    // H1 §11 criterion 5, on the same rig: **one journal reconstructs both
+    // estates.** Every Work's own canonical estate root is on the envelope
+    // (D1), so a replay can tell them apart without a second journal, a
+    // second projection, or an estate UUID.
+    let mut roots: Vec<String> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == KIND_WORK_SUBMITTED)
+        .map(|e| {
+            e.workspace_id
+                .clone()
+                .expect("submitted carries its estate")
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let mut expected = vec![
+        std::fs::canonicalize(dir.path())
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned(),
+        std::fs::canonicalize(other.path())
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    expected.sort();
+    assert_eq!(
+        roots, expected,
+        "one journal must reconstruct both estates by their own coordinates"
+    );
+
+    // And the registry says so out loud (H1 §4): both roots admitted,
+    // observationally, because both were addressed.
+    let output = sgt(&dir, &["daemon", "stop", "--json"]);
+    assert!(
+        output.status.success(),
+        "daemon stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stopped: Value =
+        serde_json::from_slice(&output.stdout).expect("daemon stop --json prints JSON");
+    // D5: the blast radius is stated, not left for the operator to infer —
+    // `sgt daemon stop` stops the *host* daemon, every admitted estate's.
+    let message = stopped["message"].as_str().expect("message");
+    assert!(
+        message.contains("host daemon") && message.contains("2 admitted estates"),
+        "daemon stop must name its blast radius: {message}"
+    );
+
+    // --- Half two: a second *process* still fails closed on the host lock. ---
+    let output = sgt(&dir, &["run", "restart the daemon"]);
+    assert!(
+        output.status.success(),
+        "sgt run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let output = sgt(&dir, &["daemon"]);
     assert!(
         !output.status.success(),
-        "second daemon must fail closed, got: {}",
+        "a second daemon process must fail closed, got: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("another daemon"),
-        "second daemon should explain the lock, got: {stderr}"
+        "the second process should explain the lock, got: {stderr}"
     );
 
     stop_daemon(dir.path());

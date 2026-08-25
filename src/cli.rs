@@ -2663,6 +2663,22 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
     }
     let client = client_for(&descriptor, Some(estate_root))?;
 
+    // 0. D5: **say what is about to stop.** `sgt daemon stop` stops the
+    // *host* daemon — every admitted estate's, not just the one this
+    // invocation happens to stand in. Before H1 those were the same
+    // sentence; now they are not, and a stop whose blast radius the operator
+    // has to infer is exactly the kind of silent behavior carryover the
+    // recon flagged. The count is read live from `GET /v1/estates` rather
+    // than assumed, and a daemon that cannot answer is reported as an
+    // unknown count rather than a comfortable zero.
+    let affected = match client.estates().await {
+        Ok(body) => body["estates"].as_array().map(Vec::len),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not read the admitted-estate registry");
+            None
+        }
+    };
+
     // 1. Pause admission — MVP-3's drain flag, scoped exactly to this verb.
     // Idempotent: a retry against a still-live, already-paused daemon
     // journals nothing new (`pause_admission`'s own doc).
@@ -2719,8 +2735,23 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
             descriptor.pid,
         )));
     }
-    report_daemon_stop(json, "stopped", "daemon stopped");
+    report_daemon_stop(json, "stopped", &stopped_message(affected));
     Ok(())
+}
+
+/// D5's blast-radius sentence: what was stopped, and how much it covered.
+///
+/// `None` is an honest "the registry could not be read", never a silent 0 —
+/// telling an operator that no estates were affected when nobody actually
+/// asked is worse than telling them the count is unknown.
+fn stopped_message(affected: Option<usize>) -> String {
+    match affected {
+        Some(1) => "stopped the host daemon; 1 admitted estate affected".to_string(),
+        Some(n) => format!("stopped the host daemon; {n} admitted estates affected"),
+        None => {
+            "stopped the host daemon; the number of admitted estates could not be read".to_string()
+        }
+    }
 }
 
 /// `sgt daemon stop`'s one report shape, human or `--json`.

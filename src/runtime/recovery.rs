@@ -371,6 +371,132 @@ mod tests {
     };
     use crate::runtime::testing;
 
+    /// Scaffold a minimal valid estate at `root`.
+    fn scaffold(root: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(root).expect("estate dir");
+        std::fs::write(
+            root.join("sergeant.toml"),
+            format!("[estate]\nname = {name:?}\n"),
+        )
+        .expect("manifest");
+    }
+
+    /// **The D10 trap, named as an acceptance test rather than hoped for.**
+    ///
+    /// Recovery never filtered by estate — there was only ever one — so under
+    /// a host journal it will happily walk two estates' Work in one pass.
+    /// That is right for H1 §11 criterion 5 and wrong for everything after
+    /// it: every *action* recovery takes goes through the engine, which used
+    /// to carry one pinned estate, so estate B's Work would have been resumed
+    /// against estate A's topology. Silently — a mis-plan, or a confusing
+    /// `Estate::resolve` error against the wrong root, never a named refusal.
+    ///
+    /// With the engine's field gone (D10), each Work's estate is resolved
+    /// from its own journaled coordinate (D1) and **re-admitted** before it
+    /// is acted on. This proves both halves at once, which is the point: one
+    /// pass, two estates, one of them broken — the broken estate's Work
+    /// blocks with the admission refusal as its reason, and its neighbour is
+    /// reconciled exactly as it would have been alone.
+    #[test]
+    fn a_work_whose_estate_no_longer_admits_blocks_and_its_neighbour_still_reconciles() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let payments = dir.path().join("payments");
+        let billing = dir.path().join("billing");
+        scaffold(&payments, "payments");
+        scaffold(&billing, "billing");
+        let mut core = testing::core(dir.path());
+        let engine = Engine::new(Arc::new(BackendRegistry::new()), None, dir.path());
+        let estates = EstateRegistry::new();
+
+        // Reconciled in work-id order: the vanished estate's Work first, so a
+        // regression that let it abort the pass would take the survivor with
+        // it.
+        let vanished = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let survivor = "01BBBBBBBBBBBBBBBBBBBBBBBB";
+        for (work_id, root) in [(vanished, &payments), (survivor, &billing)] {
+            testing::submit_in(
+                &mut core,
+                work_id,
+                "in flight across a restart",
+                Some(root.to_string_lossy().as_ref()),
+            );
+            testing::commit(
+                &mut core,
+                work_id,
+                KIND_WORKFLOW_BOUND,
+                json!({
+                    "workflow": {"name": "tiny", "version": "1", "source": "test",
+                                 "stages": [{"id": "00-first", "context": "c"}]},
+                    "backend": "vanished",
+                }),
+            );
+            testing::commit(
+                &mut core,
+                work_id,
+                KIND_STAGE_ENTERED,
+                json!({"stage_id": "00-first", "index": 0, "attempt": 1}),
+            );
+            testing::commit(
+                &mut core,
+                work_id,
+                KIND_EXECUTION_STARTED,
+                json!({"execution": {
+                    "execution_id": "e1",
+                    "backend": "vanished",
+                    "native_id": "n1",
+                    "stage_id": "00-first",
+                    "attempt": 1,
+                    "stop_requested": false,
+                }}),
+            );
+            testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+        }
+
+        // One estate's manifest is gone by the time the daemon restarts —
+        // deleted, renamed, an unmounted volume. Its coordinate is still in
+        // the journal, which is exactly the situation that must fail closed
+        // rather than be resolved against whatever else is lying around.
+        std::fs::remove_file(payments.join("sergeant.toml")).expect("break payments");
+
+        let report = reconcile(&engine, &estates, &mut core).expect("recovery must not abort");
+        assert_eq!(
+            report.blocked,
+            vec![vanished.to_string(), survivor.to_string()],
+            "both block here — but for different reasons, asserted below"
+        );
+
+        // The vanished estate's Work names *the estate* as the reason, with
+        // the admission diagnostic as its evidence — not a backend error, and
+        // not a mis-plan against some other estate.
+        let blocked = events(&core, vanished, KIND_WORK_BLOCKED);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(
+            blocked[0]["reason"], "this Work's estate could not be re-admitted at startup",
+            "the refusal must name the estate, not the symptom: {}",
+            blocked[0]
+        );
+        assert!(
+            blocked[0]["evidence"]
+                .as_str()
+                .is_some_and(|e| e.contains("no estate found") && e.contains("payments")),
+            "the admission refusal itself is the evidence: {}",
+            blocked[0]
+        );
+
+        // The survivor never touched the broken estate: it reconciled on its
+        // own terms and blocked for its own (its backend is not registered).
+        let blocked = events(&core, survivor, KIND_WORK_BLOCKED);
+        assert_eq!(blocked.len(), 1);
+        assert_ne!(
+            blocked[0]["reason"], "this Work's estate could not be re-admitted at startup",
+            "one estate's failure must not be charged to another's Work: {}",
+            blocked[0]
+        );
+        estates
+            .admit(&billing)
+            .expect("the surviving estate still admits");
+    }
+
     /// §25's fail-closed rule is stated per work: "ambiguous states fail
     /// closed to `blocked` with evidence". One work whose reconciliation
     /// *errors* — not "is ambiguous", but fails outright — must therefore

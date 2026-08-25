@@ -8,13 +8,13 @@
 //! loopback endpoint), plus a real git fixture the same way `tests/
 //! m8_estate_cli.rs` builds one for `sgt repo add`'s populate-or-verify.
 //!
-//! Every estate here uses the default `<estate_root>/.sergeant/data` layout
-//! and starts its daemon **bound** to the estate root (estate-root §5.1):
-//! `src/api.rs`'s `resolve_estate_root` reads that binding off the engine
-//! rather than walking up from `data_dir`, so these routes depend on nothing
-//! but the root the daemon was started against — and, as before, not at all
-//! on the test process's own working directory (`current_dir` is global
-//! process state, and nothing here needs to touch it).
+//! Every estate here uses the default `<estate_root>/.sergeant/data` layout.
+//! Under H1 the daemon is bound to **no** estate: `src/api.rs`'s
+//! `resolve_estate_root` reads the estate off the *request* (D4) and admits
+//! it, so these routes depend on nothing but the root each request names —
+//! and, as before, not at all on the test process's own working directory
+//! (`current_dir` is global process state, and nothing here needs to touch
+//! it).
 
 use std::path::Path;
 use std::process::Command;
@@ -22,7 +22,7 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use sergeant_rs::api::ApiClient;
+use sergeant_rs::api::{ApiClient, ClientError};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -439,6 +439,124 @@ async fn get_doctor_matches_the_shape_sgt_doctor_json_already_prints() {
     let names: Vec<&str> = checks.iter().filter_map(|c| c["name"].as_str()).collect();
     assert!(names.contains(&"estate"), "{names:?}");
     assert!(names.contains(&"disk_pressure"), "{names:?}");
+
+    handle.shutdown().await;
+}
+
+// ------------------------------------------------- H1: the estate registry
+
+/// `GET /v1/estates` (H1 §4, brief deliverable 6): the registry is
+/// **observational**. It is empty on a daemon nobody has addressed, gains a
+/// row the moment one is, and never gains a row for a root that failed
+/// admission — a refused admission is not an observation.
+#[tokio::test]
+async fn get_estates_is_empty_until_a_request_addresses_one() {
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
+
+    let unaddressed = ApiClient::new(&handle.endpoint, &handle.token).expect("client");
+    let listed = unaddressed.estates().await.expect("GET /v1/estates");
+    assert_eq!(
+        listed["estates"].as_array().expect("estates").len(),
+        0,
+        "a host daemon starts bound to zero estates: {listed}"
+    );
+
+    // A root that is not an estate is refused *and leaves no row*.
+    let bogus = TempDir::new().expect("tempdir");
+    let refused = ApiClient::new(&handle.endpoint, &handle.token)
+        .expect("client")
+        .with_estate_root(bogus.path());
+    refused
+        .repos()
+        .await
+        .expect_err("a non-estate must be refused");
+    let listed = unaddressed.estates().await.expect("GET /v1/estates");
+    assert_eq!(
+        listed["estates"].as_array().expect("estates").len(),
+        0,
+        "a refused admission must not become a registry row: {listed}"
+    );
+
+    // A real one is admitted on first contact, and reported with its
+    // canonical root, its display name, and its availability.
+    let client = client_for(&handle, root.path());
+    client.repos().await.expect("GET /v1/estate/repos");
+    let listed = unaddressed.estates().await.expect("GET /v1/estates");
+    let rows = listed["estates"].as_array().expect("estates");
+    assert_eq!(rows.len(), 1, "{listed}");
+    assert_eq!(
+        rows[0]["root"],
+        Value::String(
+            std::fs::canonicalize(root.path())
+                .expect("canonical")
+                .to_string_lossy()
+                .into_owned()
+        ),
+        "the coordinate is the canonical root (D1), never the display name"
+    );
+    assert_eq!(rows[0]["name"], "t3-estate");
+    assert_eq!(rows[0]["available"], true);
+    assert!(rows[0]["admitted_at"].is_string(), "{listed}");
+
+    handle.shutdown().await;
+}
+
+/// D4's refusal taxonomy, over the wire, on a route that cannot proceed
+/// without an estate:
+///
+/// - (c) no estate addressed at all → `404 no_estate`, naming what to send;
+/// - (a) a root that is not an estate → `422 invalid_estate`, carrying
+///   §4.4's own corrective block rather than a summary of it.
+///
+/// This is the negative the retired "bound to a different estate" refusal
+/// used to carry, re-pointed rather than dropped: what must never happen is
+/// serving a request for an estate nobody validated, and that is still
+/// exactly what happens here.
+#[tokio::test]
+async fn an_unaddressed_or_unadmitted_estate_is_refused_by_name() {
+    let (root, data_dir) = estate();
+    let handle = start(&data_dir, root.path()).await;
+
+    let unaddressed = ApiClient::new(&handle.endpoint, &handle.token).expect("client");
+    let err = unaddressed
+        .repos()
+        .await
+        .expect_err("an estate-scoped route with no estate must refuse");
+    let ClientError::Api {
+        status,
+        code,
+        message,
+    } = &err
+    else {
+        panic!("expected a structured refusal, got {err}");
+    };
+    assert_eq!((*status, code.as_str()), (404, "no_estate"), "{err}");
+    assert!(
+        message.contains("estate_root"),
+        "the refusal must say what to send: {message}"
+    );
+
+    let bogus = TempDir::new().expect("tempdir");
+    let err = ApiClient::new(&handle.endpoint, &handle.token)
+        .expect("client")
+        .with_estate_root(bogus.path())
+        .repos()
+        .await
+        .expect_err("a root that is not an estate must refuse");
+    let ClientError::Api {
+        status,
+        code,
+        message,
+    } = &err
+    else {
+        panic!("expected a structured refusal, got {err}");
+    };
+    assert_eq!((*status, code.as_str()), (422, "invalid_estate"), "{err}");
+    assert!(
+        message.contains("does not search parent directories"),
+        "§4.4's own diagnostic must survive to the client verbatim: {message}"
+    );
 
     handle.shutdown().await;
 }
