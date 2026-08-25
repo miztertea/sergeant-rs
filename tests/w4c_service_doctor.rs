@@ -1,14 +1,16 @@
-//! W4c acceptance: service packaging + doctor host rows (#275/#276).
+//! W4c acceptance: service packaging + doctor host rows (#275/#276), plus
+//! the #282 stretch.
 //!
 //! `sgt daemon install-service [--print]` (generation, idempotent write,
 //! capability-probe-gated enablement) · the `host_service_manager` and
-//! `legacy_estate_runtime` doctor rows · `sgt init`'s host-bootstrap branch.
-//! Mirrors `m8_estate_cli.rs`'s own shape: every verb here is either
-//! non-daemon-spawning plumbing (`install-service`, `doctor`, `init` — no
-//! `support::DataDir` guard needed) or reuses `tests/support`'s injectable
-//! fake-binary precedent (`runtime::git::GIT_BIN_ENV`'s sibling,
-//! `SGT_SYSTEMCTL_BIN`) to exercise the capability probe without a real
-//! systemd user session.
+//! `legacy_estate_runtime` doctor rows · `sgt init`'s host-bootstrap branch
+//! · `doc_routes`' managed-block scoping of the `sergeant-rs-workspace`
+//! rule (#282). Mirrors `m8_estate_cli.rs`'s own shape: every verb here is
+//! either non-daemon-spawning plumbing (`install-service`, `doctor`,
+//! `init` — no `support::DataDir` guard needed) or reuses `tests/
+//! support`'s injectable fake-binary precedent (`runtime::git::
+//! GIT_BIN_ENV`'s sibling, `SGT_SYSTEMCTL_BIN`) to exercise the capability
+//! probe without a real systemd user session.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -582,4 +584,93 @@ fn init_host_bootstrap_never_installs_a_service_or_touches_daemon_state() {
             .exists(),
         "`sgt init` must never install the LaunchAgent on its own"
     );
+}
+
+// ------------------------------------------------------- doc_routes (#282)
+
+/// guard-map (#282): a private, unshipped `sergeant-rs-workspace` path
+/// cited in `AGENTS.md`'s *user-authored* content (outside the
+/// `sgt:managed` block) must not fail `doc_routes` — the exact false
+/// positive this issue names, found live on the dev workspace's own
+/// estate, whose constitution legitimately cites its own repo name.
+/// Mutation this kills: reverting the managed-block scoping back to a
+/// whole-file substring check.
+#[test]
+fn doc_routes_ignores_a_workspace_citation_outside_the_managed_block() {
+    let root = tempfile::TempDir::new().expect("tempdir");
+    scaffold_bare_estate(root.path(), "doc-routes-user-content-test");
+    std::fs::write(
+        root.path().join("AGENTS.md"),
+        "# my constitution\n\n\
+         see sergeant-rs-workspace's development record for context.\n\n\
+         <!-- sgt:managed:begin -->\n\
+         managed body, no workspace citation here\n\
+         <!-- sgt:managed:end -->\n",
+    )
+    .expect("write AGENTS.md");
+    let home = tempfile::TempDir::new().expect("fake home");
+    let data_dir = root.path().join("data-dir");
+
+    let out = run(
+        root.path(),
+        Some(&data_dir),
+        &[("HOME", home.path().to_str().expect("utf8"))],
+        &["--json", "doctor"],
+    );
+    let json = out.json();
+    let row = json["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "doc_routes")
+        .expect("doc_routes row present");
+    assert_eq!(
+        row["status"].as_str(),
+        Some("ok"),
+        "a workspace citation outside the managed block must not fail: {row}"
+    );
+}
+
+/// guard-map (#282): the same substring *inside* the `sgt:managed` block —
+/// sgt-owned content — still fails, exactly as before. This is what proves
+/// the fix scoped the rule rather than disabling it.
+#[test]
+fn doc_routes_still_fails_when_the_managed_block_itself_cites_the_workspace() {
+    let root = tempfile::TempDir::new().expect("tempdir");
+    scaffold_bare_estate(root.path(), "doc-routes-managed-content-test");
+    std::fs::write(
+        root.path().join("AGENTS.md"),
+        "# my constitution\n\n\
+         <!-- sgt:managed:begin -->\n\
+         this managed body cites sergeant-rs-workspace directly\n\
+         <!-- sgt:managed:end -->\n",
+    )
+    .expect("write AGENTS.md");
+    let home = tempfile::TempDir::new().expect("fake home");
+    let data_dir = root.path().join("data-dir");
+
+    let out = run(
+        root.path(),
+        Some(&data_dir),
+        &[("HOME", home.path().to_str().expect("utf8"))],
+        &["--json", "doctor"],
+    );
+    let json = out.json();
+    let row = json["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "doc_routes")
+        .expect("doc_routes row present");
+    assert_eq!(
+        row["status"].as_str(),
+        Some("fail"),
+        "a workspace citation inside the managed block must still fail: {row}"
+    );
+    let detail = row["detail"].as_str().expect("detail present");
+    assert!(
+        detail.contains("sergeant-rs-workspace"),
+        "the detail must still name the offending citation, got: {detail}"
+    );
+    assert!(row["remedy"].as_str().is_some());
 }

@@ -3744,8 +3744,17 @@ pub(crate) mod doctor {
     ///
     /// Two unconditional severities:
     /// - The literal substring `sergeant-rs-workspace` anywhere in the
-    ///   installed corpus is always a `Fail` — a route into a private,
-    ///   unshipped repository is wrong in principle for a consumer estate.
+    ///   sgt-owned corpus is a `Fail` — a route into a private, unshipped
+    ///   repository is wrong in principle for a consumer estate. #282: for
+    ///   `AGENTS.md` this is scoped to the `sgt:managed` block only — the
+    ///   rest of the file is user-authored content
+    ///   (`domain::distro::write_agents_md`'s own contract), and a consumer
+    ///   estate's own constitution citing its own paths is not this
+    ///   binary's mistake to fail on (found live on the dev workspace's own
+    ///   estate, whose `AGENTS.md` legitimately cites
+    ///   `sergeant-rs-workspace` paths because that estate IS that
+    ///   repository). A malformed `AGENTS.md` with no markers falls back to
+    ///   the whole file — fail closed, never a silent skip.
     /// - A dead `AGENTS.md ... step N` anchor cited anywhere when
     ///   `AGENTS.md` itself has no matching `step N` text.
     ///
@@ -3786,12 +3795,42 @@ pub(crate) mod doctor {
                 continue;
             };
             let rel = path.strip_prefix(estate_root).unwrap_or(path);
+            let is_agents_md = *path == estate_root.join("AGENTS.md");
 
-            if text.contains("sergeant-rs-workspace") {
+            // #282: `AGENTS.md` outside the `sgt:managed` block is
+            // user-authored (`domain::distro::write_agents_md`'s own
+            // contract) — a consumer estate's own constitution citing its
+            // own paths (including, on this very repo's dev estate, a path
+            // that happens to spell `sergeant-rs-workspace` because that IS
+            // this estate) is not sgt's mistake to fail on. Every other
+            // source here (`skills/`, `.sergeant/workflows/`,
+            // `.sergeant/common/contexts/`) is entirely sgt-owned, so the
+            // unconditional rule still applies to the whole file there.
+            // A malformed `AGENTS.md` with no markers at all falls back to
+            // checking the whole file — fail closed, never silently skip.
+            let workspace_check_text: &str = if is_agents_md {
+                match (
+                    text.find(crate::domain::distro::MANAGED_BEGIN),
+                    text.find(crate::domain::distro::MANAGED_END),
+                ) {
+                    (Some(begin), Some(end)) if begin <= end => {
+                        &text[begin..end + crate::domain::distro::MANAGED_END.len()]
+                    }
+                    _ => &text,
+                }
+            } else {
+                &text
+            };
+            if workspace_check_text.contains("sergeant-rs-workspace") {
                 fails.push(format!(
                     "{} cites `sergeant-rs-workspace` — a private, unshipped repository \
-                     path",
-                    rel.display()
+                     path{}",
+                    rel.display(),
+                    if is_agents_md {
+                        " (inside the sgt:managed block)"
+                    } else {
+                        ""
+                    }
                 ));
             }
 
