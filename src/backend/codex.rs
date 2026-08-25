@@ -853,9 +853,12 @@ const ADMISSION_ROWS: &[AdmissionRow] = &[
         // second function under the spec's literal name. Naming the real
         // function here keeps this citation resolvable.
         admission_test: "first_turn_argv_carries_the_measured_shape",
-        note: "turn-1-only: exec resume has neither -s nor --add-dir on this build -- the \
-               composed-flags handshake is proven, enforcement itself is not (bwrap cannot \
-               initialize a network namespace on Cerberus, H0 §C.3 finding 4)",
+        note: "turn-1 grants --add-dir directly; exec resume has neither -s nor --add-dir on \
+               this build, but #259/W5b re-composes --add-dir's writable-roots effect via \
+               `-c sandbox_workspace_write.writable_roots` on resume, so only -s/network_access \
+               remains turn-1-only -- the composed-flags handshake is proven, enforcement itself \
+               is not (bwrap cannot initialize a network namespace on Cerberus, H0 §C.3 finding \
+               4)",
     },
     AdmissionRow {
         capability: "sandbox_enforcement",
@@ -3474,10 +3477,10 @@ impl CodexBackend {
         };
 
         let output_schema_path = self.output_schema_path();
+        let mut extra_dirs = bindings_outside_cwd.clone();
+        extra_dirs.extend(git_worktree_common_dirs.iter().cloned());
         let mut command = Command::new(&executable);
         if first_turn {
-            let mut extra_dirs = bindings_outside_cwd.clone();
-            extra_dirs.extend(git_worktree_common_dirs.iter().cloned());
             command.args(first_turn_argv(
                 &cwd,
                 model.as_deref(),
@@ -3490,8 +3493,6 @@ impl CodexBackend {
             let thread_id = thread_id.clone().ok_or_else(|| {
                 self.err_failed("cannot send: no thread id recorded for this execution")
             })?;
-            let mut extra_dirs = bindings_outside_cwd.clone();
-            extra_dirs.extend(git_worktree_common_dirs.iter().cloned());
             command.args(resume_turn_argv(
                 &thread_id,
                 model.as_deref(),
