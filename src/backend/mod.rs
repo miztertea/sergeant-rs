@@ -33,7 +33,7 @@
 //! backend cannot complete a stage by exiting, and cannot fail one by dying.
 
 /// The `agy --print --output-format stream-json` adapter (W1 of the *Sergeant
-/// speaks Antigravity* sprint, `docs/proposals/agy-adapter-2026-08-23.md` —
+/// speaks Antigravity* sprint, `sergeant-rs-workspace's knowledge/evidence/reference/agy-adapter-2026-08-23.md` —
 /// see the module's own doc comment for the measurements it rests on).
 /// Registration in `daemon.rs` and every CLI surface remain W2's gap (K2:
 /// this wave is the adapter and nothing else): this module compiles, is unit-
@@ -50,7 +50,7 @@ pub mod codex;
 pub mod docker;
 pub mod fake;
 /// The `opencode run --format json` adapter (W1 of the *Sergeant speaks
-/// OpenCode* sprint, `docs/proposals/opencode-adapter-2026-08-23.md` — see
+/// OpenCode* sprint, `sergeant-rs-workspace's knowledge/evidence/reference/opencode-adapter-2026-08-23.md` — see
 /// the module's own doc comment for the measurements it rests on).
 /// Registration in `daemon.rs` and every CLI surface remain W2's gap (K2:
 /// this wave is the adapter and nothing else): this module compiles, is unit-

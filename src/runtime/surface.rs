@@ -463,7 +463,7 @@ pub struct PatchInfo {
 /// separately from the flat dirty patch (#240): a per-stage-labeled copy
 /// of whatever real files existed under `<stage-dir>/output/` (excluding
 /// `README.md`, which is the declaration, not an artifact — Rule 4,
-/// `docs/icm/convention.md`) at the moment the worktree was about to be
+/// the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md)) at the moment the worktree was about to be
 /// removed. Exists so a reader can retrieve one stage's evidence
 /// directly, without reconstructing it from the flat patch that already
 /// bundles it in with every other change.
@@ -650,10 +650,11 @@ impl TeardownReport {
     /// shows a closing stage that declared a commit as its durable outcome
     /// but never actually advanced the branch and left the worktree dirty —
     /// the safety net for when an actor guesses wrong about its own runtime
-    /// model (`docs/adr/0007-actor-runtime-contract.md`).
+    /// model (`ADR 0007`).
     ///
-    /// The engine still learns nothing about what a commit *is* (NORTH-STAR:
-    /// "the engine learns no output vocabulary; only the pointer is core"):
+    /// The engine still learns nothing about what a commit *is* (the
+    /// workspace knowledge library's North Star ruling: "the engine learns
+    /// no output vocabulary; only the pointer is core"):
     /// this reads two facts the pointer already computes — a binding's
     /// teardown disposition, and whether its finalize commit ever moved past
     /// the surface's own base SHA — rather than asking any workflow what it
@@ -1140,7 +1141,7 @@ pub fn rematerialize(data_dir: &Path, surface: &WorkSurface) -> Result<WorkSurfa
 /// Materialize a gate Work's surface by *attaching* to another, already-
 /// terminal Work's branches instead of minting fresh ones (§8.6
 /// investigation, Mechanism A —
-/// `docs/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`).
+/// `sergeant-rs-workspace's knowledge/evidence/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`).
 ///
 /// Every attached binding's `work_branch` is `target_bindings`'s own — this
 /// *is* `target_work_id`'s real branch, not a copy, which is what lets
@@ -1831,7 +1832,7 @@ fn retain_dirty(
 /// retained-evidence area [`capture_dirty_patch`] writes its patch into.
 /// A stage directory is any top-level entry of the worktree that has an
 /// `output/` subdirectory; nothing here consults the workflow catalog
-/// (Rule 4, `docs/icm/convention.md`: "no engine collection, no artifact
+/// (Rule 4, the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md): "no engine collection, no artifact
 /// manifest machinery" — the worktree's own filesystem shape is ground
 /// truth, exactly as [`capture_dirty_patch`] already treats it). Returns
 /// one [`RetainedStageOutput`] per stage directory that actually had a
@@ -1968,7 +1969,7 @@ fn copy_declared_output_artifacts_at(
     bytes
 }
 
-/// #260 Q4 / Amendment 9's general finalize sweep, `docs/icm/convention.md`
+/// #260 Q4 / Amendment 9's general finalize sweep, the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md)
 /// §1a's "merge-back semantics": run once per binding at Work close,
 /// **before** [`teardown`]'s own dirty check, so a promote-class deliverable
 /// ships in the branch's history and an evidence-class `output/` never does.
@@ -5238,7 +5239,7 @@ mod tests {
     }
 
     /// #240: a stage's declared `output/` artifacts (Rule 4,
-    /// `docs/icm/convention.md`) must survive a dirty teardown as their own
+    /// the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md)) must survive a dirty teardown as their own
     /// retrievable, per-stage-labeled copy — not just bundled, undiscoverably,
     /// inside the flat `.dirty.patch` alongside every other change. Two
     /// stage directories, one with a real artifact plus its `README.md`

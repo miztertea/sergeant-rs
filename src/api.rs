@@ -303,7 +303,7 @@ impl Core {
 /// (`surface.materialized`, `workflow.bound`, `work.started`,
 /// `stage.entered`, `execution.reserved`) — several holds per work, not one,
 /// and the two-phase boundary added two of those events per work
-/// (`docs/perf/n3-two-phase-boundary-2026-08-10.md`); at one fsync each, on a
+/// (`sergeant-rs-workspace's knowledge/evidence/perf/n3-two-phase-boundary-2026-08-10.md`); at one fsync each, on a
 /// single-writer path, that volume *is* the cost. Sharing the fsync is legal
 /// because **almost nothing outside the core runs during a hold**: the mutex
 /// is held, no response has been rendered, no SSE frame sent, and §22.6
@@ -1906,8 +1906,9 @@ fn integrity_view(run: &WorkRun) -> Option<Value> {
 /// outcome must not be reported as plain `completed` when the branch never
 /// advanced and the worktree was left dirty — the safety net for when an
 /// actor guesses wrong about its own runtime model anyway
-/// (`docs/adr/0007-actor-runtime-contract.md`). The engine still learns
-/// nothing about what a commit *is* (NORTH-STAR: "the engine learns no
+/// (`ADR 0007`). The engine still learns
+/// nothing about what a commit *is* (the workspace knowledge library's
+/// North Star ruling: "the engine learns no
 /// output vocabulary; only the pointer is core"): this reads two facts the
 /// pointer already computes — a binding's teardown disposition, and whether
 /// its finalize commit ever moved past the surface's own base SHA — rather
@@ -2521,7 +2522,7 @@ fn transcript_turns(work_id: &str, events: Vec<Event>, data_dir: &std::path::Pat
     // assistant_lines`) produces the same count of entries in the same
     // order. The blob-decode fallback below skips that many leading lines
     // from the archive rather than an all-or-nothing flag, so a crash that
-    // lands between two of a turn's own assistant-line appends (docs/DEVELOPMENT.md's
+    // lands between two of a turn's own assistant-line appends (CONTRIBUTING.md's
     // "adjacent-append crash window") still recovers the lines that never
     // reached the journal, instead of either double-reporting the ones that
     // did or silently dropping the ones that didn't. Removed on consumption
@@ -6020,7 +6021,7 @@ mod tests {
     /// `partial_turn` fixture models). The event sink here converts every
     /// `EventDraft` into a real journaled `Event`, exactly as the daemon's
     /// own `journaling_sink` does, **except** it drops
-    /// `conversation.assistant.completed` — modeling docs/DEVELOPMENT.md's own
+    /// `conversation.assistant.completed` — modeling CONTRIBUTING.md's own
     /// "adjacent-append crash window" (an event handed to the sink but
     /// never durably committed before the process holding it dies), which is
     /// this module's own doc comment's stated reason `decode_partial_

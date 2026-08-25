@@ -64,11 +64,11 @@ pub const CONTEXT_FILE: &str = "CONTEXT.md";
 pub const DEFAULT_WORKFLOW: &str = "software-change";
 /// Source marker for the embedded built-in workflow.
 pub const SOURCE_EMBEDDED: &str = "embedded";
-/// A workflow directory's own OKF front-matter file (`docs/icm/
+/// A workflow directory's own OKF front-matter file (`sergeant-rs-workspace's knowledge/rulings/icm/
 /// record-shapes.md` §1) — distinct from the root catalog below.
 pub const INDEX_FILE: &str = "index.md";
-/// The root workflow catalog (`docs/icm/record-shapes.md` §1 rule 2,
-/// `docs/icm/convention.md` §1 rule 1): "the list, not an entry". Lists every
+/// The root workflow catalog (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 rule 2,
+/// `sergeant-rs-workspace's knowledge/rulings/icm/convention.md` §1 rule 1): "the list, not an entry". Lists every
 /// `status: published` workflow under [`WORKFLOW_ROOT`]; drafts and
 /// unindexed directories are never in it (§11.1's Decision T2-39).
 pub const ROOT_CATALOG_FILE: &str = ".sergeant/index.md";
@@ -826,7 +826,7 @@ impl WorkflowDefinition {
 }
 
 /// Authored fields from a workflow's own `index.md` front matter
-/// (`docs/icm/record-shapes.md` §1) — the part of a [`CatalogEntry`] that
+/// (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1) — the part of a [`CatalogEntry`] that
 /// `workflow.toml` does not carry. `tags` is `None` when the front matter
 /// declares no `tags:` key at all, never an empty list standing in for
 /// "none" (§11.2's CatalogEntry table).
@@ -839,7 +839,7 @@ pub struct WorkflowIndexFrontMatter {
     pub description: String,
     /// `tags:` verbatim, or `None` if the front matter never declared the key.
     pub tags: Option<Vec<String>>,
-    /// `edition:` verbatim (`docs/icm/record-shapes.md` §1, ADR 0016): the
+    /// `edition:` verbatim (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1, ADR 0016): the
     /// distro version that wrote this file as stock content. `None` if the
     /// front matter never declared the key — pre-ADR-0016 content, or a
     /// malformed fork.
@@ -1025,7 +1025,7 @@ pub fn catalog(root: &Path) -> Vec<CatalogEntry> {
 
 /// Parse [`ROOT_CATALOG_FILE`]'s Markdown table for the `Workflow` names
 /// whose `Status` column reads exactly `published`. `.sergeant/index.md`'s
-/// own text (`docs/icm/record-shapes.md` §1 rule 2) is the example shape:
+/// own text (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 rule 2) is the example shape:
 ///
 /// ```text
 /// | Workflow | Status | Index |
@@ -1055,7 +1055,7 @@ fn root_catalog_names(text: &str) -> Vec<String> {
 }
 
 /// #260 Q3: read one stage's declared output artifact — the filename
-/// `docs/icm/convention.md` Rule 4's `**Expected artifact:** `<file>` —
+/// the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) Rule 4's `**Expected artifact:** `<file>` —
 /// description.` line names, out of its authored `output/README.md`.
 ///
 /// `None` when the stage's package directory has no `output/README.md`, or
@@ -1162,7 +1162,7 @@ pub(crate) fn has_required_table_columns(text: &str, required: &[String]) -> boo
 }
 
 /// #260 Q4 / Amendment 9's general finalize sweep: a stage's declared
-/// `**Disposition:**` (`docs/icm/convention.md` §1a's "merge-back
+/// `**Disposition:**` (the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) §1a's "merge-back
 /// semantics") — `promote` survives the sweep into the Work branch's
 /// shipped history, `evidence` is retained as Work evidence and removed
 /// from the worktree in the finalize commit.
@@ -1218,7 +1218,7 @@ fn parse_declared_artifact_line(line: &str) -> Option<String> {
 }
 
 /// Read and parse one workflow directory's own `index.md` front matter
-/// (`docs/icm/record-shapes.md` §1). `None` on any I/O failure, missing
+/// (`sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1). `None` on any I/O failure, missing
 /// closing delimiter, or missing required field (`status`/`description`) —
 /// [`catalog`] treats that the same as the workflow not existing. `pub(crate)`
 /// so `sgt doctor`'s edition-drift check (R2 — an existing surface, not a new
@@ -1232,14 +1232,14 @@ pub(crate) fn read_index_front_matter(workflow_dir: &Path) -> Option<WorkflowInd
 /// front matter.
 ///
 /// No general YAML parser is pulled in for this: the shape
-/// `docs/icm/record-shapes.md` §1 normatively fixes is fixed and narrow — a
+/// `sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 normatively fixes is fixed and narrow — a
 /// `---`-delimited block of `key: value` lines, an optional `>-`/`|-` folded
 /// or literal block scalar for `description`, and an optional `- item` list
 /// for `tags` — so a parser scoped to exactly that shape is the tiny local
 /// composition R6 asks for over a heavyweight dependency for three known
 /// fields. `kind`, `name`, and `version` are deliberately not read here:
 /// [`CatalogEntry`] takes `name`/`version` from `workflow.toml` (§11.2's
-/// table), and `kind`/`name` agreement is `docs/icm/record-shapes.md`'s own
+/// table), and `kind`/`name` agreement is `sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md`'s own
 /// authoring-time invariant, not something this read-only projection checks.
 fn parse_index_front_matter(text: &str) -> Option<WorkflowIndexFrontMatter> {
     let mut lines = text.lines();
@@ -1600,12 +1600,12 @@ mod tests {
     use super::*;
 
     /// #260 Q3: every shipped `output/README.md` uses this exact shape
-    /// (`docs/icm/convention.md` Rule 4) — the line the hard gate's parser
+    /// (the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) Rule 4) — the line the hard gate's parser
     /// must actually recognize.
     #[test]
     fn declared_output_artifact_parses_the_shipped_readme_shape() {
         let readme = "# Output — `10-implement`\n\n\
-             Layer 4 (per-run artifact), per `docs/icm/convention.md` §1a.\n\n\
+             Layer 4 (per-run artifact), per the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) §1a.\n\n\
              **Expected artifact:** `implementation.md` — the commits produced.\n\n\
              **Disposition:** `evidence`\n";
         assert_eq!(
@@ -2864,7 +2864,7 @@ mod tests {
 
     // --------------------------------------------- T2: catalog / front matter
 
-    /// The concrete shape `docs/icm/record-shapes.md` §1 gives as its
+    /// The concrete shape `sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 gives as its
     /// canonical example: a folded `>-` description and a bulleted `tags`
     /// list, both parsed out alongside the plain `status` scalar.
     #[test]

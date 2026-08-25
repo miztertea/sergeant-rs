@@ -157,7 +157,7 @@ pub struct StartPlan {
 
 /// Why `target_work_id`'s branch cannot (yet) be taken over by a gate Work
 /// attaching to it (§8.6 investigation, Mechanism A —
-/// `docs/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`). Every
+/// `sergeant-rs-workspace's knowledge/evidence/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`). Every
 /// variant is a fail-closed refusal named with a reason: dispatch must never
 /// guess or race the target's own teardown (ADR 0005 §4.3, "ambiguity fails
 /// closed").
@@ -1100,10 +1100,10 @@ pub const KIND_TURN_ENVELOPE_EXTENDED: &str = "execution.turn_envelope_extended"
 /// helper was built for, included. 12 covers every admitted workflow's
 /// stage count (max 11) with margin for at least one retry inside any
 /// single stage, without inventing an unrelated round number.
-/// L16 arithmetic still holds at the new value: the largest measured
-/// single turn on this build's evidence is Run B2's $3.21
-/// (`GAUNTLET.md`'s N-series close-out), so a 12-turn cap is a ~$38 bound,
-/// never a $2.50 one.
+/// The turn cap is an arbitrary operator-set budget, not a cost bound —
+/// no dollar figure is claimed or implied by this number; 12 was chosen
+/// for stage-count and retry-margin coverage alone (above), not for any
+/// economics derived from it.
 ///
 /// Structurally grounded, still not live-measured: a real N-series run
 /// (or the opt-in Claude suite, `SERGEANT_CLAUDE_TESTS=1`) is what would
@@ -1488,7 +1488,7 @@ impl Engine {
     ///
     /// `local` no longer refuses here (MVP-2 D2 item 1): its launch-side
     /// translation is measured (`setting_sources_args`,
-    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`),
+    /// `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`),
     /// so the L1 gate this refusal existed to enforce is satisfied. The
     /// conflict rule is unchanged — mixing policies within one bind is still
     /// refused, because "one process, one `--setting-sources`" is a fact
@@ -1518,7 +1518,7 @@ impl Engine {
         // more than its name suggests — hooks, tool permissions, MCP
         // servers from the repository's own `.claude/settings*.json`, not
         // just "reads a text file" (measured,
-        // `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`).
+        // `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`).
         // The submit-time refusal that gated this on an unmeasured claim
         // was correctly removed once the value was measured (D2 item 1),
         // but nothing replaced it as an operator-visible signal — no
@@ -1571,7 +1571,7 @@ impl Engine {
     /// adapter's launch grammar (`suppress` or the newly-unrefused `local`)
     /// never reads this file natively, so "the file the actor will read is
     /// the one we recorded" does not hold for either — see
-    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`.
+    /// `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`.
     /// What ships is a correctly-computed, correctly-pinned identity for a
     /// file this adapter does not currently read under any policy — honest
     /// bookkeeping for a mechanism the manifest schema anticipates but this

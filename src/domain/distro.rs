@@ -162,7 +162,7 @@ fn write_file(
 /// deliberately narrower than a YAML parser (matching
 /// `domain::workflow::parse_index_front_matter`'s own "tiny local
 /// composition" rather than a general parser, Ponytail R6), scoped to
-/// exactly the shape `docs/icm/record-shapes.md` §1 fixes.
+/// exactly the shape `sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 fixes.
 fn rewrite_edition(text: &str) -> String {
     let mut lines = text.lines();
     let Some(first) = lines.next() else {

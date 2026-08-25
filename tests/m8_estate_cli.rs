@@ -1,5 +1,5 @@
 //! MVP-3 acceptance: the estate CLI surface built on top of MVP-1's manifest
-//! (`docs/gauntlet/notes/mvp-bucketing-2026-08-11.md`'s MVP-3 row).
+//! (`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/mvp-bucketing-2026-08-11.md`'s MVP-3 row).
 //!
 //! `sgt init` (scaffold + idempotency) · `sgt repo add/remove/list`
 //! (populate-or-verify, atomic validated writes, group-membership refusal)
@@ -320,7 +320,7 @@ fn init_written_templates_carry_the_binary_edition() {
 /// not found (looked in ...)"). This submits against `investigate` (the
 /// 2026-08-22 distro content rebuild's successor to the `research` package
 /// #165 itself named, and to the `prototype` package this test used
-/// before that rebuild retired it — docs/proposals/distro-content-2026-08-22.md,
+/// before that rebuild retired it — sergeant-rs-workspace's knowledge/evidence/reference/distro-content-2026-08-22.md,
 /// W2), a real shipped package, through the actual daemon (`support::DataDir`, a real
 /// spawn) rather than a hand-written fixture workflow, so the assertion is
 /// that resolution — not necessarily full execution — succeeds: any failure
@@ -392,8 +392,9 @@ fn run_workflow_resolves_against_a_freshly_initialized_estate() {
 /// before this fix that FAIL flowed straight into init's own exit code, so a
 /// colleague without `claude` installed could never `sgt init` at all — even
 /// though the row's own remedy says "until then only the `fake` backend can
-/// run work". §17.5's degraded-daemon doctrine and NORTH-STAR's day-one loop
-/// both say a missing harness narrows capabilities, it must not brick estate
+/// run work". §17.5's degraded-daemon doctrine and the workspace knowledge
+/// library's North Star ruling's day-one loop both say a missing harness
+/// narrows capabilities, it must not brick estate
 /// setup. `SGT_CLAUDE_BIN` (`src/backend/claude.rs`) pointed at a path that
 /// does not exist reproduces the runner's "no claude on PATH" condition
 /// deterministically on any host, including this one where `claude` is
@@ -1298,7 +1299,7 @@ fn manifest_data_dir_overrides_the_estate_local_default() {
 }
 
 /// guard-map (ADR 0008(b); precedence settled by owner ruling 2026-08-20 —
-/// backlog close-out kickoff, `docs/proposals/backlog-closeout-2026-08-20.md`
+/// backlog close-out kickoff, `sergeant-rs-workspace's knowledge/evidence/reference/backlog-closeout-2026-08-20.md`
 /// rulings §8): `SGT_DATA_DIR` outranks a manifest-declared `data_dir`. The
 /// full ratified order is `--data-dir` > `SGT_DATA_DIR` > manifest
 /// `data_dir` — invocation-explicit beats declared, an owner ruling now, not
@@ -2026,7 +2027,7 @@ fn run_intent_file_refuses_a_symlink_a_directory_an_oversized_file_and_non_utf8(
 // -------------------------------------------------- envelope / daemon stop
 
 /// guard-map: `sgt run --turns N --ceiling-secs S` (checkpoint-friction
-/// item, `docs/gauntlet/notes/mvp-bucketing-2026-08-11.md`'s MVP-3 row)
+/// item, `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/mvp-bucketing-2026-08-11.md`'s MVP-3 row)
 /// threads a per-submission override into R-MVP1-7's turn envelope — CLI/API
 /// plumbing onto the existing per-Work mechanics (R-NS-4: `turn_cap_bonus`
 /// already proved a Work-specific cap was legal engine state via `sgt
@@ -2122,7 +2123,7 @@ fn run_turns_and_ceiling_secs_override_the_envelope_for_one_work() {
 /// guard-map: `sgt daemon stop` (E4, MVP-3's "cheap-now" item) actually
 /// stops the daemon it names, gracefully — `data_dir.daemon_pids()` (the
 /// same pattern-scan `DataDir`'s own `Drop` leak check uses) finds nothing
-/// afterward, matching docs/DEVELOPMENT.md's own leak-detection convention. Also pins
+/// afterward, matching CONTRIBUTING.md's own leak-detection convention. Also pins
 /// idempotence in both directions named in the task: stopping a daemon that
 /// is not running yet, and stopping one that is already stopped, are both
 /// clean successes, never errors. `tests/m6_surfaces.rs`'s

@@ -1,9 +1,0 @@
-stage	c2-m1_event_core
-wall_s	1
-profraw_before	1
-profraw_produced	1
-profraw_mergeable	1
-profraw_discarded	0
-profraw_lost	0
-profraw_loss_expected	no
-profraw_total	2

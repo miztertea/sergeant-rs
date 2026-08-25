@@ -17,7 +17,7 @@
 //!
 //! Both are Linux-only via `/proc` today; both get a macOS arm here.
 //! **Verified on a real macOS host 2026-08-15** (Apple M3 Pro, macOS 26.6.1,
-//! `docs/environments/macbook.md`, the path-to-mac.md arrival trip): the full
+//! `sergeant-rs-workspace's knowledge/evidence/host-measurements/macbook.md`, the path-to-mac.md arrival trip): the full
 //! suite ran real `ps`/`kill` calls end to end (`tests/m4_backends.rs`'s
 //! liveness tests, `tests/support/mod.rs`'s `daemon_pids` reaper, and
 //! `tests/m6_surfaces.rs`'s `tui_pid`, all of which reuse

@@ -64,7 +64,7 @@ pub fn mount_path(estate_root: &Path, name: &str) -> PathBuf {
 /// user` (`backend/claude.rs`), which does not read this file; this repo's
 /// own north-star arbitration record confirms it empirically ("CLAUDE.md and
 /// AGENTS.md are invisible to the actor by design"). MVP-2 measured `local`
-/// too (`docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`)
+/// too (`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`)
 /// and found the same thing for a different reason: `--setting-sources`
 /// governs `.claude/settings*.json` configuration, not memory-file reading,
 /// for *any* value — there is no native mechanism tied to the filename
@@ -128,7 +128,7 @@ pub enum InstructionPolicy {
     /// The wider of the two launch grammars this build can produce for a
     /// bound repository. MVP-2 D2 item 1 measured what it actually
     /// translates to for the Claude adapter (L1,
-    /// `docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`):
+    /// `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`):
     /// **not** "the actor natively consumes the repository's own instruction
     /// file", the original design intent this variant was named for — that
     /// mechanism does not exist for a file named `AGENTS.md` under any
@@ -1183,7 +1183,7 @@ impl Estate {
     /// pen would refuse *every* subsequent edit, including ones that never
     /// touch the missing repository, contradicting the design capture's own
     /// wrongness contract ("a broken repo blocks works targeting it, not the
-    /// estate", `docs/gauntlet/notes/estate-manifest-design-2026-08-11.md`).
+    /// estate", `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/estate-manifest-design-2026-08-11.md`).
     /// A repository an edit itself populates or verifies (`sgt repo add`'s
     /// `populate_or_verify`) is already checked on disk by that caller,
     /// directly — this validator does not need to repeat it.
@@ -2845,7 +2845,7 @@ mod tests {
     /// grep across every doc and note: several already-committed notes
     /// discuss the legacy vocabulary in prose while describing the
     /// migration itself, which is not the live-config leak this pin is
-    /// about (docs/gauntlet/notes and docs/gauntlet/runs are historical
+    /// about (sergeant-rs-workspace's knowledge/evidence/gauntlet/notes and sergeant-rs-workspace's knowledge/evidence/gauntlet/runs are historical
     /// records, not configuration this codebase reads).
     #[test]
     fn no_committed_sergeant_toml_outside_reference_carries_legacy_vocabulary() {

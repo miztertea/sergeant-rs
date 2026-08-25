@@ -1,7 +1,7 @@
 # Sergeant
 
 <p align="center">
-  <img src="docs/img/logo.png" alt="Sergeant" width="760">
+  <img src="assets/logo.png" alt="Sergeant" width="760">
 </p>
 
 <p align="center">
@@ -156,7 +156,7 @@ Sergeant ships with seven named workflows — implementing a change (with an in-
 
 ### Write your own workflows
 
-Custom workflows are encouraged. Tell Captain how your team works and ask it to create one. New candidates land under `.sergeant/drafts/workflows/<name>/`, where they are reviewable but not runnable; after review, they are promoted into `.sergeant/workflows/<name>/`. That publication boundary is deliberate: generated procedure never becomes runnable merely because an agent wrote it. The complete authoring model is the [ICM filesystem convention](docs/icm/convention.md).
+Custom workflows are encouraged. Tell Captain how your team works and ask it to create one. New candidates land under `.sergeant/drafts/workflows/<name>/`, where they are reviewable but not runnable; after review, they are promoted into `.sergeant/workflows/<name>/`. That publication boundary is deliberate: generated procedure never becomes runnable merely because an agent wrote it. The complete authoring model is the ICM filesystem convention, maintained in the sergeant-rs-workspace knowledge library.
 
 ## Work survives the session
 
@@ -206,7 +206,7 @@ sgt tui
 
 The TUI exposes the estate, workflows, active and historical Work, current stages, attention states, and journal activity.
 
-![Sergeant TUI — fleet view](docs/img/tui-fleet.png)
+![Sergeant TUI — fleet view](assets/tui-fleet.png)
 *(capture from an earlier build; the current cockpit adds Home, Workflows, and Estate views)*
 
 **For Captain: `sgt watch`.**
@@ -293,12 +293,12 @@ Sergeant-rs is a clean-room Rust reimagining of that lineage. It keeps the agent
 
 - [AGENTS.md](AGENTS.md) — Captain's operating doctrine and routing model
 - [Workflow catalog](.sergeant/index.md) — published Sergeant workflows
-- [ICM workflow convention](docs/icm/convention.md) — workflow and stage authoring
-- [Glossary](docs/glossary.md) — precise definitions of Sergeant concepts
-- [NORTH-STAR.md](NORTH-STAR.md) — product direction and governing decisions
 - [CHANGELOG.md](CHANGELOG.md) — release history
-- [CONTRIBUTING.md](CONTRIBUTING.md) — contributing and development setup
-- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — architecture invariants, tests, and development rules
+- [CONTRIBUTING.md](CONTRIBUTING.md) — contributing, development setup, and glossary
+
+Product direction, governing decisions, the ICM workflow convention, and the
+full architecture and development record now live in the
+sergeant-rs-workspace knowledge library, not this repo.
 
 ## Contributing
 

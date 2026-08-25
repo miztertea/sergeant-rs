@@ -1,4 +1,4 @@
-//! M5 acceptance tests (docs/gauntlet/contracts/M5.md).
+//! M5 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M5.md).
 //!
 //! 1. Rebuild determinism: real work through the daemon → DuckDB populated →
 //!    delete the `.duckdb` file → restart → the §22 canned queries return
@@ -1131,7 +1131,7 @@ const DERIVED_RELATIONS: &[&str] = &[
 /// One negative case on one relation would not do it: the arms whose entire
 /// content is *which entity is wired to which* (`requested`, `caused`, `uses`,
 /// `preceded`) are precisely the ones a single probe on a strong arm leaves
-/// unexercised, and a check without its own kill probe is prose (LESSONS L7).
+/// unexercised, and a check without its own kill probe is prose (the workspace knowledge library's Lesson L7).
 /// So the predicate is driven over a synthetic journal instantiating every
 /// relation the derivation can produce, and for each derived edge:
 ///

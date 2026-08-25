@@ -405,7 +405,7 @@ fn no_shipped_workflow_or_skill_quotes_the_removed_workspace_flag() {
 // ------------------------------------------------- 3. manifest example skew
 
 /// §13.1's canonical manifest shape, carried verbatim from
-/// `docs/proposals/estate-root-git.md` §13.1 as of 2026-08-24, ahead of
+/// `sergeant-rs-workspace's knowledge/evidence/reference/estate-root-git.md` §13.1 as of 2026-08-24, ahead of
 /// that file's relocation to the workspace knowledge library
 /// (split-hardening series, sprint-plan-2026-08-24.md, W1). Fixture, not a
 /// live read, so this test no longer depends on the doc surviving in this
@@ -506,7 +506,7 @@ fn close_out_completion_boundary_covers_external_pipeline_runs() {
 // mechanism with no on-demand sync verb (#167), and the absence of any
 // leftover "Engine gap" note. Both tests are removed here because the
 // package they pinned, `dispatch`, was retired by the 2026-08-22 distro
-// content rebuild (docs/proposals/distro-content-2026-08-22.md, W2;
+// content rebuild (sergeant-rs-workspace's knowledge/evidence/reference/distro-content-2026-08-22.md, W2;
 // design proposal §4.1) — the kickoff ruling cut it outright rather than
 // keeping it alive as a transitional package, and neither file exists
 // under `.sergeant/workflows/` any more for a test to read.
@@ -541,10 +541,11 @@ fn agents_md_carries_the_intent_section() {
 /// declared mutation surface, observed and journaled, never an enforced
 /// one. Quoted verbatim, same house pattern as above.
 ///
-/// This test used to also pin NORTH-STAR.md's copy of the same sentence,
-/// but NORTH-STAR.md is scheduled to leave this repo under the
-/// split-hardening series (sprint-plan-2026-08-24.md, W1); AGENTS.md is
-/// now the sole doctrine surface this repo's build and tests depend on.
+/// This test used to also pin the North Star ruling's own copy of the same
+/// sentence; that document left this repo for the sergeant-rs-workspace
+/// knowledge library under the split-hardening series (W1 relocated it,
+/// W2c removed the local file), so AGENTS.md is now the sole doctrine
+/// surface this repo's build and tests depend on.
 #[test]
 fn agents_md_states_the_ratified_mutation_surface_contract() {
     let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
@@ -574,5 +575,55 @@ fn agents_md_states_the_ratified_mutation_surface_contract() {
             && !agents_md_flat.contains("enforced mutation surface")
             && !agents_md_flat.contains("mutation surface is enforced"),
         "AGENTS.md must state the mutation surface as declared and observed, never enforced"
+    );
+}
+
+// ------------------------------------------------ 7. citation-integrity skew
+//
+// split-hardening W2c made this repo product-documents-only: NORTH-STAR.md,
+// GAUNTLET.md, LESSONS.md, and the docs/ tree (except the handful of items
+// re-homed into assets/ and CONTRIBUTING.md) are gone, their content already
+// verified and pushed to the sergeant-rs-workspace knowledge library. A
+// leftover path-like reference to any of them is a dangling citation, not
+// live doctrine — this sweeps the surfaces a contributor or an agent
+// actually reads for exactly that. Scope deliberately excludes `skills/` and
+// `.sergeant/` (embedded distro content still citing docs/ paths is wave
+// W3's scope, not this one) and `CHANGELOG.md` (an append-only ledger this
+// wave does not edit).
+#[test]
+fn no_readme_contributing_src_test_or_workflow_file_cites_a_removed_path() {
+    const NEEDLES: &[&str] = &["NORTH-STAR.md", "GAUNTLET.md", "LESSONS.md", "docs/"];
+
+    let mut roots = vec![
+        repo_root().join("README.md"),
+        repo_root().join("CONTRIBUTING.md"),
+    ];
+    for dir in ["src", "tests", ".github"] {
+        roots.extend(walk(&repo_root().join(dir)));
+    }
+
+    let self_path = repo_root().join("tests/f_doctrine_skew.rs");
+    let mut offenders = Vec::new();
+    for path in roots {
+        // This test's own source necessarily spells out the needles it
+        // checks for (and describes, in its doc comment, what it excludes)
+        // — comparing it against itself would be a tautological failure.
+        if !path.is_file() || path == self_path {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for needle in NEEDLES {
+            if text.contains(needle) {
+                offenders.push(format!("{}: still cites {needle:?}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "dangling citation(s) to a path removed by split-hardening W2c:\n{}",
+        offenders.join("\n")
     );
 }

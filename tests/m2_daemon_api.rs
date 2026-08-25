@@ -1,4 +1,4 @@
-//! M2 acceptance tests (docs/gauntlet/contracts/M2.md).
+//! M2 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M2.md).
 //!
 //! 1. Descriptor lifecycle: written on start (owner-only, valid JSON,
 //!    loopback), `/healthz` answers, removed on clean shutdown.
@@ -1651,7 +1651,7 @@ fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
 /// contract scale 1 GiB) filling it broke every `Bash` invocation's output
 /// capture across every session on the host — `EDQUOT` under a command that
 /// still ran underneath, so it looked like a broken shell rather than a
-/// full disk (evidence in `docs/environments/cerberus.md`). An operator
+/// full disk (evidence in `sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md`). An operator
 /// remembering to export `$TMPDIR` does not close that: the incident was an
 /// unsafe *default*, so this pins a positive claim about where the rig
 /// actually lands — not merely "not literally /tmp" — which a revert to
@@ -1671,7 +1671,7 @@ fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
 /// which skips the body entirely. Measured: with `disk_backed_tmp_base`
 /// stubbed to `None`, that shape passes, while the independent probe below
 /// fails as it should. The probe reads the filesystem itself, and the skip
-/// is loud per `docs/DEVELOPMENT.md`'s two-environment rule rather than a
+/// is loud per `CONTRIBUTING.md`'s two-environment rule rather than a
 /// silent early return.
 #[test]
 fn a_data_dir_defaults_onto_disk_not_the_hosts_tmpfs() {
@@ -3754,7 +3754,7 @@ async fn t12_submission_throughput_has_an_automated_floor() {
     /// A-N3-1's amended budget, on a quiet machine at burst 50.
     const BUDGET: f64 = 24.0;
     // Load-sensitivity note (macOS / Apple M3 Pro, issue #128,
-    // docs/perf/macbook-arrival-git-spawn-2026-08-15.md):
+    // sergeant-rs-workspace's knowledge/evidence/perf/macbook-arrival-git-spawn-2026-08-15.md):
     // Isolated throughput on M3 Pro is ~10.96–11.13 works/s; under parallel
     // cargo-test / compilation contention it drops to ~9.3 works/s. The submit
     // path serializes through a single per-repo lock, so throughput = 1 /
@@ -3836,7 +3836,7 @@ async fn t12_submission_throughput_has_an_automated_floor() {
         rate >= THROUGHPUT_FLOOR,
         "submission throughput fell to {rate:.1} works/s at burst {BURST}, below the \
          {THROUGHPUT_FLOOR} works/s floor. Derivation: A-N3-1's amended budget of \
-         {BUDGET} works/s at burst 50 (docs/perf/n3-two-phase-boundary-2026-08-10.md) \
+         {BUDGET} works/s at burst 50 (sergeant-rs-workspace's knowledge/evidence/perf/n3-two-phase-boundary-2026-08-10.md) \
          divided by a {CONTENTION_ALLOWANCE}× allowance for a shared test host gives \
          12.0 on Linux; revised to {THROUGHPUT_FLOOR} on M3 Pro / macOS due to \
          git-spawn overhead (#128). This is the whole submit path — estate discovery, \
@@ -4497,7 +4497,7 @@ fn r_mvp1_10_block_reason(data_dir: &Path, work_id: &str) -> String {
 /// (`engine.rs`) is what fires, not a scripted signal.
 ///
 /// The exit door proven here is honestly `cancel`, not `retry` — and that is
-/// a finding, not an oversight (GAUNTLET.md backlog). `begin_start`'s only
+/// a finding, not an oversight (the workspace knowledge library's backlog). `begin_start`'s only
 /// durable record before a materialize failure is `surface.materializing` (a
 /// `SurfacePlan`); `workflow.bound` never lands, because binding only
 /// happens *after* a successful materialize (`settle_materialize`'s success
@@ -4532,9 +4532,9 @@ async fn r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_ca
         }
     }
     let _restore = RestorePerms(surfaces_root.clone());
-    // Environment probe (docs/DEVELOPMENT.md's testing rules): the root dev container
+    // Environment probe (CONTRIBUTING.md's testing rules): the root dev container
     // silently passes permission-bit tricks. Cerberus and the GH runner both
-    // enforce them (docs/environments/cerberus.md); where they do not, this
+    // enforce them (sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md); where they do not, this
     // fixture cannot be armed and must skip loudly rather than fail for the
     // wrong reason.
     if std::fs::create_dir(surfaces_root.join("probe")).is_ok() {

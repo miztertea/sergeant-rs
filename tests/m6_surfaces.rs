@@ -1,4 +1,4 @@
-//! M6 acceptance tests (docs/gauntlet/contracts/M6.md).
+//! M6 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M6.md).
 //!
 //! Acceptance 2 (the embedded dashboard) and its tests are gone: ADR 0011
 //! (D7) deletes `src/web.rs`, `web/`, and the `sgt web` verb outright — a
@@ -2550,7 +2550,7 @@ fn t3f_doctor_names_an_unwritable_parent_as_one_remedy_row() {
     }
     let _restore = RestorePerms(parent.path().to_path_buf());
 
-    // Environment probe (docs/DEVELOPMENT.md's testing rules): the root dev
+    // Environment probe (CONTRIBUTING.md's testing rules): the root dev
     // container silently ignores permission-bit restrictions, so this
     // fixture cannot be armed there — skip loudly rather than assert
     // something that cannot hold in that environment.
@@ -4201,7 +4201,7 @@ fn the_spawned_daemon_rig_stops_its_daemon_with_sigterm() {
 /// guard-map: MVP-3's admission drain flag (`sgt daemon stop`, scoped
 /// exactly to that use) — one journaled `admission.paused`/
 /// `admission.resumed` event pair plus a submit refusal while paused — and
-/// the L6 crash window docs/DEVELOPMENT.md names explicitly for this class of
+/// the L6 crash window CONTRIBUTING.md names explicitly for this class of
 /// mechanism: a daemon killed *after* `admission.paused` is durable but
 /// *before* it ever gets to stop must not leave the data dir stuck refusing
 /// work forever.
@@ -4694,7 +4694,7 @@ fn the_perf_clock_guard_fails_loudly_instead_of_a_malformed_timestamp() {
 /// onto it; when a checkout was cut from that same tip, the resulting diff
 /// is genuinely empty and no-mistakes silently fast-paths to `outcome:
 /// passed` without running review/test/document/lint. The fix (this repo's
-/// own `docs/gauntlet/runs/t-series-build-2026-08-16/plan.md` names it
+/// own `sergeant-rs-workspace's knowledge/evidence/gauntlet/runs/t-series-build-2026-08-16/plan.md` names it
 /// explicitly) is a pre-flight guard in `scripts/gate.sh` that replicates
 /// that same base detection and refuses loudly instead. Same pattern as the
 /// coverage harness and perf clock guard self-tests above: a shell script

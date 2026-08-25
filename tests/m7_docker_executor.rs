@@ -1,10 +1,10 @@
 //! N4 acceptance: the Docker executor (`kind = "execute"`), against a real
 //! local Docker Engine (§22.7-§22.10).
 //!
-//! **Environment posture (docs/DEVELOPMENT.md's testing rules, `docs/environments/`).**
+//! **Environment posture (CONTRIBUTING.md's testing rules, `sergeant-rs-workspace's knowledge/evidence/host-measurements/`).**
 //! Every test in this file probe-gates on [`docker_unavailable`] and skips
 //! loudly (`SKIPPED-ENV`) rather than failing hard when the host cannot
-//! express the shape — Cerberus (`docs/environments/cerberus.md`) runs the
+//! express the shape — Cerberus (`sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md`) runs the
 //! full matrix; a host with no Docker reachable does not fail these.
 //!
 //! Every test that creates a container cleans it up itself and additionally
@@ -41,14 +41,14 @@ use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::workflow::{ExecuteSpec, NetworkPolicy, WorkspaceAccess};
 
 /// A small, always-present image every measured environment can pull or
-/// already has (`docs/environments/cerberus.md`'s Docker probes use
+/// already has (`sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md`'s Docker probes use
 /// `alpine`). Kept as one named constant so a future environment that needs
 /// a different probe image changes one line.
 const PROBE_IMAGE: &str = "alpine:3.24";
 
 /// Whether the local Docker Engine answers at all. Every test in this file
 /// calls this first and returns early (with a loud, named skip) when it does
-/// not — the docs/DEVELOPMENT.md/environments convention for a shape a hosted runner
+/// not — the CONTRIBUTING.md/environments convention for a shape a hosted runner
 /// may not be able to express, distinct from a locally-fixable precondition.
 fn docker_unavailable() -> Option<&'static str> {
     match Command::new("docker").arg("version").output() {
@@ -492,7 +492,7 @@ fn network_none_has_no_usable_external_path() {
 
     // TH-12 (MVP-2 D3 fixer pass): this test only discriminates on a host
     // with working egress — on an egress-blocked host (the cloud
-    // container's measured posture, `docs/environments/`) the isolated
+    // container's measured posture, `sergeant-rs-workspace's knowledge/evidence/host-measurements/`) the isolated
     // container's `wget` fails for the same reason a *non*-isolated one
     // would, and the assertion below is a guaranteed false green that
     // proves nothing about `--network none`. A positive control: the exact

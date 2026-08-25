@@ -691,7 +691,7 @@ fn geometry_retained_preview_and_reap_confirmation() {
 // ------------------------------------------------------- real screenshots
 
 /// T4 (§20.5's "real Ratatui screenshots"): this repo has no terminal-image
-/// capture tool available (the `docs/img/*.png` pair is a hand-captured
+/// capture tool available (the `assets/*.png` pair is a hand-captured
 /// artifact of the pre-T-series two-screen TUI, unrelated to this
 /// mechanism and left untouched). `TestBackend` is already this tree's own
 /// established rendering contract (Decision T2-63); this test asks
@@ -702,12 +702,14 @@ fn geometry_retained_preview_and_reap_confirmation() {
 ///
 /// `#[ignore]` by default: writing to the working tree is not something an
 /// ordinary `cargo test` should do as a side effect. Regenerate with:
-/// `cargo test --lib -- --ignored generate_t4_wide_screenshots`.
+/// `cargo test --lib -- --ignored generate_t4_wide_screenshots`. Writes
+/// under `target/`, not the working tree proper — these captures are
+/// disposable eyeballing aids, not committed fixtures.
 #[test]
-#[ignore = "writes docs/tui-screenshots/*.txt; run explicitly to regenerate"]
+#[ignore = "writes target/tui-screenshots/*.txt; run explicitly to regenerate"]
 fn generate_t4_wide_screenshots() {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/tui-screenshots");
-    std::fs::create_dir_all(&dir).expect("create docs/tui-screenshots");
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tui-screenshots");
+    std::fs::create_dir_all(&dir).expect("create target/tui-screenshots");
 
     let fixtures: Vec<(&str, App)> = vec![
         ("home", home_full()),

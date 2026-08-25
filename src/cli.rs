@@ -72,8 +72,8 @@ struct Sgt {
     #[arg(long, global = true)]
     json: bool,
     /// Subcommand to run. Omitted, `sgt` prints the homepage (ADR 0010,
-    /// deviation from proposal §30 — see `GAUNTLET.md`'s deviation
-    /// register): a logo and a condensed quickstart, touching no daemon.
+    /// deviation from proposal §30 — see the workspace knowledge library's
+    /// deviation register): a logo and a condensed quickstart, touching no daemon.
     /// The TUI is `sgt tui`, an explicit verb like any other.
     #[command(subcommand)]
     command: Option<Command>,
@@ -224,7 +224,7 @@ enum Command {
     },
     /// Block until a Work needs attention or reaches a terminal state, then
     /// print the current snapshot and exit — the harness's return path after
-    /// `sgt run` (`docs/gauntlet/contracts/WATCH.md`), replacing
+    /// `sgt run` (`sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/WATCH.md`), replacing
     /// `sgt work show` polling with one call. With no `WORK_ID`, watches
     /// future matching transitions across the whole estate instead of one
     /// Work (WATCH-02); either way this is silent until a match — no
@@ -738,7 +738,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
     let (root, root_source) = effective_root(sgt.chdir.as_deref())?;
     let Some(command) = sgt.command else {
         // ADR 0010 (D6, deviation from proposal §30 registered in
-        // `GAUNTLET.md`): bare `sgt` is a homepage, not the TUI, and it
+        // the workspace knowledge library's deviation register): bare `sgt` is a homepage, not the TUI, and it
         // contacts no daemon at all — that is what dissolves ADR 0009's
         // hardest case (a human-facing surface with nothing to reconnect
         // to) rather than answering it. `sgt tui` is the explicit verb.
@@ -2004,8 +2004,8 @@ const LOGO: &str = r"
 ";
 
 /// Bare `sgt` (no subcommand): a homepage, not the TUI (ADR 0010, D6 —
-/// deviation from proposal §30, registered in `GAUNTLET.md`'s deviation
-/// register).
+/// deviation from proposal §30, registered in the workspace knowledge
+/// library's deviation register).
 ///
 /// Touches no daemon at all, which is the point: this is what dissolves ADR
 /// 0009's TUI carve-out debate instead of answering it — there is no daemon
@@ -2531,7 +2531,8 @@ pub(crate) mod doctor {
         /// scaffolding plus the estate-fundamental checks (`data_dir`,
         /// `journal`, `projection`) — succeed. Harness rows (`claude`,
         /// `docker`) are advisory at init time: §17.5's degraded-daemon
-        /// doctrine and NORTH-STAR's day-one loop both say a missing harness
+        /// doctrine and the workspace knowledge library's North Star ruling's
+        /// day-one loop both say a missing harness
         /// narrows which backends can run work later, it must not brick
         /// estate setup. A colleague without the `claude` CLI installed must
         /// still be able to `sgt init` — the row still prints as `FAIL` with

@@ -25,8 +25,9 @@ every Work its own git worktree and a declared mutation surface —
 authorization, not a seal — and runs submitted intents to completion
 against it, journaling what it can prove happened outside that surface
 as dirty evidence at retirement rather than silently absorbing it
-(NORTH-STAR.md's amended destination text, #180). The full destination
-and the rulings behind it are `NORTH-STAR.md` — read it before changing
+(the North Star ruling's amended destination text, #180). The full
+destination and the rulings behind it are the North Star ruling, now kept
+in the sergeant-rs-workspace knowledge library — read it before changing
 anything here.
 
 Sergeant is designed for one developer per installation: adoption by a

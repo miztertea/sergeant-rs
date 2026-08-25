@@ -138,7 +138,7 @@ async fn wait_until_all_settled(http: &reqwest::Client, handle: &DaemonHandle) {
 /// Run `sgt --data-dir <data_dir> --json doctor` with `cwd`, and return the
 /// parsed `--json` report (the whole `Report::to_json()` shape: `healthy`,
 /// `data_dir`, `checks`). Never spawns a daemon — `doctor` is one of the
-/// five commands documented not to (docs/DEVELOPMENT.md).
+/// five commands documented not to (CONTRIBUTING.md).
 fn doctor_json(cwd: &Path, data_dir: &Path) -> Value {
     let output = Command::new(SGT)
         .current_dir(cwd)

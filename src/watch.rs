@@ -1,4 +1,4 @@
-//! `sgt watch` (`docs/gauntlet/contracts/WATCH.md`; proposal
+//! `sgt watch` (`sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/WATCH.md`; proposal
 //! `reference/proposal-sgt-watch-v1.md`): a read-only client-side
 //! subscription over the existing SSE + Work inspection surfaces — the
 //! harness's return path after `sgt run`, replacing `sgt work show` polling
