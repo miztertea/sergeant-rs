@@ -138,3 +138,15 @@ cov_stage_end 1 "the coverage_stage_membership test binary must write its own pr
 cov_stage_begin c2-docs_contract
 cov_run cargo llvm-cov --no-report --test docs_contract --locked || cov_fail "docs_contract failed under instrumentation"
 cov_stage_end 1 "the docs_contract test binary must write its own profile"
+
+# W4c fixer sweep (#231(b)): wired at recovery time — the suite's own
+# authorship commit (e01a53fb) left it invoked by neither stage script, the
+# exact #231 gap coverage_stage_membership.rs exists to catch. Sits in C2,
+# not C3, for codex_backend's/opencode_backend's/agy_backend's exact reasons:
+# every `daemon install-service` case exercised here uses an injected fake
+# `systemctl`/`launchctl` shell-script stand-in (`write_fake_binary`, this
+# suite's own SGT_SYSTEMCTL_BIN precedent) or no external process at all
+# (`doctor`, `init`); no case spawns a real `sgt daemon`. Floor 1.
+cov_stage_begin c2-w4c_service_doctor
+cov_run cargo llvm-cov --no-report --test w4c_service_doctor --locked || cov_fail "w4c_service_doctor failed under instrumentation"
+cov_stage_end 1 "the w4c_service_doctor test binary must write its own profile (its fake systemctl/launchctl binaries are shell-script stand-ins, uninstrumented and no loss, per codex_backend's precedent)"
