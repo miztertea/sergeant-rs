@@ -1683,6 +1683,8 @@ fn render_transcript(result: &Value) -> String {
             "user" => "User",
             "assistant" => "Assistant",
             "ask" => "Ask",
+            "tool_use" if turn["phase"].as_str() == Some("requested") => "Tool call",
+            "tool_use" => "Tool result",
             other => other,
         };
         let recovered = if turn["source"].as_str() == Some("blob_decode") {
@@ -3218,6 +3220,7 @@ pub(crate) mod doctor {
 
         let mut retained_worktrees = 0u64;
         let mut retained_patches = 0u64;
+        let mut retained_outputs = 0u64;
         let mut retained_bytes = 0u64;
         let mut terminal_dirty_works = 0u64;
 
@@ -3226,6 +3229,11 @@ pub(crate) mod doctor {
                 retained_bytes += binding.bytes;
                 if binding.reason == "retained_dirty" && binding.path.is_file() {
                     retained_patches += 1;
+                } else if binding.reason == "retained_output" {
+                    // #240: a per-stage output copy, not a worktree — kept
+                    // out of `retained_worktrees` so that count still means
+                    // what its label says.
+                    retained_outputs += 1;
                 } else {
                     retained_worktrees += 1;
                 }
@@ -3241,6 +3249,7 @@ pub(crate) mod doctor {
             format!("  active linked worktrees:   {active_worktrees}"),
             format!("  retained worktrees:        {retained_worktrees}"),
             format!("  retained patches:          {retained_patches}"),
+            format!("  retained stage outputs:    {retained_outputs}"),
             format!(
                 "  retained artifact size:    {}",
                 human_bytes(retained_bytes)

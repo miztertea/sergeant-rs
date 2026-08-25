@@ -1503,6 +1503,26 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
          materialized surface for {work_id}"
     );
 
+    // W4-carried minor (#234's own "every patch" claim, commit 56927a14):
+    // the marker check above may stop at the first satisfying entry, but
+    // *every* retained `.dirty.patch` under the surface — not just
+    // whichever one `walk_for_marker` happened to reach first — must
+    // actually be `git apply`-able. Collected separately so a second
+    // binding's corrupt patch cannot hide behind the first binding's good
+    // one.
+    let mut patches = Vec::new();
+    for entry in &branch_worktrees {
+        collect_dirty_patches(&entry.path(), &mut patches);
+    }
+    assert!(
+        !patches.is_empty(),
+        "expected at least one retained .dirty.patch under {:?} for {work_id}",
+        data.path().join("surfaces")
+    );
+    for patch in &patches {
+        assert_patch_is_git_applyable(patch);
+    }
+
     handle.shutdown().await;
     assert_no_containers_for_work(&work_id);
 }
@@ -1515,6 +1535,14 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
 /// evidence this test is proving survives teardown now travels in that
 /// form. Either way the evidence handed to the following actor was not
 /// lost, which is the actual N4/§21.5 claim this test pins.
+///
+/// Only decides *whether the marker exists somewhere* — `.any()`'s short-
+/// circuit here is fine, since finding it in one binding's patch says
+/// nothing about whether a *different* binding's patch is well-formed.
+/// That question belongs to [`collect_dirty_patches`]/
+/// [`assert_patch_is_git_applyable`] below, which do not stop at the first
+/// one (the W4-carried minor this pair fixes: #234's "every patch" claim
+/// was not actually checked against every patch).
 fn walk_for_marker(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -1530,46 +1558,71 @@ fn walk_for_marker(dir: &Path) -> bool {
             && content.trim() == "container-produced-evidence"
         {
             return true;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("patch")
+        } else if is_dirty_patch(&path)
             && let Ok(content) = std::fs::read_to_string(&path)
             && content.contains("validated.txt")
             && content.contains("container-produced-evidence")
         {
-            // #234: a retained `.dirty.patch` that merely *contains* the
-            // right text is not enough — the whole point of the bug was a
-            // patch that looked right but `git apply` rejected as corrupt
-            // at end-of-file. Pin the acceptance criteria directly: `git
-            // apply --stat` proves the patch parses at all, and `--check`
-            // (applied into a fresh empty scratch dir, since `validated.txt`
-            // is captured here as a brand-new untracked file) proves it is
-            // actually applicable, not just textually plausible.
-            let scratch = TempDir::new().expect("scratch dir for git apply --check");
-            let stat = Command::new("git")
-                .args(["apply", "--stat", path.to_str().expect("utf8 path")])
-                .current_dir(scratch.path())
-                .output()
-                .expect("git apply --stat");
-            assert!(
-                stat.status.success(),
-                "git apply --stat rejected {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&stat.stderr)
-            );
-            let check = Command::new("git")
-                .args(["apply", "--check", path.to_str().expect("utf8 path")])
-                .current_dir(scratch.path())
-                .output()
-                .expect("git apply --check");
-            assert!(
-                check.status.success(),
-                "git apply --check rejected {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&check.stderr)
-            );
             return true;
         }
     }
     false
+}
+
+fn is_dirty_patch(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".dirty.patch"))
+}
+
+/// Every `*.dirty.patch` file anywhere under `dir`, recursively — the full
+/// set `walk_for_marker`'s short-circuiting `.any()` caller used to leave
+/// unexamined past the first one that satisfied it.
+fn collect_dirty_patches(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dirty_patches(&path, out);
+        } else if is_dirty_patch(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// #234: a retained `.dirty.patch` that merely *contains* the right text is
+/// not enough — the whole point of the bug was a patch that looked right
+/// but `git apply` rejected as corrupt at end-of-file. Pin the acceptance
+/// criteria directly: `git apply --stat` proves the patch parses at all,
+/// and `--check` (applied into a fresh empty scratch dir, since
+/// `validated.txt` is captured here as a brand-new untracked file) proves
+/// it is actually applicable, not just textually plausible.
+fn assert_patch_is_git_applyable(path: &Path) {
+    let scratch = TempDir::new().expect("scratch dir for git apply --check");
+    let stat = Command::new("git")
+        .args(["apply", "--stat", path.to_str().expect("utf8 path")])
+        .current_dir(scratch.path())
+        .output()
+        .expect("git apply --stat");
+    assert!(
+        stat.status.success(),
+        "git apply --stat rejected {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&stat.stderr)
+    );
+    let check = Command::new("git")
+        .args(["apply", "--check", path.to_str().expect("utf8 path")])
+        .current_dir(scratch.path())
+        .output()
+        .expect("git apply --check");
+    assert!(
+        check.status.success(),
+        "git apply --check rejected {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&check.stderr)
+    );
 }
 
 /// Poll OBSERVE until the container has exited, panicking on timeout.

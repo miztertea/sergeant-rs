@@ -431,6 +431,26 @@ pub struct PatchInfo {
     pub bytes: u64,
 }
 
+/// Where one stage's declared `output/` artifacts were retained
+/// separately from the flat dirty patch (#240): a per-stage-labeled copy
+/// of whatever real files existed under `<stage-dir>/output/` (excluding
+/// `README.md`, which is the declaration, not an artifact — Rule 4,
+/// `docs/icm/convention.md`) at the moment the worktree was about to be
+/// removed. Exists so a reader can retrieve one stage's evidence
+/// directly, without reconstructing it from the flat patch that already
+/// bundles it in with every other change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedStageOutput {
+    /// The stage directory name the artifacts were declared under (e.g.
+    /// `"20-panel"`), matching the workflow's own directory naming.
+    pub stage: String,
+    /// Where the copied artifacts were written, under the surface root,
+    /// sibling to the worktree they were copied out of.
+    pub path: PathBuf,
+    /// Total bytes copied.
+    pub bytes: u64,
+}
+
 /// What happened to one binding at teardown.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "disposition", rename_all = "snake_case")]
@@ -454,6 +474,14 @@ pub enum BindingDisposition {
         /// honest: those really did retain the whole directory.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         patch: Option<PatchInfo>,
+        /// #240: each stage's declared `output/` artifacts, copied out
+        /// separately and per-stage labeled, alongside `patch`. Empty
+        /// when `patch` is `None` — the whole worktree directory (output/
+        /// included) was left in place instead, so there is nothing extra
+        /// to copy. `#[serde(default)]` for the same replay reason as
+        /// `patch`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        outputs: Vec<RetainedStageOutput>,
     },
     /// The worktree path was already gone: recorded, not treated as success.
     Missing,
@@ -1307,7 +1335,10 @@ pub struct RetainedBinding {
     pub path: PathBuf,
     /// `retained_dirty` or `retained_error` — the same bare-tag spelling
     /// `sgt work show`'s output pointer already uses, so a client never has
-    /// to reconcile two vocabularies for the same fact.
+    /// to reconcile two vocabularies for the same fact. `retained_output`
+    /// (#240) is the one tag with no such counterpart: it names a
+    /// per-stage `output/` artifact copy, not a teardown disposition on
+    /// its own.
     pub reason: &'static str,
     /// The evidence teardown recorded: `git status --porcelain` output for
     /// `retained_dirty`, Git's own diagnostic for `retained_error`.
@@ -1328,67 +1359,103 @@ pub fn retained_bindings(teardown: &TeardownReport) -> Vec<RetainedBinding> {
     teardown
         .bindings
         .iter()
-        .filter_map(|b| match &b.disposition {
-            BindingDisposition::RetainedDirty {
-                changes,
-                patch: Some(info),
-            } => {
-                // Live check, not the size journaled at teardown time: a
-                // `sgt work reap` since then (or anything else that removed
-                // the file) must not keep showing up here — the same
-                // "report what is actually on disk right now" rule
-                // `directory_size`'s callers below already follow.
-                if !info.path.is_file() {
-                    return None;
-                }
-                Some(RetainedBinding {
+        .flat_map(retained_bindings_for)
+        .collect()
+}
+
+/// One binding's retained evidence: the primary retention
+/// ([`retained_bindings`]'s original single-entry shape) plus, when
+/// present, one further entry per `#240` stage-output copy — a `Vec`
+/// rather than an `Option` because a single binding can now carry more
+/// than one piece of independently retrievable evidence.
+fn retained_bindings_for(b: &BindingTeardown) -> Vec<RetainedBinding> {
+    let mut out = Vec::new();
+    match &b.disposition {
+        BindingDisposition::RetainedDirty {
+            changes,
+            patch: Some(info),
+            outputs,
+        } => {
+            // Live check, not the size journaled at teardown time: a
+            // `sgt work reap` since then (or anything else that removed
+            // the file) must not keep showing up here — the same
+            // "report what is actually on disk right now" rule
+            // `directory_size`'s callers below already follow.
+            if info.path.is_file() {
+                out.push(RetainedBinding {
                     repository: b.repository.clone(),
                     path: info.path.clone(),
                     reason: "retained_dirty",
                     detail: changes.clone(),
                     bytes: info.bytes,
-                })
+                });
             }
-            BindingDisposition::RetainedDirty {
-                changes,
-                patch: None,
-            } => {
-                if !b.worktree_path.exists() {
-                    return None;
-                }
-                Some(RetainedBinding {
+            out.extend(retained_output_bindings(b, outputs));
+        }
+        BindingDisposition::RetainedDirty {
+            changes,
+            patch: None,
+            outputs,
+        } => {
+            if b.worktree_path.exists() {
+                out.push(RetainedBinding {
                     repository: b.repository.clone(),
                     path: b.worktree_path.clone(),
                     reason: "retained_dirty",
                     detail: changes.clone(),
                     bytes: directory_size(&b.worktree_path),
-                })
+                });
             }
-            BindingDisposition::RetainedError { detail } => {
-                if !b.worktree_path.exists() {
-                    return None;
-                }
-                Some(RetainedBinding {
+            // `patch: None` means the whole worktree directory (output/
+            // included) was left in place instead of being reclaimed, so
+            // `outputs` is always empty here (see `retain_dirty`) — no
+            // separate copy exists to report.
+            out.extend(retained_output_bindings(b, outputs));
+        }
+        BindingDisposition::RetainedError { detail } => {
+            if b.worktree_path.exists() {
+                out.push(RetainedBinding {
                     repository: b.repository.clone(),
                     path: b.worktree_path.clone(),
                     reason: "retained_error",
                     detail: detail.clone(),
                     bytes: directory_size(&b.worktree_path),
-                })
+                });
             }
-            BindingDisposition::RetainedUnreferenced { evidence, .. } => {
-                if !b.worktree_path.exists() {
-                    return None;
-                }
-                Some(RetainedBinding {
+        }
+        BindingDisposition::RetainedUnreferenced { evidence, .. } => {
+            if b.worktree_path.exists() {
+                out.push(RetainedBinding {
                     repository: b.repository.clone(),
                     path: b.worktree_path.clone(),
                     reason: "retained_unreferenced",
                     detail: evidence.clone(),
                     bytes: directory_size(&b.worktree_path),
-                })
+                });
             }
-            BindingDisposition::Removed | BindingDisposition::Missing => None,
+        }
+        BindingDisposition::Removed | BindingDisposition::Missing => {}
+    }
+    out
+}
+
+/// #240: one [`RetainedBinding`] per stage-output copy still on disk,
+/// `reason: "retained_output"` — a distinct tag from `"retained_dirty"`
+/// so a reader (or `sgt work retained`'s own rendering) can tell a
+/// per-stage evidence copy apart from the flat patch it sits alongside.
+fn retained_output_bindings(
+    b: &BindingTeardown,
+    outputs: &[RetainedStageOutput],
+) -> Vec<RetainedBinding> {
+    outputs
+        .iter()
+        .filter(|o| o.path.exists())
+        .map(|o| RetainedBinding {
+            repository: b.repository.clone(),
+            path: o.path.clone(),
+            reason: "retained_output",
+            detail: format!("stage {} declared output/ artifacts", o.stage),
+            bytes: o.bytes,
         })
         .collect()
 }
@@ -1481,14 +1548,37 @@ pub fn reap(data_dir: &Path, surface: &WorkSurface, teardown: &TeardownReport) -
 fn reap_binding(data_dir: &Path, surface: &WorkSurface, binding: &BindingTeardown) -> ReapOutcome {
     match &binding.disposition {
         BindingDisposition::RetainedDirty {
-            patch: Some(info), ..
-        } => match std::fs::remove_file(&info.path) {
-            Ok(()) => ReapOutcome::Reaped { bytes: info.bytes },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReapOutcome::NothingRetained,
-            Err(e) => ReapOutcome::Failed {
-                detail: e.to_string(),
-            },
-        },
+            patch: Some(info),
+            outputs,
+            ..
+        } => {
+            // #240: dispose of the stage-output copies alongside the
+            // patch — `remove_surface_root` refuses a non-empty root, so
+            // leaving these behind would leave the whole surface
+            // undeletable after every retained patch was reaped.
+            //
+            // Patch removal is attempted *first*, deliberately: it is the
+            // one step here that can report a real, non-`NotFound` error,
+            // and the outputs are only destroyed once that step has
+            // already succeeded (or found nothing to remove). Destroying
+            // the outputs before the patch would leave `Failed` on a real
+            // patch-removal error indistinguishable from "nothing was
+            // reaped", when the irreversible output loss already
+            // happened.
+            let outcome = match std::fs::remove_file(&info.path) {
+                Ok(()) => ReapOutcome::Reaped { bytes: info.bytes },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReapOutcome::NothingRetained,
+                Err(e) => {
+                    return ReapOutcome::Failed {
+                        detail: e.to_string(),
+                    };
+                }
+            };
+            for output in outputs {
+                let _ = std::fs::remove_dir_all(&output.path);
+            }
+            outcome
+        }
         BindingDisposition::RetainedDirty { patch: None, .. } => {
             if !binding.worktree_path.exists() {
                 return ReapOutcome::NothingRetained;
@@ -1625,14 +1715,21 @@ fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposit
         return BindingDisposition::RetainedDirty {
             changes,
             patch: None,
+            outputs: Vec::new(),
         };
     }
     let Some(patch) = capture_dirty_patch(binding) else {
         return BindingDisposition::RetainedDirty {
             changes,
             patch: None,
+            outputs: Vec::new(),
         };
     };
+    // #240: copy each stage's declared `output/` artifacts out of the
+    // worktree in this same before-removal window the patch capture just
+    // used — the worktree's files are still on disk (git add/diff never
+    // remove anything), and this is the last point at which they are.
+    let outputs = retain_stage_outputs(binding);
     let path = binding.worktree_path.display().to_string();
     // The patch is already durable regardless of what happens next, so
     // nothing captured can be lost. But if the worktree removal below fails,
@@ -1644,7 +1741,9 @@ fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposit
     // reclaimable (`reap_binding`'s `patch: None` arm retries the same `git
     // worktree remove`); the now-redundant patch file (its content already
     // sitting uncommitted in the still-present directory) is removed
-    // best-effort so it does not become its own untracked leak.
+    // best-effort so it does not become its own untracked leak — the
+    // copied `outputs` are removed the same way, for the same reason: the
+    // originals are still sitting in the still-present directory.
     match git(
         &binding.source_path,
         &["worktree", "remove", "--force", &path],
@@ -1652,15 +1751,143 @@ fn retain_dirty(binding: &RepositoryBinding, changes: String) -> BindingDisposit
         Ok(_) => BindingDisposition::RetainedDirty {
             changes,
             patch: Some(patch),
+            outputs,
         },
         Err(_) => {
             let _ = std::fs::remove_file(&patch.path);
+            for output in &outputs {
+                let _ = std::fs::remove_dir_all(&output.path);
+            }
             BindingDisposition::RetainedDirty {
                 changes,
                 patch: None,
+                outputs: Vec::new(),
             }
         }
     }
+}
+
+/// #240: copy each stage directory's declared `output/` artifacts out of
+/// `binding.worktree_path` before it is removed, into
+/// `<stage-dir>.output/<stage-dir>/` sibling to the worktree — the same
+/// retained-evidence area [`capture_dirty_patch`] writes its patch into.
+/// A stage directory is any top-level entry of the worktree that has an
+/// `output/` subdirectory; nothing here consults the workflow catalog
+/// (Rule 4, `docs/icm/convention.md`: "no engine collection, no artifact
+/// manifest machinery" — the worktree's own filesystem shape is ground
+/// truth, exactly as [`capture_dirty_patch`] already treats it). Returns
+/// one [`RetainedStageOutput`] per stage directory that actually had a
+/// real (non-`README.md`) file to copy; a stage whose `output/` is empty
+/// or holds only its own declaration is not reported.
+fn retain_stage_outputs(binding: &RepositoryBinding) -> Vec<RetainedStageOutput> {
+    let Some(surface_root) = binding.worktree_path.parent() else {
+        return Vec::new();
+    };
+    let Ok(top_level) = std::fs::read_dir(&binding.worktree_path) else {
+        return Vec::new();
+    };
+    let dest_root = surface_root.join(format!("{}.output", binding.repository));
+    let mut outputs = Vec::new();
+    for entry in top_level.flatten() {
+        let stage_dir = entry.path();
+        if !stage_dir.is_dir() {
+            continue;
+        }
+        let output_dir = stage_dir.join("output");
+        if !output_dir.is_dir() {
+            continue;
+        }
+        let Some(stage_name) = stage_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let dest = dest_root.join(stage_name);
+        let bytes = copy_declared_output_artifacts(&output_dir, &dest, &binding.worktree_path);
+        if bytes > 0 {
+            outputs.push(RetainedStageOutput {
+                stage: stage_name.to_string(),
+                path: dest,
+                bytes,
+            });
+        } else {
+            // Nothing real was copied (empty dir, or only README.md) —
+            // remove the now-empty destination so it never reads as
+            // retained evidence.
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+    }
+    outputs
+}
+
+/// Copy every real file under `src`, recursively, except the top-level
+/// `README.md` (the declaration, not an artifact — Rule 4), into the
+/// matching path under `dest`, creating directories on demand. A stage may
+/// legitimately write a nested artifact tree under `output/` — convention.md
+/// does not forbid it — so this descends into subdirectories rather than
+/// stopping at the top level.
+///
+/// A file `git add -A` would not stage (gitignored) is skipped too, the
+/// same exclusion [`capture_dirty_patch`] gets for free from `git add`
+/// itself: `output/` is declared to hold only real, trackable artifacts
+/// (convention.md §4/Rule 4), and a file Git itself would refuse to track
+/// is not one — copying it here would reintroduce the disk-bloat risk R4
+/// was written to prevent (#109) if that convention is ever violated.
+///
+/// Best-effort per file: a file this cannot read or write is skipped
+/// rather than aborting the whole stage's copy, matching
+/// [`capture_dirty_patch`]'s own best-effort posture toward anything past
+/// the point where failure can no longer lose already-durable evidence.
+/// Returns the total bytes actually copied.
+fn copy_declared_output_artifacts(src: &Path, dest: &Path, worktree_root: &Path) -> u64 {
+    copy_declared_output_artifacts_at(src, dest, worktree_root, true)
+}
+
+fn copy_declared_output_artifacts_at(
+    src: &Path,
+    dest: &Path,
+    worktree_root: &Path,
+    is_top_level: bool,
+) -> u64 {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return 0;
+    };
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            bytes += copy_declared_output_artifacts_at(
+                &path,
+                &dest.join(entry.file_name()),
+                worktree_root,
+                false,
+            );
+            continue;
+        }
+        if !path.is_file() {
+            continue;
+        }
+        if is_top_level && path.file_name().and_then(|n| n.to_str()) == Some("README.md") {
+            continue;
+        }
+        if git_succeeds(
+            worktree_root,
+            &["check-ignore", "-q", &path.display().to_string()],
+        ) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read(&path) else {
+            continue;
+        };
+        if std::fs::create_dir_all(dest).is_err() {
+            continue;
+        }
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        if crate::runtime::fsutil::write_atomic(&dest.join(file_name), &contents).is_ok() {
+            bytes += contents.len() as u64;
+        }
+    }
+    bytes
 }
 
 /// Stage everything `.gitignore` does not exclude (`git add -A`), diff it
@@ -4733,6 +4960,259 @@ mod tests {
         );
         let new_file = std::fs::read(target.join("new.rs")).expect("applied untracked file");
         assert_eq!(new_file, b"fn wanted() {}\n".to_vec());
+    }
+
+    /// #240: a stage's declared `output/` artifacts (Rule 4,
+    /// `docs/icm/convention.md`) must survive a dirty teardown as their own
+    /// retrievable, per-stage-labeled copy — not just bundled, undiscoverably,
+    /// inside the flat `.dirty.patch` alongside every other change. Two
+    /// stage directories, one with a real artifact plus its `README.md`
+    /// declaration, one with only the declaration — the second must not
+    /// produce a retained-output entry at all (nothing real was written).
+    #[test]
+    fn dirty_teardown_retains_each_stages_declared_output_artifacts() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01OUTPUTS",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        // `20-panel`: a declaration plus a real artifact the run actually
+        // wrote — this one must be retained.
+        let panel_output = worktree.join("20-panel").join("output");
+        std::fs::create_dir_all(&panel_output).expect("panel output dir");
+        std::fs::write(panel_output.join("README.md"), "declares findings.md")
+            .expect("panel README");
+        std::fs::write(panel_output.join("findings.md"), "four-axis findings")
+            .expect("panel artifact");
+
+        // `10-hypothesize`: only the declaration, nothing real ever written —
+        // this one must not show up as retained output.
+        let hyp_output = worktree.join("10-hypothesize").join("output");
+        std::fs::create_dir_all(&hyp_output).expect("hypothesize output dir");
+        std::fs::write(hyp_output.join("README.md"), "declares hypotheses.md")
+            .expect("hypothesize README");
+
+        // Also touch a tracked file so the worktree is dirty and teardown
+        // takes the `RetainedDirty` path at all.
+        std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
+
+        let report = teardown_of(&surface);
+        let BindingDisposition::RetainedDirty { patch, outputs, .. } =
+            &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        assert!(patch.is_some(), "the flat patch must still be captured too");
+
+        assert_eq!(
+            outputs.len(),
+            1,
+            "only the stage with a real artifact should be retained: {outputs:?}"
+        );
+        let panel = &outputs[0];
+        assert_eq!(panel.stage, "20-panel");
+
+        // The worktree is gone — the copy is the only place this is left.
+        assert!(!worktree.exists());
+        let retained_findings = std::fs::read_to_string(panel.path.join("findings.md"))
+            .expect("retained findings.md must be readable after teardown");
+        assert_eq!(retained_findings, "four-axis findings");
+        assert!(
+            !panel.path.join("README.md").exists(),
+            "the declaration itself is not an artifact and must not be copied"
+        );
+
+        // `retained_bindings` (the `sgt work retained` read side) must
+        // surface it too, tagged distinctly from the flat patch.
+        let bindings = retained_bindings(&report);
+        assert!(
+            bindings
+                .iter()
+                .any(|b| b.reason == "retained_output" && b.path == panel.path),
+            "retained_bindings must report the stage-output copy: {bindings:?}"
+        );
+        assert!(
+            bindings.iter().any(|b| b.reason == "retained_dirty"),
+            "the flat patch must still be reported alongside it: {bindings:?}"
+        );
+    }
+
+    /// W6 (F-IN-01): `copy_declared_output_artifacts` must descend into
+    /// subdirectories of a stage's `output/`, not just copy files sitting
+    /// directly inside it — convention.md does not forbid a stage from
+    /// writing a nested artifact tree, and a flat-only copy silently drops
+    /// those files from retention with no error.
+    #[test]
+    fn dirty_teardown_retains_a_stages_nested_output_artifacts() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01NESTED",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        let panel_output = worktree.join("20-panel").join("output");
+        let nested = panel_output.join("evidence");
+        std::fs::create_dir_all(&nested).expect("nested output dir");
+        std::fs::write(panel_output.join("README.md"), "declares findings.md")
+            .expect("panel README");
+        std::fs::write(nested.join("transcript.log"), "nested artifact").expect("nested file");
+
+        std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
+
+        let report = teardown_of(&surface);
+        let BindingDisposition::RetainedDirty { outputs, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        assert_eq!(
+            outputs.len(),
+            1,
+            "the nested artifact must be retained: {outputs:?}"
+        );
+        let retained =
+            std::fs::read_to_string(outputs[0].path.join("evidence").join("transcript.log"))
+                .expect("nested artifact must survive teardown at its original relative path");
+        assert_eq!(retained, "nested artifact");
+    }
+
+    /// W6 (F-IN-02): `copy_declared_output_artifacts` must exclude files
+    /// Git would refuse to track (gitignored), the same exclusion
+    /// `capture_dirty_patch` gets for free from `git add -A` — otherwise a
+    /// stage that drops a gitignored file into `output/` reintroduces the
+    /// disk-bloat risk R4/#109 was written to prevent.
+    #[test]
+    fn dirty_teardown_excludes_gitignored_files_from_retained_output() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01IGNORED",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        let panel_output = worktree.join("20-panel").join("output");
+        std::fs::create_dir_all(&panel_output).expect("panel output dir");
+        std::fs::write(panel_output.join("README.md"), "declares findings.md")
+            .expect("panel README");
+        std::fs::write(panel_output.join("findings.md"), "real artifact").expect("real artifact");
+        std::fs::write(panel_output.join(".gitignore"), "junk.bin\n").expect("gitignore");
+        std::fs::write(panel_output.join("junk.bin"), "should never be retained")
+            .expect("ignored artifact");
+
+        std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
+
+        let report = teardown_of(&surface);
+        let BindingDisposition::RetainedDirty { outputs, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].path.join("findings.md").is_file());
+        assert!(
+            !outputs[0].path.join("junk.bin").exists(),
+            "a gitignored file must not be copied into retained output"
+        );
+    }
+
+    /// W6 (F-IN-03): if the patch removal step of `reap_binding` fails with
+    /// a real (non-`NotFound`) error, the already-copied stage-output
+    /// retention must not have been destroyed first — otherwise `Failed`
+    /// would hide that irreversible data loss already happened. Forces the
+    /// failure by making the patch's parent directory read-only so
+    /// `remove_file` is denied, then asserts the output copy is still on
+    /// disk after `reap_binding` reports `Failed`.
+    #[test]
+    fn reap_failing_to_remove_the_patch_does_not_destroy_the_output_copy_first() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01REAPORD",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        let panel_output = worktree.join("20-panel").join("output");
+        std::fs::create_dir_all(&panel_output).expect("panel output dir");
+        std::fs::write(panel_output.join("findings.md"), "real artifact").expect("real artifact");
+        std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
+
+        let report = teardown_of(&surface);
+        let BindingDisposition::RetainedDirty {
+            patch: Some(info),
+            outputs,
+            ..
+        } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected a captured patch and retained output: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        assert_eq!(outputs.len(), 1);
+        let output_path = outputs[0].path.clone();
+        assert!(output_path.join("findings.md").is_file());
+
+        let patch_dir = info
+            .path
+            .parent()
+            .expect("patch has a parent dir")
+            .to_path_buf();
+        let original_perms = std::fs::metadata(&patch_dir)
+            .expect("stat patch dir")
+            .permissions();
+        let mut locked = original_perms.clone();
+        locked.set_mode(0o555);
+        std::fs::set_permissions(&patch_dir, locked).expect("lock patch dir");
+
+        let outcome = reap_binding(fixture_data_dir(&surface), &surface, &report.bindings[0]);
+
+        // Restore permissions before any assertion can panic and leave the
+        // tempdir uncleanable.
+        std::fs::set_permissions(&patch_dir, original_perms).expect("restore patch dir perms");
+
+        assert!(
+            matches!(outcome, ReapOutcome::Failed { .. }),
+            "expected patch removal to fail: {outcome:?}"
+        );
+        assert!(
+            output_path.join("findings.md").is_file(),
+            "the output copy must survive a failed patch removal, not be destroyed first"
+        );
     }
 
     /// #234 follow-up (`60-re-verify-and-postmortem`, F-SF-04/F-TH-01): the
