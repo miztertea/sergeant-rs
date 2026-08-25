@@ -43,6 +43,17 @@
 //! once. A daemon is healthy when it can accept and route requests, not when
 //! every third-party CLI has printed `--help`.
 //!
+//! **After, measured the same way on the same host** (five cold starts each,
+//! fresh estate and data dir per start, polled at 10ms from `exec`; Cerberus,
+//! 2026-08-25): the descriptor lands at **0.06-0.10s**, and the whole probe
+//! walk is durable — the sixth `backend.probed` flushed — at **3.22-3.27s**.
+//! The same instrument re-run against the pre-#293 build measures **6.03-6.32s
+//! for both**, which is what "both" meant back then: the descriptor could not
+//! precede the walk it was waiting on. So the client-visible number falls by
+//! ~85x and stops being the walk's hostage, while the walk itself roughly
+//! halves — its floor is now its slowest single adapter (opencode ~3.2s)
+//! rather than the sum of all six, exactly as `probe_walk`'s own doc predicts.
+//!
 //! **The capability-pending contract**, which is what makes the reordering
 //! safe rather than merely faster. Between serving and a backend's probe
 //! completing:
