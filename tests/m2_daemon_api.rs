@@ -324,7 +324,7 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     let path = daemon::descriptor_path(dir.path());
     let bytes = std::fs::read(&path).expect("descriptor readable");
     let descriptor: RuntimeDescriptor = serde_json::from_slice(&bytes).expect("descriptor json");
-    assert_eq!(descriptor.schema, "sergeant.runtime/v2");
+    assert_eq!(descriptor.schema, "sergeant.runtime/v3");
     assert!(
         descriptor.endpoint.starts_with("http://127.0.0.1:"),
         "loopback endpoint, got {}",
@@ -334,14 +334,25 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     assert_eq!(descriptor.api_revision, "v1");
     assert_eq!(descriptor.token, handle.token);
     assert_token_plausible(&descriptor.token);
-    // estate-root §5.1: `v2` exists for these two fields. This daemon was
-    // started against no estate (`DaemonConfig::estate_root` is `None` — the
-    // shape most of this file's in-process rigs use), and the descriptor has
-    // to *say so* rather than omit the question: a client comparing its own
-    // exact root against `None` gets the mismatch refusal, which is the only
-    // safe answer when the daemon would plan against nothing.
-    assert_eq!(descriptor.estate_root, None);
-    assert_eq!(descriptor.manifest_path, None);
+    // D3: a v3 descriptor carries **no** estate fields at all. The admitted-
+    // estate set is dynamic daemon state (`GET /v1/estates`); baking a set
+    // into a file written once, atomically, at startup would contradict lazy
+    // admission. The serialized keys are asserted exactly, so a re-added
+    // estate field is a test failure rather than a silent re-narrowing of
+    // what the descriptor means.
+    let raw: Value = serde_json::from_slice(&bytes).expect("descriptor json");
+    let mut keys: Vec<&str> = raw
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["api_revision", "endpoint", "pid", "schema", "token"],
+        "D3: descriptor v3 is schema/endpoint/pid/api_revision/token — nothing else"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -382,34 +393,34 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     );
     successor.shutdown().await;
 
-    // The other half of §5.1: a daemon started *against* an estate publishes
-    // the canonical root and its manifest, because that is what every client
-    // compares its own exact root to before using the endpoint. Recorded, not
-    // reconstructed — a reader must never have to re-derive
-    // `<root>/sergeant.toml` (or, worse, walk for it).
+    // D3's other half, re-scoped from the retired "the descriptor publishes
+    // the one bound root" assertion: a daemon that has an estate in play
+    // publishes exactly the same five-key descriptor. The estate is not a
+    // property of the process any more, so it cannot be a property of the
+    // file the process writes once at startup.
     let estate = TempDir::new().expect("tempdir");
     support::scaffold_estate(estate.path(), "descriptor-lifecycle", &["solo"]);
-    let root = std::fs::canonicalize(estate.path()).expect("canonical estate root");
-    let bound_dir = TempDir::new().expect("tempdir");
-    let bound = daemon::start_with(
-        bound_dir.path(),
-        DaemonConfig {
-            estate_root: Some(estate.path().to_path_buf()),
-            ..DaemonConfig::default()
-        },
+    let host_dir = TempDir::new().expect("tempdir");
+    let host = daemon::start_with(host_dir.path(), DaemonConfig::default())
+        .await
+        .expect("daemon start");
+    let raw: Value = serde_json::from_slice(
+        &std::fs::read(daemon::descriptor_path(host_dir.path())).expect("descriptor readable"),
     )
-    .await
-    .expect("daemon start");
-    let descriptor = daemon::read_descriptor(bound_dir.path())
-        .expect("read descriptor")
-        .expect("descriptor published");
-    assert_eq!(descriptor.estate_root.as_deref(), Some(root.as_path()));
+    .expect("descriptor json");
+    let mut keys: Vec<&str> = raw
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
     assert_eq!(
-        descriptor.manifest_path,
-        Some(root.join("sergeant.toml")),
-        "the manifest path travels with the root, so no client reconstructs it"
+        keys,
+        vec!["api_revision", "endpoint", "pid", "schema", "token"],
+        "D3: no estate ever reaches the descriptor, however many are in play"
     );
-    bound.shutdown().await;
+    host.shutdown().await;
 }
 
 /// A bearer token must be long, high-entropy-looking, and safe to put in a
@@ -1951,26 +1962,21 @@ fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
     stop_daemon(dir.path());
 }
 
-/// Hand-write a `sergeant.runtime/v2` descriptor into `dir`, bound to `dir`
-/// itself as its estate root.
+/// Hand-write a `sergeant.runtime/v3` descriptor into `dir`.
 ///
-/// The binding matters even for a descriptor whose whole point is to be
-/// dead: §5.1 has clients verify `estate_root` **before** they judge
-/// staleness or probe the endpoint, so a fabricated descriptor naming some
-/// other root would get the mismatch refusal and the staleness path under
-/// test would never run. The canonical form is what
-/// [`Estate::admit`](sergeant_rs::domain::estate::Estate::admit)
-/// puts in the descriptor, so it is what a fixture must reproduce.
+/// D3: no estate fields. The fixture used to have to reproduce the exact
+/// canonical bound root, because §5.1 had clients compare it *before* they
+/// judged staleness — a fabricated descriptor naming any other root got the
+/// mismatch refusal and the staleness path under test never ran. That
+/// refusal class is retired; a v3 descriptor says nothing about estates, so
+/// the staleness path is reached on its own terms.
 fn write_fabricated_descriptor(dir: &DataDir, endpoint: &str, pid: u32, token: &str) {
-    let root = std::fs::canonicalize(dir.path()).expect("canonical estate root");
     let descriptor = json!({
-        "schema": "sergeant.runtime/v2",
+        "schema": "sergeant.runtime/v3",
         "endpoint": endpoint,
         "pid": pid,
         "api_revision": "v1",
         "token": token,
-        "estate_root": root,
-        "manifest_path": root.join("sergeant.toml"),
     });
     std::fs::write(
         daemon::descriptor_path(dir.path()),
@@ -2019,21 +2025,24 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
 /// Half-interpreting it could mean talking to the wrong process, or spawning
 /// a second daemon on a data dir that already has an owner.
 ///
-/// **Both directions, since estate-root §5.1 bumped the schema to
-/// `sergeant.runtime/v2`.** A newer build's descriptor was always the
-/// forward case; `sergeant.runtime/v1` is now the backward one, and it is not
-/// hypothetical — it is what a daemon from the previous release leaves on
-/// disk. There is deliberately no compatibility shim: a v1 descriptor carries
-/// no `estate_root`, so a client could not verify §5.1's binding against it
-/// at all, and reading it half-way is exactly the "talking to the wrong
-/// process" failure above. Both refusals must also carry the *remedy* (stop
-/// the old daemon and let a restarted one republish), because an operator
-/// staring at a live-but-unusable daemon has no other way to know what to do.
+/// **Both directions, and now one release deeper.** H1's D3 bumped the
+/// schema to `sergeant.runtime/v3` (no estate fields at all), so
+/// `sergeant.runtime/v2` — an estate-*bound* daemon from the previous
+/// release, still running on a developer's machine at cutover — joins the
+/// backward cases beside v1, and `v4` stands in for the forward one. There
+/// is deliberately no compatibility shim in either direction: a v2
+/// descriptor names one bound estate this build no longer believes in, and
+/// half-reading it is exactly the "talking to the wrong process" failure
+/// above. Every refusal must also carry the *remedy* (stop the old daemon
+/// and let a restarted one republish), because an operator staring at a
+/// live-but-unusable daemon has no other way to know what to do — that
+/// remedy is H1 §6's cutover story with a real backstop under it.
 #[test]
 fn descriptor_with_an_unknown_schema_fails_closed() {
     for (label, schema) in [
-        ("from the future", "sergeant.runtime/v3"),
-        ("from the previous release", "sergeant.runtime/v1"),
+        ("from the future", "sergeant.runtime/v4"),
+        ("from the previous release", "sergeant.runtime/v2"),
+        ("from two releases back", "sergeant.runtime/v1"),
     ] {
         let dir = estate_data_dir();
         let unreadable = json!({

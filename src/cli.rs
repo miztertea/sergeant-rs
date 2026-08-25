@@ -2278,11 +2278,11 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
         .build()?;
 
     let stale = if let Some(descriptor) = daemon::read_descriptor(data_dir)? {
-        // §5.1: verify the binding **before** the endpoint is used for
-        // anything, and before any decision that could spawn. A daemon bound
-        // to another estate is a named refusal — never a connection, and
-        // never a second daemon over the same data dir.
-        check_binding(&descriptor, data_dir, estate_root)?;
+        // D4: validate the addressed estate **before** the endpoint is used
+        // for anything, and before any decision that could spawn. The
+        // refusal is now about the estate ("not an estate", "admission
+        // failed"), never about which estate some descriptor was bound to.
+        check_binding(estate_root, "this command")?;
         if healthz_ok(&http, &descriptor.endpoint).await {
             return client_for(&descriptor);
         }
@@ -2326,10 +2326,11 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
         if let Ok(Some(descriptor)) = daemon::read_descriptor(data_dir)
             && !is_stale_descriptor(stale.as_ref(), &descriptor)
         {
-            // The winner of the spawn race may be another client's child,
-            // and §5.1 applies to it exactly as it did above: a daemon bound
-            // elsewhere is refused, not adopted.
-            check_binding(&descriptor, data_dir, estate_root)?;
+            // The winner of the spawn race may be another client's child.
+            // Under H1 that is fine — it is the *host* daemon either way —
+            // but the addressed estate is re-validated exactly as above,
+            // because a manifest can break inside the spawn window.
+            check_binding(estate_root, "this command")?;
             if healthz_ok(&http, &descriptor.endpoint).await {
                 return client_for(&descriptor);
             }
@@ -2348,17 +2349,27 @@ fn client_for(descriptor: &RuntimeDescriptor) -> Result<ApiClient, CliError> {
     ApiClient::new(&descriptor.endpoint, &descriptor.token).map_err(CliError::from)
 }
 
-/// §5.1/§15: refuse a descriptor bound to a different estate, naming both
-/// roots. Runs before the endpoint is probed, connected to, or used to
-/// decide whether to spawn — "never connect, never a second daemon on the
-/// same data dir" is only true if the check comes first.
-fn check_binding(
-    descriptor: &RuntimeDescriptor,
-    data_dir: &Path,
-    estate_root: &Path,
-) -> Result<(), CliError> {
-    descriptor
-        .check_estate_root(data_dir, Some(estate_root))
+/// The client gate, rewritten for H1 (sprint-plan D4, brief deliverable 4).
+///
+/// **What it used to be.** `check_binding` compared the client's exact root
+/// against the one root the v2 descriptor published, refusing in both
+/// directions — "this daemon is bound to a different estate", "this daemon
+/// is bound to no estate". That class is retired, not silently deleted: a
+/// host daemon serving an estate it was never started from is H1's whole
+/// point, so the comparison has no object left to make.
+///
+/// **What it is now.** The one thing that was ever load-bearing: does the
+/// estate this command addresses actually validate, right now, as an estate
+/// (§4.1's exact-root check, plus this root's own filesystem reliability)?
+/// The taxonomy is [`crate::runtime::estates::EstateAdmissionError`]'s —
+/// (a) not an estate, (b) admission failed, (c) no estate addressed at all.
+///
+/// It still runs *before* the endpoint is probed, connected to, or used to
+/// decide whether to spawn, for the same reason it always did: a directory
+/// mistake must not be able to reach a daemon at all.
+fn check_binding(estate_root: &Path, operation: &str) -> Result<(), CliError> {
+    crate::runtime::estates::check_estate_root(Some(estate_root), operation)
+        .map(|_| ())
         .map_err(|e| CliError::new(e.to_string()))
 }
 
@@ -2391,9 +2402,9 @@ async fn observe_connect(data_dir: &Path, estate_root: &Path) -> Result<ApiClien
             data_dir.display(),
         )));
     };
-    // §5.1, before the endpoint is touched at all — the same gate
+    // D4, before the endpoint is touched at all — the same gate
     // `ensure_daemon` applies, for the same reason.
-    check_binding(&descriptor, data_dir, estate_root)?;
+    check_binding(estate_root, "this command")?;
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
@@ -2601,10 +2612,11 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
         );
         return Ok(());
     };
-    // §5.1, before the endpoint is touched: stopping is *using* a daemon,
-    // and a daemon bound to another estate is no more this estate's to stop
-    // than it is this estate's to submit to.
-    check_binding(&descriptor, data_dir, estate_root)?;
+    // D4/D5, before the endpoint is touched: `sgt daemon stop` stops the
+    // *host* daemon — every admitted estate's — so the estate this
+    // invocation stands in is validated for the ordinary reason (a directory
+    // mistake must not reach a daemon), not because it owns the daemon.
+    check_binding(estate_root, "sgt daemon stop")?;
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;

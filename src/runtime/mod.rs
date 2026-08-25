@@ -4,6 +4,7 @@
 pub mod analytics;
 pub mod blob;
 pub mod engine;
+pub mod estates;
 pub(crate) mod fsutil;
 pub mod git;
 pub mod graph;
