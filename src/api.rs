@@ -1120,6 +1120,14 @@ async fn healthz() -> Json<Value> {
 /// every live client needs it and none of them may read the journal to find
 /// it: it is the resume point an SSE subscriber passes as `from` so that
 /// attaching to the tail does not replay all of history first.
+///
+/// **H1 keeps it a single number, deliberately** (brief deliverable 5): a
+/// host daemon owns exactly one journal, shared by every admitted estate,
+/// so there is one head and one resume point — the estate coordinate lives
+/// on each event (D1), not on the stream. `data_dir` likewise still names
+/// one directory; what changed is *which* — the host runtime root (D2),
+/// no longer any estate's. Which estates this daemon serves is a different
+/// question, and it has its own route: `GET /v1/estates`.
 fn system_body(state: &ApiState, journal_head: u64, admission_paused: bool) -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -4065,6 +4073,21 @@ struct EventsQuery {
     /// Keep only the newest `limit` matching events. Absent = all of them.
     #[serde(default)]
     limit: Option<usize>,
+    /// D4/D6: restrict to one estate's events, by canonical exact root,
+    /// matched against each event's own `workspace_id` coordinate (D1).
+    ///
+    /// Optional, and **server-side on purpose**: without it, "estate-wide
+    /// watch" would silently become "host-wide watch" for every existing
+    /// `sgt watch` invocation the moment a daemon starts serving a second
+    /// estate — a behavior change nobody asked for. The filter is not
+    /// validated by admission: this is a read, it creates nothing, and a
+    /// root that matches no event is an empty answer rather than a refusal.
+    ///
+    /// This wave lands the wire field and the filter. Routing the *client*
+    /// onto it — what `sgt watch` inside an estate defaults to, and how a
+    /// host-wide watch is asked for — is W3's, per this wave's brief.
+    #[serde(default)]
+    estate_root: Option<String>,
 }
 
 /// The `GET /v1/events` body for an already-fetched slice.
@@ -4078,13 +4101,10 @@ struct EventsQuery {
 /// asked for is gone under retention policy" — without it those two cases
 /// are wire-identical.
 fn events_body(events: Vec<Event>, query: &EventsQuery, floor_seq: u64) -> Value {
-    let mut events: Vec<Event> = match &query.work_id {
-        Some(work_id) => events
-            .into_iter()
-            .filter(|e| e.work_id.as_deref() == Some(work_id.as_str()))
-            .collect(),
-        None => events,
-    };
+    let mut events: Vec<Event> = events
+        .into_iter()
+        .filter(|e| matches_query(e, query))
+        .collect();
     if let Some(limit) = query.limit
         && events.len() > limit
     {
@@ -4093,7 +4113,33 @@ fn events_body(events: Vec<Event>, query: &EventsQuery, floor_seq: u64) -> Value
     json!({"events": events, "floor_seq": floor_seq})
 }
 
-/// `GET /v1/events?from=N&work_id=X&limit=K` — journaled history after seq N.
+/// Does this event pass the query's filters?
+///
+/// One predicate, shared by the history route and the SSE pump, so a client
+/// that asks the same question of both cannot get two different answers —
+/// which is the whole point of `watch`'s attach-then-replay ordering.
+///
+/// D4/D6: `estate_root` matches the envelope's own coordinate (D1). An event
+/// with no coordinate — every pre-envelope journal line, and everything not
+/// bound to an estate at all — is filtered *out* when an estate is asked
+/// for, because "I do not know which estate this belongs to" is not
+/// evidence that it belongs to the one asked about.
+fn matches_query(event: &Event, query: &EventsQuery) -> bool {
+    if let Some(work_id) = &query.work_id
+        && event.work_id.as_deref() != Some(work_id.as_str())
+    {
+        return false;
+    }
+    if let Some(estate_root) = &query.estate_root
+        && event.workspace_id.as_deref() != Some(estate_root.as_str())
+    {
+        return false;
+    }
+    true
+}
+
+/// `GET /v1/events?from=N&work_id=X&limit=K&estate_root=R` — journaled
+/// history after seq N.
 ///
 /// `from` is the only bound on how much journal is read; `work_id` and `limit`
 /// shape the answer, not the scan. A client that wants a cheap tail should
@@ -4147,7 +4193,7 @@ async fn event_stream(
         None => query.from,
     };
     let (tx, rx) = mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
-    tokio::spawn(pump_until_closing(state, from, tx));
+    tokio::spawn(pump_until_closing(state, from, query, tx));
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
         .into_response()
@@ -4165,11 +4211,12 @@ async fn event_stream(
 async fn pump_until_closing(
     state: ApiState,
     from: u64,
+    query: EventsQuery,
     tx: mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
 ) {
     let mut closing = state.closing.clone();
     tokio::select! {
-        () = forward_events(state, from, tx) => {}
+        () = forward_events(state, from, query, tx) => {}
         () = daemon_closing(&mut closing) => {}
     }
 }
@@ -4190,6 +4237,7 @@ async fn daemon_closing(closing: &mut watch::Receiver<bool>) {
 async fn forward_events(
     state: ApiState,
     from: u64,
+    query: EventsQuery,
     tx: mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
 ) {
     // Subscribe before reading history so nothing can fall in the gap.
@@ -4209,7 +4257,10 @@ async fn forward_events(
     match history {
         Ok(events) => {
             for event in events {
-                if send_sse(&tx, &event).await.is_err() {
+                // `last_sent` advances past a filtered-out event too: it is
+                // the resume point, not a delivery count, and a client that
+                // reconnects must not be handed the same skipped seqs again.
+                if matches_query(&event, &query) && send_sse(&tx, &event).await.is_err() {
                     return;
                 }
                 last_sent = event.seq;
@@ -4227,7 +4278,7 @@ async fn forward_events(
                 if event.seq <= last_sent {
                     continue; // already delivered from history
                 }
-                if send_sse(&tx, &event).await.is_err() {
+                if matches_query(&event, &query) && send_sse(&tx, &event).await.is_err() {
                     return;
                 }
                 last_sent = event.seq;
@@ -5616,7 +5667,7 @@ mod tests {
         }
 
         let (tx, mut rx) = mpsc::channel(1);
-        let pump = tokio::spawn(forward_events(state.clone(), 0, tx));
+        let pump = tokio::spawn(forward_events(state.clone(), 0, EventsQuery::default(), tx));
 
         // W4 §1.1.2: the very first frame on any connection is the floor
         // control frame, sent before history — consumed here, separately,
@@ -5705,7 +5756,7 @@ mod tests {
         }
 
         let (tx, mut rx) = mpsc::channel(1);
-        let pump = tokio::spawn(forward_events(state.clone(), 0, tx));
+        let pump = tokio::spawn(forward_events(state.clone(), 0, EventsQuery::default(), tx));
 
         let floor = rx
             .recv()

@@ -1464,6 +1464,36 @@ async fn h1_two_estates_submit_work_to_one_daemon_and_keep_their_own_surfaces() 
         );
     }
 
+    // D4/D6: `GET /v1/events?estate_root=` narrows the shared stream to one
+    // estate, server-side. Without it, "estate-wide watch" would silently
+    // become "host-wide watch" for every existing `sgt watch` the moment a
+    // second estate is admitted — this field is the wire half of keeping
+    // that from happening; routing the client onto it is W3's.
+    let payments_root = std::fs::canonicalize(payments.path())
+        .expect("canonical")
+        .to_string_lossy()
+        .into_owned();
+    let scoped = client
+        .get(&format!(
+            "/v1/events?estate_root={}",
+            payments_root.replace('/', "%2F")
+        ))
+        .await
+        .expect("filtered history");
+    let scoped = scoped["events"].as_array().expect("events").clone();
+    assert!(!scoped.is_empty(), "the filter must not empty the stream");
+    for event in &scoped {
+        assert_eq!(
+            event["workspace_id"], payments_root,
+            "an estate filter must return only that estate's events: {event}"
+        );
+    }
+    let whole = client.get("/v1/events").await.expect("whole history");
+    assert!(
+        whole["events"].as_array().expect("events").len() > scoped.len(),
+        "and it must actually remove events from the shared stream"
+    );
+
     handle.shutdown().await;
 }
 
