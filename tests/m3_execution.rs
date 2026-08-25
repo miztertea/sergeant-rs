@@ -200,7 +200,7 @@ fn write_two_stage_workflow_with_required_columns(
 }
 
 /// [`write_two_stage_workflow`], but `00-first` declares an `output/
-/// README.md` (#260 Q3's shape, `docs/icm/convention.md` Rule 4) naming
+/// README.md` (#260 Q3's shape, the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md) Rule 4) naming
 /// `expected_artifact` as its expected artifact — so the hard stage-output
 /// gate has something to enforce against a `StageCompleted` signal for that
 /// stage.
