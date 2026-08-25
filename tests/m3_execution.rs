@@ -5670,12 +5670,22 @@ async fn a_crash_inside_the_submit_window_fails_closed_with_the_git_evidence() {
 /// that silently means nothing is worse than a refusal.
 ///
 /// The daemon starts on a *valid* manifest and each case rewrites it
-/// underneath: §5.1 admits the estate root before the data dir is even
-/// created, so a daemon started against a broken manifest would never come up
-/// at all and there would be no submit to refuse. Re-reading the manifest at
-/// every `plan` — the root is what startup pins, not the file's contents — is
-/// what makes the edit visible here, and it is the same property `sgt repo
-/// add` relies on to reach a running daemon.
+/// underneath. Re-reading the manifest on every submission is what makes the
+/// edit visible here, and it is the same property `sgt repo add` relies on
+/// to reach a running daemon — H1 only moved *where* that re-read happens
+/// (per admitted estate rather than once per daemon), not whether it does.
+///
+/// **Two refusals, and the split between them is the point (H1 D4).** A
+/// submission is now admitted before it is planned, so a manifest fault the
+/// *exact-root check* can see — an unknown key, a schema violation — is
+/// caught at admission and refused as `invalid_estate`: the estate itself is
+/// inadmissible, so nothing about it is served, not merely this submission.
+/// A fault only the strict load can see — a declared repository with no
+/// mount, a legacy `path` key — is `Estate::admit`'s deliberate blind spot
+/// ("a broken repo blocks Works targeting it, not the estate") and still
+/// surfaces from `Engine::plan` as `workspace_error`. Both are 422 and both
+/// name the offending line; asserting *which* is what keeps the two checks
+/// from quietly collapsing into one.
 #[tokio::test]
 async fn a_malformed_workspace_file_fails_closed() {
     let repos = TempDir::new().expect("tempdir");
@@ -5708,7 +5718,10 @@ async fn a_malformed_workspace_file_fails_closed() {
     )
     .await;
     assert_eq!(status, 422, "a typo'd key must not be ignored: {body}");
-    assert_eq!(body["error"]["code"], "workspace_error");
+    assert_eq!(
+        body["error"]["code"], "invalid_estate",
+        "a schema fault makes the estate itself inadmissible: {body}"
+    );
     assert!(
         body["error"]["message"]
             .as_str()
@@ -5719,7 +5732,10 @@ async fn a_malformed_workspace_file_fails_closed() {
 
     // A declared repository with no mount at `repos/<name>` is refused too
     // (§6.1: the mount is derived, so "declared but absent" is the only shape
-    // a missing repository can now take).
+    // a missing repository can now take) — and this is the case on the *plan*
+    // side of the split above: `Estate::admit` never resolves mounts, by
+    // design, so the estate stays admissible and only the Work targeting the
+    // absent repository is refused.
     std::fs::write(
         &manifest,
         "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"ghost\"\n",
@@ -5735,6 +5751,10 @@ async fn a_malformed_workspace_file_fails_closed() {
     )
     .await;
     assert_eq!(status, 422);
+    assert_eq!(
+        body["error"]["code"], "workspace_error",
+        "a missing mount is a repository problem, not an estate-identity one: {body}"
+    );
     assert!(
         body["error"]["message"]
             .as_str()
@@ -5765,7 +5785,10 @@ async fn a_malformed_workspace_file_fails_closed() {
     )
     .await;
     assert_eq!(status, 422, "a declared path must be refused: {body}");
-    assert_eq!(body["error"]["code"], "workspace_error");
+    assert_eq!(
+        body["error"]["code"], "invalid_estate",
+        "the legacy `path` key is a schema fault, so it too is caught at          admission rather than at plan: {body}"
+    );
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
         message.contains("solo") && message.contains("`path`"),
