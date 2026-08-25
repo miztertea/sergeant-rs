@@ -650,10 +650,11 @@ impl TeardownReport {
     /// shows a closing stage that declared a commit as its durable outcome
     /// but never actually advanced the branch and left the worktree dirty —
     /// the safety net for when an actor guesses wrong about its own runtime
-    /// model (`docs/adr/0007-actor-runtime-contract.md`).
+    /// model (`ADR 0007`).
     ///
-    /// The engine still learns nothing about what a commit *is* (NORTH-STAR:
-    /// "the engine learns no output vocabulary; only the pointer is core"):
+    /// The engine still learns nothing about what a commit *is* (the
+    /// workspace knowledge library's North Star ruling: "the engine learns
+    /// no output vocabulary; only the pointer is core"):
     /// this reads two facts the pointer already computes — a binding's
     /// teardown disposition, and whether its finalize commit ever moved past
     /// the surface's own base SHA — rather than asking any workflow what it
@@ -1140,7 +1141,7 @@ pub fn rematerialize(data_dir: &Path, surface: &WorkSurface) -> Result<WorkSurfa
 /// Materialize a gate Work's surface by *attaching* to another, already-
 /// terminal Work's branches instead of minting fresh ones (§8.6
 /// investigation, Mechanism A —
-/// `docs/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`).
+/// `sergeant-rs-workspace's knowledge/evidence/gauntlet/runs/foundation-1/8.6-gate-branch-binding.md`).
 ///
 /// Every attached binding's `work_branch` is `target_bindings`'s own — this
 /// *is* `target_work_id`'s real branch, not a copy, which is what lets

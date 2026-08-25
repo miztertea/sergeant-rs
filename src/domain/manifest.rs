@@ -1,4 +1,4 @@
-//! The estate manifest's own read-modify-write pen (`docs/gauntlet/notes/
+//! The estate manifest's own read-modify-write pen (`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/
 //! estate-manifest-design-2026-08-11.md`'s "three pens, one file": hand
 //! edits, sgt's own CLI verbs, and the harness are all editing the same
 //! checked-in `sergeant.toml`). This module is the second pen — `sgt init`,

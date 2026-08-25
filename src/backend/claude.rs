@@ -3,7 +3,7 @@
 //! Every claim in this module is backed by a measurement against the
 //! installed CLI (Claude Code **2.1.226**, measured 2026-08-08 in this
 //! container) or is explicitly marked documented-not-measured and fails
-//! closed (LESSONS L1; the spike's own doctrine). The measured facts this
+//! closed (the workspace knowledge library's Lesson L1; the spike's own doctrine). The measured facts this
 //! design rests on:
 //!
 //! - `claude -p --verbose --output-format stream-json`, prompt on stdin,
@@ -73,7 +73,7 @@
 //!   `assistant` chunk — a snapshot of that chunk's own accounting, not a
 //!   cumulative turn total, and not currently parsed out by this adapter).
 //! - Fact-finding only, no promise attached: recorded here and in
-//!   `docs/environments/cerberus.md` because it is the honest answer to
+//!   `sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md` because it is the honest answer to
 //!   "what can interrupt actually tell us", not because anything in this
 //!   milestone changes `interrupt`'s mechanism.
 //!
@@ -97,7 +97,7 @@
 //! unless the environment sets `IS_SANDBOX=1`. This adapter no longer emits
 //! that flag at all (#47): it is recorded here because the refusal's stderr
 //! shape is still what an envelope-less dead turn's evidence can look like
-//! (`docs/gauntlet/runs/runB/run-manifest.md`, attempt 1), not because the
+//! (`sergeant-rs-workspace's knowledge/evidence/gauntlet/runs/runB/run-manifest.md`, attempt 1), not because the
 //! adapter still sends the flag.
 //!
 //! **Permission mode is profile configuration (#47).** `permission_mode` in
@@ -308,7 +308,7 @@ fn mutation_surface_section(bindings: &[BindingSummary]) -> String {
 
 /// The actor's question from one `post_turn_summary` line, when it asked one.
 ///
-/// **Measured, 2.1.226** (`docs/gauntlet/notes/n3-claude-ask-measurement.md`),
+/// **Measured, 2.1.226** (`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/n3-claude-ask-measurement.md`),
 /// two haiku turns in print-mode stream-json:
 ///
 /// ```text
@@ -640,7 +640,7 @@ struct TurnOutcome {
     /// The turn's last `system`/`post_turn_summary` line, verbatim.
     ///
     /// Measured on 2.1.226 (see the module docs and
-    /// `docs/gauntlet/notes/n3-claude-ask-measurement.md`): print-mode
+    /// `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/n3-claude-ask-measurement.md`): print-mode
     /// stream-json emits exactly one of these per turn, and its
     /// `needs_action` field carries the actor's own question when the actor
     /// ended the turn asking one. This is the structured record GP-2's ask
@@ -3086,7 +3086,7 @@ mod tests {
     /// and it is the *only* one this adapter reads.
     ///
     /// Both records below are the literal lines 2.1.226 emitted for the two
-    /// prompts recorded in `docs/gauntlet/notes/n3-claude-ask-measurement.md`.
+    /// prompts recorded in `sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/n3-claude-ask-measurement.md`.
     /// The empty-string case is the one that matters most: a turn that asked
     /// nothing still emits the line, so "the line exists" would have been a
     /// capability claim with no discrimination in it at all.
@@ -3255,7 +3255,7 @@ mod tests {
         let backend = ClaudeBackend::new(ClaudeConfig::new(dir.path()));
         assert!(
             backend.capabilities().ask && backend.ask_grammar_intact(),
-            "measured on 2.1.226: see docs/gauntlet/notes/n3-claude-ask-measurement.md"
+            "measured on 2.1.226: see sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/n3-claude-ask-measurement.md"
         );
 
         let emitted = Arc::new(Mutex::new(Vec::<EventDraft>::new()));

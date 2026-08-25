@@ -1,4 +1,4 @@
-//! WATCH acceptance suite (`docs/gauntlet/contracts/WATCH.md`;
+//! WATCH acceptance suite (`sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/WATCH.md`;
 //! `reference/proposal-sgt-watch-v1.md`): W1–W8 (§16.2, as amended), the
 //! live R-WATCH-* pins (R-WATCH-1's waiting tests, R-WATCH-2's two live
 //! fingerprint tests, R-WATCH-3's no-spawn refusal, R-WATCH-9's deep-equals

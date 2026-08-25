@@ -151,7 +151,7 @@ mod codex_appserver;
 /// field: `codex_appserver` itself stays a private child module (the spec's
 /// own visibility rule, above), but a `pub use` of one item out of a private
 /// module is the standard way to give that one item a public path without
-/// making the whole module public — exactly the seam `docs/DEVELOPMENT.md`'s
+/// making the whole module public — exactly the seam `CONTRIBUTING.md`'s
 /// "narrowest visibility that works" rule asks for.
 pub use codex_appserver::Budgets;
 
@@ -5988,7 +5988,7 @@ mod tests {
         }
         let _restore = RestorePerms(dir.path().to_path_buf());
 
-        // Environment probe (docs/DEVELOPMENT.md's testing rules): a root
+        // Environment probe (CONTRIBUTING.md's testing rules): a root
         // dev container silently ignores permission-bit restrictions, so
         // this fixture cannot be armed there -- skip loudly rather than
         // assert something that cannot hold in that environment.

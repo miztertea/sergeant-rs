@@ -1,4 +1,4 @@
-//! M3 acceptance tests (docs/gauntlet/contracts/M3.md).
+//! M3 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M3.md).
 //!
 //! 1. Single-repository estate: submit against the estate the daemon is bound
 //!    to → a real worktree on a work branch cut from the mount's HEAD, with a
@@ -771,7 +771,7 @@ async fn r_mvp1_4_mixed_instructions_policy_refuses_at_submit_naming_both_repos(
 
 /// R-MVP1-4 + MVP-2 D2 item 1: `instructions = "local"` parses, pins, and —
 /// now that its launch-side translation is measured
-/// (`docs/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`,
+/// (`sergeant-rs-workspace's knowledge/evidence/gauntlet/notes/d2-setting-sources-measurement-2026-08-12.md`,
 /// `ClaudeBackend::setting_sources_args`) — is accepted at submit and
 /// reaches the backend's `StartRequest` intact. This is the plumbing pin the
 /// un-refusal needs: MVP-1's sibling test above already proved a *mixed*
@@ -3755,7 +3755,7 @@ async fn retained_lists_a_dirty_teardown_and_reap_disposes_of_it_only_when_confi
 /// backend never runs `git commit`, so the branch never advances past its
 /// base SHA either. The engine still learns nothing about what a commit
 /// *is*: the check only ever compares a teardown disposition and a SHA the
-/// pointer already computed (`docs/adr/0007-actor-runtime-contract.md`).
+/// pointer already computed (`ADR 0007`).
 #[tokio::test]
 async fn a_stranded_completion_is_not_reported_as_plain_completed() {
     let repos = TempDir::new().expect("tempdir");
@@ -5656,7 +5656,7 @@ async fn a_malformed_workspace_file_fails_closed() {
 
 // ------------------------------------------ #22: repository-topology edges
 // beyond R-MVP1-12's own fixtures (`src/domain/estate.rs`'s `#22:`-tagged
-// tests). These were the "remaining edges" `docs/gauntlet/contracts/MVP-1.md`
+// tests). These were the "remaining edges" `sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/MVP-1.md`
 // named and deferred: one table-driven-in-spirit test per shape, through the
 // real daemon/API, asserting the issue's own three things — correct binding
 // record, work completes, teardown clean.

@@ -20,7 +20,7 @@
 ## Record
 
 <!-- Tick what applies; the ledger is append-only.
-- [ ] No deviation from the proposal, or the deviation is registered in GAUNTLET.md (D-row)
+- [ ] No deviation from the proposal, or the deviation is registered in the workspace knowledge library's deviation register (D-row)
 - [ ] Deferred findings landed as backlog rows or GitHub issues, not silence
 - [ ] After the suites: `pgrep -f "debug/sgt [-]-data-dir"` finds nothing
 -->

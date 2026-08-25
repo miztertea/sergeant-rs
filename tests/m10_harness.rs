@@ -99,7 +99,8 @@ fn read_launch(record: &Path) -> Launch {
 }
 
 /// D2: `sgt claude` **execs**, it does not fork-and-supervise. This is the
-/// load-bearing boundary — `NORTH-STAR.md`'s "Never" list forbids
+/// load-bearing boundary — the workspace knowledge library's North Star
+/// ruling's "Never" list forbids
 /// "reconstructed tmux-era supervision" — and it is provable rather than
 /// assumed: an `execve` replaces the calling process's image without
 /// changing its pid, while fork-then-exec hands the child a *new* pid. The

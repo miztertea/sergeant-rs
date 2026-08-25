@@ -2,4 +2,4 @@ blank_issues_enabled: true
 contact_links:
   - name: Architecture / proposal discussion
     url: https://github.com/miztertea/sergeant-rs-workspace/blob/main/knowledge/evidence/reference/proposal-depot-rust-execution-surface.md
-    about: The proposal the prototype implements (now in the private sergeant-rs-workspace repo, ADR 0014 decision 17); deviations from it are settled records under sergeant-rs-workspace's knowledge/rulings/deviations/ (GAUNTLET.md's register moved there too — see that file for the pointer).
+    about: The proposal the prototype implements (now in the private sergeant-rs-workspace repo, ADR 0014 decision 17); deviations from it are settled records under sergeant-rs-workspace's knowledge/rulings/deviations/ (workspace deviation register).

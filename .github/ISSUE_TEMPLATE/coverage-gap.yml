@@ -25,7 +25,7 @@ body:
       description: The regions/lines reported uncovered, from which report, at which commit. Quote the `scripts/coverage/` stage that produced them — a number produced any other way is not this program's number (R-S0-3).
       render: text
       placeholder: |
-        baseline: docs/coverage/baseline-<date>.md, commit <sha>
+        baseline: sergeant-rs-workspace's knowledge/evidence/coverage/baseline-<date>.md, commit <sha>
         stage:    scripts/coverage/c2-suites.sh
         regions:  src/runtime/journal.rs 412-478 (0 executions), 501-509 (0 executions)
     validations:

@@ -1679,9 +1679,9 @@ mod rule_a_eviction_tests {
     /// unbounded climb lived in — stays flat across many completed works,
     /// never one entry per work submitted. TH-08: the daemon-level half of
     /// this claim (real RSS, real fds, real hygiene, not a struct field
-    /// count) is `docs/perf/s2-churn-mvp1-fixer-2026-08-12.md` — run against
+    /// count) is `sergeant-rs-workspace's knowledge/evidence/perf/s2-churn-mvp1-fixer-2026-08-12.md` — run against
     /// this same fix, decelerating per-wave slope, not the pre-eviction
-    /// monotonic climb `docs/perf/baseline-cerberus-2026-08-11.md` measured.
+    /// monotonic climb `sergeant-rs-workspace's knowledge/evidence/perf/baseline-cerberus-2026-08-11.md` measured.
     ///
     /// Mutation this kills: removing the eviction call (or narrowing
     /// `is_absorbing` to nothing) turns `runs.len()` into `N`, not `0`.

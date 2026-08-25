@@ -1,4 +1,4 @@
-//! M1 acceptance tests (docs/gauntlet/contracts/M1.md).
+//! M1 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M1.md).
 //!
 //! 1. Round-trip + unknown-field preservation
 //! 2. Crash-tail recovery

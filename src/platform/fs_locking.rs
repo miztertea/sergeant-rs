@@ -1,7 +1,7 @@
 //! Advisory-locking reliability (#85, ADR 0003 D6).
 //!
 //! `sgt init` and daemon start both rest on exactly one process holding
-//! `daemon.lock` (`docs/DEVELOPMENT.md`'s "One owner" invariant;
+//! `daemon.lock` (`CONTRIBUTING.md`'s "One owner" invariant;
 //! `src/runtime/fsutil.rs::take_exclusive_lock`) — and that lock itself is
 //! already cross-platform for free, because
 //! [`std::fs::File::try_lock`] compiles to `flock` on Unix and `LockFileEx`
@@ -147,7 +147,7 @@ fn parse_proc_mounts(content: &str) -> Vec<MountEntry> {
 /// reason: on Linux this has a live production caller (`raw_detect` below),
 /// so it's never dead there; on macOS and other non-Linux targets it has no
 /// production caller at all, only the tests below — and `cargo clippy
-/// --all-targets -D warnings` (`docs/DEVELOPMENT.md`'s gate) trips
+/// --all-targets -D warnings` (`CONTRIBUTING.md`'s gate) trips
 /// `dead_code` on that lib-only compilation without this gate. Measured on
 /// this host 2026-08-15 (macOS, Apple M3 Pro): un-gated, `cargo clippy
 /// --all-targets -- -D warnings` fails; gated, it's clean.
@@ -195,7 +195,7 @@ fn raw_detect(path: &Path) -> Reliability {
 }
 
 /// **UNVERIFIED — unmeasured, not merely untested.** There is no macOS host
-/// in this estate (`docs/environments/`) to measure `statfs`, `getmntinfo`,
+/// in this estate (`sergeant-rs-workspace's knowledge/evidence/environments/`) to measure `statfs`, `getmntinfo`,
 /// or `diskutil info`'s output shape against, and ADR 0003 names this
 /// exactly as an open question rather than assumed. Reporting
 /// [`Reliability::Unknown`] unconditionally is the fail-closed-*safe*

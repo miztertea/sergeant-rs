@@ -30,7 +30,7 @@ body:
     id: baseline
     attributes:
       label: Baseline reference
-      placeholder: docs/perf/baseline-<date>.md section, if this deviates from a recorded baseline
+      placeholder: sergeant-rs-workspace's knowledge/evidence/perf/baseline-<date>.md section, if this deviates from a recorded baseline
     validations:
       required: false
   - type: dropdown

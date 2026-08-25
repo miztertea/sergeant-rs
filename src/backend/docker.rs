@@ -47,7 +47,7 @@
 //! is exactly the Engine API's own response shape (`docker inspect` prints
 //! the container/image inspect JSON verbatim), so this is "structured request
 //! and response types" over a slightly different transport, not a return to
-//! output-scraping. Measured on Cerberus (`docs/environments/cerberus.md`):
+//! output-scraping. Measured on Cerberus (`sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md`):
 //! Docker 29.7.2, the invoking user in the `docker` group (no sudo), registry
 //! pulls, digest-pinned pulls, bind-mount rw, `--network=none`, and exact
 //! image removal all green.

@@ -1,5 +1,5 @@
 //! W2: the daemon's single shared startup pass, its window, and the
-//! FloorState cache (`docs/proposals/journal-archival-rule-c.md`, the Q1–Q10
+//! FloorState cache (`sergeant-rs-workspace's knowledge/evidence/reference/journal-archival-rule-c.md`, the Q1–Q10
 //! rulings record).
 //!
 //! Today `start_with` walks the whole journal four times (`next_seq`, the

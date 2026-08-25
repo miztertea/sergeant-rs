@@ -46,7 +46,7 @@
 //!   settle window) is discarded, never delivered late — matching the
 //!   measured fact that a SIGKILLed turn produces no terminal `type:"result"`
 //!   envelope
-//!   (`docs/environments/cerberus.md`) — while an already-reached signal, or
+//!   (`sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md`) — while an already-reached signal, or
 //!   a park signal (`NeedsInput`/`Waiting`/`Blocked`) at any settle depth,
 //!   survives, matching INTERRUPT's own "no turn in flight is a no-op"
 //!   contract and a real `post_turn_summary` line's independent stream
@@ -81,7 +81,7 @@
 //!   engine's handling of an adapter that *cannot* report it.
 //! - **no streamed/partial evidence within one turn.** A real interrupted
 //!   turn can leave "whatever `assistant` chunks streamed before the kill"
-//!   in its raw archive (`docs/environments/cerberus.md`); this backend has
+//!   in its raw archive (`sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md`); this backend has
 //!   no chunk or streaming concept at all — one execution carries exactly
 //!   one scripted outcome, delivered whole or not at all, never a partial
 //!   fragment of it. A test needing partial-evidence fidelity is a
@@ -1372,7 +1372,7 @@ impl Backend for FakeBackend {
     /// after it was written can still leave it standing. It is never true
     /// for a `StageCompleted`/`Failed` outcome the execution had not yet
     /// reached (`settle_remaining > 0`): measured against Claude 2.1.227
-    /// (`docs/environments/cerberus.md`'s interrupt/SIGTERM entry), a
+    /// (`sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md`'s interrupt/SIGTERM entry), a
     /// SIGKILLed turn — `interrupt` and `stop` both use it — never produces
     /// a terminal `type:"result"` envelope, so a not-yet-reached terminal
     /// outcome is lost, not delivered late. Before this fix the fake
