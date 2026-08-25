@@ -463,7 +463,7 @@ pub struct PatchInfo {
 /// separately from the flat dirty patch (#240): a per-stage-labeled copy
 /// of whatever real files existed under `<stage-dir>/output/` (excluding
 /// `README.md`, which is the declaration, not an artifact — Rule 4,
-/// `docs/icm/convention.md`) at the moment the worktree was about to be
+/// the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md)) at the moment the worktree was about to be
 /// removed. Exists so a reader can retrieve one stage's evidence
 /// directly, without reconstructing it from the flat patch that already
 /// bundles it in with every other change.
@@ -1832,7 +1832,7 @@ fn retain_dirty(
 /// retained-evidence area [`capture_dirty_patch`] writes its patch into.
 /// A stage directory is any top-level entry of the worktree that has an
 /// `output/` subdirectory; nothing here consults the workflow catalog
-/// (Rule 4, `docs/icm/convention.md`: "no engine collection, no artifact
+/// (Rule 4, the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md): "no engine collection, no artifact
 /// manifest machinery" — the worktree's own filesystem shape is ground
 /// truth, exactly as [`capture_dirty_patch`] already treats it). Returns
 /// one [`RetainedStageOutput`] per stage directory that actually had a
@@ -5239,7 +5239,7 @@ mod tests {
     }
 
     /// #240: a stage's declared `output/` artifacts (Rule 4,
-    /// `docs/icm/convention.md`) must survive a dirty teardown as their own
+    /// the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md)) must survive a dirty teardown as their own
     /// retrievable, per-stage-labeled copy — not just bundled, undiscoverably,
     /// inside the flat `.dirty.patch` alongside every other change. Two
     /// stage directories, one with a real artifact plus its `README.md`
