@@ -74,10 +74,28 @@ async fn submit(
     command_id: &str,
     intent: &str,
 ) -> (reqwest::StatusCode, Vec<u8>, Value) {
+    submit_addressed(http, handle, None, command_id, intent).await
+}
+
+/// [`submit`] addressing an estate (D4). `None` is the captured-intent
+/// shape — no repository context offered — which is what most of this
+/// file's daemon-lifecycle rigs want, since they are about the daemon, not
+/// about an estate.
+async fn submit_addressed(
+    http: &reqwest::Client,
+    handle: &DaemonHandle,
+    estate_root: Option<&std::path::Path>,
+    command_id: &str,
+    intent: &str,
+) -> (reqwest::StatusCode, Vec<u8>, Value) {
     let resp = http
         .post(format!("{}/v1/work", handle.endpoint))
         .bearer_auth(&handle.token)
-        .json(&json!({"command_id": command_id, "intent": intent}))
+        .json(&json!({
+            "command_id": command_id,
+            "intent": intent,
+            "estate_root": estate_root,
+        }))
         .send()
         .await
         .expect("submit request");
@@ -601,18 +619,23 @@ async fn t3_submit_lists_pending_journals_and_survives_restart() {
     handle.shutdown().await;
 }
 
-/// H1 touch point #4/#5: `work.submitted` carries the daemon's bound
-/// estate — its canonical root, not the `[estate] name` — end to end
-/// through a real submission, not a hand-fabricated `Event`.
+/// H1 touch point #4/#5, re-scoped by D4/D10: `work.submitted` carries the
+/// estate the submission **addressed** — its canonical root, not the
+/// `[estate] name` — end to end through a real submission, not a
+/// hand-fabricated `Event`.
+///
+/// W1a wrote this against the daemon's *bound* estate. There is no binding
+/// left to read, and the fact is stronger for it: the root recorded is the
+/// one this request named and this daemon then admitted, so a second estate
+/// submitting to the same daemon records its own.
 #[tokio::test]
-async fn work_submitted_carries_the_bound_estate_root() {
+async fn work_submitted_carries_the_addressed_estate_root() {
     let estate_dir = TempDir::new().expect("estate tempdir");
     scaffold_solo_estate(estate_dir.path(), "target");
     let data_dir = TempDir::new().expect("data dir tempdir");
     let handle = daemon::start_with(
         data_dir.path(),
         DaemonConfig {
-            estate_root: Some(estate_dir.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -620,7 +643,14 @@ async fn work_submitted_carries_the_bound_estate_root() {
     .expect("daemon start");
     let http = client();
 
-    let (status, _, body) = submit(&http, &handle, &ulid(), "carry the estate root").await;
+    let (status, _, body) = submit_addressed(
+        &http,
+        &handle,
+        Some(estate_dir.path()),
+        &ulid(),
+        "carry the estate root",
+    )
+    .await;
     assert_eq!(status, 201, "submit must accept: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
 
@@ -636,7 +666,7 @@ async fn work_submitted_carries_the_bound_estate_root() {
     assert_eq!(
         submitted.workspace_id.as_deref(),
         Some(canonical_root.to_string_lossy().as_ref()),
-        "work.submitted must carry the daemon's bound estate root"
+        "work.submitted must carry the estate root the submission addressed"
     );
 }
 
@@ -2902,14 +2932,13 @@ async fn start_with_fake(data_dir: &Path, fake: &FakeBackend) -> DaemonHandle {
 async fn start_with_fake_bound(
     data_dir: &Path,
     fake: &FakeBackend,
-    estate_root: Option<&Path>,
+    _estate_root: Option<&Path>,
 ) -> DaemonHandle {
     daemon::start_with(
         data_dir,
         DaemonConfig {
             backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: estate_root.map(Path::to_path_buf),
             ..DaemonConfig::default()
         },
     )
@@ -3838,6 +3867,7 @@ async fn t12_submission_throughput_has_an_automated_floor() {
         let endpoint = handle.endpoint.clone();
         let token = handle.token.clone();
         let repo = repo.clone();
+        let estate_root = estate.path().to_path_buf();
         inflight.push(tokio::spawn(async move {
             let response = http
                 .post(format!("{endpoint}/v1/work"))
@@ -3846,6 +3876,8 @@ async fn t12_submission_throughput_has_an_automated_floor() {
                     "command_id": ulid(),
                     "intent": "throughput floor",
                     "backend": FAKE_BACKEND_NAME,
+                    // D4: `cwd` is the mount; the addressed estate is its root.
+                    "estate_root": estate_root,
                     "origin": {"client": "cli", "cwd": repo},
                 }))
                 .send()
@@ -4126,6 +4158,7 @@ async fn scope_all_combined_with_repos_refuses_with_conflicting_scope() {
         .json(&json!({
             "command_id": ulid(),
             "intent": "everything and also just this one",
+            "estate_root": estate.path(),
             "scope": {"repos": ["solo"], "all": true},
         }))
         .send()
@@ -4450,7 +4483,7 @@ async fn r_mvp1_10_start(
     data_dir: &Path,
     registry: BackendRegistry,
     completion_poll: Duration,
-    estate_root: &Path,
+    _estate_root: &Path,
 ) -> DaemonHandle {
     daemon::start_with(
         data_dir,
@@ -4458,7 +4491,6 @@ async fn r_mvp1_10_start(
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll,
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -4470,9 +4502,9 @@ async fn r_mvp1_10_start(
 ///
 /// `cwd` is sent because §13.3 still records it as origin evidence, and
 /// leaving it out would stop exercising the field — but since §5.2 it decides
-/// nothing: the daemon plans against the estate it was started against. It is
-/// passed the estate root here so the recorded evidence matches where the
-/// run actually happened.
+/// nothing. What decides is `estate_root` (D4), which every call site here
+/// passes as the same path: these tests run one estate, and the recorded
+/// evidence should match where the run actually happened.
 async fn r_mvp1_10_submit(
     http: &reqwest::Client,
     handle: &DaemonHandle,
@@ -4483,6 +4515,7 @@ async fn r_mvp1_10_submit(
     let mut req = json!({
         "command_id": ulid(),
         "intent": intent,
+        "estate_root": cwd,
         "origin": {"client": "cli", "cwd": cwd},
     });
     if let Some(name) = workflow {

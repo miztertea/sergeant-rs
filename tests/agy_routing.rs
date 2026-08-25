@@ -77,7 +77,7 @@ fn estate_with_manifest(root: &Path, manifest: &str, repos: &[&str]) {
 
 /// Start a daemon with one scripted fake (the global default) and agy
 /// registered for real, but deterministically unavailable.
-async fn start(data_dir: &Path, estate_root: &Path, global_default: Option<&str>) -> DaemonHandle {
+async fn start(data_dir: &Path, _estate_root: &Path, global_default: Option<&str>) -> DaemonHandle {
     daemon::start_with(
         data_dir,
         DaemonConfig {
@@ -86,7 +86,6 @@ async fn start(data_dir: &Path, estate_root: &Path, global_default: Option<&str>
             ),
             default_backend: global_default.map(str::to_string),
             agy: Some(deterministic_agy_config(data_dir)),
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -136,6 +135,9 @@ async fn submit(
     let mut body = json!({
         "command_id": ulid(),
         "intent": "route me",
+        // D4: the estate this submission addresses (`extra` may override it,
+        // including to `null` for the no-topology cases).
+        "estate_root": cwd,
         "origin": {"client": "cli", "cwd": cwd},
     });
     if let Some(fields) = extra.as_object() {

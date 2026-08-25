@@ -98,7 +98,6 @@ async fn a_whole_admission_never_runs_a_network_or_branch_changing_git_command()
             backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
-            estate_root: Some(estate.clone()),
             ..DaemonConfig::default()
         },
     )
@@ -116,6 +115,7 @@ async fn a_whole_admission_never_runs_a_network_or_branch_changing_git_command()
             "command_id": ulid::Ulid::generate().to_string(),
             "intent": "admit two clean mounts",
             "scope": {"all": true},
+            "estate_root": estate,
             "origin": {"client": "cli"},
         }))
         .send()

@@ -443,7 +443,16 @@ pub struct ApiState {
     /// and finish, because graceful shutdown waits for in-flight responses.
     pub closing: watch::Receiver<bool>,
     /// The workflow engine: backends, routing defaults, and the surfaces dir.
+    ///
+    /// D10: it carries **no** estate. Every handler that needs topology
+    /// admits the estate its request addressed (below) and hands the root to
+    /// `Engine::plan` per call.
     pub engine: Arc<Engine>,
+    /// H1 §4: the admitted-estate registry — this daemon's observational
+    /// record of every estate it has validated, keyed by canonical root and
+    /// rebuilt from requests. Nothing is served for an estate that is not in
+    /// here, and nothing gets in here without passing admission.
+    pub estates: Arc<crate::runtime::estates::EstateRegistry>,
     /// The disposable DuckDB analytical + graph projection (§21–§23).
     ///
     /// Behind its own lock, not the core's: an analytics query is a read of a
@@ -484,6 +493,7 @@ pub fn router(state: ApiState) -> Router {
             get(estate_list_groups).post(estate_add_group),
         )
         .route("/estate/groups/{name}", delete(estate_remove_group))
+        .route("/estates", get(list_estates))
         .route("/doctor", get(doctor_report))
         .route("/admission/pause", post(pause_admission))
         .route("/graph/work/{id}", get(work_graph))
@@ -1311,6 +1321,24 @@ fn internal_error(e: impl std::fmt::Display) -> Response {
 struct SubmitRequest {
     command_id: String,
     intent: String,
+    /// D4: the estate this submission addresses — the canonical exact root
+    /// (D1/H1-06: no UUID), validated by admission and never by trust.
+    ///
+    /// §7.4 removed `workspace` because the daemon was bound to exactly one
+    /// estate and a wire field would have been a second, conflicting
+    /// authority. A host daemon is bound to none, so the field is back — but
+    /// as an *address*, not a binding: what it names is re-admitted per
+    /// submission ([`crate::runtime::estates::EstateRegistry::admit`]), and
+    /// a root that does not validate is refused rather than served.
+    ///
+    /// Absent keeps the meaning "no repository context offered": the Work is
+    /// accepted and stays `pending`, exactly as a submission to an
+    /// estate-less daemon always did. That is not a hole in H1 §11.3 — the
+    /// client-side gate is what refuses `sgt run` outside an estate, before
+    /// a request is ever built — it is the existing, journaled,
+    /// non-error meaning of "I have no estate to offer".
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
     /// estate-root proposal §7/§13.3's structured scope request
     /// (`--repo`/`--group`/`--all`). §7.4: `estate` no longer exists as
     /// a wire field at all — the daemon is bound to exactly one estate, and
@@ -1479,10 +1507,37 @@ async fn submit_work(
     // does not reach that append (a preflight refusal, a replayed
     // `command_id`, an empty intent) simply discards it.
     let work_id_candidate = ulid::Ulid::generate().to_string();
+    // D4: admit the addressed estate **before** planning. A root that does
+    // not validate is this submission's refusal (journaled under its
+    // `command_id` like every other semantic rejection, so a retry replays
+    // it), never a plan against topology nobody checked — and never a reason
+    // to refuse some *other* estate's request.
+    let addressed = match req.estate_root.as_deref() {
+        None => None,
+        Some(root) => match state.estates.admit(root) {
+            Ok(estate) => Some(estate.root),
+            Err(e) => {
+                let result = error_body(e.code(), e.to_string());
+                let mut core = CoreGuard::acquire(&state.core).await;
+                if let Some(resp) = replay_command(&core, &req.command_id) {
+                    return resp;
+                }
+                return record_and_respond(
+                    &mut core,
+                    &req.command_id,
+                    "work.submit",
+                    None,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    result,
+                );
+            }
+        },
+    };
     let planned = if req.intent.trim().is_empty() {
         None
     } else {
         let engine = state.engine.clone();
+        let estate_root = addressed.clone();
         let backend = req.backend.clone();
         let workflow = req.workflow.clone();
         let profile = req.profile.clone();
@@ -1493,18 +1548,21 @@ async fn submit_work(
         let override_git_preflight = req.override_git_preflight;
         Some(
             blocking(move || {
-                engine.plan(&SubmitContext {
-                    cwd: origin_cwd.as_deref(),
-                    origin_client: origin_client.as_deref(),
-                    backend: backend.as_deref(),
-                    workflow: workflow.as_deref(),
-                    profile: profile.as_deref(),
-                    repos: &scope.repos,
-                    group: scope.group.as_deref(),
-                    all: scope.all,
-                    work_id: Some(&candidate),
-                    override_git_preflight,
-                })
+                engine.plan(
+                    estate_root.as_deref(),
+                    &SubmitContext {
+                        cwd: origin_cwd.as_deref(),
+                        origin_client: origin_client.as_deref(),
+                        backend: backend.as_deref(),
+                        workflow: workflow.as_deref(),
+                        profile: profile.as_deref(),
+                        repos: &scope.repos,
+                        group: scope.group.as_deref(),
+                        all: scope.all,
+                        work_id: Some(&candidate),
+                        override_git_preflight,
+                    },
+                )
             })
             .await,
         )
@@ -2264,11 +2322,13 @@ async fn list_work(State(state): State<ApiState>) -> Response {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowsQuery {
-    /// The client's working directory — estate discovery (§9) starts
-    /// here, exactly as [`Origin::cwd`] does for `POST /v1/work`, so what
-    /// this route shows as available matches what submission would actually
-    /// resolve (§19.4's "cwd discovery matches submission").
+    /// The client's working directory — evidence only since §5.2 removed
+    /// its authority over topology; still validated so an obviously-broken
+    /// client hears about it.
     cwd: String,
+    /// D4: the estate whose local catalog half this request addresses.
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
 }
 
 /// One `CatalogEntry.stages[]` element (§11.2's StageEntry): order, kind,
@@ -2367,7 +2427,15 @@ async fn list_workflows(
             "cwd must be an absolute path",
         );
     }
-    let estate_root = state.engine.estate_root.clone();
+    // D4: the catalog's estate-local half is the *addressed* estate's, and
+    // only once admitted. Unaddressed (or unadmitted) answers the embedded
+    // catalog alone — an honest "no estate in play here", never another
+    // estate's forks.
+    let estate_root = req
+        .estate_root
+        .as_deref()
+        .and_then(|root| state.estates.admit(root).ok())
+        .map(|estate| estate.root);
     let workflows = blocking(move || workflow_catalog_entries(estate_root.as_deref())).await;
     Json(json!({"workflows": workflows})).into_response()
 }
@@ -3216,8 +3284,11 @@ async fn list_retained(State(state): State<ApiState>) -> Response {
 /// estate's own ordinary checkout — §6.1's derived mount, no symlink, no
 /// linked worktree, no other estate's clone. A declared-but-unresolvable
 /// repository fails the whole pass by name rather than being swept past.
-fn sweep_topology(state: &ApiState) -> Result<Estate, (StatusCode, Value)> {
-    let root = estate_root_or_error(state)?;
+fn sweep_topology(
+    state: &ApiState,
+    requested: Option<&std::path::Path>,
+) -> Result<Estate, (StatusCode, Value)> {
+    let root = estate_root_or_error(state, requested, "sweeping")?;
     Estate::resolve(&root).map_err(|e| {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3261,8 +3332,8 @@ fn journaled_work_states(core: &Core) -> std::collections::BTreeMap<String, Work
 /// mid-walk is therefore classified against the snapshot; that is safe
 /// because nothing here acts on the answer, and the deletion half re-derives
 /// its own classification from scratch anyway.
-async fn sweep_estate(State(state): State<ApiState>) -> Response {
-    let estate = match sweep_topology(&state) {
+async fn sweep_estate(State(state): State<ApiState>, Query(query): Query<EstateQuery>) -> Response {
+    let estate = match sweep_topology(&state, query.estate_root.as_deref()) {
         Ok(estate) => estate,
         Err((status, body)) => return (status, Json(body)).into_response(),
     };
@@ -3277,6 +3348,9 @@ async fn sweep_estate(State(state): State<ApiState>) -> Response {
 #[derive(Debug, Deserialize)]
 struct SweepRequest {
     command_id: String,
+    /// D4: the estate whose `sergeant/*` refs this sweep addresses.
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
     /// Must be `true`, or the request is refused — sweep deletes branches
     /// and git's reflog is the only undo.
     #[serde(default)]
@@ -3338,7 +3412,7 @@ async fn sweep_delete(
             result,
         );
     }
-    let estate = match sweep_topology(&state) {
+    let estate = match sweep_topology(&state, req.estate_root.as_deref()) {
         Ok(estate) => estate,
         Err((status, body)) => {
             return record_and_respond(
@@ -3374,20 +3448,30 @@ async fn sweep_delete(
 // state (R-NS-4, `src/domain/manifest.rs`'s own module doc), so unlike every
 // other mutation in this file there is no `command_id`/replay pair.
 
-/// The estate root these routes edit: an upward walk from this daemon's own
-/// `data_dir`, unscoped — correct for the default `<estate_root>/.sergeant/
-/// data` layout `sgt init` always produces, deterministic, and dependent on
-/// nothing but the one fact [`ApiState`] already carries.
+/// D4: the estate root these routes operate on comes from the **request**,
+/// and is served only after this daemon's registry admits it.
 ///
-/// The process's own working directory is deliberately **not** consulted —
-/// a long-running daemon's cwd is not reliably the estate root in every real
-/// deployment, and unlike a walk that simply finds nothing, a cwd that
-/// happens to sit inside a *different* estate (an unrelated git checkout
-/// that is itself one, `sgt`'s own self-hosting shape among them) would
-/// silently resolve to the wrong manifest rather than failing closed — the
-/// one outcome R-NS-4's discipline exists to prevent.
-fn resolve_estate_root(state: &ApiState) -> Result<PathBuf, Box<Response>> {
-    estate_root_or_error(state)
+/// It used to come from `state.engine.estate_root` — the one estate the
+/// process was bound to. A host daemon has none, so every estate-scoped
+/// route now carries an explicit `estate_root` (a canonical exact root per
+/// D1/H1-06: no UUID), and the daemon validates it *by admission*, never by
+/// trust. The refusal taxonomy is
+/// [`crate::runtime::estates::EstateAdmissionError`]'s, unchanged between
+/// this and the client-side gate.
+///
+/// The process's own working directory is still deliberately **not**
+/// consulted, for exactly the reason it never was: a long-running daemon's
+/// cwd is not reliably anything, and a cwd that happens to sit inside a
+/// *different* estate would silently resolve to the wrong manifest rather
+/// than failing closed — the one outcome R-NS-4's discipline exists to
+/// prevent. H1 removes the daemon's binding; it does not give the daemon a
+/// new way to guess.
+fn resolve_estate_root(
+    state: &ApiState,
+    requested: Option<&std::path::Path>,
+    operation: &str,
+) -> Result<PathBuf, Box<Response>> {
+    estate_root_or_error(state, requested, operation)
         .map_err(|(status, body)| Box::new((status, Json(body)).into_response()))
 }
 
@@ -3395,18 +3479,75 @@ fn resolve_estate_root(state: &ApiState) -> Result<PathBuf, Box<Response>> {
 /// finished response — the shape a *command* handler needs, because its
 /// refusal has to be journaled under a `command_id` before it is answered
 /// with, and `record_and_respond` takes the body.
-fn estate_root_or_error(state: &ApiState) -> Result<PathBuf, (StatusCode, Value)> {
-    match state.engine.estate_root.clone() {
-        Some(root) => Ok(root),
-        None => Err((
+fn estate_root_or_error(
+    state: &ApiState,
+    requested: Option<&std::path::Path>,
+    operation: &str,
+) -> Result<PathBuf, (StatusCode, Value)> {
+    admit_addressed_estate(state, requested, operation).map(|estate| estate.root)
+}
+
+/// Admit the estate a request addressed, or turn the refusal into this
+/// file's one `{"error": {"code", "message"}}` shape.
+///
+/// `NOT_FOUND` for "no estate addressed" (the operation has no object) and
+/// `UNPROCESSABLE_ENTITY` for a root that will not admit (the request named
+/// something, and it is wrong) — the same split every other refusal in this
+/// file already draws between an absent thing and an invalid one.
+fn admit_addressed_estate(
+    state: &ApiState,
+    requested: Option<&std::path::Path>,
+    operation: &str,
+) -> Result<crate::runtime::estates::AdmittedEstate, (StatusCode, Value)> {
+    let Some(requested) = requested else {
+        return Err((
             StatusCode::NOT_FOUND,
             error_body(
                 "no_estate",
-                "this daemon is bound to no estate — start it from an estate root (`sgt daemon` \
-                 from the root, or `sgt -C <estate-root> daemon`)",
+                format!(
+                    "{operation} is estate-scoped, but this request addressed no estate — send \
+                     `estate_root` (the exact estate root, canonical)"
+                ),
             ),
-        )),
-    }
+        ));
+    };
+    state.estates.admit(requested).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            error_body(e.code(), e.to_string()),
+        )
+    })
+}
+
+/// `GET /v1/estates` (H1 §4, brief deliverable 6) — the admitted-estate
+/// registry as this process holds it right now.
+///
+/// Observational, and says so: a row exists because some request addressed
+/// that root and admission succeeded, never because the daemon went looking.
+/// `available` is the last re-validation's verdict, so an estate whose
+/// manifest has since been deleted is still *listed* — its Work is still in
+/// the journal — and reported unavailable with the reason, rather than
+/// vanishing as though it had never been served.
+async fn list_estates(State(state): State<ApiState>) -> Response {
+    let estates: Vec<Value> = state
+        .estates
+        .entries()
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "root": entry.estate.root,
+                "name": entry.estate.name,
+                "manifest_path": entry.estate.manifest_path,
+                "admitted_at": entry.estate.admitted_at,
+                "available": entry.available,
+                "unavailable_reason": entry.unavailable_reason,
+                "last_touched_at": entry.last_touched_at,
+                "retention": entry.estate.retention,
+                "surfaces_dir": entry.estate.surfaces_dir,
+            })
+        })
+        .collect();
+    Json(json!({"estates": estates})).into_response()
 }
 
 /// Stable per-variant code for a [`ManifestError`], for the same
@@ -3472,6 +3613,18 @@ fn manifest_error_response(e: &ManifestError) -> Response {
     )
 }
 
+/// D4: how an estate-addressed **query** names its estate.
+///
+/// `GET`/`DELETE` routes have no body to carry `estate_root` in, so it rides
+/// the query string — the canonical exact root, percent-encoded by the
+/// client. Absent is refusal (c): the operation has no object, and the
+/// daemon does not pick one.
+#[derive(Debug, Deserialize, Default)]
+struct EstateQuery {
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
+}
+
 /// The declared repositories, read the same way `sgt repo list --json` does.
 fn workspace_read(estate_root: &std::path::Path) -> Result<Estate, Box<Response>> {
     Estate::from_config_allow_empty(&estate_root.join(crate::domain::estate::MANIFEST_FILE))
@@ -3486,11 +3639,15 @@ fn workspace_read(estate_root: &std::path::Path) -> Result<Estate, Box<Response>
 
 /// `GET /v1/estate/repos` (§16.2) — the same read `sgt repo list --json`
 /// already performs, over the daemon's own estate.
-async fn estate_list_repos(State(state): State<ApiState>) -> Response {
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+async fn estate_list_repos(
+    State(state): State<ApiState>,
+    Query(query): Query<EstateQuery>,
+) -> Response {
+    let estate_root =
+        match resolve_estate_root(&state, query.estate_root.as_deref(), "listing repositories") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     let estate = match workspace_read(&estate_root) {
         Ok(w) => w,
         Err(resp) => return *resp,
@@ -3512,6 +3669,9 @@ async fn estate_list_repos(State(state): State<ApiState>) -> Response {
 
 #[derive(Debug, Deserialize)]
 struct AddRepoRequest {
+    /// D4: the estate this edit addresses (canonical exact root).
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
     name: String,
     #[serde(default)]
     origin: Option<String>,
@@ -3550,10 +3710,11 @@ async fn estate_add_repo(
             );
         }
     };
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+    let estate_root =
+        match resolve_estate_root(&state, req.estate_root.as_deref(), "adding a repository") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     let name = req.name.clone();
     let origin = req.origin.clone();
     let upstream = req.upstream.clone();
@@ -3585,8 +3746,16 @@ async fn estate_add_repo(
 /// `DELETE /v1/estate/repos/{name}` (§16.2) — `manifest::remove_repo`
 /// exactly; the group-reference refusal it returns reaches the caller
 /// structured, not reworded.
-async fn estate_remove_repo(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
-    let estate_root = match resolve_estate_root(&state) {
+async fn estate_remove_repo(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Query(query): Query<EstateQuery>,
+) -> Response {
+    let estate_root = match resolve_estate_root(
+        &state,
+        query.estate_root.as_deref(),
+        "removing a repository",
+    ) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -3598,11 +3767,15 @@ async fn estate_remove_repo(State(state): State<ApiState>, Path(name): Path<Stri
 
 /// `GET /v1/estate/groups` (§16.2) — the same read `sgt group list --json`
 /// already performs.
-async fn estate_list_groups(State(state): State<ApiState>) -> Response {
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+async fn estate_list_groups(
+    State(state): State<ApiState>,
+    Query(query): Query<EstateQuery>,
+) -> Response {
+    let estate_root =
+        match resolve_estate_root(&state, query.estate_root.as_deref(), "listing groups") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     let estate = match workspace_read(&estate_root) {
         Ok(w) => w,
         Err(resp) => return *resp,
@@ -3617,6 +3790,9 @@ async fn estate_list_groups(State(state): State<ApiState>) -> Response {
 
 #[derive(Debug, Deserialize)]
 struct AddGroupRequest {
+    /// D4: the estate this edit addresses (canonical exact root).
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
     name: String,
     #[serde(default)]
     repos: Vec<String>,
@@ -3635,10 +3811,11 @@ async fn estate_add_group(
         Ok(r) => r,
         Err(resp) => return *resp,
     };
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+    let estate_root =
+        match resolve_estate_root(&state, req.estate_root.as_deref(), "adding a group") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     let name = req.name.clone();
     let repos = req.repos.clone();
     let brief = req.brief.clone();
@@ -3672,6 +3849,7 @@ struct RemoveGroupRequest {
 async fn estate_remove_group(
     State(state): State<ApiState>,
     Path(name): Path<String>,
+    Query(query): Query<EstateQuery>,
     body: axum::body::Bytes,
 ) -> Response {
     let repos = if body.is_empty() {
@@ -3688,27 +3866,31 @@ async fn estate_remove_group(
             }
         }
     };
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+    let estate_root =
+        match resolve_estate_root(&state, query.estate_root.as_deref(), "removing a group") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     match blocking_sync(|| manifest::remove_group(&estate_root, &name, &repos)) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => manifest_error_response(&e),
     }
 }
 
-/// The directory `GET /v1/doctor` reports the estate rows against: this
-/// daemon's own bound estate root (§5.1), never the daemon process's cwd —
-/// a long-running daemon's cwd is not reliably anything. With no bound
-/// estate the data dir stands in, and the estate-root row correctly fails
-/// there, which is exactly what a daemon started outside an estate should
-/// report.
-fn doctor_root(state: &ApiState) -> PathBuf {
-    state
-        .engine
-        .estate_root
-        .clone()
+/// The directory `GET /v1/doctor` reports the estate rows against: the
+/// estate **this request addressed** (D4), never the daemon process's cwd —
+/// a long-running daemon's cwd is not reliably anything, and a host daemon
+/// no longer has a bound root to fall back on either.
+///
+/// An unaddressed or unadmitted estate falls back to the host runtime root,
+/// where the estate-root row correctly fails — which is exactly what
+/// `sgt doctor` asking a host daemon about no estate in particular should
+/// report, and is the same answer a daemon started outside an estate has
+/// always given.
+fn doctor_root(state: &ApiState, requested: Option<&std::path::Path>) -> PathBuf {
+    requested
+        .and_then(|root| state.estates.admit(root).ok())
+        .map(|estate| estate.root)
         .unwrap_or_else(|| state.data_dir.clone())
 }
 
@@ -3720,8 +3902,12 @@ fn doctor_root(state: &ApiState) -> PathBuf {
 /// CLI invocation resolved `state.data_dir` before spawning or attaching to
 /// this daemon — that resolution, and its winning rung, do not survive
 /// across the process boundary to this handler.
-async fn doctor_report(State(state): State<ApiState>) -> Response {
-    let report = doctor::run(&state.data_dir, &doctor_root(&state), false).await;
+async fn doctor_report(
+    State(state): State<ApiState>,
+    Query(query): Query<EstateQuery>,
+) -> Response {
+    let root = doctor_root(&state, query.estate_root.as_deref());
+    let report = doctor::run(&state.data_dir, &root, false).await;
     Json(report.to_json()).into_response()
 }
 
@@ -4355,10 +4541,17 @@ pub struct ApiClient {
     http: reqwest::Client,
     endpoint: String,
     token: String,
+    estate_root: Option<PathBuf>,
 }
 
 impl ApiClient {
     /// Build a client for a daemon endpoint and its bearer token.
+    ///
+    /// D4: the client addresses **no** estate until one is named with
+    /// [`Self::with_estate_root`]. That is the honest default under H1 — the
+    /// daemon is host-scoped, so a client that has not said which estate it
+    /// means has not said it — and it is what lets the host-scoped verb
+    /// bucket W3 lands connect with no estate at all.
     pub fn new(endpoint: &str, token: &str) -> Result<Self, ClientError> {
         Ok(Self {
             http: reqwest::Client::builder()
@@ -4366,7 +4559,39 @@ impl ApiClient {
                 .build()?,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            estate_root: None,
         })
+    }
+
+    /// Address every estate-scoped request from this client at `root` — the
+    /// exact estate root the caller already admitted (§4.3 admits before a
+    /// descriptor is even read, so this is never a fresh guess).
+    pub fn with_estate_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.estate_root = Some(root.into());
+        self
+    }
+
+    /// The estate this client addresses, if any.
+    pub fn estate_root(&self) -> Option<&std::path::Path> {
+        self.estate_root.as_deref()
+    }
+
+    /// `?estate_root=<root>` for the GET/DELETE routes that have no body to
+    /// carry it in. Empty when this client addresses no estate, so the
+    /// daemon answers with refusal (c) rather than being handed a blank.
+    fn estate_query(&self) -> String {
+        match &self.estate_root {
+            Some(root) => format!("?estate_root={}", urlencode(&root.to_string_lossy())),
+            None => String::new(),
+        }
+    }
+
+    /// Add this client's estate address to a request body, if it has one.
+    fn addressed(&self, mut body: Value) -> Value {
+        if let (Some(root), Some(map)) = (&self.estate_root, body.as_object_mut()) {
+            map.insert("estate_root".to_string(), json!(root));
+        }
+        body
     }
 
     /// The daemon endpoint this client talks to.
@@ -4493,8 +4718,12 @@ impl ApiClient {
     /// bind now.
     pub async fn workflows(&self, cwd: &std::path::Path) -> Result<Value, ClientError> {
         self.get(&format!(
-            "/v1/workflows?cwd={}",
-            urlencode(&cwd.display().to_string())
+            "/v1/workflows?cwd={}{}",
+            urlencode(&cwd.display().to_string()),
+            match &self.estate_root {
+                Some(root) => format!("&estate_root={}", urlencode(&root.to_string_lossy())),
+                None => String::new(),
+            }
         ))
         .await
     }
@@ -4516,7 +4745,7 @@ impl ApiClient {
     /// `GET /v1/sweep` — §12.3's deliberate sweep, classification half
     /// (#159). Mutates nothing.
     pub async fn sweep(&self) -> Result<Value, ClientError> {
-        self.get("/v1/sweep").await
+        self.get(&format!("/v1/sweep{}", self.estate_query())).await
     }
 
     /// `POST /v1/sweep` with a fresh command id (§26) — the deletion half.
@@ -4529,18 +4758,19 @@ impl ApiClient {
     ) -> Result<Value, ClientError> {
         self.post(
             "/v1/sweep",
-            &json!({
+            &self.addressed(json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "confirm": confirm,
                 "branches": branches,
-            }),
+            })),
         )
         .await
     }
 
     /// `GET /v1/estate/repos` (§16.2/§20.4) — declared repositories.
     pub async fn repos(&self) -> Result<Value, ClientError> {
-        self.get("/v1/estate/repos").await
+        self.get(&format!("/v1/estate/repos{}", self.estate_query()))
+            .await
     }
 
     /// `POST /v1/estate/repos` (§16.2/§20.4) — `manifest::add_repo`.
@@ -4553,25 +4783,33 @@ impl ApiClient {
     ) -> Result<Value, ClientError> {
         self.post(
             "/v1/estate/repos",
-            &json!({
+            &self.addressed(json!({
                 "name": name,
                 "origin": origin,
                 "upstream": upstream,
                 "instructions": instructions,
-            }),
+            })),
         )
         .await
     }
 
     /// `DELETE /v1/estate/repos/{name}` (§16.2/§20.4) — `manifest::remove_repo`.
     pub async fn remove_repo(&self, name: &str) -> Result<Value, ClientError> {
-        self.delete(&format!("/v1/estate/repos/{}", urlencode(name)), &json!({}))
-            .await
+        self.delete(
+            &format!(
+                "/v1/estate/repos/{}{}",
+                urlencode(name),
+                self.estate_query()
+            ),
+            &json!({}),
+        )
+        .await
     }
 
     /// `GET /v1/estate/groups` (§16.2/§20.4) — declared groups.
     pub async fn groups(&self) -> Result<Value, ClientError> {
-        self.get("/v1/estate/groups").await
+        self.get(&format!("/v1/estate/groups{}", self.estate_query()))
+            .await
     }
 
     /// `POST /v1/estate/groups` (§16.2/§20.4) — `manifest::add_group`'s
@@ -4584,7 +4822,7 @@ impl ApiClient {
     ) -> Result<Value, ClientError> {
         self.post(
             "/v1/estate/groups",
-            &json!({"name": name, "repos": repos, "brief": brief}),
+            &self.addressed(json!({"name": name, "repos": repos, "brief": brief})),
         )
         .await
     }
@@ -4593,7 +4831,11 @@ impl ApiClient {
     /// empty `repos` removes the whole group, otherwise just those members.
     pub async fn remove_group(&self, name: &str, repos: &[String]) -> Result<Value, ClientError> {
         self.delete(
-            &format!("/v1/estate/groups/{}", urlencode(name)),
+            &format!(
+                "/v1/estate/groups/{}{}",
+                urlencode(name),
+                self.estate_query()
+            ),
             &json!({"repos": repos}),
         )
         .await
@@ -4602,7 +4844,14 @@ impl ApiClient {
     /// `GET /v1/doctor` (§16.3/§20.4) — the same `doctor::Report` `sgt doctor
     /// --json` prints.
     pub async fn doctor(&self) -> Result<Value, ClientError> {
-        self.get("/v1/doctor").await
+        self.get(&format!("/v1/doctor{}", self.estate_query()))
+            .await
+    }
+
+    /// `GET /v1/estates` (H1 §4) — every estate this daemon has admitted.
+    /// Host-scoped: it addresses no estate, because the answer *is* the set.
+    pub async fn estates(&self) -> Result<Value, ClientError> {
+        self.get("/v1/estates").await
     }
 
     /// Open the SSE live tail at `GET /v1/events/stream?from=N`.
@@ -5189,6 +5438,7 @@ mod tests {
                 None,
                 data_dir,
             )),
+            estates: Arc::new(crate::runtime::estates::EstateRegistry::new()),
             analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
             prune_policy: crate::runtime::prune::PrunePolicy {
                 retention: crate::domain::estate::DEFAULT_RETENTION,

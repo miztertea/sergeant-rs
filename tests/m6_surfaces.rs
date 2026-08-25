@@ -151,16 +151,21 @@ fn write_solo_workflow(root: &Path) {
     std::fs::write(dir.join("00-only").join("CONTEXT.md"), "context").expect("CONTEXT.md");
 }
 
-/// Start an in-process daemon **bound** to `estate_root` (estate-root §5.1).
+/// Start an in-process host daemon over `data_dir`.
 ///
-/// The binding is not optional decoration: `Engine::plan` reads the estate the
-/// daemon was started against, never the request's `origin.cwd` (§13.3), so a
-/// daemon left with `estate_root: None` plans against nothing and every
-/// submission below would sit on `pending` forever — no surface, no stage, no
-/// backend, and every content assertion in this file reading a blank row.
+/// **H1: no estate binding.** The daemon comes up serving zero estates and
+/// admits `estate_root` the first time a request addresses it — which is why
+/// [`submit`] below sends `estate_root` explicitly. A submission that names
+/// no estate still plans against nothing and sits on `pending` forever, so
+/// the addressing is exactly as load-bearing as the old binding was; it just
+/// lives on the request now.
+///
+/// `estate_root` is kept as a parameter — unused by the start itself — so
+/// every call site still reads as "this rig's estate is that one", and the
+/// helper stays the one place a multi-estate variant would grow from.
 async fn start_fake(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     script: impl IntoIterator<Item = FakeStep>,
 ) -> (DaemonHandle, FakeBackend) {
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
@@ -170,7 +175,6 @@ async fn start_fake(
         DaemonConfig {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -179,11 +183,23 @@ async fn start_fake(
     (handle, fake)
 }
 
-async fn submit(handle: &DaemonHandle, cwd: &Path, intent: &str, workflow: &str) -> String {
+/// D4: a submission names the estate it addresses and, separately, the cwd
+/// it came from. Keeping them two parameters is the point — every call site
+/// here passes a *mount* as `cwd`, which is exactly the thing §5.2 forbids
+/// being read as topology, and a rig that conflated them would stop proving
+/// that.
+async fn submit(
+    handle: &DaemonHandle,
+    estate_root: &Path,
+    cwd: &Path,
+    intent: &str,
+    workflow: &str,
+) -> String {
     let body = json!({
         "command_id": ulid(),
         "intent": intent,
         "workflow": workflow,
+        "estate_root": estate_root,
         "origin": {"client": "cli", "cwd": cwd},
     });
     let response = http()
@@ -198,8 +214,13 @@ async fn submit(handle: &DaemonHandle, cwd: &Path, intent: &str, workflow: &str)
     value["work"]["id"].as_str().expect("work id").to_string()
 }
 
-fn client_for(handle: &DaemonHandle) -> ApiClient {
-    ApiClient::new(&handle.endpoint, &handle.token).expect("client")
+/// D4: a client addresses the estate its estate-scoped requests mean. The
+/// daemon binds none, so a client that named none would be refused by name
+/// on every estate-scoped route — which is the contract, not a rig quirk.
+fn client_for(handle: &DaemonHandle, estate_root: &Path) -> ApiClient {
+    ApiClient::new(&handle.endpoint, &handle.token)
+        .expect("client")
+        .with_estate_root(estate_root)
 }
 
 /// The `TestBackend` buffer as plain text lines — the content assertions in
@@ -275,10 +296,10 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         ],
     )
     .await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, estate.path());
 
-    let done = submit(&handle, &mount, "finish this one", "tiny").await;
-    let asking = submit(&handle, &mount, "ask me something", "tiny").await;
+    let done = submit(&handle, estate.path(), &mount, "finish this one", "tiny").await;
+    let asking = submit(&handle, estate.path(), &mount, "ask me something", "tiny").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -379,7 +400,14 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         .stream_events(app.last_seq)
         .await
         .expect("live tail attaches");
-    let fresh = submit(&handle, &mount, "arrived while watching", "tiny").await;
+    let fresh = submit(
+        &handle,
+        estate.path(),
+        &mount,
+        "arrived while watching",
+        "tiny",
+    )
+    .await;
     assert!(
         !screen_text(&render(&app)).contains(&fresh),
         "the new work must not be on screen before the TUI hears about it"
@@ -499,8 +527,8 @@ async fn t1c_respond_reaches_the_real_api_through_the_answer_composer() {
         ],
     )
     .await;
-    let client = client_for(&handle);
-    let id = submit(&handle, &mount, "ask a question", "solo").await;
+    let client = client_for(&handle, estate.path());
+    let id = submit(&handle, estate.path(), &mount, "ask a question", "solo").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -568,8 +596,8 @@ async fn t1c_cancel_reaches_the_real_api_through_the_confirmation() {
         [FakeStep::waiting("queued upstream")],
     )
     .await;
-    let client = client_for(&handle);
-    let id = submit(&handle, &mount, "wait around", "solo").await;
+    let client = client_for(&handle, estate.path());
+    let id = submit(&handle, estate.path(), &mount, "wait around", "solo").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -612,8 +640,8 @@ async fn t1c_retry_reaches_the_real_api_through_the_confirmation() {
         [FakeStep::fail("boom"), FakeStep::complete()],
     )
     .await;
-    let client = client_for(&handle);
-    let id = submit(&handle, &mount, "fail then retry", "solo").await;
+    let client = client_for(&handle, estate.path());
+    let id = submit(&handle, estate.path(), &mount, "fail then retry", "solo").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -653,8 +681,8 @@ async fn t1c_extend_reaches_the_real_api_with_the_typed_turn_count() {
         [FakeStep::blocked("envelope exhausted")],
     )
     .await;
-    let client = client_for(&handle);
-    let id = submit(&handle, &mount, "run out of turns", "solo").await;
+    let client = client_for(&handle, estate.path());
+    let id = submit(&handle, estate.path(), &mount, "run out of turns", "solo").await;
 
     let before = client.work(&id).await.expect("read back");
     assert_eq!(before["work"]["state"], "blocked");
@@ -719,7 +747,7 @@ async fn t3_estate_add_repo_reaches_the_real_api_off_the_render_loop() {
     support::init_repo(source.path());
 
     let (handle, _fake) = start_fake(&data_dir, estate_root.path(), []).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, estate_root.path());
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -804,7 +832,7 @@ async fn t3_estate_health_renders_the_real_doctor_report() {
     let estate = TempDir::new().expect("tempdir");
     empty_estate(estate.path(), "t3-health-estate");
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, estate.path());
 
     let mut app = App::new();
     app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus first
@@ -1288,9 +1316,9 @@ async fn t1_the_events_endpoint_filters_and_tails_by_work() {
     write_workflow(estate.path());
 
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
-    let client = client_for(&handle);
-    let first = submit(&handle, &mount, "first work", "tiny").await;
-    let second = submit(&handle, &mount, "second work", "tiny").await;
+    let client = client_for(&handle, estate.path());
+    let first = submit(&handle, estate.path(), &mount, "first work", "tiny").await;
+    let second = submit(&handle, estate.path(), &mount, "second work", "tiny").await;
 
     let all = client.get("/v1/events").await.expect("history");
     let all = all["events"].as_array().expect("events").len();
@@ -1349,8 +1377,8 @@ async fn a_work_view_whose_work_vanished_falls_back_to_fleet() {
         [FakeStep::needs_input("which budget?")],
     )
     .await;
-    let work_id = submit(&handle, &mount, "still here", "tiny").await;
-    let client = client_for(&handle);
+    let work_id = submit(&handle, estate.path(), &mount, "still here", "tiny").await;
+    let client = client_for(&handle, estate.path());
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");

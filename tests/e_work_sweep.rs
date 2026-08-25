@@ -64,7 +64,6 @@ async fn rig() -> (TempDir, PathBuf, TempDir, DaemonHandle) {
         DaemonConfig {
             backends: Arc::new(BackendRegistry::new().with(Arc::new(fake))),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: Some(root.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -85,6 +84,7 @@ async fn completed_work(client: &ApiClient, cwd: &Path) -> String {
                 "command_id": ulid::Ulid::generate().to_string(),
                 "intent": "leave a branch behind",
                 "workflow": "solo",
+                "estate_root": cwd,
                 "origin": {"client": "cli", "cwd": cwd},
             }),
         )
@@ -138,7 +138,10 @@ fn refs_in(mount: &Path) -> String {
 #[tokio::test]
 async fn classification_reports_redundant_and_orphan_and_mutates_nothing() {
     let (root, mount, _data, handle) = rig().await;
-    let client = ApiClient::new(&handle.endpoint, &handle.token).expect("client");
+    // D4: the sweep addresses the estate whose `sergeant/*` refs it means.
+    let client = ApiClient::new(&handle.endpoint, &handle.token)
+        .expect("client")
+        .with_estate_root(root.path());
     let id = completed_work(&client, root.path()).await;
     git(&mount, &["branch", ORPHAN_BRANCH, "main"]);
 
@@ -184,7 +187,10 @@ async fn classification_reports_redundant_and_orphan_and_mutates_nothing() {
 #[tokio::test]
 async fn deletion_without_confirmation_refuses_and_deletes_nothing() {
     let (root, mount, _data, handle) = rig().await;
-    let client = ApiClient::new(&handle.endpoint, &handle.token).expect("client");
+    // D4: the sweep addresses the estate whose `sergeant/*` refs it means.
+    let client = ApiClient::new(&handle.endpoint, &handle.token)
+        .expect("client")
+        .with_estate_root(root.path());
     let id = completed_work(&client, root.path()).await;
 
     let before = refs_in(&mount);
@@ -218,7 +224,10 @@ async fn deletion_without_confirmation_refuses_and_deletes_nothing() {
 #[tokio::test]
 async fn a_confirmed_sweep_deletes_only_the_redundant_branch_and_journals_its_tip() {
     let (root, mount, _data, handle) = rig().await;
-    let client = ApiClient::new(&handle.endpoint, &handle.token).expect("client");
+    // D4: the sweep addresses the estate whose `sergeant/*` refs it means.
+    let client = ApiClient::new(&handle.endpoint, &handle.token)
+        .expect("client")
+        .with_estate_root(root.path());
     let id = completed_work(&client, root.path()).await;
     git(&mount, &["branch", ORPHAN_BRANCH, "main"]);
     let work_branch = format!("sergeant/{id}");

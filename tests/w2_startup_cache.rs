@@ -35,14 +35,13 @@ fn daemon_started_payload(data_dir: &Path) -> Value {
 
 async fn start_and_stop(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     rebuild_cache: bool,
     segment_max_bytes: Option<u64>,
 ) {
     let handle = daemon::start_with(
         data_dir,
         DaemonConfig {
-            estate_root: Some(estate_root.to_path_buf()),
             rebuild_cache,
             segment_max_bytes,
             ..DaemonConfig::default()

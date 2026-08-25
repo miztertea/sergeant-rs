@@ -49,6 +49,7 @@ use crate::api::Core;
 use crate::domain::execution::ReconcileDisposition;
 use crate::domain::work::WorkState;
 use crate::runtime::engine::{Engine, EngineError};
+use crate::runtime::estates::EstateRegistry;
 
 /// What one restart's reconciliation did.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +77,30 @@ pub struct ReconcileReport {
 /// from starting. §25's fail-closed contract is stated per-work — "ambiguous
 /// states fail closed to blocked with evidence" — not "one bad journal entry
 /// makes the whole daemon unavailable".
-pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, EngineError> {
+///
+/// **H1 §4 / D10: each Work's estate is re-validated before it is resumed.**
+/// This pass was accidentally already host-shaped — it never filtered by
+/// estate, because there was only ever one — and that is exactly what hid
+/// the trap the recon flagged: every *action* it takes runs through the
+/// engine, which used to carry one pinned estate, so resuming estate B's
+/// Work would silently have used estate A's topology. With the engine's
+/// field gone (D10) the resolution has to come from the Work itself: its
+/// journaled `workspace_id` coordinate (D1), re-admitted here through the
+/// registry. A Work whose estate no longer validates goes `blocked` with the
+/// admission refusal as its reason — fail-closed and *named*, rather than
+/// mis-planned or refused later with a confusing diagnostic against the
+/// wrong root.
+///
+/// A Work with **no** recorded coordinate is untouched by this check and
+/// reconciles exactly as before: every journal line written before the
+/// envelope carried the field is that shape, and inventing an estate for it
+/// (or blocking it for not having one) would be the daemon deciding
+/// something the journal never recorded.
+pub fn reconcile(
+    engine: &Engine,
+    estates: &EstateRegistry,
+    core: &mut Core,
+) -> Result<ReconcileReport, EngineError> {
     let in_flight: Vec<String> = core
         .registry
         .state()
@@ -174,6 +198,12 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
 
     let mut report = ReconcileReport::default();
     for work_id in in_flight {
+        if let Some(refusal) = estate_unavailable(estates, core, &work_id) {
+            block_on_unavailable_estate(engine, core, &work_id, &refusal);
+            flush_after_reconciling(core, &work_id);
+            report.blocked.push(work_id);
+            continue;
+        }
         let outcome = engine.reconcile_work(core, &work_id);
         flush_after_reconciling(core, &work_id);
         match outcome {
@@ -189,7 +219,13 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
         }
     }
     for work_id in crashed_starts {
-        if let Err(e) = engine.reconcile_crashed_start(core, &work_id) {
+        // A crashed start is already headed for `blocked`; re-validating the
+        // estate first is what makes its *reason* honest when the estate is
+        // the thing that went away, and keeps `reconcile_crashed_start`'s own
+        // git teardown from running against a root that no longer validates.
+        if let Some(refusal) = estate_unavailable(estates, core, &work_id) {
+            block_on_unavailable_estate(engine, core, &work_id, &refusal);
+        } else if let Err(e) = engine.reconcile_crashed_start(core, &work_id) {
             block_on_reconcile_error(engine, core, &work_id, &e);
         }
         flush_after_reconciling(core, &work_id);
@@ -233,6 +269,44 @@ pub fn reconcile(engine: &Engine, core: &mut Core) -> Result<ReconcileReport, En
         }
     }
     Ok(report)
+}
+
+/// H1 §4's "re-validated before resumed mutation", per Work.
+///
+/// Returns the refusal when this Work names an estate that will not admit
+/// right now, and `None` both when it validates and when the Work names no
+/// estate at all (see [`reconcile`]'s doc for why the latter is not a
+/// refusal).
+fn estate_unavailable(estates: &EstateRegistry, core: &Core, work_id: &str) -> Option<String> {
+    let root = core
+        .registry
+        .state()
+        .work_index
+        .get(work_id)
+        .and_then(|row| row.estate_root.clone())?;
+    match estates.revalidate(std::path::Path::new(&root)) {
+        Ok(_) => None,
+        Err(e) => Some(e.to_string()),
+    }
+}
+
+/// Fail one Work closed because *its own* estate no longer validates,
+/// recording the admission refusal as the reason. Isolated exactly like
+/// [`block_on_reconcile_error`]: one estate going bad blocks that estate's
+/// Work and nothing else's.
+fn block_on_unavailable_estate(engine: &Engine, core: &mut Core, work_id: &str, refusal: &str) {
+    tracing::warn!(
+        work_id,
+        refusal,
+        "a Work's estate no longer admits; blocking it rather than resuming against \
+         topology nobody validated"
+    );
+    let _ = engine.block(
+        core,
+        work_id,
+        "this Work's estate could not be re-admitted at startup",
+        Some(refusal.to_string()),
+    );
 }
 
 /// Close the open group after one work's reconciliation, best-effort
@@ -353,7 +427,8 @@ mod tests {
         );
         testing::commit(&mut core, intact, KIND_WORK_STARTED, json!({}));
 
-        let report = reconcile(&engine, &mut core).expect("recovery must not abort");
+        let report =
+            reconcile(&engine, &EstateRegistry::new(), &mut core).expect("recovery must not abort");
         assert_eq!(report.resumed, Vec::<String>::new());
         assert_eq!(report.blocked, vec![broken.to_string(), intact.to_string()]);
 
@@ -430,7 +505,8 @@ mod tests {
         );
         testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
 
-        let report = reconcile(&engine, &mut core).expect("recovery must not abort");
+        let report =
+            reconcile(&engine, &EstateRegistry::new(), &mut core).expect("recovery must not abort");
         assert_eq!(report.blocked, vec![work_id.to_string()]);
         assert_eq!(
             core.registry.state().works[work_id].state,
@@ -512,7 +588,8 @@ mod tests {
         // below (that reconcile's flushing is not a no-op it stumbled into).
         let fsyncs_before = core.journal.fsync_count();
 
-        let report = reconcile(&engine, &mut core).expect("recovery must not abort");
+        let report =
+            reconcile(&engine, &EstateRegistry::new(), &mut core).expect("recovery must not abort");
         assert_eq!(report.blocked, vec![broken.to_string(), intact.to_string()]);
 
         assert_eq!(
@@ -611,7 +688,7 @@ mod tests {
             .expect("git");
         assert!(output.status.success(), "checkout: {output:?}");
 
-        let report = reconcile(&engine, &mut core).expect("recovery");
+        let report = reconcile(&engine, &EstateRegistry::new(), &mut core).expect("recovery");
         assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
 
         let torn = events(&core, work_id, KIND_SURFACE_TORN_DOWN);

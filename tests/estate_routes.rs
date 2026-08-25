@@ -70,11 +70,10 @@ fn estate() -> (TempDir, std::path::PathBuf) {
 
 /// Start a daemon on `data_dir`, **bound** to `estate_root` (§5.1). Every
 /// `/v1/estate/*` route resolves the estate through that binding now.
-async fn start(data_dir: &Path, estate_root: &Path) -> DaemonHandle {
+async fn start(data_dir: &Path, _estate_root: &Path) -> DaemonHandle {
     daemon::start_with(
         data_dir,
         DaemonConfig {
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -82,8 +81,13 @@ async fn start(data_dir: &Path, estate_root: &Path) -> DaemonHandle {
     .expect("daemon start")
 }
 
-fn client_for(handle: &DaemonHandle) -> ApiClient {
-    ApiClient::new(&handle.endpoint, &handle.token).expect("client")
+/// D4: a client addresses the estate its estate-scoped requests mean. The
+/// daemon binds none, so a client that named none would be refused by name
+/// on every estate-scoped route — which is the contract, not a rig quirk.
+fn client_for(handle: &DaemonHandle, estate_root: &Path) -> ApiClient {
+    ApiClient::new(&handle.endpoint, &handle.token)
+        .expect("client")
+        .with_estate_root(estate_root)
 }
 
 // -------------------------------------------------------------- repos
@@ -92,7 +96,7 @@ fn client_for(handle: &DaemonHandle) -> ApiClient {
 async fn get_estate_repos_reflects_the_manifest_empty_then_populated() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let empty = client.repos().await.expect("get repos");
     assert_eq!(empty["repos"].as_array().expect("array").len(), 0);
@@ -122,7 +126,7 @@ async fn get_estate_repos_reflects_the_manifest_empty_then_populated() {
 async fn post_estate_repos_honors_the_instructions_choice() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let source = TempDir::new().expect("source repo tempdir");
     init_repo(source.path());
@@ -144,7 +148,7 @@ async fn post_estate_repos_honors_the_instructions_choice() {
 async fn post_estate_repos_refuses_a_duplicate_name_with_the_manifest_refusal() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let source = TempDir::new().expect("source repo tempdir");
     init_repo(source.path());
@@ -172,7 +176,7 @@ async fn post_estate_repos_refuses_a_duplicate_name_with_the_manifest_refusal() 
 async fn delete_estate_repos_removes_the_declaration_but_not_the_clone() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let source = TempDir::new().expect("source repo tempdir");
     init_repo(source.path());
@@ -198,7 +202,7 @@ async fn delete_estate_repos_removes_the_declaration_but_not_the_clone() {
 async fn delete_estate_repos_refuses_while_a_group_still_references_it() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let source = TempDir::new().expect("source repo tempdir");
     init_repo(source.path());
@@ -232,7 +236,7 @@ async fn delete_estate_repos_refuses_while_a_group_still_references_it() {
 async fn post_estate_groups_creates_then_extends_by_union() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let source = TempDir::new().expect("source repo tempdir");
     init_repo(source.path());
@@ -272,7 +276,7 @@ async fn post_estate_groups_creates_then_extends_by_union() {
 async fn post_estate_groups_refuses_an_undeclared_member() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let err = client
         .add_group("core", &["ghost".to_string()], None)
@@ -290,7 +294,7 @@ async fn post_estate_groups_refuses_an_undeclared_member() {
 async fn get_estate_groups_reflects_the_manifest() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let source = TempDir::new().expect("source repo tempdir");
     init_repo(source.path());
@@ -317,7 +321,7 @@ async fn get_estate_groups_reflects_the_manifest() {
 async fn delete_estate_groups_with_named_repos_removes_only_those_members() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let source = TempDir::new().expect("source repo tempdir");
     init_repo(source.path());
@@ -354,7 +358,7 @@ async fn delete_estate_groups_with_named_repos_removes_only_those_members() {
 async fn delete_estate_groups_with_no_repos_removes_the_whole_group() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let source = TempDir::new().expect("source repo tempdir");
     init_repo(source.path());
@@ -383,7 +387,7 @@ async fn delete_estate_groups_with_no_repos_removes_the_whole_group() {
 async fn delete_estate_groups_refuses_a_nonmember() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let source = TempDir::new().expect("source repo tempdir");
     init_repo(source.path());
@@ -414,7 +418,7 @@ async fn delete_estate_groups_refuses_a_nonmember() {
 async fn get_doctor_matches_the_shape_sgt_doctor_json_already_prints() {
     let (root, data_dir) = estate();
     let handle = start(&data_dir, root.path()).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, root.path());
 
     let report = client.doctor().await.expect("get doctor report");
     assert!(report["healthy"].is_boolean());

@@ -42,7 +42,6 @@ use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::opencode::{OPENCODE_BACKEND_NAME, OpencodeBackend, OpencodeConfig};
 use crate::backend::{BackendRegistry, EventSink};
-use crate::domain::estate::Estate;
 use crate::domain::event::{EventDraft, EventSource};
 use crate::platform::fs_locking::{self, Reliability};
 use crate::runtime::analytics::{Analytics, AnalyticsError};
@@ -354,23 +353,19 @@ pub struct DaemonConfig {
     /// alternative — shrinking the window instead — would mean the tests
     /// prove a window nothing ships.
     pub segment_max_bytes: Option<u64>,
-    /// §5.1: the estate root this daemon is bound to, for its whole life.
-    ///
-    /// [`start_with`] admits it (§4.1's exact-root check —
-    /// [`Estate::admit`]) before the data dir is created, the journal
-    /// opened, or the descriptor published, so a daemon can never come up
-    /// bound to something that is not an estate. The canonical form is
-    /// pinned into the engine and published in the runtime descriptor, where
-    /// every client verifies it against its own root before use.
-    ///
-    /// `None` is a daemon bound to no estate: `Engine::plan` answers "no
-    /// repository context" and every submission stays `pending`. That is the
-    /// test rigs' shape — never a silent fallback to discovery, of which
-    /// there is none left.
-    pub estate_root: Option<PathBuf>,
     /// W3: retention cap for this daemon's journal, overriding `[estate]
-    /// retention`. `None` — production, always — takes the manifest's value
-    /// or [`crate::domain::estate::DEFAULT_RETENTION`].
+    /// retention`. `None` — production, always — takes
+    /// [`crate::domain::estate::DEFAULT_RETENTION`].
+    ///
+    /// **H1:** a host daemon has no one estate whose manifest could supply
+    /// this, so the `Manifest` rung is gone from the *process-wide* policy.
+    /// Each admitted estate's own `[estate] retention` is read at admission
+    /// ([`crate::runtime::estates::AdmittedEstate::retention`]); partitioning
+    /// the retention *decision* by estate is W4a's deliverable (D7 keeps the
+    /// blob-reference scan journal-wide either way). Until then the
+    /// process-wide policy is the explicit override or the built-in default,
+    /// which is a widening — never a silent narrowing — of what any one
+    /// estate declared.
     ///
     /// Configurable for the same reason `segment_max_bytes`/`completion_poll`
     /// are: a prune test has to stand on the far side of the cap, and
@@ -399,7 +394,6 @@ impl Default for DaemonConfig {
             turn_cap: None,
             rebuild_cache: false,
             segment_max_bytes: None,
-            estate_root: None,
             retention: None,
         }
     }
@@ -433,15 +427,18 @@ pub async fn start_with(
     data_dir: &Path,
     config: DaemonConfig,
 ) -> Result<DaemonHandle, DaemonError> {
-    // 0a. §4.1/§5.1: admit the estate root **first**, before the data dir is
-    // even created. A daemon that cannot name its estate must not come up at
-    // all — §4.3's ordering applies to the daemon's own startup exactly as
-    // it does to a client's dispatch, and the canonical root admitted here
-    // is what the descriptor publishes and every client verifies against.
-    let estate = match &config.estate_root {
-        Some(root) => Some(Estate::admit(root)?),
-        None => None,
-    };
+    // 0a. **Estate admission is no longer a startup step.** It used to be the
+    // first thing this function did — `Estate::admit(config.estate_root)`,
+    // before the data dir was even created, refusing the whole start when it
+    // failed. H1 moves it out: a host daemon starts bound to **zero** estates
+    // (the normal state, not a rig edge case) and admits each one lazily on
+    // the first request that addresses it
+    // ([`crate::runtime::estates::EstateRegistry`]). Keeping the old step
+    // would mean one estate's broken `sergeant.toml` refusing to start the
+    // daemon every *other* estate's Work depends on — which is precisely why
+    // admission failure is now an estate-specific refusal to the caller that
+    // asked for it, and never process death.
+    let estates = Arc::new(crate::runtime::estates::EstateRegistry::new());
 
     create_dir_all_durable(data_dir)?;
 
@@ -451,6 +448,12 @@ pub async fn start_with(
     // two daemons are racing the same data dir. An inconclusive probe (e.g.
     // today's always-Unknown macOS arm) does not refuse — see
     // `refuse_if_unreliable`.
+    //
+    // H1: `data_dir` is now the **host runtime root**, so this is the host
+    // half of a check that has become two. The estate half runs per estate
+    // root at admission (`estates::admit_root`), because an estate on a
+    // network share and a host root on local disk is a real shape, and one
+    // probe at one path can no longer answer for both.
     refuse_if_unreliable(data_dir, fs_locking::detect_for_path(data_dir))?;
 
     // 1. Exclusive daemon lock: a second daemon on the same data dir fails
@@ -578,46 +581,31 @@ pub async fn start_with(
         .with_floor_ledger(Arc::new(floor_ledger))
         .with_first_seq_index(first_seq_by_work);
 
-    // W3 §1.2: resolve the retention policy once, for this process's whole
-    // life — `config.retention` (test rigs only) -> `[estate] retention` ->
-    // the built-in default. Journaled on every prune event so the record
-    // names the authorization, not just the number (A1).
+    // W3 §1.2, as H1 leaves it: resolve the *process-wide* retention policy
+    // once — `config.retention` (test rigs only) -> the built-in default.
+    // Journaled on every prune event so the record names the authorization,
+    // not just the number (A1).
     //
-    // `estate` above is only an `EstateRoot` (path + manifest_path admitted
-    // by §4.1's exact-root check) — it never parsed `[estate] retention`, so
-    // it is re-read here through the *structural* parser: schema-level
-    // checks in full, no per-repository git validation (`Estate::admit`
-    // never did that either, so this cannot newly refuse a daemon start that
-    // used to succeed). A failure here — unreachable in practice, since
-    // `admit` already parsed the same file successfully — falls back to the
-    // default rather than turning a policy-resolution nicety into a new
-    // startup failure mode.
-    let estate_retention = estate.as_ref().and_then(|estate_root| {
-        match Estate::from_config_structural(&estate_root.manifest_path) {
-            Ok(full) => full.retention,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "could not re-read the estate manifest for [estate] retention; using the default"
-                );
-                None
-            }
-        }
-    });
+    // The `[estate] retention` rung is gone from **this** resolution, and
+    // that is a deliberate, named change rather than an omission. It used to
+    // re-read the one bound estate's manifest here; a host journal holds
+    // many estates' Works, so "the manifest" has no referent at startup.
+    // Each admitted estate's own declaration is read at admission
+    // (`estates::admit_root` -> `AdmittedEstate::retention`) and W4a owns
+    // partitioning the retention *decision* by estate — D7 keeps the
+    // blob-reference scan journal-wide regardless, precisely so a per-estate
+    // decision can never condemn another estate's live blobs. Until W4a
+    // lands, the process-wide number is the explicit override or the
+    // default: a widening of what any one estate declared, never a silent
+    // narrowing.
     let prune_policy = match config.retention {
         Some(retention) => crate::runtime::prune::PrunePolicy {
             retention,
             source: crate::runtime::prune::PolicySource::Config,
         },
-        None => match estate_retention {
-            Some(retention) => crate::runtime::prune::PrunePolicy {
-                retention,
-                source: crate::runtime::prune::PolicySource::Manifest,
-            },
-            None => crate::runtime::prune::PrunePolicy {
-                retention: crate::domain::estate::DEFAULT_RETENTION,
-                source: crate::runtime::prune::PolicySource::Default,
-            },
+        None => crate::runtime::prune::PrunePolicy {
+            retention: crate::domain::estate::DEFAULT_RETENTION,
+            source: crate::runtime::prune::PolicySource::Default,
         },
     };
 
@@ -862,11 +850,9 @@ pub async fn start_with(
     // harness) are never left unsynced while unbounded — see its doc.
     let mut engine = Engine::new(backends, config.default_backend.clone(), data_dir)
         .with_turn_ceiling(config.turn_ceiling);
-    // §5.2: the engine's one topology authority for the life of this
-    // process. Nothing downstream ever re-derives it from a request cwd.
-    if let Some(estate) = &estate {
-        engine = engine.with_estate_root(estate.path.clone());
-    }
+    // D10: no `with_estate_root` here any more. The engine holds no estate;
+    // each `plan` call is handed the one its request addressed, after the
+    // registry admitted it.
     if let Some(surfaces_root) = config.surfaces_root.clone() {
         engine = engine.with_surfaces_root(surfaces_root);
     }
@@ -874,7 +860,7 @@ pub async fn start_with(
         engine = engine.with_turn_cap(turn_cap);
     }
     let engine = Arc::new(engine);
-    let reconciled = recovery::reconcile(&engine, &mut core)?;
+    let reconciled = recovery::reconcile(&engine, &estates, &mut core)?;
     // Backstop, not load-bearing: `reconcile` already leaves nothing open on
     // its own account, but a future edit there that forgets a flush must not
     // be able to publish the descriptor over an unsynced group. Free when
@@ -935,6 +921,7 @@ pub async fn start_with(
         data_dir: data_dir.to_path_buf(),
         closing: closing_rx,
         engine,
+        estates,
         analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
         prune_policy,
     };
@@ -1196,13 +1183,16 @@ async fn export_events(
 /// Run the daemon in the foreground until SIGINT/SIGTERM, then shut down
 /// cleanly. This is what `sgt daemon` (and therefore auto-spawn) executes.
 ///
+/// `data_dir` is the **host runtime root** (D2): journal, projections, blob
+/// store, `daemon.lock` and the descriptor all live beneath it, and it is
+/// resolved from `--data-dir` / `SGT_DATA_DIR` / the platform convention —
+/// never from an estate. There is deliberately no estate parameter any more
+/// (deliverable 8): `-C` on a `daemon` verb names the estate the invocation
+/// is *addressing*, not one this process binds itself to for life.
+///
 /// This is the one place §28 export is configured from the environment, and
 /// [`TelemetryConfig::from_env`] answers "off" unless explicitly switched on.
-pub async fn run_until_signal(
-    data_dir: &Path,
-    estate_root: Option<&Path>,
-    rebuild_cache: bool,
-) -> Result<(), DaemonError> {
+pub async fn run_until_signal(data_dir: &Path, rebuild_cache: bool) -> Result<(), DaemonError> {
     // **Handlers first, before anything makes this daemon reachable.**
     //
     // Publishing the runtime descriptor is what tells the world "there is a
@@ -1268,10 +1258,6 @@ pub async fn run_until_signal(
             telemetry: telemetry.clone(),
             surfaces_root,
             turn_cap,
-            // §5.1: the estate this daemon is bound to for its whole life,
-            // handed down from the invocation that already admitted it
-            // (`sgt -C <root> daemon`, or `sgt daemon` from the root).
-            estate_root: estate_root.map(Path::to_path_buf),
             rebuild_cache,
             ..DaemonConfig::default()
         },

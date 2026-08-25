@@ -1150,20 +1150,6 @@ pub struct Engine {
     /// completion driver alongside [`Self::due_observations`] (see
     /// [`Self::due_interrupts`]).
     pub turn_ceiling: Duration,
-    /// §5.1/§5.2: the one estate this daemon is bound to, admitted at
-    /// startup ([`crate::domain::estate::Estate::admit`]) and pinned
-    /// here for the process's whole life.
-    ///
-    /// **This is the only topology authority.** [`Self::plan`] reads the
-    /// manifest at *this* root; a submission's `origin.cwd` is recorded
-    /// evidence only (§13.3) and can never move it. That is what removes the
-    /// recursion hazard §5.2 names — a child command launched from a Work
-    /// surface rediscovering that linked worktree as a new estate.
-    ///
-    /// `None` only for a daemon started with no estate at all (test rigs and
-    /// the intent-capture path): [`Self::plan`] answers `Ok(None)` there,
-    /// exactly as "no repository context" always has.
-    pub estate_root: Option<PathBuf>,
     /// When each Work's current turn was last (re-)spawned, for the ceiling
     /// sweep. Deliberately **not** journaled or durable: a restart forgets
     /// it, which is acceptable for a soak-test hang bound (never an
@@ -1190,17 +1176,8 @@ impl Engine {
             data_dir: data_dir.to_path_buf(),
             turn_cap: DEFAULT_TURN_CAP,
             turn_ceiling: DEFAULT_TURN_CEILING,
-            estate_root: None,
             turn_started: Arc::new(Mutex::new(BTreeMap::new())),
         }
-    }
-
-    /// Bind this engine to one estate root (§5.1). The daemon calls this
-    /// once at startup with the canonical root it was started against; every
-    /// later [`Self::plan`] reads that estate and no other.
-    pub fn with_estate_root(mut self, estate_root: PathBuf) -> Self {
-        self.estate_root = Some(estate_root);
-        self
     }
 
     /// Override the daemon-wide turn cap (R-MVP1-7). Wired from
@@ -1263,16 +1240,31 @@ impl Engine {
 
     /// Resolve everything a run needs, without touching anything.
     ///
-    /// **§5.2: the request's cwd has no authority here.** Topology comes from
-    /// [`Self::estate_root`] — the one estate this daemon was started
-    /// against — and from nowhere else. `context.cwd` survives only as
-    /// `origin.cwd`, recorded evidence for diagnostics (§13.3).
+    /// **D10: the estate is a per-call parameter, not a field.** The engine
+    /// held one `estate_root` pinned for the process's whole life while a
+    /// daemon served exactly one estate. A host daemon serves many, so the
+    /// estate this submission resolved against is handed in per call — by
+    /// the handler, from the *request*, after the admitted-estate registry
+    /// validated it ([`crate::runtime::estates::EstateRegistry::admit`]).
+    /// The field and `with_estate_root` are removed rather than left
+    /// vestigially in place: a second, stale topology authority sitting
+    /// beside the real one is exactly how estate B's Work gets planned
+    /// against estate A's manifest.
     ///
-    /// `Ok(None)` means "this daemon is bound to no estate": the intent is
-    /// accepted and stays `pending` rather than being rejected, exactly as
-    /// "no repository context" always has. Every *other* failure (a
-    /// `sergeant.toml` that no longer resolves, an unroutable backend, a
-    /// missing workflow) is a real error and is returned as one.
+    /// **§5.2 still holds, and is now the caller's to keep.** The request's
+    /// cwd has no authority here: `context.cwd` survives only as
+    /// `origin.cwd`, recorded evidence for diagnostics (§13.3). What may
+    /// name `estate_root` is an *addressed* root the daemon then validates
+    /// by admission — never a cwd it infers one from, and never a parent
+    /// search. That is what keeps §5.2's recursion hazard closed (a child
+    /// command launched from a Work surface rediscovering that linked
+    /// worktree as a new estate).
+    ///
+    /// `None` means the submission offered no repository context at all: the
+    /// intent is accepted and stays `pending` rather than being rejected,
+    /// exactly as it always has. Every *other* failure (a `sergeant.toml`
+    /// that no longer resolves, an unroutable backend, a missing workflow)
+    /// is a real error and is returned as one.
     ///
     /// "No surface" does not mean "no §13". A submission that *names* a
     /// backend has asked for something, and §13's terminal state for a
@@ -1282,11 +1274,16 @@ impl Engine {
     /// tolerated here, because a captured intent with no repository has
     /// nothing to route yet and no default to disappoint.
     ///
-    /// The manifest is re-read from the pinned root on every plan rather
-    /// than cached from startup, so `sgt repo add` reaches a running daemon
-    /// — the *root* is what startup fixes, and the root is what §5 binds.
-    pub fn plan(&self, context: &SubmitContext<'_>) -> Result<Option<StartPlan>, EngineError> {
-        let estate = match &self.estate_root {
+    /// The manifest is re-read from the addressed root on every plan rather
+    /// than cached, so `sgt repo add` reaches a running daemon — that
+    /// discipline is untouched by D10; only *which* root is re-read changes,
+    /// and it changes per call rather than never.
+    pub fn plan(
+        &self,
+        estate_root: Option<&Path>,
+        context: &SubmitContext<'_>,
+    ) -> Result<Option<StartPlan>, EngineError> {
+        let estate = match estate_root {
             None => None,
             Some(root) => Some(Estate::resolve(root)?),
         };

@@ -47,7 +47,7 @@ fn http() -> reqwest::Client {
 /// A daemon bound to `estate`, backed by a fake that hangs — so an admitted
 /// submission stays in flight and its surface can be inspected while it
 /// exists.
-async fn start(data: &DataDir, estate: &Path) -> (DaemonHandle, FakeBackend) {
+async fn start(data: &DataDir, _estate: &Path) -> (DaemonHandle, FakeBackend) {
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang()]);
     let handle = daemon::start_with(
         data.path(),
@@ -55,7 +55,6 @@ async fn start(data: &DataDir, estate: &Path) -> (DaemonHandle, FakeBackend) {
             backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
-            estate_root: Some(estate.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -64,16 +63,19 @@ async fn start(data: &DataDir, estate: &Path) -> (DaemonHandle, FakeBackend) {
     (handle, fake)
 }
 
-/// Submit, merging `extra` into the request body.
+/// Submit against `estate_root`, merging `extra` into the request body.
 async fn submit(
     client: &reqwest::Client,
     handle: &DaemonHandle,
+    estate_root: &Path,
     intent: &str,
     extra: Value,
 ) -> (reqwest::StatusCode, Value) {
     let mut body = json!({
         "command_id": ulid::Ulid::generate().to_string(),
         "intent": intent,
+        // D4: the estate this submission addresses.
+        "estate_root": estate_root,
         "origin": {"client": "cli"},
     });
     if let Some(fields) = extra.as_object() {
@@ -151,7 +153,14 @@ async fn a_dirty_mount_is_refused_before_a_work_record_exists() {
 
     let (handle, fake) = start(&data, &estate).await;
     let client = http();
-    let (status, body) = submit(&client, &handle, "work on a dirty mount", json!({})).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "work on a dirty mount",
+        json!({}),
+    )
+    .await;
 
     assert_eq!(status, 422, "a dirty mount is refused: {body}");
     assert_eq!(body["error"]["code"], "git_preflight_dirty_mount");
@@ -221,6 +230,7 @@ async fn an_unresolvable_head_is_refused_and_says_no_override_applies() {
         let (status, body) = submit(
             &client,
             &handle,
+            &estate,
             "no commit to be based on",
             json!({"override_git_preflight": override_flag}),
         )
@@ -264,6 +274,7 @@ async fn a_partial_plan_leaves_no_work_record_and_no_side_effects() {
     let (status, body) = submit(
         &client,
         &handle,
+        &estate,
         "half a scope",
         json!({"scope": {"all": true}}),
     )
@@ -323,6 +334,7 @@ async fn an_override_admits_a_dirty_mount_and_journals_what_it_excluded() {
     let (status, body) = submit(
         &client,
         &handle,
+        &estate,
         "based on the committed head",
         json!({"override_git_preflight": true}),
     )
@@ -411,7 +423,14 @@ async fn an_override_admits_a_detached_mount_with_no_named_base_branch() {
     let client = http();
 
     // Without the flag, §15's detached row refuses and offers the hatch.
-    let (status, refused) = submit(&client, &handle, "detached, no override", json!({})).await;
+    let (status, refused) = submit(
+        &client,
+        &handle,
+        &estate,
+        "detached, no override",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 422, "{refused}");
     assert_eq!(refused["error"]["code"], "git_preflight_detached_head");
     assert!(
@@ -424,6 +443,7 @@ async fn an_override_admits_a_detached_mount_with_no_named_base_branch() {
     let (status, body) = submit(
         &client,
         &handle,
+        &estate,
         "detached, overridden",
         json!({"override_git_preflight": true}),
     )
@@ -547,7 +567,7 @@ async fn the_never_bypass_list_is_never_bypassed() {
         // row has to submit under the id the branch was cut for. The daemon
         // mints its own, so the row instead relies on the branch it planted
         // colliding with nothing — see the dedicated assertion below.
-        let (status, body) = submit(&client, &handle, label, fields).await;
+        let (status, body) = submit(&client, &handle, &estate, label, fields).await;
         if expected == "git_preflight_work_branch_collision" {
             // The daemon mints a fresh ULID per submission, so a *planted*
             // branch cannot collide with it. What this row proves instead is
@@ -613,6 +633,7 @@ async fn the_never_bypass_list_is_never_bypassed() {
     let (status, body) = submit(
         &client,
         &aliased_handle,
+        &aliased_estate,
         "wrong/aliased repository path",
         json!({"override_git_preflight": true, "scope": {"repos": ["audit"]}}),
     )
@@ -656,6 +677,7 @@ async fn the_override_is_not_sticky_and_has_no_source_but_the_submission() {
     let (status, first) = submit(
         &client,
         &handle,
+        &estate,
         "overridden once",
         json!({"override_git_preflight": true}),
     )
@@ -666,7 +688,7 @@ async fn the_override_is_not_sticky_and_has_no_source_but_the_submission() {
         ("omitted entirely", json!({})),
         ("explicitly false", json!({"override_git_preflight": false})),
     ] {
-        let (status, body) = submit(&client, &handle, label, fields).await;
+        let (status, body) = submit(&client, &handle, &estate, label, fields).await;
         assert_eq!(
             status, 422,
             "{label}: the override applies to the submission that typed it and to no other: \
@@ -801,7 +823,7 @@ async fn admission_journals_nothing_before_the_plan_and_leaves_the_order_intact(
 ",
     )
     .expect("dirty it");
-    let (status, refused) = submit(&client, &handle, "refused", json!({})).await;
+    let (status, refused) = submit(&client, &handle, &estate, "refused", json!({})).await;
     assert_eq!(status, 422, "{refused}");
     let after_refusal: Vec<String> = events(&data)
         .into_iter()
@@ -815,7 +837,7 @@ async fn admission_journals_nothing_before_the_plan_and_leaves_the_order_intact(
 
     // Then an accepted one, and the order is unchanged.
     git(&mount, &["checkout", "--", "README.md"]);
-    let (status, body) = submit(&client, &handle, "admitted", json!({})).await;
+    let (status, body) = submit(&client, &handle, &estate, "admitted", json!({})).await;
     assert_eq!(status, 201, "{body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     let kinds: Vec<String> = events(&data)
