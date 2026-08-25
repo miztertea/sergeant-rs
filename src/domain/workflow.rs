@@ -100,6 +100,24 @@ pub const KIND_STAGE_BLOCKED: &str = "stage.blocked";
 pub const KIND_STAGE_FAILED: &str = "stage.failed";
 /// Event kind: a stage was canceled.
 pub const KIND_STAGE_CANCELED: &str = "stage.canceled";
+/// Event kind: #260 Q3's hard stage-output gate found a `StageCompleted`
+/// signal whose stage declares an expected `output/` artifact (per its
+/// `output/README.md`) that is not on disk, and spent this stage attempt's
+/// one bounded re-prompt asking the same actor to produce it. Distinct from
+/// [`KIND_STAGE_NEEDS_INPUT`]: the stage stays `Active` (the actor is being
+/// asked again, not parked for a human), and this is the marker
+/// [`crate::runtime::projection::WorkRun`]'s reducer reads to tell "already
+/// re-prompted once this attempt" from "first time seeing this" without
+/// re-deriving it from raw journal replay at every `StageCompleted`.
+pub const KIND_STAGE_OUTPUT_MISSING: &str = "stage.output_missing";
+/// The named `needs_input` reason #260 Q3 requires when a stage's declared
+/// `output/` artifact is still missing after its one bounded re-prompt:
+/// carried in the `stage.needs_input`/`work.needs_input` payload's
+/// `reason_code` key, alongside the existing free-text `detail`/`prompt`
+/// (research finding: this event family has no structured reason today —
+/// see the payload's `stage_id`/`path` fields for the rest of the named
+/// evidence).
+pub const REASON_STAGE_OUTPUT_MISSING: &str = "stage_output_missing";
 
 /// What kind of executor performs a stage (§11, §12.2, §13.1).
 ///
@@ -364,6 +382,15 @@ pub struct StageRecord {
     /// Reason, prompt or summary carried by the last status change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// #260 Q3: how many bounded re-prompts the hard stage-output gate has
+    /// already spent on *this* attempt (`stage.output_missing`, folded by
+    /// the reducer). Always `0` for a freshly entered attempt — `retry`
+    /// enters a new attempt via `stage.entered`, which is a fresh
+    /// [`StageRecord`], so this never carries a stale count across attempts
+    /// the way a Work-wide counter would. The gate is bounded to exactly
+    /// one re-prompt per attempt, so this only ever reads `0` or `1`.
+    #[serde(default)]
+    pub output_reprompts: u32,
 }
 
 /// Failure loading a workflow.
@@ -1011,6 +1038,48 @@ fn root_catalog_names(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// #260 Q3: read one stage's declared output artifact — the filename
+/// `docs/icm/convention.md` Rule 4's `**Expected artifact:** `<file>` —
+/// description.` line names, out of its authored `output/README.md`.
+///
+/// `None` when the stage's package directory has no `output/README.md`, or
+/// the README has no `Expected artifact:` line, or the declared artifact is
+/// not the exact `` `<file>` `` shape every shipped package uses (a bare
+/// backtick-quoted filename, no path separators) — any of those means the
+/// hard gate this feeds (`Engine`'s `StageCompleted` handling) has nothing
+/// to enforce, which is a stage's own choice not to declare one, never an
+/// error a run should fail on. Rule 4 is filesystem-shape ground truth, the
+/// same posture [`crate::runtime::surface::retain_stage_outputs`] already
+/// takes toward `output/`: no manifest, no catalog, just this one line.
+pub(crate) fn declared_output_artifact(package_dir: &Path, stage_id: &str) -> Option<String> {
+    let readme = package_dir.join(stage_id).join("output").join("README.md");
+    let text = std::fs::read_to_string(readme).ok()?;
+    declared_output_artifact_from_readme(&text)
+}
+
+/// The parsing half of [`declared_output_artifact`], pulled apart so it can
+/// be unit-tested directly against README text rather than through a
+/// temp-directory fixture for every case.
+fn declared_output_artifact_from_readme(text: &str) -> Option<String> {
+    let line = text
+        .lines()
+        .find(|line| line.trim().starts_with("**Expected artifact:**"))?;
+    parse_declared_artifact_line(line)
+}
+
+/// One `**Expected artifact:** \`<file>\` — ...` line, parsed strictly:
+/// `None` unless it names a bare backtick-quoted filename with no path
+/// separators (the exact shape every shipped `output/README.md` uses).
+fn parse_declared_artifact_line(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("**Expected artifact:**")?;
+    let after_open = rest.trim().strip_prefix('`')?;
+    let file = after_open.split('`').next().unwrap_or("").trim();
+    if file.is_empty() || file.contains('/') || file.contains('\\') {
+        return None;
+    }
+    Some(file.to_string())
+}
+
 /// Read and parse one workflow directory's own `index.md` front matter
 /// (`docs/icm/record-shapes.md` §1). `None` on any I/O failure, missing
 /// closing delimiter, or missing required field (`status`/`description`) —
@@ -1380,6 +1449,59 @@ fn compute_content_hash(name: &str, version: &str, stages: &[StageDefinition]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #260 Q3: every shipped `output/README.md` uses this exact shape
+    /// (`docs/icm/convention.md` Rule 4) — the line the hard gate's parser
+    /// must actually recognize.
+    #[test]
+    fn declared_output_artifact_parses_the_shipped_readme_shape() {
+        let readme = "# Output — `10-implement`\n\n\
+             Layer 4 (per-run artifact), per `docs/icm/convention.md` §1a.\n\n\
+             **Expected artifact:** `implementation.md` — the commits produced.\n\n\
+             **Disposition:** `evidence`\n";
+        assert_eq!(
+            declared_output_artifact_from_readme(readme),
+            Some("implementation.md".to_string())
+        );
+    }
+
+    #[test]
+    fn declared_output_artifact_is_none_without_the_expected_artifact_line() {
+        assert_eq!(
+            declared_output_artifact_from_readme("# Output\n\nnothing declared\n"),
+            None
+        );
+        assert_eq!(declared_output_artifact_from_readme(""), None);
+    }
+
+    /// A declared artifact naming a path rather than a bare filename is not
+    /// the shape Rule 4 documents — the gate must not enforce something it
+    /// cannot confidently have parsed.
+    #[test]
+    fn declared_output_artifact_refuses_a_path_shaped_declaration() {
+        assert_eq!(
+            declared_output_artifact_from_readme("**Expected artifact:** `sub/dir/file.md`\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn declared_output_artifact_reads_the_readme_off_disk_for_the_named_stage() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stage_output = dir.path().join("10-implement").join("output");
+        std::fs::create_dir_all(&stage_output).expect("output dir");
+        std::fs::write(
+            stage_output.join("README.md"),
+            "**Expected artifact:** `implementation.md` — the commits.\n",
+        )
+        .expect("readme");
+
+        assert_eq!(
+            declared_output_artifact(dir.path(), "10-implement"),
+            Some("implementation.md".to_string())
+        );
+        assert_eq!(declared_output_artifact(dir.path(), "20-other"), None);
+    }
 
     #[test]
     fn embedded_default_parses_with_its_stage_contexts() {

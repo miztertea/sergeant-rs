@@ -50,7 +50,8 @@ use sergeant_rs::domain::work::{
 };
 use sergeant_rs::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED,
-    KIND_STAGE_INPUT_RECEIVED, KIND_WORKFLOW_BOUND, WorkflowDefinition,
+    KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_OUTPUT_MISSING, KIND_WORKFLOW_BOUND,
+    REASON_STAGE_OUTPUT_MISSING, WorkflowDefinition,
 };
 use sergeant_rs::runtime::engine::{Engine, KIND_TURN_CEILING_INTERRUPTED, SubmitContext};
 use sergeant_rs::runtime::journal::Journal;
@@ -167,6 +168,27 @@ fn write_two_stage_workflow(root: &Path) {
             ("10-second", "second stage context"),
         ],
     );
+}
+
+/// [`write_two_stage_workflow`], but `00-first` declares an `output/
+/// README.md` (#260 Q3's shape, `docs/icm/convention.md` Rule 4) naming
+/// `expected_artifact` as its expected artifact — so the hard stage-output
+/// gate has something to enforce against a `StageCompleted` signal for that
+/// stage.
+fn write_two_stage_workflow_with_declared_output(root: &Path, expected_artifact: &str) {
+    write_two_stage_workflow(root);
+    let output_dir = root
+        .join(".sergeant/workflows/tiny/00-first")
+        .join("output");
+    std::fs::create_dir_all(&output_dir).expect("output dir");
+    std::fs::write(
+        output_dir.join("README.md"),
+        format!(
+            "# Output — `00-first`\n\n**Expected artifact:** `{expected_artifact}` — proof of \
+             work.\n\n**Disposition:** `evidence`\n"
+        ),
+    )
+    .expect("output/README.md");
 }
 
 /// Start a daemon bound to `estate_root`, with a scripted registry.
@@ -1278,6 +1300,113 @@ async fn t4_needs_input_parks_the_run_and_input_resumes_it() {
     .await;
     assert_eq!(status, 404);
     assert_eq!(body["error"]["code"], "work_not_found");
+
+    handle.shutdown().await;
+}
+
+/// #260 Q3: a stage whose `output/README.md` declares an expected artifact
+/// completes without ever writing it. First `StageCompleted` signal: the
+/// engine spends its one bounded re-prompt (a SEND to the same execution,
+/// `stage.output_missing` journaled, work stays `active`, no human
+/// involved). Second `StageCompleted` still missing: the Work lands
+/// `needs_input`, named `stage_output_missing`, naming the stage and the
+/// declared path — recoverable through the ordinary `respond` verb exactly
+/// like any other `needs_input`, proven here by actually producing the
+/// artifact and responding, which lets the run complete normally.
+#[tokio::test]
+async fn t10_a_stage_completed_without_its_declared_output_is_reprompted_then_needs_input() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_two_stage_workflow_with_declared_output(&estate, "proof.md");
+
+    let (registry, fake) = one_fake([
+        FakeStep::complete(), // 00-first launch: "done", but proof.md absent
+        FakeStep::complete(), // the gate's one bounded re-prompt: still absent
+        FakeStep::complete(), // the human's answer, delivered after proof.md exists
+        FakeStep::complete(), // 10-second launch: completes the work
+    ]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "finish without the declared output",
+        json!({"workflow": "tiny"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    assert_eq!(
+        body["work"]["state"], "needs_input",
+        "the second StageCompleted with the artifact still missing must park: {body}"
+    );
+    assert_eq!(body["stage"]["stage_id"], "00-first");
+    let reprompts = events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING);
+    assert_eq!(
+        reprompts.len(),
+        1,
+        "exactly one bounded re-prompt, not unlimited: {reprompts:?}"
+    );
+    assert_eq!(reprompts[0].payload["stage_id"], "00-first");
+    assert_eq!(reprompts[0].payload["path"], "proof.md");
+    let execution_id = fake.starts()[0].execution_id.clone();
+    assert_eq!(
+        fake.inputs(&execution_id),
+        vec!["declared output proof.md missing — produce it or state what you need".to_string()],
+        "the bounded re-prompt must actually reach the same execution"
+    );
+    let parked = events_of(data.path(), &work_id, "work.needs_input");
+    assert_eq!(parked.len(), 1);
+    assert_eq!(
+        parked[0].payload["reason_code"], REASON_STAGE_OUTPUT_MISSING,
+        "the second failure must carry the named reason: {parked:?}"
+    );
+    assert_eq!(parked[0].payload["stage_id"], "00-first");
+    assert_eq!(parked[0].payload["path"], "proof.md");
+    // Never advanced past the stage that failed to produce its output.
+    assert!(events_of(data.path(), &work_id, KIND_STAGE_COMPLETED).is_empty());
+
+    // Recoverable through the ordinary respond verb: the actor (a human, in
+    // this fixture) produces the declared artifact and answers.
+    std::fs::create_dir_all(worktree.join("00-first/output")).expect("output dir");
+    std::fs::write(worktree.join("00-first/output/proof.md"), "did it\n").expect("write artifact");
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "there, done"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    // ADR 0007(b): this fixture never runs `git commit` (the fake actor has
+    // no shell), so the now-present artifact leaves the worktree dirty —
+    // `completed_dirty`, not plain `completed`. The claim this proves is
+    // narrower and unaffected by that: the gate let the run *advance past*
+    // 00-first and reach the end at all, which it refused to do twice above.
+    assert_eq!(
+        body["work"]["state"], "completed_dirty",
+        "the artifact is now present, so the gate must let the run complete: {body}"
+    );
+    // Still exactly one re-prompt ever, across the whole run.
+    assert_eq!(
+        events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING).len(),
+        1
+    );
 
     handle.shutdown().await;
 }

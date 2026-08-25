@@ -49,8 +49,9 @@ use crate::domain::work::{
 use crate::domain::workflow::{
     DEFAULT_WORKFLOW, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
     KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
-    KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND, StageBinding, StageDefinition,
-    StageKind, StageStatus, WorkflowDefinition, WorkflowError,
+    KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
+    REASON_STAGE_OUTPUT_MISSING, SOURCE_EMBEDDED, StageBinding, StageDefinition, StageKind,
+    StageRecord, StageStatus, WorkflowDefinition, WorkflowError, declared_output_artifact,
 };
 use crate::runtime::preflight::{self, GitPreflight, PreflightRefusal};
 use crate::runtime::projection::{WorkRegistry, WorkRun, is_absorbing};
@@ -2648,6 +2649,11 @@ impl Engine {
                 Ok(self.teardown_next(core, work_id, false))
             }
             BackendSignal::StageCompleted { summary } => {
+                if let Some(gated) =
+                    self.check_stage_output_gate(core, work_id, &run, &workflow, &stage)?
+                {
+                    return Ok(gated);
+                }
                 let mut payload = json!({"stage_id": stage.stage_id, "index": stage.index});
                 if let Some(summary) = summary {
                     payload["detail"] = Value::String(summary);
@@ -2671,6 +2677,116 @@ impl Engine {
                 Ok(self.teardown_next(core, work_id, false))
             }
         }
+    }
+
+    /// #260 Q3's hard stage-output gate: a `StageCompleted` signal for a
+    /// stage whose package declares an `output/` artifact
+    /// ([`declared_output_artifact`]) that is not actually on disk in any
+    /// bound worktree must not be accepted at face value the way `drive`'s
+    /// `StageCompleted` arm otherwise would. Returns `Ok(None)` to let that
+    /// arm proceed exactly as before — no declared artifact, or the
+    /// artifact is present — and `Ok(Some(next))` to short-circuit it with
+    /// either a bounded re-prompt of the same actor (first miss this
+    /// attempt) or a `needs_input` park named `stage_output_missing`
+    /// (second miss), recoverable through the ordinary respond/retry/cancel
+    /// surface exactly like any other `needs_input`.
+    ///
+    /// Deliberately reads the *current* `output/README.md` off disk rather
+    /// than anything pinned in `workflow.bound` — the same filesystem-is-
+    /// ground-truth posture `retain_stage_outputs` already takes toward
+    /// `output/` (Rule 4: "no engine collection, no artifact manifest
+    /// machinery"), and `WorkflowDefinition::content_hash` deliberately
+    /// excludes `source` for the same reason.
+    fn check_stage_output_gate(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        run: &WorkRun,
+        workflow: &WorkflowDefinition,
+        stage: &StageRecord,
+    ) -> Result<Option<Next>, EngineError> {
+        if workflow.source == SOURCE_EMBEDDED {
+            return Ok(None);
+        }
+        let Some(expected) = declared_output_artifact(Path::new(&workflow.source), &stage.stage_id)
+        else {
+            return Ok(None);
+        };
+        let Some(surface) = run.surface.as_ref() else {
+            return Ok(None);
+        };
+        let produced = surface.bindings.iter().any(|binding| {
+            binding
+                .worktree_path
+                .join(&stage.stage_id)
+                .join("output")
+                .join(&expected)
+                .is_file()
+        });
+        if produced {
+            return Ok(None);
+        }
+        if stage.output_reprompts == 0 {
+            if !self.check_turn_envelope(core, work_id, &stage.stage_id)? {
+                // Already committed `stage.blocked`/`work.blocked` with its
+                // own reason; nothing more for the gate to say.
+                return Ok(Some(Next::Parked));
+            }
+            self.commit(
+                core,
+                work_id,
+                KIND_STAGE_OUTPUT_MISSING,
+                json!({
+                    "stage_id": stage.stage_id,
+                    "path": expected,
+                    "attempt": stage.attempt,
+                }),
+            )?;
+            let execution = run.execution.clone().ok_or_else(|| EngineError::NoRun {
+                work_id: work_id.to_string(),
+            })?;
+            let backend = self.backend_for(work_id, &execution.backend)?;
+            let prompt =
+                format!("declared output {expected} missing — produce it or state what you need");
+            return Ok(Some(Next::Send(Box::new(PendingSend {
+                work_id: work_id.to_string(),
+                stage_id: stage.stage_id.clone(),
+                index: stage.index,
+                attempt: stage.attempt,
+                execution,
+                backend,
+                input: prompt,
+                resume: self.resume_request(run, work_id),
+            }))));
+        }
+        let detail = format!(
+            "stage {} completed without producing its declared output {expected}, even after \
+             one re-prompt",
+            stage.stage_id
+        );
+        self.commit(
+            core,
+            work_id,
+            KIND_STAGE_NEEDS_INPUT,
+            json!({
+                "stage_id": stage.stage_id,
+                "detail": detail,
+                "reason_code": REASON_STAGE_OUTPUT_MISSING,
+                "path": expected,
+            }),
+        )?;
+        self.transition(
+            core,
+            work_id,
+            KIND_WORK_NEEDS_INPUT,
+            json!({
+                "prompt": detail,
+                "stage_id": stage.stage_id,
+                "reason_code": REASON_STAGE_OUTPUT_MISSING,
+                "path": expected,
+            }),
+        )?;
+        Ok(Some(Next::Parked))
     }
 
     /// Reattach, resume, classify one in-flight execution after a daemon
