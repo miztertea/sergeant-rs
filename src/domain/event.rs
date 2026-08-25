@@ -124,6 +124,13 @@ impl EventDraft {
         self
     }
 
+    /// Set the estate scope: the canonical estate root, not its display
+    /// name (H1 touch point #5 — two estates can share a `[estate] name`).
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
+        self
+    }
+
     /// Finalize into a full envelope at the given sequence number, stamping a
     /// fresh ULID id and the current UTC time.
     pub fn into_event(self, seq: u64) -> Event {

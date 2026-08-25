@@ -48,7 +48,7 @@ use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::KIND_SURFACE_MATERIALIZED;
 
 mod support;
-use support::{DataDir, ReapSignal, daemon_pids};
+use support::{DataDir, ReapSignal, daemon_pids, scaffold_solo_estate};
 
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
@@ -588,6 +588,45 @@ async fn t3_submit_lists_pending_journals_and_survives_restart() {
     assert_eq!(list["works"][0]["id"], work_id.as_str());
     assert_eq!(list["works"][0]["state"], "pending");
     handle.shutdown().await;
+}
+
+/// H1 touch point #4/#5: `work.submitted` carries the daemon's bound
+/// estate — its canonical root, not the `[estate] name` — end to end
+/// through a real submission, not a hand-fabricated `Event`.
+#[tokio::test]
+async fn work_submitted_carries_the_bound_estate_root() {
+    let estate_dir = TempDir::new().expect("estate tempdir");
+    scaffold_solo_estate(estate_dir.path(), "target");
+    let data_dir = TempDir::new().expect("data dir tempdir");
+    let handle = daemon::start_with(
+        data_dir.path(),
+        DaemonConfig {
+            estate_root: Some(estate_dir.path().to_path_buf()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+    let http = client();
+
+    let (status, _, body) = submit(&http, &handle, &ulid(), "carry the estate root").await;
+    assert_eq!(status, 201, "submit must accept: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+
+    handle.shutdown().await;
+
+    let canonical_root =
+        std::fs::canonicalize(estate_dir.path()).expect("canonicalize estate root");
+    let submitted = Journal::replay_data_dir(data_dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .find(|e| e.kind == KIND_WORK_SUBMITTED && e.work_id.as_deref() == Some(&work_id))
+        .expect("work.submitted journaled");
+    assert_eq!(
+        submitted.workspace_id.as_deref(),
+        Some(canonical_root.to_string_lossy().as_ref()),
+        "work.submitted must carry the daemon's bound estate root"
+    );
 }
 
 #[tokio::test]

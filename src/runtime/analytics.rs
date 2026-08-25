@@ -128,6 +128,7 @@ CREATE TABLE work (
     work_id       VARCHAR PRIMARY KEY,
     intent        VARCHAR,
     estate        VARCHAR,
+    estate_root   VARCHAR,
     workflow      VARCHAR,
     backend       VARCHAR,
     route_source  VARCHAR,
@@ -465,6 +466,13 @@ struct WorkRow {
     /// Work that never reached `workflow.bound` is an honest "not yet
     /// resolved to an estate", not a lost fact.
     estate: Option<String>,
+    /// H1 touch point #6: the canonical estate root, folded once from the
+    /// envelope's `workspace_id` at `work.submitted` — unlike `estate`
+    /// above, never overwritten at `workflow.bound`, since the coordinate
+    /// is already known (and immutable for a Work's life) at submission.
+    /// `None` for a pre-Phase-C-shaped legacy line, whose envelope never
+    /// carried the field at all — an honest "not recorded", not an error.
+    estate_root: Option<String>,
     workflow: Option<String>,
     backend: Option<String>,
     route_source: Option<String>,
@@ -576,6 +584,7 @@ impl WorkRow {
             Duck::Text(self.work_id.clone()),
             text(self.intent.as_deref()),
             text(self.estate.as_deref()),
+            text(self.estate_root.as_deref()),
             text(self.workflow.as_deref()),
             text(self.backend.as_deref()),
             text(self.route_source.as_deref()),
@@ -986,6 +995,11 @@ impl Analytics {
                             work_id: work_id.to_string(),
                             intent: string(&work["intent"]),
                             estate: string(&work["workspace"]),
+                            // H1 touch point #6: the envelope's own field,
+                            // not a payload key — real for every new Work
+                            // from `work.submitted` onward, `None` for a
+                            // legacy line whose envelope never carried it.
+                            estate_root: event.workspace_id.clone(),
                             workflow: string(&work["workflow"]),
                             backend: string(&work["backend"]),
                             route_source: None,
@@ -1602,6 +1616,40 @@ mod tests {
         let counts = analytics.table_counts().expect("counts");
         assert_eq!(counts[0], ("events".to_string(), 2));
         assert_eq!(counts[1], ("work".to_string(), 2));
+    }
+
+    /// H1 touch point #6: `estate_root` folds from the envelope at
+    /// `work.submitted` for a Work that never reaches `workflow.bound`
+    /// (today's documented `estate: None`-forever gap, now answered), and
+    /// stays `NULL` — never an error — for a pre-Phase-C-shaped legacy line
+    /// whose envelope never carried `workspace_id` at all (`Compatibility`
+    /// deliverable: old journal lines replay unchanged).
+    #[test]
+    fn work_estate_root_folds_from_the_submitted_envelope_and_stays_null_for_a_legacy_line() {
+        let root = "/estates/payments";
+        let mut current = submitted(1, "current");
+        current.workspace_id = Some(root.to_string());
+        // No `workspace_id` at all — exactly what a stored pre-Phase-C
+        // journal line deserializes to (`Event`'s `#[serde(default)]`).
+        let legacy = submitted(2, "legacy");
+
+        let mut analytics =
+            Analytics::in_memory(events(vec![current, legacy])).expect("projection");
+        analytics.materialize().expect("materialize");
+        let (columns, rows) = analytics
+            .select(
+                "SELECT work_id, estate_root FROM work ORDER BY work_id",
+                duckdb::params![],
+            )
+            .expect("select");
+        assert_eq!(columns, vec!["work_id", "estate_root"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![json!("current"), json!(root)],
+                vec![json!("legacy"), Value::Null],
+            ]
+        );
     }
 
     /// W2 §9.1 step 3: a failed `push` (surfaced through `finish`, since the

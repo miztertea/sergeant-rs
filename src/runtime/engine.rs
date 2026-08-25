@@ -4551,10 +4551,17 @@ impl Engine {
         kind: &str,
         payload: Value,
     ) -> Result<(), EngineError> {
-        core.commit(
-            EventDraft::new(EventSource::new("daemon", "engine"), kind, payload)
-                .with_work_id(work_id),
-        )?;
+        let mut draft = EventDraft::new(EventSource::new("daemon", "engine"), kind, payload)
+            .with_work_id(work_id);
+        // H1 touch point #4: the one chokepoint every engine-emitted event
+        // goes through, so this is the one place that stamps the pinned
+        // estate root — never the display name (`self.estate_root` is
+        // already canonicalized, `Estate::admit`'s doc). `None` (a daemon
+        // bound to no estate) leaves the field absent, exactly as before.
+        if let Some(root) = &self.estate_root {
+            draft = draft.with_workspace_id(root.to_string_lossy().into_owned());
+        }
+        core.commit(draft)?;
         Ok(())
     }
 
@@ -4684,6 +4691,62 @@ mod tests {
             WorkState::Blocked,
             "and the work is still exactly where it was"
         );
+    }
+
+    /// H1 touch point #4: `Engine::commit` is the one chokepoint every
+    /// engine-emitted event goes through, so the pinned estate root must
+    /// land in the envelope from there, not from each individual caller.
+    #[test]
+    fn engine_committed_events_carry_the_pinned_estate_root() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let estate_root = dir.path().join("estate");
+        let engine = engine(dir.path()).with_estate_root(estate_root.clone());
+        let work_id = "01WORKSPACEID";
+        testing::submit(&mut core, work_id, "carry the estate root");
+
+        engine
+            .block(&mut core, work_id, "prove workspace_id travels", None)
+            .expect("block");
+
+        let blocked = core
+            .journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event"))
+            .find(|e| e.kind == KIND_WORK_BLOCKED)
+            .expect("work.blocked journaled");
+        assert_eq!(
+            blocked.workspace_id.as_deref(),
+            Some(estate_root.to_string_lossy().as_ref()),
+            "an engine-committed event must carry the daemon's pinned estate root"
+        );
+    }
+
+    /// The companion case: a daemon started with no estate at all (test
+    /// rigs, the intent-capture path) commits events with `workspace_id`
+    /// still absent — there is no coordinate to stamp, and the field must
+    /// not invent one.
+    #[test]
+    fn engine_committed_events_carry_no_workspace_id_when_the_engine_has_no_estate() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let engine = engine(dir.path()); // no `.with_estate_root(..)`
+        let work_id = "01NOESTATE";
+        testing::submit(&mut core, work_id, "no estate here");
+
+        engine
+            .block(&mut core, work_id, "no estate pinned", None)
+            .expect("block");
+
+        let blocked = core
+            .journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event"))
+            .find(|e| e.kind == KIND_WORK_BLOCKED)
+            .expect("work.blocked journaled");
+        assert_eq!(blocked.workspace_id, None);
     }
 
     // ------------------------- estate-root Phase C: Engine::resolve_scope
