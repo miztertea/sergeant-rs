@@ -2006,7 +2006,21 @@ pub fn finalize_sweep(
     for output_dir in &swept_stage_dirs {
         let _ = std::fs::remove_dir_all(output_dir);
     }
-    let committed = git(&binding.worktree_path, &["add", "-A"]).is_ok()
+    // Scoped to exactly the removed `output/` dirs, not `-A`: an unscoped
+    // add would silently fold any other dirty/untracked content the actor
+    // left elsewhere in the worktree into this commit, laundering it clean
+    // before `teardown`'s dirty-worktree check ever runs (F-IN-01).
+    let add_ok = swept_stage_dirs.iter().all(|output_dir| {
+        let rel = output_dir
+            .strip_prefix(&binding.worktree_path)
+            .unwrap_or(output_dir);
+        git(
+            &binding.worktree_path,
+            &["add", "--", &rel.to_string_lossy()],
+        )
+        .is_ok()
+    });
+    let committed = add_ok
         && git(
             &binding.worktree_path,
             &[

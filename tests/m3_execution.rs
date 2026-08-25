@@ -1670,6 +1670,112 @@ async fn the_finalize_sweep_removes_evidence_class_output_and_keeps_promote_clas
     handle.shutdown().await;
 }
 
+/// F-IN-01: the finalize sweep's commit must be scoped to the `output/`
+/// dirs it actually swept, not the whole worktree (`git add -A`) — else
+/// stray dirty/untracked content the actor left *elsewhere* in the
+/// worktree gets silently folded into the engine's own finalize commit and
+/// laundered clean before `teardown`'s dirty-worktree check ever runs,
+/// defeating `retained_dirty` detection for that content. This combines a
+/// real evidence-class output (which is what makes the sweep actually
+/// commit) with unrelated dirty content in the same worktree — the
+/// compound path neither `a_dirty_worktree_is_retained_and_recorded_at_teardown`
+/// nor `the_finalize_sweep_removes_evidence_class_output_and_keeps_promote_class`
+/// exercises on its own.
+#[tokio::test]
+async fn a_finalize_sweep_never_launders_unrelated_dirty_content_into_its_own_commit() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (mount, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_workflow(&estate, "sweep", &[("00-evidence", "first stage context")]);
+
+    // `00-evidence` declares nothing — §1a's default (`evidence`) applies,
+    // so the sweep actually has something to commit.
+    std::fs::create_dir_all(mount.join("00-evidence/output")).expect("output dir");
+    std::fs::write(
+        mount.join("00-evidence/output/notes.md"),
+        "scratch working notes\n",
+    )
+    .expect("seed evidence artifact");
+    support::git(&mount, &["add", "-A"]);
+    support::git(&mount, &["commit", "-m", "seed evidence output"]);
+
+    let (registry, _fake) = one_fake([FakeStep::hang()]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "evidence plus a stray mess",
+        json!({"workflow": "sweep"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+    let surface_root = PathBuf::from(body["surface"]["root"].as_str().expect("surface root"));
+
+    // Content wholly unrelated to any stage's declared output — the sweep
+    // must never touch this.
+    std::fs::write(worktree.join("half-done.rs"), "fn main() {}\n").expect("dirty the worktree");
+
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let torn = events_of(data.path(), &work_id, KIND_SURFACE_TORN_DOWN);
+    assert_eq!(torn.len(), 1);
+    let report = &torn[0].payload["report"];
+    assert_eq!(
+        report["clean"], false,
+        "the stray file must still be seen as dirty — not absorbed into \
+         the finalize commit: {report}"
+    );
+    assert_eq!(report["bindings"][0]["disposition"], "retained_dirty");
+    assert!(
+        report["bindings"][0]["changes"]
+            .as_str()
+            .expect("changes recorded")
+            .contains("half-done.rs"),
+        "the stray content must be what teardown found dirty: {report}"
+    );
+    let patch_path = PathBuf::from(
+        report["bindings"][0]["patch"]["path"]
+            .as_str()
+            .expect("a captured patch path"),
+    );
+    let patch_text = std::fs::read_to_string(&patch_path).expect("read the captured patch");
+    assert!(
+        patch_text.contains("half-done.rs") && patch_text.contains("fn main()"),
+        "the captured patch must hold the stray content, not be silently \
+         dropped by an over-broad finalize commit: {patch_text}"
+    );
+
+    // The evidence sweep still did its own job: retained on disk...
+    let retained = surface_root.join("solo.output/00-evidence/notes.md");
+    assert_eq!(
+        std::fs::read_to_string(&retained).expect("retained evidence"),
+        "scratch working notes\n"
+    );
+
+    handle.shutdown().await;
+}
+
 /// R-H0-7 shape 1 (deferred turn finish), engine-level: `FakeStep::settle`
 /// already models "a turn that is `Running` for some number of polls after
 /// LAUNCH returns, then resolves to its real outcome" — the shape the codex
