@@ -560,3 +560,74 @@ async fn an_unaddressed_or_unadmitted_estate_is_refused_by_name() {
 
     handle.shutdown().await;
 }
+
+/// §26 survives an estate breaking underneath an accepted submission.
+///
+/// A `command_id` whose outcome is already recorded replays that outcome —
+/// even once its estate has stopped admitting. The alternative is that a
+/// client retrying an uncertain-but-accepted submission is told 422 and
+/// concludes nothing happened, while a real Work sits in the journal. §26's
+/// promise is about what already happened, not about whether it could
+/// happen again now, and D4's admission check is deliberately *behind* it.
+#[tokio::test]
+async fn an_accepted_submission_still_replays_after_its_estate_stops_admitting() {
+    let (root, data_dir) = estate();
+    // A submission has to be plannable, so this estate declares its one
+    // derived mount (§6.1) rather than being the bare post-`sgt init` shape
+    // the CRUD tests above use.
+    std::fs::write(
+        root.path().join("sergeant.toml"),
+        "[estate]\nname = \"t3-estate\"\n\n[[repo]]\nname = \"solo\"\n",
+    )
+    .expect("manifest");
+    init_repo(&root.path().join("repos").join("solo"));
+    let handle = start(&data_dir, root.path()).await;
+    let http = reqwest::Client::new();
+    let command_id = ulid::Ulid::generate().to_string();
+    let body = serde_json::json!({
+        "command_id": command_id,
+        "intent": "accepted before the estate broke",
+        "estate_root": root.path(),
+    });
+
+    let first = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&body)
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(first.status(), 201);
+    let first: Value = first.json().await.expect("json");
+
+    // The estate goes away — deleted, renamed, an unmounted volume.
+    std::fs::remove_file(root.path().join("sergeant.toml")).expect("break the estate");
+
+    // A brand-new submission is refused by name...
+    let fresh = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&serde_json::json!({
+            "command_id": ulid::Ulid::generate().to_string(),
+            "intent": "after the estate broke",
+            "estate_root": root.path(),
+        }))
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(fresh.status(), 422, "a new submission must be refused");
+
+    // ...but the retry of the accepted one replays, byte for byte.
+    let replayed = http
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&body)
+        .send()
+        .await
+        .expect("submit");
+    assert_eq!(replayed.status(), 201, "the accepted command must replay");
+    let replayed: Value = replayed.json().await.expect("json");
+    assert_eq!(replayed, first, "§26: a replay is the same answer");
+
+    handle.shutdown().await;
+}

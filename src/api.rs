@@ -1527,8 +1527,34 @@ async fn submit_work(
             Err(e) => {
                 let result = error_body(e.code(), e.to_string());
                 let mut core = CoreGuard::acquire(&state.core).await;
+                // §26 first, exactly as the accepting path does it below: a
+                // `command_id` whose outcome is already recorded replays
+                // that outcome, and one caught in the `work.submitted`/
+                // `command.accepted` crash window re-records its real
+                // outcome from the replayed state. An estate that broke
+                // *after* a submission was accepted must not turn a retry
+                // of that submission into a refusal — the Work exists, and
+                // §26's promise is about what already happened, not about
+                // whether it could happen again now.
                 if let Some(resp) = replay_command(&core, &req.command_id) {
                     return resp;
+                }
+                if let Some(work_id) = core
+                    .registry
+                    .state()
+                    .command_works
+                    .get(&req.command_id)
+                    .cloned()
+                {
+                    let replayed = work_view(&core, &state.engine, &work_id);
+                    return record_and_respond(
+                        &mut core,
+                        &req.command_id,
+                        "work.submit",
+                        Some(&work_id),
+                        StatusCode::CREATED,
+                        replayed,
+                    );
                 }
                 return record_and_respond(
                     &mut core,

@@ -1967,6 +1967,99 @@ fn t7_cli_end_to_end_a_second_estate_is_admitted_and_a_second_process_fails_clos
     stop_daemon(dir.path());
 }
 
+/// §26 outranks D4's admission check, and the crash window is where that
+/// actually bites.
+///
+/// A daemon that dies between `work.submitted` and `command.accepted` leaves
+/// a durable Work with no recorded outcome; `command_works` is the index that
+/// lets the retry answer for the command that already ran instead of running
+/// a second one (`crash_between_mutation_and_command_record_still_replays`
+/// pins that on its own). H1 adds a step *before* planning — admit the
+/// addressed estate — and if that step answered first, a retry landing in
+/// exactly this window after the estate broke would be told `422 the estate
+/// is invalid` while its Work sat in the journal. The client would conclude
+/// nothing happened. §26's promise is about what already happened, not about
+/// whether it could happen again now, so admission is deliberately behind
+/// both replay checks.
+#[tokio::test]
+async fn a_crash_window_retry_replays_even_after_its_estate_stops_admitting() {
+    let dir = TempDir::new().expect("tempdir");
+    let estate = second_estate("crash-window");
+    let handle = start(dir.path()).await;
+    let command_id = ulid();
+    let (status, _, body) = submit_addressed(
+        &client(),
+        &handle,
+        Some(estate.path()),
+        &command_id,
+        "accepted, then the estate vanished",
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    handle.shutdown().await;
+
+    // The exact crash image: the durable `work.submitted`, its
+    // `command.accepted` never written.
+    let events = journal_events(dir.path());
+    let submitted_at = events
+        .iter()
+        .position(|e| e.kind == KIND_WORK_SUBMITTED)
+        .expect("work.submitted journaled");
+    truncate_journal(dir.path(), submitted_at + 1);
+
+    // ...and by the time anyone retries, the estate is gone.
+    std::fs::remove_file(estate.path().join("sergeant.toml")).expect("break the estate");
+
+    let handle = start(dir.path()).await;
+    let http = client();
+    let (retry_status, _, retry_body) = submit_addressed(
+        &http,
+        &handle,
+        Some(estate.path()),
+        &command_id,
+        "accepted, then the estate vanished",
+    )
+    .await;
+    assert_eq!(
+        retry_status, status,
+        "the retry must answer for the command that already ran: {retry_body}"
+    );
+    assert_eq!(
+        retry_body["work"]["id"].as_str(),
+        Some(work_id.as_str()),
+        "and for the same Work: {retry_body}"
+    );
+    // Deliberately not byte-equality with the first response, unlike
+    // `crash_between_mutation_and_command_record_still_replays`: that rig's
+    // daemon plans nothing, so its Work never moves past `pending` and the
+    // two bodies are identical. Here the first submission really ran, and the
+    // truncation cut every event after `work.submitted` away — so the
+    // re-derived view honestly describes the journal as it now stands. What
+    // this test is about is *which* answer the retry gives (the recorded
+    // command's, not a refusal), not how much of the run survived surgery.
+    assert!(
+        retry_body["error"].is_null(),
+        "the retry must not be an error at all: {retry_body}"
+    );
+
+    // A genuinely new submission against the same broken estate is still
+    // refused — the exemption is for the command that already ran, not for
+    // the estate.
+    let (fresh_status, _, fresh_body) = submit_addressed(
+        &http,
+        &handle,
+        Some(estate.path()),
+        &ulid(),
+        "a new one, after the break",
+    )
+    .await;
+    assert_eq!(fresh_status, 422, "{fresh_body}");
+    assert_eq!(fresh_body["error"]["code"], "invalid_estate");
+
+    handle.shutdown().await;
+}
+
 /// The rest of the contracted CLI surface through the spawned binary:
 /// `sgt status`, `sgt work show <id>`, `sgt cancel <id>`, in both human and
 /// `--json` form. Everything here talks to a real daemon over the loopback
