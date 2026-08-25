@@ -21,7 +21,7 @@ cargo test --lib domain::estate::
 cargo test --lib cli::
 cargo test --lib backend::codex::
 cargo test --test m6_surfaces
-cargo test --workspace
+cargo test
 ```
 
 ## Results (verbatim, condensed)
@@ -78,7 +78,7 @@ test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 The new `network_access` doctor rows land beside the existing
 `permission_mode` rows, matching the fix's stated goal.
 
-### `cargo test --workspace`
+### `cargo test`
 
 First attempt (default parallel test-threads): 1 failure —
 `t5_disabled_export_runs_no_exporter_machinery` in `tests/m5_projections.rs`
@@ -90,7 +90,7 @@ between two OTLP-collector-binding tests running concurrently in the same
 binary — unrelated to `network_access`/`permission_mode`/estate/doctor
 code touched by this change.
 
-Full clean re-run of `cargo test --workspace` (all binaries, default
+Full clean re-run of `cargo test` (all binaries, default
 settings):
 
 ```
@@ -109,7 +109,7 @@ Every test binary in the workspace reported `0 failed` on this run.
 Targeted estate/cli/codex/m6_surfaces tests pass, including the two new
 tests this fix adds (`a_profile_with_an_unknown_network_access_is_refused_at_load`
 in estate.rs, `t3e_doctor_reports_the_effective_network_access_per_profile`
-in m6_surfaces.rs). The full `cargo test --workspace` pass is green;
+in m6_surfaces.rs). The full `cargo test` pass is green;
 one test in the run showed a flaky, load-dependent port-binding collision
 in an unrelated OTLP export test (`m5_projections.rs`), reproduced as
 pre-existing and independent of this change by isolating and re-running
