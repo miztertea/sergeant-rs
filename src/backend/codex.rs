@@ -1365,6 +1365,44 @@ fn git_worktree_common_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>,
         .collect()
 }
 
+/// [`worktree_git_admin_dir`] over every binding this request carries —
+/// the app-server-only companion to [`git_worktree_common_dirs`].
+///
+/// **Measured 2026-08-25 against codex-cli 0.149.1's `app-server`**: unlike
+/// `exec`'s `--add-dir` (whose grant of the common dir alone already covers
+/// `git add`/`git commit`, confirmed live via `codex exec --add-dir
+/// <common-dir>` against a real linked worktree — issue #259's exec-side fix
+/// stands unchanged), `thread/start.runtimeWorkspaceRoots` resolves into a
+/// `sandbox.writableRoots` grant that treats each linked worktree's private
+/// admin subdirectory (`<common-dir>/worktrees/<name>`) as protected in its
+/// own right, not merely inherited from a parent directory's grant. Driven
+/// by hand over the real JSON-RPC wire (`initialize` with
+/// `capabilities.experimentalApi: true`, then `command/exec` with
+/// `sandboxPolicy.writableRoots` set to the common dir alone): `git add`
+/// then fails with `Read-only file system` on this exact admin
+/// subdirectory's `index.lock`, even though the common dir that contains it
+/// was granted. Reproduced end-to-end through a real Work (`sgt run` against
+/// a scratch estate on the `codex-terra` profile, app-server transport):
+/// stage `30-close` blocked on the identical `index.lock` failure. Granting
+/// this directory *in addition to* the common dir — both, not either —
+/// resolves it; that combination is what this function adds to
+/// `launch_appserver`'s `runtimeWorkspaceRoots`, on top of (never instead
+/// of) [`git_worktree_common_dirs`].
+fn git_worktree_admin_dirs(bindings: &[BindingSummary]) -> Result<Vec<PathBuf>, String> {
+    bindings
+        .iter()
+        .map(|binding| {
+            worktree_git_admin_dir(&binding.worktree_path).map_err(|reason| {
+                format!(
+                    "{} ({}): {reason}",
+                    binding.repository,
+                    binding.worktree_path.display()
+                )
+            })
+        })
+        .collect()
+}
+
 /// The named, actionable refusal text for #259's fail-closed rule: a
 /// mutation-shaped launch (one or more bindings) whose git common-dir grant
 /// cannot be resolved is refused rather than admitted to run and later
@@ -3288,6 +3326,17 @@ impl CodexBackend {
             .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))
     }
 
+    /// The app-server-only companion to [`Self::resolve_git_worktree_common_dirs`]
+    /// — see [`git_worktree_admin_dirs`] for why `launch_appserver` needs
+    /// this grant in addition to (never instead of) the common dir.
+    fn resolve_git_worktree_admin_dirs(
+        &self,
+        bindings: &[BindingSummary],
+    ) -> Result<Vec<PathBuf>, BackendError> {
+        git_worktree_admin_dirs(bindings)
+            .map_err(|reason| self.err_failed(git_admin_dir_refusal(&reason)))
+    }
+
     fn err_unknown(&self, execution_id: &str) -> BackendError {
         BackendError::UnknownExecution {
             backend: CODEX_BACKEND_NAME.to_string(),
@@ -3719,6 +3768,10 @@ impl CodexBackend {
         // #259, mirrored from `launch_exec` — resolved fresh here rather
         // than trusted from PREPARE.
         let git_worktree_common_dirs = self.resolve_git_worktree_common_dirs(&request.bindings)?;
+        // #259 (W5c fix): app-server-only, on top of the common dir above —
+        // see `git_worktree_admin_dirs` for the measurement that shows the
+        // common dir alone is not enough on this transport.
+        let git_worktree_admin_dirs = self.resolve_git_worktree_admin_dirs(&request.bindings)?;
         let budgets = self.config.appserver_budgets.unwrap_or_default();
         let (handshake_budget, thread_start_budget, turn_start_budget) =
             (budgets.handshake, budgets.thread_start, budgets.turn_start);
@@ -3765,9 +3818,18 @@ impl CodexBackend {
         let mut roots = vec![request.cwd.to_string_lossy().into_owned()];
         roots.extend(extra_roots.iter().map(|p| p.to_string_lossy().into_owned()));
         // #259: the app-server's own writable-roots mechanism, granted the
-        // same one directory per binding that exec's `--add-dir` is.
+        // same common-dir-per-binding that exec's `--add-dir` is...
         roots.extend(
             git_worktree_common_dirs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
+        // ...plus, app-server-only, each binding's own admin subdirectory —
+        // see `git_worktree_admin_dirs`'s doc comment for the live
+        // measurement showing the common dir alone leaves this transport's
+        // `sandbox.writableRoots` denying `index.lock` under it.
+        roots.extend(
+            git_worktree_admin_dirs
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned()),
         );
