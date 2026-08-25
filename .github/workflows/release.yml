@@ -219,7 +219,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2.86.4
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: cargo-deny@0.20.2
       - name: cargo deny check (full — advisories, bans, licenses, sources)
@@ -593,7 +593,7 @@ jobs:
       - name: rustup target add ${{ matrix.target }}
         run: rustup target add ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - uses: taiki-e/install-action@a2a5f6e99e1a31540baa0468acfa302cff0f359f # v2.86.4
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
           tool: cargo-cyclonedx@0.5.9
       - name: "cargo metadata --locked (guard: cargo-cyclonedx has no native --locked/--frozen flag)"
