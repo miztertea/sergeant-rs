@@ -12,6 +12,62 @@ released before a release can proceed.
 
 (nothing yet)
 
+## [0.2.4] - 2026-08-25
+
+sergeant-rs narrows to a product-documents-only repo, codex actors gain
+commit rights, capability reporting stops overclaiming, dirty patches
+recover byte-exact, and distro trees become atomic and self-checking.
+
+### Repo scope
+
+- `sergeant-rs` is now product-documents-only: `docs/` and
+  `NORTH-STAR`/`GAUNTLET`/`LESSONS` relocated to the development
+  workspace, with their supporting assets re-homed alongside them. This
+  repo no longer carries the development-process record it used to.
+
+### Codex commit grants
+
+- Codex actors can commit — linked-worktree git grants are wired on both
+  transports, including resume turns, with preflight failing closed
+  rather than silently granting nothing. Live-proven end to end, not
+  just unit-tested. (#240)
+
+### Honest capability surface
+
+- `permission_mode` is now reported per-backend rather than assumed
+  uniform across adapters, and per-profile sandbox `network_access` is
+  validated at load and surfaced in `sgt doctor` — a misconfigured
+  profile is caught before a Work launches under it, not discovered
+  mid-run. (#259, #260)
+
+### Recoverable dirty patches
+
+- A dirty working tree's patch is now captured byte-exact and verified
+  with `git apply --check` before being trusted, closing a class of
+  silent-corruption recovery failure. (#262)
+
+### Commit imperative
+
+- Shared workflow contexts now state the commit imperative explicitly,
+  removing an ambiguity that previously left commit-or-not a per-actor
+  judgment call in contexts where it should not have been one.
+
+### Evidence and engine contract
+
+- Per-stage artifact retention now keeps `tool_use` in transcripts
+  rather than trimming it, and the engine contract gained a hard
+  stage-output gate with `needs_input` recovery, a general
+  promote/evidence finalize sweep, an opt-in branch-status wire for
+  closing stages, and typed-ingest validation. (#234)
+
+### Distro knowledge surface
+
+- `sgt init`'s distro trees are now atomic and sgt-owned end to end: a
+  managed `AGENTS.md` section, a `CLAUDE.md` symlink, a generated
+  `.sergeant/index.md`, a route rewrite, and new `doc_routes` +
+  edition doctor checks catch a malformed or hand-edited tree before it
+  ships. (#232, #241, #261)
+
 ## [0.2.3] - 2026-08-23
 
 Sergeant speaks Antigravity: a fourth native backend, registered the same
