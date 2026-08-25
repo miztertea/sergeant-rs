@@ -2793,10 +2793,16 @@ fn enable_service(unit_path: &Path) -> EnableOutcome {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(crate::platform::service::SYSTEMD_UNIT_NAME);
-            let reload = std::process::Command::new("systemctl")
+            // Same binary the probe above just used (`SGT_SYSTEMCTL_BIN`,
+            // default `systemctl`) — a test pointing the probe at a fake
+            // must see these calls go to the identical fake, not a real
+            // `systemctl` this host may not even have.
+            let bin = std::env::var(crate::platform::service::SYSTEMCTL_BIN_ENV)
+                .unwrap_or_else(|_| "systemctl".to_string());
+            let reload = std::process::Command::new(&bin)
                 .args(["--user", "daemon-reload"])
                 .status();
-            let enable = std::process::Command::new("systemctl")
+            let enable = std::process::Command::new(&bin)
                 .args(["--user", "enable", "--now", unit_name])
                 .status();
             match (reload, enable) {
@@ -2848,7 +2854,11 @@ fn enable_service(plist_path: &Path) -> EnableOutcome {
     };
     match crate::platform::service::detect_launchd_status(uid) {
         ManagerStatus::Reachable => {
-            let bootstrap = std::process::Command::new("launchctl")
+            // Same binary the probe above just used — see the systemd
+            // arm's identical note.
+            let bin = std::env::var(crate::platform::service::LAUNCHCTL_BIN_ENV)
+                .unwrap_or_else(|_| "launchctl".to_string());
+            let bootstrap = std::process::Command::new(&bin)
                 .args(["bootstrap", &format!("gui/{uid}")])
                 .arg(plist_path)
                 .status();
