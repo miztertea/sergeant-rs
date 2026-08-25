@@ -1148,14 +1148,32 @@ pub async fn start_with(
 /// able to say *why*, not pretend the backend does not exist.
 ///
 /// **Concurrent, and on the blocking pool, both deliberately (#293).** A
-/// probe is one or more real CLI invocations — measured on Cerberus
-/// 2026-08-25: agy ~2.3s, opencode ~3.2s across four invocations, codex
-/// ~0.4s, claude ~0.2s — and they are independent of one another, so running
-/// them one at a time bought nothing but their sum. They are also *blocking*
+/// probe is one or more real CLI invocations — measured per backend on
+/// Cerberus 2026-08-25, from `daemon.started` to each `backend.probed`:
+/// fake +0.03s, docker +0.05s, claude +0.27s, codex +0.39s, agy +2.40s,
+/// opencode +3.24s — and they are independent of one another, so running them
+/// one at a time bought nothing but their sum. They are also *blocking*
 /// (`std::process::Command::output`), which the old serial walk ran straight
 /// on the async runtime; `spawn_blocking` is where blocking work belongs, and
 /// it is what makes the concurrency real rather than five futures taking
 /// turns on one worker thread.
+///
+/// **Within-adapter invocation parallelism: measured, then declined (R1).**
+/// The obvious next step is to fan out the invocations *inside* the two slow
+/// adapters, and the same measurement says not to. Opencode's three probe
+/// invocations are genuinely independent, but timed individually on this host
+/// they are 0.354s / 0.359s / 0.362s — about 1.1s of its 3.24s. The rest is
+/// `serve_gates`' probe child (`opencode serve --port 0` plus the
+/// authenticated `/doc` fetch), and agy's 2.40s is almost entirely
+/// `read_config_probe`'s `agy -p /config` child, neither of which is a
+/// `--help` that fanning out helps. Parallelising opencode's helps would move
+/// it to roughly agy's number and the walk's completion barely at all — while
+/// costing a real behaviour change, since `run_probe` short-circuits today
+/// and a fan-out would fork two more doomed children on every host with no
+/// opencode installed (which is every CI runner). Revisit if a future
+/// adapter's cost is actually in its help invocations; the walk is off the
+/// startup critical path either way, and the per-backend gate means a Work
+/// waits only on the adapter it routes to.
 ///
 /// Each result is journaled and flushed as it lands, then marked on the gate
 /// — in that order, so a caller released by the gate is released over durable
