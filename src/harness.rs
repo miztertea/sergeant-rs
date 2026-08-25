@@ -11,7 +11,7 @@
 //! What "the environment" contains (proposal §8.1, left undecided there) is
 //! this module's own judgment call, not an owner ruling: PATH enrichment
 //! with the per-user toolchain directories measured to be missing from a
-//! non-interactive shell's default PATH (`sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md`:
+//! non-interactive shell's default PATH (`sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md`:
 //! `~/.cargo/bin` houses cargo/rustc and is the literal #60 failure;
 //! `~/.local/bin` is where the `claude` CLI itself and `no-mistakes` are
 //! installed on that same host, so a harness a user cannot even find on
@@ -58,7 +58,7 @@ const ORIGIN_CLIENT_ENV: &str = "SGT_ORIGIN_CLIENT";
 /// over-specification warning); this instead states each directory by name,
 /// with its own measured evidence, and stops.
 ///
-/// - `~/.cargo/bin`, `~/.local/bin` — measured (`sergeant-rs-workspace's knowledge/evidence/environments/
+/// - `~/.cargo/bin`, `~/.local/bin` — measured (`sergeant-rs-workspace's knowledge/evidence/host-measurements/
 ///   cerberus.md`), see the module doc above.
 /// - `~/.opencode/bin` — measured (`knowledge/evidence/
 ///   opencode-adapter-probes-2026-08-23.md`, "Installation facts"):

@@ -73,7 +73,7 @@
 //!   `assistant` chunk — a snapshot of that chunk's own accounting, not a
 //!   cumulative turn total, and not currently parsed out by this adapter).
 //! - Fact-finding only, no promise attached: recorded here and in
-//!   `sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md` because it is the honest answer to
+//!   `sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md` because it is the honest answer to
 //!   "what can interrupt actually tell us", not because anything in this
 //!   milestone changes `interrupt`'s mechanism.
 //!

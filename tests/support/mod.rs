@@ -88,7 +88,7 @@ pub struct ReapedDaemon {
 /// and two siblings went from `pending` to `blocked` the moment the base
 /// moved under `target/`). `/var/tmp/<name>` is the already-established
 /// disk-backed, outside-any-checkout location for exactly this class of
-/// rig (`CONTRIBUTING.md`, `sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md`'s #70 row) —
+/// rig (`CONTRIBUTING.md`, `sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md`'s #70 row) —
 /// real disk on every measured Linux/macOS host, confirmed here via `df -h
 /// /var/tmp` matching the ext4 root rather than tmpfs. Its absence (e.g. an
 /// untested Windows host) falls back to `TempDir::new()`'s own default
@@ -221,7 +221,7 @@ impl DataDir {
     /// contract scale 1 GiB) can fill it, and when it fills, every `Bash`
     /// output capture on the host starts failing `EDQUOT` under a command
     /// that still runs underneath — a broken shell, not an obvious full disk
-    /// (#70, evidence in `sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md`). An operator
+    /// (#70, evidence in `sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md`). An operator
     /// remembering to export `$TMPDIR` before running tests does not close
     /// that: the incident was an unsafe *default*. So the default here is
     /// real disk, when `disk_backed_tmp_base` finds one available; otherwise

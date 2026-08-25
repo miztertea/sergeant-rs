@@ -269,7 +269,7 @@ jobs:
   #
   # aarch64-apple-darwin per ADR 0001's measured-target set: the *build*
   # succeeded on a real macos-26 runner (above), but binary equivalence
-  # and installer correctness were not re-measured on macOS — see sergeant-rs-workspace's knowledge/evidence/adr/
+  # and installer correctness were not re-measured on macOS — see sergeant-rs-workspace's knowledge/rulings/adr/
   # 0018-measured-vocabulary-obligation-clean-build-not-full-validation.md,
   # which clarifies ADR 0001 D8's "measured" vocabulary. Per that ruling,
   # "unmeasured" on macOS means the code is written and should be right but

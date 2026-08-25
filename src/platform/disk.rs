@@ -79,7 +79,7 @@ fn raw_avail_kb(path: &Path) -> Option<u64> {
 }
 
 /// **Verified 2026-08-15** on a real macOS host (Apple M3 Pro, macOS 26.6.1,
-/// `sergeant-rs-workspace's knowledge/evidence/environments/macbook.md`) — closes #81. `--output` is a GNU
+/// `sergeant-rs-workspace's knowledge/evidence/host-measurements/macbook.md`) — closes #81. `--output` is a GNU
 /// extension BSD/macOS `df` does not have, so this drops it and leans on
 /// [`parse_bsd_avail_kb`] instead; `tests/m6_surfaces.rs`'s doctor
 /// `disk_pressure` checks and `scripts/coverage/common.sh`'s own

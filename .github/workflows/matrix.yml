@@ -25,7 +25,7 @@
 # `cargo test` swallows stdout/stderr for passing tests, which is where
 # `SKIPPED-ENV` lines live). This is the count; it does not by itself make a
 # target "measured" under ADR 0001 — that also needs `scripts/probe-env.sh`'s
-# output recorded in `sergeant-rs-workspace's knowledge/evidence/environments/<host>.md`, a documentation step this
+# output recorded in `sergeant-rs-workspace's knowledge/evidence/host-measurements/<host>.md`, a documentation step this
 # workflow does not do for the runner's own transient host.
 name: matrix
 

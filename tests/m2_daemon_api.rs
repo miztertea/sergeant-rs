@@ -1651,7 +1651,7 @@ fn the_data_dir_guard_reaps_the_daemon_a_client_command_spawns() {
 /// contract scale 1 GiB) filling it broke every `Bash` invocation's output
 /// capture across every session on the host — `EDQUOT` under a command that
 /// still ran underneath, so it looked like a broken shell rather than a
-/// full disk (evidence in `sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md`). An operator
+/// full disk (evidence in `sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md`). An operator
 /// remembering to export `$TMPDIR` does not close that: the incident was an
 /// unsafe *default*, so this pins a positive claim about where the rig
 /// actually lands — not merely "not literally /tmp" — which a revert to
@@ -4534,7 +4534,7 @@ async fn r_mvp1_10_pending_to_blocked_from_a_real_materialize_fault_exits_via_ca
     let _restore = RestorePerms(surfaces_root.clone());
     // Environment probe (CONTRIBUTING.md's testing rules): the root dev container
     // silently passes permission-bit tricks. Cerberus and the GH runner both
-    // enforce them (sergeant-rs-workspace's knowledge/evidence/environments/cerberus.md); where they do not, this
+    // enforce them (sergeant-rs-workspace's knowledge/evidence/host-measurements/cerberus.md); where they do not, this
     // fixture cannot be armed and must skip loudly rather than fail for the
     // wrong reason.
     if std::fs::create_dir(surfaces_root.join("probe")).is_ok() {

@@ -73,7 +73,7 @@ fn resolve(
 /// The fallback tail for whatever platform this binary is built for.
 ///
 /// **The macOS arm is verified 2026-08-15** on a real macOS host (Apple M3
-/// Pro, macOS 26.6.1, `sergeant-rs-workspace's knowledge/evidence/environments/macbook.md`) — closes #82.
+/// Pro, macOS 26.6.1, `sergeant-rs-workspace's knowledge/evidence/host-measurements/macbook.md`) — closes #82.
 /// `tests/m2_daemon_api.rs`'s and `tests/m8_estate_cli.rs`'s data-dir
 /// fallback integration tests both exercised the real `sgt` binary's
 /// `~/Library/Application Support/sergeant` path end to end; both tests had

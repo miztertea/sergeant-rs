@@ -195,7 +195,7 @@ fn raw_detect(path: &Path) -> Reliability {
 }
 
 /// **UNVERIFIED — unmeasured, not merely untested.** There is no macOS host
-/// in this estate (`sergeant-rs-workspace's knowledge/evidence/environments/`) to measure `statfs`, `getmntinfo`,
+/// in this estate (`sergeant-rs-workspace's knowledge/evidence/host-measurements/`) to measure `statfs`, `getmntinfo`,
 /// or `diskutil info`'s output shape against, and ADR 0003 names this
 /// exactly as an open question rather than assumed. Reporting
 /// [`Reliability::Unknown`] unconditionally is the fail-closed-*safe*
