@@ -1,0 +1,90 @@
+W5b feedback loop — evidence of construction and a red run
+=============================================================
+
+Bug under investigation: split-hardening #259 fix (merged with W5) does not
+work under a real estate layout. A live codex-terra Work on a fresh scratch
+estate (/var/tmp/codex-proof-estate, Work 01M0VBVCXEGGDF3ZCRNBKVWWWR) retired
+completed_dirty with the stage detail:
+
+  "Blocked: the requested changes are present, but Git cannot create its
+   worktree `index.lock` because the linked repository's `.git/worktrees/...`
+   path is read-only. No commit was created."
+
+That Work's own binding record showed:
+  canonical_common_dir: /var/tmp/codex-proof-estate/repos/target-repo/.git
+  worktree_path:        /var/tmp/codex-proof-estate/.sergeant/data/surfaces/<id>/target-repo
+  stage_id: "30-close" (the 4th and final workflow stage, turns_spawned: 4)
+
+Construction path (ladder order, per skill instructions):
+1. Read tests/codex_backend.rs's existing stub-driven --add-dir test
+   (the_first_turn_grants_the_works_own_git_common_dir_as_an_add_dir_root)
+   and the existing live test (live_codex_actor_commits_to_the_works_own_
+   branch). Both build `source`/`worktree` as siblings under one shared
+   TempDir, and both exercise only a single turn (turn 1's own launch).
+   Neither reaches a resumed turn at all — a real gap regardless of the
+   nesting question the sprint brief raised.
+2. Inspected src/backend/codex.rs's own resume_turn_argv and its unit test
+   (resume_turn_argv_omits_cd_and_places_the_thread_id_right_after_resume,
+   ~line 5198): confirmed by the code itself that --sandbox/--add-dir/-C are
+   deliberately NOT recomposed on `exec resume` — the comment at line 5159
+   ("--output-schema DOES re-apply on resume, unlike --sandbox/--add-dir")
+   states this is a known, deliberate design choice, resting on an assumption
+   that codex-cli's own session state persists turn-1's sandbox grant across
+   `exec resume`.
+3. Tested that assumption directly against a live codex-cli 0.149.0 binary,
+   completely bypassing sergeant's own daemon/dispatch machinery for speed:
+     - turn 1: `codex exec --json --skip-git-repo-check -C <worktree>
+       --sandbox workspace-write --add-dir <common-dir> -m gpt-5.6-luna
+       "<edit only, no git>"` — exactly resume_turn_argv's sibling,
+       first_turn_argv's own composed shape.
+     - turn 2: `codex exec resume <thread> --json --skip-git-repo-check
+       -m gpt-5.6-luna "<git add && git commit>"`, run with the shell's cwd
+       set to the worktree (so no argv-vs-cwd confound).
+   Result: turn 2 fails with
+     fatal: Unable to create '<common-dir>/worktrees/<name>/index.lock':
+     Read-only file system
+   — the identical symptom class as the real production failure (same path
+   shape, same "Read-only file system" text), reproduced with a genuinely
+   separate estate/repos vs data/surfaces layout, matching production, not
+   the unit test's nested-tempdir shape.
+4. Packaged the two-turn repro as a standalone, deterministic script:
+   codex_resume_add_dir_repro.sh (this directory). Ran it fresh (no reuse of
+   the above scratch dirs) and it reproduced red on the first try:
+
+   $ bash codex_resume_add_dir_repro.sh
+   == turn 1 (first_turn_argv shape) ==
+   == turn 2 (resume_turn_argv shape) ==
+   RED: resumed turn did not commit. Turn 2 transcript:
+   {"type":"thread.started","thread_id":"01a036cb-45fb-76e1-ac63-fab857623818"}
+   {"type":"turn.started"}
+   {"type":"item.completed","item":{"id":"item_0","type":"agent_message",
+     "text":"fatal: Unable to create
+     '/tmp/codex-resume-repro.6fxmrv/estate/repos/solo/.git/worktrees/solo/
+     index.lock': Read-only file system"}}
+   {"type":"turn.completed", ...}
+
+   worktree status:
+    M README.md
+   EXIT_CODE=1
+
+Named feedback loop: codex_resume_add_dir_repro.sh (this directory).
+  - Red-capable: fails today (exit 1), against real codex-cli, with the
+    production symptom text.
+  - Deterministic: pinned model (gpt-5.6-luna), fixed one-word-bounded
+    prompts, fresh scratch dirs each run, no reliance on wall-clock/RNG.
+  - Fast: two short turns (~30-60s total), no sgt daemon, no full Work
+    dispatch, no build step.
+  - Agent-runnable: `bash codex_resume_add_dir_repro.sh`, exit 0 = fixed,
+    exit 1 = red, exit 2 = harness-level failure (turn 1 never started).
+
+Reframing vs. the sprint brief's own hypotheses: this loop shows the failure
+is NOT (or not only) about the unit test's nested-tempdir shape (hypothesis
+1) or a canonicalization gap in worktree_git_common_dir (hypothesis 2) — it
+reproduces even with a fully correct, canonical, production-shaped
+--add-dir grant on turn 1, because turn 2 (and every later workflow stage,
+since the codex thread is resumed across stages, not relaunched) never
+resends that grant at all. This loop's next consumer (10-form-hypothesis /
+implementation) should treat "codex exec resume must re-carry --sandbox/
+--add-dir" as the primary hypothesis, verify it doesn't contradict the
+codebase's own doc comment reasoning, and correct resume_turn_argv (and its
+regression test) accordingly.

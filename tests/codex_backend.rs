@@ -1404,6 +1404,67 @@ fn the_resume_turn_launches_the_recorded_grammar() {
     assert!(resume.stdin.contains("turn two"));
 }
 
+/// #259/W5b: the exact seam the production bug lives at — a *resumed* turn
+/// (SEND, via `resume_turn_argv`) must re-grant the Work's own git common
+/// dir, the same one directory `the_first_turn_grants_the_works_own_git_
+/// common_dir_as_an_add_dir_root` proves turn 1 gets via `--add-dir`.
+/// `resume` has no `--add-dir` (proven above), so this grant must reappear
+/// as `-c sandbox_workspace_write.writable_roots=[...]` instead — the fix
+/// `30-instrument`'s H3 probe confirmed live (2/2) against real codex-cli.
+/// Before the fix, `resume_turn_argv` composed no `-c` at all here and a
+/// resumed `git commit` failed with "Read-only file system" on exactly this
+/// directory (`00-build-feedback-loop`/`10-reproduce-and-minimize`).
+#[test]
+fn the_resume_turn_regrants_the_git_common_dir_via_writable_roots() {
+    let dir = TempDir::new().expect("tempdir");
+    let source = dir.path().join("source");
+    let worktree = dir.path().join("worktree");
+    real_worktree(&source, &worktree, "sergeant/w-codex");
+    let common_dir = source.join(".git");
+
+    let stub = StubCodex::passing(dir.path());
+    stub.replays(AGENT_MESSAGE_TURN);
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("codex-home"),
+    ));
+    let mut request = start_request(&worktree);
+    request.bindings = vec![BindingSummary {
+        repository: "solo".to_string(),
+        worktree_path: worktree.clone(),
+        work_branch: "sergeant/w-codex".to_string(),
+        base_branch: Some("main".to_string()),
+        base_sha: "0".repeat(40),
+    }];
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let thread_id = handle.native_id.clone().unwrap();
+    wait_for_settled(&backend, &handle);
+
+    stub.replays(&plain_turn_naming(&thread_id));
+    backend
+        .send(&handle, "git add && git commit")
+        .expect("send");
+    let launches = stub.wait_for_launches(2);
+    let resume = &launches[1];
+    assert_eq!(resume.argv[1], "resume");
+    assert!(
+        !resume.has("--add-dir"),
+        "resume has no --add-dir on this build; the grant must travel via -c"
+    );
+    assert_eq!(
+        resume.value_after("-c"),
+        Some(
+            format!(
+                "sandbox_workspace_write.writable_roots=[\"{}\"]",
+                common_dir.to_str().unwrap()
+            )
+            .as_str()
+        )
+    );
+}
+
 #[test]
 fn the_raw_stream_is_archived_before_any_conclusion_is_drawn() {
     let dir = TempDir::new().expect("tempdir");
@@ -4905,10 +4966,23 @@ async fn daemon_start_registers_codex_and_journals_its_own_probe() {
 /// The commit advances the assigned `sergeant/<work-id>` branch." A real
 /// one-commit repo plus a real `git worktree add`-created linked worktree
 /// (`real_worktree`, same fixture the stub-driven `--add-dir` test above
-/// uses), a turn instructed to append a line and commit it, then the
-/// assigned branch's tip in the *source* checkout is asserted to have moved
-/// to a new commit whose parent is the worktree's pre-turn `HEAD` — proving
-/// the commit is real, on-branch, and not merely a detached-HEAD or
+/// uses).
+///
+/// #259/W5b (`20-hypothesize` H5): the edit and the `git add`/`git commit`
+/// are split across **two turns** — LAUNCH edits `README.md` only, then SEND
+/// resumes the same thread to add and commit — rather than one turn asked to
+/// do both. A single-turn version of this test is structurally blind to the
+/// production bug: turn 1's own `--add-dir` grant is always sufficient
+/// (`30-instrument`'s H4 probe measured this directly), so a same-turn
+/// edit+commit passes whether or not `resume_turn_argv` ever re-grants
+/// anything. The real failure (`10-reproduce-and-minimize`'s repro,
+/// `.git/worktrees/<name>/index.lock` "Read-only file system") only shows up
+/// when the commit happens on a *resumed* turn, which is also the shape a
+/// real Work uses (edit across earlier stages, commit on a later one).
+///
+/// The assigned branch's tip in the *source* checkout is asserted to have
+/// moved to a new commit whose parent is the worktree's pre-turn `HEAD` —
+/// proving the commit is real, on-branch, and not merely a detached-HEAD or
 /// working-tree-only edit.
 #[test]
 #[ignore = "opt-in, spends real tokens: SERGEANT_CODEX_TESTS=1 cargo test --test codex_backend -- --ignored"]
@@ -4929,8 +5003,8 @@ fn live_codex_actor_commits_to_the_works_own_branch() {
     let backend = CodexBackend::new(live_exec_config(data_dir.path()));
     let mut request = start_request(&worktree);
     request.model = Some("gpt-5.6-luna".to_string());
-    request.intent = "Append the single line \"ok\" to README.md, then run `git add \
-                       README.md` and `git commit -m \"live #259 test\"`. Do nothing else, \
+    request.intent = "Append the single line \"ok\" to README.md using a shell command. Do \
+                       not run any git commands. Do nothing else, \
                        and report only the word done when finished."
         .to_string();
     request.bindings = vec![BindingSummary {
@@ -4942,6 +5016,17 @@ fn live_codex_actor_commits_to_the_works_own_branch() {
     }];
     let prepared = backend.prepare(&request).expect("prepare");
     let handle = backend.launch(&prepared).expect("launch");
+    wait_for_settled(&backend, &handle);
+
+    // The commit happens on a *resumed* turn (SEND), the seam #259/W5b's
+    // fix and its regression test target — see the doc comment above.
+    backend
+        .send(
+            &handle,
+            "Run `git add README.md` then `git commit -m \"live #259 test\"`. Report only \
+             the word done when finished, or the exact error text if it fails.",
+        )
+        .expect("send");
     wait_for_settled(&backend, &handle);
 
     let after = support::git(&worktree, &["rev-parse", "HEAD"]);

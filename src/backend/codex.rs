@@ -1059,13 +1059,15 @@ struct LaunchConfig {
 /// <value>] [--add-dir <path> ...]`. Prompt travels on stdin, no positional
 /// argument — see the module docs for why.
 ///
-/// `sandbox`/`extra_dirs`/`network_access` are **turn-1-only** — `exec
-/// resume` has neither `-s`/`--add-dir` nor `-c` on this build
-/// (`resume_turn_argv` below), so enforcement lapses on turn 2 of an
-/// exec-transport conversation. That asymmetry is recorded, not routed
-/// around (W3 spec §3.2): a first turn is where a Work does most of its
-/// damage, and it is itself an argument for app-server as the resolved
-/// transport, where the policy is thread-scoped and holds for every turn.
+/// `sandbox`/`network_access` are **turn-1-only** — `exec resume` has
+/// neither `-s`/`--sandbox` nor `-C`/`--add-dir` on this build
+/// (`resume_turn_argv` below), so those two lapse on turn 2 of an
+/// exec-transport conversation. `extra_dirs` is different: #259/W5b
+/// found `resume` *does* accept `-c key=value` (measured live against
+/// codex-cli 0.149.1's own `--help`, correcting an earlier "nor `-c`"
+/// claim here), and `sandbox_workspace_write.writable_roots` mirrors what
+/// `--add-dir` grants on turn 1 — so `resume_turn_argv` recomposes the
+/// same directories via that override instead of dropping them.
 fn first_turn_argv(
     cwd: &Path,
     model: Option<&str>,
@@ -1115,22 +1117,35 @@ fn first_turn_argv(
 }
 
 /// Turn N >= 2's argv, after `<executable>` (spec §3.2): `exec resume
-/// <thread_id> --json --skip-git-repo-check [-m <model>]`. The thread id sits
+/// <thread_id> --json --skip-git-repo-check [-m <model>] [-c
+/// sandbox_workspace_write.writable_roots=[...]]`. The thread id sits
 /// immediately after `resume`, before any flag — what makes §5.4's liveness
 /// rule an adjacency check rather than a substring search. `-C` is never
 /// passed here: `exec resume` has no such flag on this build
 /// [measured-negative]; `Command::current_dir` is the only mechanism left,
 /// and is set on every spawn regardless of turn number.
 ///
-/// `output_schema_path` **does** re-apply here, unlike `sandbox`/`extra_dirs`
-/// above: `exec resume --help` on 0.149.0 lists `--output-schema` (and
+/// `output_schema_path` **does** re-apply here, unlike `sandbox`/`-C` above:
+/// `exec resume --help` on 0.149.0 lists `--output-schema` (and
 /// `-o`/`--output-last-message`) — re-measured while implementing W3, and a
 /// correction to W1's own "verify at implementation time" placeholder
 /// (spec §4.2). So `structured_output`'s exec row is **not** turn-1-only.
+///
+/// `extra_dirs` (#259/W5b): the same paths `first_turn_argv` grants via
+/// `--add-dir` — `bindings_outside_cwd` plus each binding's
+/// `worktree_git_common_dir` — re-granted here as a single `-c
+/// sandbox_workspace_write.writable_roots=["<dir>", ...]` override, since
+/// `resume` has no `--add-dir` of its own. Measured live (W5b `30-instrument`
+/// probe, codex-cli 0.149.1, 2/2 runs): a resumed turn's `git commit`, which
+/// fails identically to the unmodified baseline's "Read-only file system" on
+/// the worktree's git common dir, succeeds once this override carries that
+/// directory. Omitted entirely when `extra_dirs` is empty, so a
+/// non-mutation-shaped resume (no bindings) composes no `-c` at all.
 fn resume_turn_argv(
     thread_id: &str,
     model: Option<&str>,
     output_schema_path: Option<&Path>,
+    extra_dirs: &[PathBuf],
 ) -> Vec<String> {
     let mut argv = vec![
         "exec".to_string(),
@@ -1146,6 +1161,15 @@ fn resume_turn_argv(
     if let Some(path) = output_schema_path {
         argv.push("--output-schema".to_string());
         argv.push(path.to_string_lossy().into_owned());
+    }
+    if !extra_dirs.is_empty() {
+        let roots = extra_dirs
+            .iter()
+            .map(|dir| format!("\"{}\"", dir.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(",");
+        argv.push("-c".to_string());
+        argv.push(format!("sandbox_workspace_write.writable_roots=[{roots}]"));
     }
     argv
 }
@@ -3466,10 +3490,13 @@ impl CodexBackend {
             let thread_id = thread_id.clone().ok_or_else(|| {
                 self.err_failed("cannot send: no thread id recorded for this execution")
             })?;
+            let mut extra_dirs = bindings_outside_cwd.clone();
+            extra_dirs.extend(git_worktree_common_dirs.iter().cloned());
             command.args(resume_turn_argv(
                 &thread_id,
                 model.as_deref(),
                 output_schema_path,
+                &extra_dirs,
             ));
         }
         command
@@ -5162,6 +5189,7 @@ mod tests {
             "thread-y",
             None,
             Some(Path::new("/data/codex-output-schema.json")),
+            &[],
         );
         assert_eq!(
             resume_with_schema.last().unwrap(),
@@ -5196,7 +5224,7 @@ mod tests {
 
     #[test]
     fn resume_turn_argv_omits_cd_and_places_the_thread_id_right_after_resume() {
-        let argv = resume_turn_argv("01a02508-5880-7980-95b7-1d8bc22d5139", None, None);
+        let argv = resume_turn_argv("01a02508-5880-7980-95b7-1d8bc22d5139", None, None, &[]);
         assert_eq!(
             argv,
             vec![
@@ -5214,7 +5242,7 @@ mod tests {
         let resume_idx = argv.iter().position(|a| a == "resume").unwrap();
         assert_eq!(argv[resume_idx + 1], "01a02508-5880-7980-95b7-1d8bc22d5139");
 
-        let pinned = resume_turn_argv("thread-x", Some("gpt-5.6-luna"), None);
+        let pinned = resume_turn_argv("thread-x", Some("gpt-5.6-luna"), None, &[]);
         assert!(pinned.contains(&"-m".to_string()));
         assert_eq!(pinned.last().unwrap(), "gpt-5.6-luna");
 
@@ -5234,6 +5262,37 @@ mod tests {
                 "{absent} must never appear on resume"
             );
         }
+        assert!(
+            !argv.contains(&"-c".to_string()),
+            "no -c override when extra_dirs is empty"
+        );
+    }
+
+    /// #259/W5b: `resume` has no `--add-dir`, but it does accept `-c
+    /// key=value` (measured live, `30-instrument`'s H3 probe) — the same
+    /// git-common-dir grant `first_turn_argv` sends via `--add-dir` must
+    /// reappear here as `sandbox_workspace_write.writable_roots`, or a
+    /// resumed turn's `git commit` hits the exact "Read-only file system"
+    /// symptom #259 was filed about.
+    #[test]
+    fn resume_turn_argv_regrants_extra_dirs_via_writable_roots() {
+        let argv = resume_turn_argv(
+            "thread-z",
+            None,
+            None,
+            &[
+                PathBuf::from("/estate/repos/solo/.git"),
+                PathBuf::from("/other/outside"),
+            ],
+        );
+        let c_idx = argv
+            .iter()
+            .position(|a| a == "-c")
+            .expect("-c must be present when extra_dirs is non-empty");
+        assert_eq!(
+            argv[c_idx + 1],
+            "sandbox_workspace_write.writable_roots=[\"/estate/repos/solo/.git\",\"/other/outside\"]"
+        );
     }
 
     // ------------------------------------------------------------ §3.4 prompt
