@@ -1161,6 +1161,48 @@ pub(crate) fn has_required_table_columns(text: &str, required: &[String]) -> boo
     })
 }
 
+/// #260 Q4 / Amendment 9's general finalize sweep: a stage's declared
+/// `**Disposition:**` (`docs/icm/convention.md` §1a's "merge-back
+/// semantics") — `promote` survives the sweep into the Work branch's
+/// shipped history, `evidence` is retained as Work evidence and removed
+/// from the worktree in the finalize commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDisposition {
+    /// Ships: left in the worktree, part of what the Work branch merges.
+    Promote,
+    /// Working record only: copied out as retained Work evidence, then
+    /// removed from the worktree by the finalize sweep.
+    Evidence,
+}
+
+/// #260 Q4: read one stage's declared disposition out of its authored
+/// `output/README.md`, the same file [`declared_output_artifact`] reads.
+///
+/// `Evidence` — never a third "undeclared" state — for every case that
+/// is not an explicit `` **Disposition:** `promote` `` line: no
+/// `output/README.md`, no `**Disposition:**` line, or a value other than
+/// `promote`. §1a's own text: "silence promotes nothing" — a package that
+/// never named its output's fate does not get to have that silence read as
+/// permission to ship it.
+pub(crate) fn declared_output_disposition(package_dir: &Path, stage_id: &str) -> OutputDisposition {
+    let readme = package_dir.join(stage_id).join("output").join("README.md");
+    let Ok(text) = std::fs::read_to_string(readme) else {
+        return OutputDisposition::Evidence;
+    };
+    declared_output_disposition_from_readme(&text)
+}
+
+fn declared_output_disposition_from_readme(text: &str) -> OutputDisposition {
+    let promotes = text
+        .lines()
+        .any(|line| line.trim().starts_with("**Disposition:**") && line.contains("`promote`"));
+    if promotes {
+        OutputDisposition::Promote
+    } else {
+        OutputDisposition::Evidence
+    }
+}
+
 /// One `**Expected artifact:** \`<file>\` — ...` line, parsed strictly:
 /// `None` unless it names a bare backtick-quoted filename with no path
 /// separators (the exact shape every shipped `output/README.md` uses).
@@ -1607,6 +1649,62 @@ mod tests {
             Some("implementation.md".to_string())
         );
         assert_eq!(declared_output_artifact(dir.path(), "20-other"), None);
+    }
+
+    /// #260 Q4: an explicit `` **Disposition:** `promote` `` line, and
+    /// nothing else, reads as [`OutputDisposition::Promote`].
+    #[test]
+    fn declared_output_disposition_parses_an_explicit_promote_line() {
+        let readme = "**Expected artifact:** `implementation.md` — the commits.\n\n\
+             **Disposition:** `promote`\n";
+        assert_eq!(
+            declared_output_disposition_from_readme(readme),
+            OutputDisposition::Promote
+        );
+    }
+
+    /// #260 Q4 / §1a: "silence promotes nothing" — an explicit `evidence`
+    /// line, an absent `**Disposition:**` line, and an empty README all read
+    /// as [`OutputDisposition::Evidence`] identically.
+    #[test]
+    fn declared_output_disposition_defaults_to_evidence() {
+        assert_eq!(
+            declared_output_disposition_from_readme(
+                "**Expected artifact:** `x.md`\n\n**Disposition:** `evidence`\n"
+            ),
+            OutputDisposition::Evidence
+        );
+        assert_eq!(
+            declared_output_disposition_from_readme("**Expected artifact:** `x.md`\n"),
+            OutputDisposition::Evidence
+        );
+        assert_eq!(
+            declared_output_disposition_from_readme(""),
+            OutputDisposition::Evidence
+        );
+    }
+
+    #[test]
+    fn declared_output_disposition_reads_the_readme_off_disk_for_the_named_stage() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let stage_output = dir.path().join("10-implement").join("output");
+        std::fs::create_dir_all(&stage_output).expect("output dir");
+        std::fs::write(
+            stage_output.join("README.md"),
+            "**Expected artifact:** `implementation.md`\n\n**Disposition:** `promote`\n",
+        )
+        .expect("readme");
+
+        assert_eq!(
+            declared_output_disposition(dir.path(), "10-implement"),
+            OutputDisposition::Promote
+        );
+        // No `output/README.md` at all for this stage — the fail-closed
+        // default, not a panic or an `Option`.
+        assert_eq!(
+            declared_output_disposition(dir.path(), "20-other"),
+            OutputDisposition::Evidence
+        );
     }
 
     /// Amendment 10d: the exact line `remediate-findings/00-ingest/output/

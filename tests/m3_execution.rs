@@ -1422,13 +1422,17 @@ async fn t10_a_stage_completed_without_its_declared_output_is_reprompted_then_ne
     )
     .await;
     assert_eq!(status, 200, "input rejected: {body}");
-    // ADR 0007(b): this fixture never runs `git commit` (the fake actor has
-    // no shell), so the now-present artifact leaves the worktree dirty —
-    // `completed_dirty`, not plain `completed`. The claim this proves is
-    // narrower and unaffected by that: the gate let the run *advance past*
-    // 00-first and reach the end at all, which it refused to do twice above.
+    // This fixture never runs `git commit` (the fake actor has no shell),
+    // so the now-present artifact would leave the worktree dirty on its
+    // own — but `00-first`'s declared `evidence` disposition means #260
+    // Q4's finalize sweep copies `proof.md` out as retained evidence and
+    // removes it from the worktree in its own commit before teardown's
+    // dirty check ever runs, so the run reaches plain `completed`. The
+    // claim this proves is narrower than that plumbing detail: the gate let
+    // the run *advance past* 00-first and reach the end at all, which it
+    // refused to do twice above.
     assert_eq!(
-        body["work"]["state"], "completed_dirty",
+        body["work"]["state"], "completed",
         "the artifact is now present, so the gate must let the run complete: {body}"
     );
     // Still exactly one re-prompt ever, across the whole run.
@@ -1536,9 +1540,128 @@ async fn t11_a_present_but_untyped_declared_artifact_is_refused_the_same_way_as_
     )
     .await;
     assert_eq!(status, 200, "input rejected: {body}");
+    // The retype above is uncommitted, same as t10's — but `00-first`'s
+    // declared `evidence` disposition means #260 Q4's finalize sweep
+    // removes it (retained as evidence) in its own commit before teardown's
+    // dirty check runs, so this reaches plain `completed` too.
     assert_eq!(
-        body["work"]["state"], "completed_dirty",
+        body["work"]["state"], "completed",
         "a typed table now satisfies the gate: {body}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// #260 Q4 / Amendment 9's general finalize sweep, end to end: a run with
+/// two stage outputs — one silent on disposition (§1a's default: "silence
+/// promotes nothing", so `evidence`) and one explicit `promote` — completes
+/// clean, with the evidence-class output gone from the branch but retained
+/// on disk, and the promote-class output shipped in the branch's own
+/// history untouched.
+///
+/// Both files are seeded committed into the source repository before
+/// submit (the fake actor cannot write files itself), so the worktree is
+/// clean the moment each stage completes — proving the sweep runs
+/// unconditionally, for the ordinary "the actor already committed its own
+/// work" case, not only as dirty-worktree recovery.
+#[tokio::test]
+async fn the_finalize_sweep_removes_evidence_class_output_and_keeps_promote_class() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (mount, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_workflow(
+        &estate,
+        "sweep",
+        &[
+            ("00-evidence", "first stage context"),
+            ("10-promote", "second stage context"),
+        ],
+    );
+    // `00-evidence` declares nothing at all — §1a's default applies.
+    // `10-promote` explicitly opts its output out of the sweep.
+    let promote_readme = estate.join(".sergeant/workflows/sweep/10-promote/output");
+    std::fs::create_dir_all(&promote_readme).expect("output dir");
+    std::fs::write(
+        promote_readme.join("README.md"),
+        "**Expected artifact:** `deliverable.md` — ships with the Work.\n\n\
+         **Disposition:** `promote`\n",
+    )
+    .expect("output/README.md");
+
+    std::fs::create_dir_all(mount.join("00-evidence/output")).expect("output dir");
+    std::fs::write(
+        mount.join("00-evidence/output/notes.md"),
+        "scratch working notes\n",
+    )
+    .expect("seed evidence artifact");
+    std::fs::create_dir_all(mount.join("10-promote/output")).expect("output dir");
+    std::fs::write(
+        mount.join("10-promote/output/deliverable.md"),
+        "the actual deliverable\n",
+    )
+    .expect("seed promote artifact");
+    support::git(&mount, &["add", "-A"]);
+    support::git(&mount, &["commit", "-m", "seed both stage outputs"]);
+
+    let (registry, _fake) = one_fake([FakeStep::complete(), FakeStep::complete()]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        &estate,
+        "sweep evidence, keep promote",
+        json!({"workflow": "sweep"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let surface_root = PathBuf::from(body["surface"]["root"].as_str().expect("surface root"));
+
+    let final_body = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(
+        final_body["work"]["state"], "completed",
+        "the sweep's own commit leaves the worktree clean: {final_body}"
+    );
+    let branch = format!("sergeant/{work_id}");
+
+    // Evidence-class: gone from the branch's own history...
+    let evidence_still_present = Command::new("git")
+        .args(["show", &format!("{branch}:00-evidence/output/notes.md")])
+        .current_dir(&mount)
+        .output()
+        .expect("run git")
+        .status
+        .success();
+    assert!(
+        !evidence_still_present,
+        "evidence-class output must not survive in the branch the sweep committed to"
+    );
+    // ...but retained on disk, byte for byte.
+    let retained = surface_root.join("solo.output/00-evidence/notes.md");
+    assert_eq!(
+        std::fs::read_to_string(&retained).expect("retained evidence"),
+        "scratch working notes\n"
+    );
+
+    // Promote-class: still exactly what was seeded, still on the branch.
+    assert_eq!(
+        git(
+            &mount,
+            &["show", &format!("{branch}:10-promote/output/deliverable.md")]
+        ),
+        "the actual deliverable"
+    );
+    assert!(
+        !surface_root.join("solo.output/10-promote").exists(),
+        "promote-class output is never copied out as evidence — it ships as-is"
     );
 
     handle.shutdown().await;

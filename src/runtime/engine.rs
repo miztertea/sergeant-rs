@@ -60,7 +60,7 @@ use crate::runtime::router::{Route, RouteError, RouteInputs, route, route_stage}
 use crate::runtime::surface::{
     KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING, KIND_SURFACE_TORN_DOWN,
     RepositoryBinding, SURFACES_DIR, SurfaceError, SurfacePlan, TeardownReport, WorkSurface,
-    materialize_admitted, rematerialize, teardown,
+    finalize_sweep, materialize_admitted, rematerialize, teardown,
 };
 
 /// Everything a submission says about how it wants to run.
@@ -637,6 +637,12 @@ pub enum SurfaceEffect {
         surface: WorkSurface,
         /// Whether a restart, rather than the run itself, is what recorded it.
         recovered: bool,
+        /// #260 Q4: the resolved workflow's own `source` directory, so
+        /// [`crate::runtime::surface::finalize_sweep`] can read each
+        /// stage's declared disposition before teardown's dirty check runs.
+        /// `None` for the embedded default (no package directory to read)
+        /// or a run that never resolved a workflow at all.
+        workflow_source: Option<String>,
     },
 }
 
@@ -688,7 +694,21 @@ impl PendingSurface {
                 }
                 SurfaceOutcome::Rematerialized(rematerialize(&self.data_dir, surface).map(Some))
             }
-            SurfaceEffect::Teardown { surface, .. } => {
+            SurfaceEffect::Teardown {
+                surface,
+                workflow_source,
+                ..
+            } => {
+                // #260 Q4: sweep evidence-class stage output *before*
+                // teardown's own dirty check — a clean, promote-only
+                // worktree the sweep leaves behind is what makes the
+                // ordinary `Removed` disposition below the honest answer,
+                // exactly as it already is for a Work that never declared
+                // any output at all.
+                let source = workflow_source.as_deref().map(Path::new);
+                for binding in &surface.bindings {
+                    let _ = finalize_sweep(binding, source);
+                }
                 SurfaceOutcome::TornDown(teardown(&self.data_dir, surface))
             }
         }
@@ -4347,10 +4367,19 @@ impl Engine {
         if run.teardown.is_some() {
             return Next::Parked; // already retired
         }
+        let workflow_source = run
+            .workflow
+            .as_ref()
+            .filter(|w| w.source != SOURCE_EMBEDDED)
+            .map(|w| w.source.clone());
         Next::Surface(Box::new(PendingSurface {
             work_id: work_id.to_string(),
             data_dir: self.data_dir.clone(),
-            effect: SurfaceEffect::Teardown { surface, recovered },
+            effect: SurfaceEffect::Teardown {
+                surface,
+                recovered,
+                workflow_source,
+            },
         }))
     }
 

@@ -1918,6 +1918,121 @@ fn copy_declared_output_artifacts_at(
     bytes
 }
 
+/// #260 Q4 / Amendment 9's general finalize sweep, `docs/icm/convention.md`
+/// §1a's "merge-back semantics": run once per binding at Work close,
+/// **before** [`teardown`]'s own dirty check, so a promote-class deliverable
+/// ships in the branch's history and an evidence-class `output/` never does.
+///
+/// Walks the same top-level `<stage-id>/output/` shape [`retain_stage_outputs`]
+/// and the #260 Q3 gate already treat as ground truth for a Work's own
+/// produced artifacts (never the workflow *package*'s own tree — Rule 4's
+/// "declared locations", not a manifest). For each one that actually holds
+/// real (non-`README.md`) content, [`crate::domain::workflow::
+/// declared_output_disposition`] reads that stage's authored disposition
+/// out of the *workflow package* (`workflow_source`) — `output/README.md`
+/// lives with the procedure, never the worktree — and:
+///
+/// - `Promote`: left untouched; it ships on the branch like any other file.
+/// - `Evidence` (§1a's default: "silence promotes nothing"): copied to
+///   `<repo>.output/<stage>/`, the same destination and shape a *dirty*
+///   worktree's evidence already lands at, so nothing here can lose content
+///   a crash mid-sweep would otherwise have kept — then removed from the
+///   worktree.
+///
+/// Every stage this actually swept lands in **one** commit, made with a
+/// distinct `sergeant finalize` identity so it reads as the engine's own
+/// act rather than the actor's — "the final commit" §1a's ruling names.
+/// Nothing is committed when nothing was evidence-class (no extra history
+/// for a binding with nothing to sweep). `workflow_source == None` (the
+/// embedded default, which ships no package directory to read a
+/// disposition from) sweeps nothing, matching the Q3 gate's own
+/// `SOURCE_EMBEDDED` early return.
+///
+/// Best-effort and fail-open toward the worktree's *content*: a git
+/// failure here is folded into the returned report rather than treated as
+/// fatal — every real artifact was already durably copied out as evidence
+/// before removal was attempted, and the ordinary teardown that runs
+/// immediately after still inspects the worktree fresh and still fails
+/// closed on whatever it actually finds.
+pub fn finalize_sweep(binding: &RepositoryBinding, workflow_source: Option<&Path>) -> FinalizeSweepReport {
+    let mut report = FinalizeSweepReport::default();
+    let Some(workflow_source) = workflow_source else {
+        return report;
+    };
+    let Some(surface_root) = binding.worktree_path.parent() else {
+        return report;
+    };
+    let Ok(top_level) = std::fs::read_dir(&binding.worktree_path) else {
+        return report;
+    };
+    let dest_root = surface_root.join(format!("{}.output", binding.repository));
+    let mut swept_stage_dirs = Vec::new();
+    for entry in top_level.flatten() {
+        let stage_dir = entry.path();
+        if !stage_dir.is_dir() {
+            continue;
+        }
+        let output_dir = stage_dir.join("output");
+        if !output_dir.is_dir() {
+            continue;
+        }
+        let Some(stage_name) = stage_dir.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if crate::domain::workflow::declared_output_disposition(workflow_source, stage_name)
+            == crate::domain::workflow::OutputDisposition::Promote
+        {
+            continue;
+        }
+        let dest = dest_root.join(stage_name);
+        let bytes = copy_declared_output_artifacts(&output_dir, &dest, &binding.worktree_path);
+        if bytes == 0 {
+            let _ = std::fs::remove_dir_all(&dest);
+            continue;
+        }
+        report.evidence.push(RetainedStageOutput {
+            stage: stage_name.to_string(),
+            path: dest,
+            bytes,
+        });
+        swept_stage_dirs.push(output_dir);
+    }
+    if swept_stage_dirs.is_empty() {
+        return report;
+    }
+    for output_dir in &swept_stage_dirs {
+        let _ = std::fs::remove_dir_all(output_dir);
+    }
+    let committed = git(&binding.worktree_path, &["add", "-A"]).is_ok()
+        && git(
+            &binding.worktree_path,
+            &[
+                "-c",
+                "user.name=sergeant finalize",
+                "-c",
+                "user.email=sergeant-finalize@localhost",
+                "commit",
+                "-m",
+                "sergeant: finalize sweep — remove evidence-class stage outputs",
+            ],
+        )
+        .is_ok();
+    report.committed = committed;
+    report
+}
+
+/// [`finalize_sweep`]'s report: what it retained as evidence, and whether it
+/// actually made the finalize commit.
+#[derive(Debug, Clone, Default)]
+pub struct FinalizeSweepReport {
+    /// One entry per stage the sweep actually copied evidence out of and
+    /// removed from the worktree.
+    pub evidence: Vec<RetainedStageOutput>,
+    /// Whether the removal was committed. `false` when nothing was swept
+    /// (no commit needed) or when `git add`/`git commit` itself failed.
+    pub committed: bool,
+}
+
 /// Stage everything `.gitignore` does not exclude (`git add -A`), diff it
 /// against `HEAD` (`git diff --cached --binary`), and write the result
 /// durably under the surface root, sibling to the worktree it is about to
