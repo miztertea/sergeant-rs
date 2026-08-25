@@ -761,12 +761,17 @@ fn render_health(frame: &mut Frame, area: Rect, estate: &EstateScreen) {
                 } else {
                     Style::default().fg(color.rgb())
                 };
-                let line = format!(
-                    "[{:<4}] {:<20} {}",
-                    status,
-                    field_text(&c["name"]),
-                    field_text(&c["detail"]),
-                );
+                // §12.3: one row per check. A handful of checks (e.g.
+                // `git_surfaces`) carry a multi-line `detail` meant for the
+                // Detail pane below, not for the list — embedding it here
+                // verbatim would let one check's row swallow the vertical
+                // space several others need, silently pushing later checks
+                // off screen even though every one of them is still `ok`.
+                // The list gets the first line as a summary; the full text
+                // stays one selection away.
+                let detail = field_text(&c["detail"]);
+                let summary = detail.lines().next().unwrap_or("");
+                let line = format!("[{:<4}] {:<20} {}", status, field_text(&c["name"]), summary);
                 ListItem::new(line).style(style)
             })
             .collect();
