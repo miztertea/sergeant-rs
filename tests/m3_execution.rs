@@ -1476,7 +1476,7 @@ async fn t11_a_present_but_untyped_declared_artifact_is_refused_the_same_way_as_
     support::git(&mount, &["add", "-A"]);
     support::git(&mount, &["commit", "-m", "seed untyped artifact"]);
 
-    let (registry, _fake) = one_fake([
+    let (registry, fake) = one_fake([
         FakeStep::complete(), // 00-first launch: the untyped artifact is already there
         FakeStep::complete(), // the one bounded re-prompt: still untyped
         FakeStep::complete(), // the human's answer, delivered after it is retyped
@@ -1515,6 +1515,12 @@ async fn t11_a_present_but_untyped_declared_artifact_is_refused_the_same_way_as_
         reprompts.len(),
         1,
         "exactly one bounded re-prompt: {reprompts:?}"
+    );
+    let execution_id = fake.starts()[0].execution_id.clone();
+    assert_eq!(
+        fake.inputs(&execution_id),
+        vec!["declared output ingest.md missing — produce it or state what you need".to_string()],
+        "the bounded re-prompt must actually reach the same execution"
     );
     let parked = events_of(data.path(), &work_id, "work.needs_input");
     assert_eq!(parked.len(), 1);
