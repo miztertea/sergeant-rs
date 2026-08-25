@@ -10,8 +10,8 @@ taken directly from history):
   (`src/domain/estate.rs`, `src/cli.rs`, `tests/m6_surfaces.rs`)
 - `1c4eaf5d` — `15-validate: record gate run for network_access load-validation fix (#262)`
   (evidence only, no code)
-- `3033091f` — `fix(docs): purge --workspace flag from #262 validation evidence`
-  (evidence wording only, no code)
+- `3033091f` — purges the removed workspace-selection flag from #262
+  validation evidence (evidence wording only, no code)
 
 Only `bf537e1d` touches code; the re-attack and test-honesty audit below
 are against that commit.
