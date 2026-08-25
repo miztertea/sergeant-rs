@@ -44,7 +44,7 @@
 //! every init from the workflow packages actually written, rather than
 //! embedded as a fifth static copy that could itself drift (#261).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -107,6 +107,15 @@ pub struct DistroWriteOutcome {
     /// sgt-owned tree but are not part of the current embed
     /// (retired-package cleanup, #241), relative to the estate root.
     pub removed: Vec<PathBuf>,
+    /// Subset of `written`: an owned-tree file whose on-disk content, before
+    /// this call overwrote it, matched neither the current embed nor the
+    /// content the [distro manifest](DISTRO_MANIFEST_PATH) recorded `sgt
+    /// init` itself last writing there — i.e. something other than `sgt
+    /// init` (a hand edit) touched it since the last init (#241/#261 F6). A
+    /// file that merely differs from the current embed because it still
+    /// holds a *previous* release's embed (ordinary version drift) is not
+    /// included here; only [`written`](Self::written) is.
+    pub overwritten_modified: Vec<PathBuf>,
     /// Set when creating the `CLAUDE.md -> AGENTS.md` symlink failed and
     /// was swallowed (#241/#261 F-INV-06) — the underlying `io::Error`'s
     /// message, so a caller (`sgt init`'s own report, doctor) can surface
@@ -145,17 +154,37 @@ pub fn write_distro(estate_root: &Path) -> Result<DistroWriteOutcome, DistroErro
     write_agents_md(estate_root, &mut outcome)?;
     symlink_claude_md(estate_root, &mut outcome)?;
 
-    sync_owned_dir(estate_root, Path::new("skills"), &SKILLS, &mut outcome)?;
+    // Loaded once up front, before anything below overwrites the files it
+    // describes — this is "what `sgt init` itself last wrote" for every
+    // owned file, the baseline `write_owned_file` needs to tell a routine
+    // version-drift overwrite apart from a hand edit (#241/#261 F6). `new`
+    // is built up as the current embed is written and persisted at the end,
+    // becoming the baseline the *next* `sgt init` reads.
+    let prior_manifest = load_distro_manifest(estate_root);
+    let mut new_manifest = HashMap::new();
+
+    sync_owned_dir(
+        estate_root,
+        Path::new("skills"),
+        &SKILLS,
+        &prior_manifest,
+        &mut new_manifest,
+        &mut outcome,
+    )?;
     sync_owned_dir(
         estate_root,
         Path::new(".sergeant/common/contexts"),
         &CONTEXTS,
+        &prior_manifest,
+        &mut new_manifest,
         &mut outcome,
     )?;
     sync_owned_dir(
         estate_root,
         Path::new(".sergeant/workflows"),
         &WORKFLOWS,
+        &prior_manifest,
+        &mut new_manifest,
         &mut outcome,
     )?;
 
@@ -166,6 +195,8 @@ pub fn write_distro(estate_root: &Path) -> Result<DistroWriteOutcome, DistroErro
     // second, independently-walked copy of the same package list that
     // could drift from the first.
     write_index_md(estate_root, &mut outcome)?;
+
+    save_distro_manifest(estate_root, &new_manifest)?;
 
     Ok(outcome)
 }
@@ -288,10 +319,20 @@ fn sync_owned_dir(
     estate_root: &Path,
     prefix: &Path,
     dir: &Dir<'static>,
+    prior_manifest: &HashMap<PathBuf, String>,
+    new_manifest: &mut HashMap<PathBuf, String>,
     outcome: &mut DistroWriteOutcome,
 ) -> io::Result<()> {
     let mut embedded_rel: HashSet<PathBuf> = HashSet::new();
-    write_owned_files(estate_root, prefix, dir, &mut embedded_rel, outcome)?;
+    write_owned_files(
+        estate_root,
+        prefix,
+        dir,
+        &mut embedded_rel,
+        prior_manifest,
+        new_manifest,
+        outcome,
+    )?;
     remove_retired_files(estate_root, prefix, &embedded_rel, outcome)?;
     Ok(())
 }
@@ -307,15 +348,32 @@ fn write_owned_files(
     prefix: &Path,
     dir: &Dir<'static>,
     embedded_rel: &mut HashSet<PathBuf>,
+    prior_manifest: &HashMap<PathBuf, String>,
+    new_manifest: &mut HashMap<PathBuf, String>,
     outcome: &mut DistroWriteOutcome,
 ) -> io::Result<()> {
     for file in dir.files() {
         let rel_path = prefix.join(file.path());
         embedded_rel.insert(rel_path.clone());
-        write_owned_file(estate_root, &rel_path, file.contents(), outcome)?;
+        write_owned_file(
+            estate_root,
+            &rel_path,
+            file.contents(),
+            prior_manifest,
+            new_manifest,
+            outcome,
+        )?;
     }
     for sub in dir.dirs() {
-        write_owned_files(estate_root, prefix, sub, embedded_rel, outcome)?;
+        write_owned_files(
+            estate_root,
+            prefix,
+            sub,
+            embedded_rel,
+            prior_manifest,
+            new_manifest,
+            outcome,
+        )?;
     }
     Ok(())
 }
@@ -327,10 +385,19 @@ fn write_owned_files(
 /// rather than preserved. Skips the actual write when the target already
 /// holds byte-identical content, which is what keeps a same-binary second
 /// `sgt init` a true no-op.
+///
+/// When an overwrite does happen, `prior_manifest` (what `sgt init` itself
+/// last recorded writing to this path, see [`DISTRO_MANIFEST_PATH`]) is
+/// consulted to tell a hand edit apart from ordinary version drift: if the
+/// on-disk content about to be replaced doesn't match that record, nothing
+/// but `sgt init` could have written what's there now, so it is reported in
+/// `outcome.overwritten_modified` (#241/#261 F6) as well as `outcome.written`.
 fn write_owned_file(
     estate_root: &Path,
     rel_path: &Path,
     contents: &[u8],
+    prior_manifest: &HashMap<PathBuf, String>,
+    new_manifest: &mut HashMap<PathBuf, String>,
     outcome: &mut DistroWriteOutcome,
 ) -> io::Result<()> {
     let full_path = estate_root.join(rel_path);
@@ -345,6 +412,19 @@ fn write_owned_file(
     } else {
         contents
     };
+
+    new_manifest.insert(rel_path.to_path_buf(), content_hash(final_bytes));
+
+    if let Ok(existing) = std::fs::read(&full_path)
+        && existing != final_bytes
+    {
+        let matches_prior_write = prior_manifest
+            .get(rel_path)
+            .is_some_and(|prior_hash| content_hash(&existing) == *prior_hash);
+        if !matches_prior_write {
+            outcome.overwritten_modified.push(rel_path.to_path_buf());
+        }
+    }
 
     write_if_changed(&full_path, rel_path, final_bytes, outcome)
 }
@@ -403,6 +483,18 @@ fn remove_retired_files(
 /// cosmetic (an empty directory is harmless), but a retired package's
 /// directory disappearing along with its files is the less surprising
 /// result.
+///
+/// **Never follows symlinks (issue #241/#261 F5).** Every entry's type is
+/// read with [`std::fs::DirEntry::file_type`], which reports the entry
+/// itself — a symlink is reported as a symlink, never as whatever it
+/// points at (unlike `Path::is_dir`/`Path::metadata`, which resolve the
+/// link). A symlink entry is always a single leaf to consider for removal:
+/// this function never recurses through it and never resolves it before
+/// deleting. That is what keeps a symlink planted inside an owned tree —
+/// e.g. pointing at `.sergeant/local/` or at an absolute path outside the
+/// estate entirely — from ever causing anything beyond the symlink itself
+/// to be touched: `std::fs::remove_file` on a symlink path unlinks the
+/// link, not its target.
 fn remove_retired_and_prune(
     dir: &Path,
     estate_root: &Path,
@@ -414,13 +506,20 @@ fn remove_retired_and_prune(
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             remove_retired_and_prune(&path, estate_root, embedded_rel, outcome)?;
             if std::fs::read_dir(&path).is_ok_and(|mut e| e.next().is_none()) {
                 let _ = std::fs::remove_dir(&path);
             }
             continue;
         }
+        // A symlink (to a file, a directory, or nothing that resolves at
+        // all) falls through here rather than into the `is_dir` branch
+        // above, so it is always handled as a single entry to unlink —
+        // never recursed into, never canonicalized first.
         let rel_path = match path.strip_prefix(estate_root) {
             Ok(rel) => rel.to_path_buf(),
             Err(_) => continue,
@@ -438,6 +537,62 @@ fn remove_retired_and_prune(
         }
     }
     Ok(())
+}
+
+/// Where the distro manifest (#241/#261 F6) is persisted, relative to the
+/// estate root — deliberately outside all three sgt-owned trees
+/// (`skills/`, `.sergeant/common/contexts/`, `.sergeant/workflows/`), so
+/// [`remove_retired_files`]'s cleanup — scoped strictly to those trees —
+/// never treats this bookkeeping file itself as a retired owned file.
+const DISTRO_MANIFEST_PATH: &str = ".sergeant/.distro-manifest.json";
+
+/// The content hash [`DISTRO_MANIFEST_PATH`] records per owned file —
+/// `blake3` is already an established dependency for content-identity
+/// hashing elsewhere in this codebase (`runtime::blob`, `domain::workflow`).
+fn content_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+/// Load what the *last* `sgt init` on this estate recorded writing to each
+/// owned-tree path, keyed by path relative to the estate root. Absent,
+/// unreadable, or malformed is treated the same as empty — an estate whose
+/// owned trees predate this manifest (or whose manifest was deleted) simply
+/// has no baseline to compare against, which [`write_owned_file`] resolves
+/// conservatively: no record means an overwrite is reported as a hand edit
+/// rather than assumed innocent.
+fn load_distro_manifest(estate_root: &Path) -> HashMap<PathBuf, String> {
+    let full_path = estate_root.join(DISTRO_MANIFEST_PATH);
+    let Ok(text) = std::fs::read_to_string(&full_path) else {
+        return HashMap::new();
+    };
+    let Ok(entries) = serde_json::from_str::<HashMap<String, String>>(&text) else {
+        return HashMap::new();
+    };
+    entries
+        .into_iter()
+        .map(|(path, hash)| (PathBuf::from(path), hash))
+        .collect()
+}
+
+/// Persist `manifest` as the baseline the *next* `sgt init` reads back via
+/// [`load_distro_manifest`]. Written unconditionally at the end of every
+/// successful [`write_distro`] call — cheap (one small JSON file) and it
+/// must always reflect exactly what this call left on disk, including for
+/// files this call left untouched because they already matched the embed.
+fn save_distro_manifest(estate_root: &Path, manifest: &HashMap<PathBuf, String>) -> io::Result<()> {
+    let as_strings: std::collections::BTreeMap<String, &String> = manifest
+        .iter()
+        .map(|(path, hash)| (path.to_string_lossy().into_owned(), hash))
+        .collect();
+    let text = serde_json::to_string_pretty(&as_strings)
+        .expect("a map of strings always serializes to JSON");
+
+    let rel_path = Path::new(DISTRO_MANIFEST_PATH);
+    let full_path = estate_root.join(rel_path);
+    if let Some(parent) = full_path.parent() {
+        create_dir_all_durable(parent)?;
+    }
+    write_atomic(&full_path, text.as_bytes())
 }
 
 /// Generate `.sergeant/index.md` from the workflow packages actually on
@@ -582,6 +737,86 @@ mod tests {
         );
         let text = std::fs::read_to_string(&target).expect("read back");
         assert_ne!(text, "drifted content, must be replaced");
+    }
+
+    /// #241/#261 F6 (major): a file inside an owned tree edited by
+    /// something other than `sgt init` since the last init must be named
+    /// distinctly in the outcome, so a user's lost edit is loudly visible.
+    #[test]
+    fn write_distro_flags_a_hand_edited_owned_file_as_overwritten_modified() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_distro(tmp.path()).expect("first write");
+
+        let target = tmp.path().join("skills/sergeant-help/SKILL.md");
+        std::fs::write(&target, "a user's own hand edit, never written by sgt init")
+            .expect("simulate hand edit");
+
+        let second = write_distro(tmp.path()).expect("second write");
+        assert!(
+            second
+                .overwritten_modified
+                .iter()
+                .any(|p| p.ends_with("skills/sergeant-help/SKILL.md")),
+            "a file hand-edited since the last init must be flagged, got {:?}",
+            second.overwritten_modified
+        );
+        assert!(
+            second
+                .written
+                .iter()
+                .any(|p| p.ends_with("skills/sergeant-help/SKILL.md")),
+            "a flagged hand-edit is still overwritten like any other drifted owned file"
+        );
+    }
+
+    /// #241/#261 F6: a file that only drifted because it still holds
+    /// exactly what `sgt init` itself wrote under a previous release must
+    /// *not* be flagged as a hand edit — only content nothing but `sgt
+    /// init` could have produced escapes that label.
+    #[test]
+    fn write_distro_does_not_flag_routine_version_drift_as_overwritten_modified() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_distro(tmp.path()).expect("first write");
+
+        let target = tmp.path().join("skills/sergeant-help/SKILL.md");
+        let previous_release_content = "content sgt itself wrote under a previous release";
+        std::fs::write(&target, previous_release_content)
+            .expect("simulate a previous release's own content");
+
+        // Backdate the manifest to say `sgt init` itself last wrote exactly
+        // this content — simulating the file sitting untouched since an
+        // older release, rather than hand-edited by anyone.
+        let manifest_path = tmp.path().join(DISTRO_MANIFEST_PATH);
+        let mut manifest: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("read manifest"))
+                .expect("parse manifest");
+        manifest.insert(
+            "skills/sergeant-help/SKILL.md".to_string(),
+            content_hash(previous_release_content.as_bytes()),
+        );
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write backdated manifest");
+
+        let second = write_distro(tmp.path()).expect("second write");
+        assert!(
+            second
+                .written
+                .iter()
+                .any(|p| p.ends_with("skills/sergeant-help/SKILL.md")),
+            "the file must still be brought back in line with the current embed"
+        );
+        assert!(
+            !second
+                .overwritten_modified
+                .iter()
+                .any(|p| p.ends_with("skills/sergeant-help/SKILL.md")),
+            "content sgt itself wrote under a previous release must not be flagged as a hand \
+             edit, got {:?}",
+            second.overwritten_modified
+        );
     }
 
     #[test]
@@ -813,6 +1048,88 @@ mod tests {
         assert_eq!(
             text, "a hand-authored constitution with no markers at all\n",
             "a marker-less AGENTS.md must never be corrupted by a failed init"
+        );
+    }
+
+    /// #241/#261 F5 (BLOCKER): a symlink planted inside an owned tree,
+    /// pointing at `.sergeant/local/` — a routine `sgt init` must remove
+    /// only the symlink itself, never resolve it and delete through it.
+    #[test]
+    #[cfg(unix)]
+    fn remove_retired_files_never_follows_a_symlink_into_sergeant_local() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_distro(tmp.path()).expect("first write");
+
+        let local_dir = tmp.path().join(".sergeant/local");
+        std::fs::create_dir_all(&local_dir).expect("mkdir .sergeant/local");
+        let local_file = local_dir.join("file");
+        std::fs::write(&local_file, "the user's own local content").expect("plant local file");
+
+        // Planted inside a sgt-owned tree, not part of the current embed —
+        // exactly the shape retired-file cleanup is meant to remove, except
+        // this entry is a symlink pointing outside the owned tree.
+        let evil_link = tmp.path().join("skills/evil-symlink");
+        std::os::unix::fs::symlink(&local_file, &evil_link).expect("plant symlink");
+
+        let outcome = write_distro(tmp.path()).expect("second write");
+
+        assert!(
+            !evil_link.exists() && std::fs::symlink_metadata(&evil_link).is_err(),
+            "the symlink itself must be removed as a retired file"
+        );
+        assert!(
+            outcome.removed.iter().any(|p| p.ends_with("evil-symlink")),
+            "the outcome must report the symlink's own removal, got {:?}",
+            outcome.removed
+        );
+        assert!(
+            local_file.is_file(),
+            ".sergeant/local/file must never be reachable through owned-tree cleanup"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&local_file).expect("read local file"),
+            "the user's own local content",
+            "the symlink target's content must be untouched"
+        );
+    }
+
+    /// #241/#261 F5 (BLOCKER): a symlink planted inside an owned tree,
+    /// pointing at an absolute path entirely outside the estate — a
+    /// routine `sgt init` must remove only the symlink itself, never the
+    /// file it points at.
+    #[test]
+    #[cfg(unix)]
+    fn remove_retired_files_never_follows_a_symlink_outside_the_estate() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_distro(tmp.path()).expect("first write");
+
+        let outside = tempfile::TempDir::new().expect("outside tempdir");
+        let outside_file = outside.path().join("arbitrary-file");
+        std::fs::write(&outside_file, "content living entirely outside the estate")
+            .expect("plant outside file");
+
+        let evil_link = tmp.path().join(".sergeant/common/contexts/evil-symlink");
+        std::os::unix::fs::symlink(&outside_file, &evil_link).expect("plant symlink");
+
+        let outcome = write_distro(tmp.path()).expect("second write");
+
+        assert!(
+            !evil_link.exists() && std::fs::symlink_metadata(&evil_link).is_err(),
+            "the symlink itself must be removed as a retired file"
+        );
+        assert!(
+            outcome.removed.iter().any(|p| p.ends_with("evil-symlink")),
+            "the outcome must report the symlink's own removal, got {:?}",
+            outcome.removed
+        );
+        assert!(
+            outside_file.is_file(),
+            "a file outside the estate must never be reachable through owned-tree cleanup"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).expect("read outside file"),
+            "content living entirely outside the estate",
+            "the symlink target's content must be untouched"
         );
     }
 }

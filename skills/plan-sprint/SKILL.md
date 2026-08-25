@@ -101,7 +101,9 @@ State this limitation plainly rather than implying isolation guarantees
 the shipped `panel`/`refute` stages also don't actually have.
 
 **Edition note:** this limitation was superseded by owner ruling (sprint
-plan amendment 1) — waves MAY be dispatched as Sergeant Works. The
+plan amendment 1, dated 2026-08-24 — the split-hardening sprint plan's own
+provenance, kept in this project's private development record, not
+shipped here) — waves MAY be dispatched as Sergeant Works. The
 sub-agent shape above remains this skill's default until a plan
 explicitly elects dispatched waves; state whichever mode a given sprint
 plan actually uses rather than assuming the historical default.

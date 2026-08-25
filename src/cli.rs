@@ -1296,6 +1296,8 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         "distro_files_already_present": distro_outcome.skipped.len(),
                         "distro_files_removed": distro_outcome.removed.len(),
                         "distro_files_removed_paths": distro_outcome.removed,
+                        "distro_files_overwritten_modified": distro_outcome.overwritten_modified.len(),
+                        "distro_files_overwritten_modified_paths": distro_outcome.overwritten_modified,
                         "distro_symlink_unavailable": distro_outcome.symlink_unavailable,
                         "changed": outcome.changed() || distro_outcome.changed(),
                     },
@@ -1330,6 +1332,17 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                                 distro_outcome.removed.len()
                             );
                             for path in &distro_outcome.removed {
+                                println!("    {}", path.display());
+                            }
+                        }
+                        if !distro_outcome.overwritten_modified.is_empty() {
+                            println!(
+                                "  replaced (had local modifications) — {} file(s) inside a \
+                                 sgt-owned tree were edited outside `sgt init` since the last \
+                                 run; those edits are now lost:",
+                                distro_outcome.overwritten_modified.len()
+                            );
+                            for path in &distro_outcome.overwritten_modified {
                                 println!("    {}", path.display());
                             }
                         }
