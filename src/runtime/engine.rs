@@ -706,10 +706,12 @@ impl PendingSurface {
                 // exactly as it already is for a Work that never declared
                 // any output at all.
                 let source = workflow_source.as_deref().map(Path::new);
-                for binding in &surface.bindings {
-                    let _ = finalize_sweep(binding, source);
-                }
-                SurfaceOutcome::TornDown(teardown(&self.data_dir, surface))
+                let sweeps = surface
+                    .bindings
+                    .iter()
+                    .map(|binding| finalize_sweep(binding, source))
+                    .collect();
+                SurfaceOutcome::TornDown(teardown(&self.data_dir, surface), sweeps)
             }
         }
     }
@@ -723,7 +725,12 @@ pub enum SurfaceOutcome {
     /// A re-attached surface, `None` when nothing needed re-attaching.
     Rematerialized(Result<Option<WorkSurface>, SurfaceError>),
     /// Teardown never fails: it reports what it found (§11 fails closed).
-    TornDown(TeardownReport),
+    /// The second element is #260 Q4's finalize-sweep report, one per
+    /// binding in the same order as `surface.bindings`.
+    TornDown(
+        TeardownReport,
+        Vec<crate::runtime::surface::FinalizeSweepReport>,
+    ),
 }
 
 /// What the engine needs before it can crank again.
@@ -1880,7 +1887,10 @@ impl Engine {
                 },
                 SurfaceOutcome::Rematerialized(result),
             ) => self.settle_rematerialize(core, &work_id, &surface, index, attempt, result),
-            (SurfaceEffect::Teardown { recovered, .. }, SurfaceOutcome::TornDown(report)) => {
+            (
+                SurfaceEffect::Teardown { recovered, .. },
+                SurfaceOutcome::TornDown(report, sweeps),
+            ) => {
                 // §11.5's orthogonal axis, computed at the one point every
                 // terminal path converges on: cancel (`begin_retire_run`),
                 // failure and completion (`settle_stage`'s signal arms), and
@@ -1901,6 +1911,16 @@ impl Engine {
                 let mut payload = json!({"report": report, "integrity": integrity});
                 if recovered {
                     payload["recovered"] = Value::Bool(true);
+                }
+                // F-SI-01: the finalize sweep's own report — evidence
+                // retained and whether it committed — was previously
+                // computed then discarded (`let _ = finalize_sweep(...)`),
+                // leaving no journal/domain record of what it did. Recorded
+                // as a sibling key for the same additive-payload reason as
+                // `recovered` above; omitted when every binding's sweep was
+                // a no-op so an ordinary teardown's payload is unchanged.
+                if sweeps.iter().any(|s| !s.evidence.is_empty() || s.committed) {
+                    payload["finalize_sweep"] = json!(sweeps);
                 }
                 self.commit(core, &work_id, KIND_SURFACE_TORN_DOWN, payload)?;
                 Ok(Step::parked())

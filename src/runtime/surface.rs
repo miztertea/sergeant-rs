@@ -2040,7 +2040,7 @@ pub fn finalize_sweep(
 
 /// [`finalize_sweep`]'s report: what it retained as evidence, and whether it
 /// actually made the finalize commit.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct FinalizeSweepReport {
     /// One entry per stage the sweep actually copied evidence out of and
     /// removed from the worktree.
