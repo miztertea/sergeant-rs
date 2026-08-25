@@ -586,10 +586,8 @@ fn agents_md_states_the_ratified_mutation_surface_contract() {
 // verified and pushed to the sergeant-rs-workspace knowledge library. A
 // leftover path-like reference to any of them is a dangling citation, not
 // live doctrine — this sweeps the surfaces a contributor or an agent
-// actually reads for exactly that. Scope deliberately excludes `skills/` and
-// `.sergeant/` (embedded distro content still citing docs/ paths is wave
-// W3's scope, not this one) and `CHANGELOG.md` (an append-only ledger this
-// wave does not edit).
+// actually reads for exactly that. Excludes `CHANGELOG.md` (an append-only
+// ledger this wave does not edit).
 #[test]
 fn no_readme_contributing_src_test_or_workflow_file_cites_a_removed_path() {
     const NEEDLES: &[&str] = &["NORTH-STAR.md", "GAUNTLET.md", "LESSONS.md", "docs/"];
@@ -624,6 +622,57 @@ fn no_readme_contributing_src_test_or_workflow_file_cites_a_removed_path() {
     assert!(
         offenders.is_empty(),
         "dangling citation(s) to a path removed by split-hardening W2c:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// split-hardening W3 (#261) extended the sweep above onto `skills/` and
+/// `.sergeant/` — the embedded distro content `sgt init` actually ships —
+/// now that those stale routes are fixed. This is a separate test rather
+/// than folding into the one above because the embedded corpus
+/// legitimately uses a bare `docs/` as a placeholder for *a consumer
+/// repository's own* docs directory (e.g. `review-change/10-identify-spec-
+/// source/CONTEXT.md`'s "a PRD/spec file under `docs/`, `specs/`, or
+/// `.scratch/`"), so the needle set here is the specific stale-route
+/// fragments split-hardening actually removed or re-pointed, not a bare
+/// `docs/` substring that would misfire on that legitimate generic usage.
+#[test]
+fn no_embedded_skill_or_workflow_file_cites_a_removed_or_workspace_only_path() {
+    const NEEDLES: &[&str] = &[
+        "NORTH-STAR.md",
+        "GAUNTLET.md",
+        "LESSONS.md",
+        "docs/icm/",
+        "docs/adr/",
+        "docs/DEVELOPMENT.md",
+        "docs/environments/",
+        "docs/proposals/",
+        "sergeant-rs-workspace",
+    ];
+
+    let mut roots = walk(&repo_root().join("skills"));
+    roots.extend(walk(&repo_root().join(".sergeant")));
+    roots.push(repo_root().join("AGENTS.md"));
+
+    let mut offenders = Vec::new();
+    for path in roots {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for needle in NEEDLES {
+            if text.contains(needle) {
+                offenders.push(format!("{}: still cites {needle:?}", path.display()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "dangling citation(s) to a path removed by split-hardening W2c, or to the private \
+         workspace repo, in the embedded distro:\n{}",
         offenders.join("\n")
     );
 }

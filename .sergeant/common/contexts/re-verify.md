@@ -1,7 +1,7 @@
 # Re-verify
 
 Resolved as `@@re-verify` from `.sergeant/common/contexts/re-verify.md`
-per `docs/icm/convention.md` §4. Shared stage context, two or more
+per `.sergeant/common/contexts/icm-policy.md` §4. Shared stage context, two or more
 consumers: `implement-change/35-re-verify`,
 `fix-defect/60-re-verify-and-postmortem`, `remediate-findings/35-re-verify`.
 

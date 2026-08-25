@@ -2,7 +2,7 @@
 
 Resolved as `@@resolve-conflicts` from
 `.sergeant/common/contexts/resolve-conflicts.md` per
-`docs/icm/convention.md` §4. Shared stage context, two or more consumers:
+`.sergeant/common/contexts/icm-policy.md` §4. Shared stage context, two or more consumers:
 `implement-change/10-implement`, `remediate-findings/30-implement-accepted`,
 `validate-and-ship/50-reconcile-custody`. This is the retired
 `resolving-merge-conflicts` package's entire content, carried forward at

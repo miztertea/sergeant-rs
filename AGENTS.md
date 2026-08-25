@@ -1,5 +1,5 @@
 <!--
-  This is sergeant-rs's small constitution (docs/icm/convention.md §3): a
+  This is sergeant-rs's small constitution (.sergeant/common/contexts/icm-policy.md §3): a
   stable operating invariant document, not a procedural encyclopedia. It
   changes rarely by design — frequent churn here is a classification
   defect, not a documentation improvement (§3 rule 3). It does not restate
@@ -13,7 +13,7 @@
   §4.1); splits guardrail-shaped content into CAN (enforced by code) and
   SHOULD (disposition, unenforced) per proposal §4.2. This supersedes the
   prior 2026-08-12 rewrite's provenance note; that corpus's disposition
-  record remains `docs/icm/agents-invariant-dispositions.md`.
+  record is dev-corpus history, kept in this project's private development record rather than shipped with this file.
 -->
 
 # sergeant-rs
@@ -27,7 +27,7 @@ against it, journaling what it can prove happened outside that surface
 as dirty evidence at retirement rather than silently absorbing it
 (the North Star ruling's amended destination text, #180). The full
 destination and the rulings behind it are the North Star ruling, now kept
-in the sergeant-rs-workspace knowledge library — read it before changing
+kept in this project's private development record — read it before changing
 anything here.
 
 Sergeant is designed for one developer per installation: adoption by a
@@ -37,7 +37,7 @@ service.
 
 Documentation is layered by ownership: this file owns always-on operating
 policy for any harness acting in an estate; `.sergeant/workflows/*/index.md`
-and `SKILL.md` files own trigger-specific procedure; `docs/DEVELOPMENT.md`
+and `SKILL.md` files own trigger-specific procedure; `CONTRIBUTING.md`
 owns the rules for changing sergeant-rs's own code; `README.md` owns
 install/quickstart. When two sources disagree about a behavior, the one
 that owns that topic wins.
@@ -125,7 +125,7 @@ expertise constrains the path.
 
 Where rungs get logged in this repository's own artifacts —
 ledger entries, deviation-register rows, new dependencies — is
-`docs/DEVELOPMENT.md`, which owns that rule.
+`CONTRIBUTING.md`, which owns that rule.
 
 ### AUTHORITY — the Bounded-Judgment Ladder (J5–J0), then PACE
 
@@ -423,6 +423,6 @@ gap between them is where judgment (the ladders above) does its work.
 ## Working on sergeant-rs itself
 
 Changing sergeant-rs's own code, tests, or CI is repo content, not a
-separate product: the rules live in `docs/DEVELOPMENT.md`. Load it before
+separate product: the rules live in `CONTRIBUTING.md`. Load it before
 touching `src/`, `tests/`, `scripts/`, or CI config — it applies in full
 whether the work is dispatched or done directly in this session.

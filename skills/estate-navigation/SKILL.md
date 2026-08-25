@@ -4,11 +4,10 @@ description: Resolve an estate's declared repositories, groups, and health befor
 edition: 0.2.1
 ---
 
-Provenance for this skill's citation record lives in
-`sergeant-rs-workspace`'s `knowledge/evidence/provenance/skills.md`.
+Provenance for this skill's citation record is kept in this project's
+private development record, not shipped here.
 
-Content ported from the upstream core function map
-(`sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/upstream-core-function-map-2026-08-11.md`): `sgt-context`
+Content ported from the upstream core function map: `sgt-context`
 ("emit a project's layered agent-instructions block... for session start")
 and `sgt-sync` ("clone missing / pull existing repos") were each ruled
 **SKILL** by owner pre-ruling — "pure config read, no worktree or Work state
@@ -18,10 +17,10 @@ project registry, `yq`-parsed, with `defaults → group → repo` instruction
 layering the harness composed itself) does not exist in sergeant-rs and is
 not re-created here; this skill teaches the equivalent judgment against
 sergeant-rs's actual estate model (`sergeant.toml`'s `[estate]`/`[[repo]]`/
-`[group.<name>]`, per `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md`).
+`[group.<name>]`, per the MVP-1 estate-manifest ruling).
 
-**Extended at ICM-R2** (`sergeant-rs-workspace/knowledge/evidence/gauntlet/runs/icm-r2/sergeant-setup/
-adjudication-draft.md`) to absorb `sergeant-setup`'s two remaining live
+**Extended at ICM-R2** (sergeant-setup adjudication, dev-corpus record) to
+absorb `sergeant-setup`'s two remaining live
 behaviors — interactive repo/group registration and capability-gap tracking
 — now that package retired. Both new sections below are live, Captain-
 session judgment (PL-2): they decide whether Work should exist (a registered
@@ -32,8 +31,8 @@ an admitted background workflow.
 
 Before acting on an estate whose repositories, groups, or health you haven't
 already confirmed this session — never infer which repo or estate you're in
-from the current directory (`AGENTS.md`'s standard workflow loop step 1
-already states this as always-on policy; load this skill when a task needs
+from the current directory (`AGENTS.md`'s "Session start" section already
+states this as always-on policy; load this skill when a task needs
 more estate-navigation detail than that one line covers, e.g. "what's
 registered", "sync my repos", "is repo X declared", "register a new repo/
 group", "set up this estate", "file a ticket for a missing prerequisite").
@@ -127,7 +126,7 @@ answer:
 **What this does not cover, on purpose.** The retired interview also asked
 for per-repo role, a free-text `agent_instructions` block (default and per-
 group), and a project-level GitHub identity. None of these have a
-`sergeant.toml` field today (`sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md` — the schema
+`sergeant.toml` field today (the MVP-1 estate-manifest ruling — the schema
 has `[[repo]] instructions = "local" | "suppress"`, not free text, and no
 Graphify-path field at the estate level). The nearest thing to the third is
 `[[repo]] upstream`, and it is deliberately narrower than what was asked
@@ -163,8 +162,8 @@ consent is declined, leave the state unchanged and report the skip.
 ## Bounded judgment
 
 *(Added ICM-R2, closing a pre-existing gap this skill predated —
-`docs/adr/0013-icm-r0-owner-rulings.md` decision 4; `docs/icm/
-convention.md` §6.1 — flagged by the pilot's independent reviewer as a gap
+owner ruling ICM-R0 decision 4; `.sergeant/common/contexts/icm-policy.md`
+— flagged by the pilot's independent reviewer as a gap
 the sergeant-setup fold made worse by adding new judgment content without
 it.)*
 

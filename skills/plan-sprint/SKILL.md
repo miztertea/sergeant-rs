@@ -24,8 +24,8 @@ wave branches, and a blind panel gate before waves run.
 independently-run sprints this estate has actually completed** (quoted,
 not paraphrased):
 
-> Foundation (`sergeant-rs-workspace/knowledge/evidence/resources/
-> foundation-series/sprint-plan-2026-08-21.md`): "integration branch `integration/
+> Foundation (dev-corpus sprint plan, kept in this project's private
+> development record, not shipped here): "integration branch `integration/
 > foundation`, draft head PR carrying this plan, wave branches
 > `foundation/w<N>-<slug>` in `/var/tmp/foundation-impl/` worktrees, per
 > wave: recon → spec → implement (TDD, DataDir guards, R-S0-12 full loop)
@@ -35,8 +35,8 @@ not paraphrased):
 > subagents by default, opus where earned (named per wave below), Fable
 > never in subagents. Rung citations (R/J) in every wave PR body."
 
-> Codex (`sergeant-rs-workspace/knowledge/evidence/resources/h-series/
-> sprint-plan-codex-2026-08-21.md`): "integration branch
+> Codex (dev-corpus sprint plan, kept in this project's private
+> development record, not shipped here): "integration branch
 > `integration/codex`, draft head PR carrying this plan, wave branches
 > `codex/w<N>-<slug>` in `/var/tmp/codex-impl/` worktrees (warm base
 > build first), per wave: spec → implement (TDD, DataDir guards,
@@ -45,9 +45,9 @@ not paraphrased):
 > subagents, opus where earned (named below), Fable never below the
 > captain. Rung/ruling citations in every PR body."
 
-> CI/CD hardening (main-only at the time this skill was authored —
-> `sergeant-rs-workspace/knowledge/evidence/resources/cicd-hardening-series/
-> sprint-plan-2026-08-20.md`): "integration branch
+> CI/CD hardening (main-only at the time this skill was authored — a
+> dev-corpus sprint plan, kept in this project's private development
+> record, not shipped here): "integration branch
 > `integration/cicd-hardening`, draft head PR carrying this plan, wave
 > branches `cicd/w<N>-<slug>` in `/var/tmp/cicd-impl/` worktrees, per
 > wave: recon → spec → implement → 4-axis blind panel (spec-fidelity /
@@ -100,6 +100,12 @@ worker-submit-from-surface), which this skill does not pretend around.
 State this limitation plainly rather than implying isolation guarantees
 the shipped `panel`/`refute` stages also don't actually have.
 
+**Edition note:** this limitation was superseded by owner ruling (sprint
+plan amendment 1) — waves MAY be dispatched as Sergeant Works. The
+sub-agent shape above remains this skill's default until a plan
+explicitly elects dispatched waves; state whichever mode a given sprint
+plan actually uses rather than assuming the historical default.
+
 **Model-assignment policy — referenced, not restated.** Every seat this
 method spawns (recon, plan-panel, per-wave implement/panel/refute/fix
 seats) is governed by `.sergeant/common/contexts/model-assignment.md`.
@@ -122,8 +128,6 @@ copy-pasted-into-every-plan defect this kernel exists to stop repeating.
   this skill states this.
 
 ### This skill must not do
-- Dispatch waves as Sergeant Works — state the sub-agent limitation
-  instead, per above.
 - Decide a ratify-at-review item without the owner.
 - Write its own protocol into `AGENTS.md` — the method's vocabulary has
   zero engine footprint and stays out of the always-on file for exactly

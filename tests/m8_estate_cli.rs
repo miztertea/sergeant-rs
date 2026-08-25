@@ -223,15 +223,21 @@ fn init_writes_the_embedded_distro() {
     );
 }
 
-/// guard-map (hard constraint 1): a second `sgt init` on an
-/// already-initialized estate is a true no-op for the distro too — it does
-/// not overwrite a file a user has since edited, and it never creates
+/// guard-map (hard constraint 1, updated by split-hardening W3 / issue
+/// #241's atomic-ownership model): a second `sgt init` on an
+/// already-initialized estate is a true no-op, and it never creates
 /// `.sergeant/local/` (that directory is the user's own; stock never writes
 /// there — hard constraint 3, Phase 3's local-shadows-stock resolution
-/// depends on the separation). Mutation this kills: `write_distro` losing
-/// its per-file existence check (a second init would then clobber the
-/// user's edit back to stock content) or accidentally writing under
-/// `.sergeant/local/` instead of `.sergeant/workflows/`.
+/// depends on the separation). `AGENTS.md` is the one file with a
+/// user-editable surface at all — everything outside its
+/// `sgt:managed:begin`/`sgt:managed:end` markers is the estate's own and
+/// must survive a re-init untouched, while the managed section itself is
+/// sgt-owned and always reset to the embedded body (see
+/// `domain::distro::write_agents_md`). Mutation this kills: `write_distro`
+/// losing its byte-identical skip check (a second init would then rewrite
+/// everything, `changed()` would spuriously report `true`) or the managed-
+/// section splice losing track of the estate's own content outside the
+/// markers.
 #[test]
 fn init_writing_the_distro_is_idempotent_and_never_touches_local() {
     let estate = tempfile::TempDir::new().expect("tempdir");
@@ -239,24 +245,61 @@ fn init_writing_the_distro_is_idempotent_and_never_touches_local() {
     run(estate.path(), Some(&data_dir), &[], &["init"]).assert_ok("init");
     assert!(!estate.path().join(".sergeant/local").exists());
 
-    let sentinel = "the user edited this doctrine file\n";
-    std::fs::write(estate.path().join("AGENTS.md"), sentinel).expect("simulate a user edit");
+    let agents_md_path = estate.path().join("AGENTS.md");
+    let after_first_init = std::fs::read_to_string(&agents_md_path).expect("AGENTS.md");
+    let custom_note = "\n## This estate's own notes\n\nDon't touch this.\n";
+    std::fs::write(&agents_md_path, format!("{after_first_init}{custom_note}"))
+        .expect("simulate an estate appending its own content after the managed section");
 
     let second = run(estate.path(), Some(&data_dir), &[], &["--json", "init"]);
     second.assert_ok("second init");
     assert!(
         !second.json()["outcome"]["changed"].as_bool().unwrap(),
-        "a second init must change nothing, got {}",
+        "a second init must change nothing when the managed section is untouched, got {}",
         second.stdout
     );
-    assert_eq!(
-        std::fs::read_to_string(estate.path().join("AGENTS.md")).expect("AGENTS.md"),
-        sentinel,
-        "a second init must never clobber a user's edited AGENTS.md"
+    let after_second_init = std::fs::read_to_string(&agents_md_path).expect("AGENTS.md");
+    assert!(
+        after_second_init.contains(custom_note.trim()),
+        "a second init must never clobber an estate's own content outside the managed section, \
+         got:\n{after_second_init}"
     );
     assert!(
         !estate.path().join(".sergeant/local").exists(),
         "sgt init must never create .sergeant/local/ — that tree is the user's own"
+    );
+}
+
+/// The other half of the managed-section contract (issue #241 owner ruling
+/// point 3): a pre-existing `AGENTS.md` with no `sgt:managed` markers at all
+/// — the shape a hand-authored constitution predating this convention would
+/// have — must never be guessed at or silently overwritten. `sgt init` fails
+/// closed and names the exact remedy.
+#[test]
+fn init_fails_closed_on_a_marker_less_agents_md() {
+    let estate = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+    std::fs::create_dir_all(estate.path()).expect("mkdir");
+    let sentinel = "a hand-authored constitution with no sgt:managed markers\n";
+    std::fs::write(estate.path().join("AGENTS.md"), sentinel).expect("plant marker-less AGENTS.md");
+
+    let result = run(estate.path(), Some(&data_dir), &[], &["init"]);
+    assert_ne!(
+        result.code,
+        Some(0),
+        "init must fail closed against a marker-less AGENTS.md, got stdout={} stderr={}",
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("sgt:managed:begin"),
+        "the failure must name the exact remedy, got stderr={}",
+        result.stderr
+    );
+    assert_eq!(
+        std::fs::read_to_string(estate.path().join("AGENTS.md")).expect("AGENTS.md"),
+        sentinel,
+        "a failed init must never corrupt the marker-less AGENTS.md it refused to touch"
     );
 }
 

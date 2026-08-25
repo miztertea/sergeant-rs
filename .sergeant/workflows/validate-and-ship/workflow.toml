@@ -1,11 +1,9 @@
-# validate-and-ship — admitted workflow (N1 reference corpus,
-# sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/N1.md; candidate W18,
-# sergeant-rs-workspace/knowledge/evidence/reference-corpus/synthesis.md §1). The single final shipping boundary:
-# validate a committed change through the pipeline to a terminal outcome,
-# routing every finding, without the validating actor ever editing the
-# code. Promoted per docs/icm/promotion-spec-2026-08-11.md; full
-# behavior-unit citation trail archived at
-# sergeant-rs-workspace/knowledge/evidence/gauntlet/promoted-provenance/validate-and-ship.md.
+# validate-and-ship — admitted workflow (N1 reference corpus; candidate
+# W18). The single final shipping boundary: validate a committed change
+# through the pipeline to a terminal outcome, routing every finding,
+# without the validating actor ever editing the code. Promoted per the
+# dev-corpus promotion spec; full behavior-unit citation trail is
+# dev-corpus provenance, kept in this project's private development record, not shipped here.
 #
 # Seven ordinary actor stages (N1 adjudication A4 folded three
 # demoted checkpoints into 20-select-intent-transport and one each into
@@ -14,7 +12,7 @@
 # re-homed repo-release-verification into 20-select-intent-transport — see
 # the archived provenance for the full fold record). Stage order here is
 # authoritative; the directory listing under this workflow's own tree
-# must agree with it lexically (docs/icm/convention.md §1 rule 4).
+# must agree with it lexically (.sergeant/common/contexts/icm-policy.md §1 rule 4).
 #
 # Reshaped in place at the 2026-08-22 distro content rebuild (W2):
 # 00-check-scope gains the delivery-state declared-content-policy act;

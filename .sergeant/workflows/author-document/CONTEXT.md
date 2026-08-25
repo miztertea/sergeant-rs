@@ -2,7 +2,7 @@
 
 Layer 1 orientation only — never delivered as a stage's instructions;
 each stage's own `CONTEXT.md` (Layer 2) is the actor's contract
-(`docs/icm/convention.md` §1a rule 5).
+(`.sergeant/common/contexts/icm-policy.md` §1a rule 5).
 
 ## Purpose
 
@@ -31,7 +31,7 @@ This workflow recommends, and never dispatches, follow-up work its own
 document implies (a decision the draft surfaces as needing further
 investigation becomes a recommended `investigate` intent, never in-scope
 work this Work absorbs). There is no child-workflow dispatch and no
-worker-side submission (`docs/icm/convention.md` §7.5).
+worker-side submission (`.sergeant/common/contexts/icm-policy.md` §7.5).
 
 ## Authority envelope
 

@@ -8,7 +8,7 @@ Ported from `.sergeant/workflows/grilling` (N1 candidate W28), which
 retires: North Star ruling R-NS-6 ("execution ≠ dialogue") holds that
 conversation is the harness's job, never engine work, and dissolves the
 WORKFLOW-IF-E3 category the retriage classifier had provisionally left this
-package in (`docs/icm/retriage-2026-08-11.md`). The dogfood measurement that
+package in (dev-corpus retriage record, kept in this project's private development record). The dogfood measurement that
 forced the call: on this host, both of the retired workflow's stages
 completed autonomously with **zero** `needs_input` pauses in 2/2 runs — "negative
 value vs plain terminal Claude" — because a durable `sgt run` stage has no
@@ -81,8 +81,8 @@ If this invocation has no live human who will send the next message — the
 harness is running headless/unattended, not mid-conversation with a
 person — a "grill" invocation degrades to your best-guess autonomous
 answers with nothing to confirm against. (Corrected 2026-08-16, ICM-R2
-pilot review: the prior text here cited `docs/environments/cerberus.md`
-for this claim, but that file measures a different mechanism entirely —
+pilot review: the prior text here cited a per-host environment record
+for this claim, but that record measures a different mechanism entirely —
 the engine's `post_turn_summary`/`NeedsInput` signal for a dispatched
 workflow stage, not Captain-session turn-taking, which never goes through
 that machinery. The real distinguishing fact is self-evident from the

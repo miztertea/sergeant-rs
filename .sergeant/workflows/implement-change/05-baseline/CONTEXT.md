@@ -38,8 +38,8 @@ Apply `@@bounded-judgment`.
 
 ### J2 — delegated to this stage
 - Discovering the correct test command when the repository does not name
-  one obviously (checking `docs/DEVELOPMENT.md`, CI configuration, or
-  existing suite conventions).
+  one obviously (checking this repository's own contributing/development
+  docs, CI configuration, or existing suite conventions).
 
 ### J1 — local choices allowed
 - Exact wording of the baseline record.

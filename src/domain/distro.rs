@@ -24,12 +24,33 @@
 //! fetch`; no transitive crates beyond those two). Measured cost of this
 //! addition, recorded in the commit message: release binary size delta and
 //! `cargo build --release` wall time, before vs. after.
+//!
+//! ## Atomic ownership (issue #241, split-hardening W3)
+//!
+//! `sgt init` used to write per-file and never overwrite or remove anything
+//! — a stale copy of a retired package lingered on every estate forever
+//! (#241: "18 retired packages lingered" after a distro rebuild). This
+//! module now treats three trees as **entirely sgt-owned**: `skills/`,
+//! `.sergeant/common/contexts/`, and `.sergeant/workflows/`. After
+//! [`write_distro`] runs, each of those trees exactly matches the running
+//! binary's embedded content — a file whose content differs from the embed
+//! is overwritten, and a file present on disk but absent from the current
+//! embed is removed (retired-package cleanup). `.sergeant/local/` is never
+//! touched by any of this — see the safety note on [`remove_retired_files`].
+//!
+//! `AGENTS.md` is a partial exception (owned only inside a marker-delimited
+//! managed section, so an estate can append its own content around it — see
+//! [`write_agents_md`]), and `.sergeant/index.md` is generated fresh on
+//! every init from the workflow packages actually written, rather than
+//! embedded as a fifth static copy that could itself drift (#261).
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use include_dir::{Dir, include_dir};
 
+use crate::domain::workflow::{ROOT_CATALOG_FILE, WORKFLOW_ROOT, read_index_front_matter};
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 
 static AGENTS_MD: &str = include_str!("../../AGENTS.md");
@@ -37,36 +58,72 @@ static SKILLS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/skills");
 static CONTEXTS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/.sergeant/common/contexts");
 static WORKFLOWS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/.sergeant/workflows");
 
-/// Which paths this call actually wrote vs. left untouched because they
-/// already existed. `written.is_empty()` on a second `sgt init` is the
-/// no-op signal the AGENTS.md guardrail requires ("re-running `sgt init` on
-/// an already-initialized estate is a no-op, not a reset").
+/// The comment markers delimiting `AGENTS.md`'s sgt-owned managed section.
+/// See [`write_agents_md`].
+const MANAGED_BEGIN: &str = "<!-- sgt:managed:begin -->";
+const MANAGED_END: &str = "<!-- sgt:managed:end -->";
+
+/// What went wrong writing the distro. Distinct from a bare [`io::Error`]
+/// because the managed-`AGENTS.md` case (below) is not an I/O fault at all
+/// — it is a deliberate refusal to guess at merging content, and callers
+/// (`sgt init`'s own report, doctor) want to say so by name rather than
+/// print a generic I/O message.
+#[derive(Debug, thiserror::Error)]
+pub enum DistroError {
+    /// `AGENTS.md` exists, is not empty, and contains neither
+    /// `sgt:managed:begin` nor `sgt:managed:end` — most likely a
+    /// pre-existing, hand-authored constitution this estate wrote before
+    /// the managed-section convention existed. Overwriting it would
+    /// silently discard custom content; guessing where to insert markers
+    /// would silently corrupt it. Fail closed and name the exact remedy.
+    #[error(
+        "AGENTS.md exists without sgt:managed markers — insert `{MANAGED_BEGIN}` / \
+         `{MANAGED_END}` around the section sgt should own, or remove the file to let \
+         `sgt init` write it fresh"
+    )]
+    UnmanagedAgentsMd,
+    /// Any other failure is a plain I/O fault.
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+/// Which paths this call actually wrote, left untouched, or removed.
+///
+/// `changed()` — `written` or `removed` nonempty — is the no-op signal the
+/// `AGENTS.md` guardrail requires ("re-running `sgt init` on an
+/// already-initialized estate is a no-op, not a reset"): with the same
+/// binary and no on-disk drift, a second `sgt init` writes and removes
+/// nothing, because every owned file already matches the embed byte for
+/// byte.
 #[derive(Debug, Default, Clone)]
 pub struct DistroWriteOutcome {
-    /// Paths created by this call, relative to the estate root.
+    /// Paths created or overwritten by this call, relative to the estate
+    /// root.
     pub written: Vec<PathBuf>,
-    /// Paths that already existed and were left alone, relative to the
-    /// estate root.
+    /// Paths that already matched the embed and were left alone, relative
+    /// to the estate root.
     pub skipped: Vec<PathBuf>,
+    /// Paths removed by this call because they exist on disk inside a
+    /// sgt-owned tree but are not part of the current embed
+    /// (retired-package cleanup, #241), relative to the estate root.
+    pub removed: Vec<PathBuf>,
 }
 
 impl DistroWriteOutcome {
-    /// Whether this call wrote anything at all.
+    /// Whether this call changed anything at all.
     pub fn changed(&self) -> bool {
-        !self.written.is_empty()
+        !self.written.is_empty() || !self.removed.is_empty()
     }
 }
 
 /// Write the embedded distro into `estate_root`.
 ///
-/// Per-file idempotent: a file that already exists at its target path is
-/// never overwritten, so a second `sgt init` on an already-initialized
-/// estate writes nothing (hard constraint: re-running init is a no-op, not
-/// a reset). Writes only under `estate_root` — `AGENTS.md`, `skills/`,
-/// `.sergeant/common/contexts/`, `.sergeant/workflows/` — and never touches
-/// `.sergeant/local/`, which is the user's own and which Phase 3's
-/// local-shadows-stock resolution (`domain::workflow::WorkflowDefinition::
-/// resolve`) depends on staying separate from stock.
+/// Writes only under `estate_root` — `AGENTS.md`, `CLAUDE.md`, `skills/`,
+/// `.sergeant/common/contexts/`, `.sergeant/workflows/`, and
+/// `.sergeant/index.md` — and never touches `.sergeant/local/`, which is the
+/// user's own and which Phase 3's local-shadows-stock resolution
+/// (`domain::workflow::WorkflowDefinition::resolve`) depends on staying
+/// separate from stock.
 ///
 /// `index.md` and `SKILL.md` front matter's `edition` field is rewritten to
 /// this binary's own version (`env!("CARGO_PKG_VERSION")`) as each file is
@@ -75,83 +132,351 @@ impl DistroWriteOutcome {
 /// current distro version whenever it writes a stock copy") without relying
 /// on every future release remembering to hand-bump the checked-in
 /// front matter to match `Cargo.toml` before cutting the release.
-pub fn write_distro(estate_root: &Path) -> io::Result<DistroWriteOutcome> {
+pub fn write_distro(estate_root: &Path) -> Result<DistroWriteOutcome, DistroError> {
     let mut outcome = DistroWriteOutcome::default();
 
-    write_file(
-        estate_root,
-        Path::new("AGENTS.md"),
-        AGENTS_MD.as_bytes(),
-        &mut outcome,
-    )?;
-    write_dir(estate_root, Path::new("skills"), &SKILLS, &mut outcome)?;
-    write_dir(
+    write_agents_md(estate_root, &mut outcome)?;
+    symlink_claude_md(estate_root, &mut outcome)?;
+
+    sync_owned_dir(estate_root, Path::new("skills"), &SKILLS, &mut outcome)?;
+    sync_owned_dir(
         estate_root,
         Path::new(".sergeant/common/contexts"),
         &CONTEXTS,
         &mut outcome,
     )?;
-    write_dir(
+    sync_owned_dir(
         estate_root,
         Path::new(".sergeant/workflows"),
         &WORKFLOWS,
         &mut outcome,
     )?;
 
+    // Generated after the workflows tree above is itself in its final,
+    // post-sync state, so reading packages back off disk here sees exactly
+    // the current embed — the same "read back what was actually written"
+    // idiom `write_distro`'s edition rewrite already uses, rather than a
+    // second, independently-walked copy of the same package list that
+    // could drift from the first.
+    write_index_md(estate_root, &mut outcome)?;
+
     Ok(outcome)
+}
+
+/// `AGENTS.md`'s managed-section write (issue #261, owner ruling point 3).
+///
+/// `AGENTS.md` is not written as one opaque, never-touched-again blob: init
+/// owns only the text between `sgt:managed:begin`/`sgt:managed:end`
+/// comment markers.
+///
+/// - No `AGENTS.md` yet: write the full file, with the embedded body
+///   wrapped in fresh markers.
+/// - `AGENTS.md` exists and carries both markers: rewrite only the text
+///   between them to the current embedded body, byte for byte; everything
+///   before `begin` and after `end` — an estate's own appended content —
+///   is preserved untouched.
+/// - `AGENTS.md` exists but carries no markers: fail closed
+///   ([`DistroError::UnmanagedAgentsMd`]) rather than guess whether it is
+///   safe to overwrite or where to insert markers into a hand-authored
+///   file. This never happens on a fresh estate; it is the sole case
+///   `write_distro` can return before the rest of the distro is written.
+fn write_agents_md(
+    estate_root: &Path,
+    outcome: &mut DistroWriteOutcome,
+) -> Result<(), DistroError> {
+    let rel_path = Path::new("AGENTS.md");
+    let full_path = estate_root.join(rel_path);
+
+    let existing = match std::fs::read_to_string(&full_path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    let Some(existing) = existing else {
+        let managed = format!("{MANAGED_BEGIN}\n{AGENTS_MD}{MANAGED_END}\n");
+        write_atomic(&full_path, managed.as_bytes())?;
+        outcome.written.push(rel_path.to_path_buf());
+        return Ok(());
+    };
+
+    let (Some(begin_at), Some(end_at)) = (existing.find(MANAGED_BEGIN), existing.find(MANAGED_END))
+    else {
+        return Err(DistroError::UnmanagedAgentsMd);
+    };
+    if end_at < begin_at {
+        return Err(DistroError::UnmanagedAgentsMd);
+    }
+
+    let before = &existing[..begin_at];
+    let after = &existing[end_at + MANAGED_END.len()..];
+    let rewritten = format!("{before}{MANAGED_BEGIN}\n{AGENTS_MD}{MANAGED_END}{after}");
+
+    if rewritten == existing {
+        outcome.skipped.push(rel_path.to_path_buf());
+        return Ok(());
+    }
+    write_atomic(&full_path, rewritten.as_bytes())?;
+    outcome.written.push(rel_path.to_path_buf());
+    Ok(())
+}
+
+/// `CLAUDE.md -> AGENTS.md` (owner ruling point 2): a symlink so a harness
+/// that only looks for `CLAUDE.md` still finds the one constitution.
+///
+/// Never overwrites a pre-existing regular (non-symlink) `CLAUDE.md` — an
+/// estate that already has its own is left exactly alone. When the
+/// platform or filesystem doesn't support symlinks, the attempt is made
+/// and its failure is swallowed: `sgt init` never fails because of this,
+/// it just leaves `CLAUDE.md` absent.
+fn symlink_claude_md(estate_root: &Path, outcome: &mut DistroWriteOutcome) -> io::Result<()> {
+    let rel_path = Path::new("CLAUDE.md");
+    let full_path = estate_root.join(rel_path);
+
+    match std::fs::symlink_metadata(&full_path) {
+        Ok(_) => {
+            // Already there — a symlink from a prior init, or a real file
+            // this estate owns. Either way, never overwritten.
+            outcome.skipped.push(rel_path.to_path_buf());
+            return Ok(());
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
+    if create_symlink(Path::new("AGENTS.md"), &full_path).is_ok() {
+        outcome.written.push(rel_path.to_path_buf());
+    }
+    // Symlinks unsupported on this platform/filesystem: skip gracefully,
+    // per the owner ruling ("if the platform doesn't support symlinks,
+    // skip gracefully — don't fail init").
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_symlink(_target: &Path, _link: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "symlinks are not supported on this platform",
+    ))
+}
+
+/// Make `estate_root/prefix` exactly match `dir`'s embedded content: every
+/// embedded file is written (or left alone if already byte-identical), and
+/// every file on disk under `estate_root/prefix` that is **not** part of
+/// the current embed is removed (#241's retired-package cleanup).
+fn sync_owned_dir(
+    estate_root: &Path,
+    prefix: &Path,
+    dir: &Dir<'static>,
+    outcome: &mut DistroWriteOutcome,
+) -> io::Result<()> {
+    let mut embedded_rel: BTreeSet<PathBuf> = BTreeSet::new();
+    write_owned_files(estate_root, prefix, dir, &mut embedded_rel, outcome)?;
+    remove_retired_files(estate_root, prefix, &embedded_rel, outcome)?;
+    Ok(())
 }
 
 /// Recurse `dir` (an `include_dir!` tree), writing every file it contains
 /// under `estate_root/prefix/<file's own path within dir>` — `File::path()`
 /// already carries the full path relative to the tree's own root, so no
 /// manual path accumulation is needed as this recurses into subdirectories.
-fn write_dir(
+/// Records every path written into `embedded_rel`, which
+/// [`remove_retired_files`] then uses to find what does *not* belong.
+fn write_owned_files(
     estate_root: &Path,
     prefix: &Path,
     dir: &Dir<'static>,
+    embedded_rel: &mut BTreeSet<PathBuf>,
     outcome: &mut DistroWriteOutcome,
 ) -> io::Result<()> {
     for file in dir.files() {
-        write_file(
-            estate_root,
-            &prefix.join(file.path()),
-            file.contents(),
-            outcome,
-        )?;
+        let rel_path = prefix.join(file.path());
+        embedded_rel.insert(rel_path.clone());
+        write_owned_file(estate_root, &rel_path, file.contents(), outcome)?;
     }
     for sub in dir.dirs() {
-        write_dir(estate_root, prefix, sub, outcome)?;
+        write_owned_files(estate_root, prefix, sub, embedded_rel, outcome)?;
     }
     Ok(())
 }
 
-/// Write one file at `estate_root/rel_path` if and only if nothing is there
-/// yet. `rel_path`'s leaf name decides whether `edition` front matter gets
-/// rewritten to this binary's version before the bytes hit disk.
-fn write_file(
+/// Write one owned file, **overwriting** whatever is already there when
+/// the content differs — the three owned trees are sgt-owned, not
+/// user-owned (unlike `.sergeant/local/`, which this function is never
+/// called on), so a stale or user-edited copy inside them is replaced
+/// rather than preserved. Skips the actual write when the target already
+/// holds byte-identical content, which is what keeps a same-binary second
+/// `sgt init` a true no-op.
+fn write_owned_file(
     estate_root: &Path,
     rel_path: &Path,
     contents: &[u8],
     outcome: &mut DistroWriteOutcome,
 ) -> io::Result<()> {
     let full_path = estate_root.join(rel_path);
-    if full_path.exists() {
+    let carries_edition = matches!(
+        rel_path.file_name().and_then(|n| n.to_str()),
+        Some("index.md") | Some("SKILL.md")
+    );
+    let rewritten;
+    let final_bytes: &[u8] = if carries_edition && let Ok(text) = std::str::from_utf8(contents) {
+        rewritten = rewrite_edition(text).into_bytes();
+        &rewritten
+    } else {
+        contents
+    };
+
+    if let Ok(existing) = std::fs::read(&full_path)
+        && existing == final_bytes
+    {
         outcome.skipped.push(rel_path.to_path_buf());
         return Ok(());
     }
     if let Some(parent) = full_path.parent() {
         create_dir_all_durable(parent)?;
     }
-    let carries_edition = matches!(
-        rel_path.file_name().and_then(|n| n.to_str()),
-        Some("index.md") | Some("SKILL.md")
+    write_atomic(&full_path, final_bytes)?;
+    outcome.written.push(rel_path.to_path_buf());
+    Ok(())
+}
+
+/// Delete every file on disk under `estate_root/prefix` that is not a key
+/// of `embedded_rel`, then prune any directory left empty by that removal.
+///
+/// **Scope guarantee**: this function only ever reads and deletes inside
+/// `estate_root.join(prefix)`. Every call site in this module passes one
+/// of the three sgt-owned trees (`skills`, `.sergeant/common/contexts`,
+/// `.sergeant/workflows`) as `prefix` — `.sergeant/local/` is never passed
+/// here and this function has no path to reach it; that is what keeps
+/// #241's cleanup from ever touching the user's own workflow namespace.
+fn remove_retired_files(
+    estate_root: &Path,
+    prefix: &Path,
+    embedded_rel: &BTreeSet<PathBuf>,
+    outcome: &mut DistroWriteOutcome,
+) -> io::Result<()> {
+    let owned_root = estate_root.join(prefix);
+    let mut on_disk = Vec::new();
+    walk_files(&owned_root, &mut on_disk);
+
+    for full_path in on_disk {
+        let rel_path = match full_path.strip_prefix(estate_root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => continue,
+        };
+        if !embedded_rel.contains(&rel_path) {
+            std::fs::remove_file(&full_path)?;
+            outcome.removed.push(rel_path);
+        }
+    }
+
+    prune_empty_dirs(&owned_root);
+    Ok(())
+}
+
+/// Recursively list every file (never a directory) under `dir`.
+fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
+}
+
+/// Remove `dir` and every subdirectory left with nothing in it after
+/// [`remove_retired_files`] deleted its files — cosmetic (an empty
+/// directory is harmless), but a retired package's directory disappearing
+/// along with its files is the less surprising result.
+fn prune_empty_dirs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            prune_empty_dirs(&path);
+        }
+    }
+    if std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_none()) {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
+/// Generate `.sergeant/index.md` from the workflow packages actually on
+/// disk under `.sergeant/workflows/` post-sync (issue #261 fix option 1):
+/// read back rather than hand-embedded as a fifth static copy, so the
+/// catalog can never itself drift from the packages `sgt init` just wrote
+/// — the exact failure mode a second, independently-maintained copy would
+/// reintroduce. Has no user-editable surface (there is nothing here for an
+/// estate to have customized), so it is regenerated — compared, then
+/// written only if different — on every `sgt init`, the same way
+/// `AGENTS.md`'s managed section is.
+fn write_index_md(estate_root: &Path, outcome: &mut DistroWriteOutcome) -> io::Result<()> {
+    let workflows_dir = estate_root.join(WORKFLOW_ROOT);
+    let mut names: Vec<String> = std::fs::read_dir(&workflows_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                .filter(|entry| entry.path().join("workflow.toml").is_file())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+
+    let mut body = String::new();
+    body.push_str(
+        "<!-- Generated by `sgt init` from the workflow packages shipped under \
+         `.sergeant/workflows/`. Regenerated on every `sgt init` — hand edits here \
+         do not survive a re-init. -->\n\n",
     );
-    if carries_edition && let Ok(text) = std::str::from_utf8(contents) {
-        write_atomic(&full_path, rewrite_edition(text).as_bytes())?;
-        outcome.written.push(rel_path.to_path_buf());
+    body.push_str("# Workflow catalog\n\n");
+    body.push_str(
+        "Every admitted workflow this estate ships, generated from each package's own \
+         `index.md` front matter.\n\n",
+    );
+    body.push_str("| Workflow | Status | Index |\n");
+    body.push_str("|---|---|---|\n");
+    for name in &names {
+        let status = read_index_front_matter(&workflows_dir.join(name))
+            .map(|fm| fm.status)
+            .unwrap_or_else(|| "published".to_string());
+        let index_path = format!("{WORKFLOW_ROOT}/{name}/index.md");
+        body.push_str(&format!(
+            "| `{name}` | {status} | [`{index_path}`]({index_path}) |\n"
+        ));
+    }
+
+    let rel_path = Path::new(ROOT_CATALOG_FILE);
+    let full_path = estate_root.join(rel_path);
+    if let Ok(existing) = std::fs::read_to_string(&full_path)
+        && existing == body
+    {
+        outcome.skipped.push(rel_path.to_path_buf());
         return Ok(());
     }
-    write_atomic(&full_path, contents)?;
+    if let Some(parent) = full_path.parent() {
+        create_dir_all_durable(parent)?;
+    }
+    write_atomic(&full_path, body.as_bytes())?;
     outcome.written.push(rel_path.to_path_buf());
     Ok(())
 }
@@ -162,7 +487,7 @@ fn write_file(
 /// deliberately narrower than a YAML parser (matching
 /// `domain::workflow::parse_index_front_matter`'s own "tiny local
 /// composition" rather than a general parser, Ponytail R6), scoped to
-/// exactly the shape `sergeant-rs-workspace's knowledge/evidence/reference/icm/record-shapes.md` §1 fixes.
+/// exactly the shape ADR 0016 fixes.
 fn rewrite_edition(text: &str) -> String {
     let mut lines = text.lines();
     let Some(first) = lines.next() else {
@@ -214,35 +539,101 @@ mod tests {
     }
 
     #[test]
-    fn write_distro_is_per_file_idempotent() {
+    fn write_distro_is_owned_tree_idempotent() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let first = write_distro(tmp.path()).expect("first write");
         assert!(first.changed());
         assert!(tmp.path().join("AGENTS.md").is_file());
         assert!(tmp.path().join(".sergeant/workflows").is_dir());
 
-        let sentinel = tmp.path().join("AGENTS.md");
-        let edited = "user-edited content, must survive a second call\n";
-        std::fs::write(&sentinel, edited).expect("simulate a user edit");
-
         let second = write_distro(tmp.path()).expect("second write");
         assert!(
             !second.changed(),
-            "a second call must write nothing, got {:?}",
-            second.written
+            "a second call with the same binary must write and remove nothing, got \
+             written={:?} removed={:?}",
+            second.written,
+            second.removed
         );
-        assert_eq!(
-            std::fs::read_to_string(&sentinel).expect("read AGENTS.md"),
-            edited,
-            "a second call must never clobber an existing file"
+    }
+
+    #[test]
+    fn write_distro_overwrites_a_drifted_owned_file() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_distro(tmp.path()).expect("first write");
+
+        // Any real shipped skill file works as the drift target.
+        let target = tmp.path().join("skills/sergeant-help/SKILL.md");
+        std::fs::write(&target, "drifted content, must be replaced").expect("simulate drift");
+
+        let second = write_distro(tmp.path()).expect("second write");
+        assert!(
+            second.changed(),
+            "an owned-tree file that drifted from the embed must be rewritten"
+        );
+        let text = std::fs::read_to_string(&target).expect("read back");
+        assert_ne!(text, "drifted content, must be replaced");
+    }
+
+    #[test]
+    fn write_distro_removes_a_retired_owned_file() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_distro(tmp.path()).expect("first write");
+
+        let retired = tmp
+            .path()
+            .join(".sergeant/workflows/retired-package-not-in-embed/index.md");
+        std::fs::create_dir_all(retired.parent().unwrap()).expect("mkdir");
+        std::fs::write(&retired, "a package the current embed no longer ships").expect("plant");
+        assert!(retired.exists());
+
+        let second = write_distro(tmp.path()).expect("second write");
+        assert!(
+            !retired.exists(),
+            "a file inside an owned tree not present in the current embed must be removed"
+        );
+        assert!(
+            second
+                .removed
+                .iter()
+                .any(|p| p.ends_with("retired-package-not-in-embed/index.md")),
+            "the outcome must report the removal, got {:?}",
+            second.removed
+        );
+        assert!(
+            !retired.parent().unwrap().exists(),
+            "the now-empty retired package directory should be pruned"
         );
     }
 
     #[test]
     fn write_distro_never_touches_local() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".sergeant/local/workflows/mine"))
+            .expect("mkdir local");
+        std::fs::write(
+            tmp.path()
+                .join(".sergeant/local/workflows/mine/workflow.toml"),
+            "a user's own local workflow",
+        )
+        .expect("plant local file");
+
         write_distro(tmp.path()).expect("write");
-        assert!(!tmp.path().join(".sergeant/local").exists());
+
+        assert!(
+            tmp.path()
+                .join(".sergeant/local/workflows/mine/workflow.toml")
+                .is_file(),
+            "sgt-owned tree sync must never touch .sergeant/local/"
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                tmp.path()
+                    .join(".sergeant/local/workflows/mine/workflow.toml")
+            )
+            .expect("read local file"),
+            "a user's own local workflow",
+            "a user's own local content must survive byte-for-byte"
+        );
     }
 
     #[test]
@@ -278,5 +669,100 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn write_distro_creates_the_claude_md_symlink() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_distro(tmp.path()).expect("write");
+
+        let claude_md = tmp.path().join("CLAUDE.md");
+        let meta = std::fs::symlink_metadata(&claude_md).expect("CLAUDE.md must exist");
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&claude_md).expect("read_link");
+            assert_eq!(target, Path::new("AGENTS.md"));
+        }
+        // On a platform without symlink support the file simply won't
+        // exist at all — asserted separately below via the AGENTS.md
+        // content check, which does not depend on the symlink.
+        assert!(
+            std::fs::read_to_string(&claude_md)
+                .expect("CLAUDE.md must be readable")
+                .contains(MANAGED_BEGIN),
+            "CLAUDE.md must resolve to AGENTS.md's own managed content"
+        );
+    }
+
+    #[test]
+    fn write_distro_generates_the_index_catalog() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_distro(tmp.path()).expect("write");
+
+        let index = std::fs::read_to_string(tmp.path().join(ROOT_CATALOG_FILE))
+            .expect("read .sergeant/index.md");
+        assert!(index.contains("| Workflow | Status | Index |"));
+        // Every workflow package actually written must be named in the
+        // generated catalog.
+        for entry in std::fs::read_dir(tmp.path().join(WORKFLOW_ROOT)).expect("read_dir") {
+            let entry = entry.expect("entry");
+            if entry.path().join("workflow.toml").is_file() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                assert!(
+                    index.contains(&format!("`{name}`")),
+                    ".sergeant/index.md must list workflow package {name:?}, got:\n{index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_agents_md_wraps_a_fresh_file_in_managed_markers() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_distro(tmp.path()).expect("write");
+
+        let text = std::fs::read_to_string(tmp.path().join("AGENTS.md")).expect("read AGENTS.md");
+        assert!(text.starts_with(MANAGED_BEGIN));
+        assert!(text.contains(MANAGED_END));
+        assert!(text.contains(AGENTS_MD));
+    }
+
+    #[test]
+    fn write_agents_md_preserves_content_outside_the_markers_on_reinit() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let agents_md = tmp.path().join("AGENTS.md");
+        std::fs::create_dir_all(tmp.path()).expect("mkdir");
+        let custom = format!(
+            "# This estate's own preamble\n\nCustom text before.\n\n{MANAGED_BEGIN}\nstale \
+             body\n{MANAGED_END}\n\nCustom text after.\n"
+        );
+        std::fs::write(&agents_md, &custom).expect("plant custom AGENTS.md");
+
+        write_distro(tmp.path()).expect("write");
+
+        let text = std::fs::read_to_string(&agents_md).expect("read AGENTS.md");
+        assert!(text.contains("Custom text before."));
+        assert!(text.contains("Custom text after."));
+        assert!(text.contains(AGENTS_MD));
+        assert!(!text.contains("stale body"));
+    }
+
+    #[test]
+    fn write_agents_md_fails_closed_without_markers() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let agents_md = tmp.path().join("AGENTS.md");
+        std::fs::write(
+            &agents_md,
+            "a hand-authored constitution with no markers at all\n",
+        )
+        .expect("plant unmanaged AGENTS.md");
+
+        let err = write_distro(tmp.path()).expect_err("must fail closed");
+        assert!(matches!(err, DistroError::UnmanagedAgentsMd));
+
+        let text = std::fs::read_to_string(&agents_md).expect("read AGENTS.md");
+        assert_eq!(
+            text, "a hand-authored constitution with no markers at all\n",
+            "a marker-less AGENTS.md must never be corrupted by a failed init"
+        );
     }
 }

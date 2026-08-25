@@ -2,7 +2,7 @@
 
 Resolved as `@@fan-out-evidence` from
 `.sergeant/common/contexts/fan-out-evidence.md` per
-`docs/icm/convention.md` §4. Shared stage context, two or more consumers:
+`.sergeant/common/contexts/icm-policy.md` §4. Shared stage context, two or more consumers:
 `investigate/10-fan-out-evidence`, `implement-change/20-panel`,
 `review-change/20-panel` (the general fan-out mechanism `panel.md` and
 `refute.md` specialize for the four fixed axes).
@@ -37,7 +37,7 @@ and nothing of its siblings' reasoning. It is weaker than the isolation a
 separate Work would give — the seats share this stage's single execution,
 its journal entry, its usage window and its failure; there is no per-seat
 journal, no per-seat recovery, and a stage that dies takes every seat's
-unwritten output with it. `docs/icm/convention.md` §6.3 places review
+unwritten output with it. `.sergeant/common/contexts/icm-policy.md` §6.3 places review
 independence in the execution boundary: this stage has one execution boundary, not four.
 Report this panel as what it is — four isolated
 briefs read by one stage — and never as four independent reviews.

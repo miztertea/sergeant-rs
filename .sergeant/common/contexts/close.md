@@ -1,7 +1,7 @@
 # Close
 
 Resolved as `@@close` from `.sergeant/common/contexts/close.md` per
-`docs/icm/convention.md` §4. Shared stage context, two or more consumers:
+`.sergeant/common/contexts/icm-policy.md` §4. Shared stage context, two or more consumers:
 `implement-change/40-close`, `investigate/40-close`,
 `review-change/40-report`, `remediate-findings/40-disposition-matrix`,
 `author-document/40-finalize`, `fix-defect/60-re-verify-and-postmortem`.
@@ -19,7 +19,7 @@ every package that has one.
 - **The panel's coverage, honestly**: four axes or fewer, and if fewer,
   which axis was missing and why.
 - **Every declared `promote` artifact named and confirmed present**
-  (`docs/icm/convention.md` §1a). This is the disposition act itself —
+  (`.sergeant/common/contexts/icm-policy.md` §1a). This is the disposition act itself —
   the closing actor lists every `promote` path by name, confirms each
   exists, and states which `evidence`-class artifacts it is deliberately
   leaving on the Work branch. No deterministic finalize helper does this;

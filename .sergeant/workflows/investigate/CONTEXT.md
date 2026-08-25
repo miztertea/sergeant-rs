@@ -2,7 +2,7 @@
 
 Layer 1 orientation only — never delivered as a stage's instructions;
 each stage's own `CONTEXT.md` (Layer 2) is the actor's contract
-(`docs/icm/convention.md` §1a rule 5).
+(`.sergeant/common/contexts/icm-policy.md` §1a rule 5).
 
 ## Purpose
 
@@ -30,7 +30,7 @@ gathering, and the reading legwork is delegated.
 This workflow recommends, and never dispatches, whatever next intent its
 close packet names — most often `implement-change` or `author-document`,
 when the answer implies further work. There is no child-workflow dispatch
-and no worker-side submission (`docs/icm/convention.md` §7.5).
+and no worker-side submission (`.sergeant/common/contexts/icm-policy.md` §7.5).
 
 ## Authority envelope
 

@@ -2,7 +2,7 @@
 
 Layer 1 orientation only — never delivered as a stage's instructions;
 each stage's own `CONTEXT.md` (Layer 2) is the actor's contract
-(`docs/icm/convention.md` §1a rule 5).
+(`.sergeant/common/contexts/icm-policy.md` §1a rule 5).
 
 ## Purpose
 
@@ -38,7 +38,7 @@ the workflow it recommends (most often `remediate-findings`, when a
 finding is confirmed-but-deliberately-unfixed, or `review-change`, when a
 colleague's later diff on the same area should be reviewed independently)
 — Captain and the human authorize any of it. There is no child-workflow
-dispatch and no worker-side submission (`docs/icm/convention.md` §7.5;
+dispatch and no worker-side submission (`.sergeant/common/contexts/icm-policy.md` §7.5;
 design record §C.1–C.2).
 
 ## Authority envelope
