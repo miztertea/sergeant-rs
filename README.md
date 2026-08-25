@@ -103,6 +103,7 @@ An estate is any directory initialized by Sergeant: the exact directory containi
 my-product/
 ├── sergeant.toml
 ├── AGENTS.md
+├── CLAUDE.md -> AGENTS.md
 ├── skills/
 ├── .sergeant/
 └── repos/
@@ -158,6 +159,8 @@ Sergeant ships with seven named workflows — implementing a change (with an in-
 
 Custom workflows are encouraged. Tell Captain how your team works and ask it to create one. New candidates land under `.sergeant/drafts/workflows/<name>/`, where they are reviewable but not runnable; after review, they are promoted into `.sergeant/workflows/<name>/`. That publication boundary is deliberate: generated procedure never becomes runnable merely because an agent wrote it. The complete authoring model is the ICM filesystem convention, maintained in the sergeant-rs-workspace knowledge library.
 
+A repository can also override a stock package for itself: a same-named workflow under that repository's `.sergeant/local/workflows/<name>/` fully shadows the shipped one, without touching the estate-wide catalog.
+
 ## Work survives the session
 
 A Sergeant Work is not a terminal, a model process, or a chat session — it is durable state. You can:
@@ -192,6 +195,8 @@ The durability promise is not that a process survives every interruption. The pr
 | Dirty-state accounting | Uncommitted, misplaced, or unaccounted-for Git results stay visible |
 | Transcripts and provenance graphs | You can inspect the conversation and causal history of any Work |
 
+A Work moves through eight named states — `pending`, `active`, `waiting`, `needs_input`, `blocked`, and the terminal `completed`, `failed`, `canceled` — under a fixed transition table; `completed` and `canceled` are absorbing, `failed` is retryable by explicit operator action, and everything not in the table is rejected before it can be journaled.
+
 Sergeant treats a Work's Git worktrees as its declared mutation surface. It records integrity problems and estate drift, but it is not an operating-system security boundary. For stronger isolation, run Sergeant and your harness inside a VM, container, restricted account, or sandbox of your choice.
 
 ## Stay informed without babysitting
@@ -217,7 +222,7 @@ sgt --json watch <work-id> --follow
 
 `sgt watch` blocks quietly until Work completes, fails, blocks, or needs input — one blocking call instead of a polling loop. Captain can delegate the Work, keep talking with you or go idle, and react when Sergeant has something meaningful to report. Omit the id for an estate-wide watch.
 
-**For automation: CLI, JSON, and API.** Every major CLI surface supports structured output via a global `--json`. The CLI and TUI are both plain clients of the daemon's loopback HTTP/SSE API — neither holds private state.
+**For automation: CLI, JSON, and API.** Every major CLI surface supports structured output via a global `--json`. The CLI and TUI are both plain clients of the daemon's loopback HTTP/SSE API — neither holds private state. Every API route but `/healthz` requires the bearer token from the runtime descriptor.
 
 **For operations: OpenTelemetry.** OTLP/HTTP export is optional and off by default:
 
@@ -238,11 +243,11 @@ Whatever toolchains your repositories use, Sergeant itself needs only Git (repos
 | Surface | Current state |
 |---|---|
 | Platforms | Linux, macOS, and Windows through WSL2 |
-| Harness launchers | `sgt claude`, `sgt codex`, `sgt opencode`, `sgt goose` |
+| Harness launchers | `sgt claude`, `sgt codex`, `sgt opencode`, `sgt agy`, `sgt goose` |
 | Primary Captain harnesses | Claude Code and Codex |
-| Agent workflow execution | Claude, Codex, and OpenCode (`--backend claude\|codex\|opencode`); stages that stop to ask a question run on Claude or OpenCode's serve transport — Codex is not yet a supported backend for those |
+| Agent workflow execution | Claude, Codex, OpenCode, and Agy (`--backend claude\|codex\|opencode\|agy`); stages that stop to ask a question run on Claude or OpenCode's serve transport — Codex and Agy are not yet supported backends for those |
 | Deterministic workflow execution | Docker |
-| Planned | Goose and Antigravity as full Captain and backend targets |
+| Planned | Goose as a full Captain and backend target |
 
 Sergeant is pre-1.0. Configuration and interfaces may change between releases while the product model settles.
 
@@ -275,11 +280,11 @@ sgt run "add retry handling to the settlement worker" \
   --group payments
 ```
 
-Agent stages run on the backend you route to (`--backend claude|codex|opencode`, or a routing profile in `sergeant.toml`). Add `--backend fake` to any `sgt run` to try the whole loop deterministically without spending tokens, or run `scripts/demo.sh` from a source checkout for a guided end-to-end walkthrough. `sgt --help` and each subcommand's `--help` are the authority on the current command surface.
+Agent stages run on the backend you route to (`--backend claude|codex|opencode|agy`, or a routing profile in `sergeant.toml`). Add `--backend fake` to any `sgt run` to try the whole loop deterministically without spending tokens, or run `scripts/demo.sh` from a source checkout for a guided end-to-end walkthrough. `sgt --help` and each subcommand's `--help` are the authority on the current command surface.
 
 ## Bounded history, never silent deletion
 
-Each estate declares how much terminal Work history it retains — 1,000 terminal Works by default, with a configurable minimum of 64. Past that policy, Sergeant prunes eligible old Work and blobs automatically: Work-aware, crash-recoverable, visible through the journal, and reported by `sgt doctor`. A request for a pruned Work is answered by name and policy rather than being made indistinguishable from a Work that never existed. And every Work's output branch (`sergeant/<work-id>`) is retained after every terminal outcome — nothing deletes it automatically.
+Each estate declares how much terminal Work history it retains — 1,000 terminal Works by default, with a configurable minimum of 64. Past that policy, Sergeant prunes eligible old Work and blobs automatically: Work-aware, crash-recoverable, visible through the journal, and reported by `sgt doctor`. A request for a pruned Work is answered by name and policy rather than being made indistinguishable from a Work that never existed. And every Work's output branch (`sergeant/<work-id>`) is retained after every terminal outcome — nothing deletes it automatically. Nothing is silently reclaimed: `sgt work reap <id> --yes` explicitly discards a Work's retained dirty-state capture without ever touching its branch, and `sgt work sweep --delete-redundant --yes` deletes only `sergeant/*` branches already fully merged into their mount's default branch.
 
 ## Where Sergeant came from
 

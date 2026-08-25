@@ -8,13 +8,12 @@ Requires Rust (edition 2024) and `git`.
 cargo build
 ```
 
-First build is slow — bundled DuckDB compiles from source. See
-[`README.md`](README.md#get-it) for the current time estimate.
+First build is slow — bundled DuckDB compiles from source.
 
 ## Test
 
 ```sh
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
 ```
 
 All three must be green before a commit. `cargo test --test <name>` runs one
