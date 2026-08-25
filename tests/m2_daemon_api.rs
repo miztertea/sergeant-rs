@@ -2984,8 +2984,25 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
         sgt_dir.path().join("journal").is_dir(),
         "SGT_DATA_DIR must win over XDG_DATA_HOME and HOME"
     );
+    // Both negatives name **sergeant's own** path under the overridden root,
+    // not the root itself. The `HOME` this test hands `sgt` is inherited by
+    // every process `sgt` starts, including the backend probe walk's
+    // third-party CLI children, and those write their own state where their
+    // own conventions put it: measured on Cerberus 2026-08-25 with all five
+    // adapters installed, a single `sgt run` here leaves
+    // `$HOME/.local/state/opencode/locks`, `$HOME/.codex/`, `$HOME/.config/`,
+    // `$HOME/.cache/` and `$XDG_DATA_HOME/opencode/` behind — none of it
+    // sergeant's, none of it evidence about `resolve_data_dir`. Asserting
+    // `!$HOME/.local` therefore failed deterministically on a
+    // fully-provisioned host while passing on a runner with no such CLI
+    // installed, which is a fact about the host rather than about the rung
+    // under test. (Ordering-independent: it failed identically on the
+    // pre-#293 build.) The XDG line was already scoped this way; this makes
+    // the HOME line say the same thing — sgt did not fall through to the
+    // platform tail — which is the claim the doc comment above actually
+    // makes.
     assert!(!xdg.path().join("sergeant").exists());
-    assert!(!home.path().join(".local").exists());
+    assert!(!home.path().join(".local/share/sergeant").exists());
     assert!(
         !estate.path().join(".sergeant").exists(),
         "SGT_DATA_DIR must also outrank the estate's own `.sergeant/data` default \
@@ -3032,7 +3049,8 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
             "macOS's convention must ignore XDG_DATA_HOME, not merely prefer its own path"
         );
     } else {
-        assert!(!home2.path().join(".local").exists());
+        // Same narrowing, same reason as the first rung's pair above.
+        assert!(!home2.path().join(".local/share/sergeant").exists());
     }
 
     // Absent both, `$HOME`'s own convention-suffix is the last resort. Same
