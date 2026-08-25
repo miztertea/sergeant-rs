@@ -1,8 +1,8 @@
 # Bounded-Judgment Ladder — specialization contract
 
-Ratified by `docs/adr/0013-icm-r0-owner-rulings.md` decision 1. Re-homed
+Ratified by owner ruling ICM-R0 decision 1. Re-homed
 2026-08-17 (ADR 0014 decision 10, resolving the conflict between that
-decision and `docs/icm/convention.md` §3 rule 2's anti-duplication rule):
+decision and `.sergeant/common/contexts/icm-policy.md` §3 rule 2's anti-duplication rule):
 the rung definitions themselves (J5–J0) are canonical in `AGENTS.md`'s
 AUTHORITY section, including PACE and succession of authority. This file
 no longer restates them. It carries what only this file needs: how a

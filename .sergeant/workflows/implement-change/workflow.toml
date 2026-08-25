@@ -4,13 +4,13 @@
 # to acceptance.
 #
 # Authored 2026-08-22 for the distro content rebuild
-# (docs/proposals/distro-content-2026-08-22.md, W2). Derivation and the
-# evidence behind each stage: the design proposal §E.1, §F's stage
-# vocabulary, and the owner rulings recorded there.
+# (W2). Derivation and the evidence behind each stage: the design
+# proposal §E.1, its stage vocabulary, and the owner rulings recorded
+# there are dev-corpus provenance, kept in this project's private development record, not shipped here.
 #
 # Nine ordinary actor stages. Stage order here is authoritative; the
 # directory listing under this workflow's own tree MUST agree with it
-# lexically (docs/icm/convention.md §1 rule 4).
+# lexically (.sergeant/common/contexts/icm-policy.md §1 rule 4).
 #
 # NEW package — the sprint-proven shape. Absorbs `implement`'s two
 # middle stages and `worker-mission`'s mission-with-a-brief loop; both

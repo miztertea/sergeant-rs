@@ -8,7 +8,8 @@ edition: 0.2.1
 
 Ported from `.sergeant/workflows/sergeant-help` (N1 reference-corpus candidate
 W4), which retires: the execution-surface test's OPERATOR-SKILL verdict
-(`docs/icm/retriage-2026-08-11.md`) is that a doc lookup needs no worktree
+(dev-corpus retriage record, kept in this project's private development
+record) is that a doc lookup needs no worktree
 and no durable Work state — it belongs at this skills/`AGENTS.md` layer the
 harness loads directly, never as a dispatched `sgt run`. Content re-verified
 against the real, built CLI (`sgt --help`, 2026-08-12) rather than assumed.
@@ -25,32 +26,33 @@ how to diagnose a Sergeant error — read-only, doc/help-shaped questions.
 
 Do not use this in place of actually doing the thing: once the user has
 asked for the estate to be set up, a repo registered, or work submitted, load
-`estate-navigation` or route through `sgt run` (see `AGENTS.md`'s standard
-workflow loop) instead of continuing to answer questions about it.
+`estate-navigation` or route through `sgt run` (see `AGENTS.md`'s
+Trigger → skill/workflow routing table) instead of continuing to answer
+questions about it.
 
 ## Documentation map
 
+Every row below names a primary source that resolves inside any estate
+`sgt init` produces — no row points at this repository's own dev corpus
+(that material is private and not shipped).
+
 | Question | Primary document |
 |---|---|
-| What Sergeant is, the product/ownership model | `README.md`, `NORTH-STAR.md` |
-| Install and first estate | `README.md` ("Get it") |
-| How a harness should route, the standard workflow loop, guardrails | `AGENTS.md` |
-| Which directory an estate-scoped `sgt` command must run from, and why one refused with "no estate found in ..." or "this command must be run from the estate root" | `AGENTS.md` ("Session start"), `README.md` ("Using sgt day-to-day") |
+| What Sergeant is, the product/ownership model | `AGENTS.md` |
+| Install and first estate | `sgt --help`, `sgt init --help` |
+| How a harness should route, guardrails | `AGENTS.md` |
+| Which directory an estate-scoped `sgt` command must run from, and why one refused with "no estate found in ..." or "this command must be run from the estate root" | `AGENTS.md` ("Session start") |
 | Why a submission was refused for a dirty or detached `repos/<name>` mount, and what `--override-git-preflight` does and does not waive | `AGENTS.md` (ESTATE, and the enforced list under "CAN — enforceable authority"), `sgt run --help` |
-| Waiting for a Work's next attention/result without polling, avoiding a `sgt work show` loop, subscribing to Work transitions | `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/WATCH.md` (the `sgt watch` command), `AGENTS.md` step 6 |
-| Workflow authoring rules, the `.sergeant/` filesystem convention | `docs/icm/convention.md` |
+| Waiting for a Work's next attention/result without polling, avoiding a `sgt work show` loop, subscribing to Work transitions | `sgt watch --help` (the `sgt watch` command; a real, self-documenting CLI verb) |
+| Workflow authoring rules, the `.sergeant/` filesystem convention | `.sergeant/common/contexts/icm-policy.md` |
 | What workflows exist | `.sergeant/index.md` (the catalog) |
 | A specific workflow's stages/inputs/outputs | `.sergeant/workflows/<name>/index.md` and `CONTEXT.md` |
-| Per-host environment facts (uid, Docker, toolchain, proxy posture) | `docs/environments/<host>.md` |
-| Building/testing/gating sergeant-rs's own code | `docs/DEVELOPMENT.md` |
-| Estate manifest (`sergeant.toml`) shape and fields | `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md`, `sergeant-rs-workspace/knowledge/evidence/gauntlet/notes/estate-manifest-design-2026-08-11.md` |
-| Why a design decision was made, deviations from the proposals | `GAUNTLET.md` (deviation register, backlog) |
-| A binding lesson about how this project has been burned before | `LESSONS.md` |
-| What a milestone actually promised/delivered | `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/<milestone>.md` |
-
-There is no `docs/schema.md`/`docs/troubleshooting.md`/`docs/getting-started.md`
-in sergeant-rs — those upstream primary documents don't exist here; the rows
-above are sergeant-rs's real equivalents, not a copy of upstream's map.
+| Per-host environment facts (uid, Docker, toolchain, proxy posture) | no shipped per-host record exists in a consumer estate — ask the operator directly |
+| Building/testing/gating this repository's own code, when this estate *is* sergeant-rs's own source checkout | `CONTRIBUTING.md` if present in this checkout; otherwise ask the operator |
+| Estate manifest (`sergeant.toml`) shape and fields | `sgt doctor`, `sgt repo list`, `sgt group list`, and this estate's own `sergeant.toml` |
+| Why a design decision was made, deviations from a prior plan | `AGENTS.md`, or ask the operator — no shipped deviation register exists in a consumer estate |
+| A binding lesson about how this project has been burned before | ask the operator — no shipped lessons record exists in a consumer estate |
+| What a milestone actually promised/delivered | ask the operator — milestone records are dev-corpus provenance, not shipped |
 
 ## Query procedure
 
@@ -59,7 +61,7 @@ above are sergeant-rs's real equivalents, not a copy of upstream's map.
 3. For terms not resolved there, search repository documentation:
 
    ```sh
-   rg -n -i --glob '*.md' -- '<term>' README.md AGENTS.md docs GAUNTLET.md LESSONS.md .sergeant
+   rg -n -i --glob '*.md' -- '<term>' AGENTS.md skills .sergeant
    ```
 
 4. For flag or argument questions, run `sgt <command> --help` (every `sgt`
@@ -76,13 +78,15 @@ above are sergeant-rs's real equivalents, not a copy of upstream's map.
    and links to repository-relative documentation paths.
 6. If sources disagree, use this precedence:
    - `sgt <cmd> --help` output and observed command behavior for released
-     syntax (`docs/DEVELOPMENT.md`, "the Claude adapter's behavior is
-     *measured*, never assumed from docs" — LESSONS L1);
+     syntax — "a harness's behavior is *measured*, never assumed from
+     docs" is a standing lesson of this project's;
    - `AGENTS.md` for always-on execution/safety policy;
    - the trigger-loaded skill or workflow's own `index.md`/`CONTEXT.md` for
      its procedure;
-   - `sergeant-rs-workspace/knowledge/evidence/gauntlet/contracts/MVP-1.md` for estate-manifest fields;
-   - `README.md`/`docs/DEVELOPMENT.md` for walkthroughs and dev commands.
+   - `sgt doctor`/`sgt repo list`/`sgt group list` and this estate's own
+     `sergeant.toml` for estate-manifest fields;
+   - `AGENTS.md`, or (if this checkout is sergeant-rs's own source tree)
+     `CONTRIBUTING.md`, for walkthroughs and dev commands.
 7. State when a behavior is undocumented, unmeasured, or contradictory. Do
    not invent a command, flag, state transition, or safety guarantee.
 
@@ -110,7 +114,7 @@ confirmation for them and the user explicitly requested them.
 | A command the user ran refused with the root gate ("no estate found in ...", or "this command must be run from the estate root") | Say plainly what the refusal means — sergeant does not search parent directories for an estate and does not fall back to a plain Git checkout — and repeat the remedy the refusal itself names: `cd <estate-root>`, `sgt -C <estate-root> <command>`, or `sgt init` if this directory should become an estate. Never suggest running the command from a parent, a `repos/<name>` mount, or a Work surface; only `sgt --help`, `--version`, `sgt init`, and `sgt doctor` work outside an estate at all. |
 | A submission was refused by the Git preflight (a dirty or detached `repos/<name>` mount) | Report the mount's own named remedy verbatim — commit or stash it (`git -C <mount> status`), or check it out onto the intended branch (`git -C <mount> switch <branch>`). Name `--override-git-preflight` only as what it is: a per-submission waiver of a dirty or detached mount and nothing else, basing the Work on the committed HEAD; it is unavailable when the mount has no commit to pin, and it never waives any other preflight finding. |
 | Question actually requires estate/repo state | Load `estate-navigation` (`sgt repo list`, `sgt doctor`) rather than answering from memory. |
-| Question actually requires submitting or mutating work | Hand off to the standard workflow loop (`AGENTS.md`) / `sgt run`; this skill stays strictly read-only. |
+| Question actually requires submitting or mutating work | Hand off per `AGENTS.md`'s routing table / `sgt run`; this skill stays strictly read-only. |
 
 ## Bounded judgment
 

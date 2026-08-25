@@ -8,12 +8,12 @@
 #
 # Gate: --fail-under-lines 90, set BELOW the S2 close-out measurement
 # (94.63% lines at dc0d447, 2026-08-10 — the close-out section of
-# sergeant-rs-workspace's knowledge/evidence/coverage/baseline-2026-08-10.md) per the spread policy: routine
+# the sergeant-rs-workspace knowledge/evidence/coverage/baseline-2026-08-10.md) per the spread policy: routine
 # drift never blocks work; a real regression through 90 does. Re-set it
 # against future re-measurements, never silently.
 #
 # COV_ARTIFACTS points at runner.temp (R-S0-12 review finding 1): the
-# committed sergeant-rs-workspace's knowledge/evidence/coverage/artifacts-2026-08-10/ tree is frozen evidence
+# committed the sergeant-rs-workspace knowledge/evidence/coverage/artifacts-2026-08-10/ tree is frozen evidence
 # carrying the dev container's toolchain fingerprint — measuring into it
 # would trip the drift guard on every CI run and dirty the checkout.
 name: coverage
@@ -76,6 +76,6 @@ jobs:
             echo '```'
             cat /tmp/cov-summary.txt
             echo '```'
-            echo '_Headline includes #[cfg(test)] code (~18% of src lines) — see sergeant-rs-workspace's knowledge/evidence/coverage/baseline-2026-08-10.md for the caveat and the known-losses register._'
+            echo '_Headline includes #[cfg(test)] code (~18% of src lines) — see the sergeant-rs-workspace knowledge/evidence/coverage/baseline-2026-08-10.md for the caveat and the known-losses register._'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$GATE_RC"

@@ -33,7 +33,7 @@ along the way is resolved per `@@resolve-conflicts`, never papered over.
 - **The builder's own read of its diff is panel input, never a substitute
   for the panel.** Self-checking the change before `20-panel` runs is
   good practice; it is not itself the independent review this workflow
-  requires (`docs/DEVELOPMENT.md`:50, R-S0-12).
+  requires (R-S0-12).
   (trigger: the implementation is complete; outcome: the actor does not
   treat its own confidence as equivalent to the panel's verdict)
 

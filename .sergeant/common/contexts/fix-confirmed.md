@@ -2,7 +2,7 @@
 
 Resolved as `@@fix-confirmed` from
 `.sergeant/common/contexts/fix-confirmed.md` per
-`docs/icm/convention.md` §4. Shared stage context, two or more consumers:
+`.sergeant/common/contexts/icm-policy.md` §4. Shared stage context, two or more consumers:
 `implement-change/30-fix-confirmed`, `fix-defect/40-fix-with-regression-test`,
 `remediate-findings/30-implement-accepted`.
 

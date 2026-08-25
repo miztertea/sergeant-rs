@@ -1503,6 +1503,13 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // here because the fixture estate declares one; an estate with
             // none reads `warn`, which is `t3f`'s subject.
             "workflows",
+            // #261: the installed corpus (AGENTS.md, skills/*/SKILL.md,
+            // .sergeant/workflows/**, .sergeant/common/contexts/*.md)
+            // cites only routes that resolve inside this estate.
+            "doc_routes",
+            // #261 owner ruling point 5: the installed distro's own
+            // `edition` front matter agrees with the running binary.
+            "distro_edition",
             // estate-root §12.2: the cheap Git-surface summary — journal
             // plus retained-artifact filesystem metadata only, never a
             // per-branch git walk. Green here because the fixture estate

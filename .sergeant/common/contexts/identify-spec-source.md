@@ -2,7 +2,7 @@
 
 Resolved as `@@identify-spec-source` from
 `.sergeant/common/contexts/identify-spec-source.md` per
-`docs/icm/convention.md` §4. Shared stage context, two or more consumers:
+`.sergeant/common/contexts/icm-policy.md` §4. Shared stage context, two or more consumers:
 `implement-change/00-orient`, `review-change/10-identify-spec-source`,
 `author-document/00-map-sources`.
 
