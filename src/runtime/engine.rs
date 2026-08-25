@@ -4553,13 +4553,28 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let mut draft = EventDraft::new(EventSource::new("daemon", "engine"), kind, payload)
             .with_work_id(work_id);
-        // H1 touch point #4: the one chokepoint every engine-emitted event
-        // goes through, so this is the one place that stamps the pinned
-        // estate root — never the display name (`self.estate_root` is
-        // already canonicalized, `Estate::admit`'s doc). `None` (a daemon
-        // bound to no estate) leaves the field absent, exactly as before.
-        if let Some(root) = &self.estate_root {
-            draft = draft.with_workspace_id(root.to_string_lossy().into_owned());
+        // H1 touch point #4, now per Work rather than per process (D10).
+        //
+        // W1a stamped this from the engine's own pinned `estate_root`, which
+        // was correct while a daemon had exactly one. A host daemon has
+        // none, and reading "the engine's estate" for a Work belonging to
+        // some *other* estate is precisely the silent mis-stamping D10
+        // exists to remove — so the coordinate comes from the Work itself:
+        // the canonical root its `work.submitted` envelope recorded
+        // (`WorkIndexRow::estate_root`), folded from the journal and
+        // therefore identical across a restart and a replay.
+        //
+        // Absent (a Work submitted with no repository context, or a journal
+        // line older than the envelope field) leaves the field absent,
+        // exactly as before — never a guess, and never the display name.
+        if let Some(root) = core
+            .registry
+            .state()
+            .work_index
+            .get(work_id)
+            .and_then(|row| row.estate_root.clone())
+        {
+            draft = draft.with_workspace_id(root);
         }
         core.commit(draft)?;
         Ok(())
@@ -4693,29 +4708,45 @@ mod tests {
         );
     }
 
-    /// H1 touch point #4: `Engine::commit` is the one chokepoint every
-    /// engine-emitted event goes through, so the pinned estate root must
-    /// land in the envelope from there, not from each individual caller —
-    /// and an engine with no estate (test rigs, the intent-capture path)
-    /// must leave the field absent rather than invent a coordinate. Both
-    /// branches live in one test so the `None` half is pinned by a test
-    /// that still fails when the stamping is reverted.
+    /// H1 touch point #4 as D10 leaves it: `Engine::commit` is still the one
+    /// chokepoint every engine-emitted event goes through, but the
+    /// coordinate it stamps is now the **Work's own**, not the engine's.
+    ///
+    /// This is W1a's test evolved, not reverted. W1a proved the stamping
+    /// happens at the chokepoint against an engine pinned to one estate;
+    /// there is no pinned estate any more, and the fact that matters is
+    /// sharper: **one engine, two Works, two different estates, each event
+    /// stamped with its own Work's root.** Under the pinned field this could
+    /// not even be expressed — every event would have carried the same root,
+    /// which is exactly the silent mis-stamping D10 removes. The `None` half
+    /// is kept in the same test, so a revert of the stamping still fails.
     #[test]
-    fn engine_committed_events_stamp_workspace_id_only_when_an_estate_is_pinned() {
+    fn engine_committed_events_stamp_each_works_own_estate_root() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let mut core = testing::core(dir.path());
-        let estate_root = dir.path().join("estate");
-        let pinned = engine(dir.path()).with_estate_root(estate_root.clone());
-        let unpinned = engine(dir.path()); // no `.with_estate_root(..)`
+        let payments = dir.path().join("estates/payments");
+        let billing = dir.path().join("estates/billing");
+        // One engine — a host daemon has exactly one, serving every estate.
+        let engine = engine(dir.path());
 
-        testing::submit(&mut core, "01PINNED", "carry the estate root");
-        testing::submit(&mut core, "01NOESTATE", "no estate here");
-        pinned
-            .block(&mut core, "01PINNED", "prove workspace_id travels", None)
-            .expect("block pinned");
-        unpinned
-            .block(&mut core, "01NOESTATE", "no estate pinned", None)
-            .expect("block unpinned");
+        testing::submit_in(
+            &mut core,
+            "01PAYMENTS",
+            "carry payments' root",
+            Some(payments.to_string_lossy().as_ref()),
+        );
+        testing::submit_in(
+            &mut core,
+            "01BILLING",
+            "carry billing's root",
+            Some(billing.to_string_lossy().as_ref()),
+        );
+        testing::submit(&mut core, "01NOESTATE", "no repository context at all");
+        for work_id in ["01PAYMENTS", "01BILLING", "01NOESTATE"] {
+            engine
+                .block(&mut core, work_id, "prove workspace_id travels", None)
+                .expect("block");
+        }
 
         let blocked: Vec<_> = core
             .journal
@@ -4731,9 +4762,14 @@ mod tests {
                 .expect("work.blocked journaled")
         };
         assert_eq!(
-            by_work("01PINNED").workspace_id.as_deref(),
-            Some(estate_root.to_string_lossy().as_ref()),
-            "an engine-committed event must carry the daemon's pinned estate root"
+            by_work("01PAYMENTS").workspace_id.as_deref(),
+            Some(payments.to_string_lossy().as_ref()),
+            "each event carries its own Work's estate, not the engine's"
+        );
+        assert_eq!(
+            by_work("01BILLING").workspace_id.as_deref(),
+            Some(billing.to_string_lossy().as_ref()),
+            "the second estate is not the first estate"
         );
         assert_eq!(by_work("01NOESTATE").workspace_id, None);
     }
@@ -6066,6 +6102,7 @@ mod tests {
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
                     last_seq: 1,
+                    estate_root: None,
                 },
             );
             registry.terminal_runs.insert(
