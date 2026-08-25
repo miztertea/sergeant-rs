@@ -25,6 +25,7 @@
 //! a client that removes the path can delete a descriptor a *successor*
 //! daemon just published and leave it undiscoverable.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -704,6 +705,21 @@ impl DataDirSource {
 ///
 /// Returns the winning rung alongside the path (#80) so a caller can surface
 /// *why* this path won, not just what it is.
+///
+/// **The host+atlas split (H1 sprint plan D2, this wave W1b):** this
+/// function's *contract is unchanged* — every rung above still resolves
+/// exactly what it always has, and this wave does not rewire a single
+/// caller. What changes is what the result is *for*: `resolve_data_dir`
+/// names *estate-local* daemon state (today: journal, projections, and
+/// everything beneath them, because nothing has moved yet). At W2 cutover
+/// this function is slated to lose journal/projection ownership to
+/// [`resolve_host_runtime_dir`]'s host runtime root — the `Manifest`/
+/// `EstateDefault` rungs (and the `[estate] data_dir` manifest key behind
+/// `Manifest`) are deprecated as *journal* location from that point on
+/// (D9): a manifest still declaring `[estate] data_dir` loses its object,
+/// and `sgt doctor` is meant to warn about it, but that warning is W4c's
+/// deliverable, not this wave's — it is **not implemented here**.
+/// `surfaces_dir` is unaffected by D9 and stays estate-local (H1-07).
 fn resolve_data_dir(
     flag: Option<PathBuf>,
     root: &Path,
@@ -724,6 +740,60 @@ fn resolve_data_dir(
         });
     }
     crate::platform::data_dir::fallback_dir(|name| std::env::var_os(name))
+        .map(|dir| (dir, DataDirSource::PlatformFallback))
+        .map_err(CliError::new)
+}
+
+/// Resolve the **host runtime root** (H1 sprint plan D2): `--data-dir`
+/// flag, then `SGT_DATA_DIR`, then [`crate::platform::data_dir::fallback_dir`]
+/// — the same pre-estate platform convention `resolve_data_dir`'s own last
+/// rung already reaches (#82), now applied unconditionally rather than only
+/// when `root` fails to be an estate root. No new path constant and no new
+/// env var (R2): D2 ratified reusing the existing XDG/macOS convention
+/// as-is precisely because it is "already implemented, tested, ADR 0002 D3
+/// both-convention discipline."
+///
+/// This is a **new, parallel resolver, not a rewrite of [`resolve_data_dir`]**
+/// — this wave (W1b) is pure seam-cutting: it introduces the host-root
+/// ladder alongside the estate-root one without moving a single caller onto
+/// it yet (that is W2/W3's job, once the daemon core actually owns a host
+/// runtime root to move state into). Today the two ladders still name the
+/// *same* rungs at the top for the same reason `resolve_data_dir`'s own doc
+/// comment gives: `--data-dir`/`SGT_DATA_DIR` have never meant "this
+/// estate's data," only "the data dir," and #80's precedence ruling settled
+/// their rank once, for both meanings.
+///
+/// **Under host mode (from W2 on), `--data-dir`/`SGT_DATA_DIR` name the
+/// host runtime root** — the journal, Atlas, runtime descriptor, and
+/// `daemon.lock` all live beneath whatever this function resolves, no
+/// longer beneath the estate. Estate-local material (`sergeant.toml`,
+/// `repos/`, `surfaces_dir`) keeps resolving off the estate root via
+/// [`resolve_data_dir`]'s untouched rungs — that split, not a shared
+/// meaning, is exactly what D2/H1 §3 draw.
+///
+/// Returns the winning rung alongside the path, reusing [`DataDirSource`]
+/// (`Manifest`/`EstateDefault` simply never occur here — there is no
+/// estate rung on this ladder at all).
+///
+/// `#[allow(dead_code)]`: not yet a caller's problem. This wave (W1b) lands
+/// the resolver and its own unit tests only — no `cli.rs` caller is
+/// rewired onto it, by design (see the doc comment above and the brief's
+/// "zero behavior change"). W2/W3 are the waves that call this from
+/// `dispatch`/`ensure_daemon`'s host-scoped paths; the same
+/// production-dead-until-wired shape [`crate::platform::data_dir`]'s own
+/// `FREEDESKTOP`/`MACOS` constants already use.
+#[allow(dead_code)]
+fn resolve_host_runtime_dir(
+    flag: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Result<(PathBuf, DataDirSource), CliError> {
+    if let Some(dir) = flag {
+        return Ok((dir, DataDirSource::Flag));
+    }
+    if let Some(dir) = env("SGT_DATA_DIR") {
+        return Ok((PathBuf::from(dir), DataDirSource::Env));
+    }
+    crate::platform::data_dir::fallback_dir(env)
         .map(|dir| (dir, DataDirSource::PlatformFallback))
         .map_err(CliError::new)
 }
@@ -764,6 +834,27 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         sgt.data_dir,
         estate.as_ref().map(|e| e.path.as_path()).unwrap_or(&root),
     )?;
+    // W1b caller classification (this wave tags, does not rewire — W2/W3
+    // consume it): every downstream use of this one `data_dir` below, by
+    // where it actually gets used rather than by `Command` variant (several
+    // variants reach more than one):
+    //   HOST   — daemon discovery/spawn/stop: `ensure_daemon`/
+    //            `observe_connect`/`daemon_stop`/`spawn_daemon` (every
+    //            match arm that constructs a client or calls `daemon::
+    //            run_until_signal`), plus `exec_harness`'s adapter-state
+    //            directory (`DaemonConfig`'s per-adapter config already
+    //            documents "`None` = system binary + adapter state under
+    //            `data_dir`" — daemon-owned state, not estate-owned).
+    //   ESTATE — `doctor::run`'s journal-replay-derived checks specifically
+    //            (`journal_check`, `projection_check`, `git_surfaces_check`,
+    //            `journal_growth_check` — all read *this estate's* journal
+    //            events); everything else `doctor::run` checks about the
+    //            directory itself (existence/writability/locking/disk
+    //            pressure/adapter probes) is HOST today because `data_dir`
+    //            *is* the one directory in play, but is slated to move
+    //            under `resolve_host_runtime_dir` once W2 splits journal
+    //            ownership from estate-local state (see `resolve_data_dir`'s
+    //            doc comment above).
     match command {
         Command::Daemon {
             command: None,
@@ -1283,6 +1374,10 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // fresh estate estate discovery had nothing to find yet and
             // this report would otherwise self-check the pre-estate
             // fallback and call it `[ok]` (#164).
+            //
+            // W1b caller classification: same split as the `dispatch`-level
+            // call above — `doctor::run`'s journal-replay checks are
+            // ESTATE, the rest of what it reports on `data_dir` is HOST.
             let (data_dir, data_dir_source) = resolve_data_dir(data_dir_flag, &cwd)?;
             let report = doctor::run(&data_dir, &cwd, data_dir_source.xdg_outranked()).await;
             if sgt.json {
@@ -5187,5 +5282,61 @@ mod tests {
         );
         assert_eq!(list_state_label(&listed_work("failed", None)), "failed");
         assert_eq!(list_state_label(&listed_work("running", None)), "running");
+    }
+
+    /// D2/#80: `resolve_host_runtime_dir`'s ladder is `--data-dir` flag,
+    /// then `SGT_DATA_DIR`, then the platform fallback — the flag wins even
+    /// when both env and `HOME` would resolve to something else, mirroring
+    /// `resolve_data_dir`'s own flag>env>* precedence with no estate rung at
+    /// all (the host runtime root never depends on cwd or an estate).
+    #[test]
+    fn resolve_host_runtime_dir_flag_outranks_env_and_fallback() {
+        let probe = |name: &str| match name {
+            "SGT_DATA_DIR" => Some(OsString::from("/env/data")),
+            "HOME" => Some(OsString::from("/home/x")),
+            _ => None,
+        };
+        let (dir, source) =
+            resolve_host_runtime_dir(Some(PathBuf::from("/flag/data")), probe).unwrap();
+        assert_eq!(dir, PathBuf::from("/flag/data"));
+        assert_eq!(source, DataDirSource::Flag);
+    }
+
+    /// `SGT_DATA_DIR` outranks the platform fallback tail when no flag is
+    /// given — the second rung of the same ladder.
+    #[test]
+    fn resolve_host_runtime_dir_env_outranks_the_platform_fallback() {
+        let probe = |name: &str| match name {
+            "SGT_DATA_DIR" => Some(OsString::from("/env/data")),
+            "HOME" => Some(OsString::from("/home/x")),
+            _ => None,
+        };
+        let (dir, source) = resolve_host_runtime_dir(None, probe).unwrap();
+        assert_eq!(dir, PathBuf::from("/env/data"));
+        assert_eq!(source, DataDirSource::Env);
+    }
+
+    /// With neither flag nor `SGT_DATA_DIR` set, the ladder falls all the
+    /// way through to `platform::data_dir::fallback_dir` — the same
+    /// pre-estate tail `resolve_data_dir` reaches at its own last rung
+    /// (#82). Asserting equality against `fallback_dir`'s own result
+    /// (rather than a hardcoded path) keeps this test honest under
+    /// whichever convention (`CURRENT`) the host actually compiles for, and
+    /// exercises both-conventions discipline (ADR 0002 D3) by delegating
+    /// rather than re-deriving a second copy of the freedesktop/macOS
+    /// branch here — `platform::data_dir`'s own tests are what actually
+    /// exercise the `MACOS` arm on a non-macOS host.
+    #[test]
+    fn resolve_host_runtime_dir_falls_through_to_the_platform_fallback() {
+        let probe = |name: &str| {
+            if name == "HOME" {
+                Some(OsString::from("/home/x"))
+            } else {
+                None
+            }
+        };
+        let (dir, source) = resolve_host_runtime_dir(None, probe).unwrap();
+        assert_eq!(source, DataDirSource::PlatformFallback);
+        assert_eq!(dir, crate::platform::data_dir::fallback_dir(probe).unwrap());
     }
 }
