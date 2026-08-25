@@ -244,6 +244,15 @@ fn resolve_tiers(
                 available,
             });
         };
+        // #293's capability-pending contract, applied at the one point in the
+        // system where a backend name becomes decisive *and* its evidence is
+        // read. The daemon now serves before its probe walk finishes, so this
+        // backend's `backend.probed` record may not be durable yet — wait for
+        // it rather than route over evidence nobody has written. Keyed by
+        // this backend alone, so a Work bound for a fast adapter is never
+        // held up by a slow one it will never touch; a registry that is not a
+        // running daemon's owes nothing and does not wait at all.
+        registry.probe_gate().wait_for(requested);
         let probe = backend.probe();
         if !probe.available {
             return Err(RouteError::Unavailable {

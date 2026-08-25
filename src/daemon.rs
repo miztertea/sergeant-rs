@@ -12,14 +12,57 @@
 //! 2. open the journal (which holds its own exclusive lock — belt and
 //!    braces) and rebuild the Work registry by full replay;
 //! 3. bind `127.0.0.1` on an ephemeral port;
-//! 4. journal `daemon.started`;
+//! 4. journal `daemon.started`, register the backend adapters, reconcile work
+//!    believed in flight (§25) and clear a stale admission pause (L6) — no
+//!    request may observe a Work whose prior ownership has not been settled,
+//!    so those stay ahead of the descriptor;
 //! 5. write the runtime descriptor (endpoint, PID, API revision, random
 //!    bearer token) atomically with owner-only permissions — the descriptor
-//!    only ever points at a live, already-listening daemon.
+//!    only ever points at a live, already-listening daemon;
+//! 6. **then** walk the backend probes, concurrently, journaling
+//!    `backend.probed` per backend as each completes.
 //!
 //! Clean shutdown journals `daemon.stopped` and removes the descriptor; a
 //! crash leaves a stale descriptor, which clients detect (dead PID + refused
 //! endpoint) and replace.
+//!
+//! ## Publish, then probe (#293)
+//!
+//! Step 6 used to be step 4b-ii — the whole probe walk, serially, *before*
+//! the bind and the descriptor. The argument for that ordering was that a
+//! daemon should not be reachable before it knows what it can route to. The
+//! measurement retires it: on a fully-provisioned host (all five adapters
+//! installed) the descriptor appeared **~6.4s after exec across five cold
+//! starts** on Cerberus, 2026-08-25, every millisecond of it serial probing —
+//! agy ~2.3s, opencode ~3.2s over four invocations, codex ~0.4s, claude
+//! ~0.2s — against a client auto-spawn budget of 10s (`SPAWN_WAIT`,
+//! `src/cli.rs`). The ~3.6s of headroom left meant any concurrent load,
+//! including a test suite's own parallel daemon spawns, pushed the first
+//! `sgt run` past the budget; #293's A/B evidence showed that one defect
+//! explaining every real-spawn failure across the m2/m3/m6/m8/m9 suites at
+//! once. A daemon is healthy when it can accept and route requests, not when
+//! every third-party CLI has printed `--help`.
+//!
+//! **The capability-pending contract**, which is what makes the reordering
+//! safe rather than merely faster. Between serving and a backend's probe
+//! completing:
+//!
+//! - a caller whose preflight needs capability evidence **waits** for it —
+//!   [`crate::backend::ProbeGate`], waited on by the router's tier walk at the
+//!   one point where a backend name becomes decisive. The wait is per backend
+//!   and bounded by that backend's own probe completing, so a Work bound for a
+//!   fast adapter is never held up by a slow one it will never touch;
+//! - no capability is ever fabricated, defaulted, or inferred to fill the
+//!   window, and no submission is refused that the old ordering would have
+//!   accepted. The only difference observable to a client is *when* the
+//!   answer arrives;
+//! - the journal's evidence order per backend is unchanged: `backend.probed`
+//!   is durable before any Work routed to that backend is.
+//!
+//! What did *not* move is everything ahead of the descriptor in the list
+//! above. Restart reconciliation and the L6 pause clear stay before it,
+//! because those are claims about state a request could act on; a probe is a
+//! claim about an adapter, and the request that needs it can wait for it.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -41,7 +84,7 @@ use crate::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig};
 use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::opencode::{OPENCODE_BACKEND_NAME, OpencodeBackend, OpencodeConfig};
-use crate::backend::{BackendRegistry, EventSink};
+use crate::backend::{BackendRegistry, EventSink, ProbeGate};
 use crate::domain::event::{EventDraft, EventSource};
 use crate::platform::fs_locking::{self, Reliability};
 use crate::runtime::analytics::{Analytics, AnalyticsError};
@@ -244,6 +287,20 @@ pub enum DaemonError {
 /// checkout still exits on its own rather than being escalated to SIGKILL.
 const DRIVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// How long shutdown waits for the backend probe walk to finish before
+/// journaling `daemon.stopped` and going.
+///
+/// The walk is joined at all — rather than dropped — for the same reason the
+/// completion driver is: it commits events, and `daemon.stopped` must be the
+/// last one this daemon writes. It gets its own, longer grace because what it
+/// is waiting on is a different thing: not someone else's git checkout, but a
+/// bounded set of local `--version`/`--help` subprocess runs whose worst
+/// measured total on a fully-provisioned host is ~6.4s serial (#293, Cerberus
+/// 2026-08-25) and roughly the slowest single adapter concurrently. Thirty
+/// seconds is that with room, and it is still a bound: a daemon that will not
+/// die is a lock nobody can take.
+const PROBE_WALK_SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
 /// Handle to a running in-process daemon. Dropping it does NOT stop the
 /// daemon; call [`DaemonHandle::shutdown`] for a clean stop (journals
 /// `daemon.stopped`, removes the descriptor).
@@ -421,8 +478,16 @@ fn refuse_if_unreliable(data_dir: &Path, reliability: Reliability) -> Result<(),
     }
 }
 
-/// Start the daemon on `data_dir`. Returns once it is serving and the
-/// runtime descriptor is published.
+/// Start the daemon on `data_dir`. Returns once startup is complete: serving,
+/// runtime descriptor published, and the backend probe walk finished.
+///
+/// Those three do not happen at the same moment any more (#293). The
+/// descriptor is published — and the daemon starts accepting — *before* the
+/// probe walk runs; this call returns after the walk, because an in-process
+/// handle is read as "started" and a rig that takes a journal snapshot right
+/// after it must not race a startup append. A client waiting on the
+/// descriptor file is unblocked at the earlier moment, which is the whole
+/// point of the reordering; see this module's `Publish, then probe` doc.
 pub async fn start_with(
     data_dir: &Path,
     config: DaemonConfig,
@@ -810,38 +875,17 @@ pub async fn start_with(
     } else {
         None
     };
-    let backends = Arc::new(backends);
-
-    // 4b-ii. The capability/version probe, recorded at registration (M4
-    // contract). Probing is offline and token-free (`--version`, `--help`),
-    // and journaling the answer is the point: a version and flag set that
-    // only ever appear inside a later refusal's message are not a record.
-    // An unavailable backend is registered anyway and refuses work with this
-    // same evidence — routing must be able to say *why*, not pretend the
-    // backend does not exist.
-    for name in backends.names() {
-        let Some(backend) = backends.get(&name) else {
-            continue;
-        };
-        let report = backend.probe();
-        core.commit(EventDraft::new(
-            EventSource::new("daemon", "sergeant"),
-            KIND_BACKEND_PROBED,
-            json!({
-                "backend": name,
-                "available": report.available,
-                "detail": report.detail,
-                "capabilities": backend.capabilities(),
-                // §17: the adapter's declared runtime scope, recorded with
-                // the probe because it is a claim about the adapter, and the
-                // core is forbidden from assuming one.
-                "runtime_scope": backend.runtime_scope(),
-            }),
-        ))?;
-    }
-    // Same reasoning as the daemon.started flush above: durable before
-    // recovery starts acting on it (INV-R2-01).
-    core.flush()?;
+    // 4b-ii. The capability/version probe is *scheduled* here and runs at
+    // step 6, after the descriptor is published — see this module's
+    // startup-order doc and [`ProbeGate`] for why (#293). What happens here is
+    // only that the registry gains the readiness gate its routing path will
+    // wait on; not one subprocess is forked, and the gate is still **unarmed**,
+    // which is load-bearing: restart reconciliation two steps below reads
+    // capabilities, and a gate armed this early would make it wait for a walk
+    // that has not started.
+    let probe_gate = Arc::new(ProbeGate::new());
+    let backends = Arc::new(backends.with_probe_gate(probe_gate.clone()));
+    let probe_backends = backends.clone();
 
     // 4c. Reconcile work believed in flight *before* serving (§25): no
     // request may observe — or act on — a work whose prior ownership has not
@@ -958,6 +1002,25 @@ pub async fn start_with(
     if let Some(agy) = agy {
         agy.set_event_sink(journaling_sink(state.core.clone()));
     }
+
+    // 6. The capability/version probe walk (#293), started the moment the
+    // daemon is reachable and run concurrently across backends. Spawned after
+    // the adapter sinks are wired above so a probe can never race an adapter
+    // that has no sink yet, and joined at shutdown below so `daemon.stopped`
+    // stays the last event this daemon writes.
+    //
+    // Arming the gate is the line before the spawn, and both are ahead of the
+    // serve task: the listener is bound, so a client that read the descriptor
+    // a moment ago has its connection sitting in the accept backlog, and the
+    // first request axum takes off it is therefore handled by a routing path
+    // that already knows what evidence is outstanding.
+    probe_gate.expect(probe_backends.names());
+    let probes = tokio::spawn(probe_walk(
+        state.core.clone(),
+        probe_backends,
+        probe_gate.clone(),
+    ));
+
     let app = router(state.clone());
 
     // The one writer that is not a request (issue #46): a turn that ends on
@@ -1008,6 +1071,19 @@ pub async fn start_with(
             ),
             Ok(Ok(())) => {}
         }
+        // The probe walk is the other non-request writer (#293), and the same
+        // rule binds it: `daemon.stopped` is the last event this daemon
+        // writes, so a walk still forking `--help` at shutdown is joined
+        // rather than raced. Bounded for the same reason the driver's join is
+        // — see `PROBE_WALK_SHUTDOWN_GRACE`.
+        match tokio::time::timeout(PROBE_WALK_SHUTDOWN_GRACE, probes).await {
+            Ok(Err(e)) => tracing::warn!(error = %e, "the backend probe walk panicked"),
+            Err(_) => tracing::warn!(
+                grace = ?PROBE_WALK_SHUTDOWN_GRACE,
+                "the backend probe walk was still running at shutdown; stopping anyway"
+            ),
+            Ok(Ok(())) => {}
+        }
         // Clean shutdown: journal the stop, then retire the descriptor.
         let mut core = CoreGuard::acquire(&state.core).await;
         if let Err(e) = core.commit(EventDraft::new(
@@ -1028,12 +1104,128 @@ pub async fn start_with(
         }
     });
 
+    // The handle is handed back only once startup is *complete* — descriptor
+    // published, listener accepting, recovery settled, and the probe walk
+    // done — while everything a client waits for happened at the top of that
+    // list. This is the one place the two audiences differ, and the
+    // difference is deliberate (#293, R2):
+    //
+    // - a **client** waits on the descriptor file, which is published before
+    //   the walk starts and is the thing #293 measured at ~6.4s and now
+    //   measures in the low hundreds of milliseconds. Nothing about this wait
+    //   delays it, and the pending window between publish and walk-completion
+    //   is real, served, and covered by `ProbeGate`;
+    // - an **in-process embedder** (every test rig in `tests/`, and any
+    //   future library user) holds a `DaemonHandle` and reasonably reads it
+    //   as "this daemon has started". Handing it back mid-walk would make
+    //   every journal read taken straight after `start_with` race a startup
+    //   append — which is a rig contract quietly changing under ~65 call
+    //   sites, not a property anyone asked for.
+    //
+    // Waiting on the gate rather than the `probes` join handle is what lets
+    // the serve task keep that handle and join it at shutdown, so
+    // `daemon.stopped` stays last even if this future is dropped mid-await.
+    // The gate is a `Condvar`, so the wait goes on the blocking pool where
+    // blocking waits belong.
+    let settled = probe_gate.clone();
+    if let Err(e) = tokio::task::spawn_blocking(move || settled.wait_all()).await {
+        tracing::warn!(error = %e, "waiting for the backend probe walk failed");
+    }
+
     Ok(DaemonHandle {
         endpoint,
         token,
         shutdown_tx: Some(shutdown_tx),
         served,
     })
+}
+
+/// The capability/version probe walk, recorded at registration (M4 contract):
+/// one `backend.probed` event per registered backend, carrying what the probe
+/// found — a version and flag set that only ever appear inside a later
+/// refusal's message are not a record. An unavailable backend is probed and
+/// journaled anyway and refuses work with this same evidence; routing must be
+/// able to say *why*, not pretend the backend does not exist.
+///
+/// **Concurrent, and on the blocking pool, both deliberately (#293).** A
+/// probe is one or more real CLI invocations — measured on Cerberus
+/// 2026-08-25: agy ~2.3s, opencode ~3.2s across four invocations, codex
+/// ~0.4s, claude ~0.2s — and they are independent of one another, so running
+/// them one at a time bought nothing but their sum. They are also *blocking*
+/// (`std::process::Command::output`), which the old serial walk ran straight
+/// on the async runtime; `spawn_blocking` is where blocking work belongs, and
+/// it is what makes the concurrency real rather than five futures taking
+/// turns on one worker thread.
+///
+/// Each result is journaled and flushed as it lands, then marked on the gate
+/// — in that order, so a caller released by the gate is released over durable
+/// evidence, never over an append still in a group.
+async fn probe_walk(
+    core: Arc<tokio::sync::Mutex<Core>>,
+    backends: Arc<BackendRegistry>,
+    gate: Arc<ProbeGate>,
+) {
+    let mut walking = tokio::task::JoinSet::new();
+    for name in backends.names() {
+        let backends = backends.clone();
+        walking.spawn_blocking(move || {
+            let Some(backend) = backends.get(&name) else {
+                return (name, None);
+            };
+            let report = backend.probe();
+            // `capabilities()` is read here, inside the blocking task, and
+            // not on the runtime: for the opencode and agy adapters it
+            // resolves the transport, which is itself a subprocess gate, and
+            // for Claude it reads a claim the probe may have withdrawn.
+            let payload = json!({
+                "backend": name,
+                "available": report.available,
+                "detail": report.detail,
+                "capabilities": backend.capabilities(),
+                // §17: the adapter's declared runtime scope, recorded with
+                // the probe because it is a claim about the adapter, and the
+                // core is forbidden from assuming one.
+                "runtime_scope": backend.runtime_scope(),
+            });
+            (name, Some(payload))
+        });
+    }
+    while let Some(joined) = walking.join_next().await {
+        let (name, payload) = match joined {
+            Ok(probed) => probed,
+            Err(e) => {
+                // A panicked probe takes its own name with it, so nothing
+                // can be marked here; `settle` below is what keeps that from
+                // stranding a waiter.
+                tracing::error!(error = %e, "a backend probe panicked");
+                continue;
+            }
+        };
+        let Some(payload) = payload else {
+            // The backend left the registry between scheduling and running,
+            // which nothing does today — but a name owed a record and never
+            // getting one must not wedge a submission.
+            tracing::warn!(backend = %name, "backend vanished from the registry before its probe");
+            gate.mark(&name);
+            continue;
+        };
+        {
+            let mut core = CoreGuard::acquire(&core).await;
+            let committed = core
+                .commit(EventDraft::new(
+                    EventSource::new("daemon", "sergeant"),
+                    KIND_BACKEND_PROBED,
+                    payload,
+                ))
+                .and_then(|_| core.flush());
+            if let Err(e) = committed {
+                tracing::error!(error = %e, backend = %name, "failed to journal backend.probed");
+            }
+        }
+        gate.mark(&name);
+    }
+    // Unconditional: see `ProbeGate::settle`.
+    gate.settle();
 }
 
 /// Build the [`EventSink`] that journals an adapter's normalized events.
