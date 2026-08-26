@@ -601,6 +601,50 @@ async fn crank(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
         let settled = match next {
             EngineNext::Parked => unreachable!("returned above"),
             EngineNext::Launch(pending) => {
+                // H1-15's execution lane: admitted strictly between the
+                // reservation (already committed under the lock, in
+                // `reserve_stage`) and the launch below — outside the core
+                // lock, never under it (recon's §22.6 hazard). A lane at
+                // capacity does not stall this task silently: the wait is
+                // journaled first (distinct from turn-cap exhaustion — see
+                // `Engine::park_on_execution_lane`) so a concurrent
+                // `sgt work show` can see why this Work is parked, then the
+                // task actually waits for a slot.
+                let launch_work_id = pending.work_id().to_string();
+                if !state.engine.try_admit_execution(&launch_work_id) {
+                    {
+                        let mut core = CoreGuard::acquire(&state.core).await;
+                        if let Err(e) = state
+                            .engine
+                            .park_on_execution_lane(&mut core, &launch_work_id)
+                        {
+                            tracing::error!(
+                                work_id = %launch_work_id,
+                                error = %e,
+                                "journaling the execution-lane wait failed"
+                            );
+                        }
+                    }
+                    state.engine.admit_execution(&launch_work_id).await;
+                    let mut core = CoreGuard::acquire(&state.core).await;
+                    if let Err(e) = state
+                        .engine
+                        .resume_after_execution_lane(&mut core, &launch_work_id)
+                    {
+                        // A concurrent transition (e.g. a cancel while this
+                        // Work sat parked on the lane) can make this an
+                        // illegal edge — logged, not fatal: `settle_launch`'s
+                        // own staleness check (§14.5) is what actually
+                        // adjudicates a launch whose reservation the wait
+                        // outlived, exactly as it does for every other cause
+                        // of the same race.
+                        tracing::error!(
+                            work_id = %launch_work_id,
+                            error = %e,
+                            "resuming after the execution-lane wait failed"
+                        );
+                    }
+                }
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
                 let mut core = CoreGuard::acquire(&state.core).await;

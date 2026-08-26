@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::api::{Core, CoreError};
 use crate::backend::docker::DOCKER_BACKEND_NAME;
@@ -1126,6 +1127,48 @@ pub const DEFAULT_TURN_CAP: u32 = 12;
 /// override with [`Engine::with_turn_ceiling`].
 pub const DEFAULT_TURN_CEILING: Duration = Duration::from_secs(15 * 60);
 
+/// H1-15 (W4b) execution lane: the default bounded number of native adapter
+/// processes this daemon admits to LAUNCH concurrently.
+///
+/// Recon evidence (`recon-workers-capacity-release.md`): nothing in
+/// `engine.rs`/`api.rs`/`daemon.rs` throttled concurrent native processes
+/// before this — the turn cap bounds one Work's own lifetime, never a
+/// fleet-wide process count. Numbers-need-provenance: this is grounded in
+/// the one thing "how many can genuinely run at once" is actually about —
+/// the host's own hardware parallelism
+/// ([`std::thread::available_parallelism`]), not an arbitrary round number.
+/// A native adapter process is CPU/IO-bound work this host schedules like
+/// any other; oversubscribing it past the core count buys nothing but
+/// context-switch overhead and degrades every process's own turnaround.
+/// Falls back to `4` only when the platform cannot answer the question at
+/// all (containers with no cgroup cpu info, `wasm32` — never routine on a
+/// host this daemon actually runs on). Override with
+/// [`Engine::with_execution_lane_cap`] (`DaemonConfig::execution_lane_cap` /
+/// `SGT_EXECUTION_LANE_CAP`, wired the same way `SGT_TURN_CAP` is).
+pub fn default_execution_lane_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4)
+}
+
+/// H1-15's second lane: config surface only in S1 (deliverable 3 — no
+/// workers, no scheduling behavior). The eventual consumer is A1/S3's
+/// intelligence workers (host-runtime batch/analysis work distinct from
+/// execution's per-Work native processes); until that lands, nothing ever
+/// acquires from [`Engine::intelligence_lane`], so this cap only proves the
+/// two lanes are structurally independent (separate `Arc<Semaphore>`s —
+/// see the config-only test pinning that the execution lane's occupancy
+/// never touches this one's `available_permits`).
+///
+/// Same host-parallelism grounding as [`default_execution_lane_cap`] (R2:
+/// reusing the one number this build can trace to something real, rather
+/// than inventing a second unrelated rationale for a lane nothing consumes
+/// yet). Override with [`Engine::with_intelligence_lane_cap`]
+/// (`DaemonConfig::intelligence_lane_cap` / `SGT_INTELLIGENCE_LANE_CAP`).
+pub fn default_intelligence_lane_cap() -> usize {
+    default_execution_lane_cap()
+}
+
 /// The workflow engine: backends, defaults, and the data dir surfaces live in.
 #[derive(Debug, Clone)]
 pub struct Engine {
@@ -1158,6 +1201,37 @@ pub struct Engine {
     /// half, and the two are independent by design. Keyed by work id, one
     /// entry per Work with a turn currently in flight.
     turn_started: Arc<Mutex<BTreeMap<String, Instant>>>,
+    /// H1-15's execution lane: bounded fleet-wide admission between PREPARE
+    /// and LAUNCH ([`Self::try_admit_execution`]/[`Self::admit_execution`]),
+    /// acquired **outside the core lock** (recon: acquiring under the guard
+    /// reintroduces the §22.6 hazard the PREPARE/LAUNCH split exists to
+    /// prevent — see `crank`'s `Launch` arm in `api.rs`, the one caller).
+    pub execution_lane: Arc<Semaphore>,
+    /// The cap [`Self::execution_lane`] was built with — kept alongside it
+    /// (a `Semaphore` cannot report the total it started with, only what is
+    /// currently free) so waiting evidence and API views can name the bound
+    /// a Work is actually parked against.
+    pub execution_lane_cap: usize,
+    /// Permits currently held, keyed by work id — one execution in flight
+    /// per Work at a time (the turn model's own invariant; mirrors
+    /// [`Self::turn_started`]'s per-work keying). Inserted the moment a
+    /// permit is admitted, in `api::crank`'s `Launch` arm, and removed
+    /// exactly where an execution stops being "in flight":
+    /// [`Self::stop_execution`] (completion, failure, cancel, interrupt) and
+    /// [`Self::settle_launch`]'s two no-live-execution branches (a
+    /// daemon-side launch error, a superseded reservation). Never durable —
+    /// a restart starts with an empty lane and every Work re-admits on its
+    /// next launch, which is correct: nothing native survived the restart
+    /// either.
+    execution_permits: Arc<Mutex<BTreeMap<String, OwnedSemaphorePermit>>>,
+    /// H1-15's intelligence lane: config-only stub (deliverable 3). A
+    /// separate `Arc<Semaphore>` from [`Self::execution_lane`] by
+    /// construction — nothing here ever acquires from it, so it cannot draw
+    /// down the execution lane's budget no matter how many intelligence
+    /// workers a later sprint adds.
+    pub intelligence_lane: Arc<Semaphore>,
+    /// The cap [`Self::intelligence_lane`] was built with.
+    pub intelligence_lane_cap: usize,
 }
 
 impl Engine {
@@ -1177,6 +1251,11 @@ impl Engine {
             turn_cap: DEFAULT_TURN_CAP,
             turn_ceiling: DEFAULT_TURN_CEILING,
             turn_started: Arc::new(Mutex::new(BTreeMap::new())),
+            execution_lane: Arc::new(Semaphore::new(default_execution_lane_cap())),
+            execution_lane_cap: default_execution_lane_cap(),
+            execution_permits: Arc::new(Mutex::new(BTreeMap::new())),
+            intelligence_lane: Arc::new(Semaphore::new(default_intelligence_lane_cap())),
+            intelligence_lane_cap: default_intelligence_lane_cap(),
         }
     }
 
@@ -1199,6 +1278,136 @@ impl Engine {
     pub fn with_turn_ceiling(mut self, turn_ceiling: Duration) -> Self {
         self.turn_ceiling = turn_ceiling;
         self
+    }
+
+    /// Override the daemon-wide execution-lane cap (H1-15). Wired from
+    /// `DaemonConfig::execution_lane_cap` / `SGT_EXECUTION_LANE_CAP`
+    /// (`daemon::run_until_signal`), the same way [`Self::with_turn_cap`]
+    /// is. Rebuilds the semaphore fresh — called only at daemon startup,
+    /// before any Work has admitted a permit.
+    pub fn with_execution_lane_cap(mut self, cap: usize) -> Self {
+        self.execution_lane = Arc::new(Semaphore::new(cap));
+        self.execution_lane_cap = cap;
+        self
+    }
+
+    /// Override the daemon-wide intelligence-lane cap (H1-15, deliverable
+    /// 3 — config surface only; nothing yet acquires from this lane).
+    pub fn with_intelligence_lane_cap(mut self, cap: usize) -> Self {
+        self.intelligence_lane = Arc::new(Semaphore::new(cap));
+        self.intelligence_lane_cap = cap;
+        self
+    }
+
+    /// Try to admit `work_id` to the execution lane without waiting. `true`
+    /// stores a held permit for `work_id` and admits it; `false` means the
+    /// lane is at [`Self::execution_lane_cap`] and nothing was taken.
+    ///
+    /// **R7 for the lane primitive.** `tokio::sync::Semaphore` is a bounded,
+    /// async-aware admission counter built for exactly this shape; R1–R6 do
+    /// not supply one — the recon evidence's own grep found no existing cap
+    /// or lane concept anywhere in this tree (R2), the standard library has
+    /// no async-aware semaphore (R3), no OS primitive substitutes for an
+    /// in-process cooperative admission gate shared across `tokio` tasks
+    /// (R4), and a hand-rolled counter+waker would re-implement — worse,
+    /// and untested — exactly what R5's already-installed `tokio::sync`
+    /// gives in one line.
+    pub(crate) fn try_admit_execution(&self, work_id: &str) -> bool {
+        match Arc::clone(&self.execution_lane).try_acquire_owned() {
+            Ok(permit) => {
+                self.execution_permits
+                    .lock()
+                    .expect("execution permit map poisoned")
+                    .insert(work_id.to_string(), permit);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Block until `work_id` is admitted to the execution lane.
+    ///
+    /// **Never call this while holding the core lock.** Mirrors every
+    /// `Pending*::perform`'s own discipline (§22.6): a slow or fully-loaded
+    /// lane must never stall another core-lock holder, which is exactly the
+    /// hazard the recon evidence names for a permit taken under the guard —
+    /// this is why the lane is acquired in `api::crank`'s `Launch` arm,
+    /// strictly between the reservation (`reserve_stage`, under the lock)
+    /// and the launch (`PendingLaunch::perform`, without it).
+    pub(crate) async fn admit_execution(&self, work_id: &str) {
+        let permit = Arc::clone(&self.execution_lane)
+            .acquire_owned()
+            .await
+            .expect("execution lane semaphore is never closed for the daemon's life");
+        self.execution_permits
+            .lock()
+            .expect("execution permit map poisoned")
+            .insert(work_id.to_string(), permit);
+    }
+
+    /// Release `work_id`'s held execution-lane permit, if it holds one.
+    /// Idempotent (a work with nothing held is a no-op) — see
+    /// [`Self::execution_permits`]'s own doc for exactly which call sites
+    /// make this call and why those are the complete set (deliverable 4's
+    /// "no leak — hunt the drop path": every one of them is a plain
+    /// `BTreeMap::remove`, so the guard's own `Drop` releases the permit;
+    /// there is no path that could forget it without also forgetting to
+    /// call this).
+    pub(crate) fn release_execution_permit(&self, work_id: &str) {
+        self.execution_permits
+            .lock()
+            .expect("execution permit map poisoned")
+            .remove(work_id);
+    }
+
+    /// Journal the execution lane's own "no capacity" park — deliverable 2's
+    /// observability requirement. Reuses the existing `Active -> Waiting`
+    /// edge [`Self::drive`]'s `BackendSignal::Waiting` arm already commits
+    /// through (R2: no new event kind, no new terminal state — "waiting" is
+    /// already legal and already nonterminal), with a lane-specific reason
+    /// so it can never be confused with turn-cap exhaustion
+    /// ([`Self::check_turn_envelope`]'s `KIND_WORK_BLOCKED`, a different
+    /// event kind *and* a different [`WorkState`] — `Blocked`, not
+    /// `Waiting`). Called from `api::crank`'s `Launch` arm, under the core
+    /// lock it briefly reacquires to journal this before awaiting the lane
+    /// (never while performing the external wait itself).
+    pub(crate) fn park_on_execution_lane(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+    ) -> Result<(), EngineError> {
+        self.transition(
+            core,
+            work_id,
+            KIND_WORK_WAITING,
+            json!({
+                "reason": "execution lane at capacity",
+                "cap": self.execution_lane_cap,
+            }),
+        )
+    }
+
+    /// The lane admitted `work_id`: resume it exactly as any other
+    /// `Waiting -> Active` recovery does ([`Self::begin_input`],
+    /// [`Self::reenter_stage`] — same edge, same `KIND_WORK_RESUMED` event
+    /// kind), with a reason naming what actually happened. A Work that left
+    /// `Waiting` for some other reason while parked here (e.g. a concurrent
+    /// cancel) makes this an illegal transition; the caller logs and
+    /// proceeds regardless — [`Self::settle_launch`]'s own staleness check
+    /// (§14.5) is what actually adjudicates a launch that outlived the
+    /// state it was reserved against, exactly as it already does for every
+    /// other cause of the same race.
+    pub(crate) fn resume_after_execution_lane(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+    ) -> Result<(), EngineError> {
+        self.transition(
+            core,
+            work_id,
+            KIND_WORK_RESUMED,
+            json!({"reason": "execution_lane_admitted"}),
+        )
     }
 
     /// R-MVP1-7's effective turn cap for one specific Work: MVP-3's
@@ -3551,6 +3760,13 @@ impl Engine {
         let work_id = pending.work_id.clone();
         let reservation = &pending.reservation;
         if let Some(why) = self.reservation_is_stale(core, &pending) {
+            // H1-15: superseded before or after the launch actually
+            // happened, this reservation's execution-lane permit is never
+            // going to be released by `stop_execution` — no `run.execution`
+            // is ever recorded for it (that only happens below, past this
+            // branch). Release it here or it leaks for the lane's whole
+            // remaining life.
+            self.release_execution_permit(&work_id);
             let stop = match &outcome {
                 Ok(handle) => match pending.backend.stop(handle) {
                     Ok(completion) => {
@@ -3588,6 +3804,12 @@ impl Engine {
         let handle = match outcome {
             Ok(handle) => handle,
             Err(e) => {
+                // H1-15: a daemon-side launch error — nothing was ever
+                // launched, so `stop_execution` will never see a
+                // `run.execution` to release this permit through. Release
+                // it here (deliverable 4's explicit test: no leak on a
+                // launch error).
+                self.release_execution_permit(&work_id);
                 // The reservation named an identity nothing ever created.
                 // Saying so explicitly is what keeps the window closed:
                 // without this event the journal would show a reservation
@@ -4352,6 +4574,10 @@ impl Engine {
         if execution.stop_requested {
             return Ok(());
         }
+        // H1-15: this Work's execution is definitively no longer in flight
+        // (completion, failure, cancel, or interrupt-driven stop — every
+        // call site above) — release the execution-lane permit it holds.
+        self.release_execution_permit(work_id);
         let outcome = match self.backends.get(&execution.backend) {
             Some(backend) => match backend.stop(&handle_of(&execution)) {
                 Ok(completion) => {
