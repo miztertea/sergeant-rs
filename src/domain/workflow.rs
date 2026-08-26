@@ -631,6 +631,28 @@ pub enum WorkflowError {
         /// The nested descriptor that makes this stage a container.
         marker: String,
     },
+    /// A container stage's directory resolves to a package already open on
+    /// this nesting path — a symlink cycle. Recursing into it would never
+    /// terminate, so the loader refuses by name instead of overflowing the
+    /// stack (the captain's ruling on PR #308, 2026-08-26).
+    ///
+    /// This is not a depth limit (E14 stands: nesting itself is unbounded).
+    /// It is the one structural fact that makes depth unbounded *in a way no
+    /// author intended* — a package that contains itself.
+    #[error(
+        "{path} declares stage {stage:?}, whose directory resolves to {resolved}, a workflow \
+         package already open on this nesting path: a nested package may not contain itself \
+         (a symlink cycle), which would recurse without end"
+    )]
+    NestedPackageCycle {
+        /// Path of the declaring descriptor.
+        path: String,
+        /// The offending stage id.
+        stage: String,
+        /// The canonical directory the stage resolves to — already an
+        /// ancestor of itself.
+        resolved: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -802,7 +824,24 @@ impl WorkflowDefinition {
     /// content hash folds the whole flattened tree into one identity (E2) —
     /// a nested leaf's edit changes the parent's `content_hash` exactly as a
     /// top-level stage's does.
+    ///
+    /// **Cycle guard.** Nesting is unbounded by design (E14: no product depth
+    /// limit), so the one shape that must still be refused is a package that
+    /// *contains itself* — a symlink cycle, which is not deep nesting but
+    /// endless nesting. Each level carries the canonical paths of the
+    /// packages open above it and refuses a container that resolves to one of
+    /// them ([`WorkflowError::NestedPackageCycle`]), by name, at load time,
+    /// rather than letting the recursion overflow the stack.
     pub fn load_dir(dir: &Path) -> Result<Self, WorkflowError> {
+        Self::load_dir_within(dir, &[])
+    }
+
+    /// [`Self::load_dir`] plus the canonical paths of every package already
+    /// open above this one on the nesting path (the cycle guard's visited
+    /// set). The ancestry is a *path*, not a global set: the same package
+    /// reached twice by two different containers is finite and legal, while
+    /// the same package reached from inside itself is not.
+    fn load_dir_within(dir: &Path, ancestry: &[PathBuf]) -> Result<Self, WorkflowError> {
         let descriptor = dir.join(WORKFLOW_FILE);
         let path = descriptor.display().to_string();
         let text = std::fs::read_to_string(&descriptor).map_err(|source| WorkflowError::Io {
@@ -823,6 +862,15 @@ impl WorkflowDefinition {
         }
         let ids = check_stage_ids(&parsed.workflow.stages, &path)?;
         check_stage_tables(&ids, &parsed.stages_meta, &path)?;
+        // This package, plus everything open above it: what a container's
+        // resolved directory is checked against below.
+        let mut open = ancestry.to_vec();
+        open.push(
+            std::fs::canonicalize(dir).map_err(|source| WorkflowError::Io {
+                path: dir.display().to_string(),
+                source,
+            })?,
+        );
         let mut stages = Vec::with_capacity(ids.len());
         for id in ids {
             let stage_dir = dir.join(&id);
@@ -847,9 +895,24 @@ impl WorkflowDefinition {
                         marker: marker.display().to_string(),
                     });
                 }
+                // The cycle guard, before the recursion rather than after:
+                // a container that resolves to a package already open above
+                // it would never terminate.
+                let resolved =
+                    std::fs::canonicalize(&stage_dir).map_err(|source| WorkflowError::Io {
+                        path: stage_dir.display().to_string(),
+                        source,
+                    })?;
+                if open.contains(&resolved) {
+                    return Err(WorkflowError::NestedPackageCycle {
+                        path,
+                        stage: id,
+                        resolved: resolved.display().to_string(),
+                    });
+                }
                 // The nested package validates itself, by its own rules, and
                 // reports failures against its own descriptor path.
-                let nested = Self::load_dir(&stage_dir)?;
+                let nested = Self::load_dir_within(&stage_dir, &open)?;
                 stages.extend(nested.stages.into_iter().map(|leaf| StageDefinition {
                     id: format!("{id}/{}", leaf.id),
                     ..leaf
@@ -3205,6 +3268,73 @@ mod tests {
             }
             other => panic!("expected InvalidStageId, got {other}"),
         }
+    }
+
+    /// The ruled cycle guard (captain ruling on PR #308, 2026-08-26): a
+    /// symlink cycle in a nested package is a **named, fail-closed load
+    /// error**, never a stack overflow. E14 still stands — this adds no
+    /// depth limit, only a guard against a package that contains itself,
+    /// which is not deep nesting but unbounded nesting.
+    ///
+    /// The fixture has to satisfy the loader's own `NameMismatch` check at
+    /// every level to reach the recursion at all, so the cycle is the one
+    /// shape that can: a package whose declared stage id is its own
+    /// directory name, with that stage a symlink back to the package.
+    /// `10-inner/10-inner/10-inner/…` would otherwise recurse forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_in_a_nested_package_is_a_named_load_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "loopy");
+        write_package(&wf, "loopy", &["10-inner"]);
+        let inner = wf.join("10-inner");
+        write_package(&inner, "10-inner", &["10-inner"]);
+        std::os::unix::fs::symlink(&inner, inner.join("10-inner")).expect("cycle symlink");
+
+        let err = WorkflowDefinition::load_dir(&wf)
+            .expect_err("a package that contains itself must be refused, not recursed forever");
+        match &err {
+            WorkflowError::NestedPackageCycle { stage, path, .. } => {
+                assert_eq!(stage, "10-inner");
+                assert!(
+                    path.contains("10-inner"),
+                    "the error must name the descriptor that declared the cycling stage: {path}"
+                );
+            }
+            other => panic!("expected NestedPackageCycle, got {other}"),
+        }
+        assert!(
+            err.to_string().contains("nesting path"),
+            "the message must say what is wrong, not just that something is: {err}"
+        );
+    }
+
+    /// The guard is about a package *containing itself*, not about a package
+    /// being used twice. Two sibling containers that resolve to the same
+    /// package directory are finite, produce distinct composed ids, and must
+    /// still load — a naive global visited-set would have refused them.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_nested_package_may_be_used_by_two_siblings() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "twice");
+        write_package(&wf, "twice", &["10-shared", "20-shared"]);
+        let shared = wf.join("10-shared");
+        write_package(&shared, "10-shared", &["00-leaf"]);
+        write_stage(&shared, "00-leaf", "shared work");
+        // The second use is the same directory reached by another name; the
+        // nested package's own `name` check makes it a copy in practice, so
+        // this fixture writes the sibling as a real package with identical
+        // content and symlinks only the *leaf*, which is the shape that
+        // actually shares content on disk.
+        let second = wf.join("20-shared");
+        write_package(&second, "20-shared", &["00-leaf"]);
+        std::os::unix::fs::symlink(shared.join("00-leaf"), second.join("00-leaf"))
+            .expect("shared leaf symlink");
+
+        let def = WorkflowDefinition::load_dir(&wf).expect("sharing a package is not a cycle");
+        let ids: Vec<&str> = def.stages.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["10-shared/00-leaf", "20-shared/00-leaf"]);
     }
 
     /// A nested package's own `name` must match its stage directory, exactly
