@@ -38,6 +38,11 @@
 /// Registered in `daemon.rs` (the agy-adapter sprint's W2) and reachable via
 /// `sgt agy` and `--backend agy`.
 pub mod agy;
+/// Child-process lifecycle shared by every adapter (#310): the one
+/// process-group kill, the probe-child hardening that makes a `SIGKILL`ed
+/// daemon take its probe children with it, and the per-walk registry a
+/// daemon's own `kill` reaps through.
+pub mod child;
 pub mod claude;
 /// The `codex exec` adapter (W1 of the *Sergeant speaks Codex* sprint,
 /// `knowledge/evidence/resources/h-series/w1-spec.md`, closing deviation D6

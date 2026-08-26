@@ -2923,6 +2923,7 @@ dependencies = [
  "duckdb",
  "http-body-util",
  "include_dir",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

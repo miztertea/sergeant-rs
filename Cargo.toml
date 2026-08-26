@@ -52,6 +52,17 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3"
 ulid = "3.0.0"
 
+# #310: `prctl(PR_SET_PDEATHSIG, SIGKILL)` on a probe child, and nothing else.
+# R3/R4 fail — neither the standard library nor any process API this crate
+# already uses can couple a child's death to its parent's; only the kernel can,
+# and only through this call. R5 rather than R7: libc is already in this
+# crate's dependency graph (transitively, via tokio/reqwest/duckdb), so
+# declaring it directly adds a line here and no crate to the build. `nix` was
+# the alternative and would be a genuinely new graph edge for one constant and
+# one call. Unix-gated because that is the only place it is referenced.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # M5 Unknown #1 — "the duckdb crate's bundled-build cost in this container
 # (compile time and disk) — measure first". Measured here, dev profile, before
 # this override: libduckdb.a 2.08 GB, liblibduckdb_sys.rlib 2.0 GB, and every

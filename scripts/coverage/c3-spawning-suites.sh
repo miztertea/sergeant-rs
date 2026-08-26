@@ -73,3 +73,16 @@ cov_stage_begin c3-m7_docker_executor
 cov_run cargo llvm-cov --no-report --test m7_docker_executor --locked || cov_fail "m7_docker_executor failed under instrumentation"
 cov_stage_end 1 "the m7 test binary must write its own profile; container subprocesses are not \
 required because the suite self-skips where Docker is unreachable"
+
+# S2 V1d, wired at birth (#310): four of this suite's six tests spawn real
+# processes — a bare `sgt daemon` it SIGKILLs mid-probe-walk, and this test
+# binary re-executed as a parent whose hardened child has to die with it.
+# Belongs beside m2/m6, not in C2's no-daemon-of-its-own bucket. Floor 2: the
+# test binary plus at least one spawned daemon. Note that the SIGKILLed
+# daemons flush nothing at exit by construction — the profiles that arrive
+# here come from the suite's politely-reaped daemons, which is why the floor
+# is 2 and not the number of processes it starts.
+cov_stage_begin c3-v1d_probe_child_lifecycle
+cov_run cargo llvm-cov --no-report --test v1d_probe_child_lifecycle --locked || cov_fail "v1d_probe_child_lifecycle failed under instrumentation"
+cov_stage_end 2 "v1d spawns real sgt daemons and re-executes its own test binary; more than the \
+test binary's own profile must arrive, or no subprocess flushed"

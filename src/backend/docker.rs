@@ -909,6 +909,20 @@ impl Backend for DockerBackend {
     /// every submission that touches an execute stage, so it stays a single
     /// `docker version` round trip rather than the full lifecycle probe
     /// `sgt doctor` runs (`lifecycle_probe`).
+    ///
+    /// **Audited for #310 and deliberately left alone.** The other four
+    /// adapters' probes now go through `backend::child::harden_probe_child`,
+    /// which puts a probe child in its own process group and arms
+    /// `PR_SET_PDEATHSIG`. This one does not, for two reasons. It spawns
+    /// nothing persistent: `docker version` is a bounded client round trip
+    /// against a daemon that owns every container, so there is no long-lived
+    /// child to orphan and an orphaned client exits by itself. And the only
+    /// seam it could be applied at is [`DockerBackend::cmd`], which every
+    /// *execution* verb in this adapter shares — including `capture`'s
+    /// `docker logs`, whose output is read on threads that outlive the
+    /// spawning one. Hardening there would be applying a probe-shaped
+    /// lifetime to execution-shaped children, which is exactly the mistake
+    /// `ChildLifetime` exists to keep visible.
     fn probe(&self) -> ProbeReport {
         match self.run(&["version", "--format", "{{.Server.Version}}"]) {
             Ok(version) => ProbeReport {
