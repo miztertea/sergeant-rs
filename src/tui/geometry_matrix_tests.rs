@@ -488,6 +488,78 @@ fn geometry_workflow_tab_never_shows_a_percent_gauge() {
     }
 }
 
+/// S2 W1 / decision E10: the Workflow tab's rail gains **new persistent
+/// chrome** under nesting — an indented header row per container, with its
+/// own aggregation glyph and count — so it earns its own geometry-matrix
+/// entry, per the same rule `fleet_estate_filter` above was added under.
+fn work_nested_workflow() -> App {
+    let mut app = app_with_open_work("01NEST", "active", "which lead?");
+    app.work_screen = Some(work_view::WorkScreen::from_parts(
+        "01NEST".to_string(),
+        json!({
+            "work": {"id": "01NEST", "intent": "investigate deeply", "state": "active"},
+            "stage": {
+                "stage_id": "10-investigate/10-deep/00-inner", "index": 2, "attempt": 1,
+                "status": "active", "of": 4,
+                "executor": {"harness": "claude", "profile": {"name": "default"}},
+            },
+            "workflow": {
+                "name": "nested", "version": "1", "source": "/repo/.sergeant/workflows/nested",
+                "stages": [
+                    "00-orient",
+                    "10-investigate/00-lead",
+                    "10-investigate/10-deep/00-inner",
+                    "20-implement",
+                ],
+            },
+            "envelope": {"turn_cap": 12, "turns_spawned": 3},
+        }),
+        Vec::new(),
+        Vec::new(),
+        None,
+    ));
+    app
+}
+
+/// The rail's rows are indented, never truncated sideways, at every size —
+/// and the container header carries its aggregation without a percent
+/// (T2-50).
+///
+/// Stated rather than hidden: a container adds a *row* to the rail, so a
+/// rail that fit its pane before may now run past the bottom of the
+/// shortest size (80x24 shows through `10-deep/` here and stops). That is
+/// the Workflow pane's existing vertical behaviour for any rail longer than
+/// its height — a flat workflow with more stages truncates identically —
+/// not something nesting introduced, so this asserts the full tree only
+/// where the pane is actually tall enough to hold it.
+#[test]
+fn geometry_workflow_tab_renders_a_nested_tree_at_every_size() {
+    let mut app = work_nested_workflow();
+    app.on_key(KeyCode::Char('2')); // Workflow tab (§13.2)
+    for (w, h) in SIZES {
+        let text = text_of(&draw_at(&app, w, h));
+        assert!(
+            !text.contains('%'),
+            "{w}x{h}: Decision T2-50 holds for container rows too: {text}"
+        );
+        for needle in ["✓ 00-orient", "⠹ 10-investigate/  1/2", "  ✓ 00-lead"] {
+            assert!(
+                text.contains(needle),
+                "{w}x{h}: the tree must show {needle:?}: {text}"
+            );
+        }
+        if h >= 36 {
+            for needle in ["    ⠹ 00-inner", "· 20-implement"] {
+                assert!(
+                    text.contains(needle),
+                    "{w}x{h}: a pane this tall must show the whole rail, {needle:?} included: \
+                     {text}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn geometry_workflows_catalog_detail_and_error() {
     for (name, app) in [

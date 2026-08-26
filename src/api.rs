@@ -5827,6 +5827,34 @@ mod tests {
         );
     }
 
+    /// S2 W1 / decision E10: a nested leaf's composed hierarchical id is an
+    /// ordinary string to this helper, and the position arithmetic is the
+    /// flat one it always was — `index + 1` of `of`, counting **leaves**,
+    /// because a container never occupies a stage slot (W1-02).
+    ///
+    /// The point of pinning it is that no change was needed. A coordinate
+    /// that had started parsing `/` — to show only the leaf name, say, or to
+    /// count containers as positions — would have silently disagreed with the
+    /// engine's own flat indices, which are what retry, recovery and the
+    /// analytics rows all key on.
+    #[test]
+    fn stage_label_reads_a_composed_hierarchical_id_as_one_flat_position() {
+        let nested = json!({
+            "stage_id": "10-investigate/00-lead", "index": 1, "of": 4, "status": "active",
+        });
+        assert_eq!(stage_label(&nested), "10-investigate/00-lead 2/4 · active");
+
+        let deeper = json!({
+            "stage_id": "10-investigate/10-deep/00-inner", "index": 2, "of": 4,
+            "status": "needs_input",
+        });
+        assert_eq!(
+            stage_label(&deeper),
+            "10-investigate/10-deep/00-inner 3/4 · needs_input",
+            "depth changes the id, never the position arithmetic"
+        );
+    }
+
     async fn test_state(data_dir: &std::path::Path) -> ApiState {
         let journal = Journal::open(data_dir).expect("open journal");
         let mut registry = work_registry_projection();

@@ -482,6 +482,17 @@ impl WorkScreen {
     /// earlier/later stages' pinned bindings are not part of that response,
     /// so this shows harness/profile only where the read actually supplies
     /// it, per stage.
+    ///
+    /// **Nesting (W1, decision E10).** The wire shape stays what it has
+    /// always been — one flat array of leaf ids, index/of arithmetic intact
+    /// — and hierarchy is carried inside those ids as `/`-joined path
+    /// components. This is the one place that reads it: leaves are grouped
+    /// under an indented header line per container, and each container gets
+    /// an aggregation glyph over the leaves it owns (done / running /
+    /// pending) plus a plain `done/total` count. No percent, per T2-50.
+    ///
+    /// A flat workflow has no `/` in any id, so it renders exactly as it did
+    /// before this existed: no headers, no indentation.
     fn workflow_lines(&self) -> Vec<Line<'static>> {
         let stage_ids: Vec<String> = self.work["workflow"]["stages"]
             .as_array()
@@ -508,16 +519,43 @@ impl WorkScreen {
         let attempt = self.work["stage"]["attempt"].as_u64().unwrap_or(1);
         let executor = &self.work["stage"]["executor"];
         let mut lines = vec![label, Line::default()];
-        lines.extend(stage_ids.iter().enumerate().map(|(i, id)| {
+        // The container path currently open above the leaf being rendered,
+        // deepest last. A flat list never grows it past empty.
+        let mut open: Vec<&str> = Vec::new();
+        for (i, id) in stage_ids.iter().enumerate() {
+            let mut components: Vec<&str> = id.split('/').collect();
+            // A leaf id always has a last component; `split` guarantees one.
+            let leaf = components.pop().unwrap_or(id.as_str());
+            let shared = open
+                .iter()
+                .zip(components.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+            open.truncate(shared);
+            for depth in shared..components.len() {
+                let prefix = components[..=depth].join("/");
+                let (first, last) = container_range(&stage_ids, &prefix);
+                let (glyph, style) = progress_glyph(first, last, current_index);
+                let done = current_index
+                    .map(|cur| (cur as usize).saturating_sub(first).min(last - first + 1))
+                    .unwrap_or(0);
+                lines.push(Line::from(vec![
+                    Span::raw("  ".repeat(depth)),
+                    Span::styled(format!("{glyph} "), style),
+                    Span::styled(format!("{}/", components[depth]), style),
+                    Span::styled(
+                        format!("  {done}/{}", last - first + 1),
+                        Style::default().fg(Token::Muted.rgb()),
+                    ),
+                ]));
+                open.push(components[depth]);
+            }
             let i = i as u64;
-            let (glyph, style) = match current_index {
-                Some(cur) if i < cur => ("✓", Style::default().fg(Token::Success.rgb())),
-                Some(cur) if i == cur => ("⠹", Style::default().fg(Token::Focus.rgb())),
-                _ => ("·", Style::default().fg(Token::Muted.rgb())),
-            };
+            let (glyph, style) = progress_glyph(i as usize, i as usize, current_index);
             let mut spans = vec![
+                Span::raw("  ".repeat(components.len())),
                 Span::styled(format!("{glyph} "), style),
-                Span::styled(id.clone(), style),
+                Span::styled(leaf.to_string(), style),
             ];
             if current_index == Some(i) {
                 let mut suffix = format!("  attempt {attempt}");
@@ -532,8 +570,8 @@ impl WorkScreen {
                     Style::default().fg(Token::Muted.rgb()),
                 ));
             }
-            Line::from(spans)
-        }));
+            lines.push(Line::from(spans));
+        }
         lines
     }
 
@@ -842,6 +880,44 @@ impl WorkScreen {
         )));
 
         lines
+    }
+}
+
+/// The first and last flat index of the leaves under `prefix` (W1 §3's
+/// hierarchy separator, decision E10) — the client-side reading of the same
+/// range the engine keeps in its own container-boundary table.
+///
+/// Derived from the flat list rather than requested from the API on purpose:
+/// `GET /v1/work/{id}` serves the leaf ids and nothing else about nesting,
+/// and a container's extent is exactly "the run of leaves whose id starts
+/// with `<prefix>/`", which is contiguous by construction of the loader's
+/// depth-first splice.
+fn container_range(stage_ids: &[String], prefix: &str) -> (usize, usize) {
+    let under = format!("{prefix}/");
+    let mut first = 0;
+    let mut last = 0;
+    let mut seen = false;
+    for (i, id) in stage_ids.iter().enumerate() {
+        if id.starts_with(&under) {
+            if !seen {
+                first = i;
+                seen = true;
+            }
+            last = i;
+        }
+    }
+    (first, last)
+}
+
+/// The rail's glyph for one span of leaves `[first, last]` against the
+/// current position: finished, running, or not yet reached. A leaf is the
+/// degenerate span where `first == last`, so containers and leaves cannot
+/// drift apart on what "done" looks like.
+fn progress_glyph(first: usize, last: usize, current_index: Option<u64>) -> (&'static str, Style) {
+    match current_index {
+        Some(cur) if (cur as usize) > last => ("✓", Style::default().fg(Token::Success.rgb())),
+        Some(cur) if (cur as usize) >= first => ("⠹", Style::default().fg(Token::Focus.rgb())),
+        _ => ("·", Style::default().fg(Token::Muted.rgb())),
     }
 }
 
@@ -1757,6 +1833,131 @@ mod tests {
         assert!(
             !lines.iter().any(|l| l.contains('%')),
             "Decision T2-50: never a percent bar: {lines:?}"
+        );
+    }
+
+    /// A Work whose pinned workflow nests two levels — the TUI-side fixture
+    /// that did not exist before W1 (recon-cli-api touch point 8: "today's
+    /// only fixture is flat"). `current_index` is the deepest nested leaf,
+    /// which is also the last leaf of both its container and its container's
+    /// container.
+    fn nested_work_body(current_index: u64) -> Value {
+        json!({
+            "work": {"id": "01NEST", "intent": "nest", "state": "active"},
+            "stage": {
+                "stage_id": "10-investigate/10-deep/00-inner",
+                "index": current_index,
+                "attempt": 1,
+                "status": "active",
+                "of": 4,
+                "executor": {"harness": "claude", "profile": {"name": "default"}},
+            },
+            "workflow": {
+                "name": "nested", "version": "1", "source": "/repo/.sergeant/workflows/nested",
+                "stages": [
+                    "00-orient",
+                    "10-investigate/00-lead",
+                    "10-investigate/10-deep/00-inner",
+                    "20-implement",
+                ],
+            },
+            "envelope": {"turns_spawned": 1, "turn_cap": 10},
+        })
+    }
+
+    /// E10: the flat leaf list groups by `/` into an indented tree, one
+    /// header per container, each carrying an aggregation glyph over the
+    /// leaves it owns and a plain done/total count. Order is preserved — the
+    /// rail is still the pinned order, only drawn as the tree it is.
+    #[test]
+    fn workflow_rail_groups_nested_leaves_into_an_indented_tree() {
+        let screen = WorkScreen::from_parts(
+            "01NEST".to_string(),
+            nested_work_body(2),
+            vec![],
+            vec![],
+            None,
+        );
+        let lines: Vec<String> = screen
+            .workflow_lines()
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        // label, blank, 00-orient, 10-investigate/, 00-lead,
+        // 10-deep/, 00-inner, 20-implement.
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        assert_eq!(lines[2], "✓ 00-orient", "{lines:?}");
+        assert_eq!(
+            lines[3], "⠹ 10-investigate/  1/2",
+            "the container is in progress, with one of its two leaves behind the current: {lines:?}"
+        );
+        assert_eq!(
+            lines[4], "  ✓ 00-lead",
+            "a leaf shows its own name, indented under its container: {lines:?}"
+        );
+        assert_eq!(
+            lines[5], "  ⠹ 10-deep/  0/1",
+            "an inner container indents again and aggregates only its own leaf: {lines:?}"
+        );
+        assert!(
+            lines[6].starts_with("    ⠹ 00-inner"),
+            "the current leaf is two levels deep: {lines:?}"
+        );
+        assert!(
+            lines[6].contains("attempt 1") && lines[6].contains("claude"),
+            "the current leaf still carries its executor detail: {lines:?}"
+        );
+        assert_eq!(lines[7], "· 20-implement", "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains('%')),
+            "Decision T2-50 holds for containers too: {lines:?}"
+        );
+    }
+
+    /// The aggregation glyph is about the whole span, not the leaf that
+    /// happens to be current: once the run is past a container's last leaf,
+    /// the container reads done.
+    #[test]
+    fn a_container_reads_done_only_once_the_run_is_past_its_last_leaf() {
+        let screen = WorkScreen::from_parts(
+            "01NEST".to_string(),
+            nested_work_body(3),
+            vec![],
+            vec![],
+            None,
+        );
+        let lines: Vec<String> = screen
+            .workflow_lines()
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(lines[3], "✓ 10-investigate/  2/2", "{lines:?}");
+        assert_eq!(lines[5], "  ✓ 10-deep/  1/1", "{lines:?}");
+        assert!(
+            lines[7].starts_with("⠹ 20-implement"),
+            "the container's sibling is the current leaf now: {lines:?}"
+        );
+    }
+
+    /// The negative half, and the one that matters for every workflow that
+    /// does not nest: a flat stage list renders exactly as it did before the
+    /// tree existed — no headers, no indentation.
+    #[test]
+    fn a_flat_workflow_still_renders_as_a_flat_rail() {
+        let screen = screen_with("active", Vec::new());
+        let lines: Vec<String> = screen
+            .workflow_lines()
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert_eq!(lines.len(), 5, "label, blank, three stages: {lines:?}");
+        assert!(
+            lines[2..].iter().all(|l| !l.starts_with(' ')),
+            "nothing is indented when nothing nests: {lines:?}"
+        );
+        assert!(
+            lines[2..].iter().all(|l| !l.contains('/')),
+            "no container headers appear: {lines:?}"
         );
     }
 
