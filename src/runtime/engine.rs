@@ -5564,6 +5564,7 @@ mod tests {
                 version: "1".to_string(),
                 source: "test".to_string(),
                 stages: Vec::new(),
+                containers: Vec::new(),
                 content_hash: String::new(),
             },
             route: Route {
