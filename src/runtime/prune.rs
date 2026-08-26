@@ -156,6 +156,120 @@ pub struct PrunePolicy {
     pub source: PolicySource,
 }
 
+/// H1 brief deliverable 1 (D7 J3; partition mechanics R2 on `cap_seq`'s
+/// existing fold shape): how each retained Work's own retention floor is
+/// resolved, keyed by the canonical estate root [`WorkIndexRow::estate_root`]
+/// already carries (D1/D10 — folded once from the envelope's `workspace_id`,
+/// never re-derived here).
+///
+/// **What this is not.** It does not change where blobs are scanned for
+/// liveness (D7: that scan stays journal-wide regardless — see
+/// [`scan_condemned_range`]); it only changes which `retention` number a
+/// given Work's own group answers to when the segment horizon is computed.
+#[derive(Debug, Clone)]
+pub struct EstatePolicies {
+    /// Declared per canonical estate root — `AdmittedEstate::retention` read
+    /// per admitted estate (brief deliverable 1), never a daemon-wide value
+    /// applied to every root alike.
+    per_root: BTreeMap<String, PrunePolicy>,
+    /// Applied to a Work whose `estate_root` is `None` (no context at
+    /// submission) or names a root not in `per_root` (unadmitted, or no
+    /// longer admitted) — "the config override or built-in default applies",
+    /// per the brief's own wording.
+    fallback: PrunePolicy,
+}
+
+impl EstatePolicies {
+    /// A registry with no per-estate overrides at all: every root answers to
+    /// `fallback`.
+    pub fn new(fallback: PrunePolicy) -> Self {
+        Self {
+            per_root: BTreeMap::new(),
+            fallback,
+        }
+    }
+
+    /// Every retained Work answers to the same policy, regardless of its own
+    /// `estate_root` — the pre-H1 shape, and what every call site not yet
+    /// threading an [`crate::runtime::estates::EstateRegistry`] keeps getting
+    /// (R1: no forced churn on a call site that has not opted in). Byte-
+    /// identical in its cap arithmetic to the original single-policy
+    /// `cap_seq(&registry.work_index, n)` call, because a uniform policy
+    /// partitions the registry into exactly the groups it already was: one,
+    /// if every row shares an `estate_root` (or lacks one), or several groups
+    /// that all happen to answer to the same number.
+    pub fn uniform(policy: PrunePolicy) -> Self {
+        Self::new(policy)
+    }
+
+    /// Declare `root`'s own policy, overriding the fallback for that root
+    /// only.
+    pub fn with_estate(mut self, root: impl Into<String>, policy: PrunePolicy) -> Self {
+        self.per_root.insert(root.into(), policy);
+        self
+    }
+
+    /// Build directly from the daemon's admitted-estate registry: every
+    /// estate that declared its own `[estate] retention` gets that policy
+    /// (`PolicySource::Manifest`); an admitted estate that declared none
+    /// falls through to `fallback` exactly like an unadmitted root does —
+    /// there is nothing per-estate to read for it, so it answers to the same
+    /// config-override-or-default `fallback` already resolves.
+    pub fn from_registry(
+        estates: &crate::runtime::estates::EstateRegistry,
+        fallback: PrunePolicy,
+    ) -> Self {
+        let mut policies = Self::new(fallback);
+        for entry in estates.entries() {
+            if let Some(retention) = entry.estate.retention {
+                policies = policies.with_estate(
+                    entry.estate.root.to_string_lossy().into_owned(),
+                    PrunePolicy {
+                        retention,
+                        source: PolicySource::Manifest,
+                    },
+                );
+            }
+        }
+        policies
+    }
+
+    /// The policy a Work with this `estate_root` answers to.
+    pub fn resolve(&self, estate_root: Option<&str>) -> PrunePolicy {
+        estate_root
+            .and_then(|root| self.per_root.get(root))
+            .copied()
+            .unwrap_or(self.fallback)
+    }
+
+    /// The config-override-or-default policy applied to an unknown/unadmitted
+    /// estate — also what a report showing one aggregate number (rather than
+    /// a full per-estate breakdown) should cite.
+    pub fn fallback(&self) -> PrunePolicy {
+        self.fallback
+    }
+}
+
+/// One estate's own share of a prune cycle's before/after counts — brief
+/// deliverable 3: "the report names estates", not only an aggregate total.
+/// `examined` is this estate's retained Work count going into the cycle;
+/// `retired` is how many of those this cycle actually pruned (carried-forward
+/// residue excluded, matching [`PruneOutcome::works_pruned`]'s own
+/// convention); `kept = examined - retired`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EstatePruneStat {
+    /// Canonical estate root, or `None` for a Work with no known estate.
+    pub estate_root: Option<String>,
+    /// The policy this estate's Works answered to this cycle.
+    pub policy: PrunePolicy,
+    /// Retained Works belonging to this estate before this cycle.
+    pub examined: usize,
+    /// This estate's Works newly retired this cycle.
+    pub retired: usize,
+    /// This estate's Works still retained after this cycle.
+    pub kept: usize,
+}
+
 /// One pruned Work, as the journal remembers it after its events are gone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PrunedWorkRow {
@@ -179,6 +293,14 @@ pub struct PrunedWorkRow {
     /// later replay reproduces it identically rather than reading a wall
     /// clock at fold time.
     pub pruned_at: String,
+    /// H1 brief deliverable 3: the estate this Work was submitted against
+    /// ([`WorkIndexRow::estate_root`], copied verbatim at prune time), so a
+    /// later reader can answer "estate X's Work … was pruned" from the
+    /// residue alone, with no cache in the loop. `#[serde(default)]` for a
+    /// record committed before this field existed (§20's forward-
+    /// compatibility stance) — an honest "not recorded", never invented.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estate_root: Option<String>,
 }
 
 /// One pruned command's ledger key — Q8's exemption made durable.
@@ -431,6 +553,11 @@ pub struct PrunePlan {
     pub scan_through: u64,
     /// Why pruning did not advance further than it did.
     pub stall: PruneStall,
+    /// H1 brief deliverable 3: this cycle's examined/retired/kept, broken
+    /// down by estate. Not journaled directly (not part of
+    /// [`PruneIntentRecord`]'s wire shape) — [`run`] copies it verbatim onto
+    /// [`PruneOutcome::per_estate`], which is.
+    pub per_estate: Vec<EstatePruneStat>,
 }
 
 /// What one cycle actually did — returned by [`run`]/[`run_startup`],
@@ -468,6 +595,12 @@ pub struct PruneOutcome {
     /// re-arms `prune_pending` from this so the next tick continues the
     /// backlog drain rather than waiting on an unrelated rotation (§7.4).
     pub truncated_by_cap: bool,
+    /// H1 brief deliverable 3: this cycle's examined/retired/kept, broken
+    /// down by estate rather than folded into the aggregate counts above.
+    /// `#[serde(default)]` for a `prune.completed.outcome` committed before
+    /// this field existed.
+    #[serde(default)]
+    pub per_estate: Vec<EstatePruneStat>,
 }
 
 /// Why pruning is not advancing further — Q7's whole answer: there is no
@@ -567,15 +700,149 @@ pub fn retired_whole(state: WorkState, run: Option<&crate::runtime::projection::
 /// Works can ever tie — the ranking is total, with no tie-break rule to get
 /// wrong.
 pub fn cap_seq(work_index: &BTreeMap<String, WorkIndexRow>, n: usize) -> u64 {
+    cap_seq_over(work_index.values().map(|row| row.last_seq), n)
+}
+
+/// [`cap_seq`]'s own ranking rule, factored out over a bare `last_seq`
+/// iterator rather than a whole `work_index` (R2) — the shape
+/// [`multi_estate_cap`] needs to apply the identical rule to one estate's
+/// own slice of Works without allocating a throwaway `WorkIndexRow` map just
+/// to satisfy [`cap_seq`]'s signature.
+fn cap_seq_over(last_seqs: impl Iterator<Item = u64>, n: usize) -> u64 {
     if n == 0 {
         return u64::MAX;
     }
-    if work_index.len() <= n {
+    let mut last_seqs: Vec<u64> = last_seqs.collect();
+    if last_seqs.len() <= n {
         return 0;
     }
-    let mut last_seqs: Vec<u64> = work_index.values().map(|row| row.last_seq).collect();
     last_seqs.sort_unstable_by(|a, b| b.cmp(a));
     last_seqs[n - 1].saturating_sub(1)
+}
+
+/// H1 brief deliverable 1 (D7 J3): the shared segment horizon must respect
+/// every estate's own floor *simultaneously* — so this is the most
+/// restrictive of the independently-computed per-estate caps
+/// ([`cap_seq_over`], reused per group, R2), never a single cap taken over
+/// the combined set. Taking the combined set's own cap would let one
+/// estate's population size dilute or tighten another's floor (a small
+/// estate's Works would count toward a large estate's "top N", or vice
+/// versa) — exactly the "one estate's retention silently governs another's
+/// Works" failure the recon doc names for this touch point.
+///
+/// The reverse direction (one group with `len <= n`, protecting all of its
+/// own Works via [`cap_seq_over`]'s `0` sentinel) is not a bug when it
+/// dominates the `min`: it means that group's floor genuinely requires
+/// protecting Works down to the very start of the shared journal, and no
+/// partitioning scheme can prune around a Work while also protecting it —
+/// the atom of deletion is the segment (ADR 0019's own eventually-exact
+/// tradeoff), and a segment shared with a protected Work cannot be unlinked
+/// regardless of which estate asked for the pruning.
+pub fn multi_estate_cap(
+    work_index: &BTreeMap<String, WorkIndexRow>,
+    policies: &EstatePolicies,
+) -> u64 {
+    let mut groups: BTreeMap<Option<String>, Vec<u64>> = BTreeMap::new();
+    for row in work_index.values() {
+        groups
+            .entry(row.estate_root.clone())
+            .or_default()
+            .push(row.last_seq);
+    }
+    if groups.is_empty() {
+        return cap_seq_over(std::iter::empty(), policies.fallback().retention as usize);
+    }
+    groups
+        .into_iter()
+        .map(|(root, seqs)| {
+            let n = policies.resolve(root.as_deref()).retention as usize;
+            cap_seq_over(seqs.into_iter(), n)
+        })
+        .min()
+        .expect("groups is non-empty, checked above")
+}
+
+/// What [`sweep_horizon`] resolves its cap and reported retention from —
+/// [`candidate_horizon`]/[`plan`]'s single-policy shape (unchanged, every
+/// existing call site) or the estate-partitioned shape
+/// ([`candidate_horizon_multi_estate`]/[`plan_multi_estate`]), sharing one
+/// sweep body rather than two independently-maintained copies (R2).
+enum PruneCapSource<'a> {
+    Uniform(&'a PrunePolicy),
+    MultiEstate(&'a EstatePolicies),
+}
+
+impl PruneCapSource<'_> {
+    fn cap(&self, work_index: &BTreeMap<String, WorkIndexRow>) -> u64 {
+        match self {
+            Self::Uniform(policy) => cap_seq(work_index, policy.retention as usize),
+            Self::MultiEstate(policies) => multi_estate_cap(work_index, policies),
+        }
+    }
+
+    /// What a single-number report (`PruneStall::retention`) shows: the
+    /// uniform policy's own number, or the fallback's — a per-estate
+    /// breakdown, when one is wanted, is [`EstatePruneStat`]'s job, not this
+    /// one field's.
+    fn retention_for_report(&self) -> u32 {
+        match self {
+            Self::Uniform(policy) => policy.retention,
+            Self::MultiEstate(policies) => policies.fallback().retention,
+        }
+    }
+
+    /// What [`PrunePlan::policy`]/[`PruneIntentRecord::policy`] journals —
+    /// same reasoning as `retention_for_report`.
+    fn reported_policy(&self) -> PrunePolicy {
+        match self {
+            Self::Uniform(policy) => **policy,
+            Self::MultiEstate(policies) => policies.fallback(),
+        }
+    }
+
+    /// The policy a specific estate root actually answered to — every
+    /// retained Work under `Uniform`, or [`EstatePolicies::resolve`] under
+    /// `MultiEstate`.
+    fn resolve(&self, estate_root: Option<&str>) -> PrunePolicy {
+        match self {
+            Self::Uniform(policy) => **policy,
+            Self::MultiEstate(policies) => policies.resolve(estate_root),
+        }
+    }
+}
+
+/// Brief deliverable 3: per-estate examined/kept, computed the same way
+/// regardless of `scope` — a uniform-policy caller gets one group's worth of
+/// honest reporting for free, not just the multi-estate path.
+fn estate_prune_stats(
+    work_index: &BTreeMap<String, WorkIndexRow>,
+    retired: &[PrunedWorkRow],
+    scope: &PruneCapSource,
+) -> Vec<EstatePruneStat> {
+    let mut examined: BTreeMap<Option<String>, usize> = BTreeMap::new();
+    for row in work_index.values() {
+        *examined.entry(row.estate_root.clone()).or_default() += 1;
+    }
+    let mut retired_counts: BTreeMap<Option<String>, usize> = BTreeMap::new();
+    for row in retired {
+        *retired_counts.entry(row.estate_root.clone()).or_default() += 1;
+    }
+    let mut roots: BTreeSet<Option<String>> = examined.keys().cloned().collect();
+    roots.extend(retired_counts.keys().cloned());
+    roots
+        .into_iter()
+        .map(|root| {
+            let examined = examined.get(&root).copied().unwrap_or(0);
+            let retired = retired_counts.get(&root).copied().unwrap_or(0);
+            EstatePruneStat {
+                policy: scope.resolve(root.as_deref()),
+                estate_root: root,
+                examined,
+                retired,
+                kept: examined.saturating_sub(retired),
+            }
+        })
+        .collect()
 }
 
 /// The Work whose retirement would let the horizon advance furthest: the
@@ -616,7 +883,30 @@ pub fn candidate_horizon(
     first_seq: &FirstSeqIndex,
     policy: &PrunePolicy,
 ) -> (u64, PruneStall) {
-    sweep_horizon(bounds, registry, first_seq, policy, u64::MAX)
+    sweep_horizon(
+        bounds,
+        registry,
+        first_seq,
+        &PruneCapSource::Uniform(policy),
+        u64::MAX,
+    )
+}
+
+/// H1 brief deliverable 1: [`candidate_horizon`]'s multi-estate sibling —
+/// same sweep, [`multi_estate_cap`] in place of a single [`cap_seq`] call.
+pub fn candidate_horizon_multi_estate(
+    bounds: &[SegmentBound],
+    registry: &WorkRegistry,
+    first_seq: &FirstSeqIndex,
+    policies: &EstatePolicies,
+) -> (u64, PruneStall) {
+    sweep_horizon(
+        bounds,
+        registry,
+        first_seq,
+        &PruneCapSource::MultiEstate(policies),
+        u64::MAX,
+    )
 }
 
 /// The sweep [`candidate_horizon`] runs, factored out so [`plan`]'s
@@ -626,15 +916,19 @@ pub fn candidate_horizon(
 /// the residue cross-check to catch a straddling Work the sweep itself
 /// would have refused. `ceiling = u64::MAX` (via [`candidate_horizon`])
 /// changes nothing versus every candidate being eligible on its own terms.
+///
+/// `scope` decides only how the retention *cap* is computed
+/// ([`PruneCapSource::cap`]) — every other predicate (nostraddle, the
+/// blocking-work check, the batch cap) is unchanged by H1 and stays exactly
+/// as it was pre-partitioning.
 fn sweep_horizon(
     bounds: &[SegmentBound],
     registry: &WorkRegistry,
     first_seq: &FirstSeqIndex,
-    policy: &PrunePolicy,
+    scope: &PruneCapSource,
     ceiling: u64,
 ) -> (u64, PruneStall) {
-    let n = policy.retention as usize;
-    let cap = cap_seq(&registry.work_index, n);
+    let cap = scope.cap(&registry.work_index);
 
     // I-W3-4: the segment the writer currently holds open is never
     // unlinked. `bounds`'s own last (newest) entry is always that segment
@@ -703,7 +997,7 @@ fn sweep_horizon(
         pinning_kind: None,
         pinning_seq: None,
         retained_works: registry.work_index.len(),
-        retention: policy.retention,
+        retention: scope.retention_for_report(),
         floor_seq: bounds.first().map(|b| b.first_seq).unwrap_or(1),
         horizon_seq: h,
         truncated_by_cap,
@@ -870,6 +1164,46 @@ pub fn plan(
     first_seq: &FirstSeqIndex,
     policy: &PrunePolicy,
 ) -> Result<Option<PrunePlan>, PruneError> {
+    plan_with_scope(
+        data_dir,
+        bounds,
+        candidate,
+        registry,
+        first_seq,
+        &PruneCapSource::Uniform(policy),
+    )
+}
+
+/// H1 brief deliverable 1: [`plan`]'s multi-estate sibling — same Phase B,
+/// [`multi_estate_cap`] in place of a single [`cap_seq`] call, and
+/// [`PrunePlan::per_estate`] populated from the real partition rather than
+/// left empty.
+pub fn plan_multi_estate(
+    data_dir: &Path,
+    bounds: &[SegmentBound],
+    candidate: u64,
+    registry: &WorkRegistry,
+    first_seq: &FirstSeqIndex,
+    policies: &EstatePolicies,
+) -> Result<Option<PrunePlan>, PruneError> {
+    plan_with_scope(
+        data_dir,
+        bounds,
+        candidate,
+        registry,
+        first_seq,
+        &PruneCapSource::MultiEstate(policies),
+    )
+}
+
+fn plan_with_scope(
+    data_dir: &Path,
+    bounds: &[SegmentBound],
+    candidate: u64,
+    registry: &WorkRegistry,
+    first_seq: &FirstSeqIndex,
+    scope: &PruneCapSource,
+) -> Result<Option<PrunePlan>, PruneError> {
     if candidate == 0 {
         return Ok(None);
     }
@@ -922,7 +1256,7 @@ pub fn plan(
         // instead of a correctly-computed, possibly-smaller-but-legal
         // horizon).
         let ceiling = pin_first_seq.saturating_sub(1);
-        let (admissible, _) = sweep_horizon(bounds, registry, first_seq, policy, ceiling);
+        let (admissible, _) = sweep_horizon(bounds, registry, first_seq, scope, ceiling);
         horizon = admissible.min(horizon);
         if horizon == 0 {
             return Ok(None);
@@ -956,6 +1290,7 @@ pub fn plan(
             updated_at: row.updated_at.clone(),
             last_seq: row.last_seq,
             pruned_at: String::new(), // stamped by `run`/`run_startup` at commit time
+            estate_root: row.estate_root.clone(),
         })
         .collect();
 
@@ -1048,7 +1383,7 @@ pub fn plan(
         }
     }
 
-    let (_, mut stall) = candidate_horizon(bounds, registry, first_seq, policy);
+    let (_, mut stall) = sweep_horizon(bounds, registry, first_seq, scope, u64::MAX);
     stall.horizon_seq = horizon;
     stall.pinning_seq = effective_pin_seq;
     if let Some(pin_seq) = effective_pin_seq {
@@ -1066,8 +1401,10 @@ pub fn plan(
             });
     }
 
+    let per_estate = estate_prune_stats(&registry.work_index, &residue.works, scope);
+
     Ok(Some(PrunePlan {
-        policy: *policy,
+        policy: scope.reported_policy(),
         horizon_seq: horizon,
         segments,
         residue,
@@ -1078,6 +1415,7 @@ pub fn plan(
         rescue_quarantined,
         scan_through: surviving_scan_through,
         stall,
+        per_estate,
     }))
 }
 
@@ -1265,6 +1603,7 @@ pub fn run(
         blobs_rescued_by_reference,
         floor_seq_after: record.floor_seq_after,
         truncated_by_cap: plan.stall.truncated_by_cap,
+        per_estate: plan.per_estate.clone(),
     };
 
     // Step 5 (T10, fsynced).
@@ -1384,6 +1723,11 @@ pub fn complete_interrupted(
         blobs_rescued_by_reference,
         floor_seq_after: pending.floor_seq_after,
         truncated_by_cap: false,
+        // §6.2's "record, apply nothing" boundary: `PruneIntentRecord`
+        // (what a crash leaves behind) never carried a per-estate
+        // breakdown, so a resumed cycle has nothing to report here beyond
+        // the aggregate counts above — an honest empty, not a guess.
+        per_estate: Vec::new(),
     };
 
     core.commit(EventDraft::new(
@@ -1487,6 +1831,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00.000Z".to_string(),
             last_seq: 1,
             pruned_at: "2026-01-02T00:00:00.000Z".to_string(),
+            estate_root: None,
         }
     }
 
