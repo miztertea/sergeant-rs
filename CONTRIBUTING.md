@@ -8,7 +8,7 @@ Requires Rust (edition 2024) and `git`.
 cargo build
 ```
 
-First build is slow — bundled DuckDB compiles from source. Budget a few minutes for a cold `cargo build --tests` in a fresh worktree (roughly 2-4 minutes on modern desktop-class hardware, higher under heavy contention from a concurrent build); an incremental rebuild after that is seconds, not minutes.
+First build is slow — bundled DuckDB compiles from source. Budget a few minutes for a cold `cargo build --tests` in a fresh worktree: measured at ~2m18s solo on modern desktop-class hardware, and up to ~4 minutes when a concurrent cold build contends for the same cores; an incremental rebuild after that is seconds, not minutes.
 
 ## Test
 

@@ -71,9 +71,10 @@ release.
 - Documentation frame extended with host-runtime/cutover prose (service
   installation, the legacy-runtime reconcile-or-abandon remedy, daemon
   stop's host-wide blast radius) and a corrected Cerberus cold-build
-  figure (~2-4 minutes for a solo cold `cargo build --tests`, not the
-  stale ~10 minute figure that had been carried from an earlier,
-  differently-provisioned environment).
+  figure (~2m18s for a solo cold `cargo build --tests`; up to ~4 minutes
+  under measured concurrent-build contention — not the stale ~10 minute
+  figure that had been carried from an earlier, differently-provisioned
+  environment).
 
 ## [0.2.4] - 2026-08-25
 
