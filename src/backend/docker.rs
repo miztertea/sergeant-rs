@@ -1603,58 +1603,213 @@ mod tests {
         );
     }
 
-    /// E12's standing guard: `stage_id` never reaches a filesystem path
-    /// un-encoded. The dangerous shape is interpolating it *into* a string
-    /// that is then joined — `PathBuf::join` splits the embedded `/`, so the
-    /// result is a path, not the filename the author meant. `pin_path` was
-    /// the one instance the recon found; this asserts it stays at zero.
+    /// The index in `bytes` of the `)` that closes the `(` at `open_idx`,
+    /// tracking paren depth and skipping parens inside `"` string literals
+    /// (so a stray `)` in an interpolated string can't close the call
+    /// early). Shared by [`e12_scan`] and its own regression test.
+    fn e12_matching_paren(bytes: &[u8], open_idx: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut i = open_idx;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Whether `word` appears in `haystack` as a whole identifier, not
+    /// merely as a substring of a longer one.
+    fn e12_contains_word(haystack: &str, word: &str) -> bool {
+        haystack
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|token| token == word)
+    }
+
+    /// E12's standing guard, factored out so both
+    /// [`no_source_file_interpolates_a_stage_id_into_a_joined_filename`] (run
+    /// against `src/`) and
+    /// [`the_e12_scanner_catches_the_ampersand_and_multiline_forms`] (run
+    /// against throwaway fixtures) share one implementation: recurse into
+    /// `dir`, and in every `.rs` file scan for `stage_id` reaching a
+    /// filesystem path un-encoded — interpolated *into* a string that is
+    /// then joined, which lets `PathBuf::join` split the embedded `/` into
+    /// path components the author never meant (`pin_path` was the one
+    /// instance the recon found; this keeps it at zero).
     ///
     /// Plainly joining a stage id (`dir.join(stage_id)`) is a different
     /// thing and stays legal: there the split into components is exactly the
     /// intent — a composed id resolves its own nested directory (W1 §3).
-    #[test]
-    fn no_source_file_interpolates_a_stage_id_into_a_joined_filename() {
-        // Split so this scanner's own detector line is not itself a match —
-        // `concat!` rejoins it at compile time, but no *source* line here
-        // ever contains the contiguous pattern.
-        const JOINED_FORMAT: &str = concat!(".join(format", "!(");
-
-        fn scan(dir: &Path, offenders: &mut Vec<String>) {
-            let Ok(entries) = std::fs::read_dir(dir) else {
-                return;
+    ///
+    /// A same-line, exact-substring scan misses the idiomatic forms of this
+    /// exact bug: `.join(&format!(...))` (a `&` between the two literals)
+    /// and a `format!(` call whose args wrap onto their own line. So this
+    /// scans each file as one whitespace-collapsed token stream — every
+    /// `.join(` call, optionally followed by `&`, whose very next token is
+    /// `format!(` — and inspects that `format!` call's *whole* (possibly
+    /// multi-line) argument list for a `stage_id` token, rather than
+    /// requiring both literals adjacent on one physical line.
+    fn e12_scan(dir: &Path, offenders: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                e12_scan(&path, offenders);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
             };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    scan(&path, offenders);
-                    continue;
+            // Drop whole-line comments, then collapse every run of
+            // whitespace (including the newlines a wrapped `format!` call
+            // introduces) to a single space, so `.join(`, an optional `&`,
+            // `format!(` and its args line up as one contiguous token
+            // stream regardless of the source's own line breaks.
+            let stripped = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+            let bytes = flat.as_bytes();
+
+            let mut search_from = 0;
+            while let Some(rel) = flat[search_from..].find(".join(") {
+                let join_paren = search_from + rel + ".join(".len() - 1;
+                let mut cursor = join_paren + 1;
+                // Skip an optional `&` (whitespace collapsing may have left
+                // a space on either side) between `.join(` and the
+                // `format!(` it wraps.
+                if bytes.get(cursor) == Some(&b' ') {
+                    cursor += 1;
                 }
-                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                    continue;
-                }
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                for (number, line) in text.lines().enumerate() {
-                    let code = line.trim_start();
-                    if code.starts_with("//") {
-                        continue;
+                let had_ampersand = bytes.get(cursor) == Some(&b'&');
+                if had_ampersand {
+                    cursor += 1;
+                    if bytes.get(cursor) == Some(&b' ') {
+                        cursor += 1;
                     }
-                    if code.contains(JOINED_FORMAT) && code.contains("stage_id") {
-                        offenders.push(format!("{}:{}: {code}", path.display(), number + 1));
+                }
+                if flat[cursor..].starts_with("format!(") {
+                    let fmt_paren = cursor + "format!(".len() - 1;
+                    if let Some(close) = e12_matching_paren(bytes, fmt_paren)
+                        && e12_contains_word(&flat[fmt_paren + 1..close], "stage_id")
+                    {
+                        offenders.push(format!(
+                            "{}: .join({}format!({})",
+                            path.display(),
+                            if had_ampersand { "&" } else { "" },
+                            flat[fmt_paren + 1..close].trim()
+                        ));
                     }
                 }
+                search_from = join_paren + 1;
             }
         }
+    }
 
+    /// E12's standing guard, run against this crate's own `src/`: proves a
+    /// future raw `stage_id`-into-a-joined-filename path stays at zero. See
+    /// [`e12_scan`] for the detection rule, and
+    /// [`the_e12_scanner_catches_the_ampersand_and_multiline_forms`] for
+    /// proof the scanner itself actually catches the shapes it claims to.
+    #[test]
+    fn no_source_file_interpolates_a_stage_id_into_a_joined_filename() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
-        scan(&src, &mut offenders);
+        e12_scan(&src, &mut offenders);
         assert!(
             offenders.is_empty(),
             "E12: a stage id interpolated into a filename that is then joined splits on `/` \
              into path components — encode it (see DockerBackend::pin_path):\n{}",
             offenders.join("\n")
+        );
+    }
+
+    /// [`e12_scan`] must actually catch the shapes E12 names as missed by a
+    /// same-line, exact-substring detector: `&format!(` between the
+    /// literals, and a `format!` call whose interpolated args wrap onto
+    /// their own line. Exercised against throwaway fixture files rather
+    /// than `src/`, so this stays a regression test for the scanner itself
+    /// and never depends on — or is defeated by — whatever `src/` happens
+    /// to contain.
+    #[test]
+    fn the_e12_scanner_catches_the_ampersand_and_multiline_forms() {
+        // `FORMAT_BANG_OPEN` exists only so the fixture bodies below, when
+        // assembled, do not themselves leave the literal contiguous text
+        // `format!(` sitting in *this* file's own source next to a
+        // `.join(` — which would make `no_source_file_interpolates_a_
+        // stage_id_into_a_joined_filename`'s scan of `src/` flag this very
+        // test file. `concat!` joins it at compile time; no source line
+        // here ever contains the two pieces adjacent.
+        const FORMAT_BANG_OPEN: &str = concat!("format", "!(");
+
+        fn offenders_for(source: &str) -> Vec<String> {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            std::fs::write(dir.path().join("fixture.rs"), source).expect("fixture file");
+            let mut offenders = Vec::new();
+            e12_scan(dir.path(), &mut offenders);
+            offenders
+        }
+
+        let ampersand = format!(
+            "fn pin_path(work_id: &str, stage_id: &str) -> PathBuf {{\n\
+                 self.pins_dir().join(&{FORMAT_BANG_OPEN}\"{{work_id}}__{{stage_id}}.json\"))\n\
+             }}"
+        );
+        assert_eq!(
+            offenders_for(&ampersand).len(),
+            1,
+            "an `&format!(` between `.join(` and the stage id must still be caught"
+        );
+
+        let multiline = format!(
+            "fn pin_path(work_id: &str, stage_id: &str) -> PathBuf {{\n\
+                 self.pins_dir().join({FORMAT_BANG_OPEN}\n\
+                     \"{{work_id}}__{{stage_id}}.json\"\n\
+                 ))\n\
+             }}"
+        );
+        assert_eq!(
+            offenders_for(&multiline).len(),
+            1,
+            "a `format!(` call whose args wrap onto their own line must still be caught"
+        );
+
+        let benign = r#"
+            fn pin_path(&self, work_id: &str, stage_id: &str) -> PathBuf {
+                self.pins_dir().join(encode(stage_id))
+            }
+        "#;
+        assert!(
+            offenders_for(benign).is_empty(),
+            "a stage id that never reaches a `.join(format!(...))` must not be flagged"
         );
     }
 
