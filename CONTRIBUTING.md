@@ -19,11 +19,24 @@ cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo
 All three must be green before a commit. `cargo test --test <name>` runs one
 suite, `cargo test --test <name> <substring>` runs one test.
 
+`cargo nextest run --locked` is the fast path for the test step (S2 V1c,
+measured — see `knowledge/evidence/perf/build-test-speed-2026-08-26.md` in
+the workspace estate): same tests, same pass/fail contract, a process-per-test
+runner instead of cargo's own. Install the exact pinned version CI uses
+(`.github/workflows/ci.yml`'s `cargo-nextest@` line is the source of truth) —
+`cargo install cargo-nextest --locked --version <that version>` — never a
+floating one. Plain `cargo test --locked` stays valid and is what CI's
+non-test jobs and any nextest-incompatible lane fall back to; nothing
+requires nextest. `cargo nextest run --test <name>` and `cargo nextest run
+-E 'test(<substring>)'` are nextest's equivalents of the two `cargo test`
+invocations above.
+
 ## Pull requests
 
 `main` is protected: changes land through a pull request, not a direct push.
-CI (`fmt`, `clippy`, `cargo test`, ShellCheck, a macOS compile check, and
-dependency policy) runs on every PR and must pass.
+CI (`fmt-clippy`, `test` — nextest, split from one job into two parallel
+ones in S2 V1c — ShellCheck, a macOS compile check, and dependency policy)
+runs on every PR and must pass.
 
 ## Testing rules
 
