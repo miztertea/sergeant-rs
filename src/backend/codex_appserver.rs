@@ -28,6 +28,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::{ItemKind, ItemView, KIND_TURN_HARNESS_ERROR, NativeEvent, Terminal, TurnAccumulator};
+use crate::backend::child::{self, ChildLifetime};
 
 // -------------------------------------------------------------- fingerprint
 
@@ -636,6 +637,10 @@ pub(super) struct AppServerChild {
     stderr_tail: Arc<Mutex<Vec<u8>>>,
     pgid: u32,
     reader: Option<std::thread::JoinHandle<()>>,
+    /// `Some` only for a [`ChildLifetime::Probe`] child (#310): deregisters
+    /// this pgid from the owning probe walk's live set when this handle
+    /// drops. Held, never read.
+    _registration: Option<child::ProbeChildRegistration>,
 }
 
 /// How much of the child's stderr is retained for evidence (a ring: the tail
@@ -717,11 +722,20 @@ impl AppServerChild {
     /// holds — so `on_line` can answer a server request inline, without a
     /// second round trip through this struct. The caller must not block long
     /// in `on_line`, the same rule exec's `TurnReader` follows.
+    ///
+    /// `lifetime` is #310's fix and must be stated by every caller: a
+    /// [`ChildLifetime::Probe`] child is additionally hardened
+    /// ([`child::harden_probe_child`]) so a `SIGKILL`ed daemon takes it with
+    /// it, and recorded against the probe walk that owns the calling thread.
+    /// `gate_g4_handshake` is that caller; the launch path's child is
+    /// [`ChildLifetime::Execution`] and must never be hardened — see that
+    /// enum's own doc for why.
     pub(super) fn spawn(
         executable: &Path,
         cwd: &Path,
         env: &BTreeMap<String, String>,
         codex_home: Option<&Path>,
+        lifetime: ChildLifetime,
         on_line: impl Fn(&AppServerHandle, InboundLine) + Send + 'static,
     ) -> Result<Self, String> {
         let mut command = Command::new(executable);
@@ -739,17 +753,29 @@ impl AppServerChild {
         }
         // §1.5.5: reused, not copied — the app-server child spawns
         // grandchildren (shell commands) exactly as `codex exec` does, so
-        // the same grandchild-survives-the-kill hazard applies unchanged.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
+        // the same grandchild-survives-the-kill hazard applies unchanged. A
+        // probe child gets that group from `harden_probe_child`, plus
+        // `PR_SET_PDEATHSIG` (#310); an execution child gets the group and
+        // nothing else.
+        match lifetime {
+            ChildLifetime::Probe => child::harden_probe_child(&mut command),
+            ChildLifetime::Execution => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    command.process_group(0);
+                }
+            }
         }
 
         let mut child = command
             .spawn()
             .map_err(|e| format!("cannot spawn {executable:?} app-server: {e}"))?;
         let pgid = child.id();
+        // Recorded before anything below can fail: from here on this pgid is
+        // reachable by `ProbeChildren::kill_all`.
+        let registration =
+            matches!(lifetime, ChildLifetime::Probe).then(|| child::register_probe_child(pgid));
         let stdin = child
             .stdin
             .take()
@@ -859,6 +885,7 @@ impl AppServerChild {
             stderr_tail,
             pgid,
             reader: Some(reader),
+            _registration: registration,
         })
     }
 

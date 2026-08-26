@@ -129,6 +129,7 @@ use super::{
     ExecutionHandle, NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport,
     ResumeRequest, RuntimeScope, StartRequest,
 };
+use crate::backend::child;
 use crate::domain::estate::InstructionPolicy;
 use crate::domain::event::{Event, EventDraft, EventSource};
 use crate::domain::profile::Profile;
@@ -876,6 +877,25 @@ impl std::fmt::Debug for ClaudeBackend {
     }
 }
 
+/// One bounded probe invocation, hardened per #310.
+///
+/// `output()` waits, so the child cannot outlive *this call* — but it can
+/// outlive a daemon `SIGKILL`ed during it, and a `--version` that never
+/// returns is exactly how one gets stuck there. Both of this adapter's probe
+/// invocations go through here so neither can forget the hardening.
+///
+/// Audited for #310 alongside the other four adapters: this adapter's probe
+/// spawns **nothing persistent** — two token-free one-shots that exit on
+/// their own — so it was never a source of the leak. It is hardened anyway
+/// because the cost is one line and the failure mode it guards against is a
+/// process nobody counts.
+fn probe_output(exe: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new(exe);
+    command.args(args);
+    child::harden_probe_child(&mut command);
+    command.output()
+}
+
 impl ClaudeBackend {
     /// Build the adapter. Probing is lazy (first PROBE/START), so
     /// constructing one costs nothing on daemons that never route to it.
@@ -1014,7 +1034,7 @@ impl ClaudeBackend {
 
     fn run_probe(&self) -> ProbeOutcome {
         let exe = &self.config.executable;
-        let version_out = match Command::new(exe).arg("--version").output() {
+        let version_out = match probe_output(exe, &["--version"]) {
             Ok(out) => out,
             Err(e) => {
                 return ProbeOutcome {
@@ -1070,7 +1090,7 @@ impl ClaudeBackend {
                 version: Some(canonical_version),
             };
         }
-        let help_out = match Command::new(exe).arg("--help").output() {
+        let help_out = match probe_output(exe, &["--help"]) {
             Ok(out) => out,
             Err(e) => {
                 return ProbeOutcome {

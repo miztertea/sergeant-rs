@@ -90,6 +90,7 @@ use crate::api::{
     drive_completions, router,
 };
 use crate::backend::agy::{AGY_BACKEND_NAME, AgyBackend, AgyConfig};
+use crate::backend::child::{self, ProbeChildren};
 use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig};
 use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
@@ -353,6 +354,11 @@ pub struct DaemonHandle {
     pub token: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     served: tokio::task::JoinHandle<()>,
+    /// The probe children *this* daemon's walk has live (#310). Per-daemon,
+    /// never global: `cargo test` runs many in-process daemons at once, and a
+    /// global set would let one daemon's `kill` take a sibling's live probe
+    /// child down and turn its probe into a spurious refusal.
+    probe_children: Arc<ProbeChildren>,
 }
 
 impl DaemonHandle {
@@ -377,6 +383,21 @@ impl DaemonHandle {
         self.shutdown_tx.take();
         self.served.abort();
         let _ = (&mut self.served).await;
+        // #310: aborting the serve task does not reach the probe walk, and a
+        // probe child is a *process* — a real `opencode serve` at ~265 MB —
+        // that nothing in this process's memory owns once the handle is
+        // gone. Reaped by recorded pgid, so the kill reaches whatever the
+        // probe child itself spawned and nothing that belongs to anyone
+        // else. This is the in-process analogue of the `PR_SET_PDEATHSIG`
+        // that covers the out-of-process daemon; both exist because
+        // destructors do not run for a killed process.
+        let killed = self.probe_children.kill_all();
+        if !killed.is_empty() {
+            tracing::debug!(
+                ?killed,
+                "killed probe children still live when the daemon was killed"
+            );
+        }
     }
 }
 
@@ -1134,11 +1155,15 @@ pub async fn start_with(
     // that already knows what evidence is outstanding.
     probe_gate.expect(probe_backends.names());
     let probe_lanes = Arc::new(tokio::sync::Semaphore::new(PROBE_WALK_LANES));
+    // #310: the set every probe child this walk spawns records itself into,
+    // and the set `DaemonHandle::kill` reaps. Created here, one per daemon.
+    let probe_children = ProbeChildren::new();
     let probes = tokio::spawn(probe_walk(
         state.core.clone(),
         probe_backends,
         probe_gate.clone(),
         probe_lanes.clone(),
+        probe_children.clone(),
     ));
 
     let app = router(state.clone());
@@ -1261,6 +1286,7 @@ pub async fn start_with(
         token,
         shutdown_tx: Some(shutdown_tx),
         served,
+        probe_children,
     })
 }
 
@@ -1307,11 +1333,13 @@ async fn probe_walk(
     backends: Arc<BackendRegistry>,
     gate: Arc<ProbeGate>,
     lanes: Arc<tokio::sync::Semaphore>,
+    probe_children: Arc<ProbeChildren>,
 ) {
     let mut walking = tokio::task::JoinSet::new();
     for name in backends.names() {
         let backends = backends.clone();
         let lanes = lanes.clone();
+        let probe_children = probe_children.clone();
         walking.spawn(async move {
             // The lane permit is held across the blocking probe and released
             // when it returns — see `PROBE_WALK_LANES` for why the fan-out is
@@ -1325,7 +1353,15 @@ async fn probe_walk(
                 let Some(backend) = backends.get(&name) else {
                     return (name, None);
                 };
-                let report = backend.probe();
+                // #310: everything a probe spawns is recorded against this
+                // walk for as long as this closure runs, which is exactly the
+                // window in which a probe child is live. The owner is
+                // installed around `capabilities()` too, because for the
+                // opencode and agy adapters that call *is* a subprocess gate.
+                let (report, capabilities) = child::owned_by(probe_children, || {
+                    let report = backend.probe();
+                    (report, backend.capabilities())
+                });
                 // `capabilities()` is read here, inside the blocking task,
                 // and not on the runtime: for the opencode and agy adapters
                 // it resolves the transport, which is itself a subprocess
@@ -1335,7 +1371,7 @@ async fn probe_walk(
                     "backend": name,
                     "available": report.available,
                     "detail": report.detail,
-                    "capabilities": backend.capabilities(),
+                    "capabilities": capabilities,
                     // §17: the adapter's declared runtime scope, recorded
                     // with the probe because it is a claim about the adapter,
                     // and the core is forbidden from assuming one.
