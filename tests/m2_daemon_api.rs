@@ -4667,30 +4667,100 @@ async fn t12_submission_throughput_has_an_automated_floor() {
             (status, body)
         }));
     }
-    let mut completed = 0usize;
     let mut created = 0usize;
+    let mut work_ids = Vec::with_capacity(BURST);
     for task in inflight {
         let (status, body) = task.await.expect("submit task");
         if status.is_success() {
             created += 1;
-            if body["work"]["state"] == "completed" {
-                completed += 1;
-            }
+            work_ids.push(
+                body["work"]["id"]
+                    .as_str()
+                    .expect("accepted submission carries a work id")
+                    .to_string(),
+            );
         }
+    }
+    assert_eq!(created, BURST, "every submission must be accepted");
+
+    // W4b's execution lane (`Engine::try_admit_execution`, `src/runtime/engine.rs`,
+    // J3 ratified) means a launch that finds the lane full is handed off to a
+    // detached task (`api::crank_inner`'s `EngineNext::Launch` arm, `src/api.rs`)
+    // and the submit's HTTP response returns immediately with the Work left
+    // `waiting` — the response body no longer means "this Work is done" the way
+    // it did before the lane existed. Reading completion from the submit response
+    // body (the original shape of this test) is exactly the regression N3R2-04's
+    // own doc comment above warns about: it measures the HTTP surface, not the
+    // submit path's whole operation. So the measured operation is now submit ->
+    // every accepted Work reaches a terminal state, and the timer runs across
+    // that whole span, not just the burst of concurrent POSTs.
+    //
+    // This is a fix for the lane-era measurement gap described above, not a fix
+    // for #278. #278 asks for two things this change does not do: (a) skip or
+    // scale the wall-clock floor under coverage instrumentation, and (b) attach
+    // dated measurements to (or delete) the BUDGET / CONTENTION_ALLOWANCE /
+    // THROUGHPUT_FLOOR derivation chain below. Both remain open in #278 — this
+    // change only widens what the timer measures (it now also covers
+    // execution-lane parking wait, the detached task's own scheduling, and this
+    // poll loop's sequential request overhead against every submitted Work), so
+    // an instrumented run is, if anything, more likely to trip THROUGHPUT_FLOOR
+    // than before, not less. Do not treat #278 as resolved by this commit.
+    let poll_deadline = Instant::now() + Duration::from_secs(30);
+    let mut states: Vec<String> = Vec::new();
+    loop {
+        states.clear();
+        let mut all_terminal = true;
+        for id in &work_ids {
+            let body: Value = http
+                .get(format!("{}/v1/work/{id}", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("work show")
+                .json()
+                .await
+                .expect("work show json");
+            let state = body["work"]["state"]
+                .as_str()
+                .expect("work has a state")
+                .to_string();
+            if !matches!(state.as_str(), "completed" | "failed" | "canceled") {
+                all_terminal = false;
+            }
+            states.push(state);
+        }
+        if all_terminal {
+            break;
+        }
+        // L7 revert-sensitivity: a lane that never releases a permit (the
+        // exact shape a leaked `execution_permits` entry or a re-broken
+        // `resume_after_execution_lane` edge would produce) wedges here
+        // rather than silently passing — this loop does not have a "give up
+        // and read whatever the response body already said" fallback the
+        // way the pre-lane-era version of this test effectively did.
+        assert!(
+            Instant::now() < poll_deadline,
+            "burst did not reach a terminal state within 30s — the execution lane \
+             wedged (states observed: {states:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     let elapsed = started.elapsed();
     handle.shutdown().await;
 
-    assert_eq!(created, BURST, "every submission must be accepted");
+    let completed = states.iter().filter(|s| s.as_str() == "completed").count();
     // The whole point is that the measured operation is the whole operation: a
-    // burst that parked in `pending` would be timing the HTTP surface again.
+    // burst that parked in `waiting` and was never driven on would have shown
+    // up here as a non-`completed` terminal state, not as this test's
+    // request timing out.
     assert_eq!(
         completed, BURST,
         "every submission must have run its workflow to completion — otherwise \
-         this is not measuring the submit path the budget was measured on"
+         this is not measuring the submit path the budget was measured on \
+         (states observed: {states:?})"
     );
     let rate = BURST as f64 / elapsed.as_secs_f64();
-    eprintln!("burst {BURST} (full submit path): {rate:.1} works/s in {elapsed:?}");
+    eprintln!("burst {BURST} (submit -> all terminal, lane era): {rate:.1} works/s in {elapsed:?}");
     assert!(
         rate >= THROUGHPUT_FLOOR,
         "submission throughput fell to {rate:.1} works/s at burst {BURST}, below the \
@@ -4699,9 +4769,13 @@ async fn t12_submission_throughput_has_an_automated_floor() {
          divided by a {CONTENTION_ALLOWANCE}× allowance for a shared test host gives \
          12.0 on Linux; revised to {THROUGHPUT_FLOOR} on M3 Pro / macOS due to \
          git-spawn overhead (#128). This is the whole submit path — estate discovery, \
-         workflow bind, `git worktree add`, reservation, launch — so any external effect \
-         of ~80 ms or more put back under the core lock lands below it, whatever the host \
-         speed."
+         workflow bind, `git worktree add`, reservation, launch, and (lane era, W4b) \
+         however long the execution lane parks a launch before admitting it — so any \
+         external effect of ~80 ms or more put back under the core lock, or execution-lane \
+         parking that does not clear well inside a 25-burst, lands below it, whatever the \
+         host speed. Lane-era floor provenance: measured 2026-08-26 at 18.9-100.5 works/s \
+         across default/2-core/instrumented-2-core conditions (worst 18.9, ≥2.3x margin; \
+         sergeant-rs-workspace's knowledge/evidence/perf/t12-lane-era-throughput-2026-08-26.md)."
     );
 }
 
