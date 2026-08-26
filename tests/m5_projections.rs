@@ -2078,7 +2078,7 @@ async fn real_adapter_events_populate_the_conversation_tables_and_tool_spans() {
     .await;
     let work_id = created["work"]["id"].as_str().expect("work id").to_string();
 
-    let events = wait_for_kinds(
+    let mut events = wait_for_kinds(
         data.path(),
         &[
             "conversation.user",
@@ -2086,7 +2086,29 @@ async fn real_adapter_events_populate_the_conversation_tables_and_tool_spans() {
             "tool.completed",
             "usage.updated",
         ],
-    );
+    )
+    .await;
+    // `tiny` is a *two*-stage workflow, so this run is two turns of the same
+    // recording and the journal keeps growing while the assertions below read
+    // it. Every one of them is a claim about **one** turn — one tool call, one
+    // usage row, the recording's own token totals read back as a per-work
+    // aggregate — so the fold gets exactly the first turn's prefix rather than
+    // whatever had landed by the moment `wait_for_kinds` was satisfied.
+    // `usage.updated` is the reader's last event for the turn it belongs to
+    // and the journal is totally ordered, so cutting there can neither clip
+    // turn one nor admit any of turn two.
+    //
+    // Not hypothetical, and not a pre-existing accident either: while
+    // `wait_for_kinds` parked the runtime it also froze the daemon it was
+    // polling, so stage `10-second` had no chance to run inside the wait. With
+    // the wait yielding properly it does, and a snapshot spanning both turns
+    // folds to `tool_calls` of 2 with doubled token totals — measured on a
+    // loaded two-core cpuset (journal seqs 12-24 stage one, 25-33 stage two).
+    let first_turn_end = events
+        .iter()
+        .position(|event| event.kind == "usage.updated")
+        .expect("wait_for_kinds only returns once a usage.updated is journaled");
+    events.truncate(first_turn_end + 1);
     let execution_id = events
         .iter()
         .find(|e| e.kind == "execution.started")
@@ -2268,7 +2290,8 @@ async fn rebuilding_reproduces_the_conversation_tables_a_real_adapter_fills() {
             "tool.completed",
             "usage.updated",
         ],
-    );
+    )
+    .await;
     wait_for_a_quiet_journal(data.path()).await;
 
     let (live, high_water) = api_projection(&handle).await;
@@ -2393,9 +2416,42 @@ async fn wait_for_a_quiet_journal(data_dir: &Path) {
     }
 }
 
-/// Block until every kind in `kinds` has been journaled (the adapter's reader
-/// thread and the sink's committer are both asynchronous).
-fn wait_for_kinds(data_dir: &Path, kinds: &[&str]) -> Vec<Event> {
+/// Block until every kind in `kinds` has been journaled — the adapter's
+/// reader thread and the sink's committer both land their events well after
+/// the submission that started them has returned.
+///
+/// `async`, with a `tokio::time::sleep`, for the same reason
+/// [`wait_for_a_quiet_journal`] is, and the reason bites harder here. This
+/// helper used to be a plain `fn` around `std::thread::sleep`, on the
+/// reasoning that the two producers it waits for are OS threads and so owe
+/// the runtime nothing. They are OS threads — and the reasoning is still
+/// wrong, because it stops one link short of the journal:
+///
+/// - the daemon this waits on runs on *this test's* runtime, and
+///   `#[tokio::test]` is a **current-thread** runtime: its only worker is the
+///   test's own thread. A synchronous poll loop parks that thread for the
+///   whole 30 s deadline, so no task of that daemon is ever polled again;
+/// - the committer reaches the journal through `CoreGuard::acquire_blocking`,
+///   and `tokio::sync::Mutex` is **fair**. When `api::drive_completions` (a
+///   task, ticking every 200 ms) queues for the core lock while the committer
+///   holds it, the release hands the permit to that task. A parked runtime
+///   never polls it, so the permit is never returned and the committer's
+///   *next* `blocking_lock` waits out the whole deadline;
+/// - the observable result was exactly one sink event per run —
+///   `conversation.user`, the first one — and then nothing, which is precisely
+///   the intermittent this shape produced: `tool.requested`, `tool.completed`
+///   and `usage.updated` all landed the instant the 30 s assertion unwound the
+///   blocking loop and let the runtime turn again (measured on a two-core
+///   cpuset under load: 29.997 s from the committer's `blocking_lock` to its
+///   grant, the grant printing *after* the panic message).
+///
+/// Nothing about the contract changed: the same kinds, the same 30 s budget,
+/// which is generous for a scripted stub's events and stays that way. What
+/// changed is that the loop yields to the runtime it is waiting on, so the
+/// daemon can actually reach the state being asserted. Production was never
+/// exposed — `cli::main` builds a multi-thread runtime, where a woken task
+/// always has a worker to run on.
+async fn wait_for_kinds(data_dir: &Path, kinds: &[&str]) -> Vec<Event> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let events = journal_events(data_dir);
@@ -2407,7 +2463,7 @@ fn wait_for_kinds(data_dir: &Path, kinds: &[&str]) -> Vec<Event> {
             Instant::now() < deadline,
             "only saw {seen:?}, waiting for {kinds:?}"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
