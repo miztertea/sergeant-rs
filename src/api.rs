@@ -4670,13 +4670,20 @@ impl ApiClient {
     }
 
     /// `?estate_root=<root>` for the GET/DELETE routes that have no body to
-    /// carry it in. Empty when this client addresses no estate, so the
-    /// daemon answers with refusal (c) rather than being handed a blank.
-    fn estate_query(&self) -> String {
-        match &self.estate_root {
+    /// carry it in. Empty when `root` is `None`, so the daemon answers with
+    /// refusal (c) rather than being handed a blank.
+    fn estate_query_for(root: Option<&std::path::Path>) -> String {
+        match root {
             Some(root) => format!("?estate_root={}", urlencode(&root.to_string_lossy())),
             None => String::new(),
         }
+    }
+
+    /// [`Self::estate_query_for`] over this client's own bound
+    /// [`Self::estate_root`] — the ordinary case every estate-scoped GET/
+    /// DELETE method below still uses by default.
+    fn estate_query(&self) -> String {
+        Self::estate_query_for(self.estate_root.as_deref())
     }
 
     /// Add this client's estate address to a request body, if it has one.
@@ -4862,8 +4869,23 @@ impl ApiClient {
 
     /// `GET /v1/estate/repos` (§16.2/§20.4) — declared repositories.
     pub async fn repos(&self) -> Result<Value, ClientError> {
-        self.get(&format!("/v1/estate/repos{}", self.estate_query()))
-            .await
+        self.repos_for(self.estate_root.as_deref()).await
+    }
+
+    /// [`Self::repos`], addressed at an explicit estate root rather than
+    /// this client's own bound one (W4d deliverable 3: the Estate screen's
+    /// picker reads whichever estate is picked, which under host mode is
+    /// independent of whatever this client otherwise addresses — a host-
+    /// scoped client addresses none at all).
+    pub async fn repos_for(
+        &self,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/estate/repos{}",
+            Self::estate_query_for(estate_root)
+        ))
+        .await
     }
 
     /// `POST /v1/estate/repos` (§16.2/§20.4) — `manifest::add_repo`.
@@ -4901,8 +4923,20 @@ impl ApiClient {
 
     /// `GET /v1/estate/groups` (§16.2/§20.4) — declared groups.
     pub async fn groups(&self) -> Result<Value, ClientError> {
-        self.get(&format!("/v1/estate/groups{}", self.estate_query()))
-            .await
+        self.groups_for(self.estate_root.as_deref()).await
+    }
+
+    /// [`Self::groups`], addressed at an explicit estate root — see
+    /// [`Self::repos_for`]'s doc comment for why this exists.
+    pub async fn groups_for(
+        &self,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/estate/groups{}",
+            Self::estate_query_for(estate_root)
+        ))
+        .await
     }
 
     /// `POST /v1/estate/groups` (§16.2/§20.4) — `manifest::add_group`'s
@@ -4937,8 +4971,20 @@ impl ApiClient {
     /// `GET /v1/doctor` (§16.3/§20.4) — the same `doctor::Report` `sgt doctor
     /// --json` prints.
     pub async fn doctor(&self) -> Result<Value, ClientError> {
-        self.get(&format!("/v1/doctor{}", self.estate_query()))
-            .await
+        self.doctor_for(self.estate_root.as_deref()).await
+    }
+
+    /// [`Self::doctor`], addressed at an explicit estate root — see
+    /// [`Self::repos_for`]'s doc comment for why this exists.
+    pub async fn doctor_for(
+        &self,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/doctor{}",
+            Self::estate_query_for(estate_root)
+        ))
+        .await
     }
 
     /// `GET /v1/estates` (H1 §4) — every estate this daemon has admitted.

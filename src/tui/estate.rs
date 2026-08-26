@@ -430,12 +430,40 @@ impl GroupForm {
     }
 }
 
+/// W4d deliverable 3: the estate this screen currently addresses, once
+/// picked. `root` is the canonical estate root — the key
+/// `repos_for`/`groups_for`/`doctor_for` and `GET /v1/estates` itself both
+/// address estates by (D1) — `name` is display-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickedEstate {
+    pub name: String,
+    pub root: std::path::PathBuf,
+}
+
 /// The Estate destination's whole state: three sub-screens' data and
 /// selection, plus the two edit forms and the retained-state preview
 /// [`super::overlay::Overlay::RepoAddRemove`]/[`super::overlay::Overlay::
 /// GroupEditRemove`]/[`super::overlay::Overlay::RetainedPreview`] need.
 pub struct EstateScreen {
     pub tab: EstateTab,
+    /// `GET /v1/estates`' entries (H1 §4) — every estate this daemon has
+    /// admitted, fed to the picker (W4d deliverable 3). Populated whenever
+    /// this screen is in front, the same discipline as `repos`/`groups`/
+    /// `doctor` below.
+    pub estates: Vec<Value>,
+    /// Which entry in `estates` the picker is currently highlighting,
+    /// before anything is picked.
+    pub picker_selected: usize,
+    /// The estate `repos`/`groups`/`doctor` below address, once chosen.
+    /// `None` shows only the picker: this screen's existing sub-tabs are
+    /// inherently single-estate-at-a-time (their own `/v1/estate/*` routes
+    /// address exactly one), so there is nothing of theirs to show before
+    /// one is addressed. A client that already addresses one fixed estate
+    /// (`ApiClient::estate_root` — the pre-H1, still-supported single-
+    /// estate-scoped shape) is auto-picked the moment this screen is
+    /// entered, so that shape's behavior is unchanged byte for byte: no
+    /// picker ever appears for it.
+    pub picked: Option<PickedEstate>,
     /// `GET /v1/estate/repos`'s `repos` array.
     pub repos: Vec<Value>,
     /// `GET /v1/estate/groups`'s `groups` array.
@@ -462,6 +490,9 @@ impl Default for EstateScreen {
     fn default() -> Self {
         Self {
             tab: EstateTab::Repositories,
+            estates: Vec::new(),
+            picker_selected: 0,
+            picked: None,
             repos: Vec::new(),
             groups: Vec::new(),
             doctor: Value::Null,
@@ -483,11 +514,61 @@ impl EstateScreen {
     /// discipline [`super::fleet::FleetScreen::clamp`] applies — a refresh
     /// that shrinks a list must never leave a selection pointing past its end.
     pub fn clamp(&mut self) {
+        self.picker_selected = clamp_index(self.picker_selected, self.estates.len());
         self.repo_selected = clamp_index(self.repo_selected, self.repos.len());
         self.group_selected = clamp_index(self.group_selected, self.groups.len());
         let checks = self.doctor["checks"].as_array().map_or(0, Vec::len);
         self.check_selected = clamp_index(self.check_selected, checks);
         self.retained_selected = clamp_index(self.retained_selected, self.retained.len());
+    }
+
+    /// Auto-pick for a client that already addresses one fixed estate
+    /// (`ApiClient::estate_root` — the pre-H1 single-estate-scoped shape) —
+    /// called by `App::refresh` every time this screen is in front, so it
+    /// is idempotent rather than a one-time seed: a `root` that has not
+    /// changed leaves `picked` alone (no selection reset mid-browse), and a
+    /// changed one (a different `-C`, in practice never mid-session) is
+    /// re-picked with a fresh name.
+    pub fn auto_pick(&mut self, root: &std::path::Path, name: &str) {
+        if self.picked.as_ref().is_some_and(|p| p.root == root) {
+            return;
+        }
+        self.picked = Some(PickedEstate {
+            name: name.to_string(),
+            root: root.to_path_buf(),
+        });
+    }
+
+    /// Whether the picker is actually in front of the sub-tabs right now.
+    ///
+    /// Deliberately **not** just `self.picked.is_none()`: before the first
+    /// `App::refresh` has run at all (this screen just entered, nothing
+    /// fetched yet — the exact moment the pre-existing T3 estate tests
+    /// press Tab/`a`/`x` against), `picked` is `None` and `estates` is
+    /// still empty too. Gating on `estates` being non-empty as well means
+    /// that ordinary "nothing loaded yet" moment renders and keys exactly
+    /// as it always has — exactly like every other lazily-loaded pane here
+    /// (`repos`/`groups`/`doctor` themselves start empty and are simply
+    /// blank until the first successful read). A client that never fetches
+    /// `estates` at all (the fixed-single-estate shape, `auto_pick`'s own
+    /// case) never shows a picker for exactly this reason: the condition
+    /// this method checks never both hold for it.
+    fn showing_picker(&self) -> bool {
+        self.picked.is_none() && !self.estates.is_empty()
+    }
+
+    /// The currently highlighted picker entry's name and root, if the list
+    /// is non-empty and its entry has both fields — the same tolerant
+    /// `field_text`-adjacent reading every other screen here already does
+    /// for a body it does not control the shape of.
+    fn picker_choice(&self) -> Option<PickedEstate> {
+        let entry = self.estates.get(self.picker_selected)?;
+        let name = entry["name"].as_str()?.to_string();
+        let root = entry["root"].as_str()?;
+        Some(PickedEstate {
+            name,
+            root: std::path::PathBuf::from(root),
+        })
     }
 
     pub fn selected_repo(&self) -> Option<&Value> {
@@ -529,7 +610,42 @@ impl EstateScreen {
     /// switching and list navigation are captured here, ahead of the global
     /// destination-nav keys, the same way [`super::work_view::WorkScreen`]
     /// captures its own `Tab`.
+    ///
+    /// W4d deliverable 3: while [`Self::showing_picker`] holds, every key
+    /// is the picker's own (Up/Down to browse, Enter to choose) — none of
+    /// the existing sub-tab keys below fire. See that method's own doc
+    /// comment for why this is not simply "nothing is picked yet".
     pub fn on_key(&mut self, key: KeyCode) -> EstateOutcome {
+        if self.showing_picker() {
+            match key {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.picker_selected = (self.picker_selected + 1) % self.estates.len();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.picker_selected =
+                        (self.picker_selected + self.estates.len() - 1) % self.estates.len();
+                }
+                KeyCode::Enter => {
+                    if let Some(choice) = self.picker_choice() {
+                        self.picked = Some(choice);
+                        self.repo_selected = 0;
+                        self.group_selected = 0;
+                        self.check_selected = 0;
+                    }
+                }
+                _ => {}
+            }
+            return EstateOutcome::None;
+        }
+        // `p` returns to the picker — a no-op unless `estates` actually has
+        // more than one candidate to offer (`showing_picker` needs it
+        // non-empty too), the same "harmless outside its own tier" shape
+        // Fleet's own `v` uses.
+        if key == KeyCode::Char('p') {
+            self.picked = None;
+            self.picker_selected = 0;
+            return EstateOutcome::None;
+        }
         match key {
             KeyCode::Tab => self.tab = self.tab.next(),
             KeyCode::BackTab => self.tab = self.tab.prev(),
@@ -597,9 +713,14 @@ fn clamp_index(index: usize, len: usize) -> usize {
 // -------------------------------------------------------------- rendering
 
 pub fn render(frame: &mut Frame, area: Rect, estate: &EstateScreen) {
+    if estate.showing_picker() {
+        render_picker(frame, area, estate);
+        return;
+    }
     let [tabs_area, body_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
-    render_tabs(frame, tabs_area, estate.tab);
+    let picked_name = estate.picked.as_ref().map_or("-", |p| p.name.as_str());
+    render_tabs(frame, tabs_area, estate.tab, picked_name);
     match estate.tab {
         EstateTab::Repositories => render_repos(frame, body_area, estate),
         EstateTab::Groups => render_groups(frame, body_area, estate),
@@ -607,8 +728,41 @@ pub fn render(frame: &mut Frame, area: Rect, estate: &EstateScreen) {
     }
 }
 
-fn render_tabs(frame: &mut Frame, area: Rect, active: EstateTab) {
-    let mut spans = vec![Span::raw("Estate  ")];
+/// W4d deliverable 3: the picker above Repositories/Groups/Health,
+/// GET-/v1/estates-fed, shown in place of the sub-tabs until one is chosen.
+fn render_picker(frame: &mut Frame, area: Rect, estate: &EstateScreen) {
+    let block = bordered("Estate — pick one (↑/↓, Enter)");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if estate.estates.is_empty() {
+        frame.render_widget(
+            Paragraph::new("no estates admitted to this daemon yet").wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = estate
+        .estates
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let style = if i == estate.picker_selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            let line = format!("{:<24} {}", field_text(&e["name"]), field_text(&e["root"]),);
+            ListItem::new(line).style(style)
+        })
+        .collect();
+    frame.render_widget(List::new(items), inner);
+}
+
+fn render_tabs(frame: &mut Frame, area: Rect, active: EstateTab, picked_name: &str) {
+    let mut spans = vec![Span::styled(
+        format!("Estate [{picked_name}]  "),
+        Style::default().fg(Token::Muted.rgb()),
+    )];
     for tab in EstateTab::ALL {
         let style = if tab == active {
             Style::default()
@@ -959,8 +1113,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A picked estate for tests that exercise the existing sub-tab
+    /// behavior (W4d deliverable 3 gates every one of them on `picked` —
+    /// the picker itself is exercised separately below).
+    fn some_picked() -> Option<PickedEstate> {
+        Some(PickedEstate {
+            name: "acme".to_string(),
+            root: std::path::PathBuf::from("/estates/acme"),
+        })
+    }
+
     fn repos_estate() -> EstateScreen {
         EstateScreen {
+            picked: some_picked(),
             repos: vec![
                 json!({"name": "svc-a", "path": "repos/svc-a", "origin": "git@x:svc-a", "instructions": "suppress"}),
                 json!({"name": "svc-b", "path": "repos/svc-b", "origin": null, "instructions": "local"}),
@@ -972,7 +1137,10 @@ mod tests {
 
     #[test]
     fn tab_key_cycles_repositories_groups_health() {
-        let mut estate = EstateScreen::default();
+        let mut estate = EstateScreen {
+            picked: some_picked(),
+            ..EstateScreen::default()
+        };
         assert_eq!(estate.tab, EstateTab::Repositories);
         estate.on_key(KeyCode::Tab);
         assert_eq!(estate.tab, EstateTab::Groups);
@@ -1024,6 +1192,7 @@ mod tests {
     fn r_opens_retained_only_for_the_disk_pressure_check() {
         let mut estate = EstateScreen {
             tab: EstateTab::Health,
+            picked: some_picked(),
             doctor: json!({"checks": [
                 {"name": "git", "status": "ok", "detail": "found"},
                 {"name": "disk_pressure", "status": "warn", "detail": "82% full"},
@@ -1044,6 +1213,81 @@ mod tests {
         estate.repo_selected = 5;
         estate.clamp();
         assert_eq!(estate.repo_selected, 1);
+    }
+
+    fn two_estates() -> EstateScreen {
+        EstateScreen {
+            estates: vec![
+                json!({"name": "payments", "root": "/estates/payments"}),
+                json!({"name": "billing", "root": "/estates/billing"}),
+            ],
+            ..EstateScreen::default()
+        }
+    }
+
+    #[test]
+    fn nothing_picked_shows_only_the_picker_and_ignores_sub_tab_keys() {
+        let mut estate = two_estates();
+        // Tab is Repositories/Groups/Health's own key once picked; with
+        // nothing picked yet it must be a no-op, not a tab switch.
+        estate.on_key(KeyCode::Tab);
+        assert_eq!(estate.tab, EstateTab::Repositories);
+        assert!(estate.picked.is_none());
+    }
+
+    #[test]
+    fn up_down_browse_the_picker_and_enter_picks_the_highlighted_estate() {
+        let mut estate = two_estates();
+        assert_eq!(estate.picker_selected, 0);
+        estate.on_key(KeyCode::Down);
+        assert_eq!(estate.picker_selected, 1);
+        estate.on_key(KeyCode::Up);
+        assert_eq!(estate.picker_selected, 0);
+
+        estate.on_key(KeyCode::Down);
+        estate.on_key(KeyCode::Enter);
+        assert_eq!(
+            estate.picked,
+            Some(PickedEstate {
+                name: "billing".to_string(),
+                root: std::path::PathBuf::from("/estates/billing"),
+            })
+        );
+    }
+
+    #[test]
+    fn p_returns_a_picked_screen_to_the_picker() {
+        let mut estate = repos_estate();
+        assert!(estate.picked.is_some());
+        estate.on_key(KeyCode::Char('p'));
+        assert!(estate.picked.is_none());
+    }
+
+    #[test]
+    fn auto_pick_is_idempotent_over_an_unchanged_root() {
+        let mut estate = EstateScreen::default();
+        let root = std::path::Path::new("/estates/acme");
+        estate.auto_pick(root, "acme");
+        estate.auto_pick(root, "renamed"); // same root, e.g. a later manifest edit
+        assert_eq!(
+            estate.picked.as_ref().map(|p| p.name.as_str()),
+            Some("acme"),
+            "an unchanged root is not re-picked, even if the display name changed upstream"
+        );
+    }
+
+    #[test]
+    fn auto_pick_repicks_on_a_changed_root() {
+        let mut estate = EstateScreen::default();
+        estate.auto_pick(std::path::Path::new("/estates/a"), "a");
+        estate.auto_pick(std::path::Path::new("/estates/b"), "b");
+        assert_eq!(
+            estate.picked,
+            Some(PickedEstate {
+                name: "b".to_string(),
+                root: std::path::PathBuf::from("/estates/b"),
+            })
+        );
     }
 
     #[test]

@@ -299,21 +299,53 @@ impl App {
         // Best-effort, same reasoning as `work_screen`'s: a failed estate
         // read must not blank fleet/system data that loaded fine.
         if self.destination == Destination::Estate {
-            match client.repos().await {
-                Ok(result) => {
-                    self.estate.repos = result["repos"].as_array().cloned().unwrap_or_default();
+            // W4d deliverable 3: a client that already addresses one fixed
+            // estate (the pre-H1, still-supported single-estate-scoped
+            // shape) auto-picks it — no picker ever appears, and
+            // repos/groups/doctor below read exactly as they always have.
+            // A host-scoped client (no fixed `estate_root`) instead reads
+            // the admitted-estates list for the picker; its own choice (or
+            // none yet) decides what, if anything, gets addressed below.
+            if let Some(root) = client.estate_root() {
+                let name = self
+                    .estate
+                    .picked
+                    .as_ref()
+                    .filter(|p| p.root == root)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| {
+                        root.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| root.to_string_lossy().into_owned())
+                    });
+                self.estate.auto_pick(root, &name);
+            } else {
+                match client.estates().await {
+                    Ok(result) => {
+                        self.estate.estates =
+                            result["estates"].as_array().cloned().unwrap_or_default();
+                    }
+                    Err(e) => self.estate.last_error = Some(e.to_string()),
                 }
-                Err(e) => self.estate.last_error = Some(e.to_string()),
             }
-            match client.groups().await {
-                Ok(result) => {
-                    self.estate.groups = result["groups"].as_array().cloned().unwrap_or_default();
+            if let Some(picked) = self.estate.picked.clone() {
+                match client.repos_for(Some(&picked.root)).await {
+                    Ok(result) => {
+                        self.estate.repos = result["repos"].as_array().cloned().unwrap_or_default();
+                    }
+                    Err(e) => self.estate.last_error = Some(e.to_string()),
                 }
-                Err(e) => self.estate.last_error = Some(e.to_string()),
-            }
-            match client.doctor().await {
-                Ok(result) => self.estate.doctor = result,
-                Err(e) => self.estate.last_error = Some(e.to_string()),
+                match client.groups_for(Some(&picked.root)).await {
+                    Ok(result) => {
+                        self.estate.groups =
+                            result["groups"].as_array().cloned().unwrap_or_default();
+                    }
+                    Err(e) => self.estate.last_error = Some(e.to_string()),
+                }
+                match client.doctor_for(Some(&picked.root)).await {
+                    Ok(result) => self.estate.doctor = result,
+                    Err(e) => self.estate.last_error = Some(e.to_string()),
+                }
             }
             self.estate.clamp();
         }
