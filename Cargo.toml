@@ -68,6 +68,17 @@ ulid = "3.0.0"
 [profile.dev.package.libduckdb-sys]
 debug = false
 
+# #299 (owner-ratified 2026-08-26): generalize the same trade to every
+# dependency — nobody in this project steps through dependency code, and
+# the per-suite test binaries each carry the whole dep graph's DWARF.
+# The workspace crate itself keeps full debug info (a specific package
+# entry and the crate's own artifacts are unaffected by this wildcard),
+# so panic backtraces through sergeant code stay symbolized. Measured on
+# Cerberus at adoption: fresh `cargo build --tests` target 20 GB -> see
+# the qualification PR for the after numbers.
+[profile.dev.package."*"]
+debug = false
+
 [dev-dependencies]
 # Synchronously decoding an axum `Response` body in `tests/i9_floor_pinning.rs`
 # (spec §6.3 compensating assertion (c): calling the real `below_floor_refusal`
