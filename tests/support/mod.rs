@@ -646,3 +646,109 @@ pub fn scaffold_solo_estate(root: &Path, name: &str) -> (PathBuf, String) {
     let head = scaffold_estate(root, name, &[name]).remove(0);
     (root.join("repos").join(name), head)
 }
+
+/// A cross-process mutex over a fixed OS resource a test cannot make
+/// per-process-unique (#305: `t5_disabled_export_runs_no_exporter_machinery`
+/// must bind the daemon's literal `DEFAULT_OTLP_ENDPOINT`, port 0 or a
+/// per-process offset would test nothing — the whole point is standing in
+/// for the address a regression would really dial).
+///
+/// Backed by an atomically-created lock file (`create_new`, so the OS
+/// resolves the race), not `flock`, to stay dependency-free per this
+/// module's own precedent. A holder that panics or is killed leaves the file
+/// behind; [`Self::acquire`] treats a lock file older than `STALE_AFTER` as
+/// abandoned and steals it rather than hanging forever.
+pub struct CrossProcessLock {
+    path: PathBuf,
+}
+
+const STALE_AFTER: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+impl CrossProcessLock {
+    /// Block until the named lock is held exclusively by this call.
+    ///
+    /// `name` should identify the contended resource (e.g. a port number),
+    /// not the test — two different tests contending the same resource must
+    /// use the same name to actually serialize against each other.
+    pub fn acquire(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("sgt-test-lock-{name}"));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .and_then(|m| m.elapsed().ok())
+                        .is_some_and(|age| age > STALE_AFTER);
+                    if stale {
+                        // A holder that never dropped this — the process was
+                        // killed, not just the test failed. Reclaim rather
+                        // than deadlock every future run.
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if Instant::now() > deadline {
+                        panic!(
+                            "cross-process lock {path:?} held for over 120s; \
+                             a holder is stuck or STALE_AFTER needs raising"
+                        );
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(e) => panic!("acquire cross-process lock {path:?}: {e}"),
+            }
+        }
+    }
+}
+
+impl Drop for CrossProcessLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod cross_process_lock_tests {
+    use super::CrossProcessLock;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Two contenders for the same name never hold it at once; a fresh name
+    /// never blocks. This is the decisive property #305's fix depends on —
+    /// without it, the port-0 alternative would be indistinguishable from a
+    /// lock that doesn't actually exclude.
+    #[test]
+    fn excludes_concurrent_holders_of_the_same_name() {
+        let name = format!("test-{}", std::process::id());
+        let overlap = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let name = name.clone();
+            let overlap = Arc::clone(&overlap);
+            let peak = Arc::clone(&peak);
+            handles.push(std::thread::spawn(move || {
+                let _lock = CrossProcessLock::acquire(&name);
+                let now = overlap.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                overlap.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "at most one holder of the same lock name at a time"
+        );
+    }
+}
