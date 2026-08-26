@@ -495,6 +495,20 @@ pub struct DaemonConfig {
     /// from a typo in a file, not a runtime bound; a test rig setting
     /// `Some(4)` has not typed anything into a manifest.
     pub retention: Option<u32>,
+    /// H1-15 (W4b) execution lane: daemon-wide cap on native adapter
+    /// processes admitted between PREPARE and LAUNCH concurrently
+    /// (`SGT_EXECUTION_LANE_CAP`). `None` keeps [`Engine::new`]'s default
+    /// ([`crate::runtime::engine::default_execution_lane_cap`]). `Some` is
+    /// wired via [`Engine::with_execution_lane_cap`] in [`start_with`], the
+    /// same way `turn_cap` above is.
+    pub execution_lane_cap: Option<usize>,
+    /// H1-15's second lane: config-only capacity for A1/S3's future
+    /// intelligence workers (`SGT_INTELLIGENCE_LANE_CAP`). `None` keeps
+    /// [`crate::runtime::engine::default_intelligence_lane_cap`]. Nothing
+    /// in this build acquires from it yet (deliverable 3 — config surface,
+    /// no scheduling behavior); it exists so the two lanes' independence is
+    /// provable now rather than retrofitted later.
+    pub intelligence_lane_cap: Option<usize>,
 }
 
 impl Default for DaemonConfig {
@@ -516,6 +530,8 @@ impl Default for DaemonConfig {
             await_probe_walk: true,
             segment_max_bytes: None,
             retention: None,
+            execution_lane_cap: None,
+            intelligence_lane_cap: None,
         }
     }
 }
@@ -966,6 +982,12 @@ pub async fn start_with(
     }
     if let Some(turn_cap) = config.turn_cap {
         engine = engine.with_turn_cap(turn_cap);
+    }
+    if let Some(cap) = config.execution_lane_cap {
+        engine = engine.with_execution_lane_cap(cap);
+    }
+    if let Some(cap) = config.intelligence_lane_cap {
+        engine = engine.with_intelligence_lane_cap(cap);
     }
     let engine = Arc::new(engine);
     let reconciled = recovery::reconcile(&engine, &estates, &mut core)?;
@@ -1548,12 +1570,48 @@ pub async fn run_until_signal(data_dir: &Path, rebuild_cache: bool) -> Result<()
                 None
             }
         });
+    // H1-15's execution/intelligence lane overrides: same fail-open
+    // discipline as `SGT_TURN_CAP` above — unset or unparseable both mean
+    // "keep the built-in, host-parallelism-derived default", and 0 (which
+    // parses) is honored with a warning rather than silently ignored.
+    let execution_lane_cap = std::env::var("SGT_EXECUTION_LANE_CAP")
+        .ok()
+        .and_then(|v| match v.parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "SGT_EXECUTION_LANE_CAP=0 blocks every Work at LAUNCH; honoring it"
+                );
+                Some(0)
+            }
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "SGT_EXECUTION_LANE_CAP is not a whole number of permits — keeping the built-in default"
+                );
+                None
+            }
+        });
+    let intelligence_lane_cap = std::env::var("SGT_INTELLIGENCE_LANE_CAP")
+        .ok()
+        .and_then(|v| match v.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "SGT_INTELLIGENCE_LANE_CAP is not a whole number of permits — keeping the built-in default"
+                );
+                None
+            }
+        });
     let handle = start_with(
         data_dir,
         DaemonConfig {
             telemetry: telemetry.clone(),
             surfaces_root,
             turn_cap,
+            execution_lane_cap,
+            intelligence_lane_cap,
             rebuild_cache,
             // The signal loop below must be able to answer SIGTERM while the
             // probe walk is still running — see the field's own doc (#293).

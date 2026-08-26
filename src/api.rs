@@ -572,7 +572,21 @@ fn blocking_sync<T>(f: impl FnOnce() -> T) -> T {
 /// completion wait, which are the only places §22.6 cares about — in one place
 /// each, so there is no arm that can be missed and no arm whose drop is
 /// decoration.
-async fn crank(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
+fn crank(
+    state: &ApiState,
+    step: Step,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CoreGuard<'_>>> + Send + '_>> {
+    Box::pin(crank_inner(state, step))
+}
+
+/// [`crank`]'s actual body, split out only so `crank` itself can box the
+/// future: the H1-15 lane-full path below (`EngineNext::Launch`) hands an
+/// admitted-later launch to a detached task that drives it the rest of the
+/// way by calling `crank` again, and a directly-recursive `async fn` cannot
+/// prove its own future `Send` (the auto-trait solver has nothing closed to
+/// check against) — `tokio::spawn` then refuses it outright. Boxing the
+/// *outer* call breaks that cycle; nothing about the loop below changes.
+async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
     let mut step = step;
     let mut held: Option<CoreGuard<'_>> = None;
     loop {
@@ -601,6 +615,85 @@ async fn crank(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
         let settled = match next {
             EngineNext::Parked => unreachable!("returned above"),
             EngineNext::Launch(pending) => {
+                // H1-15's execution lane: admitted strictly between the
+                // reservation (already committed under the lock, in
+                // `reserve_stage`) and the launch below — outside the core
+                // lock, never under it (recon's §22.6 hazard). A lane at
+                // capacity does not stall this task silently: the wait is
+                // journaled first (distinct from turn-cap exhaustion — see
+                // `Engine::park_on_execution_lane`) so a concurrent
+                // `sgt work show` can see why this Work is parked.
+                let launch_work_id = pending.work_id().to_string();
+                if !state.engine.try_admit_execution(&launch_work_id) {
+                    {
+                        let mut core = CoreGuard::acquire(&state.core).await;
+                        if let Err(e) = state
+                            .engine
+                            .park_on_execution_lane(&mut core, &launch_work_id)
+                        {
+                            tracing::error!(
+                                work_id = %launch_work_id,
+                                error = %e,
+                                "journaling the execution-lane wait failed"
+                            );
+                        }
+                    }
+                    // The Work is now durably `waiting` on the lane, visible
+                    // to any concurrent `work show` — the client's own
+                    // command has been accepted, same as every other
+                    // two-phase effect in this file. Waiting for a slot to
+                    // free is not part of that acceptance and must not block
+                    // the request that triggered it (a request into a full
+                    // lane would otherwise hang for however long another
+                    // Work takes to vacate a slot, with no client-visible
+                    // signal but the connection simply not returning). So
+                    // the rest of this launch — admit, resume, perform,
+                    // settle, and drive on — is handed to a detached task,
+                    // and this crank call returns now with nothing held,
+                    // exactly as it would for `Next::Parked`.
+                    let bg_state = state.clone();
+                    tokio::spawn(async move {
+                        bg_state.engine.admit_execution(&launch_work_id).await;
+                        {
+                            let mut core = CoreGuard::acquire(&bg_state.core).await;
+                            if let Err(e) = bg_state
+                                .engine
+                                .resume_after_execution_lane(&mut core, &launch_work_id)
+                            {
+                                // A concurrent transition (e.g. a cancel
+                                // while this Work sat parked on the lane)
+                                // can make this an illegal edge — logged,
+                                // not fatal: `settle_launch`'s own staleness
+                                // check (§14.5) is what actually adjudicates
+                                // a launch whose reservation the wait
+                                // outlived, exactly as it does for every
+                                // other cause of the same race.
+                                tracing::error!(
+                                    work_id = %launch_work_id,
+                                    error = %e,
+                                    "resuming after the execution-lane wait failed"
+                                );
+                            }
+                        }
+                        let outcome = blocking(|| pending.perform()).await;
+                        let work_id = pending.work_id().to_string();
+                        let mut core = CoreGuard::acquire(&bg_state.core).await;
+                        match bg_state.engine.settle_launch(&mut core, pending, outcome) {
+                            Ok(next_step) => {
+                                drop(core);
+                                crank(&bg_state, next_step).await;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    work_id = %work_id,
+                                    error = %e,
+                                    "settling an external effect failed"
+                                );
+                            }
+                        }
+                    });
+                    return held;
+                }
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
                 let mut core = CoreGuard::acquire(&state.core).await;
