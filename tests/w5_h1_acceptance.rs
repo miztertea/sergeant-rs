@@ -238,8 +238,9 @@ fn h1_acceptance_3_run_outside_an_estate_refuses_unless_dash_c_is_explicit() {
 //
 // Pinned: `src/runtime/engine.rs`'s
 // `tests::execution_lane_exhaustion_never_touches_the_intelligence_lane`
-// (a full execution lane never blocks an intelligence-lane acquisition, and
-// vice versa — the two H1-15 lanes are independently bounded).
+// (a full execution lane never blocks an intelligence-lane acquisition —
+// only this one direction is pinned; the reverse, that a full intelligence
+// lane never blocks an execution-lane acquisition, is not yet a test).
 // ------------------------------------------------------------------------
 
 // ------------------------------------------------------------------------
