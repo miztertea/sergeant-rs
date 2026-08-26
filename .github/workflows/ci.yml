@@ -29,7 +29,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
+  # S2 V1c (build/test speed): split from one `ci` job into two that run in
+  # parallel — fmt+clippy+docs-consistency here, test execution in `test`
+  # below. Both start from the same dependency graph (dev profile,
+  # --all-targets), so they share one rust-cache entry (`shared-key: ci`)
+  # rather than each seeding its own; wall-clock is max(job), not sum(job),
+  # same reasoning ADR 0004 (D9) already applies to the Linux/macOS split
+  # above. Job names changed (`ci` → `fmt-clippy` + `test`) — branch
+  # protection's required-status-check list must name both, not the old
+  # single `ci`, or a PR could merge on fewer gates than before this split.
+  fmt-clippy:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -45,15 +54,14 @@ jobs:
         run: rustup component add clippy rustfmt
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci
 
       - name: cargo fmt --check
         run: cargo fmt --check
 
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: cargo test
-        run: cargo test --locked
 
       - name: docs-consistency (README release literals match the current version)
         run: |
@@ -65,6 +73,33 @@ jobs:
             echo "$stale"
             exit 1
           fi
+
+      - name: git diff --exit-code (no step above should have mutated a tracked file)
+        run: git diff --exit-code
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: rustup toolchain install (rust-toolchain.toml pins the version)
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ci
+
+      # S2 V1c: measured ~42% wall-clock reduction over `cargo test --locked`
+      # on this suite (warm, single run — see
+      # knowledge/evidence/perf/build-test-speed-2026-08-26.md in the
+      # workspace estate). Exact-pinned, same as this repo's other
+      # taiki-e/install-action tool installs (coverage.yml, release.yml).
+      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: cargo-nextest@0.9.99
+
+      - name: cargo nextest run
+        run: cargo nextest run --locked
 
       - name: git diff --exit-code (no step above should have mutated a tracked file)
         run: git diff --exit-code

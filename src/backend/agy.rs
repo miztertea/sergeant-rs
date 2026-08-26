@@ -7413,8 +7413,8 @@ mod tests {
     /// places an `admission_test` name may resolve. Reading them as text is how
     /// [`every_admission_test_name_resolves_to_a_real_test`] turns "the ledger
     /// cites a real test" from a claim in a commit message into something the
-    /// build enforces (the same trick `tests/coverage_stage_membership.rs` uses
-    /// on suite wiring). `include_str!` of this very file is deliberate.
+    /// build enforces (the same trick `tests/c2_light/coverage_stage_membership.rs`
+    /// uses on suite wiring). `include_str!` of this very file is deliberate.
     const THIS_MODULE_SOURCE: &str = include_str!("agy.rs");
     const INTEGRATION_SUITE_SOURCE: &str = include_str!("../../tests/agy_backend.rs");
 

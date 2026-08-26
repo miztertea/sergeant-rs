@@ -41,7 +41,7 @@ use sergeant_rs::domain::event::Event;
 use sergeant_rs::domain::work::KIND_WORK_SUBMITTED;
 use sergeant_rs::runtime::journal::Journal;
 
-mod support;
+use crate::support;
 use support::DataDir;
 
 /// How long a rendezvous may take before the test calls it a hang. This is a

@@ -22,7 +22,7 @@ use sergeant_rs::backend::BackendRegistry;
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig};
 
-mod support;
+use crate::support;
 use support::{git, scaffold_solo_estate};
 
 /// Captures the `estate` field of every `"periodic sweep"` info-level event

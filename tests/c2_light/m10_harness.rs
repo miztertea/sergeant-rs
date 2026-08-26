@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
-mod support;
+use crate::support;
 
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 

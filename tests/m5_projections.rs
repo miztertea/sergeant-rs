@@ -1565,6 +1565,14 @@ async fn t5_disabled_export_runs_no_exporter_machinery() {
     // address such a regression would actually dial. An ephemeral port whose
     // number is never handed to anything makes "zero connections" true under
     // every possible implementation, which is not a test at all.
+    // #305: this binds the daemon's literal DEFAULT_OTLP_ENDPOINT port, not a
+    // per-process one — the whole test is a stand-in for the address a
+    // regression would really dial, so it can't be made per-process-unique
+    // without testing nothing. A cross-process lock serializes only this one
+    // section (bind..hits checked), so two concurrent copies of this suite
+    // no longer race for the port; every other test in the suite runs
+    // unserialized.
+    let _otlp_port_lock = support::CrossProcessLock::acquire("otlp-4318");
     let collector_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let default_port = DEFAULT_OTLP_ENDPOINT
         .rsplit(':')
