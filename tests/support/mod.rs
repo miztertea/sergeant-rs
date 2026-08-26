@@ -339,7 +339,8 @@ pub fn daemon_pids(data_dir: &Path) -> Vec<u32> {
     pids
 }
 
-/// SIGTERM every daemon on `data_dir`, then SIGKILL whatever is left.
+/// SIGTERM every daemon on `data_dir`, then SIGKILL whatever is left — and
+/// then everything those daemons had descended from them.
 ///
 /// Returns what was signalled and with what, so a test can assert the rig
 /// did something rather than trusting it silently — and so the escalation
@@ -348,11 +349,30 @@ pub fn daemon_pids(data_dir: &Path) -> Vec<u32> {
 /// coverage profile that never arrived. A `Kill` in this report is therefore
 /// also announced on stderr, because `Drop` throws the value away and the
 /// escalation is exactly the thing a discarded return value must not hide.
+///
+/// **#310: the descendant sweep, and why its order is the whole point.** A
+/// daemon's children are its children only while it is alive; the instant it
+/// is signalled they reparent to init and no ancestry query can find them
+/// again. That is how dozens of ~265 MB `opencode serve` probe children
+/// accumulated over a working day while every orphan check reported clean —
+/// both doctrinal patterns are `sgt`-shaped and the leaked species is named
+/// `opencode`. So the tree is enumerated **before** the daemon is signalled,
+/// and the recorded pids are signalled afterwards.
+///
+/// This is belt to the product's own braces (`backend::child`'s
+/// `PR_SET_PDEATHSIG`, which is what actually closes the leak). It is the
+/// half that still works on a platform with no parent-death signal, and the
+/// half that reaches a child something other than a hardened probe spawned.
 pub fn reap_daemons(data_dir: &Path) -> Vec<ReapedDaemon> {
     let pids = daemon_pids(data_dir);
     if pids.is_empty() {
         return Vec::new();
     }
+    let descendants: Vec<u32> = pids
+        .iter()
+        .flat_map(|&pid| sergeant_rs::platform::process::descendants(pid))
+        .filter(|pid| !pids.contains(pid))
+        .collect();
     // Built from the escalation branch this call actually took, never from
     // "it went away, so TERM must have done it": that inference would report
     // `Term` for a reaper that had been changed to open with SIGKILL.
@@ -382,6 +402,34 @@ pub fn reap_daemons(data_dir: &Path) -> Vec<ReapedDaemon> {
                 TERM_GRACE.as_secs()
             );
         }
+    }
+    // The recorded tree, now that the daemons are gone. `kill -KILL -<pid>`
+    // rather than `kill -KILL <pid>`: a hardened probe child leads its own
+    // process group (`backend::child`), so the negated form reaches whatever
+    // *it* spawned, and an already-empty group is `ESRCH` — success, not an
+    // error worth reporting. Both forms are sent, because a descendant that
+    // is not a group leader is reached only by the plain one.
+    let survivors: Vec<u32> = descendants
+        .into_iter()
+        .filter(|&pid| sergeant_rs::platform::process::process_alive(pid))
+        .collect();
+    if !survivors.is_empty() {
+        for pid in &survivors {
+            let _ = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "kill -KILL -{pid} 2>/dev/null; kill -KILL {pid} 2>/dev/null"
+                ))
+                .status();
+        }
+        eprintln!(
+            "support::reap_daemons: {} process(es) descended from the daemon(s) on {:?} \
+             outlived them and were killed by recorded pid: {survivors:?}. #310: a probe \
+             child that reaches this line is one the product's own PR_SET_PDEATHSIG should \
+             already have taken.",
+            survivors.len(),
+            data_dir,
+        );
     }
     reaped
 }
