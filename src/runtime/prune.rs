@@ -2349,6 +2349,272 @@ mod tests {
         );
     }
 
+    /// Like [`commit`], but stamps the envelope's `workspace_id` (D1/D10) —
+    /// the coordinate `WorkIndexRow::estate_root` folds from at
+    /// `work.submitted`, and every multi-estate fixture this wave adds needs
+    /// a way to set.
+    fn commit_for_estate(
+        core: &mut crate::api::Core,
+        source: crate::domain::event::EventSource,
+        kind: &str,
+        work_id: Option<&str>,
+        estate_root: &str,
+        payload: serde_json::Value,
+    ) -> crate::domain::event::Event {
+        let mut draft = crate::domain::event::EventDraft::new(source, kind, payload)
+            .with_workspace_id(estate_root);
+        if let Some(id) = work_id {
+            draft = draft.with_work_id(id);
+        }
+        core.commit(draft).expect("commit")
+    }
+
+    /// [`submit_and_complete`]'s multi-estate sibling: `work.submitted`
+    /// carries `estate_root` as its `workspace_id` (folded into
+    /// `WorkIndexRow::estate_root`); the completion does not need it again
+    /// (D1: recorded once, at submission, never re-derived).
+    fn submit_and_complete_for_estate(
+        core: &mut crate::api::Core,
+        work_id: &str,
+        estate_root: &str,
+    ) {
+        commit_for_estate(
+            core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some(work_id),
+            estate_root,
+            serde_json::json!({"work": {
+                "id": work_id,
+                "intent": "multi-estate prune fixture",
+                "state": "pending",
+                "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        commit(
+            core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some(work_id),
+            serde_json::json!({}),
+        );
+    }
+
+    // -------------------------------------------------------------
+    // plan_multi_estate over a real journal (brief deliverables 1, 2, 3, 5)
+    // -------------------------------------------------------------
+
+    /// Deliverable 5, end to end: two estates share one journal; A has no
+    /// floor at all, B keeps only its newest Work. `plan_multi_estate`
+    /// retires A's Work and B's own excess Work in one cycle, leaves B's
+    /// newest Work untouched, and reports the per-estate breakdown
+    /// (deliverable 3) that produced that outcome.
+    #[test]
+    fn plan_multi_estate_retires_each_estates_own_excess_and_reports_it_per_estate() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+
+        submit_and_complete_for_estate(&mut core, "a1", "/estates/a");
+        submit_and_complete_for_estate(&mut core, "b_old", "/estates/b");
+        submit_and_complete_for_estate(&mut core, "b_new", "/estates/b");
+        // I-W3-4: push the writer's own live segment off every Work above.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor"),
+            serde_json::json!({"work": {
+                "id": "anchor", "intent": "keep the writer off every Work's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        // Fallback retention 0 (never 1000): the untagged "anchor" fixture
+        // Work (no estate context, pushed in only to clear I-W3-4's live
+        // segment) would otherwise form its own single-Work fallback group
+        // and — being alone, under any retention — force the *shared* cap
+        // to 0 regardless of A's/B's own floors, the same "small group
+        // dominates the min" arithmetic `each_estates_cap_is_computed_over_
+        // its_own_works_only` exercises directly. This test is about A's
+        // and B's own floors, not the fallback's, so the fallback is given
+        // no floor at all here.
+        let policies = EstatePolicies::new(policy(0))
+            .with_estate("/estates/a", policy(0))
+            .with_estate("/estates/b", policy(1));
+        let (candidate, _) = candidate_horizon_multi_estate(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policies,
+        );
+        assert!(candidate > 0, "the fixture must actually be prunable");
+        let plan = plan_multi_estate(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policies,
+        )
+        .expect("plan")
+        .expect("something must be prunable");
+
+        let retired: BTreeSet<String> = plan.residue.works.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            retired,
+            BTreeSet::from(["a1".to_string(), "b_old".to_string()]),
+            "A's sole Work and B's own excess (past its retention-1 floor) are retired; \
+             B's newest Work is not"
+        );
+        for row in &plan.residue.works {
+            let want = if row.id == "a1" {
+                "/estates/a"
+            } else {
+                "/estates/b"
+            };
+            assert_eq!(
+                row.estate_root.as_deref(),
+                Some(want),
+                "the residue row itself names the estate it belonged to"
+            );
+        }
+
+        let mut per_estate = plan.per_estate.clone();
+        per_estate.sort_by(|a, b| a.estate_root.cmp(&b.estate_root));
+        let a_stat = per_estate
+            .iter()
+            .find(|s| s.estate_root.as_deref() == Some("/estates/a"))
+            .expect("A's own stat row");
+        assert_eq!((a_stat.examined, a_stat.retired, a_stat.kept), (1, 1, 0));
+        assert_eq!(a_stat.policy.retention, 0);
+        let b_stat = per_estate
+            .iter()
+            .find(|s| s.estate_root.as_deref() == Some("/estates/b"))
+            .expect("B's own stat row");
+        assert_eq!((b_stat.examined, b_stat.retired, b_stat.kept), (2, 1, 1));
+        assert_eq!(b_stat.policy.retention, 1);
+    }
+
+    /// Brief deliverable 2 / D7's own named risk: a blob referenced only by
+    /// a live estate B Work must survive a prune pass that retires estate
+    /// A's Work — even though the blob's content is shared (deduped) with
+    /// what A's retired Work referenced. Both estates declare retention 0
+    /// here on purpose, so the *only* thing protecting B's Work is that it
+    /// is not yet terminal (the ordinary blocking-work mechanism) — isolating
+    /// this test from the retention-partitioning arithmetic the tests above
+    /// already cover, and proving the blob-reference scan really is
+    /// journal-wide regardless of which estate's retention triggered the
+    /// cycle (D7: "blob store and GC stay host-journal-wide").
+    #[test]
+    fn a_blob_referenced_only_by_a_live_estates_work_survives_retiring_another_estates_work() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+
+        let shared_blob = BlobStore::open(dir.path())
+            .expect("open blob store")
+            .put(b"content shared by two estates' Works")
+            .expect("put");
+        let hex = shared_blob.hex().to_string();
+
+        // Estate A: a1 is retired whole, referencing the shared blob.
+        commit_for_estate(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("a1"),
+            "/estates/a",
+            serde_json::json!({"work": {
+                "id": "a1", "intent": "cross-estate blob GC fixture (A)",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_COMPLETED,
+            Some("a1"),
+            serde_json::json!({"result_blob": format!("b3:{hex}")}),
+        );
+
+        // Estate B: b1 stays non-terminal (never completed) — a live Work,
+        // above the eventual horizon by construction — and its own later
+        // event references the *same* blob content.
+        commit_for_estate(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("b1"),
+            "/estates/b",
+            serde_json::json!({"work": {
+                "id": "b1", "intent": "cross-estate blob GC fixture (B)",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            "conversation.turn.ended",
+            Some("b1"),
+            serde_json::json!({"raw": format!("b3:{hex}")}),
+        );
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor"),
+            serde_json::json!({"work": {
+                "id": "anchor", "intent": "keep the writer off a1's/b1's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let bounds = core.journal.segment_bounds().expect("bounds");
+        // Both estates at retention 0: nothing about the retention floor is
+        // what protects b1 here (see this test's own doc comment).
+        let policies = EstatePolicies::new(policy(0))
+            .with_estate("/estates/a", policy(0))
+            .with_estate("/estates/b", policy(0));
+        let (candidate, _) = candidate_horizon_multi_estate(
+            &bounds,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policies,
+        );
+        assert!(candidate > 0, "a1 must actually be prunable");
+        let plan = plan_multi_estate(
+            dir.path(),
+            &bounds,
+            candidate,
+            core.registry.state(),
+            &core.first_seq_by_work,
+            &policies,
+        )
+        .expect("plan")
+        .expect("something must be prunable");
+
+        let retired: BTreeSet<String> = plan.residue.works.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(
+            retired,
+            BTreeSet::from(["a1".to_string()]),
+            "only A's terminal Work is retired; B's non-terminal Work still pins the horizon \
+             above itself"
+        );
+        assert!(
+            !plan.condemn.iter().any(|r| r.hex() == hex),
+            "the shared blob must survive: B's still-live event references it, and the \
+             surviving-side scan is journal-wide, not scoped to the estate whose retention \
+             triggered this cycle (D7)"
+        );
+    }
+
     /// Build a two-segment, one-Work fixture and commit its `prune.intent`
     /// (step 1 of `run`'s cycle) — then stop, exactly as a crash would.
     /// Every `crash_window_f*` test starts here and diverges only in what
