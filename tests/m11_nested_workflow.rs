@@ -616,10 +616,12 @@ async fn a_composed_stage_id_round_trips_through_events_analytics_and_work_show(
 /// Nothing reconstructs a tree to do it. The pinned `workflow.bound` carries
 /// the already-flattened stage list, the journal carries whatever stage id
 /// was current, and "the deepest incomplete path" is simply the last
-/// `StageRecord` — whose id *is* that path by construction. This test kills
-/// the daemon while a nested leaf is the failed, current stage and asserts
-/// both halves: the restarted daemon names that leaf, and `retry` re-enters
-/// that leaf rather than an ancestor or the container's first child.
+/// `StageRecord` — whose id *is* that path by construction. This test
+/// genuinely kills the daemon (`DaemonHandle::kill`, an abrupt task-abort
+/// with no cooperative shutdown — see its doc comment) while a nested leaf
+/// is the failed, current stage, and asserts both halves: the restarted
+/// daemon names that leaf, and `retry` re-enters that leaf rather than an
+/// ancestor or the container's first child.
 #[tokio::test]
 async fn a_restarted_daemon_reconstructs_the_deepest_incomplete_path_and_retry_re_enters_it() {
     let repos = TempDir::new().expect("tempdir");
@@ -646,7 +648,7 @@ async fn a_restarted_daemon_reconstructs_the_deepest_incomplete_path_and_retry_r
         ["10-investigate/10-code"],
         "the failure event names the nested leaf, which IS the container-scoped failure report"
     );
-    handle.shutdown().await;
+    handle.kill().await;
 
     // A fresh daemon over the same journal, which re-reads nothing from the
     // repository. Its remaining script picks up where the dead one left off.

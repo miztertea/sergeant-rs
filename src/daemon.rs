@@ -363,6 +363,21 @@ impl DaemonHandle {
         }
         let _ = (&mut self.served).await;
     }
+
+    /// Abruptly terminate the daemon without giving it a chance to run its
+    /// own cooperative shutdown path — the in-process rig's analogue of
+    /// SIGKILL. m6's out-of-process rig signals a real child process; this
+    /// in-process one has no separate process to signal, so it aborts the
+    /// serving task instead. The shutdown channel is dropped unsent —
+    /// nothing here asks the daemon to stop, it is simply cut off
+    /// mid-flight. Awaiting the aborted task still lets the runtime finish
+    /// unwinding it (releasing the exclusive `daemon.lock`, closing the
+    /// listener) before a fresh daemon can bind the same data dir.
+    pub async fn kill(mut self) {
+        self.shutdown_tx.take();
+        self.served.abort();
+        let _ = (&mut self.served).await;
+    }
 }
 
 /// How a daemon instance is configured beyond its data dir.
