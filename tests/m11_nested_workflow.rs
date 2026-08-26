@@ -17,6 +17,7 @@
 //!    CONTAINER (E4).
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -27,12 +28,15 @@ use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::Event;
 use sergeant_rs::domain::workflow::{
-    KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_OUTPUT_MISSING,
+    KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_OUTPUT_MISSING,
     REASON_STAGE_OUTPUT_MISSING,
 };
+use sergeant_rs::runtime::analytics::Analytics;
 use sergeant_rs::runtime::journal::Journal;
 
 mod support;
+
+const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
 // ---------------------------------------------------------------- helpers
 
@@ -147,6 +151,18 @@ async fn post(
     let status = resp.status();
     let value: Value = resp.json().await.expect("json body");
     (status, value)
+}
+
+async fn get(client: &reqwest::Client, handle: &DaemonHandle, path: &str) -> Value {
+    client
+        .get(format!("{}{path}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json body")
 }
 
 async fn submit(
@@ -471,6 +487,213 @@ async fn a_container_whose_declared_output_is_present_closes_silently() {
             .all(|e| !e.kind.starts_with("container.")),
         "W1 adds no new event kind for a container"
     );
+
+    handle.shutdown().await;
+}
+
+/// W1 §13 item 4: a composed hierarchical id is an opaque string everywhere
+/// downstream of the loader, and this proves it at each of the four places
+/// that could have parsed it and did not have to — the journal's own events,
+/// the analytics `stages` rows folded from them, the read surface `sgt work
+/// show` prints, and (below) a restarted daemon's reconstruction of the
+/// deepest incomplete path.
+///
+/// The claim is deliberately negative: **nothing new was needed**. The
+/// reducer, the fold and the read model never parsed a stage id's structure,
+/// so a `/` in one changes nothing for them — which is the whole reason
+/// hierarchy was encoded in the existing string id (W1-04) rather than in a
+/// parallel tree.
+#[tokio::test]
+async fn a_composed_stage_id_round_trips_through_events_analytics_and_work_show() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_nested_workflow(&estate);
+
+    let handle = start_fake(
+        data.path(),
+        [
+            FakeStep::complete(),                       // 00-orient
+            FakeStep::needs_input("which lead first?"), // 10-investigate/00-lead parks here
+        ],
+    )
+    .await;
+    let client = http();
+    let body = submit(&client, &handle, &estate, "nested").await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "needs_input", "{body}");
+
+    // 1. Events. Every stage event for the nested leaf carries the composed
+    //    id verbatim — no escaping, no splitting, no parent field.
+    assert_eq!(
+        stage_ids(data.path(), &work_id, KIND_STAGE_ENTERED),
+        ["00-orient", "10-investigate/00-lead"]
+    );
+    assert_eq!(
+        stage_ids(data.path(), &work_id, "stage.needs_input"),
+        ["10-investigate/00-lead"]
+    );
+
+    // 2. Analytics. The `stages` table is folded from those events by a pure
+    //    reducer; the composed id lands in its `stage_id` column unchanged,
+    //    keyed and indexed like any other.
+    let events: Vec<Result<Event, _>> = Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .collect();
+    let mut analytics = Analytics::in_memory(events).expect("fold the journal");
+    let stages = analytics.table_rows("stages").expect("stages table");
+    let stage_id_column = stages
+        .columns
+        .iter()
+        .position(|c| c == "stage_id")
+        .expect("stage_id column");
+    let idx_column = stages
+        .columns
+        .iter()
+        .position(|c| c == "idx")
+        .expect("idx column");
+    let nested_row = stages
+        .rows
+        .iter()
+        .find(|row| row[stage_id_column] == json!("10-investigate/00-lead"))
+        .unwrap_or_else(|| panic!("no analytics row for the nested leaf: {:?}", stages.rows));
+    assert_eq!(
+        nested_row[idx_column],
+        json!(1),
+        "the analytics row keeps the leaf's flat index: {nested_row:?}"
+    );
+
+    // 3. The read surface. `sgt work show` prints the same record the API
+    //    serves, so this spawns the real binary rather than asserting the
+    //    API body twice.
+    //
+    //    `spawn_blocking`, not a bare `Command::output()`: this daemon lives
+    //    on the test's own current-thread runtime, so blocking that thread
+    //    on a child process that is trying to reach it would deadlock the
+    //    server it is calling.
+    let (data_dir, cwd, id) = (data.path().to_path_buf(), estate.clone(), work_id.clone());
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(SGT)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args(["work", "show", &id])
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run sgt work show")
+    })
+    .await
+    .expect("join the spawned CLI");
+    assert!(
+        output.status.success(),
+        "sgt work show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown: Value =
+        serde_json::from_slice(&output.stdout).expect("work show prints one JSON record");
+    assert_eq!(
+        shown["stage"]["stage_id"], "10-investigate/00-lead",
+        "work show must name the leaf by its composed id: {shown}"
+    );
+    assert_eq!(
+        shown["workflow"]["stages"][1], "10-investigate/00-lead",
+        "and carry the flat leaf list E10 settled: {shown}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// W1 §9 / §13 item 4's recovery half: a daemon that dies mid-nest comes
+/// back knowing exactly which leaf was in flight, *from the journal alone*.
+///
+/// Nothing reconstructs a tree to do it. The pinned `workflow.bound` carries
+/// the already-flattened stage list, the journal carries whatever stage id
+/// was current, and "the deepest incomplete path" is simply the last
+/// `StageRecord` — whose id *is* that path by construction. This test kills
+/// the daemon while a nested leaf is the failed, current stage and asserts
+/// both halves: the restarted daemon names that leaf, and `retry` re-enters
+/// that leaf rather than an ancestor or the container's first child.
+#[tokio::test]
+async fn a_restarted_daemon_reconstructs_the_deepest_incomplete_path_and_retry_re_enters_it() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    write_nested_workflow(&estate);
+
+    let handle = start_fake(
+        data.path(),
+        [
+            FakeStep::complete(),                      // 00-orient
+            FakeStep::complete(),                      // 10-investigate/00-lead
+            FakeStep::fail("the nested leaf gave up"), // 10-investigate/10-code
+        ],
+    )
+    .await;
+    let client = http();
+    let body = submit(&client, &handle, &estate, "nested").await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    assert_eq!(body["work"]["state"], "failed", "{body}");
+    assert_eq!(
+        stage_ids(data.path(), &work_id, KIND_STAGE_FAILED),
+        ["10-investigate/10-code"],
+        "the failure event names the nested leaf, which IS the container-scoped failure report"
+    );
+    handle.shutdown().await;
+
+    // A fresh daemon over the same journal, which re-reads nothing from the
+    // repository. Its remaining script picks up where the dead one left off.
+    let handle = start_fake(
+        data.path(),
+        [
+            FakeStep::complete(), // the retried 10-investigate/10-code
+            FakeStep::complete(), // 20-implement
+        ],
+    )
+    .await;
+    let view = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(
+        view["stage"]["stage_id"], "10-investigate/10-code",
+        "the restarted daemon's current stage is the deepest incomplete path: {view}"
+    );
+    assert_eq!(view["stage"]["index"], 2, "at its flat index: {view}");
+    assert_eq!(
+        view["stage"]["of"], 4,
+        "of the flattened leaf count: {view}"
+    );
+
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/retry"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert_eq!(status, 200, "retry rejected: {body}");
+    assert_eq!(
+        body["work"]["state"], "completed",
+        "the retried nested leaf and the container's sibling must finish the run: {body}"
+    );
+    let entered = stage_ids(data.path(), &work_id, KIND_STAGE_ENTERED);
+    assert_eq!(
+        entered,
+        [
+            "00-orient",
+            "10-investigate/00-lead",
+            "10-investigate/10-code",
+            "10-investigate/10-code", // the retry: same leaf, attempt 2
+            "20-implement",
+        ],
+        "retry re-entered exactly the leaf that failed — never an ancestor container, \
+         never the container's first child"
+    );
+    let retried: Vec<u64> = events_of(data.path(), &work_id, KIND_STAGE_ENTERED)
+        .iter()
+        .filter(|e| e.payload["stage_id"] == "10-investigate/10-code")
+        .map(|e| e.payload["attempt"].as_u64().unwrap_or(1))
+        .collect();
+    assert_eq!(retried, [1, 2], "attempts 1 and 2 of the same nested leaf");
 
     handle.shutdown().await;
 }

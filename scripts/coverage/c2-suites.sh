@@ -54,13 +54,6 @@ cov_stage_begin c2-m10_harness
 cov_run cargo llvm-cov --no-report --test m10_harness --locked || cov_fail "m10_harness failed under instrumentation"
 cov_stage_end 1 "the m10 test binary must write its own profile"
 
-# S2 V1b: nested workflow packages end to end. In-process daemon, fake
-# backend, no `sgt` subprocess — so it belongs with C2's own-profile suites,
-# not with C3's spawning pair.
-cov_stage_begin c2-m11_nested_workflow
-cov_run cargo llvm-cov --no-report --test m11_nested_workflow --locked || cov_fail "m11_nested_workflow failed under instrumentation"
-cov_stage_end 1 "the m11 test binary must write its own profile"
-
 cov_stage_begin c2-estate_routes
 cov_run cargo llvm-cov --no-report --test estate_routes --locked || cov_fail "estate_routes failed under instrumentation"
 cov_stage_end 1 "the estate_routes test binary must write its own profile"
