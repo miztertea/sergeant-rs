@@ -10,11 +10,12 @@
 //! whether it runs once via `GET /v1/sweep` or on a background tick.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
 use tempfile::TempDir;
+use tracing_subscriber::layer::SubscriberExt;
 
 use sergeant_rs::api::ApiClient;
 use sergeant_rs::backend::BackendRegistry;
@@ -23,6 +24,60 @@ use sergeant_rs::daemon::{self, DaemonConfig};
 
 mod support;
 use support::{git, scaffold_solo_estate};
+
+/// Captures the `estate` field of every `"periodic sweep"` info-level event
+/// emitted by [`sergeant_rs::api`]'s periodic caller, so a test can assert
+/// the caller actually *ran* against a given mount rather than merely
+/// inferring it from an absence of mutation (which also holds if the caller
+/// never fires — `classify` mutates nothing under correct behavior either
+/// way).
+#[derive(Clone, Default)]
+struct SweepLog(Arc<Mutex<Vec<String>>>);
+
+impl SweepLog {
+    fn swept_estates(&self) -> Vec<String> {
+        self.0.lock().expect("sweep log lock poisoned").clone()
+    }
+}
+
+struct SweepLogLayer(SweepLog);
+
+#[derive(Default)]
+struct SweepEventVisitor {
+    is_periodic_sweep: bool,
+    estate: Option<String>,
+}
+
+impl tracing::field::Visit for SweepEventVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        match field.name() {
+            "message" if rendered.contains("periodic sweep") => self.is_periodic_sweep = true,
+            "estate" => self.estate = Some(rendered.trim_matches('"').to_string()),
+            _ => {}
+        }
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SweepLogLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = SweepEventVisitor::default();
+        event.record(&mut visitor);
+        if visitor.is_periodic_sweep
+            && let Some(estate) = visitor.estate
+        {
+            self.0
+                .0
+                .lock()
+                .expect("sweep log lock poisoned")
+                .push(estate);
+        }
+    }
+}
 
 fn write_solo_workflow(root: &Path) {
     let dir = root.join(".sergeant/workflows/solo");
@@ -81,6 +136,10 @@ async fn completed_work(client: &ApiClient, cwd: &Path) -> String {
 /// (b) mutates instead of only classifying.
 #[tokio::test]
 async fn periodic_sweep_walks_every_admitted_estate_and_mutates_nothing() {
+    let sweep_log = SweepLog::default();
+    let subscriber = tracing_subscriber::registry().with(SweepLogLayer(sweep_log.clone()));
+    let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
     let root_a = TempDir::new().expect("estate a tempdir");
     let (mount_a, _) = scaffold_solo_estate(root_a.path(), "svc-a");
     write_solo_workflow(root_a.path());
@@ -131,6 +190,23 @@ async fn periodic_sweep_walks_every_admitted_estate_and_mutates_nothing() {
         before_b,
         refs_in(&mount_b),
         "estate B's ref store must be byte-identical after periodic sweep ticks"
+    );
+
+    // Decisive: the periodic caller must actually have executed against
+    // both mounts, not merely have left them unmutated by never firing at
+    // all. Reverting the `maybe_run_periodic_sweep` wiring in
+    // `drive_completions` makes this fail while the ref-store assertions
+    // above keep passing vacuously.
+    let swept = sweep_log.swept_estates();
+    let root_a_display = root_a.path().display().to_string();
+    let root_b_display = root_b.path().display().to_string();
+    assert!(
+        swept.iter().any(|e| e == &root_a_display),
+        "periodic sweep caller never logged running against estate A ({root_a_display}); swept: {swept:?}"
+    );
+    assert!(
+        swept.iter().any(|e| e == &root_b_display),
+        "periodic sweep caller never logged running against estate B ({root_b_display}); swept: {swept:?}"
     );
 
     handle.shutdown().await;
