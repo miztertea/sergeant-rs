@@ -12,6 +12,69 @@ released before a release can proceed.
 
 (nothing yet)
 
+## [0.3.0] - accumulating
+
+Not yet released: per the Host+Atlas release-shape ruling, v0.3.0 ships once,
+at program completion, carrying the whole Host+Atlas program (this sprint's
+host runtime plus S2-S6's knowledge/intelligence stack). This section
+accumulates sprint over sprint on the integration branch; each sprint close
+still runs the full release pipeline in dry-run against the integration
+head, so every gate below is proven at every sprint boundary even though
+nothing is actually tagged or published until the program-completion
+release.
+
+### Host runtime (S1)
+
+- One Sergeant daemon per user installation now serves every admitted
+  estate, not one daemon per estate: lazy, observational admission by
+  exact root, a descriptor schema bump to `sergeant.runtime/v3` (no baked-in
+  estate set — the admitted registry is dynamic daemon state), and a
+  systemd user service / macOS LaunchAgent installer (`sgt daemon
+  install-service`) so the daemon survives logout and restarts on crash
+  under native per-user service management. (#275, #276)
+- Journal, DuckDB projection, and daemon runtime state moved to a shared
+  host runtime root; estate-local material (manifest, repository mounts,
+  `.sergeant/workflows/`, Work surfaces) stays exactly where it was.
+  `[estate] data_dir` is deprecated at cutover — `sgt doctor` warns if a
+  manifest still declares it.
+- Retention is now partitioned per admitted estate (own `[estate]
+  retention`, resolved fresh every prune cycle) while the blob-reference
+  scan that garbage collection depends on stays journal-wide, so one
+  estate's retention can never condemn another's still-live blobs. Both
+  the rotation-triggered prune tick and the daemon-start prune trigger
+  use the same per-estate policy resolution.
+- A bounded execution capacity lane (`Arc<Semaphore>`, acquired between
+  PREPARE and LAUNCH, outside the core lock) caps concurrent native-adapter
+  launches daemon-wide; a lane-queued Work is observably distinct from
+  turn-cap exhaustion. A second, independently bounded config-only
+  intelligence lane exists alongside it with no scheduler wired to it yet
+  — proving the two lanes' independence now rather than retrofitting it
+  once intelligence workers exist.
+- The TUI widens to a Host / Estate / Work / Stage / Execution scope: the
+  fleet endpoint returns every admitted estate's Work and the TUI filters
+  client-side; `sgt watch` gained an optional estate filter so it keeps
+  estate-scoped meaning by default inside an estate.
+- One bearer token now authorizes every estate the daemon has admitted —
+  a real widening of blast radius from the one-estate world, accepted
+  deliberately under this installation's single-user trust model and
+  recorded, not silently inherited (see [host runtime and
+  estates](docs/concepts/host-runtime.md)).
+- Startup backend probes now run concurrently instead of sequentially,
+  and the runtime descriptor is published before the probe walk finishes
+  rather than after — cutting fresh-daemon time-to-healthy well under
+  the client's own auto-spawn wait on a fully-provisioned host. (#293)
+- `[profile.dev.package."*"] debug = false` (workspace crate keeps its
+  own debuginfo) — a measured, qualified cut to fresh-build size and
+  incremental compile time with no loss of in-tree backtraces. (#299)
+- Fixed a doctor false positive in the embedded-content route checker.
+  (#282)
+- Documentation frame extended with host-runtime/cutover prose (service
+  installation, the legacy-runtime reconcile-or-abandon remedy, daemon
+  stop's host-wide blast radius) and a corrected Cerberus cold-build
+  figure (~2-4 minutes for a solo cold `cargo build --tests`, not the
+  stale ~10 minute figure that had been carried from an earlier,
+  differently-provisioned environment).
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain
