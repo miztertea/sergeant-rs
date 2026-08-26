@@ -3153,6 +3153,68 @@ mod tests {
         );
     }
 
+    /// `[stage."<id>"]` tables stay per-package: a nested package's own
+    /// tables are keyed against *its* declared ids and resolve into the
+    /// leaves it contributes, carried through the splice unchanged.
+    #[test]
+    fn a_nested_packages_own_stage_table_tags_its_leaf() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "tagged-nested");
+        write_package(&wf, "tagged-nested", &["10-investigate"]);
+        let container = wf.join("10-investigate");
+        std::fs::create_dir_all(&container).expect("container dir");
+        std::fs::write(
+            container.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"10-investigate\"\nversion = \"1\"\n\
+             stages = [\"00-lead\", \"10-code\"]\n\n\
+             [stage.\"00-lead\"]\nkind = \"actor\"\nharness = \"claude\"\nprofile = \"deep\"\n\
+             requires_ask = true\n",
+        )
+        .expect("nested descriptor");
+        write_stage(&container, "00-lead", "lead");
+        write_stage(&container, "10-code", "code");
+
+        let def = WorkflowDefinition::load_dir(&wf).expect("load");
+        let lead = &def.stages[0];
+        assert_eq!(lead.id, "10-investigate/00-lead");
+        assert_eq!(lead.harness.as_deref(), Some("claude"));
+        assert_eq!(lead.profile.as_deref(), Some("deep"));
+        assert!(lead.requires_ask);
+        // The untagged sibling keeps the actor default.
+        let code = &def.stages[1];
+        assert_eq!(code.id, "10-investigate/10-code");
+        assert_eq!(code.harness, None);
+        assert!(!code.requires_ask);
+    }
+
+    /// The other half of that rule: a parent's own `check_stage_tables` only
+    /// ever sees the parent's declared ids. A parent table naming a *nested*
+    /// leaf is undeclared metadata, refused as any other would be — there is
+    /// no cross-package table lookup.
+    #[test]
+    fn a_parent_may_not_declare_a_stage_table_for_a_nested_leaf() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "cross-package");
+        std::fs::create_dir_all(&wf).expect("workflow dir");
+        std::fs::write(
+            wf.join(WORKFLOW_FILE),
+            "[workflow]\nname = \"cross-package\"\nversion = \"1\"\n\
+             stages = [\"10-investigate\"]\n\n\
+             [stage.\"00-lead\"]\nharness = \"claude\"\n",
+        )
+        .expect("descriptor");
+        let container = wf.join("10-investigate");
+        write_package(&container, "10-investigate", &["00-lead"]);
+        write_stage(&container, "00-lead", "lead");
+
+        let err = WorkflowDefinition::load_dir(&wf)
+            .expect_err("a table naming a nested leaf must be refused");
+        assert!(
+            matches!(&err, WorkflowError::UndeclaredStageTable { stage, .. } if stage == "00-lead"),
+            "expected UndeclaredStageTable, got {err}"
+        );
+    }
+
     /// E15: a stage directory holding **both** `workflow.toml` and
     /// `CONTEXT.md` is a load error. A container has no actor (W1-02), so
     /// that `CONTEXT.md` could never be read — surfacing the author's

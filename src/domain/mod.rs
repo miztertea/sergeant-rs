@@ -47,4 +47,23 @@ mod tests {
             assert!(!is_plain_name(bad), "{bad:?} must not be a plain name");
         }
     }
+
+    /// W1 §3: a nested workflow package's stage id is a `/`-joined path of
+    /// components (`10-investigate/00-lead`). This guard stays
+    /// per-*component*: the composite is deliberately never a plain name, so
+    /// a caller that passed a whole hierarchical stage id here would refuse
+    /// every valid nested stage rather than validate one. Only
+    /// [`workflow::WorkflowDefinition::load_dir`] joins components, and only
+    /// after checking each one through here.
+    #[test]
+    fn a_composed_hierarchical_stage_id_is_never_a_plain_name() {
+        let composed = "10-investigate/00-lead";
+        assert!(
+            !is_plain_name(composed),
+            "the composite must not pass the per-component guard"
+        );
+        for component in composed.split('/') {
+            assert!(is_plain_name(component), "{component:?} is a plain name");
+        }
+    }
 }
