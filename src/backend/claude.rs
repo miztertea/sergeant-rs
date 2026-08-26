@@ -1143,7 +1143,22 @@ impl ClaudeBackend {
     /// `sergeant.toml` parse (built directly by a test, or by a future
     /// caller), so the launch boundary itself must still refuse an
     /// unrecognized mode rather than pass the raw string to the CLI.
-    fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
+    ///
+    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`]),
+    /// merged **after** the profile so a workflow-authored `Profile.env` key
+    /// cannot shadow what sergeant itself intended to send. That is hygiene,
+    /// not security — W1 §6 makes the daemon's journal the only authority on
+    /// lineage — and it mirrors `CODEX_HOME`'s own deliberate
+    /// last-writer-wins precedent in the codex adapter. RESUME passes an
+    /// empty map: a re-adopted execution's causation triple was pinned into
+    /// the process START launched, and `ResumeRequest` carries no execution
+    /// or estate coordinate to rebuild it from, so nothing is injected rather
+    /// than a partial or invented triple.
+    fn launch_config(
+        &self,
+        profile: Option<&Profile>,
+        causation: &BTreeMap<String, String>,
+    ) -> Result<LaunchConfig, BackendError> {
         let executable = profile
             .and_then(|p| p.executable.clone())
             .unwrap_or_else(|| self.config.executable.clone());
@@ -1158,6 +1173,9 @@ impl ClaudeBackend {
                     config_home.display().to_string(),
                 );
             }
+        }
+        for (key, value) in causation {
+            env.insert(key.clone(), value.clone());
         }
         // Permission mode is profile-pinned. Unspecified -> no flag at all
         // (the CLI's own default); `bypassPermissions` only ever reaches
@@ -1830,7 +1848,10 @@ impl Backend for ClaudeBackend {
             executable,
             env,
             permission_args,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -2043,7 +2064,7 @@ impl Backend for ClaudeBackend {
             executable,
             env,
             permission_args,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(request.profile.as_ref(), &BTreeMap::new())?;
         let mut state = self.lock();
         if let Some(existing) = state.executions.get(&handle.execution_id) {
             // Another thread adopted it while this one gathered evidence.

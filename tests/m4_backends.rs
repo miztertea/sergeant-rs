@@ -541,7 +541,21 @@ impl Launch {
 
 /// Environment variables the stub reports back, chosen because the adapter
 /// makes a claim about each one.
-const RECORDED_ENV: &[&str] = &["CLAUDE_CODE_SESSION_ID", "CLAUDE_CONFIG_DIR", "IS_SANDBOX"];
+const RECORDED_ENV: &[&str] = &[
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CONFIG_DIR",
+    "IS_SANDBOX",
+    // S2 E5: the causation triple. Recorded here rather than asserted from
+    // the adapter's own computed map, because "the daemon computed them" and
+    // "the actor process received them" are different claims and only the
+    // second one is what a child `sgt -C … run` can spend.
+    "SERGEANT_ESTATE_ROOT",
+    "SERGEANT_WORK_ID",
+    "SERGEANT_EXECUTION_ID",
+    // The harness's own variable, recorded so the distinction is asserted
+    // rather than assumed: injecting causation must not set it.
+    "SGT_ESTATE_ROOT",
+];
 
 impl StubClaude {
     fn new(dir: &Path, version: &str, help_flags: &[&str]) -> Self {
@@ -2424,6 +2438,123 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
         second.argv
     );
     assert_eq!(second.stdin, "second turn");
+}
+
+/// S2 E5/E6 (W1 §6): the causation triple reaches the *actor process* — read
+/// back out of the spawned stub's own environment, not out of the adapter's
+/// computed map — on the first turn and on every later turn of the same
+/// execution, since the launch config is pinned once and replayed.
+///
+/// The fourth assertion is the one both recon seats asked for: the harness's
+/// `SGT_ESTATE_ROOT` is a different mechanism and injecting causation must
+/// not set it. An implementation that wired the harness variable and believed
+/// W1-07 satisfied fails here.
+#[test]
+fn s2_the_causation_triple_reaches_the_actor_process_on_every_turn() {
+    let dir = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-causation", cwd.path(), "the intent", None);
+    request.work_id = "01PARENTWORK".to_string();
+    request.estate_root = Some(PathBuf::from("/home/dev/estate"));
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+    backend.send(&handle, "second turn").expect("send");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(2);
+    for (turn, launch) in launches.iter().enumerate() {
+        assert_eq!(
+            launch.env["SERGEANT_ESTATE_ROOT"], "/home/dev/estate",
+            "turn {turn}: the estate a child `sgt -C … run` must address"
+        );
+        assert_eq!(
+            launch.env["SERGEANT_WORK_ID"], "01PARENTWORK",
+            "turn {turn}: the parent Work"
+        );
+        assert_eq!(
+            launch.env["SERGEANT_EXECUTION_ID"], "e-causation",
+            "turn {turn}: the parent execution"
+        );
+        assert_ne!(
+            launch.env["SGT_ESTATE_ROOT"], "/home/dev/estate",
+            "turn {turn}: the harness's SGT_ESTATE_ROOT is a different \
+             mechanism — causation injection must never write it (asserted as \
+             \"not the injected value\" rather than \"unset\", because a test \
+             run from inside a real harness session legitimately inherits one)"
+        );
+    }
+}
+
+/// E6's merge order, tested rather than asserted: the triple is merged
+/// *after* `Profile.env`, so a workflow-authored profile cannot shadow what
+/// sergeant itself intended to send. This is hygiene, not security — W1 §6
+/// makes the daemon's journal the only authority on lineage, which is what
+/// the E8 validation tests in `m12_child_work.rs` pin.
+#[test]
+fn s2_a_profile_cannot_shadow_the_causation_triple() {
+    let dir = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-shadow", cwd.path(), "the intent", None);
+    request.work_id = "01REALWORK".to_string();
+    request.estate_root = Some(PathBuf::from("/home/dev/estate"));
+    request.profile = Some(Profile {
+        name: "forger".to_string(),
+        backend: CLAUDE_BACKEND_NAME.to_string(),
+        executable: Some(stub.path.clone()),
+        config_home: None,
+        env: [
+            ("SERGEANT_WORK_ID".to_string(), "01FORGED".to_string()),
+            (
+                "SERGEANT_ESTATE_ROOT".to_string(),
+                "/somewhere/else".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        default_model: None,
+        options: BTreeMap::new(),
+    });
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let first = &stub.wait_for_launches(1)[0];
+    assert_eq!(
+        first.env["SERGEANT_WORK_ID"], "01REALWORK",
+        "the profile's own value must not win over the injected one"
+    );
+    assert_eq!(first.env["SERGEANT_ESTATE_ROOT"], "/home/dev/estate");
+}
+
+/// E6's other half: a **probe** is not a `StartRequest`-bound execution and
+/// never receives the triple. `causation_env` takes the request precisely so
+/// there is nothing to pass at a probe call site — this pins the behaviour
+/// from outside, by reading the probe invocation's own environment.
+#[test]
+fn s2_a_probe_invocation_never_receives_the_causation_triple() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let report = backend.probe();
+    assert!(report.available, "the stub probes clean: {report:?}");
+    assert!(
+        stub.launches().is_empty(),
+        "a probe spawns only --version/--help, which record no environment \
+         at all — so there is no launch record for the triple to be in: {:?}",
+        stub.launches()
+    );
 }
 
 /// ADR 0007(a): whatever composes an actor's context states what wakes it.

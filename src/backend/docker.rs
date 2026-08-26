@@ -611,6 +611,27 @@ impl DockerBackend {
             args.push("--env".into());
             args.push(format!("{key}={value}"));
         }
+        // S2 E5/E6/E7: the causation triple crosses the container boundary
+        // the same way every other environment variable does — Docker's own
+        // `--env`, not a `Command::env` on a child this process spawns and
+        // inherits from. Uniform with the four native adapters (one helper,
+        // five call sites) and, unlike them, deliberately *not* a child-Work
+        // channel: **child Work originating inside an execute container is a
+        // named S2 deferral** (E7) — the `sgt` binary does not exist in any
+        // measured probe image, the executor runs a fixed
+        // `ExecuteSpec.command` argv rather than an agentic actor that could
+        // decide to run `sgt`, and the isolation posture (§16.7: no
+        // privilege, no host namespaces, the Docker socket never mounted in)
+        // is not being widened to make one possible. What these three values
+        // buy here is what the container *labels* beside them already buy —
+        // forensic and journal-correlation value, now also readable from
+        // inside the container rather than only via `docker inspect`.
+        // Injected after `spec.env` for the same last-writer-wins reason the
+        // native adapters merge last.
+        for (key, value) in crate::backend::causation_env(request) {
+            args.push("--env".into());
+            args.push(format!("{key}={value}"));
+        }
         args.push(image.image_id.clone());
         args.extend(spec.command.iter().cloned());
 
@@ -1348,6 +1369,104 @@ mod tests {
         assert_eq!(
             format!("{LABEL_SCHEMA}={SCHEMA_VERSION}"),
             "io.sergeant.schema=execution/v1"
+        );
+    }
+
+    /// A `docker` that answers `image inspect` with a fixed identity and
+    /// records every other invocation's argv, one word per line. Enough to
+    /// drive `create_container` without a Docker Engine — the argv it builds
+    /// is the whole contract this test is about.
+    fn scripted_docker(dir: &std::path::Path) -> (String, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let record = dir.join("docker-argv.txt");
+        let path = dir.join("docker-stub");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n                 echo '[{{\"Id\":\"sha256:deadbeef\",\"RepoDigests\":[],\"Os\":\"linux\",\"Architecture\":\"amd64\"}}]'\n                 exit 0\n\
+             fi\n\
+             for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done >> \"{record}\"\n\
+             if [ \"$1\" = inspect ]; then\n                 echo '[{{\"Image\":\"sha256:deadbeef\",\"State\":{{\"Status\":\"created\",\"Running\":false,\"ExitCode\":0}}}}]'\n\
+             fi\n\
+             exit 0\n",
+            record = record.display(),
+        );
+        std::fs::write(&path, script).expect("write docker stub");
+        let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod stub");
+        (path.display().to_string(), record)
+    }
+
+    /// S2 E5/E6/E7: the causation triple crosses the container boundary as
+    /// Docker's own `--env`, uniformly with the four native adapters, and is
+    /// pushed **after** `ExecuteSpec.env` so a stage-authored value cannot
+    /// shadow it. E7 is what this does *not* buy: child Work originating
+    /// inside an execute container stays a named deferral — no `sgt` exists
+    /// in any measured probe image, and nothing here widens §16.7's
+    /// isolation posture to make one possible.
+    #[test]
+    fn s2_the_causation_triple_crosses_the_container_boundary_as_env() {
+        let (dir, mut config) = config();
+        let (docker_bin, record) = scripted_docker(dir.path());
+        config.docker_bin = docker_bin;
+        let backend = DockerBackend::new(config).expect("backend");
+        let spec = ExecuteSpec {
+            image: "alpine:3.24".into(),
+            command: vec!["true".into()],
+            workdir: "/estate".into(),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            network: NetworkPolicy::None,
+            env: BTreeMap::from([("SERGEANT_WORK_ID".to_string(), "01FORGED".to_string())]),
+        };
+        let request = StartRequest {
+            work_id: "01PARENTWORK".into(),
+            execution_id: "01EXEC".into(),
+            stage_id: "10-validate".into(),
+            attempt: 1,
+            cwd: dir.path().to_path_buf(),
+            intent: "check it".into(),
+            context: String::new(),
+            model: None,
+            profile: None,
+            execute: Some(spec.clone()),
+            instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
+            estate_root: Some(PathBuf::from("/home/dev/estate")),
+        };
+        backend
+            .create_container("sgt-01EXEC", &request, &spec)
+            .expect("create");
+
+        let argv: Vec<String> = std::fs::read_to_string(&record)
+            .expect("the stub recorded a create")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let envs: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && argv[i - 1] == "--env")
+            .map(|(_, v)| v)
+            .collect();
+        assert!(
+            envs.contains(&&"SERGEANT_ESTATE_ROOT=/home/dev/estate".to_string()),
+            "the estate root crosses the boundary: {envs:?}"
+        );
+        assert!(
+            envs.contains(&&"SERGEANT_EXECUTION_ID=01EXEC".to_string()),
+            "the execution id crosses the boundary: {envs:?}"
+        );
+        // The spec's own forged value is pushed first and the injected one
+        // last; Docker's `--env` is last-wins, so the container sees the real
+        // parent.
+        let work_ids: Vec<&&String> = envs
+            .iter()
+            .filter(|v| v.starts_with("SERGEANT_WORK_ID="))
+            .collect();
+        assert_eq!(
+            work_ids.last().map(|v| v.as_str()),
+            Some("SERGEANT_WORK_ID=01PARENTWORK"),
+            "the injected value is the last `--env` for that name, so it wins: {envs:?}"
         );
     }
 

@@ -187,9 +187,9 @@ impl StubAgy {
                if [ -f \"{config_hang}\" ]; then exec sleep 60; fi\n  \
                cat \"{config_answer}\"; exit 0\n\
              fi\n\
-             if [ \"$1\" = \"--print=\" ]; then\n                 {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n                   env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n                   printf 'cwd %s\\n' \"$(pwd)\"; printf 'end\\n'; }} >> \"{record}\"\n                 if [ ! -f \"{loop_prefix}-no-init\" ]; then cat \"{loop_init}\"; fi\n                 if [ -f \"{loop_prefix}-preinit-err\" ]; then cat \"{loop_prefix}-preinit-err\" >&2; fi\n                 if [ -f \"{loop_prefix}-preinit-out\" ]; then cat \"{loop_prefix}-preinit-out\"; fi\n                 if [ -f \"{loop_prefix}-exit-now\" ]; then exit \"$(cat \"{loop_prefix}-exit-now\")\"; fi\n                 if [ -f \"{grandchild}\" ]; then\n                   ( i=0; while [ \"$i\" -lt 600 ]; do sleep 0.1; i=$((i+1)); done ) &\n                   echo $! > \"{grandchild_pid}\"\n                 fi\n                 if [ -f \"{loop_prefix}-init-hang\" ]; then exec sleep 60; fi\n                 n=0\n                 while IFS= read -r line; do\n                     n=$((n+1))\n                     printf 'stdin %s\\n' \"$line\" >> \"{record}\"\n                     if [ -f \"{loop_prefix}-stderr-pre-$n\" ]; then cat \"{loop_prefix}-stderr-pre-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-delay-$n\" ]; then sleep \"$(cat \"{loop_prefix}-delay-$n\")\"; fi\n                     if [ -f \"{replay}\" ]; then awk -v n=$n 'BEGIN{{s=1}} /^---turn---$/{{s=s+1;next}} s==n{{print}}' \"{replay}\"; fi\n                     if [ -f \"{loop_prefix}-stderr-$n\" ]; then cat \"{loop_prefix}-stderr-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-die-after-$n\" ]; then exit \"$(cat \"{loop_prefix}-die-after-$n\")\"; fi\n                 done\n                 if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n                 exit 0\n             fi\n\
+             if [ \"$1\" = \"--print=\" ]; then\n                 {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n                   env | grep -E '^(HOME|SGT_[A-Z_]*|SERGEANT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n                   printf 'cwd %s\\n' \"$(pwd)\"; printf 'end\\n'; }} >> \"{record}\"\n                 if [ ! -f \"{loop_prefix}-no-init\" ]; then cat \"{loop_init}\"; fi\n                 if [ -f \"{loop_prefix}-preinit-err\" ]; then cat \"{loop_prefix}-preinit-err\" >&2; fi\n                 if [ -f \"{loop_prefix}-preinit-out\" ]; then cat \"{loop_prefix}-preinit-out\"; fi\n                 if [ -f \"{loop_prefix}-exit-now\" ]; then exit \"$(cat \"{loop_prefix}-exit-now\")\"; fi\n                 if [ -f \"{grandchild}\" ]; then\n                   ( i=0; while [ \"$i\" -lt 600 ]; do sleep 0.1; i=$((i+1)); done ) &\n                   echo $! > \"{grandchild_pid}\"\n                 fi\n                 if [ -f \"{loop_prefix}-init-hang\" ]; then exec sleep 60; fi\n                 n=0\n                 while IFS= read -r line; do\n                     n=$((n+1))\n                     printf 'stdin %s\\n' \"$line\" >> \"{record}\"\n                     if [ -f \"{loop_prefix}-stderr-pre-$n\" ]; then cat \"{loop_prefix}-stderr-pre-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-delay-$n\" ]; then sleep \"$(cat \"{loop_prefix}-delay-$n\")\"; fi\n                     if [ -f \"{replay}\" ]; then awk -v n=$n 'BEGIN{{s=1}} /^---turn---$/{{s=s+1;next}} s==n{{print}}' \"{replay}\"; fi\n                     if [ -f \"{loop_prefix}-stderr-$n\" ]; then cat \"{loop_prefix}-stderr-$n\" >&2; fi\n                     if [ -f \"{loop_prefix}-die-after-$n\" ]; then exit \"$(cat \"{loop_prefix}-die-after-$n\")\"; fi\n                 done\n                 if [ -f \"{exit_code}\" ]; then exit \"$(cat \"{exit_code}\")\"; fi\n                 exit 0\n             fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$(printf '%s' \"$arg\" | tr '\\n' '|')\"; done;\n\
-             env | grep -E '^(HOME|SGT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n\
+             env | grep -E '^(HOME|SGT_[A-Z_]*|SERGEANT_[A-Z_]*|AGY_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
              printf 'end\\n'; }} >> \"{record}\"\n\
              if [ -f \"{replay}\" ]; then cat \"{replay}\"; fi\n\
@@ -710,7 +710,10 @@ fn start_request(cwd: &Path) -> StartRequest {
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::<BindingSummary>::new(),
-        estate_root: None,
+        // S2 E5: a real estate coordinate on every request this suite builds,
+        // so the causation-triple tests below read the value the engine would
+        // actually have threaded rather than a hole.
+        estate_root: Some(PathBuf::from("/home/dev/estate")),
     }
 }
 
@@ -1212,6 +1215,117 @@ fn a_profile_executable_and_env_reach_every_turn() {
             Some("reached"),
             "the profile's env must reach EVERY turn, not only the first"
         );
+    }
+}
+
+/// S2 E5/E6 (W1 §6): the causation triple reaches the actor process on both
+/// of this adapter's transports — the argv turn launch and the loop child —
+/// on every turn, and a profile cannot shadow it (the triple merges last).
+#[test]
+fn s2_the_causation_triple_reaches_every_turn_and_the_loop_child() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    stub.replays(MINIMAL_TURN);
+    let backend = AgyBackend::new(config_for(&stub, dir.path()));
+    let (event_sink, _events) = sink();
+    backend.set_event_sink(event_sink);
+    let mut request = pinned_request(dir.path());
+    request.work_id = "01PARENTWORK".to_string();
+    // A profile that tries to forge the lineage: the injected values win,
+    // because the triple is merged after `Profile.env`.
+    request.profile = Some(Profile {
+        name: "forger".into(),
+        backend: AGY_BACKEND_NAME.into(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::from([("SERGEANT_WORK_ID".into(), "01FORGED".into())]),
+        default_model: None,
+        options: BTreeMap::new(),
+    });
+    let execution_id = request.execution_id.clone();
+    let handle = launch_with(&backend, &request).expect("launch");
+    wait_for_settled(&backend, &handle);
+    backend.send(&handle, "turn two").expect("send");
+    for launch in &stub.wait_for_turn_launches(2) {
+        assert_eq!(
+            launch.env.get("SERGEANT_ESTATE_ROOT").map(String::as_str),
+            Some("/home/dev/estate")
+        );
+        assert_eq!(
+            launch.env.get("SERGEANT_WORK_ID").map(String::as_str),
+            Some("01PARENTWORK"),
+            "the profile's own SERGEANT_WORK_ID must not win: {:?}",
+            launch.env
+        );
+        assert_eq!(
+            launch.env.get("SERGEANT_EXECUTION_ID").map(String::as_str),
+            Some(execution_id.as_str())
+        );
+    }
+
+    // The loop transport spawns a persistent child rather than one process
+    // per turn; it is the same `launch_config` seam and must carry the same
+    // three values.
+    let loop_stub = StubAgy::new(dir.path(), "loop-agy", PASSING_VERSION, ALL_HELP);
+    let (init, replay) = loop_capture(LOOP_TWO_TURNS);
+    loop_stub.loop_init(&init);
+    loop_stub.replays(&replay);
+    let loop_backend = AgyBackend::new(loop_config_for(&loop_stub, dir.path()));
+    let mut loop_request = loop_pinned_request(dir.path());
+    loop_request.work_id = "01LOOPWORK".to_string();
+    let loop_execution_id = loop_request.execution_id.clone();
+    let loop_handle = launch_with(&loop_backend, &loop_request).expect("loop launch");
+    let loop_launches = loop_stub.wait_for_loop_launches(1);
+    assert_eq!(
+        loop_launches[0]
+            .env
+            .get("SERGEANT_WORK_ID")
+            .map(String::as_str),
+        Some("01LOOPWORK"),
+        "the loop child is a launch too: {:?}",
+        loop_launches[0].env
+    );
+    assert_eq!(
+        loop_launches[0]
+            .env
+            .get("SERGEANT_EXECUTION_ID")
+            .map(String::as_str),
+        Some(loop_execution_id.as_str())
+    );
+    assert_eq!(
+        loop_launches[0]
+            .env
+            .get("SERGEANT_ESTATE_ROOT")
+            .map(String::as_str),
+        Some("/home/dev/estate")
+    );
+    let _ = loop_handle;
+}
+
+/// E6: `apply_env` is shared verbatim between probe and turn launch so the
+/// two "can never read two different configurations" — which is exactly why
+/// the triple is folded into the resolved `env` map at `launch_config`
+/// instead of into `apply_env`'s signature. A probe has no work and no
+/// execution; it must carry none of the three.
+#[test]
+fn s2_a_probe_invocation_never_receives_the_causation_triple() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubAgy::passing(dir.path());
+    let backend = AgyBackend::new(config_for(&stub, dir.path()));
+    let report = backend.probe();
+    assert!(report.available, "the stub probes clean: {report:?}");
+    for launch in stub.launches() {
+        for name in [
+            "SERGEANT_ESTATE_ROOT",
+            "SERGEANT_WORK_ID",
+            "SERGEANT_EXECUTION_ID",
+        ] {
+            assert!(
+                !launch.env.contains_key(name),
+                "a probe invocation must not carry {name}: {:?}",
+                launch.env
+            );
+        }
     }
 }
 
