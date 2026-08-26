@@ -162,3 +162,21 @@ cov_stage_end 1 "the w4c_service_doctor test binary must write its own profile (
 cov_stage_begin c2-w2fix_probe_ordering
 cov_run cargo llvm-cov --no-report --test w2fix_probe_ordering --locked || cov_fail "w2fix_probe_ordering failed under instrumentation"
 cov_stage_end 1 "the w2fix_probe_ordering test binary must write its own profile"
+
+# W5, wired at birth: `maybe_run_periodic_sweep` proven against a real
+# in-process `daemon::start_with` (two admitted estates) — same shape as
+# w2fix_probe_ordering just above, not C3: nothing here spawns an `sgt`
+# subprocess or a real CLI, only the in-process daemon handle every m6-style
+# suite already uses. Floor 1.
+cov_stage_begin c2-e_periodic_sweep
+cov_run cargo llvm-cov --no-report --test e_periodic_sweep --locked || cov_fail "e_periodic_sweep failed under instrumentation"
+cov_stage_end 1 "the e_periodic_sweep test binary must write its own profile"
+
+# W5, wired at birth: the estate cutover rehearsal drives `sgt doctor` and
+# `sgt daemon install-service --print` as short-lived subprocesses — never a
+# real `sgt daemon` (install-service --print never starts one; doctor never
+# auto-spawns, ADR 0009) — the same w4c_service_doctor reasoning above.
+# Floor 1.
+cov_stage_begin c2-w5_cutover_rehearsal
+cov_run cargo llvm-cov --no-report --test w5_cutover_rehearsal --locked || cov_fail "w5_cutover_rehearsal failed under instrumentation"
+cov_stage_end 1 "the w5_cutover_rehearsal test binary must write its own profile"
