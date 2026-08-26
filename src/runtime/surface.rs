@@ -1897,6 +1897,22 @@ fn collect_stage_output_dirs(
         }
     }
     if depth >= MAX_STAGE_SCAN_DEPTH {
+        // Fail loud, not silent (E11's own precedent, and the same posture
+        // E15 takes elsewhere in this loader): a workflow package nested
+        // past this depth is legal for `WorkflowDefinition::load_dir` (E14:
+        // "no product depth limit"), so a leaf beyond `MAX_STAGE_SCAN_DEPTH`
+        // would otherwise load and run normally while its `output/` quietly
+        // never reaches `retain_stage_outputs`/`finalize_sweep` — exactly
+        // the silent-loss shape E11 exists to close. This does not recover
+        // the output; it names the gap so an operator sees it in the logs
+        // instead of a dirty teardown quietly losing a leaf's evidence.
+        tracing::warn!(
+            directory = %dir.display(),
+            depth,
+            max_depth = MAX_STAGE_SCAN_DEPTH,
+            "stage-output scan stopped at MAX_STAGE_SCAN_DEPTH; any stage output nested deeper \
+             than this will not be retained"
+        );
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -6018,6 +6034,110 @@ mod tests {
         assert!(
             !surface.root.exists(),
             "reaping the last retained artifact must let the root go too"
+        );
+    }
+
+    // ------------------------------------- stage-output scan depth (E11)
+
+    /// A `Write` sink for a captured `tracing` log, so
+    /// `stage_scan_past_max_depth_is_not_silent` can assert on what was
+    /// actually logged rather than merely on the (already-known) fact that
+    /// the deep leaf goes unretained.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("captured-log mutex")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A workflow package nested past [`MAX_STAGE_SCAN_DEPTH`] is legal for
+    /// `WorkflowDefinition::load_dir` (E14: "no product depth limit"), so a
+    /// leaf that deep would load and run normally — but `stage_output_dirs`
+    /// still cannot see its `output/`. This pins that the loss stays
+    /// *observed*: the scan logs loudly, by directory, when it stops
+    /// descending at the cap, instead of returning as if nothing were
+    /// pruned.
+    #[test]
+    fn stage_scan_past_max_depth_is_not_silent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+
+        // Nine levels of nesting: one past MAX_STAGE_SCAN_DEPTH (8). The
+        // final level's `output/` sits beyond what the scan can reach.
+        let mut leaf = root.to_path_buf();
+        for level in 1..=9 {
+            leaf = leaf.join(format!("lvl{level}"));
+        }
+        std::fs::create_dir_all(leaf.join("output")).expect("deeply nested output dir");
+        std::fs::write(leaf.join("output").join("evidence.txt"), b"deep artifact")
+            .expect("evidence file");
+
+        let log = CapturedLog::default();
+        let make_writer = {
+            let log = log.clone();
+            move || log.clone()
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        let found = tracing::subscriber::with_default(subscriber, || stage_output_dirs(root));
+
+        // The pre-existing gap: a leaf nested this deep is still not found.
+        assert!(
+            !found.iter().any(|(id, _)| id.starts_with("lvl1")),
+            "a stage past MAX_STAGE_SCAN_DEPTH is still not retrievable: {found:?}"
+        );
+
+        // What this fix actually adds: the loss is logged, not silent.
+        let logged = String::from_utf8(log.0.lock().expect("captured-log mutex").clone())
+            .expect("log output is UTF-8");
+        assert!(
+            logged.contains("MAX_STAGE_SCAN_DEPTH") || logged.contains("stage-output scan stopped"),
+            "expected a loud warning naming the scan-depth cutoff, got: {logged:?}"
+        );
+        assert!(
+            logged.contains("lvl8"),
+            "expected the warning to name the directory where descent stopped, got: {logged:?}"
+        );
+    }
+
+    /// A tree that fits well within [`MAX_STAGE_SCAN_DEPTH`] must not trip
+    /// the same warning — it is a cutoff signal, not routine noise.
+    #[test]
+    fn stage_scan_within_max_depth_stays_quiet() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("10-stage").join("output")).expect("output dir");
+
+        let log = CapturedLog::default();
+        let make_writer = {
+            let log = log.clone();
+            move || log.clone()
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(make_writer)
+            .with_ansi(false)
+            .finish();
+
+        let found = tracing::subscriber::with_default(subscriber, || stage_output_dirs(root));
+        assert_eq!(found.len(), 1);
+
+        let logged = String::from_utf8(log.0.lock().expect("captured-log mutex").clone())
+            .expect("log output is UTF-8");
+        assert!(
+            !logged.contains("MAX_STAGE_SCAN_DEPTH"),
+            "a shallow tree must not trip the depth-cutoff warning: {logged:?}"
         );
     }
 }
