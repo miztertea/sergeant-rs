@@ -2038,6 +2038,206 @@ mod tests {
     }
 
     // -------------------------------------------------------------
+    // EstatePolicies / multi_estate_cap (brief deliverable 1)
+    // -------------------------------------------------------------
+
+    fn estate_work_row(id: &str, estate_root: Option<&str>, last_seq: u64) -> WorkIndexRow {
+        WorkIndexRow {
+            estate_root: estate_root.map(str::to_string),
+            ..work_row(id, WorkState::Completed, last_seq)
+        }
+    }
+
+    #[test]
+    fn resolve_falls_back_for_an_unadmitted_or_unknown_estate() {
+        let policies = EstatePolicies::new(policy(1000)).with_estate("/estates/a", policy(5));
+        assert_eq!(policies.resolve(Some("/estates/a")).retention, 5);
+        assert_eq!(
+            policies.resolve(Some("/estates/vanished")).retention,
+            1000,
+            "an estate not in the map (unadmitted, or no longer admitted) answers to the fallback"
+        );
+        assert_eq!(
+            policies.resolve(None).retention,
+            1000,
+            "a Work with no estate context at all answers to the fallback too"
+        );
+    }
+
+    #[test]
+    fn uniform_matches_the_original_single_group_cap_seq_exactly() {
+        let mut idx = BTreeMap::new();
+        for (id, seq) in [("a", 10u64), ("b", 20), ("c", 30), ("d", 40), ("e", 50)] {
+            idx.insert(id.to_string(), work_row(id, WorkState::Completed, seq));
+        }
+        let policies = EstatePolicies::uniform(policy(2));
+        assert_eq!(
+            multi_estate_cap(&idx, &policies),
+            cap_seq(&idx, 2),
+            "a uniform policy over an un-partitioned registry must be byte-identical to the \
+             pre-H1 single-group cap"
+        );
+    }
+
+    /// Brief deliverable 5: two estates, different retention, one journal —
+    /// each estate's own floor honored independently. The most restrictive
+    /// per-estate cap wins (never a cap computed over the combined set,
+    /// which would let the smaller estate's population dilute the larger
+    /// one's floor, or vice versa).
+    #[test]
+    fn each_estates_cap_is_computed_over_its_own_works_only() {
+        let mut idx = BTreeMap::new();
+        // Estate A: 10 Works, retention 3 -> cap sits just below its own
+        // 3rd-newest (last_seq 8, interleaved with B below).
+        for (id, seq) in [
+            ("a1", 1u64),
+            ("a2", 3),
+            ("a3", 5),
+            ("a4", 7),
+            ("a5", 9),
+            ("a6", 11),
+            ("a7", 13),
+            ("a8", 15),
+            ("a9", 17),
+            ("a10", 19),
+        ] {
+            idx.insert(id.to_string(), estate_work_row(id, Some("/estates/a"), seq));
+        }
+        // Estate B: 10 Works, retention 7 -> a much tighter cap (protects
+        // its newest 7), interleaved with A's own seqs throughout.
+        for (id, seq) in [
+            ("b1", 2u64),
+            ("b2", 4),
+            ("b3", 6),
+            ("b4", 8),
+            ("b5", 10),
+            ("b6", 12),
+            ("b7", 14),
+            ("b8", 16),
+            ("b9", 18),
+            ("b10", 20),
+        ] {
+            idx.insert(id.to_string(), estate_work_row(id, Some("/estates/b"), seq));
+        }
+        let policies = EstatePolicies::new(policy(1000))
+            .with_estate("/estates/a", policy(3))
+            .with_estate("/estates/b", policy(7));
+
+        let cap_a_alone = cap_seq_over([1, 3, 5, 7, 9, 11, 13, 15, 17, 19].into_iter(), 3);
+        let cap_b_alone = cap_seq_over([2, 4, 6, 8, 10, 12, 14, 16, 18, 20].into_iter(), 7);
+        assert_eq!(
+            cap_a_alone, 14,
+            "A's 3rd-newest is a9 (last_seq 15); cap sits one below it"
+        );
+        assert_eq!(
+            cap_b_alone, 7,
+            "B's 7th-newest is b4 (last_seq 8); cap sits one below it"
+        );
+
+        let combined = multi_estate_cap(&idx, &policies);
+        assert_eq!(
+            combined,
+            cap_a_alone.min(cap_b_alone),
+            "the shared horizon is the more restrictive of the two independent floors"
+        );
+        assert_eq!(
+            combined, cap_b_alone,
+            "B's own floor is the tighter one here"
+        );
+
+        // B's own floor is honored *exactly*: 10 - 7 = 3 of its oldest Works
+        // fall at/below the shared cap, never more, never fewer. A's own
+        // floor (looser: cap 14) is honored too — the shared cap is only
+        // ever *more* conservative than either estate's own number, so more
+        // of A's Works happen to sit below it than A's own floor strictly
+        // requires, which never violates A's floor (a floor is a "keep at
+        // least this many", not a "prune exactly this many").
+        let below = |root: &str, cap: u64| {
+            idx.values()
+                .filter(|r| r.estate_root.as_deref() == Some(root) && r.last_seq <= cap)
+                .count()
+        };
+        assert_eq!(
+            below("/estates/b", combined),
+            3,
+            "b1..b3 fall at/below B's own 7-retention cap"
+        );
+        assert_eq!(
+            below("/estates/a", combined),
+            4,
+            "more of A's Works than A's own floor requires happen to fall below the tighter \
+             shared cap (a1..a4) — never fewer, which is the only direction that would violate A"
+        );
+    }
+
+    /// A group's own `count <= retention` (nothing of that estate is past
+    /// its floor) must not silently widen into "nothing of ANY estate may be
+    /// pruned" — reusing the combined-registry's total count would do
+    /// exactly that; per-group partitioning must not.
+    #[test]
+    fn a_small_estate_under_its_own_retention_does_not_forbid_a_large_estates_own_excess() {
+        let mut idx = BTreeMap::new();
+        // Estate A: 5 Works, retention 0 -> fully unconstrained by its own
+        // floor (cap_seq_over(_, 0) == u64::MAX).
+        for (id, seq) in [("a1", 1u64), ("a2", 2), ("a3", 3), ("a4", 4), ("a5", 5)] {
+            idx.insert(id.to_string(), estate_work_row(id, Some("/estates/a"), seq));
+        }
+        let policies = EstatePolicies::new(policy(1000)).with_estate("/estates/a", policy(0));
+        assert_eq!(
+            multi_estate_cap(&idx, &policies),
+            u64::MAX,
+            "the sole estate present declared retention 0 (no floor at all); nothing should cap it"
+        );
+    }
+
+    /// Brief deliverable 5, live via [`candidate_horizon_multi_estate`]:
+    /// estate A (retention 0, no floor at all) and estate B (retention 1,
+    /// keeps only its newest Work) share one journal. A's sole Work and B's
+    /// older Work are both eligible; B's newest Work is protected — each
+    /// estate's own floor honored independently, in one shared horizon.
+    #[test]
+    fn candidate_horizon_multi_estate_honors_each_estates_own_floor_in_one_shared_horizon() {
+        let bounds = vec![
+            bound(1, 1, 3),
+            bound(2, 4, 6),
+            bound(3, 7, 9),
+            bound(4, 10, 100),
+        ];
+        let mut registry = WorkRegistry::default();
+        registry.work_index.insert(
+            "a1".to_string(),
+            estate_work_row("a1", Some("/estates/a"), 3),
+        );
+        registry.work_index.insert(
+            "b_old".to_string(),
+            estate_work_row("b_old", Some("/estates/b"), 6),
+        );
+        registry.work_index.insert(
+            "b_new".to_string(),
+            estate_work_row("b_new", Some("/estates/b"), 9),
+        );
+        let mut first_seq = FirstSeqIndex::new();
+        first_seq.insert("a1".to_string(), 3);
+        first_seq.insert("b_old".to_string(), 6);
+        first_seq.insert("b_new".to_string(), 9);
+
+        let policies = EstatePolicies::new(policy(1000))
+            .with_estate("/estates/a", policy(0))
+            .with_estate("/estates/b", policy(1));
+        let (h, stall) = candidate_horizon_multi_estate(&bounds, &registry, &first_seq, &policies);
+        assert_eq!(
+            h, 6,
+            "a1 (A, no floor) and b_old (B's own excess past retention 1) are both eligible; \
+             b_new (B's protected newest) is not, so the horizon stops at b_old's own seq"
+        );
+        assert_eq!(
+            stall.retention, 1000,
+            "the single reported number is the fallback's own — a full breakdown is \
+             EstatePruneStat's job, not this field's"
+        );
+    }
+
+    // -------------------------------------------------------------
     // A real cycle over a real journal, via `Core` directly (no daemon).
     // -------------------------------------------------------------
 
