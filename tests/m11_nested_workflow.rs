@@ -14,7 +14,13 @@
 //!    bypassed by nesting);
 //! 3. a container that declared its own output contract is checked when its
 //!    last leaf completes, and an unmet one parks the Work naming the
-//!    CONTAINER (E4).
+//!    CONTAINER (E4);
+//! 4. a composed id round-trips through the journal, the analytics fold and
+//!    `sgt work show`, and a restarted daemon reconstructs the deepest
+//!    incomplete path from the journal alone (W1 §13 item 4);
+//! 5. the multi-boundary case the plan panel named — a three-level fixture
+//!    whose deepest leaf is simultaneously the last leaf of two ancestor
+//!    containers, gated innermost first.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -694,6 +700,187 @@ async fn a_restarted_daemon_reconstructs_the_deepest_incomplete_path_and_retry_r
         .map(|e| e.payload["attempt"].as_u64().unwrap_or(1))
         .collect();
     assert_eq!(retried, [1, 2], "attempts 1 and 2 of the same nested leaf");
+
+    handle.shutdown().await;
+}
+
+/// The three-level fixture the plan panel named as the recon's sharpest
+/// risk:
+///
+/// ```text
+/// deep/
+///   00-orient/CONTEXT.md
+///   10-investigate/workflow.toml
+///     00-lead/CONTEXT.md
+///     10-deep/workflow.toml
+///       00-inner/CONTEXT.md
+///   20-implement/CONTEXT.md
+/// ```
+///
+/// Its third leaf, `10-investigate/10-deep/00-inner`, is simultaneously the
+/// last leaf of `10-investigate/10-deep` **and** of `10-investigate` — one
+/// `StageCompleted` closing two container boundaries at once.
+fn write_three_level_workflow(root: &Path) -> PathBuf {
+    let package = root.join(".sergeant/workflows/deep");
+    write_package(
+        &package,
+        "deep",
+        &["00-orient", "10-investigate", "20-implement"],
+    );
+    write_stage(&package, "00-orient", "orient");
+    write_stage(&package, "20-implement", "implement");
+    let investigate = package.join("10-investigate");
+    write_package(&investigate, "10-investigate", &["00-lead", "10-deep"]);
+    write_stage(&investigate, "00-lead", "lead");
+    let deep = investigate.join("10-deep");
+    write_package(&deep, "10-deep", &["00-inner"]);
+    write_stage(&deep, "00-inner", "the innermost procedure");
+    package
+}
+
+/// E4's multi-boundary case, end to end: when one leaf closes two
+/// containers that both declared an output contract, the boundaries are
+/// evaluated **innermost first**, one at a time, and the run walks on only
+/// once every one of them is satisfied.
+///
+/// The sequencing is the assertion. The inner container's unmet contract is
+/// what the operator hears about first; only after it is satisfied does the
+/// outer one become the thing holding the run. Neither is skipped, and
+/// neither is reported at the same instant as the other — a leaf that ends
+/// three packages must not produce three simultaneous parks.
+///
+/// It also pins the re-prompt budget's shape: bounded per leaf *attempt*,
+/// not per contract. The one SEND this attempt is allowed goes to the first
+/// unmet contract; every later one on the same attempt parks straight away
+/// rather than re-prompting again.
+#[tokio::test]
+async fn a_leaf_that_closes_two_containers_at_once_gates_them_innermost_first() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    let package = write_three_level_workflow(&estate);
+    declare_output(&package, "10-investigate", "findings.md");
+    declare_output(&package.join("10-investigate"), "10-deep", "inner.md");
+
+    let handle = start_fake(
+        data.path(),
+        [
+            FakeStep::complete(), // 00-orient
+            FakeStep::complete(), // 10-investigate/00-lead
+            FakeStep::complete(), // 00-inner: closes both containers, neither satisfied
+            FakeStep::complete(), // the one bounded re-prompt (the INNER contract)
+            FakeStep::complete(), // after the answer: inner satisfied, outer is not
+            FakeStep::complete(), // after the second answer: both satisfied
+            FakeStep::complete(), // 20-implement
+        ],
+    )
+    .await;
+    let client = http();
+    let body = submit(&client, &handle, &estate, "deep").await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let worktree = PathBuf::from(
+        body["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("worktree"),
+    );
+
+    // Innermost first: the inner container is the one that re-prompted and
+    // then parked. The outer one has said nothing yet.
+    assert_eq!(body["work"]["state"], "needs_input", "{body}");
+    assert_eq!(body["stage"]["stage_id"], "10-investigate/10-deep/00-inner");
+    let reprompts = events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING);
+    assert_eq!(
+        reprompts.len(),
+        1,
+        "one bounded re-prompt, not one per boundary"
+    );
+    assert_eq!(
+        reprompts[0].payload["container_id"], "10-investigate/10-deep",
+        "the innermost unmet contract is the one that gets the attempt's one SEND"
+    );
+    let parked = events_of(data.path(), &work_id, "work.needs_input");
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0].payload["container_id"], "10-investigate/10-deep");
+    assert_eq!(parked[0].payload["path"], "inner.md");
+
+    // Satisfy the inner contract and answer. Same leaf, same attempt — so
+    // the budget is spent, and the *outer* container now parks the run
+    // immediately rather than re-prompting a second time.
+    std::fs::create_dir_all(worktree.join("10-investigate/10-deep/output")).expect("output dir");
+    std::fs::write(
+        worktree.join("10-investigate/10-deep/output/inner.md"),
+        "the inner aggregate\n",
+    )
+    .expect("write inner.md");
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "inner aggregate written"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    assert_eq!(
+        body["work"]["state"], "needs_input",
+        "the outer container's contract is still unmet, so the run must still be held: {body}"
+    );
+    let parked = events_of(data.path(), &work_id, "work.needs_input");
+    assert_eq!(parked.len(), 2, "the outer boundary parks in its own turn");
+    assert_eq!(
+        parked[1].payload["container_id"], "10-investigate",
+        "and it is the OUTER container that is named now: {:?}",
+        parked[1].payload
+    );
+    assert_eq!(parked[1].payload["path"], "findings.md");
+    assert_eq!(
+        events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING).len(),
+        1,
+        "still exactly one re-prompt across this attempt, whatever it was for"
+    );
+    // Neither park ever let the run past the boundary.
+    assert!(
+        !stage_ids(data.path(), &work_id, KIND_STAGE_ENTERED)
+            .iter()
+            .any(|id| id == "20-implement"),
+        "the run must be held at the leaf that closes both containers"
+    );
+
+    // Satisfy the outer contract too: both boundaries close and the run
+    // walks on to the container's sibling and finishes.
+    std::fs::create_dir_all(worktree.join("10-investigate/output")).expect("output dir");
+    std::fs::write(
+        worktree.join("10-investigate/output/findings.md"),
+        "the outer aggregate\n",
+    )
+    .expect("write findings.md");
+    let (status, body) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{work_id}/input"),
+        json!({"command_id": ulid(), "input": "outer aggregate written"}),
+    )
+    .await;
+    assert_eq!(status, 200, "input rejected: {body}");
+    assert_eq!(
+        body["work"]["state"], "completed",
+        "with both contracts satisfied the run must complete: {body}"
+    );
+    assert_eq!(
+        stage_ids(data.path(), &work_id, KIND_STAGE_ENTERED),
+        [
+            "00-orient",
+            "10-investigate/00-lead",
+            "10-investigate/10-deep/00-inner",
+            "20-implement",
+        ],
+        "one entry per leaf: closing two containers never re-enters or duplicates a stage"
+    );
+    assert_eq!(
+        stage_ids(data.path(), &work_id, KIND_STAGE_COMPLETED).len(),
+        4,
+        "and each leaf completes exactly once"
+    );
 
     handle.shutdown().await;
 }
