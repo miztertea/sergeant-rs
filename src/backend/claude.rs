@@ -2525,6 +2525,7 @@ mod tests {
             execute: None,
             instruction_policy: crate::domain::estate::InstructionPolicy::default(),
             bindings,
+            estate_root: None,
         }
     }
 

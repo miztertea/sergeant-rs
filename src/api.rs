@@ -6804,6 +6804,7 @@ mod tests {
             execute: None,
             instruction_policy: crate::domain::estate::InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         };
         let handle = {
             use crate::backend::Backend;

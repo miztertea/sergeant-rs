@@ -5282,6 +5282,7 @@ mod tests {
             execute: None,
             instruction_policy: Default::default(),
             bindings,
+            estate_root: None,
         }
     }
 

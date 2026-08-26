@@ -42,7 +42,16 @@ const DATA_DIR_ENV: &str = "SGT_DATA_DIR";
 /// (§4.4's descendant diagnostic names both roots). It can never waive the
 /// exact-root check — if Captain cds into a mount and runs `sgt run`, the
 /// tool still refuses and says how to return.
-const ESTATE_ROOT_ENV: &str = "SGT_ESTATE_ROOT";
+///
+/// **Distinct from [`crate::backend::SERGEANT_ESTATE_ROOT_ENV`]** (S2 E5),
+/// whose name differs only in prefix and whose meaning does not overlap at
+/// all: that one is set per *managed execution*, carries the estate the
+/// daemon recorded for that Work, and is validated against the journal
+/// before any causal relation is recorded. This one is set once when `sgt
+/// <harness>` execs a session and is read only to decorate a refusal.
+/// Neither may be read in place of the other; `crate::backend`'s own unit
+/// test pins that the causation triple never emits this name.
+pub(crate) const ESTATE_ROOT_ENV: &str = "SGT_ESTATE_ROOT";
 
 /// §5.3: which harness composed this environment, so a submission from
 /// inside the session routes by origin affinity (§13) and journals its true

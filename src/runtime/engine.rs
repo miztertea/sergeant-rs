@@ -3744,6 +3744,13 @@ impl Engine {
             .get(work_id)
             .map(|w| w.intent.clone())
             .unwrap_or_default();
+        // S2 E5: the causation triple's estate coordinate, read from exactly
+        // the source `commit` below stamps `workspace_id` from — the Work's
+        // own `WorkIndexRow::estate_root`, folded once at `work.submitted`
+        // and immutable for its life. Read here, before the stage's own
+        // events are committed, so the value pinned into the launch config is
+        // the same one every event of this execution carries.
+        let estate_root = Self::work_estate_root(core, work_id);
 
         self.commit(
             core,
@@ -3829,6 +3836,8 @@ impl Engine {
             // and refs an adapter states are the ones sergeant journaled —
             // never re-derived from the manifest or from the filesystem.
             bindings: surface.binding_summary(),
+            // W1 §6 / S2 E5: the estate a child `sgt -C … run` addresses.
+            estate_root,
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,
@@ -4964,17 +4973,27 @@ impl Engine {
         // Absent (a Work submitted with no repository context, or a journal
         // line older than the envelope field) leaves the field absent,
         // exactly as before — never a guess, and never the display name.
-        if let Some(root) = core
-            .registry
-            .state()
-            .work_index
-            .get(work_id)
-            .and_then(|row| row.estate_root.clone())
-        {
-            draft = draft.with_workspace_id(root);
+        if let Some(root) = Self::work_estate_root(core, work_id) {
+            draft = draft.with_workspace_id(root.to_string_lossy().into_owned());
         }
         core.commit(draft)?;
         Ok(())
+    }
+
+    /// The canonical estate root a Work was submitted against, or `None` when
+    /// the journal never recorded one.
+    ///
+    /// One reader for the two places that need it — the `workspace_id` stamp
+    /// above and S2 E5's `StartRequest::estate_root` — so the coordinate an
+    /// actor is handed and the coordinate its events are stamped with cannot
+    /// drift apart.
+    fn work_estate_root(core: &Core, work_id: &str) -> Option<PathBuf> {
+        core.registry
+            .state()
+            .work_index
+            .get(work_id)
+            .and_then(|row| row.estate_root.as_deref())
+            .map(PathBuf::from)
     }
 
     fn work_state(&self, core: &Core, work_id: &str) -> Result<WorkState, EngineError> {
@@ -6200,6 +6219,7 @@ mod tests {
             execute: None,
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         };
         let handle = fake.start(&start_request).expect("fake backend start");
         testing::commit(

@@ -428,6 +428,7 @@ fn start_request(cwd: &Path) -> StartRequest {
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::<BindingSummary>::new(),
+        estate_root: None,
     }
 }
 

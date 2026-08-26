@@ -239,6 +239,7 @@ fn drive_one_recorded_claude_turn(data_dir: &Path) -> (Event, Event) {
             execute: None,
             instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         })
         .expect("start");
 
@@ -376,6 +377,7 @@ fn drive_one_recorded_codex_turn(data_dir: &Path) -> (Event, Event) {
             execute: None,
             instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         })
         .expect("start");
 
@@ -513,6 +515,7 @@ fn drive_one_recorded_opencode_turn(data_dir: &Path) -> Event {
             execute: None,
             instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         })
         .expect("start");
 
@@ -636,6 +639,7 @@ fn drive_one_recorded_agy_turn(data_dir: &Path) -> Event {
             execute: None,
             instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         })
         .expect("start");
 
@@ -798,6 +802,7 @@ fn docker_live_arm_recovers_both_refs_and_matches_the_fixtures_shape() {
         }),
         instruction_policy: sergeant_rs::domain::estate::InstructionPolicy::default(),
         bindings: Vec::new(),
+        estate_root: None,
     };
     let prepared = backend.prepare(&req).expect("prepare");
     let handle = backend.launch(&prepared).expect("launch");

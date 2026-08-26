@@ -835,6 +835,7 @@ fn start_request(
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::new(),
+        estate_root: None,
     }
 }
 
@@ -6284,6 +6285,7 @@ fn n9_the_ask_capability_is_paired_with_what_the_backend_can_actually_report() {
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::new(),
+        estate_root: None,
     };
     let handle = fake.start(&request).expect("start");
     assert_eq!(
@@ -6600,6 +6602,7 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::new(),
+        estate_root: None,
     };
     let handle = backend.start(&request).expect("start");
 
@@ -6741,6 +6744,7 @@ fn bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mo
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::new(),
+        estate_root: None,
     };
     let handle = backend.start(&request).expect("start");
     let observation = wait_settled(&backend, &handle, Duration::from_secs(180));
@@ -7034,6 +7038,7 @@ fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
                 execute: None,
                 instruction_policy: InstructionPolicy::default(),
                 bindings: Vec::new(),
+                estate_root: None,
             })
             .expect("prepare");
         fake.launch(&prepared).expect("launch");
@@ -7130,6 +7135,7 @@ fn n13_window5_result_observed_before_the_result_append() {
             execute: None,
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");
@@ -7217,6 +7223,7 @@ fn n14_window6_result_appended_before_the_transition() {
             execute: None,
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");

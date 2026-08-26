@@ -58,6 +58,15 @@ cov_run cargo llvm-cov --no-report --test m11_nested_workflow --locked || cov_fa
 cov_stage_end 2 "m11's round-trip test spawns a real sgt work show client; more than the test \
 binary's own profile must arrive, or no subprocess flushed"
 
+# S2 V2, wired at birth (#231's lesson): m12 drives a real actor process that
+# itself invokes the real `sgt` binary against the in-process daemon, so the
+# child-Work path is measured through both. Floor 2 — the test binary plus at
+# least that client.
+cov_stage_begin c3-m12_child_work
+cov_run cargo llvm-cov --no-report --test m12_child_work --locked || cov_fail "m12_child_work failed under instrumentation"
+cov_stage_end 2 "m12's end-to-end test spawns a real sgt run client from inside a managed \
+execution; more than the test binary's own profile must arrive, or no subprocess flushed"
+
 # Added 2026-08-19 alongside C2's five, closing the same accounting gap: this
 # suite existed but no stage script invoked it, so backend/docker.rs's real
 # coverage never reached the report.

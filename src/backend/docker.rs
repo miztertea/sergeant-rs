@@ -1389,6 +1389,7 @@ mod tests {
             }),
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         };
         let prepared = backend
             .prepare(&request)
@@ -1503,6 +1504,7 @@ mod tests {
                 execute: None,
                 instruction_policy: InstructionPolicy::default(),
                 bindings: Vec::new(),
+                estate_root: None,
             };
             let spec = ExecuteSpec {
                 image: "alpine:3.24".into(),
@@ -1540,6 +1542,7 @@ mod tests {
             execute: None,
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         };
         let err = backend.prepare(&request).expect_err("must refuse");
         assert!(matches!(err, BackendError::Failed { .. }));
