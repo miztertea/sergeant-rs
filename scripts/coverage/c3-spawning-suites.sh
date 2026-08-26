@@ -40,6 +40,15 @@ cov_run cargo llvm-cov --no-report --test w3_client_surface --locked || cov_fail
 cov_stage_end 2 "w3_client_surface spawns a daemon (and, in the watch tests, a second sgt client) \
 in every test; more than the test binary's own profile must arrive, or no subprocess flushed"
 
+# W5, wired at birth: `h1_acceptance_1_and_5` and `h1_acceptance_3` both
+# drive real `sgt run` subprocesses, which auto-spawn a real host daemon
+# from a bare data dir the same way m2/m6/w3_client_surface's own fixtures
+# do — belongs beside them, not in C2.
+cov_stage_begin c3-w5_h1_acceptance
+cov_run cargo llvm-cov --no-report --test w5_h1_acceptance --locked || cov_fail "w5_h1_acceptance failed under instrumentation"
+cov_stage_end 2 "w5_h1_acceptance's two-estate test spawns a real daemon via sgt run; more than \
+the test binary's own profile must arrive, or no subprocess flushed"
+
 # Added 2026-08-19 alongside C2's five, closing the same accounting gap: this
 # suite existed but no stage script invoked it, so backend/docker.rs's real
 # coverage never reached the report.

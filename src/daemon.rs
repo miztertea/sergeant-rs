@@ -509,6 +509,12 @@ pub struct DaemonConfig {
     /// no scheduling behavior); it exists so the two lanes' independence is
     /// provable now rather than retrofitted later.
     pub intelligence_lane_cap: Option<usize>,
+    /// W5 brief deliverable 1(a): how often the periodic multi-estate sweep
+    /// caller ([`crate::api::maybe_run_periodic_sweep`]) re-walks every
+    /// admitted estate's mounts. Configurable for the same reason
+    /// `completion_poll` is: a test that needs a tick to always be due holds
+    /// this at zero rather than racing the production default.
+    pub sweep_interval: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -532,6 +538,7 @@ impl Default for DaemonConfig {
             retention: None,
             execution_lane_cap: None,
             intelligence_lane_cap: None,
+            sweep_interval: crate::api::SWEEP_INTERVAL,
         }
     }
 }
@@ -753,6 +760,14 @@ pub async fn start_with(
             source: crate::runtime::prune::PolicySource::Default,
         },
     };
+    // W5 brief deliverable 1(b): the startup trigger now partitions by
+    // estate exactly like the rotation tick (`maybe_run_rotation_triggered_
+    // prune`) does — built from the same, still-empty-at-this-instant
+    // `estates` registry (admission is lazy; see step 0a above), so a
+    // restart with no request yet answered falls fully back to
+    // `prune_policy` above, and widens correctly once estates re-admit.
+    let startup_prune_policies =
+        crate::runtime::prune::EstatePolicies::from_registry(&estates, prune_policy);
 
     // 2e-2g (W3 §10.3, §6.6): Q9's crash completion — evidence-based, exactly
     // as `recovery::reconcile_terminal_surface` is: the intent is a durable,
@@ -775,7 +790,7 @@ pub async fn start_with(
     let prune_outcome = match crate::runtime::prune::run_startup(
         &mut core,
         data_dir,
-        &prune_policy,
+        &startup_prune_policies,
         &first_seq_snapshot,
     ) {
         Ok(outcome) => outcome,
@@ -792,11 +807,11 @@ pub async fn start_with(
         format!("pruned:{}", prune_outcome.segments_unlinked)
     } else {
         let stalled = core.journal.segment_bounds().ok().map(|bounds| {
-            crate::runtime::prune::candidate_horizon(
+            crate::runtime::prune::candidate_horizon_multi_estate(
                 &bounds,
                 core.registry.state(),
                 &core.first_seq_by_work,
-                &prune_policy,
+                &startup_prune_policies,
             )
             .1
         });
@@ -1054,6 +1069,8 @@ pub async fn start_with(
         estates,
         analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
         prune_policy,
+        sweep_interval: config.sweep_interval,
+        last_swept: Arc::new(std::sync::Mutex::new(None)),
     };
     // §28's export is a fold over the event stream, subscribed here and
     // nowhere else. With export off this task does not exist.

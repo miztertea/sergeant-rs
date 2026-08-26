@@ -22,5 +22,5 @@
 <!-- Tick what applies; the ledger is append-only.
 - [ ] No deviation from the proposal, or the deviation is registered in the workspace knowledge library's deviation register (D-row)
 - [ ] Deferred findings landed as backlog rows or GitHub issues, not silence
-- [ ] After the suites: `pgrep -f "debug/sgt [-]-data-dir"` finds nothing
+- [ ] After the suites, both orphan-check patterns find nothing: `pgrep -f "debug/sgt [-]-data-dir"` (a test's own built binary — `release/sgt` too, if the change touched a release-profile path) and `pgrep -af "cargo/bin/[s]gt"` (an installed binary this session's own `sgt init`/`install-service` work may have started — the host daemon now outlives any one estate, so it does not stop merely because the test that spawned it exited)
 -->

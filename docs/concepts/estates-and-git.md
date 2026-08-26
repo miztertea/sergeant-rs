@@ -13,3 +13,5 @@ Three Git locations must not be conflated:
 Groups are named sets of repositories. They express topology and convenient scope, not workflow policy. A repository may belong to several groups.
 
 The declared surface is an authorization and attribution boundary, not an OS sandbox. Sergeant detects and records integrity problems; it cannot prevent a process running as you from reaching paths your account can reach.
+
+An estate's own topology — mounts, groups, surfaces — is unaffected by which daemon process serves it. One host daemon per user installation admits many estates by their exact roots; see [host runtime and estates](host-runtime.md) for how that admission works and what it preserves from the single-estate model.

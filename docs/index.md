@@ -23,6 +23,7 @@ Sergeant turns accepted intent into durable, staged Work across one repository o
 
 - [Captain and Sergeant](concepts/captain-and-sergeant.md)
 - [Estates and Git surfaces](concepts/estates-and-git.md)
+- [Host runtime and estates](concepts/host-runtime.md)
 - [Work, workflows, and durability](concepts/work-and-workflows.md)
 - [Security and trust](concepts/security-and-trust.md)
 
