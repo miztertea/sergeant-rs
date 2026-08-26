@@ -258,10 +258,11 @@ fn h1_acceptance_3_run_outside_an_estate_refuses_unless_dash_c_is_explicit() {
 //
 // The citation-integrity half is pinned:
 // `tests/f_doctrine_skew.rs::no_readme_contributing_src_test_or_workflow_file_cites_a_removed_path`
-// (no `docs/adr/`, `docs/proposals/`, etc. citation anywhere live). This
-// wave adds one more, W5-specific guard directly: brief deliverable 3
-// requires landing host-topology architecture prose *without* recreating a
-// `docs/adr/` tree, so this asserts that tree still does not exist.
+// (no dangling citation to any path that split-hardening W2c removed, live
+// anywhere). This wave adds one more, W5-specific guard directly: brief
+// deliverable 3 requires landing host-topology architecture prose without
+// recreating the dissolved ADR directory tree, so this asserts that tree
+// still does not exist.
 // ------------------------------------------------------------------------
 
 #[test]
