@@ -5474,10 +5474,12 @@ mod tests {
         let processes = vec![
             ProcessArgv {
                 pid: 10,
+                ppid: None,
                 argv: vec!["exec".to_string(), "-C".to_string(), "/work".to_string()],
             },
             ProcessArgv {
                 pid: 20,
+                ppid: None,
                 argv: vec!["exec".to_string(), "resume".to_string(), "t1".to_string()],
             },
         ];
@@ -5496,6 +5498,7 @@ mod tests {
     fn turn_liveness_among_reports_surface_ambiguous_for_a_first_turn_process() {
         let processes = vec![ProcessArgv {
             pid: 30,
+            ppid: None,
             argv: vec!["exec".to_string(), "-C".to_string(), "/work".to_string()],
         }];
         let liveness = turn_liveness_among("t1", Some(Path::new("/work")), 999, Some(processes));
@@ -5512,6 +5515,7 @@ mod tests {
     fn turn_liveness_among_is_dead_with_no_matching_process() {
         let processes = vec![ProcessArgv {
             pid: 1,
+            ppid: None,
             argv: vec!["other-program".to_string()],
         }];
         assert_eq!(
@@ -5524,6 +5528,7 @@ mod tests {
     fn turn_liveness_among_skips_the_callers_own_pid() {
         let processes = vec![ProcessArgv {
             pid: 42,
+            ppid: None,
             argv: vec!["exec".to_string(), "resume".to_string(), "t1".to_string()],
         }];
         assert_eq!(

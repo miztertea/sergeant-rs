@@ -25,14 +25,23 @@
 //! duplicate copies of that same scan were found and fixed to reuse this
 //! module during the same trip). Closes #18.
 
-/// One running process a liveness scan can see: its pid, and — wherever the
-/// platform can produce it — its argv, already tokenized into separate
-/// arguments (never a single joined command line: see
+/// One running process a liveness scan can see: its pid, its parent's pid,
+/// and — wherever the platform can produce it — its argv, already tokenized
+/// into separate arguments (never a single joined command line: see
 /// `backend::claude::cmdline_names_session`'s doc for why a joined line is
 /// exactly the false-positive shape this fact must not produce).
 #[derive(Debug, Clone)]
 pub struct ProcessArgv {
     pub pid: u32,
+    /// The parent this process had **at the moment of the scan**. `None`
+    /// where the platform arm could not read it (a process that exited
+    /// between being listed and being read, a `ps` line missing the column).
+    ///
+    /// Deliberately not cached anywhere: a parent that dies reparents its
+    /// children to init, so this fact is only ever true of the instant it was
+    /// gathered. [`descendants`] exists precisely so a caller captures the
+    /// tree *before* it kills the root, rather than looking for it after.
+    pub ppid: Option<u32>,
     pub argv: Vec<String>,
 }
 
@@ -56,6 +65,54 @@ pub fn process_alive(pid: u32) -> bool {
     raw_process_alive(pid)
 }
 
+/// Every process currently descended from `root`, breadth-first, `root`
+/// itself excluded.
+///
+/// **Why this exists (#310).** A daemon's probe children are its *children*
+/// only while it is alive: the instant it is SIGKILLed they reparent to init
+/// and no ancestry query can find them again. So a reaper that wants to take
+/// a whole tree down has to enumerate the tree first and signal the recorded
+/// pids afterwards — "kill the daemon, then look for its children" is the
+/// shape that let ~265 MB `opencode serve` probe children accumulate for a
+/// working day while every orphan check reported clean.
+///
+/// One scan, then a pure walk over it: re-scanning per level would let a
+/// process appear under two different parents across scans and be visited
+/// twice (or missed entirely). A cycle is impossible in a real process table,
+/// but the walk carries a `seen` set anyway — this reads a live kernel
+/// surface, and a torn read must not become an infinite loop in a `Drop`.
+///
+/// Returns empty where [`running_processes`] cannot answer at all: the
+/// fail-closed direction for a *reaper* is to signal nothing rather than
+/// guess at pids it cannot evidence.
+pub fn descendants(root: u32) -> Vec<u32> {
+    let Some(processes) = running_processes() else {
+        return Vec::new();
+    };
+    let mut children: std::collections::BTreeMap<u32, Vec<u32>> = std::collections::BTreeMap::new();
+    for process in processes {
+        if let Some(ppid) = process.ppid {
+            children.entry(ppid).or_default().push(process.pid);
+        }
+    }
+    let mut seen: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+    let mut found = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root]);
+    seen.insert(root);
+    while let Some(pid) = queue.pop_front() {
+        let Some(kids) = children.get(&pid) else {
+            continue;
+        };
+        for &kid in kids {
+            if seen.insert(kid) {
+                found.push(kid);
+                queue.push_back(kid);
+            }
+        }
+    }
+    found
+}
+
 #[cfg(target_os = "linux")]
 fn raw_running_processes() -> Option<Vec<ProcessArgv>> {
     let entries = std::fs::read_dir("/proc").ok()?;
@@ -76,9 +133,28 @@ fn raw_running_processes() -> Option<Vec<ProcessArgv>> {
             .filter(|arg| !arg.is_empty())
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect();
-        processes.push(ProcessArgv { pid, argv });
+        let ppid = std::fs::read_to_string(entry.path().join("status"))
+            .ok()
+            .as_deref()
+            .and_then(parse_proc_status_ppid);
+        processes.push(ProcessArgv { pid, ppid, argv });
     }
     Some(processes)
+}
+
+/// The `PPid:` line of `/proc/<pid>/status`.
+///
+/// `status` rather than `stat`: `stat`'s parent is field 4, *after* a `comm`
+/// field the kernel writes in parentheses without escaping — a process named
+/// `foo) 1 (bar` shifts every positional field after it, and a reaper that
+/// mis-parses one line signals the wrong pid. `status` is line-oriented and
+/// has no such hazard.
+#[cfg(any(test, target_os = "linux"))]
+fn parse_proc_status_ppid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("PPid:"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
 }
 
 #[cfg(target_os = "linux")]
@@ -86,8 +162,9 @@ fn raw_process_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// `ps -axo pid=,command=` output, one process per line: pid then its full
-/// command line, tokenized here on whitespace. That tokenization is the one
+/// `ps -axo pid=,ppid=,command=` output, one process per line: pid, parent
+/// pid, then its full command line, tokenized here on whitespace. That
+/// tokenization is the one
 /// place this arm is weaker than Linux's byte-exact NUL-split argv: a quoted
 /// argument containing a space would defeat it. The launch grammar this fact
 /// is actually matched against — `--session-id <uuid>` / `--resume <uuid>`,
@@ -115,8 +192,16 @@ fn parse_ps_output(stdout: &str) -> Vec<ProcessArgv> {
         let Some(pid) = tokens.next().and_then(|token| token.parse::<u32>().ok()) else {
             continue;
         };
+        // The parent column is required by the invocation above, so a line
+        // whose second token is not a bare number is a line this parser does
+        // not understand — dropped whole rather than turned into an entry
+        // whose argv silently starts one token late.
+        let Some(ppid) = tokens.next().and_then(|token| token.parse::<u32>().ok()) else {
+            continue;
+        };
         processes.push(ProcessArgv {
             pid,
+            ppid: Some(ppid),
             argv: tokens.map(str::to_string).collect(),
         });
     }
@@ -130,7 +215,7 @@ fn parse_ps_output(stdout: &str) -> Vec<ProcessArgv> {
 #[cfg(target_os = "macos")]
 fn raw_running_processes() -> Option<Vec<ProcessArgv>> {
     let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,command="])
+        .args(["-axo", "pid=,ppid=,command="])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -168,27 +253,113 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ordinary_shape_parses_pid_and_argv() {
-        let stdout = "1234 /usr/bin/claude --session-id abc-123\n";
+    fn ordinary_shape_parses_pid_ppid_and_argv() {
+        let stdout = "1234 1 /usr/bin/claude --session-id abc-123\n";
         let processes = parse_ps_output(stdout);
         assert_eq!(processes.len(), 1);
         assert_eq!(processes[0].pid, 1234);
+        assert_eq!(processes[0].ppid, Some(1));
         assert_eq!(
             processes[0].argv,
             vec!["/usr/bin/claude", "--session-id", "abc-123"]
         );
     }
 
-    /// A header row (should `ps -axo pid=,command=` ever regain one) or a
-    /// torn read's partial first line both have a non-numeric or missing
+    /// A header row (should `ps -axo pid=,ppid=,command=` ever regain one) or
+    /// a torn read's partial first line both have a non-numeric or missing
     /// leading token — neither may become a bogus pid entry the liveness
     /// scan then reasons about.
     #[test]
     fn line_without_a_leading_pid_is_dropped_not_a_bogus_entry() {
-        let stdout = "  PID COMMAND\n5678 /usr/bin/claude --resume def-456\n";
+        let stdout = "  PID  PPID COMMAND\n5678 4321 /usr/bin/claude --resume def-456\n";
         let processes = parse_ps_output(stdout);
         assert_eq!(processes.len(), 1);
         assert_eq!(processes[0].pid, 5678);
+        assert_eq!(processes[0].ppid, Some(4321));
+    }
+
+    /// #310: the parent column is what [`descendants`] walks. A line missing
+    /// it must not silently become an entry whose argv begins one token late
+    /// — `[/usr/bin/claude, --resume, def]` read from a two-column line would
+    /// be a *different process's* command line as far as every argv matcher
+    /// in this crate is concerned.
+    #[test]
+    fn line_without_a_parent_column_is_dropped_not_shifted() {
+        assert!(parse_ps_output("5678 /usr/bin/claude --resume def-456\n").is_empty());
+    }
+
+    #[test]
+    fn proc_status_ppid_is_read_from_its_own_line() {
+        let status = "Name:\tsgt\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t42\nPid:\t42\n\
+                      PPid:\t7\nTracerPid:\t0\n";
+        assert_eq!(parse_proc_status_ppid(status), Some(7));
+    }
+
+    /// `Pid:` precedes `PPid:` in the real file and shares its prefix in the
+    /// other direction; a matcher looking for `Pid:` anywhere in the line
+    /// would answer with the process's own id. Pinned because getting this
+    /// backwards makes every process its own parent, and [`descendants`]
+    /// would then return nothing at all — a reaper that silently reaps
+    /// nothing is the exact failure #310 is about.
+    #[test]
+    fn proc_status_ppid_is_not_confused_with_the_pid_line() {
+        let status = "Pid:\t42\nPPid:\t7\n";
+        assert_eq!(parse_proc_status_ppid(status), Some(7));
+        let no_parent = "Name:\tinit\nPid:\t1\n";
+        assert_eq!(parse_proc_status_ppid(no_parent), None);
+    }
+
+    /// A real tree, walked from a real root: this process's own children are
+    /// whatever it spawns, and a grandchild must come back too — the probe
+    /// children #310 is about are grandchildren of the test process whenever
+    /// an adapter isolates its spawn on a helper thread.
+    #[test]
+    fn descendants_reaches_a_grandchild_not_just_a_child() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("/bin/sh -c 'sleep 30' & sleep 30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a two-level tree");
+        let child_pid = child.id();
+        // The grandchild is forked by the child, so it exists only after the
+        // child has run — poll rather than sleep on a guessed duration.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let found = loop {
+            let found = descendants(std::process::id());
+            if found.len() >= 2 && found.contains(&child_pid) {
+                break found;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the spawned tree never appeared under this process: {found:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        for &pid in &found {
+            if pid != child_pid {
+                let _ = std::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+            }
+        }
+        assert!(
+            found.contains(&child_pid),
+            "the direct child {child_pid} was not in {found:?}"
+        );
+        assert!(
+            found.len() >= 2,
+            "only the direct child came back, so the walk never went a second level: {found:?}"
+        );
+    }
+
+    #[test]
+    fn descendants_never_includes_the_root_itself() {
+        assert!(!descendants(std::process::id()).contains(&std::process::id()));
     }
 
     #[test]
@@ -209,7 +380,7 @@ mod tests {
     /// fail the moment someone tries to rely on quoting surviving here.
     #[test]
     fn quoted_argument_with_a_space_is_split_current_known_weakness() {
-        let stdout = "1234 /usr/bin/claude --session-id \"abc def\"\n";
+        let stdout = "1234 1 /usr/bin/claude --session-id \"abc def\"\n";
         let processes = parse_ps_output(stdout);
         assert_eq!(processes.len(), 1);
         assert_eq!(

@@ -3049,6 +3049,7 @@ mod tests {
         let session = "11111111-2222-4333-8444-555555555555";
         let turn = ProcessArgv {
             pid: 42,
+            ppid: None,
             argv: vec![
                 "claude".to_string(),
                 "-p".to_string(),

@@ -5589,10 +5589,12 @@ mod tests {
         let processes = vec![
             ProcessArgv {
                 pid: 1,
+                ppid: None,
                 argv: vec!["run".to_string(), "-s".to_string(), "ses_abc".to_string()],
             },
             ProcessArgv {
                 pid: 2,
+                ppid: None,
                 argv: vec!["run".to_string(), "-s".to_string(), "ses_abc".to_string()],
             },
         ];
