@@ -1241,6 +1241,33 @@ pub struct Engine {
     pub intelligence_lane_cap: usize,
 }
 
+/// Whose declared output contract one [`Engine::check_output_contract`] pass
+/// is about (E4): the leaf that just completed, or a container that leaf
+/// just closed.
+///
+/// Two variants rather than a bare id, because the difference is not only
+/// which `output/` directory to read — it is what the operator is told. A
+/// container's unmet contract must not read as a complaint about the leaf,
+/// which finished cleanly.
+#[derive(Clone, Copy)]
+enum OutputContract<'a> {
+    /// The completing leaf's own contract — the only case before W1.
+    Leaf,
+    /// A container's own contract, named by its composed hierarchical id.
+    Container(&'a str),
+}
+
+impl<'a> OutputContract<'a> {
+    /// The id whose `output/` directory this contract lives in — under the
+    /// package root and under a worktree alike.
+    fn id(self, stage: &'a StageRecord) -> &'a str {
+        match self {
+            OutputContract::Leaf => &stage.stage_id,
+            OutputContract::Container(id) => id,
+        }
+    }
+}
+
 impl Engine {
     /// Build an engine over a registry and data dir. `surfaces_root`
     /// defaults to `<data_dir>/surfaces` — today's layout, nothing moves —
@@ -2908,6 +2935,19 @@ impl Engine {
                 {
                     return Ok(gated);
                 }
+                // E3/E4: the one thing nesting adds to this arm. Every leaf
+                // signal above is handled exactly as it was — nesting only
+                // asks whether completing *this* leaf also closes a
+                // container that declared its own output contract, before
+                // the run is allowed to walk past it. Checked here, ahead of
+                // `stage.completed` and `stop_execution`, for the same
+                // reason the leaf gate is: the bounded re-prompt goes to the
+                // still-live execution of the leaf that just completed.
+                if let Some(gated) =
+                    self.check_closed_container_gates(core, work_id, &run, &workflow, &stage)?
+                {
+                    return Ok(gated);
+                }
                 let mut payload = json!({"stage_id": stage.stage_id, "index": stage.index});
                 if let Some(summary) = summary {
                     payload["detail"] = Value::String(summary);
@@ -2971,10 +3011,85 @@ impl Engine {
         workflow: &WorkflowDefinition,
         stage: &StageRecord,
     ) -> Result<Option<Next>, EngineError> {
+        self.check_output_contract(core, work_id, run, workflow, OutputContract::Leaf, stage)
+    }
+
+    /// E4, the container half of the same gate: a leaf's completion may also
+    /// *close* one or more containers (W1 §4 — "the container can still
+    /// assert a mechanical aggregate/summary artifact"), and a container
+    /// that declared its own `output/README.md` must have produced it before
+    /// the run walks past the last leaf under it.
+    ///
+    /// Innermost first ([`WorkflowDefinition::containers_closing_at`]), and
+    /// the first unmet contract short-circuits — a leaf that ends three
+    /// nested packages at once produces one re-prompt/park, not three at
+    /// the same instant, and the outer contracts are re-checked on the next
+    /// `StageCompleted` for the same leaf.
+    ///
+    /// No new mechanism (E3: W1 adds no terminal vocabulary): this is
+    /// [`Self::check_output_contract`] called with the container's id
+    /// instead of the leaf's, so the bounded re-prompt, the
+    /// `stage_output_missing` reason code, and the recovery path are the
+    /// existing ones verbatim.
+    fn check_closed_container_gates(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        run: &WorkRun,
+        workflow: &WorkflowDefinition,
+        stage: &StageRecord,
+    ) -> Result<Option<Next>, EngineError> {
+        let closing: Vec<String> = workflow
+            .containers_closing_at(stage.index)
+            .into_iter()
+            .map(|boundary| boundary.container_id.clone())
+            .collect();
+        for container_id in closing {
+            if let Some(gated) = self.check_output_contract(
+                core,
+                work_id,
+                run,
+                workflow,
+                OutputContract::Container(&container_id),
+                stage,
+            )? {
+                return Ok(Some(gated));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The gate body both halves share, parameterized on *whose* declared
+    /// output contract is being checked (the engine recon's touch point 5).
+    ///
+    /// `stage` is always the leaf that just signalled `StageCompleted`, in
+    /// both cases: it owns the live execution a re-prompt is sent to, and
+    /// its attempt owns the one bounded re-prompt this gate is allowed to
+    /// spend. That budget is per leaf attempt, not per contract — a leaf
+    /// that already spent its re-prompt on its own missing artifact parks
+    /// on the next unmet contract rather than re-prompting again, and a
+    /// `retry` (a fresh attempt, a fresh `StageRecord`) restores it. Bounded
+    /// is bounded: at most one SEND per attempt, whatever it was for.
+    fn check_output_contract(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        run: &WorkRun,
+        workflow: &WorkflowDefinition,
+        contract: OutputContract<'_>,
+        stage: &StageRecord,
+    ) -> Result<Option<Next>, EngineError> {
         if workflow.source == SOURCE_EMBEDDED {
             return Ok(None);
         }
-        let Some(expected) = declared_output_artifact(Path::new(&workflow.source), &stage.stage_id)
+        // One string for the declaration lookup and the worktree lookup
+        // alike, so the two halves of this check can never disagree about
+        // which `output/` directory they mean. For a container it is the
+        // composed hierarchical id (`10-investigate`, `10-investigate/
+        // 10-deep`), which `Path::join` splits into real components exactly
+        // as it does for a nested leaf's id.
+        let contract_id = contract.id(stage);
+        let Some(expected) = declared_output_artifact(Path::new(&workflow.source), contract_id)
         else {
             return Ok(None);
         };
@@ -2988,12 +3103,11 @@ impl Engine {
         // an altogether-absent one get the identical bounded-re-prompt/
         // needs_input treatment below, per Amendment 10d's own text
         // ("malformed = stage_output_missing-class refusal").
-        let required_columns =
-            declared_required_columns(Path::new(&workflow.source), &stage.stage_id);
+        let required_columns = declared_required_columns(Path::new(&workflow.source), contract_id);
         let produced = surface.bindings.iter().any(|binding| {
             let path = binding
                 .worktree_path
-                .join(&stage.stage_id)
+                .join(contract_id)
                 .join("output")
                 .join(&expected);
             let Ok(text) = std::fs::read_to_string(&path) else {
@@ -3010,22 +3124,34 @@ impl Engine {
                 // own reason; nothing more for the gate to say.
                 return Ok(Some(Next::Parked));
             }
-            self.commit(
-                core,
-                work_id,
-                KIND_STAGE_OUTPUT_MISSING,
-                json!({
-                    "stage_id": stage.stage_id,
-                    "path": expected,
-                    "attempt": stage.attempt,
-                }),
-            )?;
+            // `stage_id` is the *leaf's* throughout, in both the leaf and
+            // the container case: a container has no `StageRecord` (E3), and
+            // this is the event the reducer folds the re-prompt count onto.
+            // `container_id` rides beside it when the unmet contract is a
+            // container's, so the journal says which one without inventing a
+            // record for it.
+            let mut payload = json!({
+                "stage_id": stage.stage_id,
+                "path": expected,
+                "attempt": stage.attempt,
+            });
+            if let OutputContract::Container(container_id) = contract {
+                payload["container_id"] = Value::String(container_id.to_string());
+            }
+            self.commit(core, work_id, KIND_STAGE_OUTPUT_MISSING, payload)?;
             let execution = run.execution.clone().ok_or_else(|| EngineError::NoRun {
                 work_id: work_id.to_string(),
             })?;
             let backend = self.backend_for(work_id, &execution.backend)?;
-            let prompt =
-                format!("declared output {expected} missing — produce it or state what you need");
+            let prompt = match contract {
+                OutputContract::Leaf => format!(
+                    "declared output {expected} missing — produce it or state what you need"
+                ),
+                OutputContract::Container(container_id) => format!(
+                    "declared output {expected} for container {container_id} missing — produce it \
+                     or state what you need"
+                ),
+            };
             return Ok(Some(Next::Send(Box::new(PendingSend {
                 work_id: work_id.to_string(),
                 stage_id: stage.stage_id.clone(),
@@ -3037,33 +3163,39 @@ impl Engine {
                 resume: self.resume_request(run, work_id),
             }))));
         }
-        let detail = format!(
-            "stage {} completed without producing its declared output {expected}, even after \
-             one re-prompt",
-            stage.stage_id
-        );
-        self.commit(
-            core,
-            work_id,
-            KIND_STAGE_NEEDS_INPUT,
-            json!({
-                "stage_id": stage.stage_id,
-                "detail": detail,
-                "reason_code": REASON_STAGE_OUTPUT_MISSING,
-                "path": expected,
-            }),
-        )?;
-        self.transition(
-            core,
-            work_id,
-            KIND_WORK_NEEDS_INPUT,
-            json!({
-                "prompt": detail,
-                "stage_id": stage.stage_id,
-                "reason_code": REASON_STAGE_OUTPUT_MISSING,
-                "path": expected,
-            }),
-        )?;
+        // E4: the park names the CONTAINER when a container's contract is the
+        // unmet one — "container 10-investigate never produced its declared
+        // aggregate", not a confusing leaf-level message about a leaf that
+        // itself finished cleanly.
+        let detail = match contract {
+            OutputContract::Leaf => format!(
+                "stage {} completed without producing its declared output {expected}, even after \
+                 one re-prompt",
+                stage.stage_id
+            ),
+            OutputContract::Container(container_id) => format!(
+                "container {container_id} closed without producing its declared output \
+                 {expected}, even after one re-prompt"
+            ),
+        };
+        let mut stage_payload = json!({
+            "stage_id": stage.stage_id,
+            "detail": detail,
+            "reason_code": REASON_STAGE_OUTPUT_MISSING,
+            "path": expected,
+        });
+        let mut work_payload = json!({
+            "prompt": detail,
+            "stage_id": stage.stage_id,
+            "reason_code": REASON_STAGE_OUTPUT_MISSING,
+            "path": expected,
+        });
+        if let OutputContract::Container(container_id) = contract {
+            stage_payload["container_id"] = Value::String(container_id.to_string());
+            work_payload["container_id"] = Value::String(container_id.to_string());
+        }
+        self.commit(core, work_id, KIND_STAGE_NEEDS_INPUT, stage_payload)?;
+        self.transition(core, work_id, KIND_WORK_NEEDS_INPUT, work_payload)?;
         Ok(Some(Next::Parked))
     }
 
@@ -5564,6 +5696,7 @@ mod tests {
                 version: "1".to_string(),
                 source: "test".to_string(),
                 stages: Vec::new(),
+                containers: Vec::new(),
                 content_hash: String::new(),
             },
             route: Route {

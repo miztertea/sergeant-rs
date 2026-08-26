@@ -334,6 +334,45 @@ pub struct StageBinding {
     pub profile: Option<crate::domain::profile::Profile>,
 }
 
+/// One container's footprint in the flattened stage list (W1 §2, decision
+/// E3; the engine recon's touch point 7).
+///
+/// A container is **not** a stage: it has no [`StageDefinition`], no
+/// [`StageBinding`], no [`StageRecord`], and the engine never enters it
+/// (W1-02). What the engine still needs to know is *when a container closes*
+/// — which flat leaf index is the last one under it — so that a container
+/// which declared its own output contract can be checked at that moment
+/// (E4). That is a side table, deliberately not a field on
+/// [`StageDefinition`].
+///
+/// It lives inside [`WorkflowDefinition`], and therefore inside the
+/// journaled `workflow.bound` payload, because recovery must be able to
+/// answer "did this leaf close a container" after a restart from the pinned
+/// definition alone — an engine-side cache would lose that fact across a
+/// daemon restart mid-park (the engine recon's Recovery item 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerBoundary {
+    /// The container's hierarchical id, composed exactly the way a leaf's is
+    /// (`10-investigate`, or `10-investigate/10-deep` for a container inside
+    /// a container). This is the id an operator is shown when the
+    /// container's own output contract is unmet, and the id the gate joins
+    /// onto a package directory *and* onto a worktree — one string in both
+    /// places, so the two halves of that check can never disagree.
+    pub container_id: String,
+    /// The directory of the package that *declares* this container — the
+    /// parent package's own source, one level above the container's own
+    /// `workflow.toml`. Provenance, recorded so a journaled row says on its
+    /// own which package on disk introduced the container;
+    /// [`SOURCE_EMBEDDED`] for a container inside the embedded distro.
+    pub source: String,
+    /// Index, in [`WorkflowDefinition::stages`], of the first leaf under
+    /// this container.
+    pub first_leaf_index: usize,
+    /// Index of the last leaf under this container. Completing the leaf at
+    /// this index is what closes the container.
+    pub last_leaf_index: usize,
+}
+
 /// A resolved workflow: ordered stages plus the identity of what produced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowDefinition {
@@ -349,6 +388,14 @@ pub struct WorkflowDefinition {
     /// position with composed `parent/child` ids (W1 §2/§3, decision E1);
     /// the container itself is never a stage (W1-02).
     pub stages: Vec<StageDefinition>,
+    /// Every container's leaf-index range (E3/E4), in document order,
+    /// outermost first within each subtree. Empty for a workflow with no
+    /// nested package — which is every workflow that predates W1, hence
+    /// `#[serde(default)]`: a `workflow.bound` payload journaled before this
+    /// field existed replays as "no containers", which is exactly what it
+    /// was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub containers: Vec<ContainerBoundary>,
     /// Stable content-identity hash over every execution-relevant field:
     /// descriptor (name, version), stage order, each stage's executor tag
     /// (kind/harness/profile), and every context verbatim (§22.3). Deliberately
@@ -356,6 +403,14 @@ pub struct WorkflowDefinition {
     /// content loaded from two different paths is the same workflow.
     /// Hex-encoded BLAKE3 over a canonical JSON projection of the fields
     /// above.
+    ///
+    /// **[`Self::containers`] is deliberately not folded in** (E2/E3): the
+    /// table is *derived* from `stages` — every row's id is the common
+    /// prefix of the leaves in its range, and its range is where those
+    /// leaves sit — so it cannot vary while the flattened stage list stays
+    /// the same, and folding it would add a second copy of the same fact to
+    /// the identity. Nesting still changes the hash, because nesting changes
+    /// the composed leaf ids and the contexts, which are already folded.
     #[serde(default)]
     pub content_hash: String,
 }
@@ -631,6 +686,28 @@ pub enum WorkflowError {
         /// The nested descriptor that makes this stage a container.
         marker: String,
     },
+    /// A container stage's directory resolves to a package already open on
+    /// this nesting path — a symlink cycle. Recursing into it would never
+    /// terminate, so the loader refuses by name instead of overflowing the
+    /// stack (the captain's ruling on PR #308, 2026-08-26).
+    ///
+    /// This is not a depth limit (E14 stands: nesting itself is unbounded).
+    /// It is the one structural fact that makes depth unbounded *in a way no
+    /// author intended* — a package that contains itself.
+    #[error(
+        "{path} declares stage {stage:?}, whose directory resolves to {resolved}, a workflow \
+         package already open on this nesting path: a nested package may not contain itself \
+         (a symlink cycle), which would recurse without end"
+    )]
+    NestedPackageCycle {
+        /// Path of the declaring descriptor.
+        path: String,
+        /// The offending stage id.
+        stage: String,
+        /// The canonical directory the stage resolves to — already an
+        /// ancestor of itself.
+        resolved: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -802,7 +879,24 @@ impl WorkflowDefinition {
     /// content hash folds the whole flattened tree into one identity (E2) —
     /// a nested leaf's edit changes the parent's `content_hash` exactly as a
     /// top-level stage's does.
+    ///
+    /// **Cycle guard.** Nesting is unbounded by design (E14: no product depth
+    /// limit), so the one shape that must still be refused is a package that
+    /// *contains itself* — a symlink cycle, which is not deep nesting but
+    /// endless nesting. Each level carries the canonical paths of the
+    /// packages open above it and refuses a container that resolves to one of
+    /// them ([`WorkflowError::NestedPackageCycle`]), by name, at load time,
+    /// rather than letting the recursion overflow the stack.
     pub fn load_dir(dir: &Path) -> Result<Self, WorkflowError> {
+        Self::load_dir_within(dir, &[])
+    }
+
+    /// [`Self::load_dir`] plus the canonical paths of every package already
+    /// open above this one on the nesting path (the cycle guard's visited
+    /// set). The ancestry is a *path*, not a global set: the same package
+    /// reached twice by two different containers is finite and legal, while
+    /// the same package reached from inside itself is not.
+    fn load_dir_within(dir: &Path, ancestry: &[PathBuf]) -> Result<Self, WorkflowError> {
         let descriptor = dir.join(WORKFLOW_FILE);
         let path = descriptor.display().to_string();
         let text = std::fs::read_to_string(&descriptor).map_err(|source| WorkflowError::Io {
@@ -823,7 +917,17 @@ impl WorkflowDefinition {
         }
         let ids = check_stage_ids(&parsed.workflow.stages, &path)?;
         check_stage_tables(&ids, &parsed.stages_meta, &path)?;
+        // This package, plus everything open above it: what a container's
+        // resolved directory is checked against below.
+        let mut open = ancestry.to_vec();
+        open.push(
+            std::fs::canonicalize(dir).map_err(|source| WorkflowError::Io {
+                path: dir.display().to_string(),
+                source,
+            })?,
+        );
         let mut stages = Vec::with_capacity(ids.len());
+        let mut containers: Vec<ContainerBoundary> = Vec::new();
         for id in ids {
             let stage_dir = dir.join(&id);
             // W1 §2 / E1: a *positive* detection of the nested-package
@@ -847,13 +951,31 @@ impl WorkflowDefinition {
                         marker: marker.display().to_string(),
                     });
                 }
+                // The cycle guard, before the recursion rather than after:
+                // a container that resolves to a package already open above
+                // it would never terminate.
+                let resolved =
+                    std::fs::canonicalize(&stage_dir).map_err(|source| WorkflowError::Io {
+                        path: stage_dir.display().to_string(),
+                        source,
+                    })?;
+                if open.contains(&resolved) {
+                    return Err(WorkflowError::NestedPackageCycle {
+                        path,
+                        stage: id,
+                        resolved: resolved.display().to_string(),
+                    });
+                }
                 // The nested package validates itself, by its own rules, and
                 // reports failures against its own descriptor path.
-                let nested = Self::load_dir(&stage_dir)?;
-                stages.extend(nested.stages.into_iter().map(|leaf| StageDefinition {
-                    id: format!("{id}/{}", leaf.id),
-                    ..leaf
-                }));
+                let nested = Self::load_dir_within(&stage_dir, &open)?;
+                splice_container(
+                    &mut stages,
+                    &mut containers,
+                    &id,
+                    &dir.display().to_string(),
+                    nested,
+                );
                 continue;
             }
             let tag = resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
@@ -902,6 +1024,7 @@ impl WorkflowDefinition {
             version: parsed.workflow.version,
             source: dir.display().to_string(),
             stages,
+            containers,
             content_hash,
         })
     }
@@ -936,6 +1059,7 @@ impl WorkflowDefinition {
         let ids = check_stage_ids(&parsed.workflow.stages, &path)?;
         check_stage_tables(&ids, &parsed.stages_meta, &path)?;
         let mut stages = Vec::with_capacity(ids.len());
+        let mut containers: Vec<ContainerBoundary> = Vec::new();
         for id in ids {
             // Same positive-detection rule as `load_dir`: a marker match,
             // never "no context happened to be embedded" — an id with
@@ -961,10 +1085,7 @@ impl WorkflowDefinition {
                 }
                 let nested_path = format!("{dir_path}/{id}/{WORKFLOW_FILE}");
                 let nested = Self::load_embedded(nested_pkg, nested_path)?;
-                stages.extend(nested.stages.into_iter().map(|leaf| StageDefinition {
-                    id: format!("{id}/{}", leaf.id),
-                    ..leaf
-                }));
+                splice_container(&mut stages, &mut containers, &id, SOURCE_EMBEDDED, nested);
                 continue;
             }
             let tag = resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
@@ -1006,6 +1127,7 @@ impl WorkflowDefinition {
             version: parsed.workflow.version,
             source: SOURCE_EMBEDDED.to_string(),
             stages,
+            containers,
             content_hash,
         })
     }
@@ -1014,6 +1136,74 @@ impl WorkflowDefinition {
     pub fn stage(&self, index: usize) -> Option<&StageDefinition> {
         self.stages.get(index)
     }
+
+    /// Every container that *closes* when the leaf at `index` completes,
+    /// **innermost first** (E3/E4, the engine recon's touch point 7).
+    ///
+    /// One leaf can close several containers at once — the last leaf of an
+    /// innermost package is also the last leaf of every ancestor package it
+    /// ends. Innermost-first is the narrowest range first: an inner
+    /// container's leaf range is strictly contained in its parent's, so
+    /// ordering by range width is the ancestry order, and the ids break any
+    /// tie deterministically (two containers cannot share a range, but the
+    /// sort must not depend on that to be stable).
+    pub fn containers_closing_at(&self, index: usize) -> Vec<&ContainerBoundary> {
+        let mut closing: Vec<&ContainerBoundary> = self
+            .containers
+            .iter()
+            .filter(|boundary| boundary.last_leaf_index == index)
+            .collect();
+        closing.sort_by(|a, b| {
+            (b.first_leaf_index, &b.container_id).cmp(&(a.first_leaf_index, &a.container_id))
+        });
+        closing
+    }
+}
+
+/// Splice one container's recursively-loaded package into its parent's flat
+/// stage list, and record what that splice means for the boundary table
+/// (E1 + E3). Shared by both loaders so the directory and embedded
+/// representations can never disagree about either half.
+///
+/// `id` is the container's own single-component stage id; `source` is the
+/// declaring package's directory (or [`SOURCE_EMBEDDED`]). Every id the
+/// nested definition produced — leaf and container alike — is prefixed with
+/// `id`, and every index it recorded is shifted by where the splice lands,
+/// which is what makes a container inside a container come out with a
+/// composed id and a correct range at any depth.
+fn splice_container(
+    stages: &mut Vec<StageDefinition>,
+    containers: &mut Vec<ContainerBoundary>,
+    id: &str,
+    source: &str,
+    nested: WorkflowDefinition,
+) {
+    let offset = stages.len();
+    // `check_stage_ids` refuses an empty `stages` list at every level
+    // (`NoStages`), so a package always contributes at least one leaf and
+    // this range is always non-empty.
+    let last_leaf_index = offset + nested.stages.len() - 1;
+    containers.push(ContainerBoundary {
+        container_id: id.to_string(),
+        source: source.to_string(),
+        first_leaf_index: offset,
+        last_leaf_index,
+    });
+    containers.extend(
+        nested
+            .containers
+            .into_iter()
+            .map(|inner| ContainerBoundary {
+                container_id: format!("{id}/{}", inner.container_id),
+                first_leaf_index: inner.first_leaf_index + offset,
+                last_leaf_index: inner.last_leaf_index + offset,
+                ..inner
+            }),
+    );
+    stages.extend(nested.stages.into_iter().map(|leaf| StageDefinition {
+        id: format!("{id}/{}", leaf.id),
+        ..leaf
+    }));
 }
 
 /// Authored fields from a workflow's own `index.md` front matter
@@ -3207,6 +3397,256 @@ mod tests {
         }
     }
 
+    /// E3 / touch point 7: a container contributes no `StageDefinition`, but
+    /// it does contribute one boundary row naming the flat index range of
+    /// the leaves it owns — the fact the engine needs to know a container
+    /// closed, and the only new thing `WorkflowDefinition` carries for it.
+    #[test]
+    fn a_container_records_the_flat_index_range_of_its_own_leaves() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "bounded");
+        write_package(
+            &wf,
+            "bounded",
+            &["00-orient", "10-investigate", "20-implement"],
+        );
+        write_stage(&wf, "00-orient", "orient");
+        write_stage(&wf, "20-implement", "implement");
+        let investigate = wf.join("10-investigate");
+        write_package(&investigate, "10-investigate", &["00-lead", "10-code"]);
+        write_stage(&investigate, "00-lead", "lead");
+        write_stage(&investigate, "10-code", "code");
+
+        let def = WorkflowDefinition::load_dir(&wf).expect("load");
+        assert_eq!(
+            def.containers,
+            vec![ContainerBoundary {
+                container_id: "10-investigate".to_string(),
+                source: wf.display().to_string(),
+                first_leaf_index: 1,
+                last_leaf_index: 2,
+            }],
+            "one row per container, naming the leaves it owns: {:?}",
+            def.stages.iter().map(|s| &s.id).collect::<Vec<_>>()
+        );
+        // The row's range says exactly which leaves it covers.
+        assert_eq!(def.stages[1].id, "10-investigate/00-lead");
+        assert_eq!(def.stages[2].id, "10-investigate/10-code");
+        // And the container id, joined onto the workflow's own source, is
+        // the container's package directory — the identity the container
+        // output gate depends on (one string for the declaration lookup and
+        // the worktree lookup alike).
+        assert_eq!(
+            Path::new(&def.source).join("10-investigate"),
+            investigate,
+            "workflow.source + container_id must resolve the container's own package"
+        );
+    }
+
+    /// The multi-boundary case the plan panel named: three levels, whose
+    /// deepest leaf is simultaneously the last leaf of two ancestors.
+    /// `containers_closing_at` must report both, innermost first.
+    #[test]
+    fn a_leaf_can_close_two_containers_at_once_innermost_first() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "three");
+        write_package(&wf, "three", &["00-orient", "10-investigate"]);
+        write_stage(&wf, "00-orient", "orient");
+        let investigate = wf.join("10-investigate");
+        write_package(&investigate, "10-investigate", &["00-lead", "10-deep"]);
+        write_stage(&investigate, "00-lead", "lead");
+        let deep = investigate.join("10-deep");
+        write_package(&deep, "10-deep", &["00-inner"]);
+        write_stage(&deep, "00-inner", "inner");
+
+        let def = WorkflowDefinition::load_dir(&wf).expect("load");
+        let ids: Vec<&str> = def.stages.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "00-orient",
+                "10-investigate/00-lead",
+                "10-investigate/10-deep/00-inner"
+            ]
+        );
+        assert_eq!(
+            def.containers,
+            vec![
+                ContainerBoundary {
+                    container_id: "10-investigate".to_string(),
+                    source: wf.display().to_string(),
+                    first_leaf_index: 1,
+                    last_leaf_index: 2,
+                },
+                ContainerBoundary {
+                    container_id: "10-investigate/10-deep".to_string(),
+                    source: investigate.display().to_string(),
+                    first_leaf_index: 2,
+                    last_leaf_index: 2,
+                },
+            ],
+            "an inner container composes its id and shifts its range by the splice offset"
+        );
+
+        // Leaf 2 ends the inner package *and* the outer one.
+        let closing: Vec<&str> = def
+            .containers_closing_at(2)
+            .iter()
+            .map(|b| b.container_id.as_str())
+            .collect();
+        assert_eq!(
+            closing,
+            ["10-investigate/10-deep", "10-investigate"],
+            "innermost first, so the innermost container's own contract is checked first"
+        );
+        assert!(
+            def.containers_closing_at(1).is_empty(),
+            "a leaf that ends nothing closes nothing"
+        );
+        assert!(def.containers_closing_at(0).is_empty());
+    }
+
+    /// A legal, simple shape the tie-break must not get wrong: a container
+    /// whose sole stage is itself a nested container. Both boundary rows
+    /// then share the exact same `first_leaf_index` (and `last_leaf_index`)
+    /// — the only thing that still distinguishes them is that the inner
+    /// container's composed id is strictly longer than the outer's. A
+    /// comparator that mismatches its tuple sides (sorting `b`'s range
+    /// against `a`'s id, or vice versa) can pass the differing-range case
+    /// above while still reporting the outer container before the inner one
+    /// here, which is exactly the violation this test pins.
+    #[test]
+    fn a_container_whose_sole_stage_is_a_nested_container_closes_innermost_first() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "wrap");
+        write_package(&wf, "wrap", &["10-wrap"]);
+        let wrap = wf.join("10-wrap");
+        write_package(&wrap, "10-wrap", &["00-inner"]);
+        let inner = wrap.join("00-inner");
+        write_package(&inner, "00-inner", &["00-leaf"]);
+        write_stage(&inner, "00-leaf", "leaf");
+
+        let def = WorkflowDefinition::load_dir(&wf).expect("load");
+        assert_eq!(
+            def.containers,
+            vec![
+                ContainerBoundary {
+                    container_id: "10-wrap".to_string(),
+                    source: wf.display().to_string(),
+                    first_leaf_index: 0,
+                    last_leaf_index: 0,
+                },
+                ContainerBoundary {
+                    container_id: "10-wrap/00-inner".to_string(),
+                    source: wrap.display().to_string(),
+                    first_leaf_index: 0,
+                    last_leaf_index: 0,
+                },
+            ],
+            "both boundaries cover the exact same, single-leaf range"
+        );
+
+        let closing: Vec<&str> = def
+            .containers_closing_at(0)
+            .iter()
+            .map(|b| b.container_id.as_str())
+            .collect();
+        assert_eq!(
+            closing,
+            ["10-wrap/00-inner", "10-wrap"],
+            "equal-range tie must still break innermost (longer composed id) first"
+        );
+    }
+
+    /// E2/E3: the boundary table is derived from the flattened stage list,
+    /// so it must not independently perturb content identity — the pinned
+    /// hash stays a function of the descriptor and the flattened stages
+    /// alone, exactly as it was before containers existed.
+    #[test]
+    fn the_container_table_does_not_perturb_the_content_hash() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "hashed");
+        write_package(&wf, "hashed", &["10-container"]);
+        let container = wf.join("10-container");
+        write_package(&container, "10-container", &["00-leaf"]);
+        write_stage(&container, "00-leaf", "leaf work");
+
+        let def = WorkflowDefinition::load_dir(&wf).expect("load");
+        assert!(!def.containers.is_empty(), "fixture must have a container");
+        assert_eq!(
+            def.content_hash,
+            compute_content_hash(&def.name, &def.version, &def.stages),
+            "content identity is the descriptor plus the flattened stages, and nothing else"
+        );
+    }
+
+    /// The ruled cycle guard (captain ruling on PR #308, 2026-08-26): a
+    /// symlink cycle in a nested package is a **named, fail-closed load
+    /// error**, never a stack overflow. E14 still stands — this adds no
+    /// depth limit, only a guard against a package that contains itself,
+    /// which is not deep nesting but unbounded nesting.
+    ///
+    /// The fixture has to satisfy the loader's own `NameMismatch` check at
+    /// every level to reach the recursion at all, so the cycle is the one
+    /// shape that can: a package whose declared stage id is its own
+    /// directory name, with that stage a symlink back to the package.
+    /// `10-inner/10-inner/10-inner/…` would otherwise recurse forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cycle_in_a_nested_package_is_a_named_load_error() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "loopy");
+        write_package(&wf, "loopy", &["10-inner"]);
+        let inner = wf.join("10-inner");
+        write_package(&inner, "10-inner", &["10-inner"]);
+        std::os::unix::fs::symlink(&inner, inner.join("10-inner")).expect("cycle symlink");
+
+        let err = WorkflowDefinition::load_dir(&wf)
+            .expect_err("a package that contains itself must be refused, not recursed forever");
+        match &err {
+            WorkflowError::NestedPackageCycle { stage, path, .. } => {
+                assert_eq!(stage, "10-inner");
+                assert!(
+                    path.contains("10-inner"),
+                    "the error must name the descriptor that declared the cycling stage: {path}"
+                );
+            }
+            other => panic!("expected NestedPackageCycle, got {other}"),
+        }
+        assert!(
+            err.to_string().contains("nesting path"),
+            "the message must say what is wrong, not just that something is: {err}"
+        );
+    }
+
+    /// The guard is about a package *containing itself*, not about a package
+    /// being used twice. Two sibling containers that resolve to the same
+    /// package directory are finite, produce distinct composed ids, and must
+    /// still load — a naive global visited-set would have refused them.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_nested_package_may_be_used_by_two_siblings() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "twice");
+        write_package(&wf, "twice", &["10-shared", "20-shared"]);
+        let shared = wf.join("10-shared");
+        write_package(&shared, "10-shared", &["00-leaf"]);
+        write_stage(&shared, "00-leaf", "shared work");
+        // The second use is the same directory reached by another name; the
+        // nested package's own `name` check makes it a copy in practice, so
+        // this fixture writes the sibling as a real package with identical
+        // content and symlinks only the *leaf*, which is the shape that
+        // actually shares content on disk.
+        let second = wf.join("20-shared");
+        write_package(&second, "20-shared", &["00-leaf"]);
+        std::os::unix::fs::symlink(shared.join("00-leaf"), second.join("00-leaf"))
+            .expect("shared leaf symlink");
+
+        let def = WorkflowDefinition::load_dir(&wf).expect("sharing a package is not a cycle");
+        let ids: Vec<&str> = def.stages.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["10-shared/00-leaf", "20-shared/00-leaf"]);
+    }
+
     /// A nested package's own `name` must match its stage directory, exactly
     /// as a top-level package's must — the recursion reuses that check rather
     /// than relaxing it.
@@ -3478,6 +3918,18 @@ mod tests {
         assert_eq!(def.stages.len(), 1);
         assert_eq!(def.stages[0].id, "10-container/00-leaf");
         assert_eq!(def.stages[0].context, "the nested procedure");
+        // Boundary parity: the embedded loader records the same side table
+        // its directory sibling does, sourced at `<embedded>` because that
+        // is where the declaring package actually lives.
+        assert_eq!(
+            def.containers,
+            vec![ContainerBoundary {
+                container_id: "10-container".to_string(),
+                source: SOURCE_EMBEDDED.to_string(),
+                first_leaf_index: 0,
+                last_leaf_index: 0,
+            }]
+        );
     }
 
     /// E2 parity: the content hash folds the flattened tree for the embedded

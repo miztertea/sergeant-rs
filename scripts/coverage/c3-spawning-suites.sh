@@ -49,6 +49,15 @@ cov_run cargo llvm-cov --no-report --test w5_h1_acceptance --locked || cov_fail 
 cov_stage_end 2 "w5_h1_acceptance's two-estate test spawns a real daemon via sgt run; more than \
 the test binary's own profile must arrive, or no subprocess flushed"
 
+# S2 V1b, wired at birth: m11's round-trip test spawns a real `sgt work show`
+# against the in-process daemon it started, so the CLI's own rendering of a
+# composed hierarchical stage id is measured rather than argued. Floor 2 —
+# the test binary plus that client.
+cov_stage_begin c3-m11_nested_workflow
+cov_run cargo llvm-cov --no-report --test m11_nested_workflow --locked || cov_fail "m11_nested_workflow failed under instrumentation"
+cov_stage_end 2 "m11's round-trip test spawns a real sgt work show client; more than the test \
+binary's own profile must arrive, or no subprocess flushed"
+
 # Added 2026-08-19 alongside C2's five, closing the same accounting gap: this
 # suite existed but no stage script invoked it, so backend/docker.rs's real
 # coverage never reached the report.

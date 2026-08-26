@@ -750,6 +750,123 @@ async fn t1c_extend_reaches_the_real_api_with_the_typed_turn_count() {
     handle.shutdown().await;
 }
 
+/// A two-level nested workflow package (S2 W1 / decision E1) in the estate:
+/// `10-investigate` is a stage directory that holds its own `workflow.toml`,
+/// so it is a container and its leaves flatten to composed ids.
+fn write_nested_workflow(root: &Path) {
+    let dir = root.join(".sergeant/workflows/nested");
+    std::fs::create_dir_all(&dir).expect("workflow dir");
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "[workflow]\nname = \"nested\"\nversion = \"1\"\n\
+         stages = [\"00-orient\", \"10-investigate\", \"20-implement\"]\n",
+    )
+    .expect("workflow.toml");
+    for stage in ["00-orient", "20-implement"] {
+        std::fs::create_dir_all(dir.join(stage)).expect("stage dir");
+        std::fs::write(dir.join(stage).join("CONTEXT.md"), "context").expect("CONTEXT.md");
+    }
+    let investigate = dir.join("10-investigate");
+    std::fs::create_dir_all(&investigate).expect("container dir");
+    std::fs::write(
+        investigate.join("workflow.toml"),
+        "[workflow]\nname = \"10-investigate\"\nversion = \"1\"\n\
+         stages = [\"00-lead\", \"10-code\"]\n",
+    )
+    .expect("nested workflow.toml");
+    for stage in ["00-lead", "10-code"] {
+        std::fs::create_dir_all(investigate.join(stage)).expect("nested stage dir");
+        std::fs::write(investigate.join(stage).join("CONTEXT.md"), "context").expect("CONTEXT.md");
+    }
+}
+
+/// S2 W1 / decision E10, end to end against a live daemon: a Work bound to a
+/// nested workflow renders its rail as a **tree** — one indented header per
+/// container, leaves under it — while the header's stage coordinate names
+/// the current leaf by its full composed id.
+///
+/// Both halves are deliberately asserted here rather than only in
+/// `work_view.rs`'s own unit tests. The wire shape stayed flat
+/// (`workflow.stages` is still one array of leaf ids, and `stage_label`
+/// still does `index + 1` of `of`), so the tree exists only in the render —
+/// which means a rig that unit-tested `workflow_lines` alone could not tell
+/// whether the API actually serves ids with `/` in them at all.
+#[tokio::test]
+async fn t1e_a_nested_workflow_renders_as_an_indented_tree_over_the_live_api() {
+    let data = TempDir::new().expect("tempdir");
+    let (estate, mount) = solo_estate("svc");
+    write_nested_workflow(estate.path());
+
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [
+            FakeStep::complete(),                 // 00-orient
+            FakeStep::needs_input("which lead?"), // 10-investigate/00-lead parks here
+        ],
+    )
+    .await;
+    let client = client_for(&handle, estate.path());
+    let work = submit(
+        &handle,
+        estate.path(),
+        &mount,
+        "investigate deeply",
+        "nested",
+    )
+    .await;
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    let action = Action::OpenWork(work.clone());
+    assert_eq!(app.execute(&client, action).await, Action::None);
+
+    // The header coordinate: `stage_label` renders a composed id as-is,
+    // with the flat position arithmetic E10 preserved.
+    let terminal = render(&app);
+    assert_shows(
+        &terminal,
+        "10-investigate/00-lead",
+        "the current stage's composed id",
+    );
+
+    // The Workflow tab (§13.4's rail), now a tree. `Tab` rather than `2`,
+    // the same way t1 above reaches it: Home's own form still owns the digit
+    // keys here, and leaving it would close the open Work.
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab);
+    let terminal = render(&app);
+    // Asserted as whole-line substrings (the rail's rows sit inside a
+    // bordered pane, so a row never *begins* at column 0): the container
+    // header carries its own glyph and a plain done/total over the leaves it
+    // owns, each of those leaves is indented one level under it, and the
+    // container's sibling stays at the top level.
+    for row in [
+        "✓ 00-orient",
+        "⠹ 10-investigate/  0/2",
+        "  ⠹ 00-lead",
+        "  · 10-code",
+        "· 20-implement",
+    ] {
+        assert_shows(&terminal, row, "a row of the nested rail");
+    }
+    let lines = screen_lines(&terminal);
+    let leaf = lines
+        .iter()
+        .find(|line| line.contains("⠹ 00-lead"))
+        .expect("the current leaf's row");
+    assert!(
+        !leaf.contains("10-investigate/00-lead"),
+        "a nested leaf shows its own name under its container header, not the composed id \
+         again: {leaf:?}"
+    );
+    assert!(
+        !screen_text(&terminal).contains('%'),
+        "never a percent bar, containers included (Decision T2-50)"
+    );
+
+    handle.shutdown().await;
+}
+
 /// §12.1 end to end: the Add-repo form's real `POST /v1/estate/repos` —
 /// kicked off the render loop rather than awaited inline (the spinner/
 /// elapsed rule), per T3's own routes over `crate::domain::manifest::
