@@ -815,14 +815,25 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
 /// serving; [`crate::runtime::prune::stall_report`] is how that becomes
 /// visible, not a blocked tick.
 ///
-/// Phase A ([`crate::runtime::prune::candidate_horizon`]) and the cheap
-/// `take_rotation_signal`/`segment_bounds` reads run under the guard (they
-/// are in-memory and fast); Phase B
-/// ([`crate::runtime::prune::plan`], the mark scan) runs on a blocking
-/// thread with the guard released, since it is the unbounded part (§10.1's
-/// own split); [`crate::runtime::prune::run`] re-acquires the guard to
-/// re-validate and commit.
+/// Phase A ([`crate::runtime::prune::candidate_horizon_multi_estate`]) and
+/// the cheap `take_rotation_signal`/`segment_bounds` reads run under the
+/// guard (they are in-memory and fast); Phase B
+/// ([`crate::runtime::prune::plan_multi_estate`], the mark scan) runs on a
+/// blocking thread with the guard released, since it is the unbounded part
+/// (§10.1's own split); [`crate::runtime::prune::run`] re-acquires the guard
+/// to re-validate and commit.
+///
+/// H1 brief deliverable 1: `state.prune_policy` is no longer applied
+/// uniformly to every retained Work — it is the fallback
+/// [`crate::runtime::prune::EstatePolicies::from_registry`] resolves for a
+/// Work whose estate is unknown or no longer admitted. Each admitted
+/// estate's own `[estate] retention` is read fresh every tick (the same
+/// "re-read, never cache" discipline `Engine::plan` already has, now applied
+/// to this policy map too), from `state.estates` — the registry the
+/// estate-scoped HTTP surface already populates.
 async fn maybe_run_rotation_triggered_prune(state: &ApiState) {
+    let policies =
+        crate::runtime::prune::EstatePolicies::from_registry(&state.estates, state.prune_policy);
     let snapshot = {
         let mut core = CoreGuard::acquire(&state.core).await;
         let rotated = core.journal.take_rotation_signal();
@@ -836,11 +847,11 @@ async fn maybe_run_rotation_triggered_prune(state: &ApiState) {
                 return;
             }
         };
-        let (candidate, _stall) = crate::runtime::prune::candidate_horizon(
+        let (candidate, _stall) = crate::runtime::prune::candidate_horizon_multi_estate(
             &bounds,
             core.registry.state(),
             &core.first_seq_by_work,
-            &state.prune_policy,
+            &policies,
         );
         let eligible_segments = bounds.iter().filter(|b| b.last_seq <= candidate).count();
         if candidate == 0 || eligible_segments < crate::runtime::prune::PRUNE_BATCH_MIN_SEGMENTS {
@@ -856,15 +867,14 @@ async fn maybe_run_rotation_triggered_prune(state: &ApiState) {
     let (bounds, candidate, registry_snapshot, first_seq_snapshot) = snapshot;
 
     let data_dir = state.data_dir.clone();
-    let policy = state.prune_policy;
     let planned = tokio::task::spawn_blocking(move || {
-        crate::runtime::prune::plan(
+        crate::runtime::prune::plan_multi_estate(
             &data_dir,
             &bounds,
             candidate,
             &registry_snapshot,
             &first_seq_snapshot,
-            &policy,
+            &policies,
         )
     })
     .await;
@@ -2532,6 +2542,12 @@ fn pruned_work_view(
         "last_seq": row.last_seq,
         "pruned_at": row.pruned_at,
         "policy": {"retention": policy.retention, "source": policy.source},
+        // H1 brief deliverable 3: the report names estates. `policy` above
+        // stays the daemon-wide fallback the caller passed in (unchanged
+        // shape); `estate_root` is this specific residue row's own recorded
+        // coordinate, `None` for a Work pruned before H1 or submitted with
+        // no estate context at all.
+        "estate_root": row.estate_root,
     })
 }
 
