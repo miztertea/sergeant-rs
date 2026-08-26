@@ -23,6 +23,13 @@ pub struct WorkRow {
     pub backend: String,
     pub intent: String,
     pub workflow: String,
+    /// The canonical estate root this Work was submitted against
+    /// (`estate_root`, H1 D1) — an identity, never a display name: two
+    /// estates may share one, so this is deliberately not the old
+    /// `workspace` field (dead since estate-root Phase C; `Work::workspace`'s
+    /// own doc comment: "deprecated, never written"). `"-"` when the
+    /// daemon has none recorded (a Work journaled before the envelope
+    /// carried it, or with no estate context at all).
     pub estate: String,
     pub repositories: String,
     pub turns: String,
@@ -68,7 +75,7 @@ fn row_from(work: &Value) -> WorkRow {
         backend: field(work, "resolved_backend"),
         intent: field(work, "intent"),
         workflow: field(work, "workflow"),
-        estate: field(work, "workspace"),
+        estate: field(work, "estate_root"),
         repositories,
         turns,
         created_at: field(work, "created_at"),
@@ -118,6 +125,12 @@ pub struct Filters {
     pub text: String,
     pub state: Option<String>,
     pub nonterminal_only: bool,
+    /// W4d deliverable 1 (H1 §9): the fleet-wide estate filter, following
+    /// the exact `state` pattern above — `None` is "every estate" (host-wide,
+    /// the honest default under host mode), `Some(root)` narrows to the one
+    /// estate whose `WorkRow.estate` (its canonical root, D1 — see that
+    /// field's own doc comment) matches exactly.
+    pub estate: Option<String>,
 }
 
 impl Filters {
@@ -127,6 +140,11 @@ impl Filters {
         }
         if let Some(state) = &self.state
             && &row.state != state
+        {
+            return false;
+        }
+        if let Some(estate) = &self.estate
+            && &row.estate != estate
         {
             return false;
         }
@@ -142,7 +160,10 @@ impl Filters {
     }
 
     fn is_default(&self) -> bool {
-        self.text.is_empty() && self.state.is_none() && !self.nonterminal_only
+        self.text.is_empty()
+            && self.state.is_none()
+            && !self.nonterminal_only
+            && self.estate.is_none()
     }
 }
 
@@ -234,6 +255,10 @@ impl FleetScreen {
                 self.filters.state = next_state_filter(self.filters.state.as_deref());
                 self.clamp(rows);
             }
+            KeyCode::Char('e') => {
+                self.filters.estate = next_estate_filter(self.filters.estate.as_deref(), rows);
+                self.clamp(rows);
+            }
             KeyCode::Char('x') if !self.filters.is_default() => {
                 self.filters = Filters::default();
             }
@@ -248,6 +273,30 @@ impl FleetScreen {
             _ => {}
         }
         FleetOutcome::None
+    }
+}
+
+/// All-estates → per-estate cycling (W4d deliverable 1), the same shape as
+/// [`next_state_filter`] but over whatever estate names are actually present
+/// in `rows` — unlike `state`, the estate dimension has no fixed enum, so
+/// the cycle is derived from the data rather than a `const` list, sorted for
+/// a deterministic keystroke order.
+fn next_estate_filter(current: Option<&str>, rows: &[WorkRow]) -> Option<String> {
+    let mut estates: Vec<&str> = rows
+        .iter()
+        .map(|r| r.estate.as_str())
+        .filter(|e| *e != "-")
+        .collect();
+    estates.sort_unstable();
+    estates.dedup();
+    match current {
+        None => estates.first().map(|s| s.to_string()),
+        Some(estate) => {
+            let index = estates.iter().position(|s| *s == estate);
+            index
+                .and_then(|i| estates.get(i + 1))
+                .map(|next| (*next).to_string())
+        }
     }
 }
 
@@ -366,12 +415,17 @@ fn filter_line(screen: &FleetScreen) -> Paragraph<'static> {
     } else {
         "off"
     };
+    let estate = screen
+        .filters
+        .estate
+        .clone()
+        .unwrap_or_else(|| "all".to_string());
     let text = if screen.filter_focus {
         format!("filter> {}_", screen.filters.text)
     } else {
         format!(
-            "filter: {} · state {state} · nonterminal {nonterminal}  \
-             ('/' filter · 's' state · 'a' nonterminal · 'v' preview · 'x' clear)",
+            "filter: {} · state {state} · estate {estate} · nonterminal {nonterminal}  \
+             ('/' filter · 's' state · 'e' estate · 'a' nonterminal · 'v' preview · 'x' clear)",
             if screen.filters.text.is_empty() {
                 "-"
             } else {
@@ -677,6 +731,53 @@ mod tests {
             None,
             "cycles back to 'all'"
         );
+    }
+
+    #[test]
+    fn the_estate_filter_matches_a_rows_estate_exactly() {
+        let mut fleet = fleet_of(&[("a", "pending"), ("b", "running")]);
+        fleet["works"][0]["estate_root"] = json!("payments");
+        fleet["works"][1]["estate_root"] = json!("billing");
+        let rows = fleet_rows(&fleet);
+        let filters = Filters {
+            estate: Some("payments".to_string()),
+            ..Filters::default()
+        };
+        let visible: Vec<&str> = rows
+            .iter()
+            .filter(|r| filters.matches(r))
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(visible, vec!["a"]);
+    }
+
+    #[test]
+    fn the_estate_filter_cycles_through_every_estate_present_then_back_to_all() {
+        let mut fleet = fleet_of(&[("a", "pending"), ("b", "pending"), ("c", "pending")]);
+        fleet["works"][0]["estate_root"] = json!("billing");
+        fleet["works"][1]["estate_root"] = json!("payments");
+        fleet["works"][2]["estate_root"] = json!("payments"); // duplicate, must not repeat
+        let rows = fleet_rows(&fleet);
+
+        let mut screen = FleetScreen::default();
+        screen.on_key(KeyCode::Char('e'), &rows);
+        assert_eq!(screen.filters.estate.as_deref(), Some("billing"));
+        screen.on_key(KeyCode::Char('e'), &rows);
+        assert_eq!(screen.filters.estate.as_deref(), Some("payments"));
+        screen.on_key(KeyCode::Char('e'), &rows);
+        assert_eq!(
+            screen.filters.estate, None,
+            "cycles back to 'all' after the last distinct estate"
+        );
+    }
+
+    #[test]
+    fn the_estate_filter_ignores_rows_with_no_estate() {
+        // `"-"` is `field_text`'s absent-value marker (§10.2) — it must
+        // never itself become a selectable filter value.
+        let rows = fleet_rows(&fleet_of(&[("a", "pending")]));
+        assert_eq!(rows[0].estate, "-");
+        assert_eq!(next_estate_filter(None, &rows), None);
     }
 
     #[test]

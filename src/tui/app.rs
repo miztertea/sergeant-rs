@@ -198,6 +198,15 @@ pub struct App {
     pub status: String,
     /// Set once the user asked to leave.
     pub quit: bool,
+    /// W4d deliverable 2 (H1 §9's "cwd... is used as an initial filter"):
+    /// the estate the CLI opportunistically admitted from cwd at launch, if
+    /// any — presentation-only state, set once by
+    /// [`App::apply_initial_estate`] and otherwise only read (never
+    /// re-derived) here — no module under `src/tui/` reads local disk
+    /// (§30's rule). Distinct from [`super::fleet::Filters::estate`], which
+    /// the operator is free to retoggle afterward with `e`; this slot only
+    /// ever supplies that filter's *initial* value.
+    pub selected_estate: Option<String>,
 }
 
 impl App {
@@ -223,7 +232,20 @@ impl App {
             live: Live::default(),
             status: "loading…".to_string(),
             quit: false,
+            selected_estate: None,
         }
+    }
+
+    /// Apply the CLI's opportunistic cwd estate (deliverable 2) as Fleet's
+    /// initial estate filter — called at most once, before the first
+    /// [`App::refresh`], so it is a starting point the operator can still
+    /// freely retoggle with `e`, never a re-imposed default. `None` (cwd is
+    /// not a valid estate root, or the TUI was launched from one that
+    /// hasn't been addressed) leaves Fleet showing every estate, the same
+    /// as it always has.
+    pub fn apply_initial_estate(&mut self, estate: Option<String>) {
+        self.selected_estate = estate.clone();
+        self.fleet.filters.estate = estate;
     }
 
     /// Re-read everything this app shows from the API.
@@ -277,21 +299,53 @@ impl App {
         // Best-effort, same reasoning as `work_screen`'s: a failed estate
         // read must not blank fleet/system data that loaded fine.
         if self.destination == Destination::Estate {
-            match client.repos().await {
-                Ok(result) => {
-                    self.estate.repos = result["repos"].as_array().cloned().unwrap_or_default();
+            // W4d deliverable 3: a client that already addresses one fixed
+            // estate (the pre-H1, still-supported single-estate-scoped
+            // shape) auto-picks it — no picker ever appears, and
+            // repos/groups/doctor below read exactly as they always have.
+            // A host-scoped client (no fixed `estate_root`) instead reads
+            // the admitted-estates list for the picker; its own choice (or
+            // none yet) decides what, if anything, gets addressed below.
+            if let Some(root) = client.estate_root() {
+                let name = self
+                    .estate
+                    .picked
+                    .as_ref()
+                    .filter(|p| p.root == root)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| {
+                        root.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| root.to_string_lossy().into_owned())
+                    });
+                self.estate.auto_pick(root, &name);
+            } else {
+                match client.estates().await {
+                    Ok(result) => {
+                        self.estate.estates =
+                            result["estates"].as_array().cloned().unwrap_or_default();
+                    }
+                    Err(e) => self.estate.last_error = Some(e.to_string()),
                 }
-                Err(e) => self.estate.last_error = Some(e.to_string()),
             }
-            match client.groups().await {
-                Ok(result) => {
-                    self.estate.groups = result["groups"].as_array().cloned().unwrap_or_default();
+            if let Some(picked) = self.estate.picked.clone() {
+                match client.repos_for(Some(&picked.root)).await {
+                    Ok(result) => {
+                        self.estate.repos = result["repos"].as_array().cloned().unwrap_or_default();
+                    }
+                    Err(e) => self.estate.last_error = Some(e.to_string()),
                 }
-                Err(e) => self.estate.last_error = Some(e.to_string()),
-            }
-            match client.doctor().await {
-                Ok(result) => self.estate.doctor = result,
-                Err(e) => self.estate.last_error = Some(e.to_string()),
+                match client.groups_for(Some(&picked.root)).await {
+                    Ok(result) => {
+                        self.estate.groups =
+                            result["groups"].as_array().cloned().unwrap_or_default();
+                    }
+                    Err(e) => self.estate.last_error = Some(e.to_string()),
+                }
+                match client.doctor_for(Some(&picked.root)).await {
+                    Ok(result) => self.estate.doctor = result,
+                    Err(e) => self.estate.last_error = Some(e.to_string()),
+                }
             }
             self.estate.clamp();
         }
@@ -1190,6 +1244,38 @@ mod tests {
             "state": state,
             "intent": format!("intent for {id}"),
         })).collect::<Vec<_>>()})
+    }
+
+    #[test]
+    fn apply_initial_estate_seeds_selected_estate_and_fleets_filter_once() {
+        let mut app = App::new();
+        assert_eq!(app.selected_estate, None);
+        assert_eq!(app.fleet.filters.estate, None);
+
+        app.apply_initial_estate(Some("payments".to_string()));
+        assert_eq!(app.selected_estate.as_deref(), Some("payments"));
+        assert_eq!(app.fleet.filters.estate.as_deref(), Some("payments"));
+
+        // The operator's own retoggle afterward is not re-imposed by a
+        // second call — deliberately not exercised here since a real
+        // caller never calls it twice; what matters is that Fleet's own `e`
+        // keystroke, once applied, is the filter's whole story from then on
+        // (this is a documentation test, not a behavioral guard: nothing
+        // re-applies `selected_estate` after startup).
+        app.fleet.filters.estate = None;
+        assert_eq!(
+            app.selected_estate.as_deref(),
+            Some("payments"),
+            "the initial slot itself is untouched by the operator's later retoggle"
+        );
+    }
+
+    #[test]
+    fn apply_initial_estate_with_no_cwd_estate_leaves_fleet_unfiltered() {
+        let mut app = App::new();
+        app.apply_initial_estate(None);
+        assert_eq!(app.selected_estate, None);
+        assert_eq!(app.fleet.filters.estate, None);
     }
 
     #[test]

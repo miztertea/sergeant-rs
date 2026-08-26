@@ -1461,7 +1461,27 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // no-spawn set like every other observation surface, and bare
             // `sgt` no longer falls into it by default.
             let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
-            crate::tui::run(client).await.map_err(CliError::from)
+            // brief deliverable 2 (W4d), H1 §9: cwd is consulted only to
+            // default Fleet's initial estate filter, mirroring `Watch`'s own
+            // opportunistic default a few arms up (that arm's own comment
+            // names this one as its analogue) — it never gates the
+            // connection above (`estate` is always `None` here,
+            // `is_host_scoped`), and a cwd that is not an estate root falls
+            // back to no initial filter rather than refusing.
+            //
+            // The canonical root (`EstateRoot::path`), not a parsed manifest
+            // name: `Filters::estate`/`WorkRow::estate` (W4d deliverable 1)
+            // key on the same root-is-identity coordinate the daemon itself
+            // folds per Work (`estate_root`, H1 D1) — "a name is not an
+            // identity" holds here exactly as it does there, and reusing it
+            // avoids a manifest read this presentation-only default has no
+            // real need for.
+            let initial_estate = Estate::admit(&root)
+                .ok()
+                .map(|admitted| admitted.path.to_string_lossy().into_owned());
+            crate::tui::run(client, initial_estate)
+                .await
+                .map_err(CliError::from)
         }
         Command::Doctor => {
             let report = doctor::run(&data_dir, &root, data_dir_source.xdg_outranked()).await;

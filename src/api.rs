@@ -2187,12 +2187,13 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
         .work_index
         .keys()
         .map(|id| {
+            let index_row = &registry.work_index[id];
             let Some(work) = registry
                 .works
                 .get(id)
                 .or_else(|| registry.terminal_works.get(id))
             else {
-                return evicted_fleet_row(&registry.work_index[id]);
+                return evicted_fleet_row(index_row);
             };
             // `registry.run_view` alone only reaches the bounded
             // in-memory cache (`TERMINAL_RUN_CACHE_CAPACITY`); once a
@@ -2249,6 +2250,23 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
                         "turn_ceiling_secs": engine.effective_turn_ceiling(Some(work)).as_secs_f64(),
                     }),
                 );
+                // W4d deliverable 1 (H1): the per-Work estate *identity* —
+                // `Work::workspace` (the old display-name field) has been
+                // dead since estate-root Phase C (`Work`'s own doc comment:
+                // "deprecated, never written"); `WorkIndexRow::estate_root`
+                // is the live coordinate H1 actually folds per Work (D1: a
+                // canonical root, never a name — two estates may share a
+                // display name). Surfacing it here is what lets the TUI's
+                // Fleet filter (§10, this wave) narrow by estate at all
+                // against a real daemon; `null` for any Work journaled
+                // before the envelope carried it, or with no estate context.
+                object.insert(
+                    "estate_root".to_string(),
+                    index_row
+                        .estate_root
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                );
             }
             row
         })
@@ -2293,6 +2311,7 @@ fn evicted_fleet_row(row: &WorkIndexRow) -> Value {
         "created_at": row.created_at,
         "updated_at": row.updated_at,
         "evicted": true,
+        "estate_root": row.estate_root,
     })
 }
 
@@ -4670,13 +4689,20 @@ impl ApiClient {
     }
 
     /// `?estate_root=<root>` for the GET/DELETE routes that have no body to
-    /// carry it in. Empty when this client addresses no estate, so the
-    /// daemon answers with refusal (c) rather than being handed a blank.
-    fn estate_query(&self) -> String {
-        match &self.estate_root {
+    /// carry it in. Empty when `root` is `None`, so the daemon answers with
+    /// refusal (c) rather than being handed a blank.
+    fn estate_query_for(root: Option<&std::path::Path>) -> String {
+        match root {
             Some(root) => format!("?estate_root={}", urlencode(&root.to_string_lossy())),
             None => String::new(),
         }
+    }
+
+    /// [`Self::estate_query_for`] over this client's own bound
+    /// [`Self::estate_root`] — the ordinary case every estate-scoped GET/
+    /// DELETE method below still uses by default.
+    fn estate_query(&self) -> String {
+        Self::estate_query_for(self.estate_root.as_deref())
     }
 
     /// Add this client's estate address to a request body, if it has one.
@@ -4862,8 +4888,23 @@ impl ApiClient {
 
     /// `GET /v1/estate/repos` (§16.2/§20.4) — declared repositories.
     pub async fn repos(&self) -> Result<Value, ClientError> {
-        self.get(&format!("/v1/estate/repos{}", self.estate_query()))
-            .await
+        self.repos_for(self.estate_root.as_deref()).await
+    }
+
+    /// [`Self::repos`], addressed at an explicit estate root rather than
+    /// this client's own bound one (W4d deliverable 3: the Estate screen's
+    /// picker reads whichever estate is picked, which under host mode is
+    /// independent of whatever this client otherwise addresses — a host-
+    /// scoped client addresses none at all).
+    pub async fn repos_for(
+        &self,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/estate/repos{}",
+            Self::estate_query_for(estate_root)
+        ))
+        .await
     }
 
     /// `POST /v1/estate/repos` (§16.2/§20.4) — `manifest::add_repo`.
@@ -4901,8 +4942,20 @@ impl ApiClient {
 
     /// `GET /v1/estate/groups` (§16.2/§20.4) — declared groups.
     pub async fn groups(&self) -> Result<Value, ClientError> {
-        self.get(&format!("/v1/estate/groups{}", self.estate_query()))
-            .await
+        self.groups_for(self.estate_root.as_deref()).await
+    }
+
+    /// [`Self::groups`], addressed at an explicit estate root — see
+    /// [`Self::repos_for`]'s doc comment for why this exists.
+    pub async fn groups_for(
+        &self,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/estate/groups{}",
+            Self::estate_query_for(estate_root)
+        ))
+        .await
     }
 
     /// `POST /v1/estate/groups` (§16.2/§20.4) — `manifest::add_group`'s
@@ -4937,8 +4990,20 @@ impl ApiClient {
     /// `GET /v1/doctor` (§16.3/§20.4) — the same `doctor::Report` `sgt doctor
     /// --json` prints.
     pub async fn doctor(&self) -> Result<Value, ClientError> {
-        self.get(&format!("/v1/doctor{}", self.estate_query()))
-            .await
+        self.doctor_for(self.estate_root.as_deref()).await
+    }
+
+    /// [`Self::doctor`], addressed at an explicit estate root — see
+    /// [`Self::repos_for`]'s doc comment for why this exists.
+    pub async fn doctor_for(
+        &self,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/doctor{}",
+            Self::estate_query_for(estate_root)
+        ))
+        .await
     }
 
     /// `GET /v1/estates` (H1 §4) — every estate this daemon has admitted.

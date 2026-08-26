@@ -103,6 +103,21 @@ fn fleet_all_states() -> App {
     app
 }
 
+/// W4d deliverable 1/5: Fleet with its new estate filter dimension active —
+/// new persistent chrome (the header's `estate <name>` segment), so it gets
+/// its own geometry-matrix entry per the brief.
+fn fleet_estate_filter() -> App {
+    let mut app = App::new();
+    app.destination = Destination::Fleet;
+    app.drawer_open = false;
+    app.rows = fleet::fleet_rows(&json!({"works": [
+        {"id": "01PAY", "state": "pending", "intent": "payments work", "estate_root": "payments"},
+        {"id": "01BILL", "state": "pending", "intent": "billing work", "estate_root": "billing"},
+    ]}));
+    app.fleet.filters.estate = Some("payments".to_string());
+    app
+}
+
 /// A single row with every field near-worst-case long, so §19.10's "long
 /// values remain contained" has something real to check: the Fleet table's
 /// own `Fill`/`Length` constraints (not hand-padded strings, §10.1's
@@ -117,7 +132,7 @@ fn fleet_long_values() -> App {
         "state": "needs_input",
         "intent": long,
         "workflow": long,
-        "workspace": long,
+        "estate_root": long,
         "stage": {"stage_id": "10-implement", "index": 1, "of": 2, "status": "running", "detail": long},
         "resolved_backend": "fake",
     }]}));
@@ -206,6 +221,20 @@ fn estate_health() -> App {
     // The remedy only shows on the Detail pane for the *selected* check
     // (§12.3) — select disk_pressure so its remedy is actually on screen.
     app.estate.check_selected = 1;
+    app
+}
+
+/// W4d deliverable 3/5: the Estate screen's picker, above its existing
+/// sub-tabs — new persistent chrome fed by `GET /v1/estates`, so it gets
+/// its own geometry-matrix entry per the brief.
+fn estate_picker() -> App {
+    let mut app = App::new();
+    app.destination = Destination::Estate;
+    app.drawer_open = false;
+    app.estate.estates = vec![
+        json!({"name": "payments", "root": "/estates/payments"}),
+        json!({"name": "billing", "root": "/estates/billing"}),
+    ];
     app
 }
 
@@ -330,6 +359,45 @@ fn geometry_fleet_long_values_stay_contained() {
         assert!(
             text.contains("needs_input"),
             "{w}x{h}: the state column must survive a huge intent: {text}"
+        );
+    }
+}
+
+#[test]
+fn geometry_fleet_estate_filter_shows_in_the_header() {
+    let app = fleet_estate_filter();
+    for (w, h) in SIZES {
+        let text = text_of(&draw_at(&app, w, h));
+        assert!(
+            text.contains("estate payments"),
+            "{w}x{h}: the active estate filter must show in the header: {text}"
+        );
+    }
+    // Only Wide is guaranteed room for both rows at once; the filter
+    // narrows to the one estate regardless of tier.
+    let text = text_of(&draw_at(&app, 180, 48));
+    assert!(text.contains("payments work"), "{text}");
+    assert!(
+        !text.contains("billing work"),
+        "the estate filter must actually narrow the visible rows: {text}"
+    );
+}
+
+#[test]
+fn geometry_estate_picker_lists_every_admitted_estate() {
+    let app = estate_picker();
+    for (w, h) in SIZES {
+        let text = text_of(&draw_at(&app, w, h));
+        assert!(text.contains("Estate"), "{w}x{h}: {text}");
+        assert!(text.contains("payments"), "{w}x{h}: {text}");
+        assert!(text.contains("billing"), "{w}x{h}: {text}");
+        // The picker replaces the sub-tabs entirely until one is chosen —
+        // deliverable 3: "the screen's own behavior is unchanged once an
+        // estate is picked", the other side of which is that there is
+        // nothing of theirs to show before one is.
+        assert!(
+            !text.contains("Repositories"),
+            "{w}x{h}: sub-tabs must not show before an estate is picked: {text}"
         );
     }
 }
