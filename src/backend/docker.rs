@@ -332,16 +332,27 @@ impl DockerBackend {
     /// journaled, separately, as evidence (`emit_image_resolved`); this file
     /// is what retry actually reads.
     fn pin_path(&self, work_id: &str, stage_id: &str) -> PathBuf {
-        // Stage ids are already constrained to plain directory names
-        // (`domain::is_plain_name`, enforced at workflow load); work ids are
-        // ULIDs. Neither can carry a path separator, so joining them with
-        // `__` cannot collide across different (work, stage) pairs and
-        // cannot escape the pins directory.
+        // E12: the stage id is interpolated *inside* one filename, and
+        // `PathBuf::join` splits an embedded `/` into path components — so a
+        // hierarchical stage id (W1 §3, `10-investigate/00-lead`) would send
+        // this pin into a directory nothing creates, and image-pin caching
+        // would silently fall back to unpinned resolution for every nested
+        // leaf. Each *component* of a stage id is still a plain directory
+        // name (`domain::is_plain_name`, enforced at workflow load) and a
+        // work id is a ULID, so `/` is the only character that has to be
+        // encoded here; `%` is encoded with it to keep the encoding
+        // injective, so two distinct stage ids can never land on one pin.
+        //
+        // The encoded name is bound to its own variable rather than
+        // interpolated from `stage_id` directly so the guard test below —
+        // which reads this source text — stays a decisive scan for the raw
+        // shape, with no allowlisted exception to keep in sync.
+        let encoded = stage_id.replace('%', "%25").replace('/', "%2F");
         self.config
             .data_dir
             .join("docker-adapter")
             .join("image-pins")
-            .join(format!("{work_id}__{stage_id}.json"))
+            .join(format!("{work_id}__{encoded}.json"))
     }
 
     fn read_pin(&self, work_id: &str, stage_id: &str) -> Option<ResolvedImage> {
@@ -1538,6 +1549,113 @@ mod tests {
         assert_eq!(read_back, image);
         // A different stage of the same work never sees this pin.
         assert!(backend.read_pin("w1", "s2").is_none());
+    }
+
+    /// E12: a hierarchical stage id (W1 §3) must not turn one pin *filename*
+    /// into a path. `format!("{work_id}__{stage_id}.json")` interpolates the
+    /// stage id **inside** the filename, and `PathBuf::join` then splits an
+    /// embedded `/` into two components — so a nested leaf's pin would have
+    /// been written under a directory that never exists, image-pin caching
+    /// silently falling back to unpinned resolution for every nested stage
+    /// with no loud failure. The encoding is injective, so two distinct
+    /// stage ids can never share a pin.
+    #[test]
+    fn a_hierarchical_stage_id_pins_to_one_filename_not_a_path() {
+        let (_dir, config) = config();
+        let pins = config.data_dir.join("docker-adapter").join("image-pins");
+        let backend = DockerBackend::new(config).expect("backend");
+
+        let path = backend.pin_path("w1", "10-investigate/00-lead");
+        assert_eq!(
+            path.parent(),
+            Some(pins.as_path()),
+            "the pin must stay directly in the pins directory: {path:?}"
+        );
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("pin file name");
+        assert!(
+            !file_name.contains('/'),
+            "the stage id must be encoded, not interpolated raw: {file_name}"
+        );
+
+        let image = ResolvedImage {
+            image_requested: "alpine:3.24".into(),
+            image_id: "sha256:deadbeef".into(),
+            repo_digests: vec![],
+            platform: "linux/amd64".into(),
+        };
+        backend.write_pin("w1", "10-investigate/00-lead", &image);
+        assert_eq!(
+            backend
+                .read_pin("w1", "10-investigate/00-lead")
+                .expect("a nested leaf's pin must round-trip"),
+            image
+        );
+        // Injective: a sibling leaf has its own pin, and the encoding of `/`
+        // never collides with a stage id that literally contains it.
+        assert!(backend.read_pin("w1", "10-investigate/10-code").is_none());
+        assert_ne!(
+            backend.pin_path("w1", "a/b"),
+            backend.pin_path("w1", "a%2Fb"),
+            "distinct stage ids must never share a pin file"
+        );
+    }
+
+    /// E12's standing guard: `stage_id` never reaches a filesystem path
+    /// un-encoded. The dangerous shape is interpolating it *into* a string
+    /// that is then joined — `PathBuf::join` splits the embedded `/`, so the
+    /// result is a path, not the filename the author meant. `pin_path` was
+    /// the one instance the recon found; this asserts it stays at zero.
+    ///
+    /// Plainly joining a stage id (`dir.join(stage_id)`) is a different
+    /// thing and stays legal: there the split into components is exactly the
+    /// intent — a composed id resolves its own nested directory (W1 §3).
+    #[test]
+    fn no_source_file_interpolates_a_stage_id_into_a_joined_filename() {
+        // Split so this scanner's own detector line is not itself a match —
+        // `concat!` rejoins it at compile time, but no *source* line here
+        // ever contains the contiguous pattern.
+        const JOINED_FORMAT: &str = concat!(".join(format", "!(");
+
+        fn scan(dir: &Path, offenders: &mut Vec<String>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan(&path, offenders);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (number, line) in text.lines().enumerate() {
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue;
+                    }
+                    if code.contains(JOINED_FORMAT) && code.contains("stage_id") {
+                        offenders.push(format!("{}:{}: {code}", path.display(), number + 1));
+                    }
+                }
+            }
+        }
+
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        scan(&src, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "E12: a stage id interpolated into a filename that is then joined splits on `/` \
+             into path components — encode it (see DockerBackend::pin_path):\n{}",
+            offenders.join("\n")
+        );
     }
 
     /// `sgt doctor`'s disk-pressure measurement over a store that actually
