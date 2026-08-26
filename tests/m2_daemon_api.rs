@@ -40,7 +40,7 @@ use sergeant_rs::domain::event::{EVENT_SCHEMA, Event};
 use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED, KIND_WORK_CANCELED,
-    KIND_WORK_RESUMED, KIND_WORK_SUBMITTED, WorkState,
+    KIND_WORK_RESUMED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, WorkState,
 };
 use sergeant_rs::domain::workflow::{KIND_STAGE_ENTERED, KIND_WORKFLOW_BOUND};
 use sergeant_rs::runtime::engine::DEFAULT_TURN_CAP;
@@ -4003,6 +4003,307 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
          or this test proves nothing about ordering: {:?}",
         events.iter().map(|e| &e.kind).collect::<Vec<_>>()
     );
+}
+
+// ------------------------------------- H1-15 (W4b) execution lane
+
+/// [`start_with_fake`], with the execution lane capped at `cap` — the one
+/// knob the lane tests below need beyond what `start_with_fake` already
+/// gives every §22.6 test above.
+async fn start_with_fake_capped(data_dir: &Path, fake: &FakeBackend, cap: usize) -> DaemonHandle {
+    daemon::start_with(
+        data_dir,
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            execution_lane_cap: Some(cap),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start")
+}
+
+/// Every `KIND_WORK_WAITING`/`KIND_WORK_BLOCKED` payload journaled for
+/// `work_id`'s `reason`, in order — the direct-journal read the lane tests
+/// use to tell "waiting on the lane" from "blocked on the turn cap" apart,
+/// the same instrument `t3`/the SGT_TURN_CAP CLI test already use for
+/// journal-level assertions.
+fn park_reasons(data_dir: &Path, work_id: &str, kind: &str) -> Vec<String> {
+    Journal::replay_data_dir(data_dir)
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == kind && e.work_id.as_deref() == Some(work_id))
+        .map(|e| e.payload["reason"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Deliverable 4's decisive test: a lane capped at 1, two Works retried
+/// concurrently — the second must wait for the first rather than both
+/// launching at once, and both must still complete once the first frees its
+/// slot. Deliverable 2 rides along for free: the second Work's wait is
+/// journaled as `KIND_WORK_WAITING` (state `waiting`), never
+/// `KIND_WORK_BLOCKED` (state `blocked`) — the turn-cap vocabulary — so the
+/// two are observably distinct via the same journal a `work show` reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANEWORKA000000000000000", "01LANEWORKB000000000000000");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::complete(), FakeStep::complete()],
+    );
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    fake.hold_launches();
+    let retry = |work_id: &'static str| {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("retry request")
+                .status()
+        })
+    };
+
+    // A is admitted (the lane has one slot) and parks inside the fake's own
+    // launch gate — the external effect itself, one seam past the lane.
+    let retry_a = retry(work_a);
+    assert!(
+        fake.await_stalled_launches(1, Duration::from_secs(30)),
+        "A's launch never reached its gate"
+    );
+
+    // B cannot be admitted: the lane is full. It must not park in the fake's
+    // gate at all (there is only one slot, A holds it) — it parks *before*
+    // ever reaching LAUNCH, on the lane itself.
+    let retry_b = retry(work_b);
+    let b_waiting = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let show: Value = client()
+                .get(format!("{}/v1/work/{work_b}", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("show B")
+                .json()
+                .await
+                .expect("show B json");
+            if show["work"]["state"] == "waiting" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        b_waiting.is_ok(),
+        "B never reported `waiting` while the lane was held by A"
+    );
+    // Only one launch ever reached the fake's gate — B's is genuinely
+    // parked earlier, on the lane, not queued behind A inside the backend.
+    assert!(
+        !fake.await_stalled_launches(2, Duration::from_millis(200)),
+        "B must not reach LAUNCH while the lane is full"
+    );
+
+    fake.release_launches();
+    let (status_a, status_b) = (
+        retry_a.await.expect("A retry task"),
+        retry_b.await.expect("B retry task"),
+    );
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
+
+    // Both actually finish (B's admission unblocked once A released).
+    let both_completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let list: Value = client()
+                .get(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("list")
+                .json()
+                .await
+                .expect("list json");
+            // `completed_dirty` (ADR 0007(b)) counts too: the seeded surface
+            // points at a non-git `data_dir`, so teardown strands it — an
+            // artifact of this test's fixture, not of the lane feature under
+            // test, which only cares that both Works reached a completed
+            // disposition rather than staying `active`/`waiting`.
+            let done = list["works"]
+                .as_array()
+                .expect("works")
+                .iter()
+                .filter(|w| {
+                    w["state"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("completed"))
+                })
+                .count();
+            if done == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(both_completed.is_ok(), "both Works must reach completed");
+
+    handle.shutdown().await;
+
+    // Deliverable 2: distinct journal vocabulary. B waited on the lane
+    // (`KIND_WORK_WAITING`, a lane-specific reason) and never touched the
+    // turn-cap's own `KIND_WORK_BLOCKED` vocabulary.
+    let waiting = park_reasons(dir.path(), work_b, KIND_WORK_WAITING);
+    assert!(
+        waiting.iter().any(|r| r.contains("execution lane")),
+        "B's wait must be journaled with a lane-specific reason, got {waiting:?}"
+    );
+    // `seed_blocked_run` itself journals one `blocked` ("seeded") to give the
+    // retry something to retry from — the fixture's own starting position,
+    // not evidence about the lane. What must never appear is a *second* one
+    // caused by the retry itself (a turn-cap-style block).
+    let blocked = park_reasons(dir.path(), work_b, KIND_WORK_BLOCKED);
+    assert_eq!(
+        blocked,
+        vec!["seeded".to_string()],
+        "B waited on the lane, not the turn cap — retrying it must never add \
+         a second `blocked` reason: {blocked:?}"
+    );
+}
+
+/// Deliverable 4: a permit released on a **daemon-side launch error** (the
+/// backend's own `launch()` returning `Err`, settled in `settle_launch`'s
+/// no-live-execution branch, never `stop_execution`). If this leaked, B's
+/// retry below would hang forever on a lane of 1 with A's permit never
+/// freed — this test would time out rather than merely fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_execution_lane_permit_releases_on_a_daemon_side_launch_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANEFAILA0000000000000000", "01LANEFAILB0000000000000000");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [
+            FakeStep::invalid_model_refusal("no such model"),
+            FakeStep::complete(),
+        ],
+    );
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    let status_a = http
+        .post(format!("{}/v1/work/{work_a}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("A retry")
+        .status();
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+
+    let show_a: Value = http
+        .get(format!("{}/v1/work/{work_a}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show A")
+        .json()
+        .await
+        .expect("show A json");
+    assert_eq!(
+        show_a["work"]["state"], "blocked",
+        "A's launch error must fail it closed, not leave it waiting: {show_a}"
+    );
+
+    // The decisive check: B's retry must not hang. A bounded timeout — not
+    // a bare `.await` — is what turns "the permit leaked" into a named test
+    // failure instead of a wedged suite.
+    let retried_b = tokio::time::timeout(Duration::from_secs(10), async {
+        http.post(format!("{}/v1/work/{work_b}/retry", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid()}))
+            .send()
+            .await
+            .expect("B retry")
+            .status()
+    })
+    .await;
+    handle.shutdown().await;
+
+    let status_b = retried_b
+        .expect("B's retry never answered — A's execution-lane permit leaked on the launch error");
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
+}
+
+/// Deliverable 4: a permit released on **execution failure** — an
+/// observed `BackendSignal::Failed`, settled through `drive`'s `Failed` arm
+/// and released in `stop_execution`, the other release chokepoint from the
+/// launch-error one above. Same shape, same decisive check: B's retry must
+/// not hang on a lane of 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_execution_lane_permit_releases_on_execution_failure() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANESTOPA0000000000000000", "01LANESTOPB0000000000000000");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::fail("the turn failed"), FakeStep::complete()],
+    );
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    let status_a = http
+        .post(format!("{}/v1/work/{work_a}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("A retry")
+        .status();
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+
+    let show_a: Value = http
+        .get(format!("{}/v1/work/{work_a}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show A")
+        .json()
+        .await
+        .expect("show A json");
+    assert_eq!(show_a["work"]["state"], "failed", "A must fail: {show_a}");
+
+    let retried_b = tokio::time::timeout(Duration::from_secs(10), async {
+        http.post(format!("{}/v1/work/{work_b}/retry", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid()}))
+            .send()
+            .await
+            .expect("B retry")
+            .status()
+    })
+    .await;
+    handle.shutdown().await;
+
+    let status_b = retried_b
+        .expect("B's retry never answered — A's execution-lane permit leaked on stage failure");
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
 }
 
 // ------------------------------------- the throughput floor, as a guard

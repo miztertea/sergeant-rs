@@ -4931,6 +4931,79 @@ mod tests {
         );
     }
 
+    /// Numbers-need-provenance: the execution lane's built-in default must
+    /// trace to the one thing this repo actually measured it against — the
+    /// host's own hardware parallelism — not an arbitrary round number.
+    #[test]
+    fn default_execution_lane_cap_is_grounded_in_host_parallelism() {
+        let expected = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4);
+        assert_eq!(default_execution_lane_cap(), expected);
+        assert_eq!(
+            default_intelligence_lane_cap(),
+            expected,
+            "the intelligence lane's stub default reuses the same grounding (R2)"
+        );
+    }
+
+    /// D4's structural admission test: a lane of `cap` admits exactly `cap`
+    /// concurrent work ids without blocking, and the `cap + 1`th is refused
+    /// — never blocked internally, never silently oversubscribed.
+    #[test]
+    fn try_admit_execution_is_bounded_by_the_configured_cap() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let engine = engine(dir.path()).with_execution_lane_cap(2);
+
+        assert!(engine.try_admit_execution("w1"));
+        assert!(engine.try_admit_execution("w2"));
+        assert!(
+            !engine.try_admit_execution("w3"),
+            "a third admission must be refused once the cap-2 lane is full"
+        );
+
+        engine.release_execution_permit("w1");
+        assert!(
+            engine.try_admit_execution("w3"),
+            "releasing a held permit must free exactly one slot"
+        );
+    }
+
+    /// Releasing a work id that holds no permit is a documented no-op
+    /// (idempotent), not a panic — the same posture as `block`'s repeat call
+    /// (above) and every other release-on-a-path-that-may-not-apply engine
+    /// helper.
+    #[test]
+    fn release_execution_permit_is_idempotent_for_a_work_holding_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let engine = engine(dir.path()).with_execution_lane_cap(1);
+        engine.release_execution_permit("never-admitted");
+        engine.release_execution_permit("never-admitted");
+        assert!(engine.try_admit_execution("w1"), "the lane is still whole");
+    }
+
+    /// D3's structural proof: draining every execution-lane permit must
+    /// leave the intelligence lane's own capacity completely untouched —
+    /// they are two separate `Arc<Semaphore>`s, not one budget split two
+    /// ways. Revert-sensitive: a shared-semaphore implementation would fail
+    /// this by starving the intelligence lane's `available_permits` too.
+    #[test]
+    fn execution_lane_exhaustion_never_touches_the_intelligence_lane() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let engine = engine(dir.path())
+            .with_execution_lane_cap(1)
+            .with_intelligence_lane_cap(3);
+
+        assert_eq!(engine.intelligence_lane.available_permits(), 3);
+        assert!(engine.try_admit_execution("w1"));
+        assert!(!engine.try_admit_execution("w2"), "execution lane is full");
+        assert_eq!(
+            engine.intelligence_lane.available_permits(),
+            3,
+            "the intelligence lane's own capacity must be untouched by execution-lane pressure"
+        );
+    }
+
     /// H1 touch point #4 as D10 leaves it: `Engine::commit` is still the one
     /// chokepoint every engine-emitted event goes through, but the
     /// coordinate it stamps is now the **Work's own**, not the engine's.
