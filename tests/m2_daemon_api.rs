@@ -4683,19 +4683,28 @@ async fn t12_submission_throughput_has_an_automated_floor() {
     }
     assert_eq!(created, BURST, "every submission must be accepted");
 
-    // #278 / W4b (J3, ratified lane behavior): the execution lane
-    // (`Engine::try_admit_execution`, `src/runtime/engine.rs`) means a launch
-    // that finds the lane full is handed off to a detached task
-    // (`api::crank_inner`'s `EngineNext::Launch` arm, `src/api.rs`) and the
-    // submit's HTTP response returns immediately with the Work left
-    // `waiting` — the response body no longer means "this Work is done" the
-    // way it did before the lane existed. Reading completion from the submit
-    // response body (the original shape of this test) is exactly the
-    // regression N3R2-04's own doc comment above warns about: it measures
-    // the HTTP surface, not the submit path's whole operation. So the
-    // measured operation is now submit -> every accepted Work reaches a
-    // terminal state, and the timer runs across that whole span, not just
-    // the burst of concurrent POSTs.
+    // W4b's execution lane (`Engine::try_admit_execution`, `src/runtime/engine.rs`,
+    // J3 ratified) means a launch that finds the lane full is handed off to a
+    // detached task (`api::crank_inner`'s `EngineNext::Launch` arm, `src/api.rs`)
+    // and the submit's HTTP response returns immediately with the Work left
+    // `waiting` — the response body no longer means "this Work is done" the way
+    // it did before the lane existed. Reading completion from the submit response
+    // body (the original shape of this test) is exactly the regression N3R2-04's
+    // own doc comment above warns about: it measures the HTTP surface, not the
+    // submit path's whole operation. So the measured operation is now submit ->
+    // every accepted Work reaches a terminal state, and the timer runs across
+    // that whole span, not just the burst of concurrent POSTs.
+    //
+    // This is a fix for the lane-era measurement gap described above, not a fix
+    // for #278. #278 asks for two things this change does not do: (a) skip or
+    // scale the wall-clock floor under coverage instrumentation, and (b) attach
+    // dated measurements to (or delete) the BUDGET / CONTENTION_ALLOWANCE /
+    // THROUGHPUT_FLOOR derivation chain below. Both remain open in #278 — this
+    // change only widens what the timer measures (it now also covers
+    // execution-lane parking wait, the detached task's own scheduling, and this
+    // poll loop's sequential request overhead against every submitted Work), so
+    // an instrumented run is, if anything, more likely to trip THROUGHPUT_FLOOR
+    // than before, not less. Do not treat #278 as resolved by this commit.
     let poll_deadline = Instant::now() + Duration::from_secs(30);
     let mut states: Vec<String> = Vec::new();
     loop {
@@ -4762,9 +4771,9 @@ async fn t12_submission_throughput_has_an_automated_floor() {
          git-spawn overhead (#128). This is the whole submit path — estate discovery, \
          workflow bind, `git worktree add`, reservation, launch, and (lane era, W4b) \
          however long the execution lane parks a launch before admitting it — so any \
-         external effect of ~80 ms or more put back under the core lock, or any lane \
-         parking that does not clear well inside a 25-burst on a >=2-core host, lands \
-         below it, whatever the host speed."
+         external effect of ~80 ms or more put back under the core lock, or execution-lane \
+         parking that does not clear well inside a 25-burst, lands below it, whatever the \
+         host speed."
     );
 }
 
