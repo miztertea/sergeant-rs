@@ -464,6 +464,16 @@ pub struct ApiState {
     /// for its whole life (§1.2) — read by [`drive_completions`]'s rotation
     /// trigger (§10.4).
     pub prune_policy: crate::runtime::prune::PrunePolicy,
+    /// W5 brief deliverable 1(a): how often [`maybe_run_periodic_sweep`]
+    /// re-walks every admitted estate's mounts. A sweep is a real git walk
+    /// per mount (`for-each-ref` + one `merge-base` per ref), so unlike the
+    /// prune trigger's in-memory checks this cannot run every completion-poll
+    /// tick without cost; production uses the default, a test can hold it at
+    /// zero to make a tick always due.
+    pub sweep_interval: Duration,
+    /// Last time [`maybe_run_periodic_sweep`] actually ran, so the interval
+    /// above throttles across ticks rather than per-request.
+    pub last_swept: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 /// Build the axum router for the full v1 surface.
@@ -770,6 +780,12 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
 /// execution in flight costs the enumeration and nothing else.
 pub const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+/// W5 brief deliverable 1(a): default cadence for
+/// [`maybe_run_periodic_sweep`]'s multi-estate walk — real git subprocesses
+/// per mount, unlike [`COMPLETION_POLL_INTERVAL`]'s in-memory checks, so it
+/// runs far less often than every completion-poll tick.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+
 /// Settle turns that finish with nobody watching (issue #46).
 ///
 /// **The measured defect.** Run B's stage `00-contract` sat `active` for
@@ -899,6 +915,7 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
             return;
         }
         maybe_run_rotation_triggered_prune(&state).await;
+        maybe_run_periodic_sweep(&state).await;
     }
 }
 
@@ -989,6 +1006,89 @@ async fn maybe_run_rotation_triggered_prune(state: &ApiState) {
         Err(join_err) => {
             tracing::error!(error = %join_err, "rotation-triggered prune planning task panicked");
         }
+    }
+}
+
+/// The estates a periodic sweep pass classifies this tick.
+///
+/// W5 brief deliverable 1(a) — the caller `runtime::sweep::classify`'s own
+/// `// W4a seam:` comment names as owed: every *available* admitted estate
+/// (an unavailable one already failed re-validation; walking its mount would
+/// only reproduce the same git-level error the registry already recorded,
+/// never new information a sweep could add). Pure and synchronous so a test
+/// can assert the selection without paying for a real git walk.
+fn periodic_sweep_targets(estates: &crate::runtime::estates::EstateRegistry) -> Vec<PathBuf> {
+    estates
+        .entries()
+        .into_iter()
+        .filter(|entry| entry.available)
+        .map(|entry| entry.estate.root)
+        .collect()
+}
+
+/// W5 brief deliverable 1(a): the periodic multi-estate sweep caller
+/// `runtime::sweep`'s own seam comment names as not yet built. Runs on the
+/// same crank-loop tick as [`maybe_run_rotation_triggered_prune`], throttled
+/// by `state.sweep_interval` — a sweep's per-mount `for-each-ref`/
+/// `merge-base` walk is not cheap enough to repeat every completion-poll
+/// tick the way the prune trigger's in-memory checks are.
+///
+/// Classification only, exactly like `GET /v1/sweep`: this never deletes
+/// anything ([`sweep::classify`]'s own doc — "mutates nothing"), so a
+/// failure or an empty registry costs nothing but a skipped log line, and
+/// the deliberate two-step confirm before any `branch -D` (`POST
+/// /v1/sweep`) stays the operator's own explicit call.
+async fn maybe_run_periodic_sweep(state: &ApiState) {
+    {
+        let mut last = state.last_swept.lock().expect("last_swept lock poisoned");
+        let now = Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < state.sweep_interval) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let roots = periodic_sweep_targets(&state.estates);
+    if roots.is_empty() {
+        return;
+    }
+    let works = {
+        let core = CoreGuard::acquire(&state.core).await;
+        journaled_work_states(&core)
+    };
+    for root in roots {
+        let estate = match Estate::resolve(&root) {
+            Ok(estate) => estate,
+            Err(e) => {
+                tracing::warn!(
+                    estate = %root.display(),
+                    error = %e,
+                    "periodic sweep: estate no longer resolves"
+                );
+                continue;
+            }
+        };
+        let works = works.clone();
+        let report = blocking(move || sweep::classify(&estate, &works)).await;
+        let mut redundant = 0usize;
+        let mut orphan = 0usize;
+        let mut retained = 0usize;
+        for repo in &report.repositories {
+            for branch in &repo.branches {
+                match branch.classification {
+                    sweep::Classification::Redundant => redundant += 1,
+                    sweep::Classification::Orphan => orphan += 1,
+                    sweep::Classification::Retained => retained += 1,
+                    sweep::Classification::Active => {}
+                }
+            }
+        }
+        tracing::info!(
+            estate = %root.display(),
+            redundant,
+            orphan,
+            retained,
+            "periodic sweep"
+        );
     }
 }
 
@@ -5314,6 +5414,48 @@ mod tests {
     use crate::domain::event::EVENT_SCHEMA;
     use crate::runtime::projection::work_registry_projection;
 
+    fn scaffold_estate_manifest(root: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(root.join("repos").join("solo")).expect("mount dir");
+        std::fs::write(
+            root.join("sergeant.toml"),
+            format!("[estate]\nname = {name:?}\n"),
+        )
+        .expect("manifest");
+    }
+
+    /// W5 brief deliverable 1(a): `periodic_sweep_targets` names every
+    /// *available* admitted estate and skips one that failed
+    /// re-validation — the same selection `EstatePolicies::from_registry`
+    /// makes for retention, applied to what a periodic sweep pass walks.
+    #[test]
+    fn periodic_sweep_targets_includes_only_available_admitted_estates() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let healthy = dir.path().join("healthy");
+        let broken = dir.path().join("broken");
+        scaffold_estate_manifest(&healthy, "healthy");
+        scaffold_estate_manifest(&broken, "broken");
+
+        let registry = crate::runtime::estates::EstateRegistry::new();
+        assert!(
+            periodic_sweep_targets(&registry).is_empty(),
+            "nothing admitted yet"
+        );
+
+        registry.admit(&healthy).expect("admit healthy");
+        registry.admit(&broken).expect("admit broken");
+        std::fs::remove_file(broken.join("sergeant.toml")).expect("break the manifest");
+        registry
+            .admit(&broken)
+            .expect_err("re-validation must fail");
+
+        let targets = periodic_sweep_targets(&registry);
+        assert_eq!(
+            targets,
+            vec![std::fs::canonicalize(&healthy).expect("canonical")],
+            "only the still-available estate is a sweep target: {targets:?}"
+        );
+    }
+
     // ------------------------------------------------------------------
     // §26 refuse-by-name (Q8) — `below_floor_refusal`'s own wire shape
     // (spec §4.3). Finding: no test anywhere in the diff constructed a
@@ -5712,6 +5854,8 @@ mod tests {
                 retention: crate::domain::estate::DEFAULT_RETENTION,
                 source: crate::runtime::prune::PolicySource::Default,
             },
+            sweep_interval: SWEEP_INTERVAL,
+            last_swept: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 

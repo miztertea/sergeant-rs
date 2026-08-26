@@ -231,20 +231,18 @@ pub struct DeletedBranch {
 pub fn classify(estate: &Estate, works: &BTreeMap<String, WorkState>) -> SweepReport {
     // W4a seam: this function is already correctly single-estate per call
     // (recon-engine-journal touch point 8 names it "correct as-is") and
-    // needs no change here. What H1 still owes is the *caller*: every call
-    // to `classify` today is the per-request estate-scoped HTTP surface
-    // (`GET`/`POST /v1/sweep`, `api.rs`'s `sweep_estate`/its POST sibling) —
-    // there is no periodic daemon-side loop anywhere in this codebase yet to
-    // iterate admitted estates and call this once per estate (checked:
-    // `daemon.rs` has no periodic sweep caller at all — unlike
-    // `maybe_run_rotation_triggered_prune`'s rotation-triggered prune tick,
-    // which this wave *did* rewire onto `EstateRegistry`-backed multi-estate
-    // retention, see `prune::EstatePolicies`). When a periodic sweep caller
-    // is added, it must iterate `estates::EstateRegistry::entries()` and
-    // call `classify` once per admitted estate — never assume the
-    // one-estate world this function's own signature still lets a naive
-    // caller fall into. Named here rather than dropped (brief deliverable
-    // 4); a W5 item.
+    // needs no change here. What H1 owed was the *caller* — closed by W5
+    // brief deliverable 1(a): `api::maybe_run_periodic_sweep` is now the
+    // periodic daemon-side loop this comment used to say did not exist yet.
+    // It iterates `estates::EstateRegistry::entries()` (via
+    // `api::periodic_sweep_targets`) and calls `classify` once per admitted,
+    // available estate, on the same crank tick
+    // `maybe_run_rotation_triggered_prune`'s rotation-triggered prune runs
+    // on (throttled separately — see `ApiState::sweep_interval` — because a
+    // sweep's git walk is not cheap enough to repeat every completion-poll
+    // tick). The per-request estate-scoped HTTP surface (`GET`/`POST
+    // /v1/sweep`, below) is unchanged; the periodic pass is classification
+    // only and never deletes, exactly like the read half of that pair.
     SweepReport {
         repositories: estate
             .repositories

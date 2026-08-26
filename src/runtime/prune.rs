@@ -1638,24 +1638,36 @@ pub fn run(
 /// then [`run`] — short-circuiting cheaply (a handful of map iterations)
 /// when nothing is eligible, which is the common case for a frequently
 /// restarted daemon.
+///
+/// W5 brief deliverable 1(b): partitions retention per admitted estate via
+/// [`candidate_horizon_multi_estate`]/[`plan_multi_estate`], exactly as
+/// [`crate::api::maybe_run_rotation_triggered_prune`]'s rotation-triggered
+/// tick already does — `policies` is built the same way, with
+/// [`EstatePolicies::from_registry`], so a Work whose estate is not (yet, at
+/// this restart) admitted still answers to the daemon-wide fallback rather
+/// than being silently skipped. Before this, the startup trigger alone
+/// still applied one process-wide floor to every retained Work regardless
+/// of which estate declared its own `[estate] retention` — the asymmetry
+/// this fixes.
 pub fn run_startup(
     core: &mut crate::api::Core,
     data_dir: &Path,
-    policy: &PrunePolicy,
+    policies: &EstatePolicies,
     first_seq: &FirstSeqIndex,
 ) -> Result<PruneOutcome, PruneError> {
     let bounds = core.journal.segment_bounds()?;
-    let (candidate, _stall) = candidate_horizon(&bounds, core.registry.state(), first_seq, policy);
+    let (candidate, _stall) =
+        candidate_horizon_multi_estate(&bounds, core.registry.state(), first_seq, policies);
     if candidate == 0 {
         return Ok(PruneOutcome::default());
     }
-    let Some(plan) = plan(
+    let Some(plan) = plan_multi_estate(
         data_dir,
         &bounds,
         candidate,
         core.registry.state(),
         first_seq,
-        policy,
+        policies,
     )?
     else {
         return Ok(PruneOutcome::default());
@@ -2497,6 +2509,48 @@ mod tests {
             .expect("B's own stat row");
         assert_eq!((b_stat.examined, b_stat.retired, b_stat.kept), (2, 1, 1));
         assert_eq!(b_stat.policy.retention, 1);
+    }
+
+    /// W5 brief deliverable 1(b): `run_startup` partitions retention per
+    /// estate exactly like the rotation tick — same fixture shape as
+    /// `plan_multi_estate_retires_each_estates_own_excess_and_reports_it_
+    /// per_estate` above, but driven through the startup entry point
+    /// itself. Before the fix, `run_startup` took one process-wide
+    /// `PrunePolicy` and would have applied estate A's floor (or the
+    /// fallback) to estate B's Work too; this proves each estate's own
+    /// declared retention governs its own Work.
+    #[test]
+    fn run_startup_partitions_retention_per_estate_like_the_rotation_tick_does() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = tiny_core(dir.path());
+
+        submit_and_complete_for_estate(&mut core, "a1", "/estates/a");
+        submit_and_complete_for_estate(&mut core, "b_old", "/estates/b");
+        submit_and_complete_for_estate(&mut core, "b_new", "/estates/b");
+        // I-W3-4: push the writer's own live segment off every Work above.
+        commit(
+            &mut core,
+            daemon_source(),
+            crate::domain::work::KIND_WORK_SUBMITTED,
+            Some("anchor"),
+            serde_json::json!({"work": {
+                "id": "anchor", "intent": "keep the writer off every Work's segments",
+                "state": "pending", "created_by": "test",
+                "created_at": "2026-01-01T00:00:00.000Z",
+            }}),
+        );
+        core.flush().expect("flush");
+
+        let policies = EstatePolicies::new(policy(0))
+            .with_estate("/estates/a", policy(0))
+            .with_estate("/estates/b", policy(1));
+        let first_seq = core.first_seq_by_work.clone();
+        let outcome =
+            run_startup(&mut core, dir.path(), &policies, &first_seq).expect("run_startup");
+        assert_eq!(
+            outcome.works_pruned, 2,
+            "A's sole Work and B's own excess are retired — B's newest Work is not: {outcome:?}"
+        );
     }
 
     /// Brief deliverable 2 / D7's own named risk: a blob referenced only by
