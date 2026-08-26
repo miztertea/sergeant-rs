@@ -776,14 +776,22 @@ impl AppServerChild {
         // reachable by `ProbeChildren::kill_all`.
         let registration =
             matches!(lifetime, ChildLifetime::Probe).then(|| child::register_probe_child(pgid));
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "child stdin was not piped".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "child stdout was not piped".to_string())?;
+        // #310: an early return here used to drop `child` without signalling
+        // it, leaving a live `codex app-server` with nothing holding it. The
+        // arms are "cannot happen" — stdio was piped four lines above — which
+        // is precisely the kind of path this issue is about.
+        let reap_and_fail = |child: &mut Child, reason: &str| -> String {
+            super::kill_process_group(Some(pgid));
+            let _ = child.kill();
+            let _ = child.wait();
+            reason.to_string()
+        };
+        let Some(stdin) = child.stdin.take() else {
+            return Err(reap_and_fail(&mut child, "child stdin was not piped"));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            return Err(reap_and_fail(&mut child, "child stdout was not piped"));
+        };
         // Stderr is drained on its own thread into a bounded ring. Draining
         // is what keeps the pipe from filling and blocking the child;
         // *retaining* the tail is what makes a child that died mid-turn
@@ -955,13 +963,21 @@ impl AppServerChild {
 
 impl Drop for AppServerChild {
     fn drop(&mut self) {
-        // Best-effort: a caller that wants the join should call `kill`
-        // itself. This exists so a `CodexExecution` dropped without an
+        // Best-effort: a caller that wants the reader joined should call
+        // `kill` itself. This exists so a `CodexExecution` dropped without an
         // explicit STOP does not leave the child running past the adapter's
         // own memory of it (mirrors exec's own posture: adapter state
         // dropping is not a supported lifecycle path, but it should not
         // orphan a process either).
+        //
+        // #310: killed *and reaped*. A killed child nobody reaps stays in the
+        // process table answering `kill(pid, 0)` as alive and matching
+        // `pgrep -f 'codex.*app-server'` — indistinguishable, to an orphan
+        // check, from the leak itself.
         super::kill_process_group(Some(self.pgid));
+        let mut child = self.child.lock().expect("child lock");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

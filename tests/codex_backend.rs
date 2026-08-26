@@ -1746,20 +1746,37 @@ fn the_group_kill_never_depends_on_a_kill_executable_being_installed() {
     // `kill_process_group` names the very construct being banned, in order to
     // explain why it is banned, and a check that cannot tell code from the
     // comment documenting it would forbid saying so.
-    let source: String = include_str!("../src/backend/codex.rs")
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let strip = |source: &str| -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // #310 moved the one implementation to `backend/child.rs` — three
+    // adapters carried a byte-identical private copy and the probe path
+    // needed a fourth. The ban still binds this adapter (it must not grow a
+    // local copy that spawns `kill`), and the positive assertion now names
+    // the file the behaviour actually lives in.
+    let adapter = strip(include_str!("../src/backend/codex.rs"));
+    let shared = strip(include_str!("../src/backend/child.rs"));
+    for (file, source) in [("codex.rs", &adapter), ("child.rs", &shared)] {
+        assert!(
+            !source.contains("Command::new(\"kill\")"),
+            "{file}: the process-group kill must not spawn a bare `kill` executable: it is a \
+             package a host need not install, and `Command` reports its absence as an ENOENT \
+             that a dropped result silently turns into 'INTERRUPT killed nothing'. Go through \
+             a shell builtin."
+        );
+    }
     assert!(
-        !source.contains("Command::new(\"kill\")"),
-        "the process-group kill must not spawn a bare `kill` executable: it is a package a \
-         host need not install, and `Command` reports its absence as an ENOENT that a dropped \
-         result silently turns into 'INTERRUPT killed nothing'. Go through a shell builtin."
+        shared.contains("kill -KILL -{pgid}"),
+        "the process-group kill must still SIGKILL the negated group id (§5.5)"
     );
     assert!(
-        source.contains("kill -KILL -{pgid}"),
-        "the process-group kill must still SIGKILL the negated group id (§5.5)"
+        adapter.contains("crate::backend::child::kill_process_group"),
+        "this adapter must reach the group kill through the one shared implementation, not a \
+         reinstated local copy"
     );
 }
 

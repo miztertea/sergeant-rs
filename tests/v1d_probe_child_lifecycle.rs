@@ -502,3 +502,130 @@ fn the_data_dir_guard_leaves_no_descendant_of_its_daemons_alive() {
         survivors.len()
     );
 }
+
+// ------------------------------- 3. the in-process daemon's own descendant reap
+
+/// The kernel's one-letter state for `pid` (`R`, `S`, `Z`, ...), or a
+/// description of why it could not be read.
+///
+/// Read from `/proc/<pid>/stat` by splitting at the **last** `)`: the `comm`
+/// field before it is parenthesised and unescaped, so a positional split from
+/// the left is wrong for any process whose name contains a bracket.
+fn proc_state(pid: u32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .and_then(|(_, tail)| tail.split_whitespace().next().map(str::to_string))
+                .unwrap_or_else(|| "<unparseable /proc stat>".to_string()),
+            Err(e) => format!("<{e}>"),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        "<no /proc on this platform>".to_string()
+    }
+}
+
+/// The probe children spawned **directly by this test process**, which is
+/// what an in-process daemon's probe children are.
+///
+/// Attribution by parent pid, not by a descendant walk: the other tests in
+/// this file spawn real `sgt daemon` children of this same process, and
+/// *their* serve children are descendants of this process too. Only the
+/// in-process daemon's are its direct children, so that is the filter.
+fn direct_serve_children() -> Vec<u32> {
+    let me = std::process::id();
+    running_processes()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|process| process.ppid == Some(me) && is_opencode_serve_child(&process.argv))
+        .map(|process| process.pid)
+        .collect()
+}
+
+/// #310 requirement 3, from the daemon's own side: `DaemonHandle::kill` — the
+/// in-process rig's analogue of `SIGKILL` — reaps the probe children its walk
+/// still has live.
+///
+/// Aborting the serve task does not reach the probe walk, and a probe child is
+/// a *process*: a real `opencode serve` at ~265 MB that nothing in this
+/// process's memory owns once the handle is gone. `PR_SET_PDEATHSIG` covers
+/// the out-of-process daemon because that daemon's death is a process death;
+/// an in-process daemon's is not, so the same guarantee has to come from the
+/// per-daemon `ProbeChildren` set the walk records into.
+///
+/// `await_probe_walk: false` is what makes the window observable at all: the
+/// default hands the handle back only after the walk has finished, by which
+/// time every probe has already killed its own child.
+#[tokio::test]
+async fn daemon_handle_kill_reaps_a_probe_child_its_walk_still_has_live() {
+    if let Some(missing) = missing_probe_clis() {
+        eprintln!(
+            "SKIPPED-ENV: no probe on this host spawns a persistent child for \
+             DaemonHandle::kill to reap: {missing}"
+        );
+        return;
+    }
+
+    let dir = DataDir::new();
+    support::scaffold_estate(dir.path(), "v1d", &["solo"]);
+    let handle = sergeant_rs::daemon::start_with(
+        dir.path(),
+        sergeant_rs::daemon::DaemonConfig {
+            await_probe_walk: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start the in-process daemon");
+
+    let deadline = Instant::now() + DEADLINE;
+    let live = loop {
+        let live = direct_serve_children();
+        if !live.is_empty() {
+            break live;
+        }
+        if Instant::now() >= deadline {
+            break Vec::new();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+
+    handle.kill().await;
+
+    let survivors: Vec<u32> = live
+        .iter()
+        .copied()
+        .filter(|&pid| {
+            // Poll each one: the group kill is a subprocess, so "gone" is not
+            // instantaneous even though it is prompt.
+            !wait_until_gone(pid, Duration::from_secs(10))
+        })
+        .collect();
+    for &pid in &survivors {
+        hard_kill(pid);
+    }
+
+    assert!(
+        !live.is_empty(),
+        "the in-process daemon's walk never showed a live `opencode serve` child within \
+         {DEADLINE:?}, so this test cannot evidence the reap — it fails rather than passing \
+         vacuously"
+    );
+    // The kernel's own state letter for each survivor, because the two ways
+    // to fail here need different fixes and the pid alone does not say which:
+    // `R`/`S` means the kill never reached it, `Z` means it was killed and
+    // nobody reaped it — and a zombie is not a harmless bookkeeping detail
+    // here, it still answers `kill(pid, 0)` as alive and still matches
+    // `pgrep -x opencode`, so an orphan check cannot tell it from the leak.
+    let states: Vec<String> = survivors.iter().map(|&pid| proc_state(pid)).collect();
+    assert!(
+        survivors.is_empty(),
+        "DaemonHandle::kill left {} probe child(ren) of its own walk behind: {survivors:?} \
+         (states {states:?})",
+        survivors.len()
+    );
+}

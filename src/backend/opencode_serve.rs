@@ -627,10 +627,16 @@ impl ServeChild {
         // kills the group leaves nothing behind either way.
         let registration =
             matches!(lifetime, ChildLifetime::Probe).then(|| child::register_probe_child(pgid));
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "serve child stdout was not piped".to_string())?;
+        // #310: an early return here used to drop `child` without signalling
+        // it, leaving a live `opencode serve` with nothing holding it. The arm
+        // is "cannot happen" — stdout was piped a dozen lines above — which is
+        // precisely the kind of path this issue is about.
+        let Some(stdout) = child.stdout.take() else {
+            super::kill_process_group(Some(pgid));
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("serve child stdout was not piped".to_string());
+        };
 
         let stderr_tail = Arc::new(Mutex::new(Vec::<u8>::new()));
         if let Some(mut stderr) = child.stderr.take() {
@@ -674,11 +680,20 @@ impl ServeChild {
 
         let base_url = match rx.recv_timeout(port_budget) {
             Ok(Some(url)) => url,
+            // #310: both failure arms below kill *and reap*. Killing alone
+            // leaves a zombie — the pid is still in the process table, still
+            // answers `kill(pid, 0)` as alive, and still shows up under
+            // `pgrep -x opencode`, so an orphan check cannot tell it from a
+            // live 265 MB server. Measured: this is the arm that fired when
+            // `DaemonHandle::kill` reaped a live gate child out from under a
+            // spawn still waiting for its listening line.
             Ok(None) => {
                 let tail =
                     String::from_utf8_lossy(&stderr_tail.lock().expect("serve stderr tail lock"))
                         .into_owned();
+                super::kill_process_group(Some(pgid));
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(format!(
                     "serve child's stdout reached EOF before a listening line arrived; stderr: {tail}"
                 ));
@@ -689,6 +704,7 @@ impl ServeChild {
                         .into_owned();
                 super::kill_process_group(Some(pgid));
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(format!(
                     "serve child emitted no listening line within {port_budget:?}; stderr: {tail}"
                 ));
@@ -756,9 +772,15 @@ impl ServeChild {
 impl Drop for ServeChild {
     /// Best-effort (§3.7, mirrors `AppServerChild::drop`): adapter state
     /// dropping is not a supported lifecycle path, but it must not orphan a
-    /// process.
+    /// process — nor leave a zombie, which is #310's addition here. A killed
+    /// child nobody reaps stays in the process table answering `kill(pid, 0)`
+    /// as alive and matching `pgrep -x opencode`, which is exactly the shape
+    /// an orphan check cannot distinguish from the leak.
     fn drop(&mut self) {
         super::kill_process_group(Some(self.pgid));
+        let mut child = self.child.lock().expect("serve child lock");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
