@@ -1209,6 +1209,39 @@ fn r_watch_10a_signals_end_the_watcher_natively_with_no_side_effects() {
     let submitted = submit(estate.path(), &data, "hang", "R-WATCH-10a: signal test");
     let id = submitted["work"]["id"].as_str().unwrap().to_string();
 
+    // The freshly spawned daemon is not journal-quiescent at submit-response
+    // time: since the #293 fix, the backend probe walk runs concurrently
+    // AFTER the descriptor is published, journaling one `backend.probed` per
+    // registered backend up to seconds later (the slowest installed CLI sets
+    // the tail). A signal-side-effect assertion needs a settled baseline, so
+    // wait for the journal to stop growing before opening the window —
+    // otherwise the probe tail lands inside it and the exact-count check
+    // blames the watcher for the daemon's own startup evidence.
+    {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut previous = 0usize;
+        let mut stable_for = 0u32;
+        loop {
+            let len = journal_len(data.path());
+            // Three consecutive unchanged 250ms samples: long enough to
+            // outlast committer batching, far shorter than any real gap.
+            if len == previous {
+                stable_for += 1;
+                if stable_for >= 3 {
+                    break;
+                }
+            } else {
+                stable_for = 0;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the journal never settled after submit ({len} events)"
+            );
+            previous = len;
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
     for (flag, expected_signal) in [("-INT", 2), ("-TERM", 15)] {
         let before = journal_len(data.path());
 
