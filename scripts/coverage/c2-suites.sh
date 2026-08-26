@@ -50,17 +50,9 @@ cov_stage_begin c2-m9_watch
 cov_run cargo llvm-cov --no-report --test m9_watch --locked || cov_fail "m9_watch failed under instrumentation"
 cov_stage_end 1 "the m9 test binary must write its own profile"
 
-cov_stage_begin c2-m10_harness
-cov_run cargo llvm-cov --no-report --test m10_harness --locked || cov_fail "m10_harness failed under instrumentation"
-cov_stage_end 1 "the m10 test binary must write its own profile"
-
 cov_stage_begin c2-estate_routes
 cov_run cargo llvm-cov --no-report --test estate_routes --locked || cov_fail "estate_routes failed under instrumentation"
 cov_stage_end 1 "the estate_routes test binary must write its own profile"
-
-cov_stage_begin c2-t2_workflow_catalog
-cov_run cargo llvm-cov --no-report --test t2_workflow_catalog --locked || cov_fail "t2_workflow_catalog failed under instrumentation"
-cov_stage_end 1 "the t2_workflow_catalog test binary must write its own profile"
 
 # Added 2026-08-22, closing the identical accounting gap the 2026-08-19 block
 # above closed for m8/m9/m10/estate_routes/t2_workflow_catalog: these two
@@ -79,10 +71,6 @@ cov_stage_begin c2-codex_backend
 cov_run cargo llvm-cov --no-report --test codex_backend --locked || cov_fail "codex_backend failed under instrumentation"
 cov_stage_end 1 "the codex_backend test binary must write its own profile (StubCodex's children are shell-script stand-ins, uninstrumented and no loss, per m4's own precedent)"
 
-cov_stage_begin c2-codex_routing
-cov_run cargo llvm-cov --no-report --test codex_routing --locked || cov_fail "codex_routing failed under instrumentation"
-cov_stage_end 1 "the codex_routing test binary must write its own profile"
-
 # Added 2026-08-23, in the same commit that adds the suite (the W1 opencode
 # wave) — wired at birth rather than recovered later, per the owner's 90-floor
 # ruling and the #231 lesson: a suite absent from every stage list contributes
@@ -94,14 +82,6 @@ cov_stage_begin c2-opencode_backend
 cov_run cargo llvm-cov --no-report --test opencode_backend --locked || cov_fail "opencode_backend failed under instrumentation"
 cov_stage_end 1 "the opencode_backend test binary must write its own profile (StubOpencode's children are shell-script stand-ins, uninstrumented and no loss, per codex_backend's precedent)"
 
-# Added 2026-08-23, in the same commit that creates the suite (W2, opencode
-# registration wave) — codex_routing's exact rationale: in-process-only
-# throughout (no StubOpencode, no subprocess), so it sits in C2 rather than
-# needing C3's ≥2-profile floor. Floor 1.
-cov_stage_begin c2-opencode_routing
-cov_run cargo llvm-cov --no-report --test opencode_routing --locked || cov_fail "opencode_routing failed under instrumentation"
-cov_stage_end 1 "the opencode_routing test binary must write its own profile"
-
 # Added 2026-08-23, in the same commit that adds the suite (the W1 agy wave) --
 # wired at birth rather than recovered later, per the owner's 90-floor ruling
 # and the #231 lesson: a suite absent from every stage list contributes nothing
@@ -112,32 +92,6 @@ cov_stage_end 1 "the opencode_routing test binary must write its own profile"
 cov_stage_begin c2-agy_backend
 cov_run cargo llvm-cov --no-report --test agy_backend --locked || cov_fail "agy_backend failed under instrumentation"
 cov_stage_end 1 "the agy_backend test binary must write its own profile (StubAgy's children are shell-script stand-ins, uninstrumented and no loss, per codex_backend's precedent)"
-
-# Added 2026-08-23, in the same commit that creates the suite (W2, agy
-# registration wave) — codex_routing's/opencode_routing's exact rationale:
-# in-process-only throughout (no StubAgy, no subprocess), so it sits in C2
-# rather than needing C3's ≥2-profile floor. Floor 1.
-cov_stage_begin c2-agy_routing
-cov_run cargo llvm-cov --no-report --test agy_routing --locked || cov_fail "agy_routing failed under instrumentation"
-cov_stage_end 1 "the agy_routing test binary must write its own profile"
-
-# Added 2026-08-23, same commit that creates the suite (W2, opencode
-# registration wave, item 6 / #231(b)): a plain static-scan test, no
-# subprocess, no daemon — sits in C2 for the same reason codex_routing does.
-# Floor 1.
-cov_stage_begin c2-coverage_stage_membership
-cov_run cargo llvm-cov --no-report --test coverage_stage_membership --locked || cov_fail "coverage_stage_membership failed under instrumentation"
-cov_stage_end 1 "the coverage_stage_membership test binary must write its own profile"
-
-# Added 2026-08-25, in the same commit that creates the suite (the docs/
-# product-manual wave, #231(b)): the CLI-reference test spawns the `sgt`
-# binary once for `--help`, the same one-subprocess shape as m3/m5/
-# estate_routes/t2_workflow_catalog above; the link-soundness, catalog-
-# coverage, and skill-reference tests are plain static scans, no subprocess
-# at all. Floor 1.
-cov_stage_begin c2-docs_contract
-cov_run cargo llvm-cov --no-report --test docs_contract --locked || cov_fail "docs_contract failed under instrumentation"
-cov_stage_end 1 "the docs_contract test binary must write its own profile"
 
 # W4c fixer sweep (#231(b)): wired at recovery time — the suite's own
 # authorship commit (e01a53fb) left it invoked by neither stage script, the
@@ -151,32 +105,26 @@ cov_stage_begin c2-w4c_service_doctor
 cov_run cargo llvm-cov --no-report --test w4c_service_doctor --locked || cov_fail "w4c_service_doctor failed under instrumentation"
 cov_stage_end 1 "the w4c_service_doctor test binary must write its own profile (its fake systemctl/launchctl binaries are shell-script stand-ins, uninstrumented and no loss, per codex_backend's precedent)"
 
-# Added 2026-08-25, in the same wave that creates the suite (W2fix, #293) —
-# wired at birth rather than recovered later, which is exactly what the
-# #231(b) guard that caught this one exists to force. Sits in C2, not C3:
-# every case starts an in-process `daemon::start_with` against a hermetic
-# fake registry that pre-empts all five real adapters, so nothing here spawns
-# an `sgt` subprocess, a real CLI, or even a shell-script stand-in. The suite
-# reads the runtime descriptor *file* as a client would, which is a read and
-# not a spawn. Floor 1.
-cov_stage_begin c2-w2fix_probe_ordering
-cov_run cargo llvm-cov --no-report --test w2fix_probe_ordering --locked || cov_fail "w2fix_probe_ordering failed under instrumentation"
-cov_stage_end 1 "the w2fix_probe_ordering test binary must write its own profile"
-
-# W5, wired at birth: `maybe_run_periodic_sweep` proven against a real
-# in-process `daemon::start_with` (two admitted estates) — same shape as
-# w2fix_probe_ordering just above, not C3: nothing here spawns an `sgt`
-# subprocess or a real CLI, only the in-process daemon handle every m6-style
-# suite already uses. Floor 1.
-cov_stage_begin c2-e_periodic_sweep
-cov_run cargo llvm-cov --no-report --test e_periodic_sweep --locked || cov_fail "e_periodic_sweep failed under instrumentation"
-cov_stage_end 1 "the e_periodic_sweep test binary must write its own profile"
-
-# W5, wired at birth: the estate cutover rehearsal drives `sgt doctor` and
-# `sgt daemon install-service --print` as short-lived subprocesses — never a
-# real `sgt daemon` (install-service --print never starts one; doctor never
-# auto-spawns, ADR 0009) — the same w4c_service_doctor reasoning above.
-# Floor 1.
-cov_stage_begin c2-w5_cutover_rehearsal
-cov_run cargo llvm-cov --no-report --test w5_cutover_rehearsal --locked || cov_fail "w5_cutover_rehearsal failed under instrumentation"
-cov_stage_end 1 "the w5_cutover_rehearsal test binary must write its own profile"
+# S2 V1c (build/test speed): the ten suites this stage used to wire one by
+# one — m10_harness, t2_workflow_catalog, codex_routing, opencode_routing,
+# agy_routing, coverage_stage_membership, docs_contract, w2fix_probe_ordering,
+# e_periodic_sweep, w5_cutover_rehearsal — are each small (under 350 lines),
+# spawn no daemon of their own (docs_contract's one `sgt --help` call and
+# w5_cutover_rehearsal's `sgt doctor`/`install-service --print` calls are the
+# only subprocesses among them, both short-lived), and each paid a full
+# separate link plus its own copy of `support`'s compile for a handful of
+# tests. They now live as `mod`s of one binary, `tests/c2_light.rs`
+# (`tests/c2_light/<name>.rs` holds each original file unmodified except for
+# `mod support;` → `use crate::support;`, made necessary by no longer being
+# its own crate root) — every test stays addressable as
+# `cargo test --test c2_light <old_suite_name>::<test>`. One instrumented
+# binary, one profile: floor 1. Measured before adopting (v1c baseline,
+# knowledge/evidence/perf/build-test-speed-2026-08-26.md): the heavier C2/C3
+# suites are deliberately left separate — their own compile time already
+# dwarfs their link overhead, so folding them in would add real intra-process
+# hygiene risk (thread-shared ports/env across suites that used to be
+# separate processes) for a link-time saving measurement showed was already
+# small.
+cov_stage_begin c2-c2_light
+cov_run cargo llvm-cov --no-report --test c2_light --locked || cov_fail "c2_light failed under instrumentation"
+cov_stage_end 1 "the c2_light test binary must write its own profile"

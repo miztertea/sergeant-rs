@@ -39,7 +39,7 @@ use sergeant_rs::backend::codex::CodexConfig;
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 
-mod support;
+use crate::support;
 
 // ---------------------------------------------------------------- helpers
 

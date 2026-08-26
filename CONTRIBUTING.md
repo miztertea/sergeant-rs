@@ -27,9 +27,22 @@ dependency policy) runs on every PR and must pass.
 
 ## Testing rules
 
-Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m10_harness.rs`.
-`cargo test --test <name>` runs one suite, `cargo test --test <name> <substring>`
-runs one test by name.
+Tests live in per-milestone suites `tests/m1_event_core.rs` … `tests/m9_watch.rs`,
+plus purpose-named suites for later work. `cargo test --test <name>` runs one
+suite, `cargo test --test <name> <substring>` runs one test by name.
+
+Ten small, non-spawning suites — `docs_contract`, `coverage_stage_membership`,
+`w5_cutover_rehearsal`, `e_periodic_sweep`, `agy_routing`, `codex_routing`,
+`opencode_routing`, `w2fix_probe_ordering`, `m10_harness`, and
+`t2_workflow_catalog` — are consolidated into one harness binary,
+`tests/c2_light.rs` (each original file lives on unmodified under
+`tests/c2_light/<name>.rs`). They stay addressable exactly as before, just
+through that binary's name: `cargo test --test c2_light <old_suite_name>::<test>`.
+Every other suite remains its own binary — S2 V1c measured that the
+heavier suites' own compile time already dwarfs their link overhead, so only
+this bounded, low-risk group of small files was folded in (see
+`knowledge/evidence/perf/build-test-speed-2026-08-26.md` in the workspace
+estate).
 
 **The two-environment rule.** Tests run in two known environments with
 opposite constraints: a root dev container (permission-bit tricks silently
