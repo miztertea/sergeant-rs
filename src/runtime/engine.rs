@@ -1216,13 +1216,20 @@ pub struct Engine {
     /// per Work at a time (the turn model's own invariant; mirrors
     /// [`Self::turn_started`]'s per-work keying). Inserted the moment a
     /// permit is admitted, in `api::crank`'s `Launch` arm, and removed
-    /// exactly where an execution stops being "in flight":
-    /// [`Self::stop_execution`] (completion, failure, cancel, interrupt) and
-    /// [`Self::settle_launch`]'s two no-live-execution branches (a
-    /// daemon-side launch error, a superseded reservation). Never durable —
-    /// a restart starts with an empty lane and every Work re-admits on its
-    /// next launch, which is correct: nothing native survived the restart
-    /// either.
+    /// exactly where an execution is *confirmed* no longer in flight:
+    /// [`Self::stop_execution`] releases immediately only when there is
+    /// nothing left to confirm (an immediate completion, a `stop()` error,
+    /// or no registered backend); when `backend.stop()` returns a pending
+    /// completion, the removal is folded into that completion's own tail
+    /// work and happens only once `Deferred::wait` actually joins it,
+    /// outside the core lock — never at stop-request time, so a
+    /// cancel/interrupt never transiently frees a lane slot for a native
+    /// process that may still be alive. [`Self::settle_launch`]'s two
+    /// no-live-execution branches (a daemon-side launch error, a superseded
+    /// reservation) remove immediately, since there is no native process to
+    /// wait for in either. Never durable — a restart starts with an empty
+    /// lane and every Work re-admits on its next launch, which is correct:
+    /// nothing native survived the restart either.
     execution_permits: Arc<Mutex<BTreeMap<String, OwnedSemaphorePermit>>>,
     /// H1-15's intelligence lane: config-only stub (deliverable 3). A
     /// separate `Arc<Semaphore>` from [`Self::execution_lane`] by
@@ -4558,6 +4565,20 @@ impl Engine {
     /// goes into `deferred` rather than being joined here (issue #14/B3):
     /// this runs under the daemon's core lock, and §22.6 forbids a thread
     /// join under it.
+    ///
+    /// H1-15: the execution-lane permit is released on *confirmed* stop, not
+    /// on request. `backend.stop()` returning a pending [`Completion`] means
+    /// the native process's actual teardown is still outstanding — freeing
+    /// the lane slot here would let a new Work admit and launch its own
+    /// native process while the one being canceled/interrupted may still be
+    /// alive, transiently oversubscribing `execution_lane_cap` in exactly
+    /// the cancel/interrupt scenario the lane exists to bound. So the permit
+    /// is folded into the deferred completion's own tail work and released
+    /// only once that tail actually runs (in `Deferred::wait`, outside the
+    /// core lock — never here). Only when there is no tail to defer to (an
+    /// immediate completion, a `stop()` error, or no registered backend —
+    /// nothing left to confirm) is the permit released immediately, since
+    /// no further observation of native teardown is coming.
     fn stop_execution(
         &self,
         core: &mut Core,
@@ -4574,19 +4595,40 @@ impl Engine {
         if execution.stop_requested {
             return Ok(());
         }
-        // H1-15: this Work's execution is definitively no longer in flight
-        // (completion, failure, cancel, or interrupt-driven stop — every
-        // call site above) — release the execution-lane permit it holds.
-        self.release_execution_permit(work_id);
         let outcome = match self.backends.get(&execution.backend) {
             Some(backend) => match backend.stop(&handle_of(&execution)) {
                 Ok(completion) => {
-                    deferred.push(completion);
+                    if completion.is_pending() {
+                        // Confirmed-stop release: fold the permit drop into
+                        // the tail work itself, so it only happens once the
+                        // native process's teardown has actually been
+                        // joined — never at request time.
+                        let permits = Arc::clone(&self.execution_permits);
+                        let permit_work_id = work_id.to_string();
+                        deferred.push(Completion::deferred(move || {
+                            completion.wait();
+                            permits
+                                .lock()
+                                .expect("execution permit map poisoned")
+                                .remove(&permit_work_id);
+                        }));
+                    } else {
+                        // Nothing outstanding to confirm — release now.
+                        self.release_execution_permit(work_id);
+                    }
                     json!({"requested": true})
                 }
-                Err(e) => json!({"requested": true, "error": e.to_string()}),
+                Err(e) => {
+                    // `stop()` itself failed: no tail to defer to, so there
+                    // is nothing further to observe before releasing.
+                    self.release_execution_permit(work_id);
+                    json!({"requested": true, "error": e.to_string()})
+                }
             },
-            None => json!({"requested": false, "error": "backend not registered"}),
+            None => {
+                self.release_execution_permit(work_id);
+                json!({"requested": false, "error": "backend not registered"})
+            }
         };
         self.commit(
             core,

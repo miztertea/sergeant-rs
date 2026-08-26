@@ -4306,6 +4306,237 @@ async fn t_execution_lane_permit_releases_on_execution_failure() {
     assert!(status_b.is_success(), "B's retry answered {status_b}");
 }
 
+/// The fixed defect: a stop *request* must not free the execution-lane
+/// permit — only a *confirmed* stop (the native context's own tail work,
+/// joined) may. `stop_execution` used to call `release_execution_permit`
+/// unconditionally, before `backend.stop()`'s completion was ever awaited;
+/// on a lane of 1 that let a canceled Work's slot free the instant the
+/// cancel was issued, while the fake's "evidence archive" completion —
+/// standing in for the native process's own teardown — was still stalled.
+/// A second Work could then admit and launch while the canceled one might
+/// still be alive: exactly the transient oversubscription the finding
+/// named.
+///
+/// Decisive shape: cancel A with its archive completion held open (so the
+/// "native process" is provably still un-torn-down), and prove B *cannot*
+/// admit to a lane of 1 while that hold is in effect — only after the
+/// archive is released (and the completion actually joined) does B's
+/// admission become possible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_execution_lane_permit_stays_held_until_stop_is_confirmed_not_merely_requested() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANECONFIRMA00000000000A", "01LANECONFIRMB00000000000B");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    // `hang` keeps A's execution alive so the cancel below has a real native
+    // context to stop; B just needs to complete once admitted.
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang(), FakeStep::complete()]);
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    let status_a = http
+        .post(format!("{}/v1/work/{work_a}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("A retry")
+        .status();
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+
+    // Arm the archive gate — A's coming STOP will hand back a *pending*
+    // `Completion` that stalls here, standing in for a native process still
+    // tearing down.
+    fake.hold_archives();
+    let cancel_a = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_a}/cancel"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("cancel A request")
+                .status()
+        })
+    };
+    assert!(
+        fake.await_stalled_archives(1, Duration::from_secs(30)),
+        "A's stop completion never reached its gate — cancel A never actually stopped anything"
+    );
+
+    // The decisive check: with A's stop merely *requested* (its completion
+    // still stalled, unconfirmed), B must not be able to admit to a lane of
+    // 1. Give it a bounded window rather than asserting instantaneously —
+    // enough to catch a leaked permit without making the test itself slow.
+    let retry_b = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_b}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("B retry request")
+                .status()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let show_b: Value = http
+        .get(format!("{}/v1/work/{work_b}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show B")
+        .json()
+        .await
+        .expect("show B json");
+    assert_eq!(
+        show_b["work"]["state"], "waiting",
+        "B must still be parked on the lane while A's stop is only requested, not confirmed: \
+         {show_b}"
+    );
+
+    // Now confirm the stop: release the archive, let A's cancel finish
+    // joining it, and only then does the permit free for B.
+    fake.release_archives();
+    let status_a2 = cancel_a.await.expect("cancel A task");
+    assert!(status_a2.is_success(), "cancel A answered {status_a2}");
+
+    let status_b = tokio::time::timeout(Duration::from_secs(10), retry_b)
+        .await
+        .expect("B's retry never answered after A's stop was confirmed — the permit leaked")
+        .expect("B retry task");
+    handle.shutdown().await;
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
+}
+
+/// The other fixed defect: `crank`'s `Launch` arm blocking the *client's own
+/// request* on execution-lane admission, not just the Work's internal
+/// state. With the fix, a request that lands in a full lane journals the
+/// wait and returns promptly — it does not sit open until another Work
+/// vacates a slot.
+///
+/// Decisive shape: hold A's launch at the fake's own launch gate (a stall
+/// downstream of, and much longer than, lane admission itself), then send
+/// B's retry into the full lane and require its HTTP response to land
+/// quickly — long before A's stall is ever released. The old behavior
+/// (blocking inline on `Engine::admit_execution`) would make this request
+/// hang until `release_launches` below runs; this test never calls that
+/// until after asserting B's response already arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blocking() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANEFASTA000000000000000", "01LANEFASTB000000000000000");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::complete(), FakeStep::complete()],
+    );
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    fake.hold_launches();
+    let retry = |work_id: &'static str| {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("retry request")
+                .status()
+        })
+    };
+
+    // A takes the lane's one slot and stalls inside the fake's own launch
+    // gate — a stall this test deliberately never releases until well after
+    // judging B.
+    let retry_a = retry(work_a);
+    assert!(
+        fake.await_stalled_launches(1, Duration::from_secs(30)),
+        "A's launch never reached its gate"
+    );
+
+    // The decisive check: B's retry into the full lane must answer well
+    // inside a short bound, without waiting on A's still-held launch.
+    let started = Instant::now();
+    let status_b = tokio::time::timeout(Duration::from_secs(2), retry(work_b))
+        .await
+        .expect("B's retry blocked on execution-lane admission instead of returning promptly")
+        .expect("B retry task");
+    let elapsed = started.elapsed();
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "B's retry took {elapsed:?} — it must return as soon as the lane wait is journaled, \
+         not once a slot actually frees"
+    );
+
+    let show_b: Value = http
+        .get(format!("{}/v1/work/{work_b}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show B")
+        .json()
+        .await
+        .expect("show B json");
+    assert_eq!(
+        show_b["work"]["state"], "waiting",
+        "B's request returned promptly, but the Work itself must still be durably parked on \
+         the lane: {show_b}"
+    );
+
+    // Only now release A — proving B's earlier prompt response was not an
+    // artifact of the lane already having freed by coincidence.
+    fake.release_launches();
+    let status_a = retry_a.await.expect("A retry task");
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+
+    let both_completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let list: Value = client()
+                .get(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("list")
+                .json()
+                .await
+                .expect("list json");
+            let done = list["works"]
+                .as_array()
+                .expect("works")
+                .iter()
+                .filter(|w| {
+                    w["state"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("completed"))
+                })
+                .count();
+            if done == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(both_completed.is_ok(), "both Works must reach completed");
+
+    handle.shutdown().await;
+}
+
 // ------------------------------------- the throughput floor, as a guard
 //
 // N3-10: adjudication A-N3-1 amended the burst-50 floor to ">=24 works/s with
