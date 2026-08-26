@@ -23,6 +23,13 @@ pub struct WorkRow {
     pub backend: String,
     pub intent: String,
     pub workflow: String,
+    /// The canonical estate root this Work was submitted against
+    /// (`estate_root`, H1 D1) — an identity, never a display name: two
+    /// estates may share one, so this is deliberately not the old
+    /// `workspace` field (dead since estate-root Phase C; `Work::workspace`'s
+    /// own doc comment: "deprecated, never written"). `"-"` when the
+    /// daemon has none recorded (a Work journaled before the envelope
+    /// carried it, or with no estate context at all).
     pub estate: String,
     pub repositories: String,
     pub turns: String,
@@ -68,7 +75,7 @@ fn row_from(work: &Value) -> WorkRow {
         backend: field(work, "resolved_backend"),
         intent: field(work, "intent"),
         workflow: field(work, "workflow"),
-        estate: field(work, "workspace"),
+        estate: field(work, "estate_root"),
         repositories,
         turns,
         created_at: field(work, "created_at"),
@@ -120,9 +127,9 @@ pub struct Filters {
     pub nonterminal_only: bool,
     /// W4d deliverable 1 (H1 §9): the fleet-wide estate filter, following
     /// the exact `state` pattern above — `None` is "every estate" (host-wide,
-    /// the honest default under host mode), `Some(name)` narrows to the one
-    /// estate whose `WorkRow.estate` (§10.2's already-wired per-Work
-    /// display name) matches exactly.
+    /// the honest default under host mode), `Some(root)` narrows to the one
+    /// estate whose `WorkRow.estate` (its canonical root, D1 — see that
+    /// field's own doc comment) matches exactly.
     pub estate: Option<String>,
 }
 
@@ -729,8 +736,8 @@ mod tests {
     #[test]
     fn the_estate_filter_matches_a_rows_estate_exactly() {
         let mut fleet = fleet_of(&[("a", "pending"), ("b", "running")]);
-        fleet["works"][0]["workspace"] = json!("payments");
-        fleet["works"][1]["workspace"] = json!("billing");
+        fleet["works"][0]["estate_root"] = json!("payments");
+        fleet["works"][1]["estate_root"] = json!("billing");
         let rows = fleet_rows(&fleet);
         let filters = Filters {
             estate: Some("payments".to_string()),
@@ -747,9 +754,9 @@ mod tests {
     #[test]
     fn the_estate_filter_cycles_through_every_estate_present_then_back_to_all() {
         let mut fleet = fleet_of(&[("a", "pending"), ("b", "pending"), ("c", "pending")]);
-        fleet["works"][0]["workspace"] = json!("billing");
-        fleet["works"][1]["workspace"] = json!("payments");
-        fleet["works"][2]["workspace"] = json!("payments"); // duplicate, must not repeat
+        fleet["works"][0]["estate_root"] = json!("billing");
+        fleet["works"][1]["estate_root"] = json!("payments");
+        fleet["works"][2]["estate_root"] = json!("payments"); // duplicate, must not repeat
         let rows = fleet_rows(&fleet);
 
         let mut screen = FleetScreen::default();

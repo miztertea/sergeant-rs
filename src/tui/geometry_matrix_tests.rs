@@ -111,8 +111,8 @@ fn fleet_estate_filter() -> App {
     app.destination = Destination::Fleet;
     app.drawer_open = false;
     app.rows = fleet::fleet_rows(&json!({"works": [
-        {"id": "01PAY", "state": "pending", "intent": "payments work", "workspace": "payments"},
-        {"id": "01BILL", "state": "pending", "intent": "billing work", "workspace": "billing"},
+        {"id": "01PAY", "state": "pending", "intent": "payments work", "estate_root": "payments"},
+        {"id": "01BILL", "state": "pending", "intent": "billing work", "estate_root": "billing"},
     ]}));
     app.fleet.filters.estate = Some("payments".to_string());
     app
@@ -132,7 +132,7 @@ fn fleet_long_values() -> App {
         "state": "needs_input",
         "intent": long,
         "workflow": long,
-        "workspace": long,
+        "estate_root": long,
         "stage": {"stage_id": "10-implement", "index": 1, "of": 2, "status": "running", "detail": long},
         "resolved_backend": "fake",
     }]}));

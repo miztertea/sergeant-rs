@@ -1497,6 +1497,151 @@ async fn h1_two_estates_submit_work_to_one_daemon_and_keep_their_own_surfaces() 
     handle.shutdown().await;
 }
 
+/// W4d deliverable 4: a host-scoped client — one that addresses **no**
+/// fixed estate at all, `ApiClient::new` with no `.with_estate_root` — sees
+/// both estates' Work in Fleet, the estate filter cycles all/payments/
+/// billing correctly, and the Estate screen's picker lists both. Reuses
+/// [`start_fake_host`] (already landed for the daemon/journal seat's own
+/// acceptance test above) rather than adding a second multi-estate daemon
+/// fixture — the brief's "start_fake_host-style sibling" already exists.
+#[tokio::test]
+async fn t5_fleet_and_estate_screen_span_two_estates() {
+    let data = TempDir::new().expect("tempdir");
+    let (payments, payments_mount) = solo_estate("payments");
+    let (billing, billing_mount) = solo_estate("billing");
+    write_workflow(payments.path());
+    write_workflow(billing.path());
+
+    let (handle, _fake) =
+        start_fake_host(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+
+    submit(
+        &handle,
+        payments.path(),
+        &payments_mount,
+        "payments work",
+        "tiny",
+    )
+    .await;
+    submit(
+        &handle,
+        billing.path(),
+        &billing_mount,
+        "billing work",
+        "tiny",
+    )
+    .await;
+
+    // Host-scoped: addresses no estate at all — the exact shape `sgt tui`
+    // builds under H1 (`ApiClient::new` with no `.with_estate_root`).
+    let client = ApiClient::new(&handle.endpoint, &handle.token).expect("client");
+
+    // D1: the estate filter's own identity is the canonical root the daemon
+    // folds per Work (`estate_root`), never the manifest's display name —
+    // two estates could share one.
+    let payments_root = std::fs::canonicalize(payments.path())
+        .expect("canonical")
+        .to_string_lossy()
+        .into_owned();
+    let billing_root = std::fs::canonicalize(billing.path())
+        .expect("canonical")
+        .to_string_lossy()
+        .into_owned();
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('2')); // Fleet
+    assert_eq!(app.destination, Destination::Fleet);
+    // The Attention drawer is a global, unfiltered cross-cut (both Works
+    // are non-terminal-free/`completed`... it lists recently-finished ones
+    // regardless of Fleet's own local filter) — closed here so this test's
+    // "must actually narrow" assertions read Fleet's own table alone,
+    // the same `drawer_open = false` every other Fleet geometry fixture
+    // already sets.
+    app.drawer_open = false;
+
+    // --- Fleet shows both estates' Work -------------------------------
+    let terminal = render(&app);
+    assert_shows(&terminal, "payments work", "payments estate's work");
+    assert_shows(&terminal, "billing work", "billing estate's work");
+    assert_shows(
+        &terminal,
+        "estate all",
+        "the header's default all-estates filter",
+    );
+
+    // --- the estate filter cycles all -> <one> -> <other> -> all ------
+    // `next_estate_filter` sorts distinct estate roots, and each estate's
+    // root is an independent fresh tempdir (`solo_estate` per estate), so
+    // which one sorts first is not fixed across runs — compare directly
+    // rather than asserting a specific order.
+    let (first_root, first_intent, second_root, second_intent) = if billing_root < payments_root {
+        (
+            &billing_root,
+            "billing work",
+            &payments_root,
+            "payments work",
+        )
+    } else {
+        (
+            &payments_root,
+            "payments work",
+            &billing_root,
+            "billing work",
+        )
+    };
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('e'));
+    assert_eq!(
+        app.fleet.filters.estate.as_deref(),
+        Some(first_root.as_str())
+    );
+    let terminal = render(&app);
+    assert_shows(&terminal, first_intent, "the filtered-in row");
+    assert!(
+        !screen_text(&terminal).contains(second_intent),
+        "the filter must actually narrow the fleet: {}",
+        screen_text(&terminal)
+    );
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('e'));
+    assert_eq!(
+        app.fleet.filters.estate.as_deref(),
+        Some(second_root.as_str())
+    );
+    let terminal = render(&app);
+    assert_shows(&terminal, second_intent, "the filtered-in row");
+    assert!(!screen_text(&terminal).contains(first_intent));
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('e'));
+    assert_eq!(app.fleet.filters.estate, None, "cycles back to all-estates");
+
+    // --- the Estate screen's picker lists both --------------------------
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('4')); // Estate
+    assert_eq!(app.destination, Destination::Estate);
+    app.refresh(&client).await.expect("estate refresh");
+    assert!(
+        app.estate.picked.is_none(),
+        "a host-scoped client must not silently address either estate on its own"
+    );
+    let terminal = render(&app);
+    assert_shows(&terminal, "payments", "the picker's payments entry");
+    assert_shows(&terminal, "billing", "the picker's billing entry");
+
+    // Picking one addresses that estate's own repos/groups/doctor below.
+    app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    assert!(
+        app.estate.picked.is_some(),
+        "Enter picks the highlighted entry"
+    );
+    app.refresh(&client).await.expect("post-pick refresh");
+    let terminal = render(&app);
+    assert_shows(&terminal, "Repositories", "sub-tabs appear once picked");
+
+    handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn t1_the_events_endpoint_filters_and_tails_by_work() {
     let data = TempDir::new().expect("tempdir");

@@ -2187,12 +2187,13 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
         .work_index
         .keys()
         .map(|id| {
+            let index_row = &registry.work_index[id];
             let Some(work) = registry
                 .works
                 .get(id)
                 .or_else(|| registry.terminal_works.get(id))
             else {
-                return evicted_fleet_row(&registry.work_index[id]);
+                return evicted_fleet_row(index_row);
             };
             // `registry.run_view` alone only reaches the bounded
             // in-memory cache (`TERMINAL_RUN_CACHE_CAPACITY`); once a
@@ -2249,6 +2250,23 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
                         "turn_ceiling_secs": engine.effective_turn_ceiling(Some(work)).as_secs_f64(),
                     }),
                 );
+                // W4d deliverable 1 (H1): the per-Work estate *identity* —
+                // `Work::workspace` (the old display-name field) has been
+                // dead since estate-root Phase C (`Work`'s own doc comment:
+                // "deprecated, never written"); `WorkIndexRow::estate_root`
+                // is the live coordinate H1 actually folds per Work (D1: a
+                // canonical root, never a name — two estates may share a
+                // display name). Surfacing it here is what lets the TUI's
+                // Fleet filter (§10, this wave) narrow by estate at all
+                // against a real daemon; `null` for any Work journaled
+                // before the envelope carried it, or with no estate context.
+                object.insert(
+                    "estate_root".to_string(),
+                    index_row
+                        .estate_root
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                );
             }
             row
         })
@@ -2293,6 +2311,7 @@ fn evicted_fleet_row(row: &WorkIndexRow) -> Value {
         "created_at": row.created_at,
         "updated_at": row.updated_at,
         "evicted": true,
+        "estate_root": row.estate_root,
     })
 }
 
