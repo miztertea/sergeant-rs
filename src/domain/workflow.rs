@@ -1154,7 +1154,7 @@ impl WorkflowDefinition {
             .filter(|boundary| boundary.last_leaf_index == index)
             .collect();
         closing.sort_by(|a, b| {
-            (b.first_leaf_index, &a.container_id).cmp(&(a.first_leaf_index, &b.container_id))
+            (b.first_leaf_index, &b.container_id).cmp(&(a.first_leaf_index, &a.container_id))
         });
         closing
     }
@@ -3504,6 +3504,58 @@ mod tests {
             "a leaf that ends nothing closes nothing"
         );
         assert!(def.containers_closing_at(0).is_empty());
+    }
+
+    /// A legal, simple shape the tie-break must not get wrong: a container
+    /// whose sole stage is itself a nested container. Both boundary rows
+    /// then share the exact same `first_leaf_index` (and `last_leaf_index`)
+    /// — the only thing that still distinguishes them is that the inner
+    /// container's composed id is strictly longer than the outer's. A
+    /// comparator that mismatches its tuple sides (sorting `b`'s range
+    /// against `a`'s id, or vice versa) can pass the differing-range case
+    /// above while still reporting the outer container before the inner one
+    /// here, which is exactly the violation this test pins.
+    #[test]
+    fn a_container_whose_sole_stage_is_a_nested_container_closes_innermost_first() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "wrap");
+        write_package(&wf, "wrap", &["10-wrap"]);
+        let wrap = wf.join("10-wrap");
+        write_package(&wrap, "10-wrap", &["00-inner"]);
+        let inner = wrap.join("00-inner");
+        write_package(&inner, "00-inner", &["00-leaf"]);
+        write_stage(&inner, "00-leaf", "leaf");
+
+        let def = WorkflowDefinition::load_dir(&wf).expect("load");
+        assert_eq!(
+            def.containers,
+            vec![
+                ContainerBoundary {
+                    container_id: "10-wrap".to_string(),
+                    source: wf.display().to_string(),
+                    first_leaf_index: 0,
+                    last_leaf_index: 0,
+                },
+                ContainerBoundary {
+                    container_id: "10-wrap/00-inner".to_string(),
+                    source: wrap.display().to_string(),
+                    first_leaf_index: 0,
+                    last_leaf_index: 0,
+                },
+            ],
+            "both boundaries cover the exact same, single-leaf range"
+        );
+
+        let closing: Vec<&str> = def
+            .containers_closing_at(0)
+            .iter()
+            .map(|b| b.container_id.as_str())
+            .collect();
+        assert_eq!(
+            closing,
+            ["10-wrap/00-inner", "10-wrap"],
+            "equal-range tie must still break innermost (longer composed id) first"
+        );
     }
 
     /// E2/E3: the boundary table is derived from the flattened stage list,
