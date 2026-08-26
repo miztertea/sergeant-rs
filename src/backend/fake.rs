@@ -742,6 +742,15 @@ pub struct FakeBackend {
     /// Where a STOP [`Completion`] can be made to stall — the fake's stand-in
     /// for the Claude adapter's transcript-archive join (issue #14/B3).
     archive_gate: Arc<Gate>,
+    /// Where PROBE can be made to stall — the instrument for #293's
+    /// publish-then-probe ordering. A real adapter's probe is one or more
+    /// `--version`/`--help` subprocess runs (measured at up to ~3.2s for
+    /// opencode on Cerberus, 2026-08-25), and the durable pin for that fix
+    /// has to be an *ordering* assertion rather than a wall clock: park one
+    /// probe indefinitely and assert what the daemon can already do while it
+    /// is parked. Same rendezvous-not-sleep reasoning as
+    /// [`FakeBackend::hold_launches`].
+    probe_gate: Arc<Gate>,
     /// Whether STOP/INTERRUPT hand back a deferred completion at all.
     archive_armed: Arc<Mutex<bool>>,
     /// W4 (2026-08-23): whether PREPARE mints no native identity at all —
@@ -795,6 +804,7 @@ impl FakeBackend {
             send_gate: Arc::new(Gate::default()),
             observe_gate: Arc::new(Gate::default()),
             archive_gate: Arc::new(Gate::default()),
+            probe_gate: Arc::new(Gate::default()),
             archive_armed: Arc::new(Mutex::new(false)),
             server_minted_native_ids: false,
         }
@@ -942,6 +952,27 @@ impl FakeBackend {
     /// Block until `n` stop/interrupt completions are parked, or time out.
     pub fn await_stalled_archives(&self, n: usize, timeout: Duration) -> bool {
         self.archive_gate.wait_for_waiting(n, timeout)
+    }
+
+    /// Stall every later PROBE until [`FakeBackend::release_probes`].
+    ///
+    /// The #293 instrument. A probe parked here stands in for the slowest
+    /// real adapter's subprocess walk; anything the daemon answers while it
+    /// is parked is something the startup path demonstrably does not wait on.
+    pub fn hold_probes(&self) {
+        self.probe_gate.hold();
+    }
+
+    /// Let stalled probes through.
+    pub fn release_probes(&self) {
+        self.probe_gate.release();
+    }
+
+    /// Block until `n` probes are parked in the gate, or the timeout expires.
+    /// Returns whether the rendezvous happened — a test asserts on it rather
+    /// than sleeping and hoping.
+    pub fn await_stalled_probes(&self, n: usize, timeout: Duration) -> bool {
+        self.probe_gate.wait_for_waiting(n, timeout)
     }
 
     /// Make PROBE report unavailable (routing must then fail closed).
@@ -1169,6 +1200,10 @@ impl Backend for FakeBackend {
     }
 
     fn probe(&self) -> ProbeReport {
+        // Outside the backend's own lock, exactly like the other gates: a
+        // caller parked here must not be holding it, or the instrument would
+        // measure the fake's contention instead of the daemon's ordering.
+        self.probe_gate.pass();
         let mut state = self.lock();
         state.probes += 1;
         ProbeReport {
@@ -2187,6 +2222,30 @@ mod tests {
             fake.observe(&e2).expect("observe").signal,
             BackendSignal::StageCompleted { summary: None }
         );
+    }
+
+    /// #293's instrument: PROBE parks in its own gate, and it parks *outside*
+    /// the backend's own lock — otherwise a daemon test could not read this
+    /// backend's state (or any other backend's) while one probe is stalled,
+    /// and the ordering pin would be measuring the fake instead of the daemon.
+    #[test]
+    fn probe_parks_in_its_own_gate_without_holding_the_backend_lock() {
+        let fake = Arc::new(FakeBackend::new("fake"));
+        fake.hold_probes();
+        let prober = {
+            let fake = fake.clone();
+            std::thread::spawn(move || fake.probe())
+        };
+        assert!(
+            fake.await_stalled_probes(1, Duration::from_secs(5)),
+            "the probe must park in the gate"
+        );
+        // The lock is free while the probe is parked: a state read answers.
+        assert_eq!(fake.probe_count(), 0, "no probe has completed yet");
+        fake.release_probes();
+        let report = prober.join().expect("probe thread");
+        assert!(report.available);
+        assert_eq!(fake.probe_count(), 1, "the released probe completed");
     }
 
     /// §15's capability flags are advertised, and an unsupported capability is

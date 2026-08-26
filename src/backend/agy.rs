@@ -316,12 +316,17 @@ const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 /// zero-interaction the way the doc comment above it claims** — an
 /// unauthenticated `agy` (no cached credentials under the effective
 /// `settings_home`/`HOME`) answers it by printing an OAuth URL and blocking
-/// on an interactive login for up to 60s before giving up on its own. `run_probe`
-/// runs synchronously inside daemon registration (`daemon::start_with`,
-/// before the descriptor is published), so an unbounded wait here is exactly
-/// the class of regression this project already tracks for a blocking HTTP
-/// client built during registration — its subprocess analogue, on any host
-/// that has `agy` installed but not yet logged in. Five seconds is
+/// on an interactive login for up to 60s before giving up on its own.
+/// `run_probe` runs inside the daemon's startup backend probe walk, which
+/// since #293 happens *after* the runtime descriptor is published and
+/// alongside a daemon that is already serving — so an unbounded wait here no
+/// longer delays the descriptor the way it did when registration was
+/// synchronous. It is still bounded, for two reasons the reordering did not
+/// retire: the walk holds this backend's routing gate closed
+/// (`backend::ProbeGate`) until its evidence lands, and a stopping daemon has
+/// to wait out whatever probe child is in flight. An unbounded wait would put
+/// an interactive login prompt on both, on any host that has `agy` installed
+/// but is not logged in. Five seconds is
 /// generous headroom over the sub-second reply a real, authenticated `agy`
 /// gave in measurement; a probe that cannot answer inside it is killed and
 /// treated exactly like any other probe failure — best-effort by

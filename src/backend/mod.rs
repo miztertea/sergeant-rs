@@ -56,9 +56,9 @@ pub mod fake;
 /// and contract-tested, and is reachable by nothing yet.
 pub mod opencode;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -872,6 +872,120 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError>;
 }
 
+/// Per-backend probe readiness (#293) — what a caller waits on when it needs
+/// a backend's PROBE evidence and the daemon has not finished collecting it.
+///
+/// **Why this exists.** The daemon publishes its runtime descriptor and starts
+/// serving *before* it walks the backend probes, because the walk is a set of
+/// real CLI invocations (measured on Cerberus 2026-08-25: ~6.4s serially with
+/// five adapters installed, against a 10s client auto-spawn budget) and a
+/// daemon is healthy when it can accept and route requests, not when every
+/// third-party CLI has printed `--help`. That leaves a window in which a
+/// backend's evidence does not exist yet, and exactly one thing may happen in
+/// it: a caller that needs the evidence **waits**. Nothing fabricates a
+/// capability, nothing defaults one, and no submission is refused that the
+/// old probe-walk-first ordering would have accepted — the only difference a
+/// client can observe is *when* the answer arrives.
+///
+/// **Per backend, not per walk.** The wait is keyed by backend name and is
+/// released by that backend's own `backend.probed` record becoming durable,
+/// so a Work routed to a fast adapter is never held up by a slow one it will
+/// never touch. That is also what keeps the M4 evidence order intact:
+/// `backend.probed` for a backend is durable before any Work routed to it is.
+///
+/// **Blocking, not async, deliberately (R2).** Its one real caller is
+/// [`crate::runtime::router`]'s tier walk, which is synchronous and runs
+/// inside the planning path's `block_in_place`; a `Condvar` rendezvous is the
+/// same primitive `fake::Gate` already uses here and needs no runtime
+/// assumptions at all. An async gate would have forced the wait up into the
+/// handler, where the backend the request will route to is not yet known.
+#[derive(Debug, Default)]
+pub struct ProbeGate {
+    state: Mutex<ProbeGateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ProbeGateState {
+    /// Backends still owed a durable `backend.probed` record. Empty means
+    /// nothing waits — which is both the initial state and the final one.
+    pending: BTreeSet<String>,
+}
+
+impl ProbeGate {
+    /// A gate that owes nothing: every wait returns at once.
+    ///
+    /// This is the resting state for every registry that is not a running
+    /// daemon's — unit tests, `sgt doctor`'s own in-process adapters, the CLI
+    /// preflight — and it is also the daemon's own state until it arms the
+    /// gate, which matters: restart reconciliation reads capabilities before
+    /// the walk is spawned, and a gate armed any earlier would wait for a
+    /// walk that has not started.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Arm the gate: these backends now owe evidence, and waits for them
+    /// block until [`ProbeGate::mark`] or [`ProbeGate::settle`] says
+    /// otherwise. Called once, immediately before the probe walk is spawned.
+    pub fn expect(&self, names: impl IntoIterator<Item = String>) {
+        self.state.lock().expect("probe gate lock").pending = names.into_iter().collect();
+        self.changed.notify_all();
+    }
+
+    /// Record that `name`'s probe evidence is durable, releasing its waiters.
+    pub fn mark(&self, name: &str) {
+        self.state
+            .lock()
+            .expect("probe gate lock")
+            .pending
+            .remove(name);
+        self.changed.notify_all();
+    }
+
+    /// Record that the walk is over, however it ended.
+    ///
+    /// Called unconditionally when the walk drains, so a probe that panicked,
+    /// a backend that left the registry, or a journal append that failed
+    /// cannot leave a request waiting forever on evidence that is never
+    /// coming. Failing open here is right: the alternative is a daemon that
+    /// serves reads and hangs every submission, which is worse than the
+    /// defect the reordering fixed.
+    pub fn settle(&self) {
+        self.state.lock().expect("probe gate lock").pending.clear();
+        self.changed.notify_all();
+    }
+
+    /// Whether nothing is owed.
+    pub fn is_settled(&self) -> bool {
+        self.state
+            .lock()
+            .expect("probe gate lock")
+            .pending
+            .is_empty()
+    }
+
+    /// Block until `name`'s probe evidence is durable.
+    ///
+    /// Returns immediately for a backend the gate is not waiting on — an
+    /// unarmed gate, an already-probed backend, or a name that is not in the
+    /// registry at all.
+    pub fn wait_for(&self, name: &str) {
+        let mut state = self.state.lock().expect("probe gate lock");
+        while state.pending.contains(name) {
+            state = self.changed.wait(state).expect("probe gate wait");
+        }
+    }
+
+    /// Block until every backend the gate is waiting on has its evidence.
+    pub fn wait_all(&self) {
+        let mut state = self.state.lock().expect("probe gate lock");
+        while !state.pending.is_empty() {
+            state = self.changed.wait(state).expect("probe gate wait");
+        }
+    }
+}
+
 /// The set of backends this daemon can route to.
 ///
 /// Compiled-in rather than configured: M3 has exactly one backend to register,
@@ -880,12 +994,31 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default, Clone)]
 pub struct BackendRegistry {
     backends: BTreeMap<String, Arc<dyn Backend>>,
+    /// #293's probe readiness, carried here because the registry is what is
+    /// already threaded through every path that resolves a backend by name —
+    /// the router's tier walk above all. A registry that is not a running
+    /// daemon's keeps the owed-nothing default and never waits; a clone
+    /// shares the original's gate, which is what makes
+    /// `daemon::start_with`'s "clone the configured registry, add the real
+    /// adapters" step carry one gate rather than forking it.
+    probe_gate: Arc<ProbeGate>,
 }
 
 impl BackendRegistry {
     /// An empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach the probe-readiness gate this registry's callers wait on.
+    pub fn with_probe_gate(mut self, gate: Arc<ProbeGate>) -> Self {
+        self.probe_gate = gate;
+        self
+    }
+
+    /// This registry's probe-readiness gate.
+    pub fn probe_gate(&self) -> &Arc<ProbeGate> {
+        &self.probe_gate
     }
 
     /// Register a backend under its own name.

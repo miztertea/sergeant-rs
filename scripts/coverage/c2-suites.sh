@@ -150,3 +150,15 @@ cov_stage_end 1 "the docs_contract test binary must write its own profile"
 cov_stage_begin c2-w4c_service_doctor
 cov_run cargo llvm-cov --no-report --test w4c_service_doctor --locked || cov_fail "w4c_service_doctor failed under instrumentation"
 cov_stage_end 1 "the w4c_service_doctor test binary must write its own profile (its fake systemctl/launchctl binaries are shell-script stand-ins, uninstrumented and no loss, per codex_backend's precedent)"
+
+# Added 2026-08-25, in the same wave that creates the suite (W2fix, #293) —
+# wired at birth rather than recovered later, which is exactly what the
+# #231(b) guard that caught this one exists to force. Sits in C2, not C3:
+# every case starts an in-process `daemon::start_with` against a hermetic
+# fake registry that pre-empts all five real adapters, so nothing here spawns
+# an `sgt` subprocess, a real CLI, or even a shell-script stand-in. The suite
+# reads the runtime descriptor *file* as a client would, which is a read and
+# not a spawn. Floor 1.
+cov_stage_begin c2-w2fix_probe_ordering
+cov_run cargo llvm-cov --no-report --test w2fix_probe_ordering --locked || cov_fail "w2fix_probe_ordering failed under instrumentation"
+cov_stage_end 1 "the w2fix_probe_ordering test binary must write its own profile"
