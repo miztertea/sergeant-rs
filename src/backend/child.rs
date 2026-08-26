@@ -181,7 +181,10 @@ pub fn harden_probe_child(command: &mut Command) {
             });
         }
     }
-    #[cfg(not(any(unix, target_os = "linux")))]
+    // `target_os = "linux"` implies `unix`, so this is simply the non-unix
+    // case: no process groups, no parent-death signal, nothing to arm. Named
+    // rather than omitted so a Windows build compiles and the gap is visible.
+    #[cfg(not(unix))]
     {
         let _ = command;
     }
