@@ -4773,7 +4773,9 @@ async fn t12_submission_throughput_has_an_automated_floor() {
          however long the execution lane parks a launch before admitting it — so any \
          external effect of ~80 ms or more put back under the core lock, or execution-lane \
          parking that does not clear well inside a 25-burst, lands below it, whatever the \
-         host speed."
+         host speed. Lane-era floor provenance: measured 2026-08-26 at 18.9-100.5 works/s \
+         across default/2-core/instrumented-2-core conditions (worst 18.9, ≥2.3x margin; \
+         sergeant-rs-workspace's knowledge/evidence/perf/t12-lane-era-throughput-2026-08-26.md)."
     );
 }
 
