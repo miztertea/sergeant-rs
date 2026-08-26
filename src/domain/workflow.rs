@@ -720,6 +720,30 @@ const EMBEDDED_CONTEXTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// The embedded loader's equivalent of a workflow package directory (W1 §2,
+/// [`WorkflowDefinition::load_embedded`]): a `workflow.toml`, the leaf
+/// `CONTEXT.md` contents it can splice in directly, and any stage ids that
+/// are themselves nested embedded packages — the embedded parity to
+/// [`WorkflowDefinition::load_dir`]'s directory-marker recursion, over a
+/// static representation since `include_str!` content has no directory to
+/// walk at runtime.
+struct EmbeddedPackage<'a> {
+    /// The package's `workflow.toml` text.
+    workflow_toml: &'a str,
+    /// `(stage id, CONTEXT.md)` pairs for this package's own leaf stages.
+    contexts: &'a [(&'a str, &'a str)],
+    /// `(stage id, nested package)` pairs: a stage id here is this loader's
+    /// positive marker for "this stage is a container", mirroring
+    /// `load_dir`'s `stage_dir.join(WORKFLOW_FILE).is_file()` check.
+    ///
+    /// A lifetime parameter rather than a hardcoded `'static`: the real
+    /// `EMBEDDED_CONTEXTS`/`EMBEDDED_WORKFLOW_TOML` consts are `'static`, but
+    /// the parity tests below build a synthetic `EmbeddedPackage` out of
+    /// stack-local strings, and the recursion/splice mechanism is exactly
+    /// the same either way.
+    nested: &'a [(&'a str, EmbeddedPackage<'a>)],
+}
+
 impl WorkflowDefinition {
     /// Resolve `name` for a estate rooted at `root`.
     ///
@@ -885,13 +909,67 @@ impl WorkflowDefinition {
     /// The built-in `software-change` workflow.
     pub fn embedded() -> Result<Self, WorkflowError> {
         let path = format!("<embedded>/{DEFAULT_WORKFLOW}/{WORKFLOW_FILE}");
-        let parsed = parse_descriptor(EMBEDDED_WORKFLOW_TOML, &path)?;
+        let pkg = EmbeddedPackage {
+            workflow_toml: EMBEDDED_WORKFLOW_TOML,
+            contexts: EMBEDDED_CONTEXTS,
+            nested: &[],
+        };
+        Self::load_embedded(&pkg, path)
+    }
+
+    /// Parity with [`Self::load_dir`] for the embedded representation (W1
+    /// §2 / decision E1): a stage id present in `pkg.nested` is this
+    /// loader's equivalent of a directory holding its own `workflow.toml` —
+    /// a positive marker detection, recursed and spliced exactly as
+    /// `load_dir` does, over whatever the embedded package representation
+    /// (a static `EmbeddedPackage` tree, since there is no build-time
+    /// directory walk for `include_str!` content) actually supports. The
+    /// built-in `software-change` workflow happens to declare no nested
+    /// entries today (`embedded()` passes `nested: &[]`), but the mechanism
+    /// itself does not assume that — see the recursion/splice tests below.
+    fn load_embedded(pkg: &EmbeddedPackage<'_>, path: String) -> Result<Self, WorkflowError> {
+        let dir_path = path
+            .strip_suffix(&format!("/{WORKFLOW_FILE}"))
+            .unwrap_or(&path)
+            .to_string();
+        let parsed = parse_descriptor(pkg.workflow_toml, &path)?;
         let ids = check_stage_ids(&parsed.workflow.stages, &path)?;
         check_stage_tables(&ids, &parsed.stages_meta, &path)?;
         let mut stages = Vec::with_capacity(ids.len());
         for id in ids {
+            // Same positive-detection rule as `load_dir`: a marker match,
+            // never "no context happened to be embedded" — an id with
+            // neither still fails closed via `MissingStage` below.
+            if let Some((_, nested_pkg)) = pkg.nested.iter().find(|(nested_id, _)| *nested_id == id)
+            {
+                let marker = format!("{dir_path}/{id}/{WORKFLOW_FILE}");
+                if pkg.contexts.iter().any(|(cid, _)| *cid == id) {
+                    let context = format!("{dir_path}/{id}/{CONTEXT_FILE}");
+                    return Err(WorkflowError::NestedPackageWithContext {
+                        path,
+                        stage: id,
+                        marker,
+                        context,
+                    });
+                }
+                if parsed.stages_meta.contains_key(&id) {
+                    return Err(WorkflowError::NestedPackageStageTable {
+                        path,
+                        stage: id,
+                        marker,
+                    });
+                }
+                let nested_path = format!("{dir_path}/{id}/{WORKFLOW_FILE}");
+                let nested = Self::load_embedded(nested_pkg, nested_path)?;
+                stages.extend(nested.stages.into_iter().map(|leaf| StageDefinition {
+                    id: format!("{id}/{}", leaf.id),
+                    ..leaf
+                }));
+                continue;
+            }
             let tag = resolve_stage_tag(&id, parsed.stages_meta.get(&id), &path)?;
-            let embedded_context = EMBEDDED_CONTEXTS
+            let embedded_context = pkg
+                .contexts
                 .iter()
                 .find(|(stage, _)| *stage == id)
                 .map(|(_, context)| (*context).to_string());
@@ -906,7 +984,7 @@ impl WorkflowDefinition {
                     return Err(WorkflowError::MissingStage {
                         path: path.clone(),
                         stage: id.clone(),
-                        missing: format!("<embedded>/{DEFAULT_WORKFLOW}/{id}/{CONTEXT_FILE}"),
+                        missing: format!("{dir_path}/{id}/{CONTEXT_FILE}"),
                     });
                 }
             };
@@ -3354,14 +3432,15 @@ mod tests {
         );
     }
 
-    /// Parity guard for the embedded loader: the built-in `software-change`
-    /// workflow is flat, and nesting is a *directory* loader concept — a
-    /// nested package can never be `SOURCE_EMBEDDED` (there is no embedded
-    /// nested descriptor to parse). Stated as a test so an embedded package
-    /// that grew a nested stage would fail here rather than silently load a
-    /// container as an actor stage with no context.
+    /// The built-in `software-change` workflow happens to be flat today
+    /// (`embedded()` passes `nested: &[]`) — this pins that current fact, not
+    /// a claim that the embedded loader is incapable of nesting. See the
+    /// `embedded_loader_*` tests below for proof the recursion/splice
+    /// mechanism itself works, exercised against a synthetic
+    /// `EmbeddedPackage` since the real built-in package has no nested entry
+    /// to exercise it against.
     #[test]
-    fn the_embedded_workflow_stays_flat() {
+    fn the_built_in_software_change_workflow_is_flat_today() {
         let def = WorkflowDefinition::embedded().expect("embedded workflow");
         for stage in &def.stages {
             assert!(
@@ -3370,6 +3449,149 @@ mod tests {
                 stage.id
             );
         }
+    }
+
+    // ---------------------------------- embedded-loader nesting parity (E1)
+
+    /// W1 §2 / E1 parity: a stage id present in an `EmbeddedPackage`'s
+    /// `nested` list recurses and splices with a composed `parent/child` id,
+    /// exactly like `load_dir`'s directory-marker recursion — proven here
+    /// against a synthetic package since the real embedded `software-change`
+    /// workflow has no nested entry today.
+    #[test]
+    fn embedded_loader_recurses_into_a_nested_package_and_composes_the_id() {
+        let leaf = EmbeddedPackage {
+            workflow_toml: "[workflow]\nname = \"10-container\"\nversion = \"1\"\nstages = [\"00-leaf\"]\n",
+            contexts: &[("00-leaf", "the nested procedure")],
+            nested: &[],
+        };
+        let root = EmbeddedPackage {
+            workflow_toml: "[workflow]\nname = \"synthetic\"\nversion = \"1\"\nstages = [\"10-container\"]\n",
+            contexts: &[],
+            nested: &[("10-container", leaf)],
+        };
+        let def = WorkflowDefinition::load_embedded(
+            &root,
+            "<embedded>/synthetic/workflow.toml".to_string(),
+        )
+        .expect("recurse into the nested embedded package");
+        assert_eq!(def.stages.len(), 1);
+        assert_eq!(def.stages[0].id, "10-container/00-leaf");
+        assert_eq!(def.stages[0].context, "the nested procedure");
+    }
+
+    /// E2 parity: the content hash folds the flattened tree for the embedded
+    /// loader too — editing a nested leaf's context changes the parent's
+    /// `content_hash`, exactly like `editing_a_nested_leafs_context_changes_the_parents_content_hash`
+    /// proves for `load_dir`.
+    #[test]
+    fn embedded_loader_folds_a_nested_leafs_content_into_the_parents_hash() {
+        const ROOT_TOML: &str =
+            "[workflow]\nname = \"synthetic\"\nversion = \"1\"\nstages = [\"10-container\"]\n";
+        const LEAF_TOML: &str =
+            "[workflow]\nname = \"10-container\"\nversion = \"1\"\nstages = [\"00-leaf\"]\n";
+
+        let original_leaf = EmbeddedPackage {
+            workflow_toml: LEAF_TOML,
+            contexts: &[("00-leaf", "original")],
+            nested: &[],
+        };
+        let original_root = EmbeddedPackage {
+            workflow_toml: ROOT_TOML,
+            contexts: &[],
+            nested: &[("10-container", original_leaf)],
+        };
+        let before = WorkflowDefinition::load_embedded(
+            &original_root,
+            "<embedded>/synthetic/workflow.toml".to_string(),
+        )
+        .expect("load");
+
+        let edited_leaf = EmbeddedPackage {
+            workflow_toml: LEAF_TOML,
+            contexts: &[("00-leaf", "edited")],
+            nested: &[],
+        };
+        let edited_root = EmbeddedPackage {
+            workflow_toml: ROOT_TOML,
+            contexts: &[],
+            nested: &[("10-container", edited_leaf)],
+        };
+        let after = WorkflowDefinition::load_embedded(
+            &edited_root,
+            "<embedded>/synthetic/workflow.toml".to_string(),
+        )
+        .expect("reload");
+
+        assert_ne!(
+            before.content_hash, after.content_hash,
+            "E2: a nested leaf's content folds into the embedded parent's identity too"
+        );
+    }
+
+    /// Parity with [`WorkflowError::NestedPackageWithContext`]: a stage id
+    /// that is both a nested embedded package and carries its own embedded
+    /// `CONTEXT.md` is refused, the same fail-closed shape `load_dir` gives a
+    /// stage directory holding both a nested `workflow.toml` and a
+    /// `CONTEXT.md`.
+    #[test]
+    fn embedded_loader_refuses_a_nested_package_that_also_carries_a_context() {
+        let leaf = EmbeddedPackage {
+            workflow_toml: "[workflow]\nname = \"10-container\"\nversion = \"1\"\nstages = [\"00-leaf\"]\n",
+            contexts: &[("00-leaf", "the nested procedure")],
+            nested: &[],
+        };
+        let root = EmbeddedPackage {
+            workflow_toml: "[workflow]\nname = \"synthetic\"\nversion = \"1\"\nstages = [\"10-container\"]\n",
+            // A context embedded for the very id that is also `nested` —
+            // the embedded equivalent of a stage directory holding both
+            // `workflow.toml` and `CONTEXT.md`.
+            contexts: &[("10-container", "should never be read")],
+            nested: &[("10-container", leaf)],
+        };
+        let err = WorkflowDefinition::load_embedded(
+            &root,
+            "<embedded>/synthetic/workflow.toml".to_string(),
+        )
+        .expect_err("a nested package with a context must be refused");
+        assert!(
+            matches!(&err, WorkflowError::NestedPackageWithContext { stage, .. } if stage == "10-container"),
+            "expected NestedPackageWithContext, got {err}"
+        );
+    }
+
+    /// Parity with [`WorkflowError::NestedPackageStageTable`]: a `[stage.*]`
+    /// table naming a nested-package stage id is refused, the same
+    /// fail-closed shape `load_dir` gives a `[stage.*]` table over a
+    /// directory that is itself a nested workflow package.
+    #[test]
+    fn embedded_loader_refuses_a_stage_table_over_a_nested_package() {
+        let leaf = EmbeddedPackage {
+            workflow_toml: "[workflow]\nname = \"10-container\"\nversion = \"1\"\nstages = [\"00-leaf\"]\n",
+            contexts: &[("00-leaf", "the nested procedure")],
+            nested: &[],
+        };
+        let root = EmbeddedPackage {
+            workflow_toml: concat!(
+                "[workflow]\n",
+                "name = \"synthetic\"\n",
+                "version = \"1\"\n",
+                "stages = [\"10-container\"]\n",
+                "[stage.\"10-container\"]\n",
+                "kind = \"actor\"\n",
+            ),
+            contexts: &[],
+            nested: &[("10-container", leaf)],
+        };
+        let err = WorkflowDefinition::load_embedded(
+            &root,
+            "<embedded>/synthetic/workflow.toml".to_string(),
+        )
+        .expect_err("a stage table over a nested package must be refused");
+        assert!(
+            matches!(&err, WorkflowError::NestedPackageStageTable { stage, .. } if stage == "10-container"),
+            "expected NestedPackageStageTable, got {err}"
+        );
     }
 
     // --------------------------------------------- T2: catalog / front matter
