@@ -645,12 +645,25 @@ fn journal_segment(data_dir: &Path) -> PathBuf {
 
 // ------------------------------------------------------ 2. one owner
 
-/// Acceptance 2. Only the daemon's own projection module opens DuckDB.
+/// Acceptance 2. Only the daemon's own projection module opens
+/// `sergeant.duckdb`.
 ///
 /// Enforced structurally and checked mechanically: the `duckdb` crate is
 /// named in exactly one source file, that file hands out no connection, and
 /// the dependency is a normal one (a client binary that wanted its own copy
 /// would have to change this test first).
+///
+/// **Scope (S3 X1).** This assertion is about the operations projection's
+/// database and stays that. Atlas (`src/runtime/atlas/`) is a *second,
+/// separate* database with its own single owning file, pinned by its own
+/// test — `tests/x1_atlas_substrate.rs`'s
+/// `atlas_database_has_exactly_one_owner`. The scan below therefore skips
+/// that tree rather than growing an allowed-owners list: a union rule
+/// ("either of these files may open a database") would pass just as happily
+/// once one owner had grown into the other's database, which is exactly the
+/// drift a one-owner acceptance exists to catch. Every `.rs` file outside
+/// those two trees is still scanned here, so the two tests together leave no
+/// source unscanned.
 #[test]
 fn t2_the_duckdb_file_has_exactly_one_owner() {
     let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -663,8 +676,12 @@ fn t2_the_duckdb_file_has_exactly_one_owner() {
         text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
             .any(|token| token == "duckdb")
     };
+    // Atlas's own tree is out of this test's scope, not exempt from having an
+    // owner: `tests/x1_atlas_substrate.rs` scans it, with the same token scan
+    // and the same positive half, against `runtime/atlas/db.rs`.
+    let atlas_tree = src.join("runtime").join("atlas");
     for file in rust_sources(&src) {
-        if file.ends_with("runtime/analytics.rs") {
+        if file.ends_with("runtime/analytics.rs") || file.starts_with(&atlas_tree) {
             continue;
         }
         let text = std::fs::read_to_string(&file).expect("read source");
@@ -674,6 +691,12 @@ fn t2_the_duckdb_file_has_exactly_one_owner() {
             file.strip_prefix(&src).expect("under src").display()
         );
     }
+    assert!(
+        atlas_tree.join("db.rs").is_file(),
+        "the skip above is only honest while {} exists to carry the second \
+         one-owner assertion",
+        atlas_tree.join("db.rs").display()
+    );
 
     // The positive half of "exactly one owner". Without it the loop above is
     // satisfied by a build that stopped using the crate altogether — and R5

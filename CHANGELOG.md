@@ -206,6 +206,34 @@ release.
     above. Recorded here per the brief's own honesty requirement rather
     than silently discarded as a bad take.
 
+### Atlas substrate (S3)
+
+- Atlas — the world-intelligence store — gets its own module tree
+  (`src/runtime/atlas/`) and its own database file, `<data-dir>/atlas/
+  atlas.duckdb`, deliberately outside the disposable `projections/`
+  directory. `runtime/atlas/db.rs` is its single owning file: it is the
+  only module in that tree that reaches the database driver, and it hands
+  no live connection out. Two independent structural tests now hold two
+  independent one-owner invariants — M5's keeps naming `runtime/
+  analytics.rs` as the operations projection's sole owner, and a new suite
+  (`tests/x1_atlas_substrate.rs`) names `runtime/atlas/db.rs` as Atlas's.
+  They are never merged into one "either of these files may open a
+  database" rule.
+- Atlas declares the `meta`, `source`, `git` and `context` schema
+  namespaces; no table yet. Every table lands in the change that lands its
+  writer, the same empty-table refusal doctrine the operations projection
+  already applies.
+- The two stores do not share a rebuild discipline, and both module docs
+  say so: the operations projection is deleted and re-folded from the
+  journal on every daemon start, while Atlas's `source.*`, `git.*` and
+  `meta.coverage` persist across restarts — they are derived from source
+  bytes plus extractor identity, keyed by source generation, and a
+  generation is evicted only when those bytes change.
+- The ten operations tables moved into an `ops` schema inside
+  `sergeant.duckdb`. Physical requalification only: every table name the
+  daemon reports (`/v1/analytics`, `sgt analytics`) and every answer it
+  gives is unchanged, and the existing projection suite passes as-is.
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain

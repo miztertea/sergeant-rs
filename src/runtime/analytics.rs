@@ -25,6 +25,15 @@
 //! adapter emits `filesystem.changed` or `git.changed`), so they are absent
 //! rather than declared empty — a table that can only ever answer "zero rows"
 //! is a false promise, not completeness.
+//!
+//! **They live in the [`OPS_SCHEMA`] namespace** (S3 F3, A1 §5's
+//! meta/ops/source/git/context split). That is a physical requalification and
+//! nothing more: the names this module answers with — [`Analytics::table_counts`],
+//! [`Analytics::table_rows`], the API's `tables` list — are still the bare
+//! table names, because the namespace says which database family a table
+//! belongs to, not what it is called. The other families named by §5 belong
+//! to a different file with a different rebuild discipline
+//! ([`crate::runtime::atlas`]); nothing in §5's list implies one database.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -105,10 +114,27 @@ pub enum AnalyticsError {
 /// re-planned mid-rebuild.
 const STATEMENT_CACHE: usize = 64;
 
-/// The §22 schema. Written on every rebuild; there is no migration path and
-/// there does not need to be one — the file is derived.
+/// The schema every operations table lives in (S3 F3, A1 §5).
+///
+/// Physical qualification only — nothing this module reports changes name
+/// because of it. See the module doc.
+const OPS_SCHEMA: &str = "ops";
+
+/// One operations table, qualified and quoted for SQL.
+///
+/// The quoting is what keeps `usage` (a reserved word) addressable; the
+/// qualification is what stops a bare name from resolving against DuckDB's
+/// default `main` schema, which this database deliberately leaves empty.
+fn ops(table: &str) -> String {
+    format!("{OPS_SCHEMA}.\"{table}\"")
+}
+
+/// The §22 schema, in the [`OPS_SCHEMA`] namespace. Written on every rebuild;
+/// there is no migration path and there does not need to be one — the file is
+/// derived.
 const SCHEMA: &str = r#"
-CREATE TABLE events (
+CREATE SCHEMA ops;
+CREATE TABLE ops.events (
     seq            BIGINT PRIMARY KEY,
     event_id       VARCHAR NOT NULL,
     timestamp      VARCHAR NOT NULL,
@@ -123,8 +149,8 @@ CREATE TABLE events (
     kind           VARCHAR NOT NULL,
     payload        VARCHAR NOT NULL
 );
-CREATE INDEX idx_events_kind_work ON events(kind, work_id);
-CREATE TABLE work (
+CREATE INDEX idx_events_kind_work ON ops.events(kind, work_id);
+CREATE TABLE ops.work (
     work_id       VARCHAR PRIMARY KEY,
     intent        VARCHAR,
     estate        VARCHAR,
@@ -143,7 +169,7 @@ CREATE TABLE work (
     submitted_seq BIGINT,
     submitted_ms  BIGINT
 );
-CREATE TABLE stages (
+CREATE TABLE ops.stages (
     work_id     VARCHAR,
     stage_id    VARCHAR,
     attempt     BIGINT,
@@ -156,7 +182,7 @@ CREATE TABLE stages (
     ended_ms    BIGINT,
     PRIMARY KEY (work_id, stage_id, attempt)
 );
-CREATE TABLE executions (
+CREATE TABLE ops.executions (
     execution_id          VARCHAR PRIMARY KEY,
     work_id               VARCHAR,
     backend               VARCHAR,
@@ -170,7 +196,7 @@ CREATE TABLE executions (
     stop_requested        BOOLEAN,
     reconcile_disposition VARCHAR
 );
-CREATE TABLE messages (
+CREATE TABLE ops.messages (
     seq          BIGINT PRIMARY KEY,
     work_id      VARCHAR,
     execution_id VARCHAR,
@@ -178,7 +204,7 @@ CREATE TABLE messages (
     text         VARCHAR,
     ts_ms        BIGINT
 );
-CREATE TABLE tool_calls (
+CREATE TABLE ops.tool_calls (
     execution_id  VARCHAR,
     tool_use_id   VARCHAR,
     work_id       VARCHAR,
@@ -190,7 +216,7 @@ CREATE TABLE tool_calls (
     is_error      BOOLEAN,
     PRIMARY KEY (execution_id, tool_use_id)
 );
-CREATE TABLE "usage" (
+CREATE TABLE ops."usage" (
     seq                   BIGINT PRIMARY KEY,
     work_id               VARCHAR,
     execution_id          VARCHAR,
@@ -204,7 +230,7 @@ CREATE TABLE "usage" (
     model_pin             VARCHAR,
     is_error              BOOLEAN
 );
-CREATE TABLE repositories (
+CREATE TABLE ops.repositories (
     work_id          VARCHAR,
     repository       VARCHAR,
     source_path      VARCHAR,
@@ -218,14 +244,14 @@ CREATE TABLE repositories (
     disposition      VARCHAR,
     PRIMARY KEY (work_id, repository)
 );
-CREATE TABLE graph_nodes (
+CREATE TABLE ops.graph_nodes (
     node_id    VARCHAR PRIMARY KEY,
     kind       VARCHAR NOT NULL,
     label      VARCHAR,
     work_id    VARCHAR,
     source_seq BIGINT NOT NULL
 );
-CREATE TABLE graph_edges (
+CREATE TABLE ops.graph_edges (
     edge_id    VARCHAR PRIMARY KEY,
     relation   VARCHAR NOT NULL,
     from_node  VARCHAR NOT NULL,
@@ -264,14 +290,14 @@ pub const CANNED_QUERIES: &[CannedQuery] = &[
             WITH spans AS (\
                 SELECT work_id, kind, ts_ms, \
                        lead(ts_ms) OVER (PARTITION BY work_id ORDER BY seq) AS next_ms \
-                FROM events \
+                FROM ops.events \
                 WHERE work_id IS NOT NULL AND kind LIKE 'work.%' \
             ) \
             SELECT w.work_id, w.state, \
                    COALESCE(SUM(CASE WHEN spans.kind = 'work.blocked' AND spans.next_ms IS NOT NULL \
                                      THEN spans.next_ms - spans.ts_ms END), 0) AS blocked_ms, \
                    COUNT(CASE WHEN spans.kind = 'work.blocked' THEN 1 END) AS blocked_episodes \
-            FROM work w LEFT JOIN spans ON spans.work_id = w.work_id \
+            FROM ops.work w LEFT JOIN spans ON spans.work_id = w.work_id \
             GROUP BY w.work_id, w.state ORDER BY blocked_ms DESC, w.work_id",
     },
     CannedQuery {
@@ -285,7 +311,7 @@ pub const CANNED_QUERIES: &[CannedQuery] = &[
                    COUNT(*) FILTER (WHERE s.attempt > 1) AS retries, \
                    COUNT(*) AS stage_attempts, \
                    COUNT(DISTINCT s.work_id) AS works \
-            FROM stages s JOIN work w ON w.work_id = s.work_id \
+            FROM ops.stages s JOIN ops.work w ON w.work_id = s.work_id \
             GROUP BY 1 ORDER BY retries DESC, backend",
     },
     CannedQuery {
@@ -296,12 +322,12 @@ pub const CANNED_QUERIES: &[CannedQuery] = &[
                    COALESCE(r.repositories, 0) AS repositories, \
                    COALESCE(t.tool_calls, 0) AS tool_calls, \
                    COALESCE(m.messages, 0) AS messages \
-            FROM executions e \
-            LEFT JOIN (SELECT work_id, COUNT(*) AS repositories FROM repositories GROUP BY 1) r \
+            FROM ops.executions e \
+            LEFT JOIN (SELECT work_id, COUNT(*) AS repositories FROM ops.repositories GROUP BY 1) r \
                    ON r.work_id = e.work_id \
-            LEFT JOIN (SELECT execution_id, COUNT(*) AS tool_calls FROM tool_calls GROUP BY 1) t \
+            LEFT JOIN (SELECT execution_id, COUNT(*) AS tool_calls FROM ops.tool_calls GROUP BY 1) t \
                    ON t.execution_id = e.execution_id \
-            LEFT JOIN (SELECT execution_id, COUNT(*) AS messages FROM messages GROUP BY 1) m \
+            LEFT JOIN (SELECT execution_id, COUNT(*) AS messages FROM ops.messages GROUP BY 1) m \
                    ON m.execution_id = e.execution_id \
             ORDER BY e.started_seq",
     },
@@ -315,16 +341,16 @@ pub const CANNED_QUERIES: &[CannedQuery] = &[
         sql: "\
             WITH failure AS (\
                 SELECT work_id, MIN(seq) AS failed_seq \
-                FROM events \
+                FROM ops.events \
                 WHERE work_id IS NOT NULL \
                   AND kind IN ('work.failed', 'work.blocked', 'stage.failed', 'stage.blocked') \
                 GROUP BY work_id \
             ) \
             SELECT f.work_id, f.failed_seq, \
-                   (SELECT kind FROM events WHERE seq = f.failed_seq) AS failure_kind, \
+                   (SELECT kind FROM ops.events WHERE seq = f.failed_seq) AS failure_kind, \
                    COUNT(t.tool_use_id) AS tool_calls_before \
             FROM failure f \
-            LEFT JOIN tool_calls t \
+            LEFT JOIN ops.tool_calls t \
                    ON t.work_id = f.work_id AND t.requested_seq < f.failed_seq \
             GROUP BY f.work_id, f.failed_seq ORDER BY tool_calls_before DESC, f.work_id",
     },
@@ -338,7 +364,7 @@ pub const CANNED_QUERIES: &[CannedQuery] = &[
                    COALESCE(SUM(output_tokens), 0) AS output_tokens, \
                    COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
                    COALESCE(SUM(total_cost_usd), 0) AS total_cost_usd \
-            FROM \"usage\" GROUP BY work_id ORDER BY work_id",
+            FROM ops.\"usage\" GROUP BY work_id ORDER BY work_id",
     },
 ];
 
@@ -853,7 +879,7 @@ impl Analytics {
     fn reset(&mut self) -> Result<(), AnalyticsError> {
         for table in TABLES {
             self.conn
-                .execute_batch(&format!("DELETE FROM \"{table}\""))?;
+                .execute_batch(&format!("DELETE FROM {}", ops(table)))?;
         }
         self.rows = Rows::default();
         self.graph = GraphContext::default();
@@ -893,7 +919,7 @@ impl Analytics {
         }
         for table in MUTABLE_TABLES {
             self.conn
-                .execute_batch(&format!("DELETE FROM \"{table}\""))?;
+                .execute_batch(&format!("DELETE FROM {}", ops(table)))?;
         }
         append_all(
             &self.conn,
@@ -1335,7 +1361,7 @@ impl Analytics {
         for table in TABLES {
             let mut statement = self
                 .conn
-                .prepare(&format!("SELECT COUNT(*) FROM \"{table}\""))?;
+                .prepare(&format!("SELECT COUNT(*) FROM {}", ops(table)))?;
             let count: i64 = statement.query_row(duckdb::params![], |row| row.get(0))?;
             counts.push(((*table).to_string(), count));
         }
@@ -1365,7 +1391,7 @@ impl Analytics {
                 name: table.to_string(),
             })?;
         self.materialize()?;
-        let sql = format!("SELECT * FROM \"{table}\"");
+        let sql = format!("SELECT * FROM {}", ops(table));
         let (columns, rows) = self.select(&sql, duckdb::params![])?;
         Ok(QueryResult {
             name: (*table).to_string(),
@@ -1385,15 +1411,15 @@ impl Analytics {
     pub fn graph_neighborhood(&mut self, work_id: &str) -> Result<GraphView, AnalyticsError> {
         self.materialize()?;
         let (node_columns, node_rows) = self.select(
-            "SELECT node_id, kind, label, work_id, source_seq FROM graph_nodes \
+            "SELECT node_id, kind, label, work_id, source_seq FROM ops.graph_nodes \
              WHERE work_id = ?1 \
-                OR node_id IN (SELECT from_node FROM graph_edges WHERE work_id = ?1) \
-                OR node_id IN (SELECT to_node FROM graph_edges WHERE work_id = ?1) \
+                OR node_id IN (SELECT from_node FROM ops.graph_edges WHERE work_id = ?1) \
+                OR node_id IN (SELECT to_node FROM ops.graph_edges WHERE work_id = ?1) \
              ORDER BY source_seq, node_id",
             duckdb::params![work_id],
         )?;
         let (edge_columns, edge_rows) = self.select(
-            "SELECT edge_id, relation, from_node, to_node, source_seq FROM graph_edges \
+            "SELECT edge_id, relation, from_node, to_node, source_seq FROM ops.graph_edges \
              WHERE work_id = ?1 ORDER BY source_seq, edge_id",
             duckdb::params![work_id],
         )?;
@@ -1511,7 +1537,7 @@ fn append_all(conn: &Connection, table: &str, rows: Vec<Vec<Duck>>) -> Result<()
     if rows.is_empty() {
         return Ok(());
     }
-    let mut appender = conn.appender(table)?;
+    let mut appender = conn.appender_to_db(table, OPS_SCHEMA)?;
     for values in rows {
         appender.append_row(duckdb::appender_params_from_iter(values))?;
     }
@@ -1629,6 +1655,39 @@ mod tests {
         assert!(counts.iter().all(|(_, count)| *count == 0));
     }
 
+    /// S3 F3. The requalification is physical, not cosmetic: every table this
+    /// module creates lives in the `ops` namespace and DuckDB's default
+    /// `main` schema holds nothing at all. Read back out of the catalog, so a
+    /// table added later without a namespace fails here rather than quietly
+    /// landing in `main` and still answering queries.
+    #[test]
+    fn every_table_lives_in_the_ops_schema_and_main_holds_nothing() {
+        let analytics = Analytics::in_memory(Vec::new()).expect("projection");
+        let (columns, rows) = analytics
+            .select(
+                "SELECT schema_name, table_name FROM duckdb_tables() \
+                 WHERE database_name = current_database() ORDER BY table_name",
+                duckdb::params![],
+            )
+            .expect("select");
+        assert_eq!(columns, vec!["schema_name", "table_name"]);
+        let mut expected: Vec<&str> = TABLES.to_vec();
+        expected.sort_unstable();
+        let found: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                assert_eq!(
+                    row[0],
+                    json!(OPS_SCHEMA),
+                    "{:?} is not in the ops namespace",
+                    row[1]
+                );
+                row[1].as_str().expect("table name").to_string()
+            })
+            .collect();
+        assert_eq!(found, expected);
+    }
+
     #[test]
     fn folding_is_idempotent_over_a_replayed_prefix() {
         // `catch_up` skipping the covered prefix is what lets the daemon hand
@@ -1663,7 +1722,7 @@ mod tests {
         analytics.materialize().expect("materialize");
         let (columns, rows) = analytics
             .select(
-                "SELECT work_id, estate_root FROM work ORDER BY work_id",
+                "SELECT work_id, estate_root FROM ops.work ORDER BY work_id",
                 duckdb::params![],
             )
             .expect("select");
@@ -1690,7 +1749,7 @@ mod tests {
         let mut analytics = Analytics::in_memory(Vec::new()).expect("projection");
         analytics
             .conn
-            .execute_batch("DROP TABLE events")
+            .execute_batch("DROP TABLE ops.events")
             .expect("drop the events table to force the next append to fail");
 
         let mut fold = analytics.fold().expect("fold");
@@ -1717,7 +1776,7 @@ mod tests {
         let mut analytics = Analytics::in_memory(events(vec![odd])).expect("projection");
         analytics.materialize().expect("materialize");
         let (_, rows) = analytics
-            .select("SELECT ts_ms FROM events", duckdb::params![])
+            .select("SELECT ts_ms FROM ops.events", duckdb::params![])
             .expect("select");
         assert_eq!(rows, vec![vec![Value::Null]]);
     }
@@ -1865,7 +1924,7 @@ mod tests {
         analytics.materialize().expect("materialize");
         let (_, rows) = analytics
             .select(
-                "SELECT reconcile_disposition FROM executions WHERE execution_id = 'e1'",
+                "SELECT reconcile_disposition FROM ops.executions WHERE execution_id = 'e1'",
                 duckdb::params![],
             )
             .expect("select");

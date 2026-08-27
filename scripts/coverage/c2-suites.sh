@@ -137,3 +137,13 @@ cov_stage_end 1 "the c2_light test binary must write its own profile"
 cov_stage_begin c2-v4_w1_acceptance
 cov_run cargo llvm-cov --no-report --test v4_w1_acceptance --locked || cov_fail "v4_w1_acceptance failed under instrumentation"
 cov_stage_end 1 "the v4_w1_acceptance test binary must write its own profile"
+
+# S3 X1: the Atlas substrate's structural suite — the second one-owner
+# invariant (`runtime/atlas/db.rs`, held separately from M5's assertion about
+# `runtime/analytics.rs`), the module-doc persistence contract, and the schema
+# namespaces read back out of a real database file. Source scanning plus one
+# tempdir; no daemon, no estate, no backend, so it sits in C2 rather than C3.
+# Floor 1.
+cov_stage_begin c2-x1_atlas_substrate
+cov_run cargo llvm-cov --no-report --test x1_atlas_substrate --locked || cov_fail "x1_atlas_substrate failed under instrumentation"
+cov_stage_end 1 "the x1_atlas_substrate test binary must write its own profile"
