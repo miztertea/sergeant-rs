@@ -21,6 +21,20 @@ description = "Local execution surface for coding agents: durable work, isolated
 name = "sgt"
 path = "src/main.rs"
 
+# S4 Y1 (G2): the supervised parse-worker's own binary. `worker.rs`'s
+# transport spawns this — never `sgt` itself — as a child, over a
+# `program: PathBuf` the caller names explicitly (`std::env::current_exe()`
+# in the daemon, `env!("CARGO_BIN_EXE_sgt-atlas-worker")` in tests), so
+# neither surface has to guess the other's path. Y1 ships the transport plus
+# a trivial, honestly-labeled body (one Document unit for UTF-8 input) and
+# the test-only `--fault` fixture modes the supervision acceptance needs;
+# Y2 replaces the body with the real Anydoc adapter behind the same CLI
+# contract, which is why this is a real `[[bin]]` rather than a
+# `tests/`-only helper.
+[[bin]]
+name = "sgt-atlas-worker"
+path = "src/bin/atlas_worker.rs"
+
 [dependencies]
 axum = "0.8"
 blake3 = "1.8.6"

@@ -675,6 +675,49 @@ impl AtlasDb {
         Self::over(conn, PathBuf::from(":memory:"))
     }
 
+    /// Open an **existing** Atlas database read-only: no file is created, no
+    /// directory is created, and no DDL runs (register row 12's S4 rider).
+    ///
+    /// [`Self::open`] is the daemon's own path and is allowed to create and
+    /// migrate the store, because the daemon is Atlas's sole writer. Every
+    /// other process — `sgt doctor`'s coverage row is the one caller — may
+    /// only ever *read* it, and before this method existed that read went
+    /// through [`Self::open`] anyway: a read-write connection that happened
+    /// not to change anything, opened by a process that is not the writer.
+    /// `CREATE SCHEMA IF NOT EXISTS`/`CREATE TABLE IF NOT EXISTS` are no-ops
+    /// against a store the daemon already built, but "no-op" describes the
+    /// result, not the access mode the statement demanded to run at all —
+    /// this method demands none.
+    ///
+    /// Two consequences of asking DuckDB itself for `AccessMode::ReadOnly`,
+    /// rather than merely skipping the DDL calls: a database that does not
+    /// exist yet is refused outright instead of silently materialized (the
+    /// caller checks [`atlas_db_path`] first, same as [`Self::open`]'s
+    /// caller always has — this method does not repeat that check because it
+    /// has no directory to create either), and a call that somehow reached a
+    /// write path (there is none exposed from a `&self`-only reader, but the
+    /// guarantee is DuckDB's enforcement rather than this crate's discipline)
+    /// would be refused by the engine itself, not merely by convention.
+    ///
+    /// A daemon holding this same file for writing is not a conflict this
+    /// method resolves — DuckDB's own locking decides whether a concurrent
+    /// read-only open is possible, and a caller that gets [`AtlasError`] back
+    /// is expected to treat it exactly as "the store could not be read from
+    /// here right now," the same as any other open failure.
+    pub fn open_read_only(data_dir: &Path) -> Result<Self, AtlasError> {
+        let path = atlas_db_path(data_dir);
+        let config = duckdb::Config::default().access_mode(duckdb::AccessMode::ReadOnly)?;
+        let conn = Connection::open_with_flags(&path, config)?;
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+        // F4's network-hardening settings only — no `SCHEMA_DDL`, no
+        // `TABLE_DDL`. Both are genuine DDL and a read-only connection
+        // cannot run them even under `IF NOT EXISTS`; skipping them here
+        // rather than letting DuckDB refuse them is what keeps this path a
+        // read, not a read that happens to trip over a write guard.
+        conn.execute_batch(HARDENING_DDL)?;
+        Ok(Self { conn, path })
+    }
+
     fn over(conn: Connection, path: PathBuf) -> Result<Self, AtlasError> {
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         // First, before any other statement: extension autoloading and
@@ -2778,6 +2821,59 @@ mod tests {
 
         let second = AtlasDb::open(dir.path()).expect("reopen");
         assert_eq!(second.schema_names().expect("schemas"), names);
+    }
+
+    /// Register row 12's S4 rider, half one: a read-only open of a store
+    /// that does not exist yet must refuse rather than materialize one —
+    /// [`AtlasDb::open`]'s own `create_dir_all_durable` + `Connection::open`
+    /// would have brought both the directory and the file into being; this
+    /// path must do neither.
+    #[test]
+    fn open_read_only_refuses_a_store_that_does_not_exist_and_creates_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = AtlasDb::open_read_only(dir.path())
+            .expect_err("no store exists yet; a read-only open must not create one");
+        assert!(
+            !atlas_dir(dir.path()).exists(),
+            "must not create the directory: {err}"
+        );
+        assert!(
+            !atlas_db_path(dir.path()).exists(),
+            "must not create the file: {err}"
+        );
+    }
+
+    /// Register row 12's S4 rider, half two: once a real (write) open has
+    /// built the store, a read-only open must see exactly what was confirmed
+    /// — and must not itself be able to write, which is the property that
+    /// makes "no DDL" a fact DuckDB enforces rather than a habit this file
+    /// keeps. `stage_scan` issues genuine `INSERT`s; if the read-only
+    /// connection could run them, this would silently pass.
+    #[test]
+    fn open_read_only_reads_confirmed_rows_and_cannot_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        {
+            let mut writer = AtlasDb::open(dir.path()).expect("seed the store");
+            record(&mut writer, &scan_of("notes", "# One\n"), "evt-1");
+        }
+
+        let mut reader = AtlasDb::open_read_only(dir.path()).expect("read-only open");
+        let sources = reader.indexed_sources().expect("read confirmed coverage");
+        assert_eq!(
+            sources
+                .iter()
+                .map(|s| s.source_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes"],
+            "a read-only open must see the generation the write path confirmed"
+        );
+
+        let write = reader.stage_scan(&scan_of("notes", "# Two\n"));
+        assert!(
+            write.is_err(),
+            "a connection opened AccessMode::ReadOnly must refuse a write, proving this is a \
+             real read-only open and not merely one that happens not to have written yet"
+        );
     }
 
     /// The store must not land inside the directory whose contract is that

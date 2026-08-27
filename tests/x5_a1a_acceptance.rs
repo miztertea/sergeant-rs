@@ -43,7 +43,7 @@
 //! | 9 | image/scanned evidence enters the OCR fallback with page/region/engine provenance | deferred-s4 | — |
 //! | 10 | external Git acquisition resolves an exact commit in a no-Work-checkout cache | deferred-s4 | — |
 //! | 11 | source parsing uses content/extractor identity so unchanged resources reuse cached facts | met | `x2_knowledge_sources::a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one` |
-//! | 12 | daemon remains sole Atlas writer and worker failure cannot corrupt journal authority | met-with-deviation | `x5_a1a_acceptance::a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli` |
+//! | 12 | daemon remains sole Atlas writer and worker failure cannot corrupt journal authority | met | `x5_a1a_acceptance::a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli` |
 //! | 13 | `sgt map`/status surfaces expose source/generation/coverage rather than arbitrary SQL | met | `x5_a1a_acceptance::a1a_item_13_no_client_sql_reaches_the_store` |
 //! | 14 | all existing exact-root, Work-surface, distro-route/edition and split-hardening output-contract tests remain green | met | `x5_a1a_acceptance::a1a_item_14_the_inherited_contract_pins_still_exist` |
 //!
@@ -353,11 +353,19 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 12,
-        verdict: Verdict::MetWithDeviation,
+        verdict: Verdict::Met,
         checks: &[
             at(
                 "tests/x5_a1a_acceptance.rs",
                 "a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli",
+            ),
+            at(
+                "src/runtime/atlas/db.rs",
+                "open_read_only_refuses_a_store_that_does_not_exist_and_creates_nothing",
+            ),
+            at(
+                "src/runtime/atlas/db.rs",
+                "open_read_only_reads_confirmed_rows_and_cannot_write",
             ),
             at(
                 "tests/x1_atlas_substrate.rs",
@@ -375,14 +383,24 @@ const WALK: &[Item] = &[
                 "tests/x2_knowledge_sources.rs",
                 "a_crash_after_the_summary_but_before_confirmation_completes_the_scan",
             ),
+            at(
+                "tests/y1_worker_transport.rs",
+                "a_fault_worker_leaves_the_daemon_up_the_permit_freed_and_a_named_coverage_row",
+            ),
         ],
-        note: "RESIDUAL, named rather than glossed: `sgt doctor`'s atlas coverage row opens the \
-               store from the CLI process when no daemon holds the lock. It writes no fact — the \
-               open runs idempotent `IF NOT EXISTS` DDL and then reads — but it is a read-write \
-               open by a non-daemon process, so 'sole writer' is exact for facts and approximate \
-               for the file handle. DESTINATION: S4, as a read-only open. Everything else holds: \
-               no fact-writing path is reachable from the CLI at all, and a worker that dies \
-               mid-scan leaves the journal authoritative in both crash windows.",
+        note: "RESIDUAL CLOSED (S4 Y1, G2): the row-1 residual read 'DESTINATION: S4, as a \
+               read-only open' — `sgt doctor`'s atlas coverage row now opens the store through \
+               `AtlasDb::open_read_only`, which asks DuckDB itself for `AccessMode::ReadOnly` and \
+               runs no `CREATE SCHEMA`/`CREATE TABLE` DDL at all, idempotent or not. The two new \
+               db.rs checks pin both halves: a store that does not exist is refused rather than \
+               materialized, and a store that does exist is read but genuinely cannot be written \
+               through this connection (DuckDB refuses the write, not merely this crate declining \
+               to attempt one). G2 also widens what 'daemon remains sole Atlas writer' has to \
+               survive: a worker's returned batch is now itself untrusted input, validated \
+               daemon-side (identity, `enclosed_name` path safety, F10 deny-set membership on \
+               declared child names) before anything is written — the fault-injection check cited \
+               here is the SUPERVISION proof for that (Y2 carries the real-parser malformed-input \
+               proof); nothing here claims a third-party parser exists yet.",
     },
     Item {
         number: 13,
@@ -921,7 +939,9 @@ fn a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli() {
         .collect();
     assert_eq!(
         opens,
-        vec!["let sources = match AtlasDb::open(data_dir).and_then(|db| db.indexed_sources()) {"],
+        vec![
+            "let sources = match AtlasDb::open_read_only(data_dir).and_then(|db| db.indexed_sources()) {"
+        ],
         "the CLI's only Atlas call is doctor's coverage read; a new one is a writer-boundary \
          decision, not a refactor"
     );

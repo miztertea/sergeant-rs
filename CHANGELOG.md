@@ -400,6 +400,54 @@ release.
   community extensions are turned off and locked off on every connection, so
   reading a dataset can never become a network fetch.
 
+### Supervised parse workers (S4)
+
+- Third-party document parsing moves out of the daemon and into supervised
+  child processes: a worker takes bytes and returns a normalized batch, and
+  the daemon remains the only writer Atlas has. The adapters themselves did
+  not change shape — they were already pure functions over bytes — so this
+  is a transport boundary, not a new architecture.
+- **The daemon's validation of a returned batch is the authority, not a
+  formality.** Every batch is re-checked before a row is written: the
+  identity triple (source generation, resource hash, extractor identity),
+  path safety for every child resource the worker declares (the same
+  containment rule an archive entry gets), and the secrets deny set matched
+  on the declared *name* as well as the path. A worker that declares a child
+  called `.env`, or one whose path escapes its parent, is refused with a
+  named coverage row rather than trusted. The worker's own checks are
+  defence in depth; they are not what the store relies on.
+- Every worker spawn carries the child-lifetime discipline the probe leak
+  established (its own process group, `PDEATHSIG`, a bounded deadline, and
+  kill-plus-reap on *every* exit path, not only the timeout one), and runs
+  under an intelligence-lane permit that is released even when the child
+  panics or is killed.
+- **A memory bound, because a deadline is a hang guard and not a memory
+  guard.** On Linux each worker is spawned under an `RLIMIT_AS` address-space
+  cap, so a child that allocates without bound dies by its own limit instead
+  of raising host-wide memory pressure and letting the kernel's OOM killer
+  choose a victim — which, on the machine this was developed on, repeatedly
+  meant the session manager rather than the process actually at fault. The
+  cap composes with the existing process hardening rather than replacing it,
+  and the child cannot raise its own ceiling before `exec`.
+  - **Platform honesty:** this is a Linux mechanism. On macOS the worker is
+    still supervised, still deadline-bounded, and still killed and reaped —
+    but no memory containment is claimed there, and the module says so
+    rather than implying the guarantee is universal.
+  - **Number honesty:** the 512 MiB ceiling is provisional and unmeasured.
+    No real parser ships yet, so there was no corpus to size it against; it
+    must be re-derived once one lands. The effective host ceiling is that
+    figure multiplied by the intelligence lane's concurrency cap, not the
+    per-child number alone.
+  - A memory kill is reported as its own named fault when the evidence
+    supports it, matching a deliberately narrow set of real allocator
+    failure signatures. When it cannot be attributed that precisely, the
+    fault is still reported honestly as a worker failure — never absorbed,
+    and never relabelled as a timeout.
+- `sgt doctor`'s `atlas` row now opens the store read-only: it creates no
+  database file and runs no schema statements to report on one. The row's
+  behaviour is otherwise unchanged — it still checks for the file first, and
+  still defers to the daemon when a running daemon holds the store.
+
 ### Atlas closeout (S3)
 
 - `docs/concepts/atlas-and-knowledge.md` documents Atlas for operators: what

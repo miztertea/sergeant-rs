@@ -5873,8 +5873,12 @@ pub(crate) mod doctor {
     /// **A missing store is `ok`, not a warning.** An estate that has declared
     /// no `[[knowledge]]` source has nothing to index, and a diagnostic that
     /// nagged about an unused feature would train operators to ignore it.
-    /// Opening also *creates* the file, so this checks for the file first and
-    /// never brings one into existence to report on it.
+    /// This checks for the file first and never brings one into existence to
+    /// report on it — and once it exists, the open below is Atlas's
+    /// read-only constructor (S4 register row 12's rider), never the
+    /// read-write one the daemon uses: the daemon is Atlas's sole writer, so
+    /// the one caller outside the daemon that reads this store may not hold
+    /// a connection that could write it, "IF NOT EXISTS" DDL included.
     fn atlas_coverage_check(data_dir: &Path) -> Check {
         use crate::runtime::atlas::db::{AtlasDb, atlas_db_path};
 
@@ -5885,7 +5889,7 @@ pub(crate) mod doctor {
                 "no source has been indexed on this host yet (nothing to report)",
             );
         }
-        let sources = match AtlasDb::open(data_dir).and_then(|db| db.indexed_sources()) {
+        let sources = match AtlasDb::open_read_only(data_dir).and_then(|db| db.indexed_sources()) {
             Ok(sources) => sources,
             // Almost always a running daemon holding the store, which is not
             // a fault: the daemon is the surface that can answer, and the row
