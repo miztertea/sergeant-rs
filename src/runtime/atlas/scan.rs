@@ -57,6 +57,7 @@ use crate::domain::source::{
 };
 use crate::runtime::atlas::deny::{AcquisitionFilter, BadPattern, Verdict};
 use crate::runtime::atlas::syntax::{SyntaxLanguage, language_for};
+use crate::runtime::atlas::tabular::{ContextFields, ScannedDataset, format_for, reader_identity};
 use crate::runtime::atlas::text::{
     MARKDOWN_EXTRACTOR, TEXT_EXTRACTOR, as_text, extractor_for, markdown_units, plain_units,
 };
@@ -73,6 +74,34 @@ use crate::runtime::atlas::text::{
 /// already in the coverage table.
 pub const MAX_RESOURCE_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The largest tabular dataset this build will register (X4).
+///
+/// **Declared, not measured**, and deliberately much larger than
+/// [`MAX_RESOURCE_BYTES`] because it bounds a different thing. A document is
+/// read whole into memory and stored as one `TEXT` value; a dataset is never
+/// loaded at all — it is hashed in a streaming pass and then read *in place*
+/// through a row-capped query. So the only cost this ceiling actually bounds
+/// is the streaming hash, and 512 MiB of it is seconds, not minutes. A file
+/// above it is reported `unsupported` **naming this bound**, never silently
+/// skipped, so the day a real corpus argues for a different number the
+/// evidence for it is already in the coverage table.
+pub const MAX_DATASET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Bytes per read of the streaming hash of a dataset. A page-sized multiple,
+/// chosen for no other reason and load-bearing for nothing.
+const DATASET_HASH_CHUNK: usize = 64 * 1024;
+
+/// The coverage detail for a dataset a walk cannot read in place (X4).
+///
+/// An estate-git or Work-overlay walk reaches bytes through Git's object
+/// store, and a blob has no path DuckDB can open. Reading it would mean
+/// materializing a copy — which is precisely what "read in place" exists to
+/// avoid, and what a knowledge source's read-only posture makes gratuitous.
+/// So it is reported `unsupported`, naming the reason, and the wave that has a
+/// consumer for repository-resident datasets can decide what to do about it.
+pub const DATASET_NO_ROOT: &str =
+    "tabular datasets are read in place, and this source's bytes have no path to read in place";
+
 /// One source to scan: the manifest's declaration, resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeSource {
@@ -82,6 +111,9 @@ pub struct KnowledgeSource {
     pub root: PathBuf,
     /// Per-source ignore globs, extending the built-in deny set.
     pub ignore: Vec<String>,
+    /// **F10a**: this source's declared tabular column allowlist. Default
+    /// none, which is the refusal — see [`ContextFields`].
+    pub context_fields: ContextFields,
 }
 
 impl From<&KnowledgeSpec> for KnowledgeSource {
@@ -90,6 +122,7 @@ impl From<&KnowledgeSpec> for KnowledgeSource {
             name: spec.name.clone(),
             root: spec.path.clone(),
             ignore: spec.ignore.clone(),
+            context_fields: ContextFields::declared(&spec.context_fields),
         }
     }
 }
@@ -251,6 +284,28 @@ pub struct SourceScan {
     /// summary, because "which parser produced this?" is one of A1 §3's four
     /// provenance questions.
     pub extractors: BTreeSet<String>,
+    /// Tabular datasets this walk registered, in path order (X4).
+    ///
+    /// Registered, **not read**: a dataset's bytes never enter this struct.
+    /// The walk hashes them (streamed, never held) and records where they are;
+    /// the reading happens in place, later, inside [`super::db`], through a
+    /// canned parameterized query against the file the estate already has.
+    /// That is why this is a separate field from [`Self::files`] rather than a
+    /// [`ScannedFile`] with a different extractor: a `ScannedFile` carries the
+    /// units extracted from its bytes, and a dataset has none of that here.
+    pub datasets: Vec<ScannedDataset>,
+    /// Absolute path of the source root, for a walk that had one.
+    ///
+    /// `None` for a walk whose bytes came out of an object store
+    /// ([`super::git`]) rather than off a filesystem. It is the *only* thing
+    /// that makes an in-place dataset read possible, so its absence is exactly
+    /// why an estate-git dataset is reported `unsupported` rather than
+    /// silently skipped (see [`DATASET_NO_ROOT`]).
+    pub root: Option<PathBuf>,
+    /// **F10a**: the operator-declared column allowlist for this source,
+    /// defaulting to none. Governs whether a dataset row's text may become a
+    /// context unit, and nothing else.
+    pub context_fields: ContextFields,
 }
 
 impl SourceScan {
@@ -324,7 +379,9 @@ pub fn scan_local_knowledge(source: &KnowledgeSource) -> Result<SourceScan, BadP
     let filter = AcquisitionFilter::new(&source.ignore)?;
     let mut walk = Walk {
         filter: &filter,
+        context_fields: &source.context_fields,
         files: Vec::new(),
+        datasets: Vec::new(),
         coverage: Vec::new(),
         extractors: BTreeSet::new(),
     };
@@ -345,13 +402,23 @@ pub fn scan_local_knowledge(source: &KnowledgeSource) -> Result<SourceScan, BadP
     }
     let Walk {
         files,
+        datasets,
         coverage,
         extractors,
         ..
     } = walk;
+    // A dataset is part of the observed world exactly as a document is, so it
+    // is folded into the generation key on the same terms — path plus content
+    // hash. Leaving it out would make an edited CSV look like an unchanged
+    // source and skip the re-read that produces its derived evidence.
     let resources: BTreeMap<String, String> = files
         .iter()
         .map(|f| (f.relative_path.clone(), f.content_hash.clone()))
+        .chain(
+            datasets
+                .iter()
+                .map(|d| (d.relative_path.clone(), d.content_hash.clone())),
+        )
         .collect();
     Ok(SourceScan {
         source_name: source.name.clone(),
@@ -361,6 +428,9 @@ pub fn scan_local_knowledge(source: &KnowledgeSource) -> Result<SourceScan, BadP
         revision: None,
         observed_at: rfc3339_utc_now(),
         files,
+        datasets,
+        root: Some(source.root.clone()),
+        context_fields: source.context_fields.clone(),
         coverage,
         extractors,
     })
@@ -370,7 +440,9 @@ pub fn scan_local_knowledge(source: &KnowledgeSource) -> Result<SourceScan, BadP
 /// value is inert data with no borrow of the filter that made it.
 struct Walk<'a> {
     filter: &'a AcquisitionFilter,
+    context_fields: &'a ContextFields,
     files: Vec<ScannedFile>,
+    datasets: Vec<ScannedDataset>,
     coverage: Vec<CoverageRow>,
     extractors: BTreeSet<String>,
 }
@@ -487,6 +559,14 @@ impl Walk<'_> {
 
     /// Acquire and extract one regular file that passed the boundary.
     fn file(&mut self, path: &Path, relative: String, meta: std::fs::Metadata) {
+        // Asked before [`claims_for`], and disjoint from it: the two routing
+        // tables claim different extensions, and a dataset is registered
+        // rather than extracted — the branch below never reads the bytes into
+        // memory the way the document path does.
+        if let Some(format) = format_for(&relative) {
+            self.dataset(path, relative, meta, format);
+            return;
+        }
         let Some(claims) = claims_for(&relative) else {
             self.coverage.push(CoverageRow {
                 path: Some(relative),
@@ -548,6 +628,83 @@ impl Walk<'_> {
             syntax: extracted.syntax,
         });
     }
+
+    /// Register one tabular dataset (X4).
+    ///
+    /// **Registration, not acquisition.** The file is hashed in a streaming
+    /// pass and closed; nothing here reads a row, decides a schema, or holds a
+    /// buffer bigger than [`DATASET_HASH_CHUNK`]. What the dataset *contains*
+    /// is answered later, in place, by the one module that owns a database
+    /// connection — which is also the only place F10a's allowlist can be
+    /// applied to a value, because it is the only place a value exists.
+    fn dataset(
+        &mut self,
+        path: &Path,
+        relative: String,
+        meta: std::fs::Metadata,
+        format: crate::runtime::atlas::tabular::DatasetFormat,
+    ) {
+        if meta.len() > MAX_DATASET_BYTES {
+            self.coverage.push(CoverageRow {
+                path: Some(relative),
+                status: Coverage::Unsupported,
+                detail: Some(format!(
+                    "larger than the {MAX_DATASET_BYTES}-byte dataset ceiling"
+                )),
+                bytes: Some(meta.len()),
+            });
+            return;
+        }
+        let hash = match hash_file(path) {
+            Ok(hash) => hash,
+            Err(e) => {
+                self.coverage.push(CoverageRow {
+                    path: Some(relative),
+                    status: Coverage::Unavailable,
+                    detail: Some(format!("cannot be read: {e}")),
+                    bytes: Some(meta.len()),
+                });
+                return;
+            }
+        };
+        let reader = reader_identity(format, self.context_fields);
+        self.extractors.insert(reader.clone());
+        self.coverage.push(CoverageRow {
+            path: Some(relative.clone()),
+            status: Coverage::Indexed,
+            detail: Some(reader.clone()),
+            bytes: Some(meta.len()),
+        });
+        self.datasets.push(ScannedDataset {
+            relative_path: relative,
+            format,
+            dataset_key: local_key(&hash, &reader),
+            content_hash: hash,
+            reader,
+            byte_len: meta.len(),
+            mtime_millis: mtime_millis(&meta),
+        });
+    }
+}
+
+/// BLAKE3 of a file's bytes, streamed.
+///
+/// The document path reads whole files because it has to hand the text to an
+/// extractor; a dataset has no such need, and a 512 MiB Parquet file has no
+/// business being resident just to be named.
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; DATASET_HASH_CHUNK];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// The coverage detail for a path no extractor and no grammar claims (F8).
@@ -794,6 +951,7 @@ mod tests {
             name: "notes".to_string(),
             root: dir.path().to_path_buf(),
             ignore: ignore.iter().map(|s| (*s).to_string()).collect(),
+            context_fields: ContextFields::none(),
         };
         let scan = scan_local_knowledge(&source).expect("scan");
         (dir, scan)
@@ -937,6 +1095,7 @@ mod tests {
             name: "notes".to_string(),
             root: dir.path().to_path_buf(),
             ignore: Vec::new(),
+            context_fields: ContextFields::none(),
         };
         // Touch: mtime moves, content does not. Nothing derived may move.
         let touched = dir.path().join("a.md");
@@ -988,6 +1147,7 @@ mod tests {
             name: "gone".to_string(),
             root: PathBuf::from("/nonexistent/knowledge/root"),
             ignore: Vec::new(),
+            context_fields: ContextFields::none(),
         };
         let scan = scan_local_knowledge(&source).expect("scan must not fail");
         assert!(scan.files.is_empty());
@@ -1024,6 +1184,7 @@ mod tests {
             name: "notes".to_string(),
             root: dir.path().to_path_buf(),
             ignore: Vec::new(),
+            context_fields: ContextFields::none(),
         };
         let scan = scan_local_knowledge(&source).expect("scan");
         assert!(scan.root_unavailable().is_none(), "{:?}", scan.coverage);
@@ -1040,6 +1201,7 @@ mod tests {
             name: "notes".to_string(),
             root: dir.path().to_path_buf(),
             ignore: Vec::new(),
+            context_fields: ContextFields::none(),
         };
         let scan = scan_local_knowledge(&source).expect("scan");
         let link = row(&scan, "escape");
@@ -1065,6 +1227,7 @@ mod tests {
             name: "notes".to_string(),
             root: dir.path().to_path_buf(),
             ignore: Vec::new(),
+            context_fields: ContextFields::none(),
         };
         let second = scan_local_knowledge(&source).expect("rescan");
         assert_eq!(first.coverage, second.coverage);

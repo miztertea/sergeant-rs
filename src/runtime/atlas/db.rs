@@ -96,12 +96,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use duckdb::Connection;
+use duckdb::{Connection, Statement};
 
 use crate::domain::source::{
     AuthorityClass, Coverage, CoverageRow, SourceGeneration, SourceKind, UnitKind,
 };
 use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
+use crate::runtime::atlas::tabular::{
+    DatasetFormat, RowKeyBasis, RowUnit, ScannedDataset, row_units,
+};
 use crate::runtime::fsutil::create_dir_all_durable;
 
 /// Directory under the data dir holding Atlas's durable store.
@@ -183,6 +186,36 @@ CREATE SCHEMA IF NOT EXISTS source;\n\
 CREATE SCHEMA IF NOT EXISTS git;\n\
 CREATE SCHEMA IF NOT EXISTS context;\n";
 
+/// **F4's standing refusal: this database never reaches the network.**
+///
+/// DuckDB's default is to *autoload* a known extension the moment a query
+/// needs one, and to *autoinstall* it — a download from an extension
+/// repository — if it is not already on disk. That default is convenient and
+/// completely unacceptable here: it would mean an operator's `sgt` reaching
+/// the internet as a side effect of reading their own CSV, at a moment nobody
+/// asked for a network call, with the fetched binary running at the daemon's
+/// privilege.
+///
+/// So both are turned off on every connection, before any statement runs, and
+/// community extensions with them. The consequence is deliberate and is the
+/// reason F4 buys the `json`/`parquet` features at all: a reader is either
+/// compiled into the bundled library or it does not exist for this process.
+/// There is no third state where it appears later.
+///
+/// `lock_configuration` is set last and makes the three settings above
+/// permanent for the life of the connection — a later `SET` cannot undo them,
+/// so this is a property of the store rather than a convention its callers
+/// are trusted to keep. `tests/x4_tabular_map.rs` pins all of it, including
+/// the negative: an `https://` path is refused rather than fetched.
+///
+/// External *file* access stays on, because that is what "read in place"
+/// means — the operator's own CSV, at the path their own manifest declared.
+const HARDENING_DDL: &str = "\
+SET autoinstall_known_extensions = false;\n\
+SET autoload_known_extensions = false;\n\
+SET allow_community_extensions = false;\n\
+SET lock_configuration = true;\n";
+
 /// The tables the scanners write — X2's four, plus X3b's three. Applied after
 /// [`SCHEMA_DDL`], on every open, for the same idempotency reason.
 ///
@@ -224,6 +257,30 @@ CREATE SCHEMA IF NOT EXISTS context;\n";
 ///   always be traced back to the resource it came from (A1 §3).
 /// * `meta.coverage.path` is nullable: a null path is a generation-wide row,
 ///   which is how an eviction reports itself.
+///
+/// X4's three tabular tables, and why they are three (F12, A1 §6.4, F10a):
+///
+/// * **`source.datasets` is a registration, not a copy.** It records where a
+///   dataset is, what it hashes to, which reader claims it, and what a bounded
+///   in-place read *found* — its columns, a row count capped at [`MAX_ROWS`],
+///   and whether that cap truncated the answer. The dataset's own rows are not
+///   here and are not anywhere in this file: they stay in the operator's file,
+///   which is what "read in place" means.
+/// * **`source.dataset_facts` is derived evidence in A1 §6.4's shape.** Every
+///   row carries the three things that make an answer checkable rather than
+///   trusted: the input `generation_id` (which world), `query_identity`
+///   (which question, at which version, over which exact SQL), and
+///   `output_hash` (a digest of the answer itself). `row_limit`/`truncated`
+///   are F12's bound, stored beside the answer because "the first 10,000 rows"
+///   and "all the rows" are different facts and a reader must not have to
+///   guess which one this is.
+/// * **`context.row_units` is the F10a-gated bridge** and lives in the
+///   `context` namespace because that is what it is: retrieval-facing text,
+///   assembled from a source. It exists **only** for a dataset whose source
+///   declared `context_fields`; with no allowlist the table stays empty for
+///   that source, and that is the refusal, not an oversight. `key_basis` says
+///   whether `row_key` is content-derived or had to fold in the ordinal — see
+///   [`crate::runtime::atlas::tabular`] for why an S5 consumer needs to know.
 const TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS source.generations (\n\
   generation_id    TEXT NOT NULL,\n\
@@ -302,6 +359,46 @@ CREATE TABLE IF NOT EXISTS meta.coverage (\n\
   detail        TEXT,\n\
   bytes         BIGINT,\n\
   observed_at   TEXT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS source.datasets (\n\
+  generation_id TEXT NOT NULL,\n\
+  source_name   TEXT NOT NULL,\n\
+  relative_path TEXT NOT NULL,\n\
+  format        TEXT NOT NULL,\n\
+  content_hash  TEXT NOT NULL,\n\
+  reader        TEXT NOT NULL,\n\
+  dataset_key   TEXT NOT NULL,\n\
+  byte_len      BIGINT NOT NULL,\n\
+  mtime_millis  BIGINT,\n\
+  columns       TEXT NOT NULL,\n\
+  row_count     BIGINT NOT NULL,\n\
+  truncated     BOOLEAN NOT NULL,\n\
+  row_units     BIGINT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS source.dataset_facts (\n\
+  generation_id  TEXT NOT NULL,\n\
+  source_name    TEXT NOT NULL,\n\
+  relative_path  TEXT NOT NULL,\n\
+  dataset_key    TEXT NOT NULL,\n\
+  query          TEXT NOT NULL,\n\
+  query_identity TEXT NOT NULL,\n\
+  row_limit      BIGINT NOT NULL,\n\
+  truncated      BOOLEAN NOT NULL,\n\
+  columns        TEXT NOT NULL,\n\
+  rows           TEXT NOT NULL,\n\
+  output_hash    TEXT NOT NULL,\n\
+  observed_at    TEXT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS context.row_units (\n\
+  generation_id TEXT NOT NULL,\n\
+  source_name   TEXT NOT NULL,\n\
+  relative_path TEXT NOT NULL,\n\
+  dataset_key   TEXT NOT NULL,\n\
+  ordinal       BIGINT NOT NULL,\n\
+  row_key       TEXT NOT NULL,\n\
+  key_basis     TEXT NOT NULL,\n\
+  fields        TEXT NOT NULL,\n\
+  body          TEXT NOT NULL\n\
 );\n";
 
 /// A generation whose rows are written but whose summary is not yet journaled
@@ -324,6 +421,204 @@ const STATE_EVICTED: &str = "evicted";
 /// recon's own `unbounded-select()` risk. Callers that want fewer say so;
 /// none can ask for "all".
 pub const MAX_ROWS: usize = 10_000;
+
+/// One canned question this build can ask of a tabular dataset, **in place**
+/// (F11's "canned/parameterized only — never string-built SQL").
+///
+/// A fixed catalogue, for the same reason
+/// [`crate::runtime::analytics::CANNED_QUERIES`] is one: an endpoint that runs
+/// a client's SQL hands back the one-owner property the whole architecture is
+/// built on. Here it does worse than that — the SQL names a *file path*, so
+/// arbitrary SQL against a dataset reader is arbitrary file access with the
+/// daemon's privileges.
+///
+/// The SQL itself is not on this struct because there are three of it: the
+/// table function is the reader's name (`read_csv`/`read_json`/`read_parquet`)
+/// and a table function name cannot be a bind parameter. So each query is a
+/// constant per format, selected by an enum ([`reader_call`]), and *every
+/// value* — the path, the row cap — is bound. Nothing a caller supplies is
+/// ever concatenated into a statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatasetQuery {
+    /// Stable name, and the `query` column's value.
+    pub name: &'static str,
+    /// What it answers, in one sentence.
+    pub question: &'static str,
+    /// Bumped whenever the SQL changes meaning. Part of
+    /// [`query_identity`], so an answer stored by an older build is
+    /// distinguishable from a fresh one rather than silently comparable.
+    pub version: &'static str,
+}
+
+/// **The deterministic aggregate** (X4's ≥1): per column, how many rows, how
+/// many are non-null, and how many distinct values.
+///
+/// Deterministic in the sense that matters for evidence: the same file and the
+/// same bound produce byte-identical output, because the aggregate is exact
+/// (`count(DISTINCT …)`, not an approximate sketch) and the result is ordered
+/// by column name rather than left in whatever order the reader emitted. Two
+/// runs that disagree mean the file changed, which is the only thing a stored
+/// [`output_hash`] is any use for.
+///
+/// It is also column-agnostic, which is what lets it be canned at all: the
+/// rows are unpivoted into `(column_name, value)` pairs, so no column
+/// *identifier* is ever interpolated into the statement. A profile that took
+/// a column name as an argument would have to build SQL from it.
+pub const DATASET_COLUMN_PROFILE: DatasetQuery = DatasetQuery {
+    name: "column_profile",
+    question: "For each column: how many rows, how many are non-null, and how many distinct values?",
+    version: "v1",
+};
+
+/// The bounded row count: how many rows the reader produced, up to
+/// [`MAX_ROWS`].
+pub const DATASET_ROW_COUNT: DatasetQuery = DatasetQuery {
+    name: "row_count",
+    question: "How many rows does this dataset have, up to the row cap?",
+    version: "v1",
+};
+
+/// Every canned dataset query, in the order a scan runs them.
+pub const DATASET_QUERIES: &[DatasetQuery] = &[DATASET_ROW_COUNT, DATASET_COLUMN_PROFILE];
+
+/// The table-function call for one format — the only thing that varies inside
+/// a dataset query's SQL, and a compile-time constant chosen by an enum.
+///
+/// `union_by_name`/`filename` and the rest of DuckDB's reader options are
+/// deliberately left at their defaults: an option this build does not
+/// understand the failure modes of is not one it should be setting on an
+/// operator's file.
+fn reader_call(format: DatasetFormat) -> &'static str {
+    match format {
+        DatasetFormat::Csv => "read_csv(?, auto_detect = true)",
+        DatasetFormat::Json => "read_json(?, auto_detect = true)",
+        DatasetFormat::Parquet => "read_parquet(?)",
+    }
+}
+
+/// `SELECT` list that casts every column to `VARCHAR`, bounded.
+///
+/// **Every canned dataset query answers in text, and that is a contract, not a
+/// convenience.** What gets stored as derived evidence is text, and
+/// [`output_hash`] hashes exactly what is stored — so an answer's digest
+/// covers the answer a reader will actually see, with no formatting step in
+/// between where two builds could disagree about how a `DOUBLE` renders.
+fn rows_sql(format: DatasetFormat) -> String {
+    format!(
+        "SELECT COLUMNS(*)::VARCHAR FROM {} LIMIT ?",
+        reader_call(format)
+    )
+}
+
+/// [`DATASET_ROW_COUNT`]'s SQL for one format.
+///
+/// The count is taken over a *bounded* subquery, so a dataset far larger than
+/// the cap costs one capped scan rather than a full one (F12). The caller asks
+/// for `cap + 1` and learns from the answer whether the cap bit.
+fn row_count_sql(format: DatasetFormat) -> String {
+    format!(
+        "SELECT count(*)::VARCHAR AS rows FROM (SELECT 1 FROM {} LIMIT ?)",
+        reader_call(format)
+    )
+}
+
+/// [`DATASET_COLUMN_PROFILE`]'s SQL for one format.
+fn column_profile_sql(format: DatasetFormat) -> String {
+    format!(
+        "SELECT column_name, count(*)::VARCHAR AS rows, \
+         count(value)::VARCHAR AS non_null_rows, \
+         count(DISTINCT value)::VARCHAR AS distinct_values \
+         FROM (SELECT COLUMNS(*)::VARCHAR FROM {} LIMIT ?) \
+         UNPIVOT (value FOR column_name IN (COLUMNS(*))) \
+         GROUP BY column_name ORDER BY column_name",
+        reader_call(format)
+    )
+}
+
+/// The SQL for one canned query over one format.
+///
+/// A `match` over the catalogue rather than a function pointer on
+/// [`DatasetQuery`]: the catalogue is a `const`, and a `const` holding
+/// function pointers is harder to read than the two arms it would replace.
+fn sql_for(query: &DatasetQuery, format: DatasetFormat) -> String {
+    if query.name == DATASET_ROW_COUNT.name {
+        row_count_sql(format)
+    } else {
+        column_profile_sql(format)
+    }
+}
+
+/// A canned query's identity: its name, its version, and a digest of the exact
+/// SQL that ran (A1 §6.4's "which question produced this?").
+///
+/// The SQL digest is not redundant with the version. The version is a promise
+/// a human keeps; the digest is a fact about the statement. If someone edits
+/// the SQL and forgets the version bump, stored evidence still says the
+/// question changed.
+pub fn query_identity(query: &DatasetQuery, sql: &str) -> String {
+    format!(
+        "{}/{}#{}",
+        query.name,
+        query.version,
+        blake3::hash(sql.as_bytes()).to_hex()
+    )
+}
+
+/// A digest of one query result — A1 §6.4's output hash.
+///
+/// Over the columns *and* the rows, with domain separation and explicit
+/// separators, so two different answers cannot hash alike by running their
+/// fields together. `NULL` is folded in as its own marker rather than as an
+/// empty string, because "no value" and "the empty string" are different
+/// answers.
+pub fn output_hash(columns: &[String], rows: &[Vec<Option<String>>]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sergeant.atlas.query-output/v1\n");
+    for column in columns {
+        hasher.update(column.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update(b"\n");
+    for row in rows {
+        for value in row {
+            match value {
+                Some(value) => {
+                    hasher.update(b"v");
+                    hasher.update(value.as_bytes());
+                }
+                None => {
+                    hasher.update(b"n");
+                }
+            }
+            hasher.update(b"\0");
+        }
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// One canned query's answer, with everything needed to check it (A1 §6.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatasetFact {
+    /// Path relative to the source root.
+    pub relative_path: String,
+    /// F7's key for the dataset this answers about.
+    pub dataset_key: String,
+    /// Which canned query.
+    pub query: String,
+    /// Name, version and SQL digest ([`query_identity`]).
+    pub query_identity: String,
+    /// The row cap this answer was produced under (F12).
+    pub row_limit: u64,
+    /// Whether the cap bit — whether there was more the answer does not cover.
+    pub truncated: bool,
+    /// Column names, in order.
+    pub columns: Vec<String>,
+    /// Rows, aligned with `columns`. `None` is SQL `NULL`.
+    pub rows: Vec<Vec<Option<String>>>,
+    /// Digest of `columns` + `rows` ([`output_hash`]).
+    pub output_hash: String,
+}
 
 /// Atlas's database over one data dir.
 ///
@@ -366,6 +661,11 @@ impl AtlasDb {
 
     fn over(conn: Connection, path: PathBuf) -> Result<Self, AtlasError> {
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+        // First, before any other statement: extension autoloading and
+        // autoinstalling are off, and locked off (F4). A connection that ran
+        // one query before this ran is a connection that could have reached
+        // the network once.
+        conn.execute_batch(HARDENING_DDL)?;
         conn.execute_batch(SCHEMA_DDL)?;
         conn.execute_batch(TABLE_DDL)?;
         // No reconciliation here. A provisional generation is already
@@ -493,6 +793,16 @@ impl AtlasDb {
         }
         let generation_id = ulid::Ulid::generate().to_string();
         let extractors = join_extractors(&scan.extractors);
+        // X4: the datasets are read **before** the transaction opens, and
+        // never inside it. A failing statement aborts the transaction it ran
+        // in, so one unreadable CSV read inside the staging transaction would
+        // take every other row of the scan down with it — see
+        // [`read_dataset`], which is where that argument lives.
+        let reads: Vec<IngestedDataset> = scan
+            .datasets
+            .iter()
+            .map(|dataset| read_dataset(&self.conn, scan, dataset))
+            .collect();
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO source.generations \
@@ -540,7 +850,26 @@ impl AtlasDb {
                 occurrences as i64,
             ])?;
         }
+        // X4: the datasets, read **in place**. This is the one place in the
+        // build where an extractor is a SQL reader rather than Rust over
+        // bytes, and it is here rather than in the walk for the reason the
+        // one-owner rule gives: the reader is the database.
+        //
+        // Each dataset's outcome replaces the placeholder coverage row the
+        // walk left for that path, below, so F8's one-row-per-path rule holds
+        // and the row says what actually happened rather than what was
+        // attempted.
+        let mut outcomes: BTreeMap<String, CoverageRow> = BTreeMap::new();
+        for (dataset, read) in scan.datasets.iter().zip(&reads) {
+            let outcome = write_dataset(&tx, &generation_id, scan, dataset, read)?;
+            outcomes.insert(dataset.relative_path.clone(), outcome);
+        }
         for row in &scan.coverage {
+            let row = row
+                .path
+                .as_deref()
+                .and_then(|path| outcomes.get(path))
+                .unwrap_or(row);
             insert_coverage(
                 &tx,
                 &generation_id,
@@ -969,6 +1298,383 @@ impl AtlasDb {
         Ok(out)
     }
 
+    /// **F4, read back off the live connection**: what this store's extension
+    /// posture actually is, rather than what [`HARDENING_DDL`] intended.
+    ///
+    /// Read out of DuckDB's own settings and catalogue for the same reason
+    /// [`Self::schema_names`] reads out of the catalogue: a test comparing
+    /// this against the constant would be checking the constant. `locked` is
+    /// the load-bearing one — with it true, no later `SET` can re-enable
+    /// autoloading, so the refusal is a property of the connection instead of
+    /// a convention its callers are trusted to keep.
+    pub fn hardening(&self) -> Result<Hardening, AtlasError> {
+        let mut statement = self.conn.prepare(
+            "SELECT current_setting('autoinstall_known_extensions')::BOOLEAN, \
+                    current_setting('autoload_known_extensions')::BOOLEAN, \
+                    current_setting('allow_community_extensions')::BOOLEAN, \
+                    current_setting('lock_configuration')::BOOLEAN",
+        )?;
+        let mut rows = statement.query([])?;
+        let row = rows.next()?.ok_or_else(|| AtlasError::UnknownValue {
+            column: "current_setting".to_string(),
+            value: "no row".to_string(),
+        })?;
+        let posture = Hardening {
+            autoinstall_known_extensions: row.get(0)?,
+            autoload_known_extensions: row.get(1)?,
+            allow_community_extensions: row.get(2)?,
+            locked: row.get(3)?,
+            statically_linked: Vec::new(),
+        };
+        drop(rows);
+        drop(statement);
+        let mut statement = self.conn.prepare(
+            "SELECT extension_name FROM duckdb_extensions() \
+             WHERE loaded AND install_mode = 'STATICALLY_LINKED' \
+             ORDER BY extension_name LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![MAX_ROWS as i64])?;
+        let mut statically_linked = Vec::new();
+        while let Some(row) = rows.next()? {
+            statically_linked.push(row.get::<usize, String>(0)?);
+        }
+        Ok(Hardening {
+            statically_linked,
+            ..posture
+        })
+    }
+
+    /// Run one canned query against one dataset file, in place (F12).
+    ///
+    /// The bounded, parameterized read [`Self::stage_scan`] uses, exposed so a
+    /// caller can ask a canned question of a dataset without a scan — and so
+    /// F4's refusal can be tested on the negative it is actually about, a path
+    /// that is not a local file.
+    ///
+    /// **`path` is a file path this process will open**, so this is not, and
+    /// must not become, an HTTP-reachable surface: the daemon's `map` and
+    /// `intelligence` routes read rows this store already holds, never a path
+    /// a client named. What is safe about it is what F11 asks for — the
+    /// *query* is canned and every value is bound — which is a different
+    /// property from the path being safe.
+    pub fn dataset_probe(
+        &self,
+        format: DatasetFormat,
+        path: &str,
+        query: &DatasetQuery,
+    ) -> Result<DatasetFact, AtlasError> {
+        let sql = sql_for(query, format);
+        dataset_fact(
+            &self.conn,
+            query,
+            &sql,
+            &ScannedDataset {
+                relative_path: path.to_string(),
+                format,
+                content_hash: String::new(),
+                reader: format.reader_version().to_string(),
+                dataset_key: String::new(),
+                byte_len: 0,
+                mtime_millis: None,
+            },
+            path,
+        )
+    }
+
+    /// Registered datasets of one source's confirmed generation, in path
+    /// order, bounded by `limit` (capped at [`MAX_ROWS`], F12).
+    pub fn datasets(
+        &self,
+        source_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredDataset>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT d.relative_path, d.format, d.content_hash, d.reader, d.dataset_key, \
+                    d.byte_len, d.columns, d.row_count, d.truncated, d.row_units \
+             FROM source.datasets d JOIN source.generations g USING (generation_id) \
+             WHERE g.source_name = ? AND g.state = ? \
+             ORDER BY d.relative_path LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let format: String = row.get(1)?;
+            out.push(StoredDataset {
+                relative_path: row.get(0)?,
+                format: DatasetFormat::parse(&format).ok_or_else(|| AtlasError::UnknownValue {
+                    column: "format".to_string(),
+                    value: format.clone(),
+                })?,
+                content_hash: row.get(2)?,
+                reader: row.get(3)?,
+                dataset_key: row.get(4)?,
+                byte_len: row.get::<usize, i64>(5)? as u64,
+                columns: split_names(&row.get::<usize, String>(6)?),
+                row_count: row.get::<usize, i64>(7)? as u64,
+                truncated: row.get(8)?,
+                row_units: row.get::<usize, i64>(9)? as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Derived evidence for one source's confirmed generation — every canned
+    /// query's answer, with the identity and output hash that make it
+    /// checkable (A1 §6.4). Bounded by `limit` (capped at [`MAX_ROWS`], F12).
+    pub fn dataset_facts(
+        &self,
+        source_name: &str,
+        limit: usize,
+    ) -> Result<Vec<DatasetFact>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT f.relative_path, f.dataset_key, f.query, f.query_identity, f.row_limit, \
+                    f.truncated, f.columns, f.rows, f.output_hash \
+             FROM source.dataset_facts f JOIN source.generations g USING (generation_id) \
+             WHERE g.source_name = ? AND g.state = ? \
+             ORDER BY f.relative_path, f.query LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(DatasetFact {
+                relative_path: row.get(0)?,
+                dataset_key: row.get(1)?,
+                query: row.get(2)?,
+                query_identity: row.get(3)?,
+                row_limit: row.get::<usize, i64>(4)? as u64,
+                truncated: row.get(5)?,
+                columns: split_names(&row.get::<usize, String>(6)?),
+                rows: parse_rows(&row.get::<usize, String>(7)?),
+                output_hash: row.get(8)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// **F10a's observable half**: the context units one source's confirmed
+    /// generation exposes from its tabular rows.
+    ///
+    /// A source that declared no `context_fields` answers with an empty
+    /// vector, always — not because this query filtered them out, but because
+    /// nothing wrote any. Bounded by `limit` (capped at [`MAX_ROWS`], F12).
+    pub fn row_units(
+        &self,
+        source_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredRowUnit>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT r.relative_path, r.dataset_key, r.ordinal, r.row_key, r.key_basis, \
+                    r.fields, r.body \
+             FROM context.row_units r JOIN source.generations g USING (generation_id) \
+             WHERE g.source_name = ? AND g.state = ? \
+             ORDER BY r.relative_path, r.ordinal LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let basis: String = row.get(4)?;
+            out.push(StoredRowUnit {
+                relative_path: row.get(0)?,
+                dataset_key: row.get(1)?,
+                ordinal: row.get::<usize, i64>(2)? as u64,
+                row_key: row.get(3)?,
+                basis: RowKeyBasis::parse(&basis).ok_or_else(|| AtlasError::UnknownValue {
+                    column: "key_basis".to_string(),
+                    value: basis.clone(),
+                })?,
+                fields: split_names(&row.get::<usize, String>(5)?),
+                body: row.get(6)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every source with a confirmed generation, and what that generation
+    /// holds — the read behind `sgt intelligence status`, `sgt map repos` and
+    /// `sgt map stats` (F8, F11).
+    ///
+    /// The counts are correlated subqueries over one generation rather than
+    /// separate statements, so a source's numbers all describe the same world.
+    /// Bounded by [`MAX_ROWS`] (F12).
+    pub fn indexed_sources(&self) -> Result<Vec<SourceStatus>, AtlasError> {
+        let mut statement = self.conn.prepare(
+            "SELECT g.source_name, g.source_kind, g.authority_class, g.generation_id, \
+                    g.content_key, g.observed_at, g.extractors, \
+                    (SELECT count(*) FROM source.files f \
+                       WHERE f.generation_id = g.generation_id) AS files, \
+                    (SELECT count(*) FROM source.units u \
+                       WHERE u.generation_id = g.generation_id) AS units, \
+                    (SELECT count(*) FROM source.symbols s \
+                       WHERE s.generation_id = g.generation_id) AS symbols, \
+                    (SELECT count(*) FROM source.occurrences o \
+                       WHERE o.generation_id = g.generation_id) AS occurrences, \
+                    (SELECT count(*) FROM source.edges e \
+                       WHERE e.generation_id = g.generation_id) AS edges, \
+                    (SELECT count(*) FROM source.datasets d \
+                       WHERE d.generation_id = g.generation_id) AS datasets, \
+                    (SELECT count(*) FROM context.row_units r \
+                       WHERE r.generation_id = g.generation_id) AS row_units \
+             FROM source.generations g WHERE g.state = ? \
+             ORDER BY g.source_name LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![STATE_CONFIRMED, MAX_ROWS as i64])?;
+        let mut out: Vec<SourceStatus> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind: String = row.get(1)?;
+            let authority: String = row.get(2)?;
+            out.push(SourceStatus {
+                source_name: row.get(0)?,
+                kind: SourceKind::parse(&kind).ok_or_else(|| AtlasError::UnknownValue {
+                    column: "source_kind".to_string(),
+                    value: kind.clone(),
+                })?,
+                authority: AuthorityClass::parse(&authority).ok_or_else(|| {
+                    AtlasError::UnknownValue {
+                        column: "authority_class".to_string(),
+                        value: authority.clone(),
+                    }
+                })?,
+                generation_id: row.get(3)?,
+                content_key: row.get(4)?,
+                observed_at: row.get(5)?,
+                extractors: split_extractors(&row.get::<usize, String>(6)?)
+                    .into_iter()
+                    .collect(),
+                files: row.get::<usize, i64>(7)? as u64,
+                units: row.get::<usize, i64>(8)? as u64,
+                symbols: row.get::<usize, i64>(9)? as u64,
+                occurrences: row.get::<usize, i64>(10)? as u64,
+                edges: row.get::<usize, i64>(11)? as u64,
+                datasets: row.get::<usize, i64>(12)? as u64,
+                row_units: row.get::<usize, i64>(13)? as u64,
+                coverage: BTreeMap::new(),
+            });
+        }
+        drop(rows);
+        drop(statement);
+        // Coverage counts per source, after the cursor above is finished with:
+        // F8's rows are the point of `intelligence status`, and a status line
+        // without them would report what was indexed while staying silent
+        // about what was excluded.
+        for status in &mut out {
+            status.coverage = self.coverage_counts(&status.source_name)?;
+        }
+        Ok(out)
+    }
+
+    /// `sgt map outline <source>`: the titled structure units of one source's
+    /// confirmed generation, in path then document order.
+    ///
+    /// Titled only. A whole-document unit and an untitled preamble are real
+    /// units but they are not an outline, and padding the answer with them
+    /// would make the first screen of a large source useless. Bounded by
+    /// `limit` (capped at [`MAX_ROWS`], F12).
+    pub fn outline(&self, source_name: &str, limit: usize) -> Result<Vec<StoredUnit>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT u.relative_path, u.local_key, u.ordinal, u.unit_kind, u.heading_level, \
+                    u.title, u.byte_start, u.byte_end \
+             FROM source.units u JOIN source.generations g USING (generation_id) \
+             WHERE g.source_name = ? AND g.state = ? AND u.title IS NOT NULL \
+             ORDER BY u.relative_path, u.ordinal LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind: String = row.get(3)?;
+            out.push(StoredUnit {
+                relative_path: row.get(0)?,
+                local_key: row.get(1)?,
+                ordinal: row.get::<usize, i64>(2)? as u64,
+                kind: UnitKind::parse(&kind).ok_or_else(|| AtlasError::UnknownValue {
+                    column: "unit_kind".to_string(),
+                    value: kind.clone(),
+                })?,
+                heading_level: row.get::<usize, Option<i64>>(4)?.map(|v| v as u8),
+                title: row.get(5)?,
+                byte_start: row.get::<usize, i64>(6)? as u64,
+                byte_end: row.get::<usize, i64>(7)? as u64,
+                // An outline is a table of contents, not the document: the
+                // body is deliberately not selected, so `map outline` on a
+                // large source cannot return the source.
+                body: String::new(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// `sgt map symbol <name>`: the symbol index across every source, for one
+    /// **exact** name.
+    ///
+    /// Exact equality, bound as a parameter — never a `LIKE` pattern built
+    /// from the argument, which would let `%` and `_` mean things the caller
+    /// never wrote (the argument [`Self::evict_work_overlays`] already makes).
+    /// Bounded by `limit` (capped at [`MAX_ROWS`], F12).
+    pub fn symbol_lookup(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredSymbolHit>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT g.source_name, s.language, s.label, s.name, s.occurrences \
+             FROM source.symbols s JOIN source.generations g USING (generation_id) \
+             WHERE g.state = ? AND s.name = ? \
+             ORDER BY g.source_name, s.language, s.label LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![STATE_CONFIRMED, name, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredSymbolHit {
+                source_name: row.get(0)?,
+                symbol: StoredSymbol {
+                    language: row.get(1)?,
+                    label: row.get(2)?,
+                    name: row.get(3)?,
+                    occurrences: row.get::<usize, i64>(4)? as u64,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// `sgt map references <name>`: every recorded site of one exact symbol
+    /// name, across sources.
+    ///
+    /// **These are definition sites, not resolved references**, because a
+    /// definition site is what a grammar can state without resolving anything
+    /// (A1-09, and `source.occurrences`' own contract). The verb is named for
+    /// what a reader goes looking for; the answer says what it actually is.
+    /// Bounded by `limit` (capped at [`MAX_ROWS`], F12).
+    pub fn references(&self, name: &str, limit: usize) -> Result<Vec<StoredReference>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT g.source_name, o.relative_path, o.language, o.label, o.name, o.ordinal, \
+                    o.byte_start, o.byte_end \
+             FROM source.occurrences o JOIN source.generations g USING (generation_id) \
+             WHERE g.state = ? AND o.name = ? \
+             ORDER BY g.source_name, o.relative_path, o.ordinal LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![STATE_CONFIRMED, name, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredReference {
+                source_name: row.get(0)?,
+                relative_path: row.get(1)?,
+                language: row.get(2)?,
+                label: row.get(3)?,
+                name: row.get(4)?,
+                ordinal: row.get::<usize, i64>(5)? as u64,
+                byte_start: row.get::<usize, i64>(6)? as u64,
+                byte_end: row.get::<usize, i64>(7)? as u64,
+            });
+        }
+        Ok(out)
+    }
+
     /// Every generation's state, keyed by id — a diagnostic read, and what a
     /// crash-window test inspects.
     pub fn generation_states(&self) -> Result<BTreeMap<String, String>, AtlasError> {
@@ -1188,6 +1894,340 @@ fn insert_unit(
     Ok(())
 }
 
+/// One canned dataset statement's answer: column names, then rows aligned
+/// with them, every value `Option<String>` because every canned dataset query
+/// casts to `VARCHAR` (see [`rows_sql`]).
+type TextAnswer = (Vec<String>, Vec<Vec<Option<String>>>);
+
+/// Run one canned dataset statement and collect its answer as text.
+///
+/// Both parameters are bound: the absolute path of the file to read, and the
+/// row cap. Nothing a caller supplies is concatenated into `sql`, which is a
+/// constant chosen by [`reader_call`].
+///
+/// Every column comes back `Option<String>` because every canned dataset query
+/// casts to `VARCHAR` — see [`rows_sql`] for why that is a contract and not a
+/// shortcut.
+fn fetch_text(
+    conn: &Connection,
+    sql: &str,
+    path: &str,
+    limit: i64,
+) -> Result<TextAnswer, AtlasError> {
+    let mut statement = conn.prepare(sql)?;
+    let mut rows = statement.query(duckdb::params![path, limit])?;
+    let mut columns: Vec<String> = Vec::new();
+    let mut out: Vec<Vec<Option<String>>> = Vec::new();
+    while let Some(row) = rows.next()? {
+        if columns.is_empty() {
+            columns = row.as_ref().column_names();
+        }
+        let mut values = Vec::with_capacity(columns.len());
+        for index in 0..columns.len() {
+            values.push(row.get::<usize, Option<String>>(index)?);
+        }
+        out.push(values);
+    }
+    if columns.is_empty() {
+        // A query that produced no row still has a schema, and an empty answer
+        // with named columns is a different (and more useful) fact than an
+        // empty answer with none.
+        columns = rows
+            .as_ref()
+            .map(Statement::column_names)
+            .unwrap_or_default();
+    }
+    Ok((columns, out))
+}
+
+/// Run one canned query against one dataset and turn the answer into derived
+/// evidence (A1 §6.4).
+fn dataset_fact(
+    conn: &Connection,
+    query: &DatasetQuery,
+    sql: &str,
+    dataset: &ScannedDataset,
+    absolute: &str,
+) -> Result<DatasetFact, AtlasError> {
+    // `MAX_ROWS + 1` so the answer itself says whether the cap bit, rather
+    // than leaving "exactly MAX_ROWS" ambiguous between "that many" and "at
+    // least that many".
+    let probe = MAX_ROWS as i64 + 1;
+    let (columns, mut rows) = fetch_text(conn, sql, absolute, probe)?;
+    let truncated = rows.len() > MAX_ROWS;
+    rows.truncate(MAX_ROWS);
+    Ok(DatasetFact {
+        relative_path: dataset.relative_path.clone(),
+        dataset_key: dataset.dataset_key.clone(),
+        query: query.name.to_string(),
+        query_identity: query_identity(query, sql),
+        row_limit: MAX_ROWS as u64,
+        truncated,
+        output_hash: output_hash(&columns, &rows),
+        columns,
+        rows,
+    })
+}
+
+/// **One dataset's in-place read** — reads only, no write, no transaction.
+///
+/// Deliberately outside [`AtlasDb::stage_scan`]'s transaction, and that is a
+/// correctness rule rather than a style choice: a failing statement aborts the
+/// DuckDB transaction it ran in, so a single malformed CSV read inside the
+/// staging transaction would poison every insert after it and take the whole
+/// scan down with it. A read failure has to be *survivable*, because it is a
+/// coverage fact — "this file is a dataset and we could not read it" is
+/// exactly the evidence [`Coverage::Error`] exists to carry, and a knowledge
+/// directory's one bad file must not cost the estate everything else in it.
+///
+/// So the reads happen first, each failure captured as a value, and the
+/// transaction that follows writes only rows it already holds.
+fn read_dataset(conn: &Connection, scan: &SourceScan, dataset: &ScannedDataset) -> IngestedDataset {
+    let failed = |detail: String| IngestedDataset {
+        columns: Vec::new(),
+        row_count: 0,
+        truncated: false,
+        facts: Vec::new(),
+        units: Vec::new(),
+        status: Coverage::Error,
+        detail,
+    };
+    let Some(root) = scan.root.as_ref() else {
+        // Unreachable from the three walks in this build — only a filesystem
+        // walk registers datasets — but stated rather than assumed, because
+        // this is a public store and the alternative is a panic.
+        return failed(crate::runtime::atlas::scan::DATASET_NO_ROOT.to_string());
+    };
+    let absolute = root.join(&dataset.relative_path);
+    let Some(absolute) = absolute.to_str().map(str::to_owned) else {
+        return failed("the dataset's path is not valid UTF-8".to_string());
+    };
+
+    let mut facts = Vec::with_capacity(DATASET_QUERIES.len());
+    for query in DATASET_QUERIES {
+        let sql = sql_for(query, dataset.format);
+        match dataset_fact(conn, query, &sql, dataset, &absolute) {
+            Ok(fact) => facts.push(fact),
+            Err(e) => return failed(format!("{}: {e}", query.name)),
+        }
+    }
+
+    // The row read, and **F10a's gate expressed as the bound on it**: with no
+    // declared allowlist the same statement runs with a limit of zero, so the
+    // column names come back in reader order and not a single value is ever
+    // fetched. The refusal is therefore a property of what runs, not only of
+    // what is stored — and the schema is still learned, which is what lets a
+    // dataset be registered honestly without being exposed.
+    let exposes_nothing = scan.context_fields.exposes_nothing();
+    let row_bound = if exposes_nothing {
+        0
+    } else {
+        MAX_ROWS as i64 + 1
+    };
+    let (columns, mut rows) =
+        match fetch_text(conn, &rows_sql(dataset.format), &absolute, row_bound) {
+            Ok(answer) => answer,
+            Err(e) => return failed(format!("rows: {e}")),
+        };
+    let mut truncated = rows.len() > MAX_ROWS;
+    rows.truncate(MAX_ROWS);
+    // `NULL` renders as the empty string for a context unit: a unit is text,
+    // and one that spelled the word "NULL" would be indistinguishable from a
+    // cell that literally said so.
+    let text: Vec<Vec<String>> = rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(Option::unwrap_or_default)
+                .collect::<Vec<String>>()
+        })
+        .collect();
+    let units = row_units(
+        &scan.source_name,
+        &dataset.relative_path,
+        &scan.context_fields,
+        &columns,
+        &text,
+    );
+
+    let row_count = facts
+        .iter()
+        .find(|fact| fact.query == DATASET_ROW_COUNT.name)
+        .and_then(|fact| fact.rows.first())
+        .and_then(|row| row.first().cloned().flatten())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let capped = row_count.min(MAX_ROWS as u64);
+    truncated = truncated || row_count > MAX_ROWS as u64;
+    let detail = format!(
+        "{} ({} column{}, {} row{}{}); context units: {}",
+        dataset.reader,
+        columns.len(),
+        if columns.len() == 1 { "" } else { "s" },
+        capped,
+        if capped == 1 { "" } else { "s" },
+        if truncated { ", capped" } else { "" },
+        if exposes_nothing {
+            "none — no context_fields declared for this source (F10a)".to_string()
+        } else {
+            format!(
+                "{} from {}",
+                units.len(),
+                scan.context_fields.columns().join(",")
+            )
+        }
+    );
+    IngestedDataset {
+        columns,
+        row_count: capped,
+        truncated,
+        facts,
+        units,
+        status: Coverage::Indexed,
+        detail,
+    }
+}
+
+/// What [`read_dataset`] found, ready to be written by the staging
+/// transaction.
+struct IngestedDataset {
+    columns: Vec<String>,
+    row_count: u64,
+    truncated: bool,
+    facts: Vec<DatasetFact>,
+    units: Vec<RowUnit>,
+    status: Coverage,
+    detail: String,
+}
+
+/// Write one already-read dataset's rows, and return the coverage row it
+/// earned — which replaces the placeholder the walk left for that path (see
+/// [`AtlasDb::stage_scan`]), so F8's one-row-per-path rule still holds and the
+/// row says what happened rather than what was attempted.
+fn write_dataset(
+    conn: &Connection,
+    generation_id: &str,
+    scan: &SourceScan,
+    dataset: &ScannedDataset,
+    read: &IngestedDataset,
+) -> Result<CoverageRow, AtlasError> {
+    conn.prepare_cached(
+        "INSERT INTO source.datasets \
+         (generation_id, source_name, relative_path, format, content_hash, reader, dataset_key, \
+          byte_len, mtime_millis, columns, row_count, truncated, row_units) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )?
+    .execute(duckdb::params![
+        generation_id,
+        &scan.source_name,
+        &dataset.relative_path,
+        dataset.format.as_str(),
+        &dataset.content_hash,
+        &dataset.reader,
+        &dataset.dataset_key,
+        dataset.byte_len as i64,
+        dataset.mtime_millis,
+        &join_names(&read.columns),
+        read.row_count as i64,
+        read.truncated,
+        read.units.len() as i64,
+    ])?;
+    for fact in &read.facts {
+        insert_dataset_fact(conn, generation_id, &scan.source_name, fact)?;
+    }
+    for unit in &read.units {
+        insert_row_unit(conn, generation_id, &scan.source_name, dataset, unit)?;
+    }
+    Ok(CoverageRow {
+        path: Some(dataset.relative_path.clone()),
+        status: read.status,
+        detail: Some(read.detail.clone()),
+        bytes: Some(dataset.byte_len),
+    })
+}
+
+/// Insert one derived-evidence row (A1 §6.4).
+fn insert_dataset_fact(
+    conn: &Connection,
+    generation_id: &str,
+    source_name: &str,
+    fact: &DatasetFact,
+) -> Result<(), AtlasError> {
+    conn.prepare_cached(
+        "INSERT INTO source.dataset_facts \
+         (generation_id, source_name, relative_path, dataset_key, query, query_identity, \
+          row_limit, truncated, columns, rows, output_hash, observed_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )?
+    .execute(duckdb::params![
+        generation_id,
+        source_name,
+        &fact.relative_path,
+        &fact.dataset_key,
+        &fact.query,
+        &fact.query_identity,
+        fact.row_limit as i64,
+        fact.truncated,
+        &join_names(&fact.columns),
+        &render_rows(&fact.rows),
+        &fact.output_hash,
+        crate::domain::event::rfc3339_utc_now(),
+    ])?;
+    Ok(())
+}
+
+/// Insert one F10a-gated context unit.
+fn insert_row_unit(
+    conn: &Connection,
+    generation_id: &str,
+    source_name: &str,
+    dataset: &ScannedDataset,
+    unit: &RowUnit,
+) -> Result<(), AtlasError> {
+    conn.prepare_cached(
+        "INSERT INTO context.row_units \
+         (generation_id, source_name, relative_path, dataset_key, ordinal, row_key, key_basis, \
+          fields, body) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )?
+    .execute(duckdb::params![
+        generation_id,
+        source_name,
+        &dataset.relative_path,
+        &dataset.dataset_key,
+        unit.ordinal as i64,
+        &unit.row_key,
+        unit.basis.as_str(),
+        &join_names(&unit.fields),
+        &unit.text,
+    ])?;
+    Ok(())
+}
+
+/// Column/field names as one stored value: JSON, so a name containing a comma
+/// survives the round trip.
+fn join_names(names: &[String]) -> String {
+    serde_json::to_string(names).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// [`join_names`] backwards; an unparseable value is the empty list rather
+/// than a failure, because a malformed column list must not make an otherwise
+/// readable evidence row unreadable.
+fn split_names(stored: &str) -> Vec<String> {
+    serde_json::from_str(stored).unwrap_or_default()
+}
+
+/// A query answer's rows as one stored value, in the same JSON shape the API
+/// serves them in.
+fn render_rows(rows: &[Vec<Option<String>>]) -> String {
+    serde_json::to_string(rows).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// [`render_rows`] backwards.
+fn parse_rows(stored: &str) -> Vec<Vec<Option<String>>> {
+    serde_json::from_str(stored).unwrap_or_default()
+}
+
 /// Insert one coverage observation.
 fn insert_coverage(
     conn: &Connection,
@@ -1244,6 +2284,23 @@ fn evict(
     )?;
     conn.execute(
         "DELETE FROM source.files WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM source.datasets WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM source.dataset_facts WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    // The F10a-gated units go with everything else an eviction takes. That
+    // matters more here than elsewhere: narrowing a source's `context_fields`
+    // changes the reader identity, which stages a new generation, which
+    // evicts this one — and *this* delete is what actually retracts the text
+    // the wider allowlist exposed.
+    conn.execute(
+        "DELETE FROM context.row_units WHERE generation_id = ?",
         duckdb::params![generation_id],
     )?;
     conn.execute(
@@ -1396,6 +2453,145 @@ pub struct StoredCoverage {
     pub observed_at: String,
 }
 
+/// This store's live extension posture (F4) — see [`AtlasDb::hardening`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hardening {
+    /// Whether DuckDB may *download* an extension it does not have. Always
+    /// false here.
+    pub autoinstall_known_extensions: bool,
+    /// Whether DuckDB may load a known extension on demand. Always false here.
+    pub autoload_known_extensions: bool,
+    /// Whether community extensions may load. Always false here.
+    pub allow_community_extensions: bool,
+    /// Whether the three above are locked against a later `SET`.
+    pub locked: bool,
+    /// Extensions compiled into this binary and already loaded — F4's
+    /// qualification, stated by the database rather than by the build file:
+    /// `json` and `parquet` are here because the feature flags put them here,
+    /// which is why nothing has to be fetched to read a dataset.
+    pub statically_linked: Vec<String>,
+}
+
+/// One registered tabular dataset, read back out of the store (X4).
+///
+/// Everything here is *about* the dataset; none of it is the dataset. Its rows
+/// live in the operator's own file, which is what reading in place means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDataset {
+    /// Path relative to the source root.
+    pub relative_path: String,
+    /// Which reader claims it.
+    pub format: DatasetFormat,
+    /// BLAKE3 of the file's bytes.
+    pub content_hash: String,
+    /// The reader identity under this source's allowlist — F7's second key
+    /// input, which carries F10a's `context_fields` (see
+    /// [`crate::runtime::atlas::tabular::reader_identity`]).
+    pub reader: String,
+    /// F7's reusable extraction key.
+    pub dataset_key: String,
+    /// Size in bytes.
+    pub byte_len: u64,
+    /// Column names, in reader order, as the in-place read found them.
+    pub columns: Vec<String>,
+    /// Rows counted, up to [`MAX_ROWS`].
+    pub row_count: u64,
+    /// Whether the row cap bit — whether the file holds more than
+    /// `row_count` says (F12).
+    pub truncated: bool,
+    /// How many context units this dataset produced. **Zero unless the source
+    /// declared `context_fields`** (F10a).
+    pub row_units: u64,
+}
+
+/// One F10a-gated context unit, read back out of the store (X4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredRowUnit {
+    /// Path relative to the source root.
+    pub relative_path: String,
+    /// F7's key for the dataset it came from.
+    pub dataset_key: String,
+    /// Position in the dataset, in reader order.
+    pub ordinal: u64,
+    /// The row's name.
+    pub row_key: String,
+    /// Whether that name is content-derived or had to fold in the ordinal.
+    pub basis: RowKeyBasis,
+    /// The allowlisted columns that produced this unit — the audit trail of
+    /// what was exposed.
+    pub fields: Vec<String>,
+    /// The rendered text.
+    pub body: String,
+}
+
+/// One source's confirmed generation and what it holds — the shape
+/// `sgt intelligence status` and `sgt map stats` are rendered from (F8, F11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceStatus {
+    /// The declared source.
+    pub source_name: String,
+    /// How its bytes were acquired.
+    pub kind: SourceKind,
+    /// What the estate may do with it.
+    pub authority: AuthorityClass,
+    /// The confirmed generation.
+    pub generation_id: String,
+    /// Its content identity.
+    pub content_key: String,
+    /// When it was observed.
+    pub observed_at: String,
+    /// The extractor identities that produced its rows (F7's second key
+    /// input), sorted.
+    pub extractors: Vec<String>,
+    /// Acquired documents.
+    pub files: u64,
+    /// Structure units.
+    pub units: u64,
+    /// Distinct symbols in the index.
+    pub symbols: u64,
+    /// Symbol definition sites.
+    pub occurrences: u64,
+    /// Syntax-derived edges.
+    pub edges: u64,
+    /// Registered tabular datasets.
+    pub datasets: u64,
+    /// F10a-gated context units.
+    pub row_units: u64,
+    /// F8's coverage counts by status — including `excluded`, which is the
+    /// number that makes the secrets posture checkable rather than claimed.
+    pub coverage: BTreeMap<String, u64>,
+}
+
+/// One symbol-index hit, with the source it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSymbolHit {
+    /// The declared source.
+    pub source_name: String,
+    /// The index entry itself.
+    pub symbol: StoredSymbol,
+}
+
+/// One symbol definition site, with the source it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReference {
+    /// The declared source.
+    pub source_name: String,
+    /// Path relative to the source root.
+    pub relative_path: String,
+    /// The grammar's language name.
+    pub language: String,
+    /// What the grammar called it.
+    pub label: String,
+    /// The name as written.
+    pub name: String,
+    /// Position within its file, in document order.
+    pub ordinal: u64,
+    /// Offset into the original file bytes.
+    pub byte_start: u64,
+    /// End offset into the original file bytes, exclusive.
+    pub byte_end: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1483,6 +2679,9 @@ mod tests {
                 bytes: Some(body.len() as u64),
             }],
             extractors: BTreeSet::from(["markdown/v1".to_string()]),
+            datasets: Vec::new(),
+            root: None,
+            context_fields: crate::runtime::atlas::tabular::ContextFields::none(),
         }
     }
 

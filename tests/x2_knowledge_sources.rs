@@ -109,6 +109,10 @@ fn source(name: &str, root: &Path) -> KnowledgeSource {
         name: name.to_string(),
         root: root.to_path_buf(),
         ignore: Vec::new(),
+        // X4/F10a: this suite's sources declare no tabular allowlist, which is
+        // the default and the refusal. The allowlist's own behaviour is
+        // `tests/x4_tabular_map.rs`'s.
+        context_fields: Default::default(),
     }
 }
 

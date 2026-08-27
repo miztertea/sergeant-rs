@@ -43,6 +43,7 @@ use crate::domain::execution::{
     KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
 use crate::domain::manifest::{self, ManifestError};
+use crate::domain::source::SourceKind;
 use crate::domain::work::{
     CausationClaim, EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED,
     KIND_WORK_BLOCKED, KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED,
@@ -56,6 +57,7 @@ use crate::domain::workflow::{
     WorkflowDefinition,
 };
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
+use crate::runtime::atlas::db::{self as atlas_db, AtlasDb, AtlasError, SourceStatus};
 use crate::runtime::engine::{
     Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
     Next as EngineNext, Step, SubmitContext,
@@ -460,6 +462,20 @@ pub struct ApiState {
     /// up from the journal at query time (see [`with_analytics`]), so a
     /// failure anywhere in here costs an answer, never a fact.
     pub analytics: Arc<tokio::sync::Mutex<Analytics>>,
+    /// S3 X4: Atlas's durable store, opened lazily and kept for the process.
+    ///
+    /// `None` until something asks — and it stays `None` on a host that has
+    /// never scanned a source, because opening the file *creates* it and a
+    /// host with no knowledge sources should not pay a database creation for a
+    /// feature it has never used (the same argument `daemon::start_with`
+    /// already makes for startup reconciliation, R1).
+    ///
+    /// Behind its own lock, not the core's, for the same reason
+    /// [`Self::analytics`] is: a `map` query is a read of derived evidence and
+    /// must never be able to stall a mutation. Unlike analytics it is **not**
+    /// caught up from the journal — no replay reproduces it (F1) — so a read
+    /// here answers from what the scanner wrote and never rebuilds anything.
+    pub atlas: Arc<tokio::sync::Mutex<Option<crate::runtime::atlas::db::AtlasDb>>>,
     /// W3: the retention policy this daemon resolved once at start, pinned
     /// for its whole life (§1.2) — read by [`drive_completions`]'s rotation
     /// trigger (§10.4).
@@ -509,6 +525,17 @@ pub fn router(state: ApiState) -> Router {
         .route("/graph/work/{id}", get(work_graph))
         .route("/analytics", get(analytics_index))
         .route("/analytics/{name}", get(analytics_query))
+        // S3 X4, F11's minimum honest set. Canned and parameterized, both:
+        // every one of these reads rows Atlas already holds, and none of them
+        // takes SQL, a path, or a pattern from the caller. `map neighbors`
+        // and `map changed` are deliberately absent — S5 and S6 own them,
+        // where their consumers exist (F11's named deferral).
+        .route("/intelligence/status", get(intelligence_status))
+        .route("/map/repos", get(map_repos))
+        .route("/map/stats", get(map_stats))
+        .route("/map/outline", get(map_outline))
+        .route("/map/symbol", get(map_symbol))
+        .route("/map/references", get(map_references))
         .route("/events", get(event_history))
         .route("/events/stream", get(event_stream))
         .route("/system", get(system_info))
@@ -4425,6 +4452,293 @@ async fn work_graph(State(state): State<ApiState>, Path(id): Path<String>) -> Re
     }
 }
 
+// ---------------------------------------------------- S3 X4: intelligence
+
+/// Run one read against Atlas's store (F11).
+///
+/// Opens the store on first use and keeps it, and — unlike
+/// [`with_analytics`] — never catches anything up: `source.*` and
+/// `meta.coverage` are derived from source bytes plus extractor identity, and
+/// no journal replay reproduces them (F1). A read here answers with what the
+/// scanner wrote, or says honestly that nothing has been scanned.
+///
+/// A host that has never scanned a source has no Atlas file, and creating one
+/// to answer a read would mean every `sgt intelligence status` on a fresh
+/// install left a database behind. So the absent file is an *answer*, handed
+/// to the caller as `None`, not a failure and not a reason to create anything.
+async fn with_atlas<T>(
+    state: &ApiState,
+    f: impl FnOnce(&AtlasDb) -> Result<T, AtlasError>,
+) -> Result<Option<T>, MapRefusal> {
+    let mut guard = state.atlas.lock().await;
+    if guard.is_none() {
+        if !crate::runtime::atlas::db::atlas_db_path(&state.data_dir).exists() {
+            return Ok(None);
+        }
+        match AtlasDb::open(&state.data_dir) {
+            Ok(atlas) => *guard = Some(atlas),
+            Err(e) => {
+                return Err(Box::new(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "atlas_unavailable",
+                    format!("atlas could not be opened: {e}"),
+                )));
+            }
+        }
+    }
+    let atlas = guard.as_ref().expect("opened above");
+    match f(atlas) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => Err(Box::new(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "atlas_unavailable",
+            format!("atlas read failed: {e}"),
+        ))),
+    }
+}
+
+/// A refused map read, boxed.
+///
+/// An axum [`Response`] is a large value, and a `Result` whose error is larger
+/// than its success case makes every caller pay for the failure path — which
+/// is what `clippy::result_large_err` is about. Boxing costs one allocation on
+/// a path that is already an error.
+type MapRefusal = Box<Response>;
+
+/// The `?limit=` every map read accepts, and the `?source=`/`?name=` the ones
+/// that address something accept.
+///
+/// `limit` is advisory in one direction only: the store caps it at
+/// `MAX_ROWS` whatever is asked for, so a client cannot widen a bound (F12).
+#[derive(Debug, Default, Deserialize)]
+struct MapQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl MapQuery {
+    fn limit(&self) -> usize {
+        self.limit
+            .unwrap_or(atlas_db::MAX_ROWS)
+            .min(atlas_db::MAX_ROWS)
+    }
+
+    /// The `?source=` a source-addressed read needs, or a 400 naming it.
+    fn source(&self) -> Result<&str, MapRefusal> {
+        self.source
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "source_required",
+                    "this map read addresses one source: pass ?source=<name>",
+                ))
+            })
+    }
+
+    /// The `?name=` a symbol-addressed read needs, or a 400 naming it.
+    fn name(&self) -> Result<&str, MapRefusal> {
+        self.name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "name_required",
+                    "this map read addresses one symbol: pass ?name=<symbol>",
+                ))
+            })
+    }
+}
+
+/// What every map/intelligence response says when nothing has been scanned.
+///
+/// An explicit shape rather than an empty list, because "no source has been
+/// indexed on this host" and "this source has nothing in it" are different
+/// answers and a client that could not tell them apart would report the wrong
+/// one.
+fn atlas_absent() -> Response {
+    Json(json!({
+        "atlas": {"present": false},
+        "sources": [],
+        "detail": "no source has been indexed on this host yet",
+    }))
+    .into_response()
+}
+
+/// One source's status, as `sgt intelligence status` renders it (F8).
+fn source_status_json(status: &SourceStatus) -> Value {
+    json!({
+        "source": status.source_name,
+        "kind": status.kind.as_str(),
+        "authority": status.authority.as_str(),
+        "generation": status.generation_id,
+        "content_key": status.content_key,
+        "observed_at": status.observed_at,
+        "extractors": status.extractors,
+        "files": status.files,
+        "units": status.units,
+        "symbols": status.symbols,
+        "occurrences": status.occurrences,
+        "edges": status.edges,
+        "datasets": status.datasets,
+        "row_units": status.row_units,
+        "coverage": status.coverage,
+    })
+}
+
+/// `GET /v1/intelligence/status` — F8's coverage, per indexed source.
+async fn intelligence_status(State(state): State<ApiState>) -> Response {
+    match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sources)) => Json(json!({
+            "atlas": {"present": true},
+            "sources": sources.iter().map(source_status_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/repos` — the repository sources Atlas has indexed.
+///
+/// Repository sources only: a knowledge source is evidence about a directory,
+/// not a repository, and folding the two into one list would make the verb's
+/// name a lie. `sgt intelligence status` is the list of everything.
+async fn map_repos(State(state): State<ApiState>) -> Response {
+    match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sources)) => Json(json!({
+            "atlas": {"present": true},
+            "repos": sources
+                .iter()
+                .filter(|s| s.kind == SourceKind::EstateGit)
+                .map(source_status_json)
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/stats` — what the map actually holds, per source.
+async fn map_stats(State(state): State<ApiState>) -> Response {
+    match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sources)) => Json(json!({
+            "atlas": {"present": true},
+            "sources": sources.iter().map(source_status_json).collect::<Vec<_>>(),
+            "totals": {
+                "sources": sources.len(),
+                "files": sources.iter().map(|s| s.files).sum::<u64>(),
+                "units": sources.iter().map(|s| s.units).sum::<u64>(),
+                "symbols": sources.iter().map(|s| s.symbols).sum::<u64>(),
+                "occurrences": sources.iter().map(|s| s.occurrences).sum::<u64>(),
+                "edges": sources.iter().map(|s| s.edges).sum::<u64>(),
+                "datasets": sources.iter().map(|s| s.datasets).sum::<u64>(),
+                "row_units": sources.iter().map(|s| s.row_units).sum::<u64>(),
+            },
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/outline?source=<name>` — one source's titled structure units.
+async fn map_outline(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let source = match query.source() {
+        Ok(source) => source.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.outline(&source, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(units)) => Json(json!({
+            "atlas": {"present": true},
+            "source": source,
+            "limit": limit,
+            "outline": units.iter().map(|u| json!({
+                "path": u.relative_path,
+                "ordinal": u.ordinal,
+                "kind": u.kind.as_str(),
+                "level": u.heading_level,
+                "title": u.title,
+                "byte_start": u.byte_start,
+                "byte_end": u.byte_end,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/symbol?name=<symbol>` — the symbol index, by exact name.
+async fn map_symbol(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let name = match query.name() {
+        Ok(name) => name.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.symbol_lookup(&name, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(hits)) => Json(json!({
+            "atlas": {"present": true},
+            "name": name,
+            "limit": limit,
+            "symbols": hits.iter().map(|h| json!({
+                "source": h.source_name,
+                "language": h.symbol.language,
+                "label": h.symbol.label,
+                "name": h.symbol.name,
+                "occurrences": h.symbol.occurrences,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/references?name=<symbol>` — every recorded site of one exact
+/// symbol name.
+///
+/// The `derivation` field is not decoration: these are **definition sites**,
+/// which is what a grammar can state without resolving anything (A1-09). A
+/// client that assumed "references" meant resolved call sites would be wrong,
+/// so the answer says what it is.
+async fn map_references(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let name = match query.name() {
+        Ok(name) => name.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.references(&name, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sites)) => Json(json!({
+            "atlas": {"present": true},
+            "name": name,
+            "limit": limit,
+            "derivation": "syntax-derived definition sites; unresolved (A1-09)",
+            "references": sites.iter().map(|r| json!({
+                "source": r.source_name,
+                "path": r.relative_path,
+                "language": r.language,
+                "label": r.label,
+                "name": r.name,
+                "ordinal": r.ordinal,
+                "byte_start": r.byte_start,
+                "byte_end": r.byte_end,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
 /// `GET /v1/analytics` — the canned §22 questions this daemon can answer.
 async fn analytics_index(State(state): State<ApiState>) -> Response {
     match with_analytics(&state, |analytics| analytics.table_counts()).await {
@@ -5417,9 +5731,9 @@ impl ApiClient {
 }
 
 /// Minimal percent-encoding for the few values this crate puts in a URL
-/// (work ids, today). Anything outside the unreserved set is escaped rather
-/// than trusted.
-fn urlencode(value: &str) -> String {
+/// (work ids, and X4's `map` arguments). Anything outside the unreserved set
+/// is escaped rather than trusted.
+pub fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -6001,6 +6315,225 @@ mod tests {
         );
     }
 
+    // ------------------------------------------- S3 X4: the map surface
+
+    /// One handler response, decoded.
+    async fn body_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(json!(null)),
+        )
+    }
+
+    /// Record one knowledge scan into a data dir through the ordinary path,
+    /// and return the state that will read it back.
+    async fn state_with_a_scanned_source(
+        data_dir: &std::path::Path,
+    ) -> (ApiState, tempfile::TempDir) {
+        let source_root = tempfile::TempDir::new().expect("source root");
+        std::fs::write(
+            source_root.path().join("guide.md"),
+            "# Guide\n\ntext\n\n## Details\n\nmore\n",
+        )
+        .expect("write md");
+        std::fs::write(
+            source_root.path().join("lib.py"),
+            "def only():\n    return 1\n",
+        )
+        .expect("write py");
+        std::fs::write(
+            source_root.path().join("rows.csv"),
+            "title,email\nalpha,a@example.com\n",
+        )
+        .expect("write csv");
+
+        // The scan is recorded *before* the state opens its own journal: the
+        // journal is exclusively locked, and two holders is a test artefact,
+        // not a property under test.
+        {
+            let mut journal = Journal::open(data_dir).expect("journal");
+            let mut atlas = crate::runtime::atlas::db::AtlasDb::open(data_dir).expect("atlas");
+            crate::runtime::atlas::record::scan_and_record(
+                &mut atlas,
+                &mut journal,
+                &crate::runtime::atlas::scan::KnowledgeSource {
+                    name: "notes".to_string(),
+                    root: source_root.path().to_path_buf(),
+                    ignore: Vec::new(),
+                    context_fields: crate::runtime::atlas::tabular::ContextFields::none(),
+                },
+                None,
+            )
+            .expect("scan and record");
+        }
+        let state = test_state(data_dir).await;
+        (state, source_root)
+    }
+
+    /// F11: `intelligence status` and every `map` verb answer from Atlas's
+    /// own rows, and the answers carry F8's coverage rather than a bare
+    /// indexed count.
+    #[tokio::test]
+    async fn the_map_surface_answers_from_atlas() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (state, _source) = state_with_a_scanned_source(dir.path()).await;
+
+        let (status, body) = body_json(intelligence_status(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["atlas"]["present"], json!(true));
+        let source = &body["sources"][0];
+        assert_eq!(source["source"], "notes");
+        assert_eq!(source["kind"], "local_knowledge");
+        assert_eq!(source["datasets"], json!(1));
+        assert_eq!(
+            source["row_units"],
+            json!(0),
+            "F10a: no declared context_fields means no exposed row text"
+        );
+        assert!(
+            source["coverage"]["indexed"].as_u64().unwrap_or(0) >= 3,
+            "coverage must be reported per status, not as one total: {source}"
+        );
+
+        // The outline is the titled units and nothing else.
+        let (status, body) = body_json(
+            map_outline(
+                State(state.clone()),
+                Query(MapQuery {
+                    source: Some("notes".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let titles: Vec<&str> = body["outline"]
+            .as_array()
+            .expect("outline")
+            .iter()
+            .filter_map(|u| u["title"].as_str())
+            .collect();
+        assert!(titles.contains(&"Guide"), "outline was {titles:?}");
+        assert!(titles.contains(&"Details"), "outline was {titles:?}");
+
+        // A symbol, by exact name, and its recorded sites.
+        let (status, body) = body_json(
+            map_symbol(
+                State(state.clone()),
+                Query(MapQuery {
+                    name: Some("only".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["symbols"][0]["source"], "notes");
+        assert_eq!(body["symbols"][0]["language"], "python");
+
+        let (status, body) = body_json(
+            map_references(
+                State(state.clone()),
+                Query(MapQuery {
+                    name: Some("only".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["references"][0]["path"], "lib.py");
+        assert!(
+            body["derivation"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("definition sites"),
+            "the answer must say what it actually is (A1-09): {body}"
+        );
+
+        // `map repos` is repository sources; a knowledge source is not one.
+        let (status, body) = body_json(map_repos(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["repos"].as_array().expect("repos").len(), 0);
+
+        // `map stats` totals what the map holds.
+        let (status, body) = body_json(map_stats(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["totals"]["sources"], json!(1));
+        assert_eq!(body["totals"]["datasets"], json!(1));
+    }
+
+    /// A source-addressed or symbol-addressed map read with nothing to
+    /// address is a named 400, not an empty list.
+    #[tokio::test]
+    async fn a_map_read_with_nothing_to_address_is_refused_by_name() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (state, _source) = state_with_a_scanned_source(dir.path()).await;
+
+        let (status, body) =
+            body_json(map_outline(State(state.clone()), Query(MapQuery::default())).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "source_required");
+
+        let (status, body) =
+            body_json(map_symbol(State(state.clone()), Query(MapQuery::default())).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "name_required");
+    }
+
+    /// A host that has never scanned anything answers, and **creates no
+    /// database to do it**.
+    ///
+    /// Opening Atlas creates its file, so a status read on a fresh install
+    /// would otherwise leave a store behind for a feature nobody used (R1).
+    #[tokio::test]
+    async fn an_unscanned_host_answers_without_creating_a_store() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+
+        let (status, body) = body_json(intelligence_status(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["atlas"]["present"], json!(false));
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no source has been indexed"),
+            "the absent answer must say what is absent: {body}"
+        );
+        assert!(
+            !crate::runtime::atlas::db::atlas_db_path(dir.path()).exists(),
+            "a read must not create the store it reports on"
+        );
+    }
+
+    /// F12 at the wire: a client cannot widen the store's row cap.
+    #[tokio::test]
+    async fn a_client_cannot_ask_for_more_rows_than_the_cap() {
+        let query = MapQuery {
+            limit: Some(usize::MAX),
+            ..MapQuery::default()
+        };
+        assert_eq!(query.limit(), atlas_db::MAX_ROWS);
+        assert_eq!(MapQuery::default().limit(), atlas_db::MAX_ROWS);
+        assert_eq!(
+            MapQuery {
+                limit: Some(5),
+                ..MapQuery::default()
+            }
+            .limit(),
+            5
+        );
+    }
+
     async fn test_state(data_dir: &std::path::Path) -> ApiState {
         let journal = Journal::open(data_dir).expect("open journal");
         let mut registry = work_registry_projection();
@@ -6024,6 +6557,7 @@ mod tests {
             )),
             estates: Arc::new(crate::runtime::estates::EstateRegistry::new()),
             analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
+            atlas: Arc::new(tokio::sync::Mutex::new(None)),
             prune_policy: crate::runtime::prune::PrunePolicy {
                 retention: crate::domain::estate::DEFAULT_RETENTION,
                 source: crate::runtime::prune::PolicySource::Default,

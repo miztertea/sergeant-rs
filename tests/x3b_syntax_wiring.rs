@@ -311,6 +311,7 @@ fn a_local_knowledge_scan_keys_its_syntax_extraction_locally() {
         name: "notes".to_string(),
         root: dir.path().to_path_buf(),
         ignore: Vec::new(),
+        context_fields: Default::default(),
     })
     .expect("scan");
 

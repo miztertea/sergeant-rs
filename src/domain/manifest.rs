@@ -750,6 +750,7 @@ pub fn add_knowledge(
     name: &str,
     path: &Path,
     ignore: &[String],
+    context_fields: &[String],
 ) -> Result<(), ManifestError> {
     if !is_plain_name(name) {
         return Err(ManifestError::InvalidName {
@@ -785,6 +786,16 @@ pub fn add_knowledge(
             array.push(glob.as_str());
         }
         table.insert("ignore", Item::Value(array.into()));
+    }
+    // F10a. Written only when there is something to write: an absent key and
+    // an empty array mean the same thing (no column is exposed), and the
+    // absent one is the honest spelling of a default nobody chose.
+    if !context_fields.is_empty() {
+        let mut array = toml_edit::Array::new();
+        for column in context_fields {
+            array.push(column.as_str());
+        }
+        table.insert("context_fields", Item::Value(array.into()));
     }
     knowledge_array_mut(&mut doc, &manifest_path)?.push(table);
 
