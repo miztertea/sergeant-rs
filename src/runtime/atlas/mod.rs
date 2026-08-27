@@ -107,6 +107,9 @@
 //! db      ── the one module that reaches the database driver, in or out
 //! record  ── the thin three-step glue F1's crash window is stated over
 //! lane    ── the thin F6 glue: an intelligence permit and the blocking pool
+//! worker  ── the supervised parse-worker transport (S4 Y1, G2): spawn,
+//!            kill+reap, and the daemon-side AUTHORITY over what a worker
+//!            returns — no DB, no journal, independently testable
 //! ```
 //!
 //! # A dataset is read in place, and that inverts one thing (X4)
@@ -151,3 +154,4 @@ pub mod scan;
 pub mod syntax;
 pub mod tabular;
 pub mod text;
+pub mod worker;

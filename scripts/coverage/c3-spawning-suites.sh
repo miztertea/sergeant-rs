@@ -106,3 +106,21 @@ cov_stage_begin c3-x2_knowledge_sources
 cov_run cargo llvm-cov --no-report --test x2_knowledge_sources --locked || cov_fail "x2_knowledge_sources failed under instrumentation"
 cov_stage_end 2 "x2_knowledge_sources spawns real sgt clients and starts real daemons; more than \
 the test binary's own profile must arrive, or no subprocess flushed"
+
+# S4 Y1, wired at birth (the #231 lesson, same as m12/x2 above): every test
+# in this suite spawns a real `sgt-atlas-worker` subprocess — a second real
+# `[[bin]]` target this package builds, not a shell-script stand-in — so it
+# belongs beside the other real-process suites, not in C2's no-subprocess
+# bucket. Floor 2, not higher: the fault-injection cases (abort/hang/
+# allocate) are killed by SIGABRT or SIGKILL by design and legitimately flush
+# no profile of their own (the same fact v1d_probe_child_lifecycle's own
+# comment above states for a SIGKILLed daemon), but the happy-path and
+# batch-refusal cases spawn a worker that exits 0 normally and must flush —
+# more than the test binary's own profile must arrive, or no subprocess
+# flushed.
+cov_stage_begin c3-y1_worker_transport
+cov_run cargo llvm-cov --no-report --test y1_worker_transport --locked || cov_fail "y1_worker_transport failed under instrumentation"
+cov_stage_end 2 "y1_worker_transport spawns real sgt-atlas-worker subprocesses in its happy-path \
+and batch-refusal cases; more than the test binary's own profile must arrive, or no subprocess \
+flushed (the abort/hang/allocate fault cases are expected to flush nothing, by the same logic \
+v1d's SIGKILLed daemons do not)"

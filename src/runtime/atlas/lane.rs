@@ -33,8 +33,10 @@
 //! F6 asks for: however much extraction the daemon is asked to do, it never
 //! spends the execution lane's budget doing it.
 
+use crate::runtime::atlas::deny::AcquisitionFilter;
 use crate::runtime::atlas::git::{EstateGitScan, EstateGitSource, GitScanError, scan_estate_git};
 use crate::runtime::atlas::overlay::{OverlayScan, WorkOverlay, scan_work_overlay};
+use crate::runtime::atlas::worker::{WorkerIdentity, WorkerOutcome, WorkerSpawn, run_worker};
 use crate::runtime::engine::{Engine, IntelligenceError};
 
 /// Why an extraction on the lane did not produce an answer.
@@ -68,4 +70,23 @@ pub async fn scan_work_overlay_on_lane(
     Ok(engine
         .run_intelligence(move || scan_work_overlay(&overlay))
         .await??)
+}
+
+/// Run one supervised parse worker under an intelligence-lane permit, on the
+/// blocking pool (F6, S4 Y1's G2) — never the execution lane, exactly as
+/// [`scan_estate_git_on_lane`] and [`scan_work_overlay_on_lane`] already
+/// hold for the two extraction kinds that came before it. The permit is
+/// acquired before the worker is even spawned and is held for the whole of
+/// [`super::worker::run_worker`] — supervision included, so a worker that
+/// has to be killed past its deadline still frees the permit only when that
+/// kill and reap are done, never early.
+pub async fn run_worker_on_lane(
+    engine: &Engine,
+    spawn: WorkerSpawn,
+    identity: WorkerIdentity,
+    deny: AcquisitionFilter,
+) -> Result<WorkerOutcome, IntelligenceError> {
+    engine
+        .run_intelligence(move || run_worker(spawn, &identity, &deny))
+        .await
 }
