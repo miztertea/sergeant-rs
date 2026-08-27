@@ -514,6 +514,14 @@ fn spawn_and_collect(spawn: &WorkerSpawn) -> Result<Vec<u8>, WorkerFault> {
             ))),
         };
     };
+    // The child itself already exited (signalled, non-zero, or clean) — but
+    // #310's contract is "kill the group, then reap" on every exit path, not
+    // only the deadline one: a child that forked its own subprocess before
+    // dying leaves that grandchild in the same pgid, unreachable once
+    // `registration` is dropped below. Signalling an already-empty group is
+    // a documented no-op (`kill_process_group`'s own doc), so this costs
+    // nothing on the common case where the worker never forked anything.
+    child::kill_process_group(Some(pgid));
     drop(registration);
 
     if let Some(fault) = fault_for_exit(status, &mut process) {
