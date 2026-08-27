@@ -252,10 +252,11 @@ Rules:
    author who wants real nested execution within the same Work names a
    stage directory that carries its own `workflow.toml` (engine-level
    recursion); an author whose need is separately durable submits child
-   Work instead (`sgt -C "$SERGEANT_ESTATE_ROOT" run`, its own identity,
-   journal-validated against the parent). Neither is a `@@name`
-   reference, and reaching for one to imply either is still the same
-   violation of scope this rule has always named.
+   Work instead, under the conditions AGENTS.md's ESTATE section states
+   (host-atlas r3 ratification, ruling 2 — the same ruling ratified both
+   primitives). Neither is a `@@name` reference, and reaching for one to
+   imply either is still the same violation of scope this rule has
+   always named.
 2. Sergeant pins the textual `@@name` token in the referring `CONTEXT.md`,
    but at this milestone does **not** pin the transitive contents of
    `common/contexts/<name>.md` at replay time beyond what Git and the work

@@ -367,6 +367,41 @@ fn icm_policy_rule_one_points_to_the_real_nesting_primitives() {
     );
 }
 
+/// Aria-seat review (S2, adjudicated by the captain, J3): icm-policy.md §4
+/// rule 1's child-Work pointer must not restand the preconditions
+/// AGENTS.md's ESTATE section already states — that reads as a second,
+/// standalone-looking sanction rather than a pointer to the one place the
+/// conditions actually live. It must instead point there by reference,
+/// and both primitives (workflow.toml recursion and child Work) must
+/// carry the ratification citation, since the same ruling ratified both.
+#[test]
+fn icm_policy_rule_one_points_to_agents_md_rather_than_restating_preconditions() {
+    let icm_policy =
+        std::fs::read_to_string(repo_root().join(".sergeant/common/contexts/icm-policy.md"))
+            .expect("read icm-policy.md");
+    let icm_policy_flat = icm_policy.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        icm_policy_flat.contains("under the conditions AGENTS.md's ESTATE section states"),
+        "icm-policy.md §4 rule 1's child-Work pointer must reference AGENTS.md's ESTATE \
+         section's conditions rather than restating them"
+    );
+    assert!(
+        icm_policy_flat.contains("host-atlas r3 ratification, ruling 2")
+            && icm_policy_flat.contains("the same ruling ratified both primitives"),
+        "icm-policy.md §4 rule 1 must cite the ratification and say it ratified both \
+         primitives (workflow.toml recursion and child Work)"
+    );
+
+    // Regression guard: the standalone-looking restatement of child-Work's
+    // own preconditions is gone, not merely supplemented.
+    assert!(
+        !icm_policy_flat.contains("its own identity, journal-validated against the parent"),
+        "icm-policy.md §4 rule 1 must not still restate child Work's preconditions inline \
+         now that it points to AGENTS.md's ESTATE section for them"
+    );
+}
+
 // -------------------------------------------------- 2. embedded distro skew
 
 /// No `CONTEXT.md` under the embedded `.sergeant/workflows/` distro source
