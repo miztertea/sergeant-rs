@@ -370,6 +370,7 @@ const WALK: &[Item] = &[
             at(
                 "tests/x2_knowledge_sources.rs",
                 "a_crash_between_the_rows_and_the_summary_reports_neither",
+                "a_crash_after_the_summary_but_before_confirmation_completes_the_scan",
             ),
         ],
         note: "RESIDUAL, named rather than glossed: `sgt doctor`'s atlas coverage row opens the \
