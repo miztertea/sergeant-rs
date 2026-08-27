@@ -314,6 +314,59 @@ fn fix_confirmed_context_states_the_commit_imperative() {
     );
 }
 
+/// W1's engine-level nesting (host-atlas r3 ratification ruling 2, J3)
+/// makes icm-policy.md §4 rule 1's "true nested workflows do not exist
+/// yet" clause stale: the rule's actual point — a `@@name` reference is
+/// context composition, never workflow composition, and must not be read
+/// as "run this as a sub-workflow" — still holds and must not be
+/// softened, but the dead-end "engine-gap claim" pointer is replaced with
+/// the two real primitives W1 ships (a stage directory carrying its own
+/// `workflow.toml` for engine-level recursion; child Work for a
+/// separately-durable need). This is a net-new pin — no test covered this
+/// text before S2 (confirmed by grep for "icm-policy" and "nested
+/// workflows do not exist" over `tests/`, both empty).
+///
+/// Written first against the pre-amendment text (the stale "do not exist
+/// yet; ... engine-gap claim" clause) to confirm it fails on that exact
+/// wording, then against the amended text to confirm it passes.
+#[test]
+fn icm_policy_rule_one_points_to_the_real_nesting_primitives() {
+    let icm_policy =
+        std::fs::read_to_string(repo_root().join(".sergeant/common/contexts/icm-policy.md"))
+            .expect("read icm-policy.md");
+    let icm_policy_flat = icm_policy.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The core prohibition — unsoftened — still stands.
+    assert!(
+        icm_policy_flat.contains(
+            "A `@@name` reference used to imply \"and then run that other procedure as a \
+             sub-workflow\" is a violation of scope"
+        ),
+        "icm-policy.md §4 rule 1 must still forbid reading `@@name` as workflow composition — \
+         W1 replaces only the stale 'do not exist yet' clause, not this prohibition"
+    );
+
+    // The amended clause names both real primitives.
+    assert!(
+        icm_policy_flat.contains("its own `workflow.toml`"),
+        "icm-policy.md §4 rule 1 must point an author who wants real nested execution at a \
+         stage directory carrying its own `workflow.toml`"
+    );
+    assert!(
+        icm_policy_flat.contains("child Work"),
+        "icm-policy.md §4 rule 1 must name child Work as the separately-durable alternative to \
+         a `@@name` reference"
+    );
+
+    // Regression guard: the stale claim is gone, not merely amended-around.
+    assert!(
+        !icm_policy_flat.contains("do not exist yet")
+            && !icm_policy_flat.contains("engine-gap claim"),
+        "icm-policy.md §4 rule 1 must not still carry the stale 'true nested workflows do not \
+         exist yet' / 'engine-gap claim' text now that W1 ships the real primitives"
+    );
+}
+
 // -------------------------------------------------- 2. embedded distro skew
 
 /// No `CONTEXT.md` under the embedded `.sergeant/workflows/` distro source
