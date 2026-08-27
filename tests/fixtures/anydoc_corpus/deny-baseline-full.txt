@@ -1,0 +1,1209 @@
+warning[duplicate]: found 2 duplicate entries for crate 'base64'
+   ┌─ /var/tmp/hats4/y2/Cargo.lock:33:1
+   │  
+33 │ ╭ base64 0.22.1 registry+https://github.com/rust-lang/crates.io-index
+34 │ │ base64 0.23.1 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰───────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ base64 v0.22.1
+     ├── arrow-cast v58.4.0
+     │   └── arrow v58.4.0
+     │       └── duckdb v1.10505.0
+     │           └── (dev) sergeant-rs v0.3.0
+     ├── hyper-util v0.1.20
+     │   ├── axum v0.8.9
+     │   │   └── sergeant-rs v0.3.0 (*)
+     │   ├── hyper-rustls v0.27.9
+     │   │   └── reqwest v0.13.4
+     │   │       ├── opentelemetry-http v0.32.0
+     │   │       │   └── opentelemetry-otlp v0.32.0
+     │   │       │       └── sergeant-rs v0.3.0 (*)
+     │   │       ├── opentelemetry-otlp v0.32.0 (*)
+     │   │       └── sergeant-rs v0.3.0 (*)
+     │   └── reqwest v0.13.4 (*)
+     └── reqwest v0.13.4 (*)
+   ├ base64 v0.23.1
+     ├── ureq v3.4.0
+     │   └── (build) libduckdb-sys v1.10505.0
+     │       └── duckdb v1.10505.0
+     │           └── (dev) sergeant-rs v0.3.0
+     └── ureq-proto v0.6.1
+         └── ureq v3.4.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'crossterm'
+   ┌─ /var/tmp/hats4/y2/Cargo.lock:64:1
+   │  
+64 │ ╭ crossterm 0.28.1 registry+https://github.com/rust-lang/crates.io-index
+65 │ │ crossterm 0.29.0 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ crossterm v0.28.1
+     └── comfy-table v7.1.4
+         ├── arrow-cast v58.4.0
+         │   └── arrow v58.4.0
+         │       └── duckdb v1.10505.0
+         │           └── (dev) sergeant-rs v0.3.0
+         └── duckdb v1.10505.0 (*)
+   ├ crossterm v0.29.0
+     └── ratatui-crossterm v0.1.2
+         ├── ratatui v0.30.2
+         │   └── sergeant-rs v0.3.0
+         └── ratatui-textarea v0.9.2
+             └── sergeant-rs v0.3.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'foldhash'
+   ┌─ /var/tmp/hats4/y2/Cargo.lock:88:1
+   │  
+88 │ ╭ foldhash 0.1.5 registry+https://github.com/rust-lang/crates.io-index
+89 │ │ foldhash 0.2.0 registry+https://github.com/rust-lang/crates.io-index
+   │ ╰────────────────────────────────────────────────────────────────────┘ lock entries
+   │  
+   ├ foldhash v0.1.5
+     └── hashbrown v0.15.5
+         └── hashlink v0.10.0
+             └── duckdb v1.10505.0
+                 └── (dev) sergeant-rs v0.3.0
+   ├ foldhash v0.2.0
+     ├── hashbrown v0.16.1
+     │   └── kasuari v0.4.12
+     │       └── ratatui-core v0.1.2
+     │           ├── ratatui v0.30.2
+     │           │   └── sergeant-rs v0.3.0
+     │           ├── ratatui-crossterm v0.1.2
+     │           │   ├── ratatui v0.30.2 (*)
+     │           │   └── ratatui-textarea v0.9.2
+     │           │       └── sergeant-rs v0.3.0 (*)
+     │           ├── ratatui-macros v0.7.2
+     │           │   └── ratatui v0.30.2 (*)
+     │           ├── ratatui-textarea v0.9.2 (*)
+     │           └── ratatui-widgets v0.3.2
+     │               ├── ratatui v0.30.2 (*)
+     │               ├── ratatui-macros v0.7.2 (*)
+     │               └── ratatui-textarea v0.9.2 (*)
+     └── hashbrown v0.17.1
+         ├── arrow-array v58.4.0
+         │   ├── arrow v58.4.0
+         │   │   └── duckdb v1.10505.0
+         │   │       └── (dev) sergeant-rs v0.3.0 (*)
+         │   ├── arrow-arith v58.4.0
+         │   │   └── arrow v58.4.0 (*)
+         │   ├── arrow-cast v58.4.0
+         │   │   └── arrow v58.4.0 (*)
+         │   ├── arrow-ord v58.4.0
+         │   │   ├── arrow v58.4.0 (*)
+         │   │   └── arrow-cast v58.4.0 (*)
+         │   ├── arrow-row v58.4.0
+         │   │   └── arrow v58.4.0 (*)
+         │   ├── arrow-select v58.4.0
+         │   │   ├── arrow v58.4.0 (*)
+         │   │   ├── arrow-cast v58.4.0 (*)
+         │   │   ├── arrow-ord v58.4.0 (*)
+         │   │   └── arrow-string v58.4.0
+         │   │       └── arrow v58.4.0 (*)
+         │   └── arrow-string v58.4.0 (*)
+         ├── indexmap v2.14.0
+         │   ├── serde_json v1.0.151
+         │   │   ├── axum v0.8.9
+         │   │   │   └── sergeant-rs v0.3.0 (*)
+         │   │   ├── (build) libduckdb-sys v1.10505.0
+         │   │   │   └── duckdb v1.10505.0 (*)
+         │   │   ├── reqwest v0.13.4
+         │   │   │   ├── opentelemetry-http v0.32.0
+         │   │   │   │   └── opentelemetry-otlp v0.32.0
+         │   │   │   │       └── sergeant-rs v0.3.0 (*)
+         │   │   │   ├── opentelemetry-otlp v0.32.0 (*)
+         │   │   │   └── sergeant-rs v0.3.0 (*)
+         │   │   ├── sergeant-rs v0.3.0 (*)
+         │   │   └── (build) tree-sitter v0.26.13
+         │   │       └── sergeant-rs v0.3.0 (*)
+         │   ├── toml_edit v0.25.13+spec-1.1.0
+         │   │   └── sergeant-rs v0.3.0 (*)
+         │   └── zip v6.0.0
+         │       └── (build) libduckdb-sys v1.10505.0 (*)
+         ├── lru v0.18.2
+         │   └── ratatui-core v0.1.2 (*)
+         ├── ratatui-core v0.1.2 (*)
+         └── ratatui-widgets v0.3.2 (*)
+
+warning[duplicate]: found 3 duplicate entries for crate 'getrandom'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:100:1
+    │  
+100 │ ╭ getrandom 0.2.17 registry+https://github.com/rust-lang/crates.io-index
+101 │ │ getrandom 0.3.4 registry+https://github.com/rust-lang/crates.io-index
+102 │ │ getrandom 0.4.3 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰─────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ getrandom v0.2.17
+      ├── const-random-macro v0.1.16
+      │   └── const-random v0.1.18
+      │       └── ahash v0.8.12
+      │           ├── arrow-array v58.4.0
+      │           │   ├── arrow v58.4.0
+      │           │   │   └── duckdb v1.10505.0
+      │           │   │       └── (dev) sergeant-rs v0.3.0
+      │           │   ├── arrow-arith v58.4.0
+      │           │   │   └── arrow v58.4.0 (*)
+      │           │   ├── arrow-cast v58.4.0
+      │           │   │   └── arrow v58.4.0 (*)
+      │           │   ├── arrow-ord v58.4.0
+      │           │   │   ├── arrow v58.4.0 (*)
+      │           │   │   └── arrow-cast v58.4.0 (*)
+      │           │   ├── arrow-row v58.4.0
+      │           │   │   └── arrow v58.4.0 (*)
+      │           │   ├── arrow-select v58.4.0
+      │           │   │   ├── arrow v58.4.0 (*)
+      │           │   │   ├── arrow-cast v58.4.0 (*)
+      │           │   │   ├── arrow-ord v58.4.0 (*)
+      │           │   │   └── arrow-string v58.4.0
+      │           │   │       └── arrow v58.4.0 (*)
+      │           │   └── arrow-string v58.4.0 (*)
+      │           └── arrow-select v58.4.0 (*)
+      └── ring v0.17.14
+          ├── rustls v0.23.43
+          │   ├── hyper-rustls v0.27.9
+          │   │   └── reqwest v0.13.4
+          │   │       ├── opentelemetry-http v0.32.0
+          │   │       │   └── opentelemetry-otlp v0.32.0
+          │   │       │       └── sergeant-rs v0.3.0 (*)
+          │   │       ├── opentelemetry-otlp v0.32.0 (*)
+          │   │       └── sergeant-rs v0.3.0 (*)
+          │   ├── reqwest v0.13.4 (*)
+          │   ├── rustls-platform-verifier v0.7.0
+          │   │   └── reqwest v0.13.4 (*)
+          │   ├── tokio-rustls v0.26.4
+          │   │   ├── hyper-rustls v0.27.9 (*)
+          │   │   └── reqwest v0.13.4 (*)
+          │   └── ureq v3.4.0
+          │       └── (build) libduckdb-sys v1.10505.0
+          │           └── duckdb v1.10505.0 (*)
+          └── rustls-webpki v0.103.13
+              ├── rustls v0.23.43 (*)
+              └── rustls-platform-verifier v0.7.0 (*)
+    ├ getrandom v0.3.4
+      ├── ahash v0.8.12
+      │   ├── arrow-array v58.4.0
+      │   │   ├── arrow v58.4.0
+      │   │   │   └── duckdb v1.10505.0
+      │   │   │       └── (dev) sergeant-rs v0.3.0
+      │   │   ├── arrow-arith v58.4.0
+      │   │   │   └── arrow v58.4.0 (*)
+      │   │   ├── arrow-cast v58.4.0
+      │   │   │   └── arrow v58.4.0 (*)
+      │   │   ├── arrow-ord v58.4.0
+      │   │   │   ├── arrow v58.4.0 (*)
+      │   │   │   └── arrow-cast v58.4.0 (*)
+      │   │   ├── arrow-row v58.4.0
+      │   │   │   └── arrow v58.4.0 (*)
+      │   │   ├── arrow-select v58.4.0
+      │   │   │   ├── arrow v58.4.0 (*)
+      │   │   │   ├── arrow-cast v58.4.0 (*)
+      │   │   │   ├── arrow-ord v58.4.0 (*)
+      │   │   │   └── arrow-string v58.4.0
+      │   │   │       └── arrow v58.4.0 (*)
+      │   │   └── arrow-string v58.4.0 (*)
+      │   └── arrow-select v58.4.0 (*)
+      └── rand_core v0.9.5
+          ├── rand v0.9.5
+          │   └── opentelemetry_sdk v0.32.1
+          │       ├── opentelemetry-otlp v0.32.0
+          │       │   └── sergeant-rs v0.3.0 (*)
+          │       ├── opentelemetry-proto v0.32.0
+          │       │   └── opentelemetry-otlp v0.32.0 (*)
+          │       └── (dev) sergeant-rs v0.3.0 (*)
+          └── rand_chacha v0.9.0
+              └── rand v0.9.5 (*)
+    ├ getrandom v0.4.3
+      ├── jobserver v0.1.35
+      │   └── cc v1.4.2
+      │       ├── (build) aws-lc-sys v0.44.0
+      │       │   └── aws-lc-rs v1.18.0
+      │       │       ├── rustls v0.23.43
+      │       │       │   ├── hyper-rustls v0.27.9
+      │       │       │   │   └── reqwest v0.13.4
+      │       │       │   │       ├── opentelemetry-http v0.32.0
+      │       │       │   │       │   └── opentelemetry-otlp v0.32.0
+      │       │       │   │       │       └── sergeant-rs v0.3.0
+      │       │       │   │       ├── opentelemetry-otlp v0.32.0 (*)
+      │       │       │   │       └── sergeant-rs v0.3.0 (*)
+      │       │       │   ├── reqwest v0.13.4 (*)
+      │       │       │   ├── rustls-platform-verifier v0.7.0
+      │       │       │   │   └── reqwest v0.13.4 (*)
+      │       │       │   ├── tokio-rustls v0.26.4
+      │       │       │   │   ├── hyper-rustls v0.27.9 (*)
+      │       │       │   │   └── reqwest v0.13.4 (*)
+      │       │       │   └── ureq v3.4.0
+      │       │       │       └── (build) libduckdb-sys v1.10505.0
+      │       │       │           └── duckdb v1.10505.0
+      │       │       │               └── (dev) sergeant-rs v0.3.0 (*)
+      │       │       └── rustls-webpki v0.103.13
+      │       │           ├── rustls v0.23.43 (*)
+      │       │           └── rustls-platform-verifier v0.7.0 (*)
+      │       ├── (build) blake3 v1.8.7
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── cmake v0.1.58
+      │       │   └── (build) aws-lc-sys v0.44.0 (*)
+      │       ├── (build) iana-time-zone-haiku v0.1.2
+      │       │   └── iana-time-zone v0.1.65
+      │       │       └── chrono v0.4.45
+      │       │           ├── arrow-arith v58.4.0
+      │       │           │   └── arrow v58.4.0
+      │       │           │       └── duckdb v1.10505.0 (*)
+      │       │           ├── arrow-array v58.4.0
+      │       │           │   ├── arrow v58.4.0 (*)
+      │       │           │   ├── arrow-arith v58.4.0 (*)
+      │       │           │   ├── arrow-cast v58.4.0
+      │       │           │   │   └── arrow v58.4.0 (*)
+      │       │           │   ├── arrow-ord v58.4.0
+      │       │           │   │   ├── arrow v58.4.0 (*)
+      │       │           │   │   └── arrow-cast v58.4.0 (*)
+      │       │           │   ├── arrow-row v58.4.0
+      │       │           │   │   └── arrow v58.4.0 (*)
+      │       │           │   ├── arrow-select v58.4.0
+      │       │           │   │   ├── arrow v58.4.0 (*)
+      │       │           │   │   ├── arrow-cast v58.4.0 (*)
+      │       │           │   │   ├── arrow-ord v58.4.0 (*)
+      │       │           │   │   └── arrow-string v58.4.0
+      │       │           │   │       └── arrow v58.4.0 (*)
+      │       │           │   └── arrow-string v58.4.0 (*)
+      │       │           └── arrow-cast v58.4.0 (*)
+      │       ├── (build) libduckdb-sys v1.10505.0 (*)
+      │       ├── (build) ring v0.17.14
+      │       │   ├── rustls v0.23.43 (*)
+      │       │   └── rustls-webpki v0.103.13 (*)
+      │       ├── (build) tree-sitter v0.26.13
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── (build) tree-sitter-bash v0.25.1
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── (build) tree-sitter-javascript v0.25.0
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── (build) tree-sitter-md v0.5.3
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── (build) tree-sitter-python v0.25.0
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── (build) tree-sitter-rust v0.24.2
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── (build) tree-sitter-toml-ng v0.7.0
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       └── (build) tree-sitter-typescript v0.23.2
+      │           └── sergeant-rs v0.3.0 (*)
+      ├── rand v0.10.2
+      │   └── ulid v3.0.0
+      │       └── sergeant-rs v0.3.0 (*)
+      └── tempfile v3.27.0
+          └── (dev) sergeant-rs v0.3.0 (*)
+
+warning[duplicate]: found 3 duplicate entries for crate 'hashbrown'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:105:1
+    │  
+105 │ ╭ hashbrown 0.15.5 registry+https://github.com/rust-lang/crates.io-index
+106 │ │ hashbrown 0.16.1 registry+https://github.com/rust-lang/crates.io-index
+107 │ │ hashbrown 0.17.1 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ hashbrown v0.15.5
+      └── hashlink v0.10.0
+          └── duckdb v1.10505.0
+              └── (dev) sergeant-rs v0.3.0
+    ├ hashbrown v0.16.1
+      └── kasuari v0.4.12
+          └── ratatui-core v0.1.2
+              ├── ratatui v0.30.2
+              │   └── sergeant-rs v0.3.0
+              ├── ratatui-crossterm v0.1.2
+              │   ├── ratatui v0.30.2 (*)
+              │   └── ratatui-textarea v0.9.2
+              │       └── sergeant-rs v0.3.0 (*)
+              ├── ratatui-macros v0.7.2
+              │   └── ratatui v0.30.2 (*)
+              ├── ratatui-textarea v0.9.2 (*)
+              └── ratatui-widgets v0.3.2
+                  ├── ratatui v0.30.2 (*)
+                  ├── ratatui-macros v0.7.2 (*)
+                  └── ratatui-textarea v0.9.2 (*)
+    ├ hashbrown v0.17.1
+      ├── arrow-array v58.4.0
+      │   ├── arrow v58.4.0
+      │   │   └── duckdb v1.10505.0
+      │   │       └── (dev) sergeant-rs v0.3.0
+      │   ├── arrow-arith v58.4.0
+      │   │   └── arrow v58.4.0 (*)
+      │   ├── arrow-cast v58.4.0
+      │   │   └── arrow v58.4.0 (*)
+      │   ├── arrow-ord v58.4.0
+      │   │   ├── arrow v58.4.0 (*)
+      │   │   └── arrow-cast v58.4.0 (*)
+      │   ├── arrow-row v58.4.0
+      │   │   └── arrow v58.4.0 (*)
+      │   ├── arrow-select v58.4.0
+      │   │   ├── arrow v58.4.0 (*)
+      │   │   ├── arrow-cast v58.4.0 (*)
+      │   │   ├── arrow-ord v58.4.0 (*)
+      │   │   └── arrow-string v58.4.0
+      │   │       └── arrow v58.4.0 (*)
+      │   └── arrow-string v58.4.0 (*)
+      ├── indexmap v2.14.0
+      │   ├── serde_json v1.0.151
+      │   │   ├── axum v0.8.9
+      │   │   │   └── sergeant-rs v0.3.0 (*)
+      │   │   ├── (build) libduckdb-sys v1.10505.0
+      │   │   │   └── duckdb v1.10505.0 (*)
+      │   │   ├── reqwest v0.13.4
+      │   │   │   ├── opentelemetry-http v0.32.0
+      │   │   │   │   └── opentelemetry-otlp v0.32.0
+      │   │   │   │       └── sergeant-rs v0.3.0 (*)
+      │   │   │   ├── opentelemetry-otlp v0.32.0 (*)
+      │   │   │   └── sergeant-rs v0.3.0 (*)
+      │   │   ├── sergeant-rs v0.3.0 (*)
+      │   │   └── (build) tree-sitter v0.26.13
+      │   │       └── sergeant-rs v0.3.0 (*)
+      │   ├── toml_edit v0.25.13+spec-1.1.0
+      │   │   └── sergeant-rs v0.3.0 (*)
+      │   └── zip v6.0.0
+      │       └── (build) libduckdb-sys v1.10505.0 (*)
+      ├── lru v0.18.2
+      │   └── ratatui-core v0.1.2
+      │       ├── ratatui v0.30.2
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── ratatui-crossterm v0.1.2
+      │       │   ├── ratatui v0.30.2 (*)
+      │       │   └── ratatui-textarea v0.9.2
+      │       │       └── sergeant-rs v0.3.0 (*)
+      │       ├── ratatui-macros v0.7.2
+      │       │   └── ratatui v0.30.2 (*)
+      │       ├── ratatui-textarea v0.9.2 (*)
+      │       └── ratatui-widgets v0.3.2
+      │           ├── ratatui v0.30.2 (*)
+      │           ├── ratatui-macros v0.7.2 (*)
+      │           └── ratatui-textarea v0.9.2 (*)
+      ├── ratatui-core v0.1.2 (*)
+      └── ratatui-widgets v0.3.2 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'linux-raw-sys'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:157:1
+    │  
+157 │ ╭ linux-raw-sys 0.4.15 registry+https://github.com/rust-lang/crates.io-index
+158 │ │ linux-raw-sys 0.12.1 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰──────────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ linux-raw-sys v0.4.15
+      └── rustix v0.38.44
+          └── crossterm v0.28.1
+              └── comfy-table v7.1.4
+                  ├── arrow-cast v58.4.0
+                  │   └── arrow v58.4.0
+                  │       └── duckdb v1.10505.0
+                  │           └── (dev) sergeant-rs v0.3.0
+                  └── duckdb v1.10505.0 (*)
+    ├ linux-raw-sys v0.12.1
+      └── rustix v1.1.4
+          ├── crossterm v0.29.0
+          │   └── ratatui-crossterm v0.1.2
+          │       ├── ratatui v0.30.2
+          │       │   └── sergeant-rs v0.3.0
+          │       └── ratatui-textarea v0.9.2
+          │           └── sergeant-rs v0.3.0 (*)
+          ├── tempfile v3.27.0
+          │   └── (dev) sergeant-rs v0.3.0 (*)
+          └── xattr v1.6.1
+              └── tar v0.4.46
+                  └── (build) libduckdb-sys v1.10505.0
+                      └── duckdb v1.10505.0
+                          └── (dev) sergeant-rs v0.3.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'r-efi'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:197:1
+    │  
+197 │ ╭ r-efi 5.3.0 registry+https://github.com/rust-lang/crates.io-index
+198 │ │ r-efi 6.0.0 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰─────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ r-efi v5.3.0
+      └── getrandom v0.3.4
+          ├── ahash v0.8.12
+          │   ├── arrow-array v58.4.0
+          │   │   ├── arrow v58.4.0
+          │   │   │   └── duckdb v1.10505.0
+          │   │   │       └── (dev) sergeant-rs v0.3.0
+          │   │   ├── arrow-arith v58.4.0
+          │   │   │   └── arrow v58.4.0 (*)
+          │   │   ├── arrow-cast v58.4.0
+          │   │   │   └── arrow v58.4.0 (*)
+          │   │   ├── arrow-ord v58.4.0
+          │   │   │   ├── arrow v58.4.0 (*)
+          │   │   │   └── arrow-cast v58.4.0 (*)
+          │   │   ├── arrow-row v58.4.0
+          │   │   │   └── arrow v58.4.0 (*)
+          │   │   ├── arrow-select v58.4.0
+          │   │   │   ├── arrow v58.4.0 (*)
+          │   │   │   ├── arrow-cast v58.4.0 (*)
+          │   │   │   ├── arrow-ord v58.4.0 (*)
+          │   │   │   └── arrow-string v58.4.0
+          │   │   │       └── arrow v58.4.0 (*)
+          │   │   └── arrow-string v58.4.0 (*)
+          │   └── arrow-select v58.4.0 (*)
+          └── rand_core v0.9.5
+              ├── rand v0.9.5
+              │   └── opentelemetry_sdk v0.32.1
+              │       ├── opentelemetry-otlp v0.32.0
+              │       │   └── sergeant-rs v0.3.0 (*)
+              │       ├── opentelemetry-proto v0.32.0
+              │       │   └── opentelemetry-otlp v0.32.0 (*)
+              │       └── (dev) sergeant-rs v0.3.0 (*)
+              └── rand_chacha v0.9.0
+                  └── rand v0.9.5 (*)
+    ├ r-efi v6.0.0
+      └── getrandom v0.4.3
+          ├── jobserver v0.1.35
+          │   └── cc v1.4.2
+          │       ├── (build) aws-lc-sys v0.44.0
+          │       │   └── aws-lc-rs v1.18.0
+          │       │       ├── rustls v0.23.43
+          │       │       │   ├── hyper-rustls v0.27.9
+          │       │       │   │   └── reqwest v0.13.4
+          │       │       │   │       ├── opentelemetry-http v0.32.0
+          │       │       │   │       │   └── opentelemetry-otlp v0.32.0
+          │       │       │   │       │       └── sergeant-rs v0.3.0
+          │       │       │   │       ├── opentelemetry-otlp v0.32.0 (*)
+          │       │       │   │       └── sergeant-rs v0.3.0 (*)
+          │       │       │   ├── reqwest v0.13.4 (*)
+          │       │       │   ├── rustls-platform-verifier v0.7.0
+          │       │       │   │   └── reqwest v0.13.4 (*)
+          │       │       │   ├── tokio-rustls v0.26.4
+          │       │       │   │   ├── hyper-rustls v0.27.9 (*)
+          │       │       │   │   └── reqwest v0.13.4 (*)
+          │       │       │   └── ureq v3.4.0
+          │       │       │       └── (build) libduckdb-sys v1.10505.0
+          │       │       │           └── duckdb v1.10505.0
+          │       │       │               └── (dev) sergeant-rs v0.3.0 (*)
+          │       │       └── rustls-webpki v0.103.13
+          │       │           ├── rustls v0.23.43 (*)
+          │       │           └── rustls-platform-verifier v0.7.0 (*)
+          │       ├── (build) blake3 v1.8.7
+          │       │   └── sergeant-rs v0.3.0 (*)
+          │       ├── cmake v0.1.58
+          │       │   └── (build) aws-lc-sys v0.44.0 (*)
+          │       ├── (build) iana-time-zone-haiku v0.1.2
+          │       │   └── iana-time-zone v0.1.65
+          │       │       └── chrono v0.4.45
+          │       │           ├── arrow-arith v58.4.0
+          │       │           │   └── arrow v58.4.0
+          │       │           │       └── duckdb v1.10505.0 (*)
+          │       │           ├── arrow-array v58.4.0
+          │       │           │   ├── arrow v58.4.0 (*)
+          │       │           │   ├── arrow-arith v58.4.0 (*)
+          │       │           │   ├── arrow-cast v58.4.0
+          │       │           │   │   └── arrow v58.4.0 (*)
+          │       │           │   ├── arrow-ord v58.4.0
+          │       │           │   │   ├── arrow v58.4.0 (*)
+          │       │           │   │   └── arrow-cast v58.4.0 (*)
+          │       │           │   ├── arrow-row v58.4.0
+          │       │           │   │   └── arrow v58.4.0 (*)
+          │       │           │   ├── arrow-select v58.4.0
+          │       │           │   │   ├── arrow v58.4.0 (*)
+          │       │           │   │   ├── arrow-cast v58.4.0 (*)
+          │       │           │   │   ├── arrow-ord v58.4.0 (*)
+          │       │           │   │   └── arrow-string v58.4.0
+          │       │           │   │       └── arrow v58.4.0 (*)
+          │       │           │   └── arrow-string v58.4.0 (*)
+          │       │           └── arrow-cast v58.4.0 (*)
+          │       ├── (build) libduckdb-sys v1.10505.0 (*)
+          │       ├── (build) ring v0.17.14
+          │       │   ├── rustls v0.23.43 (*)
+          │       │   └── rustls-webpki v0.103.13 (*)
+          │       ├── (build) tree-sitter v0.26.13
+          │       │   └── sergeant-rs v0.3.0 (*)
+          │       ├── (build) tree-sitter-bash v0.25.1
+          │       │   └── sergeant-rs v0.3.0 (*)
+          │       ├── (build) tree-sitter-javascript v0.25.0
+          │       │   └── sergeant-rs v0.3.0 (*)
+          │       ├── (build) tree-sitter-md v0.5.3
+          │       │   └── sergeant-rs v0.3.0 (*)
+          │       ├── (build) tree-sitter-python v0.25.0
+          │       │   └── sergeant-rs v0.3.0 (*)
+          │       ├── (build) tree-sitter-rust v0.24.2
+          │       │   └── sergeant-rs v0.3.0 (*)
+          │       ├── (build) tree-sitter-toml-ng v0.7.0
+          │       │   └── sergeant-rs v0.3.0 (*)
+          │       └── (build) tree-sitter-typescript v0.23.2
+          │           └── sergeant-rs v0.3.0 (*)
+          ├── rand v0.10.2
+          │   └── ulid v3.0.0
+          │       └── sergeant-rs v0.3.0 (*)
+          └── tempfile v3.27.0
+              └── (dev) sergeant-rs v0.3.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'rand'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:199:1
+    │  
+199 │ ╭ rand 0.9.5 registry+https://github.com/rust-lang/crates.io-index
+200 │ │ rand 0.10.2 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰─────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ rand v0.9.5
+      └── opentelemetry_sdk v0.32.1
+          ├── opentelemetry-otlp v0.32.0
+          │   └── sergeant-rs v0.3.0
+          ├── opentelemetry-proto v0.32.0
+          │   └── opentelemetry-otlp v0.32.0 (*)
+          └── (dev) sergeant-rs v0.3.0 (*)
+    ├ rand v0.10.2
+      └── ulid v3.0.0
+          └── sergeant-rs v0.3.0
+
+warning[duplicate]: found 2 duplicate entries for crate 'rand_core'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:202:1
+    │  
+202 │ ╭ rand_core 0.9.5 registry+https://github.com/rust-lang/crates.io-index
+203 │ │ rand_core 0.10.1 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰──────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ rand_core v0.9.5
+      ├── rand v0.9.5
+      │   └── opentelemetry_sdk v0.32.1
+      │       ├── opentelemetry-otlp v0.32.0
+      │       │   └── sergeant-rs v0.3.0
+      │       ├── opentelemetry-proto v0.32.0
+      │       │   └── opentelemetry-otlp v0.32.0 (*)
+      │       └── (dev) sergeant-rs v0.3.0 (*)
+      └── rand_chacha v0.9.0
+          └── rand v0.9.5 (*)
+    ├ rand_core v0.10.1
+      ├── chacha20 v0.10.1
+      │   └── rand v0.10.2
+      │       └── ulid v3.0.0
+      │           └── sergeant-rs v0.3.0
+      ├── getrandom v0.4.3
+      │   ├── jobserver v0.1.35
+      │   │   └── cc v1.4.2
+      │   │       ├── (build) aws-lc-sys v0.44.0
+      │   │       │   └── aws-lc-rs v1.18.0
+      │   │       │       ├── rustls v0.23.43
+      │   │       │       │   ├── hyper-rustls v0.27.9
+      │   │       │       │   │   └── reqwest v0.13.4
+      │   │       │       │   │       ├── opentelemetry-http v0.32.0
+      │   │       │       │   │       │   └── opentelemetry-otlp v0.32.0
+      │   │       │       │   │       │       └── sergeant-rs v0.3.0 (*)
+      │   │       │       │   │       ├── opentelemetry-otlp v0.32.0 (*)
+      │   │       │       │   │       └── sergeant-rs v0.3.0 (*)
+      │   │       │       │   ├── reqwest v0.13.4 (*)
+      │   │       │       │   ├── rustls-platform-verifier v0.7.0
+      │   │       │       │   │   └── reqwest v0.13.4 (*)
+      │   │       │       │   ├── tokio-rustls v0.26.4
+      │   │       │       │   │   ├── hyper-rustls v0.27.9 (*)
+      │   │       │       │   │   └── reqwest v0.13.4 (*)
+      │   │       │       │   └── ureq v3.4.0
+      │   │       │       │       └── (build) libduckdb-sys v1.10505.0
+      │   │       │       │           └── duckdb v1.10505.0
+      │   │       │       │               └── (dev) sergeant-rs v0.3.0 (*)
+      │   │       │       └── rustls-webpki v0.103.13
+      │   │       │           ├── rustls v0.23.43 (*)
+      │   │       │           └── rustls-platform-verifier v0.7.0 (*)
+      │   │       ├── (build) blake3 v1.8.7
+      │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │       ├── cmake v0.1.58
+      │   │       │   └── (build) aws-lc-sys v0.44.0 (*)
+      │   │       ├── (build) iana-time-zone-haiku v0.1.2
+      │   │       │   └── iana-time-zone v0.1.65
+      │   │       │       └── chrono v0.4.45
+      │   │       │           ├── arrow-arith v58.4.0
+      │   │       │           │   └── arrow v58.4.0
+      │   │       │           │       └── duckdb v1.10505.0 (*)
+      │   │       │           ├── arrow-array v58.4.0
+      │   │       │           │   ├── arrow v58.4.0 (*)
+      │   │       │           │   ├── arrow-arith v58.4.0 (*)
+      │   │       │           │   ├── arrow-cast v58.4.0
+      │   │       │           │   │   └── arrow v58.4.0 (*)
+      │   │       │           │   ├── arrow-ord v58.4.0
+      │   │       │           │   │   ├── arrow v58.4.0 (*)
+      │   │       │           │   │   └── arrow-cast v58.4.0 (*)
+      │   │       │           │   ├── arrow-row v58.4.0
+      │   │       │           │   │   └── arrow v58.4.0 (*)
+      │   │       │           │   ├── arrow-select v58.4.0
+      │   │       │           │   │   ├── arrow v58.4.0 (*)
+      │   │       │           │   │   ├── arrow-cast v58.4.0 (*)
+      │   │       │           │   │   ├── arrow-ord v58.4.0 (*)
+      │   │       │           │   │   └── arrow-string v58.4.0
+      │   │       │           │   │       └── arrow v58.4.0 (*)
+      │   │       │           │   └── arrow-string v58.4.0 (*)
+      │   │       │           └── arrow-cast v58.4.0 (*)
+      │   │       ├── (build) libduckdb-sys v1.10505.0 (*)
+      │   │       ├── (build) ring v0.17.14
+      │   │       │   ├── rustls v0.23.43 (*)
+      │   │       │   └── rustls-webpki v0.103.13 (*)
+      │   │       ├── (build) tree-sitter v0.26.13
+      │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │       ├── (build) tree-sitter-bash v0.25.1
+      │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │       ├── (build) tree-sitter-javascript v0.25.0
+      │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │       ├── (build) tree-sitter-md v0.5.3
+      │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │       ├── (build) tree-sitter-python v0.25.0
+      │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │       ├── (build) tree-sitter-rust v0.24.2
+      │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │       ├── (build) tree-sitter-toml-ng v0.7.0
+      │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │       └── (build) tree-sitter-typescript v0.23.2
+      │   │           └── sergeant-rs v0.3.0 (*)
+      │   ├── rand v0.10.2 (*)
+      │   └── tempfile v3.27.0
+      │       └── (dev) sergeant-rs v0.3.0 (*)
+      └── rand v0.10.2 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'rustix'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:217:1
+    │  
+217 │ ╭ rustix 0.38.44 registry+https://github.com/rust-lang/crates.io-index
+218 │ │ rustix 1.1.4 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰──────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ rustix v0.38.44
+      └── crossterm v0.28.1
+          └── comfy-table v7.1.4
+              ├── arrow-cast v58.4.0
+              │   └── arrow v58.4.0
+              │       └── duckdb v1.10505.0
+              │           └── (dev) sergeant-rs v0.3.0
+              └── duckdb v1.10505.0 (*)
+    ├ rustix v1.1.4
+      ├── crossterm v0.29.0
+      │   └── ratatui-crossterm v0.1.2
+      │       ├── ratatui v0.30.2
+      │       │   └── sergeant-rs v0.3.0
+      │       └── ratatui-textarea v0.9.2
+      │           └── sergeant-rs v0.3.0 (*)
+      ├── tempfile v3.27.0
+      │   └── (dev) sergeant-rs v0.3.0 (*)
+      └── xattr v1.6.1
+          └── tar v0.4.46
+              └── (build) libduckdb-sys v1.10505.0
+                  └── duckdb v1.10505.0
+                      └── (dev) sergeant-rs v0.3.0 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'strum'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:256:1
+    │  
+256 │ ╭ strum 0.27.2 registry+https://github.com/rust-lang/crates.io-index
+257 │ │ strum 0.28.0 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰──────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ strum v0.27.2
+      └── duckdb v1.10505.0
+          └── (dev) sergeant-rs v0.3.0
+    ├ strum v0.28.0
+      ├── ratatui-core v0.1.2
+      │   ├── ratatui v0.30.2
+      │   │   └── sergeant-rs v0.3.0
+      │   ├── ratatui-crossterm v0.1.2
+      │   │   ├── ratatui v0.30.2 (*)
+      │   │   └── ratatui-textarea v0.9.2
+      │   │       └── sergeant-rs v0.3.0 (*)
+      │   ├── ratatui-macros v0.7.2
+      │   │   └── ratatui v0.30.2 (*)
+      │   ├── ratatui-textarea v0.9.2 (*)
+      │   └── ratatui-widgets v0.3.2
+      │       ├── ratatui v0.30.2 (*)
+      │       ├── ratatui-macros v0.7.2 (*)
+      │       └── ratatui-textarea v0.9.2 (*)
+      └── ratatui-widgets v0.3.2 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'strum_macros'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:258:1
+    │  
+258 │ ╭ strum_macros 0.27.2 registry+https://github.com/rust-lang/crates.io-index
+259 │ │ strum_macros 0.28.0 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰─────────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ strum_macros v0.27.2
+      └── strum v0.27.2
+          └── duckdb v1.10505.0
+              └── (dev) sergeant-rs v0.3.0
+    ├ strum_macros v0.28.0
+      └── strum v0.28.0
+          ├── ratatui-core v0.1.2
+          │   ├── ratatui v0.30.2
+          │   │   └── sergeant-rs v0.3.0
+          │   ├── ratatui-crossterm v0.1.2
+          │   │   ├── ratatui v0.30.2 (*)
+          │   │   └── ratatui-textarea v0.9.2
+          │   │       └── sergeant-rs v0.3.0 (*)
+          │   ├── ratatui-macros v0.7.2
+          │   │   └── ratatui v0.30.2 (*)
+          │   ├── ratatui-textarea v0.9.2 (*)
+          │   └── ratatui-widgets v0.3.2
+          │       ├── ratatui v0.30.2 (*)
+          │       ├── ratatui-macros v0.7.2 (*)
+          │       └── ratatui-textarea v0.9.2 (*)
+          └── ratatui-widgets v0.3.2 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'syn'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:261:1
+    │  
+261 │ ╭ syn 2.0.119 registry+https://github.com/rust-lang/crates.io-index
+262 │ │ syn 3.0.3 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰───────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ syn v2.0.119
+      ├── derive_arbitrary v1.4.2
+      │   └── arbitrary v1.4.2
+      │       └── zip v6.0.0
+      │           └── (build) libduckdb-sys v1.10505.0
+      │               └── duckdb v1.10505.0
+      │                   └── (dev) sergeant-rs v0.3.0
+      ├── derive_more-impl v2.1.1
+      │   └── derive_more v2.1.1
+      │       └── crossterm v0.29.0
+      │           └── ratatui-crossterm v0.1.2
+      │               ├── ratatui v0.30.2
+      │               │   └── sergeant-rs v0.3.0 (*)
+      │               └── ratatui-textarea v0.9.2
+      │                   └── sergeant-rs v0.3.0 (*)
+      ├── futures-macro v0.3.33
+      │   └── futures-util v0.3.33
+      │       ├── axum v0.8.9
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── futures-executor v0.3.33
+      │       │   └── opentelemetry_sdk v0.32.1
+      │       │       ├── opentelemetry-otlp v0.32.0
+      │       │       │   └── sergeant-rs v0.3.0 (*)
+      │       │       ├── opentelemetry-proto v0.32.0
+      │       │       │   └── opentelemetry-otlp v0.32.0 (*)
+      │       │       └── (dev) sergeant-rs v0.3.0 (*)
+      │       ├── hyper-util v0.1.20
+      │       │   ├── axum v0.8.9 (*)
+      │       │   ├── hyper-rustls v0.27.9
+      │       │   │   └── reqwest v0.13.4
+      │       │   │       ├── opentelemetry-http v0.32.0
+      │       │   │       │   └── opentelemetry-otlp v0.32.0 (*)
+      │       │   │       ├── opentelemetry-otlp v0.32.0 (*)
+      │       │   │       └── sergeant-rs v0.3.0 (*)
+      │       │   └── reqwest v0.13.4 (*)
+      │       ├── js-sys v0.3.104
+      │       │   ├── iana-time-zone v0.1.65
+      │       │   │   └── chrono v0.4.45
+      │       │   │       ├── arrow-arith v58.4.0
+      │       │   │       │   └── arrow v58.4.0
+      │       │   │       │       └── duckdb v1.10505.0 (*)
+      │       │   │       ├── arrow-array v58.4.0
+      │       │   │       │   ├── arrow v58.4.0 (*)
+      │       │   │       │   ├── arrow-arith v58.4.0 (*)
+      │       │   │       │   ├── arrow-cast v58.4.0
+      │       │   │       │   │   └── arrow v58.4.0 (*)
+      │       │   │       │   ├── arrow-ord v58.4.0
+      │       │   │       │   │   ├── arrow v58.4.0 (*)
+      │       │   │       │   │   └── arrow-cast v58.4.0 (*)
+      │       │   │       │   ├── arrow-row v58.4.0
+      │       │   │       │   │   └── arrow v58.4.0 (*)
+      │       │   │       │   ├── arrow-select v58.4.0
+      │       │   │       │   │   ├── arrow v58.4.0 (*)
+      │       │   │       │   │   ├── arrow-cast v58.4.0 (*)
+      │       │   │       │   │   ├── arrow-ord v58.4.0 (*)
+      │       │   │       │   │   └── arrow-string v58.4.0
+      │       │   │       │   │       └── arrow v58.4.0 (*)
+      │       │   │       │   └── arrow-string v58.4.0 (*)
+      │       │   │       └── arrow-cast v58.4.0 (*)
+      │       │   ├── opentelemetry v0.32.0
+      │       │   │   ├── opentelemetry-http v0.32.0 (*)
+      │       │   │   ├── opentelemetry-otlp v0.32.0 (*)
+      │       │   │   ├── opentelemetry-proto v0.32.0 (*)
+      │       │   │   ├── opentelemetry_sdk v0.32.1 (*)
+      │       │   │   └── sergeant-rs v0.3.0 (*)
+      │       │   ├── reqwest v0.13.4 (*)
+      │       │   ├── wasm-bindgen-futures v0.4.77
+      │       │   │   └── reqwest v0.13.4 (*)
+      │       │   ├── web-sys v0.3.104
+      │       │   │   └── reqwest v0.13.4 (*)
+      │       │   └── web-time v1.1.0
+      │       │       └── ulid v3.0.0
+      │       │           └── sergeant-rs v0.3.0 (*)
+      │       ├── opentelemetry_sdk v0.32.1 (*)
+      │       ├── reqwest v0.13.4 (*)
+      │       ├── tower v0.5.3
+      │       │   ├── axum v0.8.9 (*)
+      │       │   ├── reqwest v0.13.4 (*)
+      │       │   └── tower-http v0.6.11
+      │       │       └── reqwest v0.13.4 (*)
+      │       └── tower-http v0.6.11 (*)
+      ├── jni-macros v0.22.4
+      │   └── jni v0.22.4
+      │       └── rustls-platform-verifier v0.7.0
+      │           └── reqwest v0.13.4 (*)
+      ├── jni-sys-macros v0.4.1
+      │   └── jni-sys v0.4.1
+      │       └── jni v0.22.4 (*)
+      ├── prost-derive v0.14.4
+      │   └── prost v0.14.4
+      │       ├── opentelemetry-otlp v0.32.0 (*)
+      │       └── opentelemetry-proto v0.32.0 (*)
+      ├── strum_macros v0.27.2
+      │   └── strum v0.27.2
+      │       └── duckdb v1.10505.0 (*)
+      ├── strum_macros v0.28.0
+      │   └── strum v0.28.0
+      │       ├── ratatui-core v0.1.2
+      │       │   ├── ratatui v0.30.2 (*)
+      │       │   ├── ratatui-crossterm v0.1.2 (*)
+      │       │   ├── ratatui-macros v0.7.2
+      │       │   │   └── ratatui v0.30.2 (*)
+      │       │   ├── ratatui-textarea v0.9.2 (*)
+      │       │   └── ratatui-widgets v0.3.2
+      │       │       ├── ratatui v0.30.2 (*)
+      │       │       ├── ratatui-macros v0.7.2 (*)
+      │       │       └── ratatui-textarea v0.9.2 (*)
+      │       └── ratatui-widgets v0.3.2 (*)
+      ├── synstructure v0.13.2
+      │   ├── yoke-derive v0.8.2
+      │   │   └── yoke v0.8.3
+      │   │       ├── icu_collections v2.2.0
+      │   │       │   ├── icu_normalizer v2.2.0
+      │   │       │   │   └── idna_adapter v1.2.2
+      │   │       │   │       └── idna v1.1.0
+      │   │       │   │           └── url v2.5.8
+      │   │       │   │               ├── reqwest v0.13.4 (*)
+      │   │       │   │               └── tower-http v0.6.11 (*)
+      │   │       │   └── icu_properties v2.2.0
+      │   │       │       └── idna_adapter v1.2.2 (*)
+      │   │       ├── icu_provider v2.2.0
+      │   │       │   ├── icu_normalizer v2.2.0 (*)
+      │   │       │   └── icu_properties v2.2.0 (*)
+      │   │       ├── zerotrie v0.2.4
+      │   │       │   ├── icu_properties v2.2.0 (*)
+      │   │       │   └── icu_provider v2.2.0 (*)
+      │   │       └── zerovec v0.11.6
+      │   │           ├── icu_collections v2.2.0 (*)
+      │   │           ├── icu_locale_core v2.2.0
+      │   │           │   ├── icu_properties v2.2.0 (*)
+      │   │           │   └── icu_provider v2.2.0 (*)
+      │   │           ├── icu_normalizer v2.2.0 (*)
+      │   │           ├── icu_properties v2.2.0 (*)
+      │   │           ├── icu_provider v2.2.0 (*)
+      │   │           ├── potential_utf v0.1.5
+      │   │           │   └── icu_collections v2.2.0 (*)
+      │   │           └── tinystr v0.8.3
+      │   │               └── icu_locale_core v2.2.0 (*)
+      │   └── zerofrom-derive v0.1.7
+      │       └── zerofrom v0.1.8
+      │           ├── icu_collections v2.2.0 (*)
+      │           ├── icu_provider v2.2.0 (*)
+      │           ├── yoke v0.8.3 (*)
+      │           ├── zerotrie v0.2.4 (*)
+      │           └── zerovec v0.11.6 (*)
+      ├── tracing-attributes v0.1.31
+      │   └── tracing v0.1.44
+      │       ├── axum v0.8.9 (*)
+      │       ├── axum-core v0.5.6
+      │       │   └── axum v0.8.9 (*)
+      │       ├── hyper-util v0.1.20 (*)
+      │       ├── sergeant-rs v0.3.0 (*)
+      │       └── tower v0.5.3 (*)
+      ├── wasm-bindgen-macro-support v0.2.127
+      │   └── wasm-bindgen-macro v0.2.127
+      │       └── wasm-bindgen v0.2.127
+      │           ├── iana-time-zone v0.1.65 (*)
+      │           ├── js-sys v0.3.104 (*)
+      │           ├── reqwest v0.13.4 (*)
+      │           ├── wasm-bindgen-futures v0.4.77 (*)
+      │           ├── web-sys v0.3.104 (*)
+      │           └── web-time v1.1.0 (*)
+      ├── windows-implement v0.60.2
+      │   └── windows-core v0.62.2
+      │       └── iana-time-zone v0.1.65 (*)
+      ├── windows-interface v0.59.3
+      │   └── windows-core v0.62.2 (*)
+      ├── yoke-derive v0.8.2 (*)
+      ├── zerocopy-derive v0.8.56
+      │   └── zerocopy v0.8.56
+      │       ├── ahash v0.8.12
+      │       │   ├── arrow-array v58.4.0 (*)
+      │       │   └── arrow-select v58.4.0 (*)
+      │       ├── half v2.7.1
+      │       │   ├── arrow-array v58.4.0 (*)
+      │       │   ├── arrow-buffer v58.4.0
+      │       │   │   ├── arrow v58.4.0 (*)
+      │       │   │   ├── arrow-arith v58.4.0 (*)
+      │       │   │   ├── arrow-array v58.4.0 (*)
+      │       │   │   ├── arrow-cast v58.4.0 (*)
+      │       │   │   ├── arrow-data v58.4.0
+      │       │   │   │   ├── arrow v58.4.0 (*)
+      │       │   │   │   ├── arrow-arith v58.4.0 (*)
+      │       │   │   │   ├── arrow-array v58.4.0 (*)
+      │       │   │   │   ├── arrow-cast v58.4.0 (*)
+      │       │   │   │   ├── arrow-ord v58.4.0 (*)
+      │       │   │   │   ├── arrow-row v58.4.0 (*)
+      │       │   │   │   ├── arrow-select v58.4.0 (*)
+      │       │   │   │   └── arrow-string v58.4.0 (*)
+      │       │   │   ├── arrow-ord v58.4.0 (*)
+      │       │   │   ├── arrow-row v58.4.0 (*)
+      │       │   │   ├── arrow-select v58.4.0 (*)
+      │       │   │   └── arrow-string v58.4.0 (*)
+      │       │   ├── arrow-cast v58.4.0 (*)
+      │       │   ├── arrow-data v58.4.0 (*)
+      │       │   └── arrow-row v58.4.0 (*)
+      │       └── ppv-lite86 v0.2.21
+      │           └── rand_chacha v0.9.0
+      │               └── rand v0.9.5
+      │                   └── opentelemetry_sdk v0.32.1 (*)
+      ├── zerofrom-derive v0.1.7 (*)
+      └── zerovec-derive v0.11.3
+          └── zerovec v0.11.6 (*)
+    ├ syn v3.0.3
+      ├── async-trait v0.1.92
+      │   └── opentelemetry-http v0.32.0
+      │       └── opentelemetry-otlp v0.32.0
+      │           └── sergeant-rs v0.3.0
+      ├── clap_derive v4.6.4
+      │   └── clap v4.6.6
+      │       └── sergeant-rs v0.3.0 (*)
+      ├── darling_core v0.24.0
+      │   ├── darling v0.24.0
+      │   │   └── instability v0.3.13
+      │   │       ├── ratatui v0.30.2
+      │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │       ├── ratatui-crossterm v0.1.2
+      │   │       │   ├── ratatui v0.30.2 (*)
+      │   │       │   └── ratatui-textarea v0.9.2
+      │   │       │       └── sergeant-rs v0.3.0 (*)
+      │   │       └── ratatui-widgets v0.3.2
+      │   │           ├── ratatui v0.30.2 (*)
+      │   │           ├── ratatui-macros v0.7.2
+      │   │           │   └── ratatui v0.30.2 (*)
+      │   │           └── ratatui-textarea v0.9.2 (*)
+      │   └── darling_macro v0.24.0
+      │       └── darling v0.24.0 (*)
+      ├── darling_macro v0.24.0 (*)
+      ├── displaydoc v0.2.7
+      │   ├── icu_collections v2.2.0
+      │   │   ├── icu_normalizer v2.2.0
+      │   │   │   └── idna_adapter v1.2.2
+      │   │   │       └── idna v1.1.0
+      │   │   │           └── url v2.5.8
+      │   │   │               ├── reqwest v0.13.4
+      │   │   │               │   ├── opentelemetry-http v0.32.0 (*)
+      │   │   │               │   ├── opentelemetry-otlp v0.32.0 (*)
+      │   │   │               │   └── sergeant-rs v0.3.0 (*)
+      │   │   │               └── tower-http v0.6.11
+      │   │   │                   └── reqwest v0.13.4 (*)
+      │   │   └── icu_properties v2.2.0
+      │   │       └── idna_adapter v1.2.2 (*)
+      │   ├── icu_locale_core v2.2.0
+      │   │   ├── icu_properties v2.2.0 (*)
+      │   │   └── icu_provider v2.2.0
+      │   │       ├── icu_normalizer v2.2.0 (*)
+      │   │       └── icu_properties v2.2.0 (*)
+      │   ├── icu_provider v2.2.0 (*)
+      │   ├── tinystr v0.8.3
+      │   │   └── icu_locale_core v2.2.0 (*)
+      │   └── zerotrie v0.2.4
+      │       ├── icu_properties v2.2.0 (*)
+      │       └── icu_provider v2.2.0 (*)
+      ├── instability v0.3.13 (*)
+      ├── serde_derive v1.0.229
+      │   └── serde v1.0.229
+      │       ├── (build) libduckdb-sys v1.10505.0
+      │       │   └── duckdb v1.10505.0
+      │       │       └── (dev) sergeant-rs v0.3.0 (*)
+      │       ├── reqwest v0.13.4 (*)
+      │       ├── serde_urlencoded v0.7.1
+      │       │   ├── axum v0.8.9
+      │       │   │   └── sergeant-rs v0.3.0 (*)
+      │       │   └── reqwest v0.13.4 (*)
+      │       └── (dev) sergeant-rs v0.3.0 (*)
+      ├── thiserror-impl v2.0.20
+      │   └── thiserror v2.0.20
+      │       ├── jni v0.22.4
+      │       │   └── rustls-platform-verifier v0.7.0
+      │       │       └── reqwest v0.13.4 (*)
+      │       ├── kasuari v0.4.12
+      │       │   └── ratatui-core v0.1.2
+      │       │       ├── ratatui v0.30.2 (*)
+      │       │       ├── ratatui-crossterm v0.1.2 (*)
+      │       │       ├── ratatui-macros v0.7.2 (*)
+      │       │       ├── ratatui-textarea v0.9.2 (*)
+      │       │       └── ratatui-widgets v0.3.2 (*)
+      │       ├── opentelemetry v0.32.0
+      │       │   ├── opentelemetry-http v0.32.0 (*)
+      │       │   ├── opentelemetry-otlp v0.32.0 (*)
+      │       │   ├── opentelemetry-proto v0.32.0
+      │       │   │   └── opentelemetry-otlp v0.32.0 (*)
+      │       │   ├── opentelemetry_sdk v0.32.1
+      │       │   │   ├── opentelemetry-otlp v0.32.0 (*)
+      │       │   │   ├── opentelemetry-proto v0.32.0 (*)
+      │       │   │   └── (dev) sergeant-rs v0.3.0 (*)
+      │       │   └── sergeant-rs v0.3.0 (*)
+      │       ├── opentelemetry-otlp v0.32.0 (*)
+      │       ├── opentelemetry_sdk v0.32.1 (*)
+      │       ├── ratatui-core v0.1.2 (*)
+      │       └── sergeant-rs v0.3.0 (*)
+      └── tokio-macros v2.7.2
+          └── tokio v1.53.1
+              ├── axum v0.8.9 (*)
+              ├── hyper v1.11.0
+              │   ├── axum v0.8.9 (*)
+              │   ├── hyper-rustls v0.27.9
+              │   │   └── reqwest v0.13.4 (*)
+              │   ├── hyper-util v0.1.20
+              │   │   ├── axum v0.8.9 (*)
+              │   │   ├── hyper-rustls v0.27.9 (*)
+              │   │   └── reqwest v0.13.4 (*)
+              │   └── reqwest v0.13.4 (*)
+              ├── hyper-rustls v0.27.9 (*)
+              ├── hyper-util v0.1.20 (*)
+              ├── opentelemetry_sdk v0.32.1 (*)
+              ├── reqwest v0.13.4 (*)
+              ├── sergeant-rs v0.3.0 (*)
+              ├── tokio-rustls v0.26.4
+              │   ├── hyper-rustls v0.27.9 (*)
+              │   └── reqwest v0.13.4 (*)
+              ├── tokio-stream v0.1.19
+              │   └── sergeant-rs v0.3.0 (*)
+              └── tower v0.5.3
+                  ├── axum v0.8.9 (*)
+                  ├── reqwest v0.13.4 (*)
+                  └── tower-http v0.6.11 (*)
+
+warning[duplicate]: found 2 duplicate entries for crate 'windows-sys'
+    ┌─ /var/tmp/hats4/y2/Cargo.lock:339:1
+    │  
+339 │ ╭ windows-sys 0.52.0 registry+https://github.com/rust-lang/crates.io-index
+340 │ │ windows-sys 0.61.2 registry+https://github.com/rust-lang/crates.io-index
+    │ ╰────────────────────────────────────────────────────────────────────────┘ lock entries
+    │  
+    ├ windows-sys v0.52.0
+      ├── ring v0.17.14
+      │   ├── rustls v0.23.43
+      │   │   ├── hyper-rustls v0.27.9
+      │   │   │   └── reqwest v0.13.4
+      │   │   │       ├── opentelemetry-http v0.32.0
+      │   │   │       │   └── opentelemetry-otlp v0.32.0
+      │   │   │       │       └── sergeant-rs v0.3.0
+      │   │   │       ├── opentelemetry-otlp v0.32.0 (*)
+      │   │   │       └── sergeant-rs v0.3.0 (*)
+      │   │   ├── reqwest v0.13.4 (*)
+      │   │   ├── rustls-platform-verifier v0.7.0
+      │   │   │   └── reqwest v0.13.4 (*)
+      │   │   ├── tokio-rustls v0.26.4
+      │   │   │   ├── hyper-rustls v0.27.9 (*)
+      │   │   │   └── reqwest v0.13.4 (*)
+      │   │   └── ureq v3.4.0
+      │   │       └── (build) libduckdb-sys v1.10505.0
+      │   │           └── duckdb v1.10505.0
+      │   │               └── (dev) sergeant-rs v0.3.0 (*)
+      │   └── rustls-webpki v0.103.13
+      │       ├── rustls v0.23.43 (*)
+      │       └── rustls-platform-verifier v0.7.0 (*)
+      └── rustix v0.38.44
+          └── crossterm v0.28.1
+              └── comfy-table v7.1.4
+                  ├── arrow-cast v58.4.0
+                  │   └── arrow v58.4.0
+                  │       └── duckdb v1.10505.0 (*)
+                  └── duckdb v1.10505.0 (*)
+    ├ windows-sys v0.61.2
+      ├── anstyle-query v1.1.5
+      │   └── anstream v1.0.0
+      │       └── clap_builder v4.6.6
+      │           └── clap v4.6.6
+      │               └── sergeant-rs v0.3.0
+      ├── anstyle-wincon v3.0.11
+      │   └── anstream v1.0.0 (*)
+      ├── errno v0.3.14
+      │   ├── rustix v0.38.44
+      │   │   └── crossterm v0.28.1
+      │   │       └── comfy-table v7.1.4
+      │   │           ├── arrow-cast v58.4.0
+      │   │           │   └── arrow v58.4.0
+      │   │           │       └── duckdb v1.10505.0
+      │   │           │           └── (dev) sergeant-rs v0.3.0 (*)
+      │   │           └── duckdb v1.10505.0 (*)
+      │   ├── rustix v1.1.4
+      │   │   ├── crossterm v0.29.0
+      │   │   │   └── ratatui-crossterm v0.1.2
+      │   │   │       ├── ratatui v0.30.2
+      │   │   │       │   └── sergeant-rs v0.3.0 (*)
+      │   │   │       └── ratatui-textarea v0.9.2
+      │   │   │           └── sergeant-rs v0.3.0 (*)
+      │   │   ├── tempfile v3.27.0
+      │   │   │   └── (dev) sergeant-rs v0.3.0 (*)
+      │   │   └── xattr v1.6.1
+      │   │       └── tar v0.4.46
+      │   │           └── (build) libduckdb-sys v1.10505.0
+      │   │               └── duckdb v1.10505.0 (*)
+      │   └── signal-hook-registry v1.4.8
+      │       ├── signal-hook v0.3.18
+      │       │   ├── crossterm v0.29.0 (*)
+      │       │   └── signal-hook-mio v0.2.5
+      │       │       └── crossterm v0.29.0 (*)
+      │       └── tokio v1.53.1
+      │           ├── axum v0.8.9
+      │           │   └── sergeant-rs v0.3.0 (*)
+      │           ├── hyper v1.11.0
+      │           │   ├── axum v0.8.9 (*)
+      │           │   ├── hyper-rustls v0.27.9
+      │           │   │   └── reqwest v0.13.4
+      │           │   │       ├── opentelemetry-http v0.32.0
+      │           │   │       │   └── opentelemetry-otlp v0.32.0
+      │           │   │       │       └── sergeant-rs v0.3.0 (*)
+      │           │   │       ├── opentelemetry-otlp v0.32.0 (*)
+      │           │   │       └── sergeant-rs v0.3.0 (*)
+      │           │   ├── hyper-util v0.1.20
+      │           │   │   ├── axum v0.8.9 (*)
+      │           │   │   ├── hyper-rustls v0.27.9 (*)
+      │           │   │   └── reqwest v0.13.4 (*)
+      │           │   └── reqwest v0.13.4 (*)
+      │           ├── hyper-rustls v0.27.9 (*)
+      │           ├── hyper-util v0.1.20 (*)
+      │           ├── opentelemetry_sdk v0.32.1
+      │           │   ├── opentelemetry-otlp v0.32.0 (*)
+      │           │   ├── opentelemetry-proto v0.32.0
+      │           │   │   └── opentelemetry-otlp v0.32.0 (*)
+      │           │   └── (dev) sergeant-rs v0.3.0 (*)
+      │           ├── reqwest v0.13.4 (*)
+      │           ├── sergeant-rs v0.3.0 (*)
+      │           ├── tokio-rustls v0.26.4
+      │           │   ├── hyper-rustls v0.27.9 (*)
+      │           │   └── reqwest v0.13.4 (*)
+      │           ├── tokio-stream v0.1.19
+      │           │   └── sergeant-rs v0.3.0 (*)
+      │           └── tower v0.5.3
+      │               ├── axum v0.8.9 (*)
+      │               ├── reqwest v0.13.4 (*)
+      │               └── tower-http v0.6.11
+      │                   └── reqwest v0.13.4 (*)
+      ├── mio v1.2.2
+      │   ├── crossterm v0.29.0 (*)
+      │   ├── signal-hook-mio v0.2.5 (*)
+      │   └── tokio v1.53.1 (*)
+      ├── nu-ansi-term v0.50.3
+      │   └── tracing-subscriber v0.3.23
+      │       └── sergeant-rs v0.3.0 (*)
+      ├── rustix v1.1.4 (*)
+      ├── rustls-platform-verifier v0.7.0
+      │   └── reqwest v0.13.4 (*)
+      ├── schannel v0.1.29
+      │   └── rustls-native-certs v0.8.4
+      │       └── rustls-platform-verifier v0.7.0 (*)
+      ├── socket2 v0.6.5
+      │   ├── hyper-util v0.1.20 (*)
+      │   └── tokio v1.53.1 (*)
+      ├── tempfile v3.27.0 (*)
+      ├── tokio v1.53.1 (*)
+      └── winapi-util v0.1.11
+          ├── same-file v1.0.6
+          │   └── walkdir v2.5.0
+          │       └── (build) jni v0.22.4
+          │           └── rustls-platform-verifier v0.7.0 (*)
+          └── walkdir v2.5.0 (*)
+
+error[yanked]: detected yanked crate (try `cargo update -p chacha20`)
+   ┌─ /var/tmp/hats4/y2/Cargo.lock:44:1
+   │
+44 │ chacha20 0.10.1 registry+https://github.com/rust-lang/crates.io-index
+   │ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ yanked version
+   │
+   ├ chacha20 v0.10.1
+     └── rand v0.10.2
+         └── ulid v3.0.0
+             └── sergeant-rs v0.3.0
+
+advisories FAILED, bans ok, licenses ok, sources ok
