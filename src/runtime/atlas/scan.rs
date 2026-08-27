@@ -44,14 +44,8 @@ use crate::domain::source::{
 };
 use crate::runtime::atlas::deny::{AcquisitionFilter, BadPattern, Verdict};
 use crate::runtime::atlas::text::{
-    MARKDOWN_EXTRACTOR, TEXT_EXTRACTOR, as_text, markdown_units, plain_units,
+    MARKDOWN_EXTRACTOR, as_text, extractor_for, markdown_units, plain_units,
 };
-
-/// Extensions routed to the Markdown extractor.
-const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown"];
-
-/// Extensions routed to the plain-text extractor.
-const TEXT_EXTENSIONS: &[&str] = &["txt", "text"];
 
 /// The largest resource this build reads into memory to extract.
 ///
@@ -142,6 +136,17 @@ pub struct SourceScan {
     /// [`generation_key`]) — the value ruling §4's eviction rule is stated
     /// over.
     pub content_key: String,
+    /// The source's own revision identity, when it has one: the pinned commit
+    /// SHA for an [`SourceKind::EstateGit`] scan, `None` for a filesystem walk
+    /// that has no such thing.
+    ///
+    /// Deliberately *not* the same field as [`Self::content_key`], and not a
+    /// substitute for it. The content key answers "is this the same world?"
+    /// and drives ruling §4's eviction; the revision answers "which commit was
+    /// this?" and is provenance a reader needs but no comparison uses — two
+    /// commits with identical trees are the same world, and folding the commit
+    /// into the key would evict a generation that changed no source byte.
+    pub revision: Option<String>,
     /// When the walk finished (RFC3339 UTC).
     pub observed_at: String,
     /// Acquired resources, in path order.
@@ -241,6 +246,7 @@ pub fn scan_local_knowledge(source: &KnowledgeSource) -> Result<SourceScan, BadP
         kind: SourceKind::LocalKnowledge,
         authority: AuthorityClass::EstateReadonly,
         content_key: generation_key(&resources),
+        revision: None,
         observed_at: rfc3339_utc_now(),
         files,
         coverage,
@@ -410,25 +416,8 @@ impl Walk<'_> {
             });
             return;
         };
-        let structure = if extractor == MARKDOWN_EXTRACTOR {
-            markdown_units(text)
-        } else {
-            plain_units(text)
-        };
         let hash = content_hash(&bytes);
-        let units = structure
-            .into_iter()
-            .enumerate()
-            .map(|(ordinal, unit)| ScannedUnit {
-                ordinal: ordinal as u64,
-                kind: unit.kind,
-                heading_level: unit.heading_level,
-                title: unit.title,
-                byte_start: unit.byte_start as u64,
-                byte_end: unit.byte_end as u64,
-                text: text[unit.byte_start..unit.byte_end].to_string(),
-            })
-            .collect();
+        let units = extract_units(text, extractor);
         self.extractors.insert(extractor.to_string());
         self.coverage.push(CoverageRow {
             path: Some(relative.clone()),
@@ -448,25 +437,33 @@ impl Walk<'_> {
     }
 }
 
-/// The extractor for a path, by extension, or `None` for a family this build
-/// does not claim.
+/// Run one extractor over decoded text and number its units.
 ///
-/// Extension-driven and nothing else: sniffing content to guess a format
-/// would mean reading bytes to decide whether to read bytes, and the honest
-/// answer for an unclaimed extension is `unsupported`, which coverage
-/// reports.
-fn extractor_for(relative: &str) -> Option<&'static str> {
-    let extension = Path::new(relative)
-        .extension()
-        .and_then(|e| e.to_str())?
-        .to_ascii_lowercase();
-    if MARKDOWN_EXTENSIONS.contains(&extension.as_str()) {
-        Some(MARKDOWN_EXTRACTOR)
-    } else if TEXT_EXTENSIONS.contains(&extension.as_str()) {
-        Some(TEXT_EXTRACTOR)
+/// The one place `StructureUnit` becomes `ScannedUnit`, for every source kind
+/// there is. Three walks — the filesystem one below, the estate-git one
+/// ([`super::git`]) and a Work overlay ([`super::overlay`]) — reach identical
+/// bytes by different routes, and F7's premise is that identical bytes plus an
+/// identical extractor identity are *one* extraction. Two copies of this loop
+/// would be two ways for that to stop being true.
+pub fn extract_units(text: &str, extractor: &str) -> Vec<ScannedUnit> {
+    let structure = if extractor == MARKDOWN_EXTRACTOR {
+        markdown_units(text)
     } else {
-        None
-    }
+        plain_units(text)
+    };
+    structure
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, unit)| ScannedUnit {
+            ordinal: ordinal as u64,
+            kind: unit.kind,
+            heading_level: unit.heading_level,
+            title: unit.title,
+            byte_start: unit.byte_start as u64,
+            byte_end: unit.byte_end as u64,
+            text: text[unit.byte_start..unit.byte_end].to_string(),
+        })
+        .collect()
 }
 
 /// Modification time in Unix milliseconds, when the platform offers one.
@@ -481,6 +478,7 @@ fn mtime_millis(meta: &std::fs::Metadata) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::atlas::text::TEXT_EXTRACTOR;
 
     /// Build a source tree and scan it.
     fn scan_tree(files: &[(&str, &[u8])], ignore: &[&str]) -> (tempfile::TempDir, SourceScan) {

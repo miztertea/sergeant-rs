@@ -24,7 +24,10 @@ use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::source::KIND_SOURCE_SCANNED;
 use crate::runtime::atlas::db::{AtlasDb, AtlasError, ScanCommit};
 use crate::runtime::atlas::deny::BadPattern;
+use crate::runtime::atlas::git::{EstateGitSource, GitScanError, scan_estate_git};
+use crate::runtime::atlas::overlay::{WorkOverlay, scan_work_overlay};
 use crate::runtime::atlas::scan::{KnowledgeSource, SourceScan, scan_local_knowledge};
+use crate::runtime::integrity::EstateDriftObservation;
 use crate::runtime::journal::{Journal, JournalError};
 
 /// What one call to [`scan_and_record`] did.
@@ -74,6 +77,9 @@ pub enum ScanRecordError {
     /// A `[[knowledge]] ignore` glob does not compile.
     #[error(transparent)]
     Pattern(#[from] BadPattern),
+    /// An estate-git or overlay scan failed before any row was written.
+    #[error(transparent)]
+    GitScan(#[from] GitScanError),
     /// Atlas refused a write.
     #[error(transparent)]
     Atlas(#[from] AtlasError),
@@ -122,8 +128,59 @@ pub fn scan_and_record(
     source: &KnowledgeSource,
     workspace_id: Option<&str>,
 ) -> Result<ScanRecord, ScanRecordError> {
-    let scan = scan_local_knowledge(source)?;
-    let staged = match db.stage_scan(&scan)? {
+    record_scan(db, journal, &scan_local_knowledge(source)?, workspace_id)
+}
+
+/// [`scan_and_record`] for one estate-git source: the same three steps, over a
+/// commit instead of a directory.
+///
+/// The steps are shared rather than mirrored, which is the point. F1's crash
+/// window is a property of the *order* — stage, journal, confirm — and a
+/// second copy of that order for a second source kind would be a second place
+/// for it to be got subtly wrong. What differs between the two source kinds is
+/// how bytes are acquired, and that difference is entirely upstream of here.
+///
+/// Returns the [`ScanRecord`] alongside the scan's drift observation, when the
+/// mount's HEAD has moved off the pinned SHA. The observation rides beside the
+/// record for the same reason it rides beside the scan: it is a fact about the
+/// mount, not about the generation, and folding it in would make a clean scan
+/// look unclean.
+pub fn scan_and_record_estate_git(
+    db: &mut AtlasDb,
+    journal: &mut Journal,
+    source: &EstateGitSource,
+    workspace_id: Option<&str>,
+) -> Result<(ScanRecord, Option<EstateDriftObservation>), ScanRecordError> {
+    let scanned = scan_estate_git(source)?;
+    let record = record_scan(db, journal, &scanned.scan, workspace_id)?;
+    Ok((record, scanned.drift))
+}
+
+/// [`scan_and_record`] for one Work overlay — same three steps again.
+///
+/// The generation this writes is scoped to its Work and removed by
+/// [`AtlasDb::evict_work_overlays`], never by ruling §4's byte-change rule;
+/// see [`super::overlay`] for why those are two different lifetimes.
+pub fn scan_and_record_overlay(
+    db: &mut AtlasDb,
+    journal: &mut Journal,
+    overlay: &WorkOverlay,
+    workspace_id: Option<&str>,
+) -> Result<ScanRecord, ScanRecordError> {
+    let scanned = scan_work_overlay(overlay)?;
+    record_scan(db, journal, &scanned.scan, workspace_id)
+}
+
+/// **F1's crash-window coupling itself**, over an already-completed scan of
+/// any source kind. See [`scan_and_record`] for the ordering argument — this
+/// is the code that argument is about.
+pub fn record_scan(
+    db: &mut AtlasDb,
+    journal: &mut Journal,
+    scan: &SourceScan,
+    workspace_id: Option<&str>,
+) -> Result<ScanRecord, ScanRecordError> {
+    let staged = match db.stage_scan(scan)? {
         ScanCommit::Unchanged {
             generation_id,
             content_key,
@@ -149,7 +206,7 @@ pub fn scan_and_record(
     let mut draft = EventDraft::new(
         EventSource::new("daemon", "atlas"),
         KIND_SOURCE_SCANNED,
-        scan_summary(&scan, &staged),
+        scan_summary(scan, &staged),
     );
     if let Some(workspace_id) = workspace_id {
         draft = draft.with_workspace_id(workspace_id);
@@ -158,7 +215,7 @@ pub fn scan_and_record(
     let evicted = db.confirm_scan(&staged, &event.id)?;
     Ok(ScanRecord::Recorded {
         generation_id: staged,
-        content_key: scan.content_key,
+        content_key: scan.content_key.clone(),
         summary_event_id: event.id,
         evicted,
     })
@@ -263,7 +320,7 @@ pub fn reconcile_sources(
 /// have to be pinnable together. A test that hand-rolled its own summary
 /// would keep passing on the day this function stopped emitting it.
 pub fn scan_summary(scan: &SourceScan, generation_id: &str) -> serde_json::Value {
-    serde_json::json!({
+    let mut summary = serde_json::json!({
         "source": scan.source_name,
         "source_kind": scan.kind.as_str(),
         "authority_class": scan.authority.as_str(),
@@ -274,5 +331,15 @@ pub fn scan_summary(scan: &SourceScan, generation_id: &str) -> serde_json::Value
         "units": scan.unit_count(),
         "coverage": scan.counts(),
         "extractors": scan.extractors.iter().collect::<Vec<_>>(),
-    })
+    });
+    // Added only when the source actually has a revision (a pinned commit
+    // SHA). An explicit `null` would read as "this source has a revision and
+    // we do not know it", which is a different claim and a false one for a
+    // filesystem walk.
+    if let Some(revision) = &scan.revision
+        && let Some(object) = summary.as_object_mut()
+    {
+        object.insert("revision".to_string(), revision.as_str().into());
+    }
+    summary
 }
