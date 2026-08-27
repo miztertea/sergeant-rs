@@ -103,7 +103,12 @@ fn declare_output(package: &Path, id: &str, artifact: &str) {
 /// (W1 §13 item 9, required-column side; mirrors
 /// `tests/m3_execution.rs::write_two_stage_workflow_with_required_columns`,
 /// the flat-case precedent).
-fn declare_output_with_required_columns(package: &Path, id: &str, artifact: &str, columns: &[&str]) {
+fn declare_output_with_required_columns(
+    package: &Path,
+    id: &str,
+    artifact: &str,
+    columns: &[&str],
+) {
     let dir = package.join(id).join("output");
     std::fs::create_dir_all(&dir).expect("output dir");
     let quoted: Vec<String> = columns.iter().map(|c| format!("`{c}`")).collect();
