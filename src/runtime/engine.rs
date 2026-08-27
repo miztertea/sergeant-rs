@@ -1151,22 +1151,36 @@ pub fn default_execution_lane_cap() -> usize {
         .unwrap_or(4)
 }
 
-/// H1-15's second lane: config surface only in S1 (deliverable 3 — no
-/// workers, no scheduling behavior). The eventual consumer is A1/S3's
-/// intelligence workers (host-runtime batch/analysis work distinct from
-/// execution's per-Work native processes); until that lands, nothing ever
-/// acquires from [`Engine::intelligence_lane`], so this cap only proves the
-/// two lanes are structurally independent (separate `Arc<Semaphore>`s —
-/// see the config-only test pinning that the execution lane's occupancy
-/// never touches this one's `available_permits`).
+/// H1-15's second lane, and **as of S3/X3a a lane with a real consumer**:
+/// Atlas's source extraction acquires it ([`Engine::run_intelligence`], via
+/// [`crate::runtime::atlas::lane`]). Host-runtime batch/analysis work,
+/// deliberately distinct from execution's per-Work native processes, and
+/// bounded separately from them so a repository scan can never spend a Work's
+/// launch capacity.
 ///
 /// Same host-parallelism grounding as [`default_execution_lane_cap`] (R2:
-/// reusing the one number this build can trace to something real, rather
-/// than inventing a second unrelated rationale for a lane nothing consumes
-/// yet). Override with [`Engine::with_intelligence_lane_cap`]
+/// reusing the one number this build can trace to something real, rather than
+/// inventing a second unrelated rationale). Override with
+/// [`Engine::with_intelligence_lane_cap`]
 /// (`DaemonConfig::intelligence_lane_cap` / `SGT_INTELLIGENCE_LANE_CAP`).
 pub fn default_intelligence_lane_cap() -> usize {
     default_execution_lane_cap()
+}
+
+/// Why an intelligence-lane job did not produce an answer.
+///
+/// Neither variant is reachable in ordinary operation, and both are returned
+/// rather than panicked for the same reason: Atlas is derived evidence, and no
+/// failure of a derived index may cost the estate its daemon (A1-01).
+#[derive(Debug, thiserror::Error)]
+pub enum IntelligenceError {
+    /// The lane's semaphore was closed — only reachable during shutdown.
+    #[error("the intelligence lane is closed")]
+    LaneClosed,
+    /// The blocking job panicked or was cancelled; the join error's own text
+    /// is carried rather than summarized.
+    #[error("an intelligence job did not complete: {0}")]
+    Job(String),
 }
 
 /// The workflow engine: backends, defaults, and the data dir surfaces live in.
@@ -1325,12 +1339,78 @@ impl Engine {
         self
     }
 
-    /// Override the daemon-wide intelligence-lane cap (H1-15, deliverable
-    /// 3 — config surface only; nothing yet acquires from this lane).
+    /// Override the daemon-wide intelligence-lane cap (H1-15, deliverable 3).
+    /// Wired from `DaemonConfig::intelligence_lane_cap` /
+    /// `SGT_INTELLIGENCE_LANE_CAP`.
     pub fn with_intelligence_lane_cap(mut self, cap: usize) -> Self {
         self.intelligence_lane = Arc::new(Semaphore::new(cap));
         self.intelligence_lane_cap = cap;
         self
+    }
+
+    /// Take an intelligence-lane permit without waiting, or `None` when the
+    /// lane is at [`Self::intelligence_lane_cap`].
+    ///
+    /// The permit is **handed to the caller**, not stored in a map the way an
+    /// execution permit is, and the difference is deliberate. An execution
+    /// permit belongs to a Work — it outlives the call that took it, it has to
+    /// be findable by work id, and releasing it is a decision about whether a
+    /// native process is still alive. An intelligence permit belongs to a
+    /// *job*: taken, held for the job's duration, dropped when it returns.
+    /// Handing the caller the guard makes "released when the work finishes" a
+    /// property of ownership rather than of remembering to call a release
+    /// function on every path out.
+    pub fn try_admit_intelligence(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.intelligence_lane).try_acquire_owned().ok()
+    }
+
+    /// Wait for an intelligence-lane permit.
+    ///
+    /// **Never the execution lane** (F6, and H1-15's whole point): the two are
+    /// separate `Arc<Semaphore>`s, so however much extraction queues here, a
+    /// Work's launch capacity is exactly what it was. The reverse holds too,
+    /// and both directions are pinned by tests.
+    pub async fn admit_intelligence(&self) -> Result<OwnedSemaphorePermit, IntelligenceError> {
+        Arc::clone(&self.intelligence_lane)
+            .acquire_owned()
+            .await
+            .map_err(|_| IntelligenceError::LaneClosed)
+    }
+
+    /// **F6's execution shape**: run one blocking intelligence job under an
+    /// intelligence-lane permit, on the blocking pool.
+    ///
+    /// Two properties, and both are the point:
+    ///
+    /// * **Bounded.** The permit is acquired before the job is spawned and
+    ///   dropped when it returns, so at most [`Self::intelligence_lane_cap`]
+    ///   extractions are ever in flight — not "usually", and not "unless a
+    ///   burst arrives".
+    /// * **Off the async runtime.** Extraction is CPU and IO work measured in
+    ///   whole files: parsing, hashing, waiting on a Git subprocess. Run
+    ///   directly in an async task it would hold a runtime worker thread for
+    ///   its whole duration and stall every unrelated future sharing it.
+    ///   `spawn_blocking` is the runtime's own answer, already in this build's
+    ///   `tokio` (R5).
+    ///
+    /// A job that panics surfaces as [`IntelligenceError::Job`] rather than
+    /// unwinding into the caller: one bad file must not take a daemon down,
+    /// and Atlas is derived evidence, never authority (A1-01).
+    pub async fn run_intelligence<F, T>(&self, job: F) -> Result<T, IntelligenceError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = self.admit_intelligence().await?;
+        tokio::task::spawn_blocking(move || {
+            let result = job();
+            // Held across the whole job and released here by the guard's own
+            // `Drop` — on the panicking path exactly as on the ordinary one.
+            drop(permit);
+            result
+        })
+        .await
+        .map_err(|e| IntelligenceError::Job(e.to_string()))
     }
 
     /// Try to admit `work_id` to the execution lane without waiting. `true`

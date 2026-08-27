@@ -282,6 +282,154 @@ pub fn git_remote_set_url(dir: &Path, name: &str, url: &str) -> Result<String, G
     git(dir, &["remote", "set-url", "--", name, url])
 }
 
+/// One object `git cat-file --batch` answered with.
+///
+/// `oid`/`kind` are Git's own header words, kept rather than re-derived: the
+/// header is what proves the bytes below it are the object that was asked
+/// for, and a caller keying on the OID (A1's F7 estate-git rule) wants the
+/// value Git echoed, not the one it sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatFileObject {
+    /// The object's full OID, as Git echoed it.
+    pub oid: String,
+    /// `blob`, `tree`, `commit` or `tag`.
+    pub kind: String,
+    /// The object's contents, byte for byte.
+    pub bytes: Vec<u8>,
+}
+
+/// Read many objects from `dir`'s object store in **one** Git process
+/// (`cat-file --batch`), answering positionally: element `i` is `oids[i]`'s
+/// object, or `None` when Git reported it missing.
+///
+/// **Why a batch primitive exists at all (R6/R7).** The obvious spelling —
+/// `git cat-file blob <oid>` per file — is one process, one fork, one object
+/// database open and one pack index load *per file*. On a repository of a few
+/// thousand blobs that is the whole cost of the scan, and it is spent on
+/// process startup rather than on reading anything. `--batch` is Git's own
+/// answer to exactly this shape: one process, one object database, `n`
+/// answers. R2–R5 supply no in-tree batching helper, and R6's one-liner
+/// ([`git_bytes`] in a loop) is precisely the thing being replaced.
+///
+/// **Read-only, and only ever the object store.** `cat-file` reads objects; it
+/// does not consult, touch or need a working tree, and nothing here fetches,
+/// pulls, switches or writes. That is what lets a caller pin a SHA and keep
+/// reading it while the mount's HEAD moves underneath (§8.2's pin, made
+/// durable for reads).
+///
+/// **Deadlock, avoided rather than hoped against.** Git streams answers as it
+/// reads requests, so a caller that writes every OID before reading a byte
+/// can fill the stdout pipe buffer and block Git forever while Git blocks on
+/// the caller. The request is therefore written from its own thread while this
+/// one drains stdout. Callers bound each batch's cumulative object size; this
+/// function does not, because it cannot know a sensible ceiling for a caller
+/// it has never met.
+pub fn git_cat_file_batch(
+    dir: &Path,
+    oids: &[String],
+) -> Result<Vec<Option<CatFileObject>>, GitError> {
+    if oids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let args = ["cat-file", "--batch"];
+    let mut child = command(dir, &args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| GitError::Spawn {
+            args: owned(&args),
+            dir: dir.display().to_string(),
+            source,
+        })?;
+    let mut request = String::with_capacity(oids.len() * 41);
+    for oid in oids {
+        request.push_str(oid);
+        request.push('\n');
+    }
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let writer = std::thread::spawn(move || {
+        use std::io::Write;
+        // The write's own error is deliberately dropped: a Git that died
+        // early makes this a broken pipe, and the *useful* diagnostic is the
+        // exit status and stderr collected below, not `EPIPE`.
+        let _ = stdin
+            .write_all(request.as_bytes())
+            .and_then(|()| stdin.flush());
+    });
+    let output = child.wait_with_output().map_err(|source| GitError::Spawn {
+        args: owned(&args),
+        dir: dir.display().to_string(),
+        source,
+    })?;
+    let _ = writer.join();
+    if !output.status.success() {
+        return Err(GitError::Failed {
+            args: owned(&args),
+            dir: dir.display().to_string(),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    parse_cat_file_batch(&output.stdout, oids.len(), dir, &args)
+}
+
+/// Split `cat-file --batch`'s stream into one answer per request.
+///
+/// The wire shape, from `git cat-file`'s own documentation: an existing object
+/// is `<oid> SP <type> SP <size> LF <contents> LF`, and a missing one is
+/// `<name> SP missing LF`. Sizes are taken from the header rather than by
+/// scanning for a terminator, because blob contents may contain any byte
+/// including `LF` — a line-oriented parse of this stream is wrong on the first
+/// file that ends without a newline.
+fn parse_cat_file_batch(
+    stdout: &[u8],
+    expected: usize,
+    dir: &Path,
+    args: &[&str],
+) -> Result<Vec<Option<CatFileObject>>, GitError> {
+    let malformed = |detail: String| GitError::Failed {
+        args: owned(args),
+        dir: dir.display().to_string(),
+        status: "exit status: 0".to_string(),
+        stderr: detail,
+    };
+    let mut out = Vec::with_capacity(expected);
+    let mut at = 0usize;
+    while out.len() < expected {
+        let Some(offset) = stdout[at..].iter().position(|b| *b == b'\n') else {
+            return Err(malformed(format!(
+                "cat-file --batch answered {} of {expected} objects before its \
+                 stream ended",
+                out.len()
+            )));
+        };
+        let header = String::from_utf8_lossy(&stdout[at..at + offset]).into_owned();
+        at += offset + 1;
+        let mut words = header.split(' ');
+        let oid = words.next().unwrap_or_default().to_string();
+        let kind = words.next().unwrap_or_default().to_string();
+        if kind == "missing" || kind.is_empty() {
+            out.push(None);
+            continue;
+        }
+        let size: usize = words.next().and_then(|s| s.parse().ok()).ok_or_else(|| {
+            malformed(format!("cat-file --batch header is unreadable: {header:?}"))
+        })?;
+        if at + size > stdout.len() {
+            return Err(malformed(format!(
+                "cat-file --batch promised {size} bytes for {oid} and delivered {}",
+                stdout.len().saturating_sub(at)
+            )));
+        }
+        let bytes = stdout[at..at + size].to_vec();
+        // The record's own trailing LF, which is framing and not content.
+        at += size + 1;
+        out.push(Some(CatFileObject { oid, kind, bytes }));
+    }
+    Ok(out)
+}
+
 /// One hermetic Git invocation: no pager, no prompts, no editor, stdin closed.
 fn command(dir: &Path, args: &[&str]) -> Command {
     let git_bin = std::env::var(GIT_BIN_ENV).unwrap_or_else(|_| "git".to_string());
@@ -305,6 +453,72 @@ fn owned(args: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The framing is size-prefixed, not line-oriented: a blob with no
+    /// trailing newline, a blob that is entirely newlines, an empty blob and a
+    /// missing object all have to survive one stream together.
+    #[test]
+    fn a_batch_stream_is_split_by_its_declared_sizes() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"aaa blob 5\nno-nl\n");
+        stream.extend_from_slice(b"bbb blob 3\n\n\n\n\n");
+        stream.extend_from_slice(b"ccc blob 0\n\n");
+        stream.extend_from_slice(b"deadbeef missing\n");
+        let parsed =
+            parse_cat_file_batch(&stream, 4, Path::new("/tmp"), &["cat-file"]).expect("parse");
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[0].as_ref().expect("present").bytes, b"no-nl");
+        assert_eq!(parsed[0].as_ref().expect("present").oid, "aaa");
+        assert_eq!(parsed[1].as_ref().expect("present").bytes, b"\n\n\n");
+        assert!(parsed[2].as_ref().expect("present").bytes.is_empty());
+        assert!(
+            parsed[3].is_none(),
+            "a missing object is None, not an error"
+        );
+    }
+
+    /// A truncated stream is a named failure, never a short answer silently
+    /// treated as "these objects do not exist".
+    #[test]
+    fn a_truncated_batch_stream_is_an_error_not_a_short_answer() {
+        let err = parse_cat_file_batch(b"aaa blob 99\nshort", 1, Path::new("/tmp"), &["cat-file"])
+            .expect_err("truncated");
+        assert!(err.to_string().contains("promised 99 bytes"), "{err}");
+        let err = parse_cat_file_batch(b"", 2, Path::new("/tmp"), &["cat-file"])
+            .expect_err("empty stream");
+        assert!(err.to_string().contains("0 of 2 objects"), "{err}");
+    }
+
+    /// End to end against real Git: one process answers many objects, in
+    /// request order, and never needs a working tree to do it.
+    #[test]
+    fn one_process_reads_many_blobs_in_request_order() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        git(root, &["init", "--initial-branch=main"]).expect("init");
+        git(root, &["config", "user.email", "t@example.com"]).expect("email");
+        git(root, &["config", "user.name", "T"]).expect("name");
+        let mut oids = Vec::new();
+        for (name, body) in [("a.txt", "alpha"), ("b.txt", "beta\n\nmore"), ("c.txt", "")] {
+            std::fs::write(root.join(name), body).expect("write");
+            let _ = name;
+            oids.push(
+                git(
+                    root,
+                    &["hash-object", "-w", root.join(name).to_str().expect("utf8")],
+                )
+                .expect("hash-object"),
+            );
+        }
+        oids.push("0".repeat(40));
+        let objects = git_cat_file_batch(root, &oids).expect("batch");
+        assert_eq!(objects.len(), 4);
+        assert_eq!(objects[0].as_ref().expect("a").bytes, b"alpha");
+        assert_eq!(objects[1].as_ref().expect("b").bytes, b"beta\n\nmore");
+        assert!(objects[2].as_ref().expect("c").bytes.is_empty());
+        assert!(objects[3].is_none());
+        assert!(git_cat_file_batch(root, &[]).expect("empty").is_empty());
+    }
 
     #[test]
     fn failure_carries_gits_own_diagnostic() {

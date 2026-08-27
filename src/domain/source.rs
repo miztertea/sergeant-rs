@@ -189,6 +189,91 @@ pub fn content_hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+/// **F7's estate-git cache key**: the Git blob OID **plus** extractor
+/// identity, and nothing else.
+///
+/// The rule this function exists to make unavoidable is the negative one:
+/// *never a second hash of bytes Git already hashed*. A blob's OID is a
+/// cryptographic digest of exactly those bytes, computed once, when the object
+/// was written, by the tool that owns them. Re-hashing them with BLAKE3 to
+/// produce a "content hash" would cost a full pass over every byte in the
+/// repository on every scan, to arrive at a second name for a thing that
+/// already has one. The OID is the content half; this composes it with the
+/// extractor half.
+///
+/// The composition hashes two short strings — an OID and an extractor
+/// identity, tens of bytes between them — which is not the thing the rule
+/// forbids. What it buys is one fixed-width key whichever source kind produced
+/// it, so `source.files.local_key` stays one column with one meaning.
+///
+/// **Domain-separated from [`local_key`] on purpose.** A blob OID and a BLAKE3
+/// content hash are different lengths from different hash families, but they
+/// are both "hex of some bytes", and two key spaces that could ever collide
+/// would let a local-knowledge extraction be reused for a Git blob whose OID
+/// happened to be spelled the same. The separator makes that impossible rather
+/// than unlikely.
+pub fn estate_git_key(blob_oid: &str, extractor: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sergeant.atlas.estate-git-key/v1\n");
+    hasher.update(blob_oid.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(extractor.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+/// The content identity of a Work overlay's *changed* paths: BLAKE3 over each
+/// changed path and what the overlay recorded for it, in path order.
+///
+/// "What the overlay recorded" is the BLAKE3 hash of the working-tree bytes for
+/// a path that has bytes, and a marker for one that does not — deleted,
+/// unreadable, not a regular file. A path with no bytes still changed the
+/// world, so it still has to move this digest;
+/// [`crate::runtime::atlas::overlay`] owns those markers and the
+/// argument for each.
+///
+/// The changed half only. Unchanged paths are the base tree's, by definition,
+/// and are already identified by [`overlay_generation_key`]'s other input —
+/// folding them in again would mean hashing a whole repository to describe a
+/// two-file edit. Paths *excluded* at the acquisition boundary are folded in
+/// nowhere at all, exactly as [`generation_key`] excludes them: what these keys
+/// identify is the world evidence was derived from, and a denied path
+/// contributed no bytes to it.
+///
+/// An empty map is a real answer, not a degenerate one: a Work surface that
+/// has changed nothing has exactly this digest, and [`overlay_generation_key`]
+/// then names the base plus "nothing", which is what a freshly cut surface
+/// actually is.
+pub fn overlay_digest(changed: &BTreeMap<String, String>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sergeant.atlas.overlay-digest/v1\n");
+    for (path, hash) in changed {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(hash.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+/// A Work overlay generation's identity: **the base commit SHA composed with
+/// the overlay digest of what the surface changed.**
+///
+/// Both halves are load-bearing and neither is sufficient. The base alone
+/// cannot distinguish two Works cut from the same commit that have edited
+/// different files; the overlay digest alone cannot distinguish one edit
+/// applied over two different bases, which is a different world with different
+/// unchanged neighbours. Composing them means an overlay generation is the
+/// same generation exactly when both the ground it stands on and the change it
+/// makes are the same — the only condition under which reusing it is correct.
+pub fn overlay_generation_key(base_sha: &str, overlay_digest: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sergeant.atlas.overlay-generation-key/v1\n");
+    hasher.update(base_sha.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(overlay_digest.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Content identity of a whole generation: a hash over every acquired
 /// resource's `(relative path, content hash)` pair, in path order.
 ///

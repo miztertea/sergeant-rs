@@ -147,3 +147,21 @@ cov_stage_end 1 "the v4_w1_acceptance test binary must write its own profile"
 cov_stage_begin c2-x1_atlas_substrate
 cov_run cargo llvm-cov --no-report --test x1_atlas_substrate --locked || cov_fail "x1_atlas_substrate failed under instrumentation"
 cov_stage_end 1 "the x1_atlas_substrate test binary must write its own profile"
+
+# S3 X3a: the mechanical estate-git plumbing — a tree walk at an
+# admission-pinned SHA, batched blob reads, the concurrent-HEAD-advance rule,
+# Work-overlay hashing, and F6's intelligence-lane permits. Real `git`
+# subprocesses over tempdir repositories plus an in-process Atlas store and a
+# tokio runtime; no daemon, no estate root, no backend, so C2 rather than C3.
+# Floor 1.
+cov_stage_begin c2-x3a_git_plumbing
+cov_run cargo llvm-cov --no-report --test x3a_git_plumbing --locked || cov_fail "x3a_git_plumbing failed under instrumentation"
+cov_stage_end 1 "the x3a_git_plumbing test binary must write its own profile"
+
+# S3 X3a, the read-only claim: one test in its own process (it sets the
+# process-global `SGT_GIT_BIN` override to a recording shim), asserting that a
+# scan runs only read-only Git verbs and leaves the mount byte-identical.
+# Floor 1.
+cov_stage_begin c2-x3a_scan_uses_only_local_reads
+cov_run cargo llvm-cov --no-report --test x3a_scan_uses_only_local_reads --locked || cov_fail "x3a_scan_uses_only_local_reads failed under instrumentation"
+cov_stage_end 1 "the x3a_scan_uses_only_local_reads test binary must write its own profile"

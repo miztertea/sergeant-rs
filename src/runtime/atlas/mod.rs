@@ -51,25 +51,39 @@
 //!
 //! # Scope of what exists here today
 //!
-//! The four namespaces, and the four tables the local-knowledge scanner
-//! writes: `source.generations`, `source.files`, `source.units` and
-//! `meta.coverage`. `git` and `context` are still empty namespaces, by the
-//! same empty-table refusal doctrine the operations projection states — a
-//! table that can only ever answer "zero rows" is a false promise, not
-//! completeness, so every table lands in the wave that lands its writer.
+//! The four namespaces, and the four tables three walks now write:
+//! `source.generations`, `source.files`, `source.units` and `meta.coverage`.
+//! Local knowledge, an estate repository at an admission-pinned commit, and a
+//! Work surface overlaid on its base all land in the same four tables, because
+//! they produce the same kind of fact — a resource, its content identity, its
+//! extractor, and its units — and the source kind is a column, not a schema.
+//!
+//! `git` and `context` are still empty namespaces, and deliberately so even
+//! now that estate-git bytes are indexed: the `git.*` namespace is for
+//! *history* facts (commits, authorship, churn), which nothing in this build
+//! derives. The empty-table refusal doctrine the operations projection states
+//! applies — a table that can only ever answer "zero rows" is a false promise,
+//! not completeness — so every table still lands in the wave that lands its
+//! writer.
 //!
 //! ```text
-//! deny   ── pure predicate over a path (F10, the acquisition boundary)
-//! text   ── pure functions over bytes  (F6, extraction)
-//! scan   ── the walk: filesystem in, plain Rust out; no DB, no journal
-//! db     ── the one module that reaches the database driver, in or out
-//! record ── the thin three-step glue F1's crash window is stated over
+//! deny    ── pure predicate over a path (F10, the acquisition boundary)
+//! text    ── pure functions over bytes, and the one extractor routing table
+//! scan    ── the walk: filesystem in, plain Rust out; no DB, no journal
+//! git     ── the same, from a pinned commit's Git objects (X3a)
+//! overlay ── a Work surface's changes, over a base tree (X3a)
+//! db      ── the one module that reaches the database driver, in or out
+//! record  ── the thin three-step glue F1's crash window is stated over
+//! lane    ── the thin F6 glue: an intelligence permit and the blocking pool
 //! ```
 //!
-//! The dependency arrows run strictly downward through that list. `scan` does
-//! not import `db`, and `db` does not import the journal — which is what
-//! makes F6's "DB-touching glue kept thin and separately reviewable" a
-//! property of the module graph rather than a promise in a comment.
+//! The dependency arrows run strictly downward through that list. `scan`,
+//! `git` and `overlay` do not import `db`; `db` does not import the journal;
+//! and neither the walks nor `db` import the engine — which is what makes
+//! F6's "DB-touching glue kept thin and separately reviewable" a property of
+//! the module graph rather than a promise in a comment. `record` and `lane`
+//! are the two thin files at the bottom, and they are thin because everything
+//! above them is a pure function they merely call.
 //!
 //! (This file, like every sibling, is forbidden by
 //! `tests/x1_atlas_substrate.rs` from even *naming* the driver crate, so it
@@ -79,6 +93,9 @@
 
 pub mod db;
 pub mod deny;
+pub mod git;
+pub mod lane;
+pub mod overlay;
 pub mod record;
 pub mod scan;
 pub mod text;

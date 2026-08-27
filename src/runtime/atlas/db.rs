@@ -560,6 +560,71 @@ impl AtlasDb {
         Ok(targets.into_iter().map(|(id, _)| id).collect())
     }
 
+    /// Evict **every** generation belonging to one Work's overlay sources, in
+    /// one transaction, each leaving its own `generation_evicted` coverage row.
+    ///
+    /// A Work overlay describes a world only that Work can see: its base tree
+    /// plus that surface's uncommitted changes. When the Work is gone, the
+    /// world is gone, and rows describing it are no longer derived evidence
+    /// about anything — they are claims about a surface that does not exist.
+    /// So this is the one eviction that is *not* keyed on source bytes
+    /// changing (ruling §4's rule, which governs a durable source); an overlay
+    /// generation's lifetime is its Work's, and that is the rule for it.
+    ///
+    /// **Confirmed generations included**, unlike [`Self::evict_provisional`].
+    /// That difference is the whole point: an overlay's confirmed rows are
+    /// exactly the ones that must not outlive their Work.
+    ///
+    /// The read is **range-bounded on the overlay prefix itself** — plain
+    /// parameterized comparisons, so F12's rule against string-built SQL
+    /// holds without a `LIKE` (a Work id interpolated into a pattern would
+    /// let `%` and `_` mean things a caller passing an id never meant), and
+    /// the row cap bounds *this Work's* generations rather than the whole
+    /// estate. A cap shared with every other source's live generations could
+    /// push a retiring Work's overlays out of the window, and a confirmed
+    /// generation that survives here outlives its Work — exactly what this
+    /// eviction exists to forbid. The `starts_with` check stays as a belt
+    /// over the range's braces.
+    pub fn evict_work_overlays(&mut self, work_id: &str) -> Result<Vec<String>, AtlasError> {
+        let prefix = crate::runtime::atlas::overlay::overlay_source_prefix(work_id);
+        // The prefix ends in '/', so its exclusive upper bound is the same
+        // string with the final byte bumped to '0' ('/' + 1).
+        let mut upper = prefix.clone();
+        let last = upper.pop().expect("overlay prefix is never empty");
+        upper.push((last as u8 + 1) as char);
+        let mut statement = self.conn.prepare(
+            "SELECT generation_id, source_name FROM source.generations \
+             WHERE state != ? AND source_name >= ? AND source_name < ? \
+             ORDER BY observed_at DESC, generation_id DESC LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![
+            STATE_EVICTED,
+            prefix,
+            upper,
+            MAX_ROWS as i64
+        ])?;
+        let mut targets: Vec<(String, String)> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let source_name: String = row.get(1)?;
+            if source_name.starts_with(&prefix) {
+                targets.push((row.get(0)?, source_name));
+            }
+        }
+        drop(rows);
+        drop(statement);
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let reason = format!("the Work this overlay was scoped to ({work_id}) was retired");
+        let observed_at = crate::domain::event::rfc3339_utc_now();
+        let tx = self.conn.transaction()?;
+        for (generation_id, source_name) in &targets {
+            evict(&tx, generation_id, source_name, &reason, &observed_at)?;
+        }
+        tx.commit()?;
+        Ok(targets.into_iter().map(|(id, _)| id).collect())
+    }
+
     /// The newest **confirmed** generation for one source, if there is one.
     ///
     /// Every read below goes through the same filter. A provisional or
@@ -991,6 +1056,7 @@ mod tests {
             kind: SourceKind::LocalKnowledge,
             authority: AuthorityClass::EstateReadonly,
             content_key: hash.clone(),
+            revision: None,
             observed_at: crate::domain::event::rfc3339_utc_now(),
             files: vec![ScannedFile {
                 relative_path: "doc.md".to_string(),

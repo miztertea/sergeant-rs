@@ -38,6 +38,37 @@ pub const MARKDOWN_EXTRACTOR: &str = "markdown/v1";
 /// Extractor identity for plain text.
 pub const TEXT_EXTRACTOR: &str = "text/v1";
 
+/// Extensions routed to the Markdown extractor.
+pub const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown"];
+
+/// Extensions routed to the plain-text extractor.
+pub const TEXT_EXTENSIONS: &[&str] = &["txt", "text"];
+
+/// The extractor for a path, by extension, or `None` for a family this build
+/// does not claim.
+///
+/// Extension-driven and nothing else: sniffing content to guess a format
+/// would mean reading bytes to decide whether to read bytes, and the honest
+/// answer for an unclaimed extension is `unsupported`, which coverage
+/// reports. That reasoning is why this lives *here* rather than beside a
+/// particular walk — routing has to be one function, or a Markdown file
+/// acquired from a Git object could be extracted differently from the same
+/// bytes acquired from a knowledge directory, and F7's whole premise is that
+/// identical bytes plus an identical extractor identity are one extraction.
+pub fn extractor_for(relative: &str) -> Option<&'static str> {
+    let extension = std::path::Path::new(relative)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    if MARKDOWN_EXTENSIONS.contains(&extension.as_str()) {
+        Some(MARKDOWN_EXTRACTOR)
+    } else if TEXT_EXTENSIONS.contains(&extension.as_str()) {
+        Some(TEXT_EXTRACTOR)
+    } else {
+        None
+    }
+}
+
 /// One extracted structure unit, positioned in the original bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructureUnit {

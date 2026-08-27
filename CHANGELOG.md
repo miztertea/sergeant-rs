@@ -275,6 +275,36 @@ release.
 - New dependency: `globset`, for the exclusion set and `[[knowledge]]
   ignore` glob matching.
 
+### Estate-repository indexing (S3)
+
+- Atlas now indexes declared repositories as well as knowledge paths. A
+  repository is read **at the commit its Work admission pinned**, out of the
+  Git object store — never from the mount's working tree, and never by
+  fetching, pulling, switching or writing anything. A scan running while the
+  mount's HEAD moves stays on the commit it pinned; the move is reported as a
+  drift observation beside the scan, never blended into it.
+- Blob reads are batched: one `git cat-file --batch` process answers many
+  objects, instead of one Git process per file.
+- Cached extractions of repository content are keyed by **Git's own blob
+  object id** plus the extractor's identity. Bytes Git has already hashed are
+  never hashed a second time, and two identical files share one extraction by
+  construction. A repository generation is identified by its tree, so a commit
+  that changed no file — an empty commit, a reworded message — is recognized
+  as the same world and evicts nothing.
+- A Work surface is indexed as an **overlay** over its base commit: files the
+  Work changed are content-hashed from the surface, every unchanged file keeps
+  the base tree's object-id key, and the generation is identified by the base
+  commit composed with a digest of the changes. Overlay evidence is scoped to
+  its Work and removed when that Work is retired, leaving an explicit eviction
+  row.
+- The intelligence capacity lane declared in the host-runtime work now has a
+  real consumer: extraction acquires it, runs on the blocking pool, and is
+  bounded by `SGT_INTELLIGENCE_LANE_CAP`. It never draws on the execution
+  lane, so indexing a large repository cannot reduce the number of Works that
+  can run.
+- No new dependency: the existing Git-CLI module gained a batched object-read
+  primitive rather than the codebase gaining a Git library.
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain
