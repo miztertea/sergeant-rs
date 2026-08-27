@@ -159,7 +159,52 @@ release.
   nine acceptance criteria literally, citing the named pin for each
   already-proven claim and adding one self-contained structural test for
   the one gap (no merge primitive exists in the engine to cascade
-  through).
+  through); item 9's required-column half now has its own nested-leaf
+  test (`tests/m11_nested_workflow.rs::a_nested_leafs_required_column_contract_is_enforced_exactly_as_a_flat_ones_is`)
+  and its finalize half cites the pre-existing
+  `src/runtime/surface.rs::tests::the_finalize_sweep_reaches_a_nested_leafs_output`.
+
+#### V4 live evidence
+
+- **Opt-in live suites, serially, against the real `aria` opencode
+  endpoint** (`SERGEANT_OPENCODE_TESTS=1 cargo test --locked --test
+  opencode_backend -- --ignored --test-threads=1`): 8 passed, 0 failed
+  (`live_opencode_history_exports_the_whole_session`,
+  `live_opencode_minimal_turn_completes_with_usage`,
+  `live_opencode_probe_reports_the_installed_version`,
+  `live_opencode_resume_recalls_a_nonce_across_processes`,
+  `live_opencode_serve_abort_yields_an_interrupted_terminal_and_a_usable_session`,
+  `live_opencode_serve_actor_question_parks_and_resumes_on_answer`,
+  `live_opencode_serve_approval_round_trip_runs_the_gated_tool`,
+  `live_opencode_serve_minimal_turn_completes_with_usage`); finished in
+  140.55s. No capability differences from the measured `opencode`
+  admission row surfaced.
+- **Real end-to-end live proof** on a scratch estate
+  (`/var/tmp/hats2/v4-live-proof/estate`) against this box's real daemon
+  binary, bound to a scratch host-mode data dir via `SGT_DATA_DIR`
+  (`/var/tmp/hats2/v4-live-proof/data`) — never the estate's own
+  production journal. A real Work on the `opencode` backend (the `aria`
+  model) ran a workflow whose `CONTEXT.md` instructed the actor to submit
+  a child Work via the sanctioned `sgt -C "$SERGEANT_ESTATE_ROOT" run`
+  path; both parent (`01M10KPMV6K8JD6GYM1ZW0WA2V`) and child
+  (`01M10KR5W2ERFPCHMWH1ECQNNV`) reached `work.completed`. The child's own
+  `work.submitted` journal payload records the validated relation
+  verbatim: `"parent_work_id": "01M10KPMV6K8JD6GYM1ZW0WA2V"`,
+  `"parent_execution_id": "01M10KPQVS6ZJMT98CGBVP586S"` — no
+  `causation_unverified` marker, i.e. the claim validated clean against
+  the daemon's own journal, not merely accepted unverified.
+  - **A first attempt at this same proof produced no parent relation at
+    all** (neither `parent_work_id` nor a `causation_unverified` marker):
+    the actor's shell resolved the bare `sgt` on `$PATH` to a stale
+    installed binary (`~/.cargo/bin/sgt`, built before this sprint's
+    causation transport) rather than this branch's own build, so the
+    submitted child never claimed a parent to begin with. Not a
+    sergeant-rs defect — a live-environment `$PATH` artifact of this one
+    run — diagnosed by comparing binary contents (`strings … | grep
+    claimed_parent_work_id`) between the two, then re-run with the
+    branch's own build first on `$PATH`, which produced the clean result
+    above. Recorded here per the brief's own honesty requirement rather
+    than silently discarded as a bad take.
 
 ## [0.2.4] - 2026-08-25
 
