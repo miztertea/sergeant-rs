@@ -95,3 +95,14 @@ cov_stage_begin c3-v1d_probe_child_lifecycle
 cov_run cargo llvm-cov --no-report --test v1d_probe_child_lifecycle --locked || cov_fail "v1d_probe_child_lifecycle failed under instrumentation"
 cov_stage_end 2 "v1d spawns real sgt daemons and re-executes its own test binary; more than the \
 test binary's own profile must arrive, or no subprocess flushed"
+
+# S3 X2, wired at birth (the #231 lesson: a suite absent from every stage
+# list contributes nothing to Gate D however green it runs). Four of this
+# suite's tests drive real `sgt` client processes (`knowledge add`/`list`,
+# `repo add`, `init`), and two more start a real in-process daemon over a
+# data dir. Belongs beside m2/m6 rather than in C2's no-daemon-of-its-own
+# bucket. Floor 2: the test binary plus at least one flushed `sgt` client.
+cov_stage_begin c3-x2_knowledge_sources
+cov_run cargo llvm-cov --no-report --test x2_knowledge_sources --locked || cov_fail "x2_knowledge_sources failed under instrumentation"
+cov_stage_end 2 "x2_knowledge_sources spawns real sgt clients and starts real daemons; more than \
+the test binary's own profile must arrive, or no subprocess flushed"

@@ -758,6 +758,51 @@ pub async fn start_with(
         &first_seq_by_work,
     )?;
     startup::persist_or_remove(floor_state.as_ref(), data_dir)?;
+
+    // 2e (S3 X2, F1): Atlas's startup reconciliation.
+    //
+    // The two rebuild disciplines meet here, a few lines apart, and the
+    // difference between them is the whole of F1. `Analytics::begin_rebuild`
+    // above *deleted* its file and refolded it from the journal, because the
+    // operations tables are a pure fold of it. Atlas is opened and **kept**:
+    // its `source.*` and `meta.coverage` rows are derived from source bytes
+    // plus extractor identity, and no journal replay reproduces them.
+    // Opening it reconciles it (see `AtlasDb::open`) — any generation a crash
+    // left with rows and no `source.scanned` summary is evicted, leaving an
+    // explicit `generation_evicted` coverage row rather than a half-scan
+    // reported as coverage.
+    //
+    // Opened and dropped rather than held: nothing in this build reads Atlas
+    // while the daemon runs (`sgt intelligence status` and the `map` surface
+    // land with their own wave), so keeping a second connection open for the
+    // process lifetime would buy nothing. What must happen at startup is the
+    // reconciliation, and that is what this does.
+    //
+    // And only when the file is already there. Opening creates it, and
+    // creating it here would mean every host that has never declared a
+    // knowledge source pays a database creation on every start for a feature
+    // it has never used (R1) — while a file that does not exist has, by
+    // definition, no crash-window generation to reconcile. The scanner
+    // creates the store the first time it actually writes to it.
+    if crate::runtime::atlas::db::atlas_db_path(data_dir).exists() {
+        match crate::runtime::atlas::db::AtlasDb::open(data_dir) {
+            Ok(atlas) => tracing::debug!(
+                target: "sergeant::atlas",
+                path = %atlas.path().display(),
+                "atlas opened and reconciled at startup"
+            ),
+            // Never fatal. Atlas is derived evidence; a daemon that refused
+            // to start because a derived store was unreadable would trade
+            // every Work in the estate for an index (A1-01: the journal, Git
+            // and the original bytes are authority — Atlas is not).
+            Err(e) => tracing::warn!(
+                target: "sergeant::atlas",
+                error = %e,
+                "atlas could not be opened at startup; source intelligence is unavailable this run"
+            ),
+        }
+    }
+
     let rebuild_ms = u64::try_from(rebuild_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let startup_cache = plan.startup_cache_tag();
     // The oldest surviving seq (1 on every W2 production path — the floor

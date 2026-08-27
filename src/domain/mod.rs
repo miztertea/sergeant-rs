@@ -6,6 +6,7 @@ pub mod event;
 pub mod execution;
 pub mod manifest;
 pub mod profile;
+pub mod source;
 pub mod work;
 pub mod workflow;
 

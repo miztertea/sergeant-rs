@@ -234,6 +234,47 @@ release.
   daemon reports (`/v1/analytics`, `sgt analytics`) and every answer it
   gives is unchanged, and the existing projection suite passes as-is.
 
+### Knowledge sources and coverage (S3)
+
+- `sergeant.toml` gains `[[knowledge]]`: a named local path the estate reads
+  as **evidence**, with optional `ignore` globs. It is never a mount —
+  nothing is cloned, no worktree is cut from it, nothing writes to it — and
+  a declared path that resolves inside a repository mount, inside
+  `surfaces_dir`, or inside `data_dir` is refused by name at manifest parse,
+  because those are exactly the locations the estate itself mutates.
+  `sgt knowledge add`/`list` declare and read them back; both are pure
+  manifest operations with no daemon involved.
+- Atlas gains its first real writer, the local-knowledge scanner, and with
+  it the four tables it populates: `source.generations`, `source.files`,
+  `source.units` and `meta.coverage`. Markdown and plain text are extracted
+  into document and heading-delimited section units carrying byte offsets
+  into the original file, so every derived unit can be traced back to the
+  bytes it came from. Extraction is a set of pure functions over bytes; the
+  database glue around them is separate and thin.
+- Secrets are excluded at the acquisition boundary, before a file is opened:
+  dotfiles and dot-directories, `.env` files, private keys, keystores, and
+  credential/secret files by convention, plus each source's own `ignore`
+  globs — which extend that floor and can never narrow it. Excluded paths
+  are **counted and reported** as excluded, with the pattern that refused
+  them, rather than being silently absent.
+- Every path a scan sees leaves exactly one coverage row (`discovered`,
+  `indexed`, `excluded`, `unavailable`, `unsupported`, `error`, or
+  `generation_evicted`), and each completed scan journals exactly one
+  compact `source.scanned` summary — source, generation, content key,
+  counts, extractor identities — never a per-file event stream.
+- Re-scanning a source whose bytes have not changed writes nothing and
+  evicts nothing; a generation is superseded only when the content it was
+  derived from actually changed, and the superseded generation leaves an
+  explicit eviction row rather than vanishing.
+- A crash between a scan's rows and its summary now leaves neither reported.
+  Rows commit as one provisional generation, the summary is journaled, and a
+  second transaction confirms it and evicts its predecessor; no read path
+  can see an unconfirmed generation, and opening Atlas — which every daemon
+  start does — evicts any that a crash left behind, leaving a
+  `generation_evicted` coverage row that names the crash window.
+- New dependency: `globset`, for the exclusion set and `[[knowledge]]
+  ignore` glob matching.
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain

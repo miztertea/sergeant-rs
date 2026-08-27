@@ -547,6 +547,7 @@ mod tests {
             name: "sweep-fixture".to_string(),
             root: root.to_path_buf(),
             repositories,
+            knowledge: Vec::new(),
             default_backend: None,
             default_workflow: None,
             profiles: Vec::new(),

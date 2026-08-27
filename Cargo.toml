@@ -19,6 +19,24 @@ axum = "0.8"
 blake3 = "1.8.6"
 clap = { version = "4.6.6", features = ["derive"] }
 duckdb = { version = "1", features = ["bundled"] }
+# S3 X2 (F10): the scanner needs glob matching for two things a manifest and a
+# constant both spell in glob syntax — the built-in secrets deny set and each
+# `[[knowledge]] ignore` entry. Rungs, in order: R2 fails (nothing in this
+# crate matches globs; `is_plain_name` answers a different question), R3 fails
+# (std has no glob matcher and `Path` comparison cannot express `**/*.pem`),
+# R4 fails (the OS offers no portable one — shell globbing would mean spawning
+# a shell over operator-supplied patterns, which is worse than a dependency in
+# every respect), R5 fails (nothing already in the graph exposes glob
+# matching; `regex` is present but making operators write regexes for an
+# `ignore` list is a worse contract, and translating globs to regexes by hand
+# is the very R7 this rung exists to avoid), R6 fails (a correct `**`
+# implementation with alternates and character classes is not one line — it is
+# the bug farm every hand-rolled matcher becomes). R5-as-new-edge → declare
+# globset: ripgrep's own matcher, `default-features = false` because the only
+# default feature is `log`, which buys nothing here. Its own graph is
+# aho-corasick + regex-automata/regex-syntax, all already resolved for this
+# build, plus `bstr` and `fnv`.
+globset = { version = "0.4.20", default-features = false }
 include_dir = { version = "0.7.4", default-features = false }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }

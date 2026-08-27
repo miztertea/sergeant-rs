@@ -3962,6 +3962,7 @@ fn manifest_error_code(e: &ManifestError) -> &'static str {
         ManifestError::NoEstate { .. } => "no_estate",
         ManifestError::InvalidName { .. } => "invalid_name",
         ManifestError::RepoAlreadyDeclared { .. } => "repo_already_declared",
+        ManifestError::KnowledgeAlreadyDeclared { .. } => "knowledge_already_declared",
         ManifestError::RepoNotDeclared { .. } => "repo_not_declared",
         ManifestError::RepoInUseByGroups { .. } => "repo_in_use_by_groups",
         ManifestError::GroupNotDeclared { .. } => "group_not_declared",
@@ -3985,9 +3986,9 @@ fn manifest_error_status(e: &ManifestError) -> StatusCode {
         | ManifestError::Invalid { .. }
         | ManifestError::ExistingPathNotAGitRepository { .. }
         | ManifestError::MalformedSection { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-        ManifestError::Locked { .. } | ManifestError::RepoAlreadyDeclared { .. } => {
-            StatusCode::CONFLICT
-        }
+        ManifestError::Locked { .. }
+        | ManifestError::RepoAlreadyDeclared { .. }
+        | ManifestError::KnowledgeAlreadyDeclared { .. } => StatusCode::CONFLICT,
         ManifestError::NoEstate { .. }
         | ManifestError::RepoNotDeclared { .. }
         | ManifestError::GroupNotDeclared { .. }
@@ -4777,6 +4778,12 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_ADMISSION_RESUMED,
     crate::runtime::prune::KIND_PRUNE_INTENT,
     crate::runtime::prune::KIND_PRUNE_COMPLETED,
+    // S3 X2: the one compact summary a completed source scan journals. Named
+    // here for the same reason as every kind above — a journaled kind absent
+    // from this list is a frame every enumerating client silently drops — and
+    // it is *one* kind per completed scan, never one per file, which is what
+    // makes putting it on the live stream affordable at all.
+    crate::domain::source::KIND_SOURCE_SCANNED,
 ];
 
 /// Frame names this stream sends that are **not** journaled `KIND_*` events
