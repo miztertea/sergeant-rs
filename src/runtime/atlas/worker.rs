@@ -49,6 +49,27 @@
 //! `SIGABRT`'d worker is observed) are all **kill the group, then reap** —
 //! never kill without reap, which would leave a zombie an orphan check
 //! cannot distinguish from a live leak.
+//!
+//! # Memory containment (G2 amendment — the fault class the deadline alone
+//! left open)
+//!
+//! The deadline above is a HANG guard: it bounds how long a child may run,
+//! not how much address space it may reserve while running. Without a
+//! per-child ceiling, an allocation blowup raises host-global memory
+//! pressure long before a slow-growing worker would ever trip its own
+//! deadline, and once pressure is host-global the kernel OOM killer picks
+//! *its own* victim rather than the runaway child — on this estate's own
+//! host that has repeatedly meant infrastructure dies, not the hog. So
+//! [`spawn_and_collect`] also arms [`WORKER_ADDRESS_SPACE_LIMIT_BYTES`] as
+//! `RLIMIT_AS` on the child (`cap_worker_address_space`), in the identical
+//! post-fork, pre-exec, one-thread window
+//! [`crate::backend::child::harden_probe_child`]'s own `PR_SET_PDEATHSIG`
+//! closure already documents as safe for this call shape — a second concern
+//! armed the same way at the same call site, not a second mechanism. A
+//! child that exceeds it dies on its own, well inside the deadline, and is
+//! reported the same way every other Y1 fault is: a named [`CoverageRow`]
+//! ([`WorkerFault::MemoryLimitExceeded`]), never a silent absorption into
+//! host-wide pressure.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -65,6 +86,21 @@ use crate::runtime::atlas::deny::{AcquisitionFilter, Verdict};
 
 /// How often [`run_worker`] polls a live child against its deadline.
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The address-space (`RLIMIT_AS`) ceiling armed on every worker child at
+/// spawn (`cap_worker_address_space`) — the memory-fault class the deadline
+/// alone cannot close (module doc, "Memory containment").
+///
+/// **512 MiB.** Sized generously for real document parsing — a worker
+/// holding a large document's whole decoded text plus working structures in
+/// memory at once comfortably fits well under this — while staying far
+/// below ordinary host headroom, so a legitimate worker never trips it and
+/// a runaway one dies on its own long before it could raise host-global
+/// pressure or contend with anything else running on the host. `pub` (not
+/// `pub(crate)`) so the deterministic memory-fault acceptance test
+/// (`tests/y1_worker_transport.rs`) can size its own deadline against the
+/// real value rather than duplicating it.
+pub const WORKER_ADDRESS_SPACE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 
 /// How long [`run_worker`] waits, after the child has already exited or been
 /// reaped, for its stdout-draining thread to hand back what it read.
@@ -356,6 +392,20 @@ enum WorkerFault {
     /// The worker was terminated by a signal (a `SIGABRT`'d worker lands
     /// here, `signal` is the raw number).
     Signaled { signal: i32, stderr_tail: String },
+    /// The worker was terminated after exceeding
+    /// [`WORKER_ADDRESS_SPACE_LIMIT_BYTES`] (`RLIMIT_AS`, armed by
+    /// `cap_worker_address_space` at spawn).
+    ///
+    /// The kernel enforces the ceiling by failing the child's own
+    /// allocation (`RLIMIT_AS` makes the mapping syscall behind it return
+    /// `ENOMEM`), so the worker still self-terminates by signal rather than
+    /// being `SIGKILL`'d from outside — [`fault_for_exit`] tells this apart
+    /// from an ordinary [`Self::Signaled`] by the allocator's own "memory
+    /// allocation of N bytes failed" message in `stderr_tail`, not by which
+    /// raw signal number the platform happens to raise for an aborted
+    /// allocation (that varies by target and Rust toolchain version, the
+    /// message does not).
+    MemoryLimitExceeded { signal: i32, stderr_tail: String },
     /// The worker exited on its own, with a non-zero status.
     ExitedNonZero {
         code: Option<i32>,
@@ -382,6 +432,13 @@ impl WorkerFault {
             } => format!(
                 "supervised parse worker was terminated by signal {signal}; stderr: \
                  {stderr_tail}"
+            ),
+            Self::MemoryLimitExceeded {
+                signal,
+                stderr_tail,
+            } => format!(
+                "supervised parse worker exceeded its {WORKER_ADDRESS_SPACE_LIMIT_BYTES}-byte \
+                 address-space limit and was terminated (signal {signal}); stderr: {stderr_tail}"
             ),
             Self::ExitedNonZero { code, stderr_tail } => format!(
                 "supervised parse worker exited with status {code:?}; stderr: {stderr_tail}"
@@ -448,6 +505,9 @@ fn spawn_and_collect(spawn: &WorkerSpawn) -> Result<Vec<u8>, WorkerFault> {
     // and killed inside this one function, on one thread — exactly the shape
     // `ChildLifetime::Probe` documents as safe to harden this way (#310).
     child::harden_probe_child(&mut command);
+    // RLIMIT_AS (Linux): the memory-fault class #310's hardening above does
+    // not cover — see the module doc's "Memory containment" section.
+    cap_worker_address_space(&mut command);
 
     let mut process = command
         .spawn()
@@ -540,16 +600,71 @@ fn spawn_and_collect(spawn: &WorkerSpawn) -> Result<Vec<u8>, WorkerFault> {
     }
 }
 
+/// Arm [`WORKER_ADDRESS_SPACE_LIMIT_BYTES`] as `RLIMIT_AS` on `command`'s
+/// child, in the identical post-fork, pre-exec window
+/// [`child::harden_probe_child`]'s own `PR_SET_PDEATHSIG` closure already
+/// documents as safe for this call shape: spawned and killed inside one
+/// function, on one thread ([`child::ChildLifetime::Probe`]'s own doc).
+///
+/// `setrlimit` is a plain syscall — no allocation, no libc global state
+/// beyond the kernel's own per-process limit table — the same class of
+/// async-signal-safe primitive `harden_probe_child`'s own SAFETY comment
+/// already relies on for `prctl`/`getppid` in this same window.
+///
+/// Linux-only, matching `harden_probe_child`'s own `PR_SET_PDEATHSIG` gate:
+/// this module makes no memory-containment promise on a platform where
+/// neither mechanism exists (module doc, "Memory containment").
+#[cfg(target_os = "linux")]
+fn cap_worker_address_space(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let limit = WORKER_ADDRESS_SPACE_LIMIT_BYTES as libc::rlim_t;
+    // SAFETY: see this function's own doc, and `harden_probe_child`'s
+    // matching SAFETY comment — identical post-fork window, identical
+    // async-signal-safe-only constraint, satisfied the same way.
+    unsafe {
+        command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: limit,
+                rlim_max: limit,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// The non-Linux half of [`cap_worker_address_space`]: named rather than
+/// omitted, exactly the reasoning [`child::harden_probe_child`]'s own
+/// non-unix arm gives for doing the same.
+#[cfg(not(target_os = "linux"))]
+fn cap_worker_address_space(_command: &mut Command) {}
+
 /// `None` for a clean exit; `Some` naming a signal termination or a
 /// non-zero status, stderr tail attached either way.
+///
+/// A signal termination whose stderr carries Rust's own allocator-failure
+/// message ("memory allocation of ... bytes failed") is reported as
+/// [`WorkerFault::MemoryLimitExceeded`] rather than a plain
+/// [`WorkerFault::Signaled`] — the message, not the raw signal number
+/// (platform- and toolchain-dependent), is what reliably names an
+/// `RLIMIT_AS` kill.
 fn fault_for_exit(status: ExitStatus, process: &mut std::process::Child) -> Option<WorkerFault> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
+            let stderr_tail = drain_stderr(process);
+            if stderr_tail.contains("memory allocation of") && stderr_tail.contains("failed") {
+                return Some(WorkerFault::MemoryLimitExceeded {
+                    signal,
+                    stderr_tail,
+                });
+            }
             return Some(WorkerFault::Signaled {
                 signal,
-                stderr_tail: drain_stderr(process),
+                stderr_tail,
             });
         }
     }

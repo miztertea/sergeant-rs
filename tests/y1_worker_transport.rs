@@ -27,7 +27,9 @@ use sergeant_rs::domain::source::Coverage;
 use sergeant_rs::runtime::atlas::db::AtlasDb;
 use sergeant_rs::runtime::atlas::deny::AcquisitionFilter;
 use sergeant_rs::runtime::atlas::lane::run_worker_on_lane;
-use sergeant_rs::runtime::atlas::worker::{WorkerIdentity, WorkerOutcome, WorkerSpawn, run_worker};
+use sergeant_rs::runtime::atlas::worker::{
+    WORKER_ADDRESS_SPACE_LIMIT_BYTES, WorkerIdentity, WorkerOutcome, WorkerSpawn, run_worker,
+};
 use sergeant_rs::runtime::engine::Engine;
 
 /// The real worker binary Cargo built alongside this test binary (`sgt` is
@@ -46,6 +48,18 @@ const FAULT_DEADLINE: Duration = Duration::from_millis(400);
 /// per-case `FAULT_DEADLINE` above would never fire and this is what would
 /// catch it instead of the test hanging forever.
 const TEST_OUTER_BOUND: Duration = Duration::from_secs(20);
+/// Deliberately generous, and used by exactly one test
+/// ([`an_allocating_worker_is_killed_by_its_address_space_cap_not_the_deadline`]):
+/// the `--fault allocate` mode grows by 8 MiB every 20ms
+/// (`src/bin/atlas_worker.rs`'s own `Fault::Allocate` doc), so it reaches
+/// [`WORKER_ADDRESS_SPACE_LIMIT_BYTES`] (512 MiB) in roughly 1.3s regardless
+/// of host memory pressure — `RLIMIT_AS` bounds virtual address space, not
+/// resident memory, so this is deterministic on any host. This deadline is
+/// wide enough that the address-space cap always wins the race, on purpose:
+/// a deadline short enough to also plausibly fire (like [`FAULT_DEADLINE`]
+/// above) would leave the test unable to tell "killed by the cap" apart from
+/// "killed by the clock".
+const MEMORY_CAP_TEST_DEADLINE: Duration = Duration::from_secs(8);
 
 fn deny() -> AcquisitionFilter {
     AcquisitionFilter::new(&[]).expect("compile default deny set")
@@ -228,6 +242,13 @@ const FAULT_CASES: &[FaultCase] = &[
         fault: "exit-nonzero",
         names: "status",
     },
+    // With FAULT_DEADLINE this short (400ms), the allocate fault reaches
+    // only ~160 MiB before the clock fires — well under
+    // WORKER_ADDRESS_SPACE_LIMIT_BYTES (512 MiB) — so this case is still the
+    // HANG-guard proof, same as it was before the memory cap existed. The
+    // memory-guard proof, with a deadline wide enough for the cap to win
+    // instead, is `an_allocating_worker_is_killed_by_its_address_space_cap_not_the_deadline`
+    // below.
     FaultCase {
         fault: "allocate",
         names: "deadline",
@@ -321,6 +342,72 @@ async fn a_fault_worker_leaves_the_daemon_up_the_permit_freed_and_a_named_covera
     })
     .await
     .expect("the whole fault-injection walk must finish well inside its outer bound");
+}
+
+/// **The memory-fault class the deadline alone left open (independent
+/// review finding, refuter-confirmed, folded into the plan as G2's
+/// amendment):** an allocation blowup must be killed by the address-space
+/// cap itself, deterministically, and distinguishably from the deadline —
+/// not merely "eventually killed by something". A deadline generous enough
+/// that the cap has to fire first ([`MEMORY_CAP_TEST_DEADLINE`]), plus an
+/// elapsed-time assertion showing the kill landed well before that deadline
+/// could have fired, is what makes this a proof of the memory guard rather
+/// than a second proof of the hang guard already covered above.
+#[test]
+fn an_allocating_worker_is_killed_by_its_address_space_cap_not_the_deadline() {
+    let input = b"irrelevant for a memory-fault run".to_vec();
+    let identity = identity_for(&input);
+
+    let started = std::time::Instant::now();
+    let outcome = run_worker(
+        spawn(
+            vec![
+                "--generation".to_string(),
+                identity.generation_id.clone(),
+                "--extractor".to_string(),
+                identity.extractor.clone(),
+                "--fault".to_string(),
+                "allocate".to_string(),
+            ],
+            input,
+            MEMORY_CAP_TEST_DEADLINE,
+        ),
+        &identity,
+        &deny(),
+    );
+    let elapsed = started.elapsed();
+
+    let WorkerOutcome::Refused(row) = outcome else {
+        panic!("an allocation past the address-space cap must be refused: {outcome:?}");
+    };
+    assert_eq!(row.status, Coverage::Error, "{row:?}");
+    let detail = row.detail.clone().unwrap_or_default();
+
+    // Distinguishes cap-kill from deadline-kill by what the row actually
+    // says, not by inference: `WorkerFault::TimedOut`'s own detail names
+    // "exceeded its deadline" and nothing else does.
+    assert!(
+        !detail.contains("exceeded its deadline"),
+        "must be killed by the address-space cap, not the wall-clock deadline: {detail:?}"
+    );
+    assert!(
+        detail.contains(&WORKER_ADDRESS_SPACE_LIMIT_BYTES.to_string())
+            && detail.contains("address-space"),
+        "coverage detail must name the address-space limit that killed it: {detail:?}"
+    );
+
+    // Distinguishes cap-kill from deadline-kill by *when* it happened, not
+    // only by what the row says: a deadline-kill could not possibly return
+    // before MEMORY_CAP_TEST_DEADLINE elapsed, so landing well inside half
+    // of it is proof the cap — not the clock — ended the child. RLIMIT_AS
+    // bounds virtual address space, not resident memory, so this timing is
+    // independent of host memory pressure and safe to assert without
+    // flaking under load.
+    assert!(
+        elapsed < MEMORY_CAP_TEST_DEADLINE / 2,
+        "the address-space cap must fire well inside the deadline budget, not race it: killed \
+         after {elapsed:?}, deadline was {MEMORY_CAP_TEST_DEADLINE:?}"
+    );
 }
 
 /// No `sgt`-shaped, `opencode`, or `codex` children may survive the suite
