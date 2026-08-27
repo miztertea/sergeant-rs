@@ -414,8 +414,10 @@ release.
   pinned by tests that fail when the situation changes, so neither can close
   or widen unnoticed.
 - Combined dependency footprint, measured once at the sprint boundary rather
-  than inferred by adding the two per-wave deltas: against the pre-Atlas
-  baseline, `Cargo.lock` gains 10 packages, a cold `cargo build --tests` gains
+  than inferred by adding the two per-wave deltas: against the baseline before
+  the two heavy dependency additions — the integration head after X3a, the same
+  commit the X3b evidence measured, which already carries X1–X3a's own code —
+  `Cargo.lock` gains 10 packages, a cold `cargo build --tests` gains
   ~15 s (+10%), dev `target/` gains 1.41 GB (+9.7%), the dev binary gains 12.5
   MiB (+5.0%) and — measured for the first time this sprint — the **release**
   binary gains 4.66 MiB (+6.9%), 67.8 MiB to 72.4 MiB. The grammar objects are

@@ -920,6 +920,144 @@ fn a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli() {
 
 // ------------------------------------------------------- item 13: no client SQL
 
+/// One string literal lifted out of a Rust source file, with the lines it
+/// spans — the unit [`sql_literal_holes`] reasons over.
+struct Literal {
+    start_line: usize,
+    end_line: usize,
+    text: String,
+}
+
+/// Every string literal in `source`, in file order, line comments skipped.
+///
+/// A character scan rather than a line scan, and that is the point: a Rust
+/// string literal may span lines (rustfmt's trailing `\` continuation), so a
+/// per-line reader cannot tell a literal's interior from the code around it.
+/// Line comments are skipped because db.rs's own doc comments quote SQL in
+/// prose, and prose is not a statement.
+///
+/// `src/runtime/atlas/db.rs` carries no raw strings, no block comments and no
+/// character literal holding a quote; the two `assert!`s in
+/// [`sql_literal_holes`] fail loudly if that ever stops being true, rather
+/// than letting the scan silently see nothing.
+fn string_literals(source: &str) -> Vec<Literal> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = Vec::new();
+    let mut line = 1usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\n' => {
+                line += 1;
+                i += 1;
+            }
+            '/' if chars.get(i + 1) == Some(&'/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '"' => {
+                let start_line = line;
+                let mut text = String::new();
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' {
+                        if chars.get(i + 1) == Some(&'\n') {
+                            line += 1;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if chars[i] == '\n' {
+                        line += 1;
+                    }
+                    text.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+                out.push(Literal {
+                    start_line,
+                    end_line: line,
+                    text,
+                });
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Every interpolation hole in every SQL-carrying string literal in `source`,
+/// rendered as `<enclosing fn>: <hole> <- <filler>` in file order.
+///
+/// A hole is any `{` that is not the `{{` escape, and it is reported with the
+/// text up to its `}` — so a named hole (`{table}`) is reported as `{table}`
+/// and shows up as a new, unpinned entry rather than being skipped the way a
+/// "leading `{}` only" test would skip it.
+fn sql_literal_holes(source: &str, lines: &[&str]) -> Vec<String> {
+    const KEYWORDS: [&str; 5] = ["SELECT", "INSERT", "UPDATE", "DELETE", "FROM"];
+
+    let literals = string_literals(source);
+    assert!(
+        literals.len() > 40,
+        "the literal scanner must actually be reading db.rs, saw {} literals",
+        literals.len()
+    );
+    let sql: Vec<&Literal> = literals
+        .iter()
+        .filter(|literal| KEYWORDS.iter().any(|word| literal.text.contains(word)))
+        .collect();
+    assert!(
+        sql.len() > 10,
+        "the scanner must actually be finding Atlas's SQL, saw {} statements",
+        sql.len()
+    );
+
+    let mut out = Vec::new();
+    for literal in sql {
+        // The enclosing function: the nearest `fn` declaration at or above the
+        // literal's first line.
+        let function = lines[..literal.start_line]
+            .iter()
+            .rev()
+            .find_map(|line| {
+                let trimmed = line.trim_start();
+                let rest = trimmed
+                    .strip_prefix("pub fn ")
+                    .or_else(|| trimmed.strip_prefix("fn "))?;
+                Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest))
+            })
+            .unwrap_or("<no enclosing fn>");
+        // The filler: the first non-blank line after the literal closes.
+        let filler = lines[literal.end_line..]
+            .iter()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
+            .unwrap_or("<nothing>");
+
+        let text: Vec<char> = literal.text.chars().collect();
+        let mut i = 0usize;
+        while i < text.len() {
+            if text[i] != '{' {
+                i += 1;
+                continue;
+            }
+            if text.get(i + 1) == Some(&'{') {
+                i += 2; // `{{` is an escaped brace, not a hole.
+                continue;
+            }
+            let close = text[i..]
+                .iter()
+                .position(|c| *c == '}')
+                .map_or(text.len() - 1, |offset| i + offset);
+            let hole: String = text[i..=close].iter().collect();
+            out.push(format!("{function}: {hole} <- {filler}"));
+            i = close + 1;
+        }
+    }
+    out
+}
+
 /// §17.13 — the map and status surfaces answer in source/generation/coverage
 /// terms, and there is no way to hand the store a query.
 ///
@@ -930,59 +1068,73 @@ fn a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli() {
 #[test]
 fn a1a_item_13_no_client_sql_reaches_the_store() {
     let db = read("src/runtime/atlas/db.rs");
+    let lines: Vec<&str> = db.lines().collect();
 
-    // 1. No public API takes SQL. `query_identity` takes the SQL that ran, to
-    //    hash it into provenance — it executes nothing — so it is named as the
-    //    single allowed exception rather than matched around.
-    for line in db.lines().filter(|line| line.contains("pub fn ")) {
-        if line.contains("pub fn query_identity(") {
+    // 1. No public API takes SQL. The scan walks whole `pub fn` *signatures* —
+    //    accumulating lines until the parameter list's parentheses close —
+    //    rather than single lines, because rustfmt splits a long signature
+    //    across lines and a per-line scan would wave through an `sql: &str`
+    //    parameter that landed on its own line. `query_identity` takes the SQL
+    //    that ran, to hash it into provenance — it executes nothing — so it is
+    //    named as the single allowed exception rather than matched around.
+    assert!(
+        db.contains("pub fn query_identity("),
+        "the one named exception must still exist, or this check is excusing nothing"
+    );
+    let mut signatures = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        if !line.trim_start().starts_with("pub fn ") {
+            continue;
+        }
+        let mut signature = String::new();
+        let mut depth = 0i32;
+        for candidate in &lines[index..] {
+            signature.push_str(candidate.trim());
+            signature.push(' ');
+            depth += candidate.matches('(').count() as i32;
+            depth -= candidate.matches(')').count() as i32;
+            if depth <= 0 {
+                break;
+            }
+        }
+        signatures += 1;
+        if signature.contains("pub fn query_identity(") {
             continue;
         }
         assert!(
-            !line.contains("sql:"),
-            "Atlas exposes an SQL-taking entry point, which item 13 forbids: {line}"
+            !signature.contains("sql:"),
+            "Atlas exposes an SQL-taking entry point, which item 13 forbids: {signature}"
         );
     }
+    assert!(
+        signatures > 20,
+        "the signature scan must actually be walking Atlas's public API, saw {signatures}"
+    );
 
     // 2. Every statement is a literal. The only interpolation any SQL-building
     //    format string performs is `reader_call(format)`, a compile-time
     //    constant chosen by a three-variant enum — the operator's own path is
     //    bound as a `?` parameter, never pasted in.
-    let mut interpolations = Vec::new();
-    for (index, line) in db.lines().enumerate() {
-        let Some(open) = line.find('{') else { continue };
-        if !line.contains("SELECT")
-            && !line.contains("INSERT")
-            && !line.contains("DELETE")
-            && !line.contains("UPDATE")
-            && !line.contains("FROM")
-        {
-            continue;
-        }
-        // `{}` in an SQL literal is a hole something fills. The filler is the
-        // first line after the literal ends — so skip the literal's own
-        // continuation lines, which end in a backslash or close the string.
-        if line[open..].starts_with("{}") {
-            let filler = db
-                .lines()
-                .skip(index + 1)
-                .map(str::trim)
-                .find(|l| !l.is_empty() && !l.ends_with('\\') && !l.ends_with("\","))
-                .unwrap_or("");
-            interpolations.push(filler.to_string());
-        }
-    }
-    assert!(
-        !interpolations.is_empty(),
-        "this check must actually find the canned readers' format strings"
+    //
+    //    This walks db.rs's string literals character by character, because a
+    //    line-based scan is evadable three ways: a literal rustfmt split
+    //    across lines, a *named* hole (`{table}`) rather than a positional
+    //    one, and a hole sitting on a continuation line that carries no SQL
+    //    keyword of its own. Every hole in every SQL literal is collected
+    //    wherever it sits, and the resulting list is pinned exhaustively — the
+    //    same discipline item 12 applies to the CLI's `AtlasDb::` call list.
+    let holes = sql_literal_holes(&db, &lines);
+    assert_eq!(
+        holes.iter().map(String::as_str).collect::<Vec<_>>(),
+        vec![
+            "rows_sql: {} <- reader_call(format)",
+            "row_count_sql: {} <- reader_call(format)",
+            "column_profile_sql: {} <- reader_call(format)",
+        ],
+        "the exhaustive list of (function, hole, filler) triples for every interpolation in \
+         every SQL literal in db.rs. A new hole — positional or named, on any line — is a \
+         query-surface decision, not a refactor"
     );
-    for filler in &interpolations {
-        assert!(
-            filler.starts_with("reader_call(format)"),
-            "an SQL literal is interpolated with `{filler}`; the only fragment that may vary \
-             is the enum-chosen reader call"
-        );
-    }
 
     // 3. The verb set is closed, and the two deferred verbs stay deferred. The
     //    verb list itself, not the prose around it — `map --help`'s own text
