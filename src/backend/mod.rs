@@ -287,6 +287,121 @@ pub struct StartRequest {
     /// read it as a mutation surface of nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<BindingSummary>,
+    /// W1 §6 (S2 E5/E6): the canonical estate root this Work was submitted
+    /// against — the third of the three values [`causation_env`] injects, and
+    /// the only one this request did not already carry.
+    ///
+    /// Same source as the `workspace_id` stamp every committed event gets
+    /// (`WorkIndexRow::estate_root`, folded once from `work.submitted`), so
+    /// an actor's `sgt -C "$SERGEANT_ESTATE_ROOT" run` addresses exactly the
+    /// estate the daemon will validate its claim against — never a root
+    /// re-derived from a worktree path.
+    ///
+    /// `#[serde(default)]` on [`Self::instruction_policy`]'s precedent: a
+    /// `StartRequest` journaled before this field existed replays as `None`,
+    /// which is exactly what it was — no estate coordinate was transported,
+    /// so no causation env was injected either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estate_root: Option<PathBuf>,
+}
+
+/// `SERGEANT_ESTATE_ROOT` — the estate a child `sgt -C … run` must address
+/// (W1 §6, S2 E5).
+///
+/// **Not `SGT_ESTATE_ROOT`.** [`crate::harness`]'s variable of that
+/// near-identical name is a different mechanism entirely: it is set once when
+/// `sgt <harness>` execs a Captain session, it is read back only to decorate
+/// an exact-root refusal message, and it never travels to a managed
+/// execution. This one is set per managed execution, carries the estate the
+/// *daemon* recorded for that Work, and is validated against the journal
+/// before any relation is recorded. Neither may be read in place of the
+/// other.
+pub const SERGEANT_ESTATE_ROOT_ENV: &str = "SERGEANT_ESTATE_ROOT";
+/// `SERGEANT_WORK_ID` — the Work whose execution is running (W1 §6, S2 E5).
+pub const SERGEANT_WORK_ID_ENV: &str = "SERGEANT_WORK_ID";
+/// `SERGEANT_EXECUTION_ID` — the execution itself (W1 §6, S2 E5).
+pub const SERGEANT_EXECUTION_ID_ENV: &str = "SERGEANT_EXECUTION_ID";
+
+/// The three causation values one managed execution transports to whatever it
+/// launches (W1-07, S2 E6) — one helper, so a sixth adapter adds a call and
+/// not a sixth copy of the merge.
+///
+/// **Exactly three values, and this is the rung log for that.** W1-07 is R7:
+/// R1 yes (a child `sgt run` cannot name its parent otherwise); R2 no — no
+/// managed-execution identity env existed; R3–R6 cannot supply product
+/// lineage. Binary discoverability is deliberately *not* a fourth value: a
+/// child resolves `sgt` off the inherited PATH exactly as the adapters
+/// already resolve `claude`/`codex`/`agy`/`opencode`, with the same
+/// PATH-diagnostic failure mode and no new mechanism.
+///
+/// **Merged last, always.** `Profile.env` is workflow-authored plaintext and
+/// occupies the same map; injecting after it means the transport hint is at
+/// least what sergeant itself intended to send. That is a hygiene property,
+/// not a security one — W1 §6 is explicit that "environment variables are a
+/// transport hint, not trusted lineage", and the daemon validates every claim
+/// against its own journal regardless of what reached the actor.
+///
+/// **Never handed to a probe.** A probe is not a `StartRequest`-bound
+/// execution: it has no work, no execution, and no estate. Taking
+/// `&StartRequest` rather than three loose strings is what makes that
+/// structural — there is nothing to pass at a probe call site.
+///
+/// A request with no `estate_root` (a Work submitted with no repository
+/// context, or a pre-S2 journal line replayed) omits that one pair rather
+/// than inventing a root. The other two are always present.
+pub fn causation_env(request: &StartRequest) -> BTreeMap<String, String> {
+    causation_env_from_parts(
+        request.estate_root.as_deref(),
+        &request.work_id,
+        &request.execution_id,
+    )
+}
+
+/// The same triple as [`causation_env`], rebuilt on RESUME.
+///
+/// A restarted adapter's `resume()` has a [`ResumeRequest`] (which carries
+/// the re-supplied `estate_root`, S2 E6) and an [`ExecutionHandle`] (which
+/// already carries the execution id — `ResumeRequest` itself does not need a
+/// second copy of it). Before this helper existed, `resume()` had nothing to
+/// build the causation triple from and passed an empty map to
+/// `launch_config` instead — not just for the reconciliation snapshot but
+/// for the env cached for the rest of that execution's life, silently
+/// dropping causation for every turn spawned after a daemon restart. This is
+/// the fix: the same three values, re-supplied exactly as the model pin and
+/// the profile already are on the same path.
+pub fn resume_causation_env(
+    request: &ResumeRequest,
+    execution_id: &str,
+) -> BTreeMap<String, String> {
+    causation_env_from_parts(
+        request.estate_root.as_deref(),
+        &request.work_id,
+        execution_id,
+    )
+}
+
+/// Shared body for [`causation_env`] and [`resume_causation_env`] — one place
+/// that knows the three names and the omit-when-absent rule for the estate
+/// root, so START and RESUME cannot drift into building the triple two
+/// different ways.
+fn causation_env_from_parts(
+    estate_root: Option<&std::path::Path>,
+    work_id: &str,
+    execution_id: &str,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    if let Some(root) = estate_root {
+        env.insert(
+            SERGEANT_ESTATE_ROOT_ENV.to_string(),
+            root.to_string_lossy().into_owned(),
+        );
+    }
+    env.insert(SERGEANT_WORK_ID_ENV.to_string(), work_id.to_string());
+    env.insert(
+        SERGEANT_EXECUTION_ID_ENV.to_string(),
+        execution_id.to_string(),
+    );
+    env
 }
 
 /// Everything a backend needs to RESUME an execution it no longer remembers
@@ -339,16 +454,29 @@ pub struct ResumeRequest {
     /// claim, not a claim of absence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<BindingSummary>,
+    /// S2 E6/W1 §6, re-supplied on RESUME for the same reason the model pin,
+    /// the profile, and the bindings are: [`causation_env`] needs it to
+    /// rebuild the `SERGEANT_ESTATE_ROOT`/`SERGEANT_WORK_ID`/
+    /// `SERGEANT_EXECUTION_ID` triple for every turn a restarted adapter
+    /// spawns after reattaching, not only for the reconciliation snapshot
+    /// itself. Before this field existed, an adapter's `resume()` had
+    /// nothing to build that triple from and cached an empty env for the
+    /// rest of the execution's life — silently dropping causation for every
+    /// turn after a daemon restart. Same source as
+    /// [`StartRequest::estate_root`]: the Work's own journaled estate root,
+    /// never re-derived from a worktree path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estate_root: Option<PathBuf>,
 }
 
 impl ResumeRequest {
     /// A resume request carrying only the two things every caller has: the
-    /// work and its surface. Model, profile and instruction policy all
-    /// default to `None` — "not re-supplied" — which adapters must treat as
-    /// absent, never invented; an adapter that needs *some* concrete policy
-    /// to launch under falls back to its own safe default (today,
-    /// `InstructionPolicy::default()` = `Suppress`) only at that point, not
-    /// here.
+    /// work and its surface. Model, profile, instruction policy, and estate
+    /// root all default to `None` — "not re-supplied" — which adapters must
+    /// treat as absent, never invented; an adapter that needs *some*
+    /// concrete policy to launch under falls back to its own safe default
+    /// (today, `InstructionPolicy::default()` = `Suppress`) only at that
+    /// point, not here.
     pub fn new(work_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             work_id: work_id.into(),
@@ -357,6 +485,7 @@ impl ResumeRequest {
             profile: None,
             instruction_policy: None,
             bindings: Vec::new(),
+            estate_root: None,
         }
     }
 }
@@ -1050,5 +1179,106 @@ impl BackendRegistry {
         Self::new().with(Arc::new(fake::FakeBackend::from_env(
             fake::FAKE_BACKEND_NAME,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> StartRequest {
+        StartRequest {
+            work_id: "01WORK".to_string(),
+            execution_id: "01EXEC".to_string(),
+            stage_id: "00-only".to_string(),
+            attempt: 1,
+            cwd: PathBuf::from("/data/surfaces/01WORK"),
+            intent: "do the thing".to_string(),
+            context: String::new(),
+            model: None,
+            profile: None,
+            execute: None,
+            instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
+            estate_root: Some(PathBuf::from("/home/dev/estate")),
+        }
+    }
+
+    /// E5: the names are the contract's, spelled `SERGEANT_*`, and there are
+    /// exactly three of them. A fourth value (a binary path, a data dir)
+    /// would be a new mechanism W1-07's rung table already refused.
+    #[test]
+    fn causation_env_is_exactly_the_contracts_three_names() {
+        let env = causation_env(&request());
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "SERGEANT_ESTATE_ROOT",
+                "SERGEANT_EXECUTION_ID",
+                "SERGEANT_WORK_ID"
+            ],
+            "exactly three pairs, named as W1 §6 names them"
+        );
+        assert_eq!(env["SERGEANT_ESTATE_ROOT"], "/home/dev/estate");
+        assert_eq!(env["SERGEANT_WORK_ID"], "01WORK");
+        assert_eq!(env["SERGEANT_EXECUTION_ID"], "01EXEC");
+    }
+
+    /// E5's other half: `SGT_ESTATE_ROOT` is a different mechanism and this
+    /// helper must never emit it. A caller that wired the harness variable
+    /// and believed W1-07 satisfied is exactly the confusion both recon
+    /// seats flagged.
+    #[test]
+    fn causation_env_never_emits_the_harnesss_own_sgt_variable() {
+        let env = causation_env(&request());
+        assert!(
+            !env.contains_key(crate::harness::ESTATE_ROOT_ENV),
+            "the harness's SGT_ESTATE_ROOT is a different mechanism: {env:?}"
+        );
+        assert!(
+            env.keys().all(|k| k.starts_with("SERGEANT_")),
+            "every injected name carries the contract's own prefix: {env:?}"
+        );
+    }
+
+    /// A Work submitted with no repository context has no estate coordinate.
+    /// The pair is omitted rather than filled with an invented root — a
+    /// child addressing `""` would be refused by admission anyway, and a
+    /// guess is what W1 §6 forbids.
+    #[test]
+    fn causation_env_omits_the_estate_root_it_does_not_have() {
+        let mut request = request();
+        request.estate_root = None;
+        let env = causation_env(&request);
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["SERGEANT_EXECUTION_ID", "SERGEANT_WORK_ID"],
+            "no root recorded means no root transported: {env:?}"
+        );
+    }
+
+    /// The journal-replay contract every added `StartRequest` field carries
+    /// (`instruction_policy`/`bindings`' own precedent): a request journaled
+    /// before this field existed replays as `None`, not as an error and not
+    /// as an invented root.
+    #[test]
+    fn a_start_request_journaled_before_estate_root_existed_still_replays() {
+        let pre_s2 = serde_json::json!({
+            "work_id": "01WORK",
+            "execution_id": "01EXEC",
+            "stage_id": "00-only",
+            "attempt": 1,
+            "cwd": "/data/surfaces/01WORK",
+            "intent": "do the thing",
+            "context": "",
+        });
+        let replayed: StartRequest =
+            serde_json::from_value(pre_s2).expect("a pre-S2 request must still replay");
+        assert_eq!(replayed.estate_root, None);
+        assert_eq!(
+            causation_env(&replayed).len(),
+            2,
+            "and it transports only what it actually knows"
+        );
     }
 }

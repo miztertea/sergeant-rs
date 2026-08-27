@@ -184,6 +184,29 @@ enum Command {
         /// it — the operator types it for that submission or it is not set.
         #[arg(long)]
         override_git_preflight: bool,
+        /// Submit, then stay attached until this Work reaches a terminal
+        /// state (W1 §7/W1-10, S2 E9).
+        ///
+        /// Purely client-side: this is `sgt watch --follow <id>` running in
+        /// the same process, over the same API and event surfaces, after the
+        /// submission returns. No new engine state exists to hold a Work
+        /// open — the parent actor blocks, the daemon does not, and a
+        /// `--wait` that is interrupted leaves the Work running exactly as
+        /// an unwatched one would.
+        ///
+        /// Attention transitions (`needs_input`, `blocked`, `failed`,
+        /// `waiting`) are reported as they happen and do **not** end the
+        /// wait; only `completed`/`canceled` do — the same watch set and the
+        /// same exit rule `sgt watch --follow` already uses, including its
+        /// consequence that a Work which fails and is never retried keeps a
+        /// waiter attached after the `failed` notice.
+        ///
+        /// Under `--json` the stream is concatenated JSON documents: the
+        /// submit record exactly as `sgt run --json` already prints it,
+        /// then one compact notice per line, exactly as `sgt watch --json`
+        /// emits them.
+        #[arg(long)]
+        wait: bool,
     },
     /// Inspect work items.
     Work {
@@ -1063,6 +1086,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             turns,
             ceiling_secs,
             override_git_preflight,
+            wait,
         } => {
             // estate-root proposal §7.2: scope resolution is core-owned. The
             // CLI forwards `--repo`/`--group`/`--all` verbatim as
@@ -1090,6 +1114,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     ));
                 }
             };
+            let claimed = claimed_causation();
             let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let envelope = if turns.is_some() || ceiling_secs.is_some() {
                 Some(json!({"turn_cap": turns, "ceiling_secs": ceiling_secs}))
@@ -1118,6 +1143,15 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 "override_git_preflight": override_git_preflight,
                 "created_by": "cli",
                 "origin": origin(),
+                // W1 §5/§6 (S2 E8 as amended): when this invocation is itself
+                // running inside a managed execution, `claimed_causation()`
+                // carries the `SERGEANT_*` coordinates it inherited. Claimed,
+                // never asserted — the daemon validates them against its own
+                // journal and drops the relation (with a journaled marker) if
+                // they do not check out. Absent outside a managed execution,
+                // which is the ordinary top-level `sgt run`.
+                "claimed_parent_work_id": claimed.0,
+                "claimed_parent_execution_id": claimed.1,
             });
             let result = client.post("/v1/work", &body).await?;
             if sgt.json {
@@ -1125,7 +1159,41 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             } else {
                 print_work_line("submitted", &result);
             }
-            Ok(())
+            if !wait {
+                return Ok(());
+            }
+            // W1-10 / E9: submit **then observe**, over the API and event
+            // path that already exist. `crate::watch::watch` is called, not
+            // re-derived: its head-before-stream-before-read sequencing is
+            // what closes the race between the submission above and the
+            // subscription below, and inlining a poll loop here would either
+            // duplicate that or reopen it (m9 pins the module's own crate
+            // boundary; nothing in this arm crosses it).
+            let Some(id) = result["work"]["id"].as_str() else {
+                return Err(CliError::new(
+                    "the daemon accepted the submission but named no work id, so there is \
+                     nothing to wait on",
+                ));
+            };
+            let options = crate::watch::WatchOptions {
+                work_id: Some(id.to_string()),
+                follow: true,
+                estate_root: Some(estate_root(&estate)),
+            };
+            let json = sgt.json;
+            crate::watch::watch(&client, &options, |notice| {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(notice).expect("watch notice serializes")
+                    );
+                } else {
+                    println!("{}", crate::watch::render_human(notice));
+                }
+            })
+            .await
+            .map(|_exit| ())
+            .map_err(|e| CliError::new(e.to_string()))
         }
         Command::Respond { id, input } => {
             let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
@@ -2332,6 +2400,37 @@ fn origin() -> Value {
         "client": client,
         "cwd": std::env::current_dir().ok(),
     })
+}
+
+/// W1 §6 (S2 E5/E8): the parent Work/execution this invocation **claims**,
+/// read out of the `SERGEANT_*` environment a managed execution was launched
+/// with ([`crate::backend::causation_env`] is what puts them there).
+///
+/// Read exactly the way [`origin`] above reads `SGT_ORIGIN_CLIENT` — the
+/// client owns its own environment, the daemon has none — and with exactly as
+/// much authority: none. W1 §6 calls these "a transport hint, not trusted
+/// lineage"; the daemon checks both against its own journal before recording
+/// any relation, and journals a `causation_unverified` marker (never a
+/// refusal) when they do not check out. An empty value is treated as absent,
+/// so an exported-but-blank variable claims nothing rather than claiming
+/// `""`.
+///
+/// **`SERGEANT_ESTATE_ROOT` is deliberately not read here.** The estate is
+/// resolved by ordinary `-C`/cwd admission before this function is ever
+/// reached (§4.3), and reading a *claimed* root would be exactly the implicit
+/// estate discovery from a Work surface that W1 §12 lists as a non-goal. The
+/// actor passes it as `-C`, where it is admitted like any other addressed
+/// root, or the command refuses.
+fn claimed_causation() -> (Option<String>, Option<String>) {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    (
+        read(crate::backend::SERGEANT_WORK_ID_ENV),
+        read(crate::backend::SERGEANT_EXECUTION_ID_ENV),
+    )
 }
 
 /// ASCII-art wordmark for the bare-`sgt` homepage (ADR 0010, D6).

@@ -33,6 +33,18 @@ pub struct WorkRow {
     pub estate: String,
     pub repositories: String,
     pub turns: String,
+    /// W1 §10 (S2 E8): the **validated** parent Work this one was submitted
+    /// from — `"-"` for an ordinary top-level Work, and for one whose full
+    /// row has aged out of the daemon's caches (the slim index row the
+    /// evicted fleet row is built from carries no causation).
+    ///
+    /// Exposure, not yet grouping: W1 §10's "Causal child Work" tree is V4's
+    /// integration item and needs both halves of the wave landed. This is the
+    /// coordinate it will group on, projected here so that render reads a
+    /// row it already has rather than issuing a second request per Work
+    /// (D6: the fleet endpoint returns everything, the TUI filters
+    /// client-side).
+    pub parent: String,
     pub created_at: String,
     /// The current stage's own detail text — a question when the state is
     /// `needs_input`, a reason when it is `blocked`/`failed` (§9.3's
@@ -78,6 +90,7 @@ fn row_from(work: &Value) -> WorkRow {
         estate: field(work, "estate_root"),
         repositories,
         turns,
+        parent: field(work, "parent_work_id"),
         created_at: field(work, "created_at"),
         question: field(&work["stage"], "detail"),
     }
@@ -626,6 +639,23 @@ mod tests {
             "stage": {"stage_id": "10-implement", "index": 1, "of": 2, "status": "running"},
             "resolved_backend": "fake",
         })).collect::<Vec<_>>()})
+    }
+
+    /// S2 E8 (W1 §10): the validated parent rides the fleet body's own row,
+    /// so the causal-child tree can group without a second request per Work.
+    /// A top-level Work — and one whose full row has aged out into the slim
+    /// evicted shape, which carries no causation at all — both project the
+    /// same honest `"-"`.
+    #[test]
+    fn a_fleet_row_projects_the_validated_parent_work() {
+        let mut fleet = fleet_of(&[("child", "active"), ("top", "active")]);
+        fleet["works"][0]["parent_work_id"] = json!("01PARENTWORK");
+        let rows = fleet_rows(&fleet);
+        assert_eq!(rows[0].parent, "01PARENTWORK");
+        assert_eq!(
+            rows[1].parent, "-",
+            "an ordinary top-level Work claims no parent"
+        );
     }
 
     #[test]

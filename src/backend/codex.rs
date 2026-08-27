@@ -3230,7 +3230,23 @@ impl CodexBackend {
     /// split/w5-codex-commit-path named: the field used to be read straight
     /// off `self.config` at every LAUNCH call site, so no profile could ever
     /// change it.
-    fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
+    ///
+    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`] at
+    /// START, [`crate::backend::resume_causation_env`] at RESUME), merged
+    /// **after** the profile — the same last-writer-wins discipline
+    /// `CODEX_HOME` already gets at the spawn site, and for the same reason:
+    /// a workflow-authored `Profile.env` key must not shadow what sergeant
+    /// itself intended to send. RESUME rebuilds the triple from
+    /// `ResumeRequest::estate_root` (re-supplied, S2 E6) and the execution id
+    /// on the `handle` every `resume()` already receives — the env this
+    /// produces is what every later turn on the execution reuses, so an
+    /// empty map here was a permanent loss of causation past the restart,
+    /// not just a gap in the reconciliation snapshot.
+    fn launch_config(
+        &self,
+        profile: Option<&Profile>,
+        causation: &BTreeMap<String, String>,
+    ) -> Result<LaunchConfig, BackendError> {
         if let Some(profile) = profile
             && profile.options.contains_key("codex_profile")
         {
@@ -3262,6 +3278,9 @@ impl CodexBackend {
                 Ok(None) => {}
                 Err(e) => return Err(self.err_failed(format!("profile {:?}: {e}", profile.name))),
             }
+        }
+        for (key, value) in causation {
+            env.insert(key.clone(), value.clone());
         }
         Ok(LaunchConfig {
             executable,
@@ -3669,7 +3688,10 @@ impl CodexBackend {
             env,
             codex_home,
             network_access,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         // #259: re-resolved here rather than trusting PREPARE's own check —
         // `launch_config`'s own doc comment states the same rule ("LAUNCH
         // re-resolves it, so the two phases can never disagree").
@@ -3729,7 +3751,10 @@ impl CodexBackend {
             env,
             codex_home,
             network_access,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         // #259, mirrored from `launch_exec` — resolved fresh here rather
         // than trusted from PREPARE.
         let git_worktree_common_dirs = self.resolve_git_worktree_common_dirs(&request.bindings)?;
@@ -4435,7 +4460,10 @@ impl Backend for CodexBackend {
         // Validates (in particular, refuses a codex-native profile layer)
         // without keeping the result: LAUNCH re-resolves it, so the two
         // phases can never disagree about it.
-        self.launch_config(request.profile.as_ref())?;
+        self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         if !request.bindings.is_empty() {
             self.resolve_git_worktree_common_dirs(&request.bindings)?;
         }
@@ -4653,7 +4681,10 @@ impl Backend for CodexBackend {
             env,
             codex_home,
             network_access,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::resume_causation_env(request, &handle.execution_id),
+        )?;
         // #259: NOT resolved here. A re-adopted execution's `turns` starts
         // at 1, so the `execution.turns == 0` gate that reads this field for
         // argv construction never fires for it — the grant is provably dead
@@ -5282,6 +5313,7 @@ mod tests {
             execute: None,
             instruction_policy: Default::default(),
             bindings,
+            estate_root: None,
         }
     }
 
@@ -6027,7 +6059,7 @@ mod tests {
             options,
         };
         let err = backend
-            .launch_config(Some(&profile))
+            .launch_config(Some(&profile), &BTreeMap::new())
             .expect_err("must be refused");
         let text = err.to_string();
         assert!(text.contains("codex_profile"));
@@ -6050,7 +6082,7 @@ mod tests {
             options: BTreeMap::new(),
         };
         let resolved = backend
-            .launch_config(Some(&profile))
+            .launch_config(Some(&profile), &BTreeMap::new())
             .expect("valid profile");
         assert_eq!(resolved.executable, PathBuf::from("/custom/codex"));
         assert_eq!(resolved.env.get("FOO"), Some(&"bar".to_string()));

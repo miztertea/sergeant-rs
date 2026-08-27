@@ -291,6 +291,28 @@ impl std::fmt::Display for WorkState {
     }
 }
 
+/// S2 E8's `causation_unverified` marker: exactly what a client claimed, and
+/// exactly why the daemon would not record it as a relation.
+///
+/// Both coordinates are kept verbatim, unvalidated, because that is the whole
+/// evidentiary value: an operator reading `sgt work show` needs to see *which*
+/// parent was claimed to tell a stale inherited environment (the ordinary
+/// case — the parent finished, its execution moved on) from a forgery or a
+/// misconfiguration. `reason` names which check failed, in the daemon's own
+/// words, so the marker never needs to be correlated against anything else to
+/// be readable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausationClaim {
+    /// The parent Work id the client claimed, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_work_id: Option<String>,
+    /// The parent execution id the client claimed, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_execution_id: Option<String>,
+    /// Why the claim was not recorded as a relation.
+    pub reason: String,
+}
+
 /// A Work record per §10: id, intent, targeted repositories (`scope_request`
 /// and its resolution, §7.3), workflow, state, created_by, created_at.
 /// `workflow` and `backend` are recorded for M3/M4 but not executed in M2.
@@ -374,6 +396,45 @@ pub struct Work {
     /// journaled before Phase E recorded.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub git_preflight_override: bool,
+    /// W1 §6 (S2 E8 as amended): the **validated** parent Work this one was
+    /// submitted from, when a claimed causation survived the daemon's own
+    /// journal check at submit.
+    ///
+    /// Validated, never claimed. The client sends
+    /// `claimed_parent_work_id`/`claimed_parent_execution_id` — read out of
+    /// the `SERGEANT_*` environment a managed execution was launched with,
+    /// which W1 §6 calls "a transport hint, not trusted lineage" — and the
+    /// daemon records the relation here only after checking that the Work
+    /// exists in its own journal and belongs to the addressed estate. A
+    /// claim that fails is recorded in [`Self::causation_unverified`]
+    /// instead, and this stays `None`.
+    ///
+    /// `#[serde(default)]`, like every field added after the first
+    /// `work.submitted` was written: absent means no causation, which is
+    /// what every Work journaled before S2 recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_work_id: Option<String>,
+    /// The validated parent *execution* — which turn of which stage of
+    /// [`Self::parent_work_id`] spent its causation env on this submission.
+    /// `None` with a `parent_work_id` present means the client claimed a
+    /// Work but no execution; the relation is still recorded, one coordinate
+    /// coarser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_execution_id: Option<String>,
+    /// S2 E8 **as amended**: a claimed causation that did not validate.
+    ///
+    /// The submission proceeds as an ordinary causation-less Work — never a
+    /// refusal. The ratification's own clause is that W1 §5's substance is
+    /// "preserved by ordinary admission, explicit addressing, and
+    /// journal-validated causation *rather than by refusal*", and the
+    /// stale-inherited-env reality makes refusal actively wrong: no adapter
+    /// `env_clear`s, and a long-lived actor session can outlive the
+    /// execution whose coordinates it inherited. So the claim is neither
+    /// trusted nor discarded — it is journaled here, in the same
+    /// `work.submitted` payload as the Work itself, so no crash window can
+    /// separate the submission from the marker that explains it (L6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_unverified: Option<CausationClaim>,
     /// Current state (only mutated by folding journal events).
     pub state: WorkState,
     /// Who submitted it.

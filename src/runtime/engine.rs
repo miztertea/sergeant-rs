@@ -2425,7 +2425,7 @@ impl Engine {
                 execution,
                 backend,
                 input: input.to_string(),
-                resume: self.resume_request(&run, work_id),
+                resume: self.resume_request(core, &run, work_id),
             })),
             deferred: Deferred::new(),
         })
@@ -3160,7 +3160,7 @@ impl Engine {
                 execution,
                 backend,
                 input: prompt,
-                resume: self.resume_request(run, work_id),
+                resume: self.resume_request(core, run, work_id),
             }))));
         }
         // E4: the park names the CONTAINER when a container's contract is the
@@ -3276,7 +3276,7 @@ impl Engine {
                     "backend {:?} is not registered in this daemon",
                     execution.backend
                 )),
-                Some(backend) => match self.reattach(backend, &run, work_id, &execution) {
+                Some(backend) => match self.reattach(core, backend, &run, work_id, &execution) {
                     Err(detail) => ambiguous(detail),
                     Ok(did) => {
                         reattached = did;
@@ -3537,6 +3537,7 @@ impl Engine {
     /// journals `surface.materialized` before the first stage is entered.
     fn reattach(
         &self,
+        core: &Core,
         backend: &Arc<dyn Backend>,
         run: &WorkRun,
         work_id: &str,
@@ -3545,7 +3546,7 @@ impl Engine {
         if !backend.capabilities().resume {
             return Ok(false);
         }
-        let Some(request) = self.resume_request(run, work_id) else {
+        let Some(request) = self.resume_request(core, run, work_id) else {
             return Ok(false);
         };
         backend
@@ -3565,7 +3566,14 @@ impl Engine {
     /// and, since N3, the *stage's* decisions (§12.5). Re-adopting a stage 10
     /// execution under stage 00's profile would be the same fabrication, one
     /// field further in.
-    fn resume_request(&self, run: &WorkRun, work_id: &str) -> Option<ResumeRequest> {
+    ///
+    /// `estate_root` is read the same way `Engine::execute` reads it before
+    /// building a `StartRequest` — `Self::work_estate_root(core, work_id)`,
+    /// the Work's own journaled coordinate — so a resumed execution's
+    /// `causation_env` is built from the same root every turn before the
+    /// restart carried, not silently dropped (S2 E6, causation-after-resume
+    /// fix).
+    fn resume_request(&self, core: &Core, run: &WorkRun, work_id: &str) -> Option<ResumeRequest> {
         let surface = run.surface.as_ref()?;
         let stage_profile = run.current_stage_profile();
         Some(ResumeRequest {
@@ -3579,6 +3587,7 @@ impl Engine {
             // lost whatever it derived from it, and the Work's mutation
             // surface is not something it may re-invent from a bare cwd.
             bindings: surface.binding_summary(),
+            estate_root: Self::work_estate_root(core, work_id),
         })
     }
 
@@ -3744,6 +3753,13 @@ impl Engine {
             .get(work_id)
             .map(|w| w.intent.clone())
             .unwrap_or_default();
+        // S2 E5: the causation triple's estate coordinate, read from exactly
+        // the source `commit` below stamps `workspace_id` from — the Work's
+        // own `WorkIndexRow::estate_root`, folded once at `work.submitted`
+        // and immutable for its life. Read here, before the stage's own
+        // events are committed, so the value pinned into the launch config is
+        // the same one every event of this execution carries.
+        let estate_root = Self::work_estate_root(core, work_id);
 
         self.commit(
             core,
@@ -3829,6 +3845,8 @@ impl Engine {
             // and refs an adapter states are the ones sergeant journaled —
             // never re-derived from the manifest or from the filesystem.
             bindings: surface.binding_summary(),
+            // W1 §6 / S2 E5: the estate a child `sgt -C … run` addresses.
+            estate_root,
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,
@@ -4964,17 +4982,27 @@ impl Engine {
         // Absent (a Work submitted with no repository context, or a journal
         // line older than the envelope field) leaves the field absent,
         // exactly as before — never a guess, and never the display name.
-        if let Some(root) = core
-            .registry
-            .state()
-            .work_index
-            .get(work_id)
-            .and_then(|row| row.estate_root.clone())
-        {
-            draft = draft.with_workspace_id(root);
+        if let Some(root) = Self::work_estate_root(core, work_id) {
+            draft = draft.with_workspace_id(root.to_string_lossy().into_owned());
         }
         core.commit(draft)?;
         Ok(())
+    }
+
+    /// The canonical estate root a Work was submitted against, or `None` when
+    /// the journal never recorded one.
+    ///
+    /// One reader for the two places that need it — the `workspace_id` stamp
+    /// above and S2 E5's `StartRequest::estate_root` — so the coordinate an
+    /// actor is handed and the coordinate its events are stamped with cannot
+    /// drift apart.
+    fn work_estate_root(core: &Core, work_id: &str) -> Option<PathBuf> {
+        core.registry
+            .state()
+            .work_index
+            .get(work_id)
+            .and_then(|row| row.estate_root.as_deref())
+            .map(PathBuf::from)
     }
 
     fn work_state(&self, core: &Core, work_id: &str) -> Result<WorkState, EngineError> {
@@ -6200,6 +6228,7 @@ mod tests {
             execute: None,
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         };
         let handle = fake.start(&start_request).expect("fake backend start");
         testing::commit(
@@ -6311,6 +6340,9 @@ mod tests {
                 intent_detail: None,
                 envelope: None,
                 git_preflight_override: false,
+                parent_work_id: None,
+                parent_execution_id: None,
+                causation_unverified: None,
                 state,
                 created_by: "test".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),

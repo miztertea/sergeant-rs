@@ -2615,7 +2615,26 @@ impl OpencodeBackend {
     ///   conversation to stay under it, and whether `run -s … --agent …`
     ///   does that was never measured — the same failure `codex.rs` refuses
     ///   `codex_profile` over.
-    fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
+    ///
+    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`]),
+    /// merged **after** the profile so a workflow-authored `Profile.env` key
+    /// cannot shadow what sergeant itself intended to send. It is folded into
+    /// the resolved `env` map here rather than added as a third parameter to
+    /// [`Self::apply_env`], which is deliberately generic over "whatever env
+    /// map was resolved" so a probe call and a turn can never read two
+    /// different configurations — a probe reaches `apply_env` with the map
+    /// this function never touched. RESUME rebuilds the triple via
+    /// [`crate::backend::resume_causation_env`] from
+    /// `ResumeRequest::estate_root` (re-supplied, S2 E6) and the execution id
+    /// on the `handle` every `resume()` already receives — the resolved env
+    /// this produces is what every later turn on the execution reuses, so an
+    /// empty map here silently dropped causation for the rest of the
+    /// execution's life, not only for the reconciliation snapshot.
+    fn launch_config(
+        &self,
+        profile: Option<&Profile>,
+        causation: &BTreeMap<String, String>,
+    ) -> Result<LaunchConfig, BackendError> {
         if let Some(profile) = profile {
             if profile.config_home.is_some() {
                 return Err(self.err_failed(format!(
@@ -2648,6 +2667,9 @@ impl OpencodeBackend {
             for (key, value) in &profile.env {
                 env.insert(key.clone(), value.clone());
             }
+        }
+        for (key, value) in causation {
+            env.insert(key.clone(), value.clone());
         }
         Ok(LaunchConfig { executable, env })
     }
@@ -2999,7 +3021,10 @@ impl OpencodeBackend {
     /// adapter state is removed on every error path.
     fn launch_run(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
         let request = &prepared.request;
-        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let LaunchConfig { executable, env } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -3086,7 +3111,10 @@ impl OpencodeBackend {
         prepared: &PreparedExecution,
     ) -> Result<ExecutionHandle, BackendError> {
         let request = &prepared.request;
-        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let LaunchConfig { executable, env } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         let budgets = self.config.serve_budgets.unwrap_or_default();
         let config_content = self.config.config_content.clone();
         let password = opencode_serve::mint_server_password();
@@ -4481,7 +4509,10 @@ impl Backend for OpencodeBackend {
         }
         // Validated without keeping the result: LAUNCH re-resolves it, so the
         // two phases can never disagree about it.
-        self.launch_config(request.profile.as_ref())?;
+        self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         Ok(PreparedExecution {
             execution_id: request.execution_id.clone(),
             native_id: None,
@@ -4643,7 +4674,10 @@ impl Backend for OpencodeBackend {
                 return Ok(());
             }
         }
-        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let LaunchConfig { executable, env } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::resume_causation_env(request, &handle.execution_id),
+        )?;
         if run_export(
             &executable,
             &request.cwd,
@@ -5086,6 +5120,7 @@ mod tests {
             execute: None,
             instruction_policy: Default::default(),
             bindings,
+            estate_root: None,
         }
     }
 
