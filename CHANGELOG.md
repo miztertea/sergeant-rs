@@ -30,21 +30,28 @@ release.
   exact root, a descriptor schema bump to `sergeant.runtime/v3` (no baked-in
   estate set — the admitted registry is dynamic daemon state), and a
   systemd user service / macOS LaunchAgent installer (`sgt daemon
-  install-service`) so the daemon survives logout and restarts on crash
-  under native per-user service management. (#275, #276)
+  install-service`, with `--print` to inspect the generated unit without
+  writing it) so the daemon survives logout and restarts on crash
+  under native per-user service management. `sgt doctor` gains a
+  `host_service_manager` row reporting whether a native per-user service
+  manager (systemd on Linux, launchd on macOS) is reachable from this
+  session. (#275, #276)
 - Journal, DuckDB projection, and daemon runtime state moved to a shared
   host runtime root; estate-local material (manifest, repository mounts,
   `.sergeant/workflows/`, Work surfaces) stays exactly where it was.
-  `[estate] data_dir` is deprecated at cutover — `sgt doctor` warns if a
-  manifest still declares it.
+  `[estate] data_dir` is deprecated at cutover; `sgt doctor` gains a
+  `legacy_estate_runtime` row warning when legacy daemon runtime state
+  (`.sergeant/data/{daemon.lock,runtime.json,journal/}`) is still present on
+  disk.
 - Retention is now partitioned per admitted estate (own `[estate]
   retention`, resolved fresh every prune cycle) while the blob-reference
   scan that garbage collection depends on stays journal-wide, so one
   estate's retention can never condemn another's still-live blobs. Both
   the rotation-triggered prune tick and the daemon-start prune trigger
   use the same per-estate policy resolution.
-- A bounded execution capacity lane (`Arc<Semaphore>`, acquired between
-  PREPARE and LAUNCH, outside the core lock) caps concurrent native-adapter
+- A bounded execution capacity lane (`Arc<Semaphore>`, sized by
+  `SGT_EXECUTION_LANE_CAP`, acquired between PREPARE and LAUNCH, outside the
+  core lock) caps concurrent native-adapter
   launches daemon-wide; a lane-queued Work is observably distinct from
   turn-cap exhaustion. A second, independently bounded config-only
   intelligence lane exists alongside it with no scheduler wired to it yet
@@ -52,8 +59,8 @@ release.
   once intelligence workers exist.
 - The TUI widens to a Host / Estate / Work / Stage / Execution scope: the
   fleet endpoint returns every admitted estate's Work and the TUI filters
-  client-side; `sgt watch` gained an optional estate filter so it keeps
-  estate-scoped meaning by default inside an estate.
+  client-side; `sgt watch` keeps estate-scoped meaning by default inside an estate
+  (host-wide outside one) and gained `--all` to watch every admitted estate.
 - One bearer token now authorizes every estate the daemon has admitted —
   a real widening of blast radius from the one-estate world, accepted
   deliberately under this installation's single-user trust model and
@@ -228,7 +235,7 @@ release.
   column rather than in a schema of their own.
 - The two stores do not share a rebuild discipline, and both module docs
   say so: the operations projection is deleted and re-folded from the
-  journal on every daemon start, while Atlas's `source.*`, `git.*` and
+  journal on every daemon start, while Atlas's `source.*`, `context.*` and
   `meta.coverage` persist across restarts — they are derived from source
   bytes plus extractor identity, keyed by source generation, and a
   generation is evicted only when those bytes change.
@@ -377,7 +384,9 @@ release.
 - New read surfaces: `sgt intelligence status` reports every indexed source's
   generation and its full coverage breakdown (including what was *excluded*,
   which is what makes the secrets posture checkable), and `sgt map
-  repos|outline|symbol|references|stats` reads the derived world map. All of
+  repos|outline|symbol|references|stats` reads the derived world map, where
+  `references` returns the definition occurrence sites a grammar can state
+  without resolving anything — not resolved cross-file usages. All of
   them are canned and parameterized — no client SQL, no client-named path, no
   match pattern — and every read is bounded, with a row cap a client can lower
   but never raise. `map neighbors` and `map changed` are deliberately not
