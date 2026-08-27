@@ -150,7 +150,12 @@ fn walk_rs_files(dir: &std::path::Path) -> Vec<PathBuf> {
 //    behave identically for nested leaf stages and are not bypassed by
 //    container completion.
 //
-// Verify BOTH halves are actually pinned (the brief's own instruction):
+// Item 9 names three contract families: expected-output, required-column,
+// and finalize. All three are walked below, each cited by name; none is
+// merely implied by another.
+//
+// Expected-output half — verify BOTH the leaf and container cases are
+// actually pinned (the brief's own instruction):
 //
 // Half A — a nested leaf's own output contract is enforced exactly as a
 // flat leaf's is (the leaf-level half):
@@ -164,4 +169,24 @@ fn walk_rs_files(dir: &std::path::Path) -> Vec<PathBuf> {
 // leaf) and
 // `tests/m11_nested_workflow.rs::a_container_whose_declared_output_is_present_closes_silently`
 // (a met one closes without a spurious park). Both halves present.
+//
+// Required-column half — Amendment 10d's `**Required columns:**` line is
+// enforced against a nested leaf's *composed* hierarchical id, not only a
+// flat one's, because `check_output_contract` (`src/runtime/engine.rs`)
+// runs `has_required_table_columns` against the same `contract_id` the
+// expected-output check above already exercises for nesting — one gate,
+// shared by both column families:
+// `tests/m11_nested_workflow.rs::a_nested_leafs_required_column_contract_is_enforced_exactly_as_a_flat_ones_is`
+// (a present-but-untyped artifact at a nested id is refused the identical
+// `stage_output_missing`-class way `tests/m3_execution.rs`'s flat-case
+// precedent,
+// `t11_a_present_but_untyped_declared_artifact_is_refused_the_same_way_as_a_missing_one`,
+// pins for a flat one).
+//
+// Finalize half — E11: `finalize_sweep` (`src/runtime/surface.rs`) walks to
+// the same nested depth as the two gates above, copying an evidence-class
+// nested leaf's output out and removing it from the worktree, sweeping a
+// container's own sibling `output/` in the same pass, and leaving a
+// promote-class nested leaf to ship:
+// `src/runtime/surface.rs::tests::the_finalize_sweep_reaches_a_nested_leafs_output`.
 // ------------------------------------------------------------------------

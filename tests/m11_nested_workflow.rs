@@ -96,6 +96,29 @@ fn declare_output(package: &Path, id: &str, artifact: &str) {
     .expect("output/README.md");
 }
 
+/// [`declare_output`], but additionally declares Amendment 10d's
+/// `**Required columns:**` line — the required-column half of the
+/// split-hardening contract, exercised here against a nested leaf's composed
+/// id exactly as [`declare_output`] exercises the expected-artifact half
+/// (W1 §13 item 9, required-column side; mirrors
+/// `tests/m3_execution.rs::write_two_stage_workflow_with_required_columns`,
+/// the flat-case precedent).
+fn declare_output_with_required_columns(package: &Path, id: &str, artifact: &str, columns: &[&str]) {
+    let dir = package.join(id).join("output");
+    std::fs::create_dir_all(&dir).expect("output dir");
+    let quoted: Vec<String> = columns.iter().map(|c| format!("`{c}`")).collect();
+    std::fs::write(
+        dir.join("README.md"),
+        format!(
+            "# Output — `{id}`\n\n**Expected artifact:** `{artifact}` — proof of \
+             work.\n\n**Required columns:** {} — a typed set, not prose.\n\n**Disposition:** \
+             `evidence`\n",
+            quoted.join(", ")
+        ),
+    )
+    .expect("output/README.md");
+}
+
 /// The two-level fixture every test below starts from:
 ///
 /// ```text
@@ -330,6 +353,89 @@ async fn a_nested_leafs_own_output_contract_is_enforced_exactly_as_a_flat_ones_i
     assert!(
         reprompts[0].payload["container_id"].is_null(),
         "a leaf's own contract is not a container's: {:?}",
+        reprompts[0].payload
+    );
+    let parked = events_of(data.path(), &work_id, "work.needs_input");
+    assert_eq!(
+        parked[0].payload["reason_code"],
+        REASON_STAGE_OUTPUT_MISSING
+    );
+    assert_eq!(parked[0].payload["stage_id"], "10-investigate/00-lead");
+    // Only the leaf that failed its contract is unfinished: 00-orient
+    // completed normally before it.
+    assert_eq!(
+        stage_ids(data.path(), &work_id, KIND_STAGE_COMPLETED),
+        ["00-orient"]
+    );
+
+    handle.shutdown().await;
+}
+
+/// W1 §13 item 9, the required-column half: a nested leaf's declared
+/// `**Required columns:**` line (Amendment 10d) is enforced against its
+/// composed hierarchical id exactly as a flat leaf's is —
+/// `has_required_table_columns` is reached through `check_output_contract`'s
+/// `contract_id` regardless of nesting depth. Mirrors
+/// `tests/m3_execution.rs::t11_a_present_but_untyped_declared_artifact_is_refused_the_same_way_as_a_missing_one`,
+/// the flat-case precedent this test carries one level deeper.
+#[tokio::test]
+async fn a_nested_leafs_required_column_contract_is_enforced_exactly_as_a_flat_ones_is() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (mount, _head) = support::scaffold_solo_estate(&estate, "solo");
+    let package = write_nested_workflow(&estate);
+    // The contract is declared on the nested leaf itself, at
+    // `10-investigate/00-lead/output/README.md`, this time with a
+    // **Required columns:** line.
+    declare_output_with_required_columns(
+        &package.join("10-investigate"),
+        "00-lead",
+        "lead.md",
+        &["id", "axis"],
+    );
+
+    // The declared artifact must exist *before* the stage launches (the fake
+    // actor writes nothing) — present, but untyped prose rather than the
+    // required table, so the check must reach past "does the file exist" to
+    // "does it carry the required columns" for a nested id.
+    std::fs::create_dir_all(mount.join("10-investigate/00-lead/output")).expect("output dir");
+    std::fs::write(
+        mount.join("10-investigate/00-lead/output/lead.md"),
+        "Findings: one about id 1, axis correctness. No table here.\n",
+    )
+    .expect("seed untyped artifact");
+    support::git(&mount, &["add", "-A"]);
+    support::git(&mount, &["commit", "-m", "seed untyped nested artifact"]);
+
+    let handle = start_fake(
+        data.path(),
+        [
+            FakeStep::complete(), // 00-orient
+            FakeStep::complete(), // 00-lead: "done", lead.md present but untyped
+            FakeStep::complete(), // the one bounded re-prompt: still untyped
+        ],
+    )
+    .await;
+    let client = http();
+    let body = submit(&client, &handle, &estate, "nested").await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+
+    assert_eq!(
+        body["work"]["state"], "needs_input",
+        "a present-but-untyped nested artifact must be refused, not accepted: {body}"
+    );
+    assert_eq!(
+        body["stage"]["stage_id"], "10-investigate/00-lead",
+        "the parked stage is the nested leaf, named by its composed id: {body}"
+    );
+    let reprompts = events_of(data.path(), &work_id, KIND_STAGE_OUTPUT_MISSING);
+    assert_eq!(reprompts.len(), 1, "exactly one bounded re-prompt");
+    assert_eq!(reprompts[0].payload["stage_id"], "10-investigate/00-lead");
+    assert_eq!(reprompts[0].payload["path"], "lead.md");
+    assert!(
+        reprompts[0].payload["container_id"].is_null(),
+        "a leaf's own required-column contract is not a container's: {:?}",
         reprompts[0].payload
     );
     let parked = events_of(data.path(), &work_id, "work.needs_input");
