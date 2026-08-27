@@ -318,6 +318,14 @@ enum Command {
         #[command(subcommand)]
         command: RepoCommand,
     },
+    /// Manage the estate's declared knowledge sources (`[[knowledge]]` in
+    /// `sergeant.toml`): local paths read as **evidence**, never mounted and
+    /// never written to (A1-03). A pure manifest edit — no daemon involved,
+    /// and nothing is cloned, created or touched on disk.
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommand,
+    },
     /// Manage the estate's declared groups (`[group.<name>]` in
     /// `sergeant.toml`). A pure manifest edit — no daemon involved.
     Group {
@@ -443,6 +451,36 @@ enum RepoCommand {
         name: String,
     },
     /// List declared repositories.
+    List,
+}
+
+/// `sgt knowledge ...` subcommands (S3, F11's minimum honest set).
+///
+/// Add and list, and deliberately nothing else yet. A `remove` verb, a
+/// `scan` verb and a coverage report are all real needs with real consumers
+/// — in later waves. Shipping a verb whose output nothing yet produces would
+/// be the same false promise as an empty table (R1).
+#[derive(Subcommand, Debug)]
+enum KnowledgeCommand {
+    /// Declare a local path as read-only evidence. Nothing is cloned,
+    /// created or verified on disk — this appends a `[[knowledge]]` entry
+    /// and validates the manifest it would produce.
+    ///
+    /// Refused if the path resolves inside a repository mount, the surfaces
+    /// directory, or the data directory: a knowledge source is evidence
+    /// about a world the estate observes, not one it mutates.
+    Add {
+        /// Source name (used in coverage rows and source coordinates).
+        name: String,
+        /// Path to the source root. Relative paths resolve against the
+        /// estate root.
+        path: PathBuf,
+        /// Glob to exclude from scanning, repeatable. **Extends** the
+        /// built-in secrets deny set; it can never narrow it.
+        #[arg(long)]
+        ignore: Vec<String>,
+    },
+    /// List declared knowledge sources.
     List,
 }
 
@@ -1718,6 +1756,9 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
         }
         Command::Repo { command } => repo_command(sgt.json, &estate_root(&estate), command).await,
+        Command::Knowledge { command } => {
+            knowledge_command(sgt.json, &estate_root(&estate), command).await
+        }
         Command::Group { command } => group_command(sgt.json, &estate_root(&estate), command).await,
         Command::Workflow { command } => {
             workflow_command(sgt.json, &estate_root(&estate), command).await
@@ -1933,6 +1974,61 @@ async fn repo_command(
                         estate.instruction_policy(&r.name),
                         estate.repository_origin(&r.name).unwrap_or("-"),
                         estate.repository_upstream(&r.name).unwrap_or("-"),
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `sgt knowledge add/list` (S3 F11): a pure manifest edit/read, same
+/// rationale as [`repo_command`] — no daemon, no network, no disk beyond
+/// `sergeant.toml` itself.
+async fn knowledge_command(
+    json: bool,
+    estate_root: &Path,
+    command: KnowledgeCommand,
+) -> Result<(), CliError> {
+    match command {
+        KnowledgeCommand::Add { name, path, ignore } => {
+            crate::domain::manifest::add_knowledge(estate_root, &name, &path, &ignore)?;
+            if json {
+                print_json(&json!({"added": name, "path": path, "ignore": ignore}));
+            } else {
+                println!("added knowledge source {name} at {}", path.display());
+            }
+            Ok(())
+        }
+        KnowledgeCommand::List => {
+            // The structural loader, not the strict one: a knowledge source
+            // has nothing to do with whether every declared repository is
+            // cloned, and listing sources must not fail because one is not
+            // (the same reason the manifest pen validates structurally).
+            let estate = crate::domain::estate::Estate::from_config_structural(
+                &estate_root.join(crate::domain::estate::MANIFEST_FILE),
+            )?;
+            if json {
+                print_json(&json!({
+                    "knowledge": estate.knowledge.iter().map(|k| json!({
+                        "name": k.name,
+                        "path": k.path,
+                        "ignore": k.ignore,
+                    })).collect::<Vec<_>>(),
+                }));
+            } else if estate.knowledge.is_empty() {
+                println!("no knowledge sources declared");
+            } else {
+                for source in &estate.knowledge {
+                    println!(
+                        "{}  {}  ignore={}",
+                        source.name,
+                        source.path.display(),
+                        if source.ignore.is_empty() {
+                            "-".to_string()
+                        } else {
+                            source.ignore.join(",")
+                        }
                     );
                 }
             }

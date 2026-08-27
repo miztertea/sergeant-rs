@@ -51,10 +51,34 @@
 //!
 //! # Scope of what exists here today
 //!
-//! Schema namespaces only. `meta`, `source`, `git` and `context` are created
-//! by [`db`]; no table is declared yet. That is the same empty-table refusal
-//! doctrine the operations projection states: a table that can only ever
-//! answer "zero rows" is a false promise, not completeness, so every table
-//! lands in the wave that lands its writer.
+//! The four namespaces, and the four tables the local-knowledge scanner
+//! writes: `source.generations`, `source.files`, `source.units` and
+//! `meta.coverage`. `git` and `context` are still empty namespaces, by the
+//! same empty-table refusal doctrine the operations projection states — a
+//! table that can only ever answer "zero rows" is a false promise, not
+//! completeness, so every table lands in the wave that lands its writer.
+//!
+//! ```text
+//! deny   ── pure predicate over a path (F10, the acquisition boundary)
+//! text   ── pure functions over bytes  (F6, extraction)
+//! scan   ── the walk: filesystem in, plain Rust out; no DB, no journal
+//! db     ── the one module that reaches the database driver, in or out
+//! record ── the thin three-step glue F1's crash window is stated over
+//! ```
+//!
+//! The dependency arrows run strictly downward through that list. `scan` does
+//! not import `db`, and `db` does not import the journal — which is what
+//! makes F6's "DB-touching glue kept thin and separately reviewable" a
+//! property of the module graph rather than a promise in a comment.
+//!
+//! (This file, like every sibling, is forbidden by
+//! `tests/x1_atlas_substrate.rs` from even *naming* the driver crate, so it
+//! says "the database driver" where a reader might expect the crate's own
+//! name. That is the one-owner rule biting its own documentation, which is
+//! the correct direction for it to bite.)
 
 pub mod db;
+pub mod deny;
+pub mod record;
+pub mod scan;
+pub mod text;

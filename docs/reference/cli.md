@@ -6,7 +6,7 @@ Global options are `-C <ESTATE_ROOT>`, `--data-dir <PATH>`, and `--json`. A daem
 
 - **Unscoped** — `--help`, `--version`, `init`, `doctor` — valid anywhere, touch no daemon.
 - **Host-scoped** — `tui`, `status`, `work show`/`list`/`transcript`, `watch`, and every `daemon` verb (foreground start, `stop`, `install-service`) — valid from any directory, no estate root required. `sgt watch` still consults `-C`/cwd opportunistically: inside a valid estate root it defaults to that estate's events; `--all`, or a cwd that is not one, watches every estate the daemon has admitted.
-- **Estate-scoped** — everything else (`run`, `repo`, `group`, `workflow`, `respond`, `retry`, `extend`, `cancel`, `work reap`/`sweep`/`retained`, `analytics`, and the harness launchers) — requires an exact estate root (`-C <ESTATE_ROOT>` or a cwd that is one); refused outside one.
+- **Estate-scoped** — everything else (`run`, `repo`, `knowledge`, `group`, `workflow`, `respond`, `retry`, `extend`, `cancel`, `work reap`/`sweep`/`retained`, `analytics`, and the harness launchers) — requires an exact estate root (`-C <ESTATE_ROOT>` or a cwd that is one); refused outside one.
 
 Harness launchers exec the native harness; estate client commands use the host daemon and may auto-start it according to their help contract — the spawned daemon addresses no estate itself (H1: every estate it ever serves is admitted per-request, over the wire, once it is already running).
 
@@ -16,6 +16,7 @@ Harness launchers exec the native harness; estate client commands use the host d
 | `status`, `tui` | health and human operation | host |
 | `doctor` | diagnose this installation | unscoped |
 | `init`, `repo`, `group` | estate topology | unscoped (`init`) / estate (`repo`, `group`) |
+| `knowledge` | declare and list local paths read as evidence — never mounted, never written to | estate |
 | `workflow` | fork a stock package into a local, editable copy | estate |
 | `run` | submit accepted intent and scope | estate |
 | `work` | list, show, transcript, retained-state, reap, and sweep operations | host (`list`/`show`/`transcript`) / estate (`retained`, `reap`, `sweep`) |

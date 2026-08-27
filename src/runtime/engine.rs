@@ -5288,6 +5288,7 @@ mod tests {
                     path: PathBuf::from(format!("/nowhere/{name}")),
                 })
                 .collect(),
+            knowledge: Vec::new(),
             default_backend: None,
             default_workflow: None,
             profiles: Vec::new(),
@@ -5705,6 +5706,7 @@ mod tests {
                 name: "solo".to_string(),
                 root: dir.path().to_path_buf(),
                 repositories: Vec::new(),
+                knowledge: Vec::new(),
                 default_backend: None,
                 default_workflow: None,
                 profiles: Vec::new(),
