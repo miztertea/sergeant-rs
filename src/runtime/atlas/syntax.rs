@@ -66,6 +66,14 @@ pub const SYNTAX_EXTRACTOR_VERSION: &str = "v1";
 /// language with no fixture in the corpus would be a claim nothing checks —
 /// so a `.tsx` file routes to `None` and is honestly coverage-reported
 /// `unsupported` (F8) rather than parsed by an almost-right grammar.
+///
+/// `.jsx`/`.mjs`/`.cjs` sit on the other side of that line: they ARE
+/// claimed by the JavaScript family, so a file whose syntax the JS grammar
+/// cannot parse (real JSX above all) reports `error` coverage with zero
+/// symbols — a claimed-but-failed parse, not an unclaimed extension. That
+/// is F8's honest-error rule doing its job, but it makes JavaScript's
+/// claimed surface broader than what the grammar parses cleanly; narrowing
+/// `.jsx` out (or adopting the TSX grammar) is a later wave's call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyntaxLanguage {
     Rust,
