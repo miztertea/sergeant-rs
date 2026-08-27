@@ -767,10 +767,14 @@ pub async fn start_with(
     // operations tables are a pure fold of it. Atlas is opened and **kept**:
     // its `source.*` and `meta.coverage` rows are derived from source bytes
     // plus extractor identity, and no journal replay reproduces them.
-    // Opening it reconciles it (see `AtlasDb::open`) — any generation a crash
-    // left with rows and no `source.scanned` summary is evicted, leaving an
-    // explicit `generation_evicted` coverage row rather than a half-scan
-    // reported as coverage.
+    // `record::reconcile_sources` is what closes the crash window, and it
+    // needs both halves of the evidence — which is why it takes the journal
+    // as well as the store. A generation a crash left `provisional` is
+    // promoted when its `source.scanned` summary is in the journal (the scan
+    // completed; only the confirming transaction was lost) and evicted, with
+    // an explicit `generation_evicted` coverage row, when it is not. The
+    // database's `state` column alone cannot tell those two apart, and they
+    // have opposite correct answers.
     //
     // Opened and dropped rather than held: nothing in this build reads Atlas
     // while the daemon runs (`sgt intelligence status` and the `map` surface
@@ -786,11 +790,25 @@ pub async fn start_with(
     // creates the store the first time it actually writes to it.
     if crate::runtime::atlas::db::atlas_db_path(data_dir).exists() {
         match crate::runtime::atlas::db::AtlasDb::open(data_dir) {
-            Ok(atlas) => tracing::debug!(
-                target: "sergeant::atlas",
-                path = %atlas.path().display(),
-                "atlas opened and reconciled at startup"
-            ),
+            Ok(mut atlas) => {
+                match crate::runtime::atlas::record::reconcile_sources(&mut atlas, &journal) {
+                    Ok(resolved) => tracing::debug!(
+                        target: "sergeant::atlas",
+                        path = %atlas.path().display(),
+                        promoted = resolved.promoted.len(),
+                        evicted = resolved.evicted.len(),
+                        "atlas opened and reconciled at startup"
+                    ),
+                    // Same reasoning as an unopenable store, one line down:
+                    // derived evidence never costs the estate its daemon.
+                    Err(e) => tracing::warn!(
+                        target: "sergeant::atlas",
+                        error = %e,
+                        "atlas could not be reconciled at startup; a crash-window \
+                         generation may remain unresolved (it stays unreadable)"
+                    ),
+                }
+            }
             // Never fatal. Atlas is derived evidence; a daemon that refused
             // to start because a derived store was unreadable would trade
             // every Work in the estate for an index (A1-01: the journal, Git

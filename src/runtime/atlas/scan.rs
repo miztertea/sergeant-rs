@@ -169,6 +169,30 @@ impl SourceScan {
     pub fn unit_count(&self) -> u64 {
         self.files.iter().map(|f| f.units.len() as u64).sum()
     }
+
+    /// The coverage row saying the **source root itself** could not be read,
+    /// when there is one.
+    ///
+    /// Three walk outcomes produce it, and only those three: the root's
+    /// metadata could not be taken, the root is not a directory, or the root
+    /// directory could not be listed. Each writes an
+    /// [`Unavailable`](Coverage::Unavailable) row whose path is the root's own
+    /// — `None` before the walk starts, `Some("")` once it has.
+    ///
+    /// It exists because an unreadable root and an emptied one are
+    /// indistinguishable by [`content_key`](Self::content_key) alone: both
+    /// hash an empty resource map. Ruling §4 evicts a generation *only* when
+    /// the source bytes changed, and an unplugged drive changed no bytes — so
+    /// the decision to supersede needs this signal, which the walk already
+    /// recorded, rather than a key comparison that cannot tell the two apart.
+    /// A readable directory that is genuinely empty produces no such row and
+    /// may still legitimately supersede.
+    pub fn root_unavailable(&self) -> Option<&CoverageRow> {
+        self.coverage.iter().find(|row| {
+            row.status == Coverage::Unavailable
+                && row.path.as_deref().is_none_or(|path| path.is_empty())
+        })
+    }
 }
 
 /// Walk one declared knowledge root.
@@ -662,6 +686,39 @@ mod tests {
         assert_eq!(scan.coverage.len(), 1);
         assert_eq!(scan.coverage[0].status, Coverage::Unavailable);
         assert_eq!(scan.coverage[0].path, None);
+        assert!(
+            scan.root_unavailable().is_some(),
+            "an unreachable root must be distinguishable from an empty one"
+        );
+    }
+
+    /// The signal that lets ruling §4 tell "the bytes are gone" from "the
+    /// path is gone": an empty *readable* directory reports no root
+    /// unavailability, and neither does a file-level one.
+    #[test]
+    fn an_empty_readable_root_is_not_an_unavailable_root() {
+        let (dir, empty) = scan_tree(&[], &[]);
+        assert!(empty.files.is_empty());
+        assert!(
+            empty.root_unavailable().is_none(),
+            "a readable, genuinely empty root is a real observation of \
+             emptiness: {:?}",
+            empty.coverage
+        );
+
+        // A file the walk could not read is a *file's* unavailability. The
+        // root was listed perfectly well, so nothing about the source's own
+        // reachability is in doubt.
+        std::fs::write(dir.path().join("keep.md"), b"# Keep\n").expect("write");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc", dir.path().join("escape")).expect("symlink");
+        let source = KnowledgeSource {
+            name: "notes".to_string(),
+            root: dir.path().to_path_buf(),
+            ignore: Vec::new(),
+        };
+        let scan = scan_local_knowledge(&source).expect("scan");
+        assert!(scan.root_unavailable().is_none(), "{:?}", scan.coverage);
     }
 
     /// A symlink is not followed: a knowledge source's boundary is the

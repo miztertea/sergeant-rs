@@ -17,6 +17,23 @@
 //! set protects it from, because the one thing a secrets floor may not have
 //! is a per-source override that turns it off.
 //!
+//! # Case is not a way through the floor
+//!
+//! Every glob here is compiled **case-insensitively**. The reason is an
+//! asymmetry that would otherwise be exploitable by accident: extractor
+//! routing lowercases the extension before it decides
+//! ([`extractor_for`](crate::runtime::atlas::scan)), so `NOTES.MD` is read
+//! exactly as `notes.md` is — while a case-sensitive deny set would let
+//! `Secrets.md`, `CREDENTIALS.txt` or `ID_RSA` walk straight past the very
+//! families [`DEFAULT_DENY`] names, be read, hashed, extracted and persisted.
+//! A secrets floor may not be narrower than the reader it guards, so the two
+//! agree about case in the one direction that is safe: the floor tolerates
+//! everything the reader tolerates.
+//!
+//! Operator `ignore` globs are compiled the same way, for the same reason and
+//! in the same direction — case-insensitivity only ever *widens* an
+//! exclusion, and `ignore` is a list that may only widen.
+//!
 //! # A denied byte is a counted byte
 //!
 //! Nothing here silently drops a path. The scanner turns every verdict into a
@@ -24,7 +41,7 @@
 //! naming the pattern that matched — which is what makes "the deny set is
 //! working" a checkable claim rather than an absence of evidence.
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 /// The built-in deny set (F10's G4 minimum), in addition to the dotfile rule
 /// below.
@@ -114,6 +131,11 @@ impl AcquisitionFilter {
     /// The defaults are compiled first so an index reported by the set maps
     /// back onto the same pattern list every time, and a source pattern can
     /// never displace a default one.
+    ///
+    /// Every glob is built with `case_insensitive(true)` — see this module's
+    /// "Case is not a way through the floor". That is a property of the
+    /// compilation, not of the pattern strings, so a default entry and an
+    /// operator entry cannot drift apart on it.
     pub fn new(ignore: &[String]) -> Result<Self, BadPattern> {
         let mut builder = GlobSetBuilder::new();
         let mut patterns = Vec::with_capacity(DEFAULT_DENY.len() + ignore.len());
@@ -131,10 +153,13 @@ impl AcquisitionFilter {
                 }
             }),
         ) {
-            let glob = Glob::new(&pattern).map_err(|source| BadPattern {
-                pattern: pattern.clone(),
-                source,
-            })?;
+            let glob = GlobBuilder::new(&pattern)
+                .case_insensitive(true)
+                .build()
+                .map_err(|source| BadPattern {
+                    pattern: pattern.clone(),
+                    source,
+                })?;
             builder.add(glob);
             patterns.push(pattern);
         }
@@ -218,6 +243,54 @@ mod tests {
         }
     }
 
+    /// The floor is as case-tolerant as the reader it guards.
+    ///
+    /// [`extractor_for`](crate::runtime::atlas::scan) lowercases the
+    /// extension before routing, so `Secrets.md` and `CREDENTIALS.txt` are
+    /// files this build will happily read, hash, extract and persist. A
+    /// case-sensitive deny set would therefore let exactly the families
+    /// [`DEFAULT_DENY`] names through the acquisition boundary — which is the
+    /// leak F10 exists to prevent, arriving by way of a shift key.
+    #[test]
+    fn the_default_set_refuses_case_variants_of_the_families_it_names() {
+        let filter = filter();
+        for denied in [
+            "Secrets.md",
+            "SECRETS.md",
+            "Secrets.MD",
+            "notes/CREDENTIALS.txt",
+            "Credentials.markdown",
+            "CREDENTIALS",
+            "keys/ID_RSA",
+            "keys/Id_Ed25519.txt",
+            "Server.PEM",
+            "deep/API.Key",
+            "Local.ENV",
+            "deploy/Service-Account-Prod.json",
+            "Vault.KDBX",
+        ] {
+            assert!(
+                !filter.verdict(denied).is_allowed(),
+                "{denied:?} must be refused at the acquisition boundary — the \
+                 extractor routing that follows is case-insensitive, so the \
+                 floor cannot be case-sensitive"
+            );
+        }
+    }
+
+    /// An operator `ignore` entry is compiled the same way, and case can only
+    /// ever widen what it excludes — never re-admit anything.
+    #[test]
+    fn an_operator_pattern_is_case_insensitive_too() {
+        let filter = AcquisitionFilter::new(&["*.log".to_string()]).expect("compile");
+        assert_eq!(
+            filter.verdict("deep/RUN.LOG"),
+            Verdict::Denied {
+                pattern: "**/*.log".to_string()
+            }
+        );
+    }
+
     /// And ordinary prose is not swept up. A deny set that refuses the corpus
     /// it was meant to protect is a deny set nobody keeps switched on.
     #[test]
@@ -230,6 +303,11 @@ mod tests {
             "runbooks/rotate-credentials-quarterly.md",
             "env-vars.md",
             "monkey.txt",
+            // Case-insensitivity widens the floor; it must not widen it onto
+            // ordinary prose that merely mentions a sensitive word.
+            "Design/Keystore-Design.md",
+            "Runbooks/Rotate-Credentials-Quarterly.md",
+            "NOTES.MD",
         ] {
             assert_eq!(
                 filter.verdict(allowed),

@@ -17,6 +17,11 @@
 //!   `source.scanned` summary. Startup reconciliation must leave
 //!   neither-reported (with an explicit eviction row), never a half-scan
 //!   reported as coverage.
+//! * `a_crash_after_the_summary_but_before_confirmation_completes_the_scan`
+//!   is the *other* window, one boundary later, and its correct answer is the
+//!   opposite one: the summary is durable and already broadcast, so
+//!   reconciliation promotes rather than evicts. Both-present is a rule in
+//!   both directions — journal-present/database-evicted breaks it too.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,7 +34,7 @@ use sergeant_rs::domain::event::Event;
 use sergeant_rs::domain::source::{Coverage, KIND_SOURCE_SCANNED, UnitKind};
 use sergeant_rs::runtime::analytics::Analytics;
 use sergeant_rs::runtime::atlas::db::AtlasDb;
-use sergeant_rs::runtime::atlas::record::{ScanRecord, scan_and_record};
+use sergeant_rs::runtime::atlas::record::{ScanRecord, scan_and_record, scan_summary};
 use sergeant_rs::runtime::atlas::scan::{KnowledgeSource, scan_local_knowledge};
 use sergeant_rs::runtime::journal::Journal;
 
@@ -559,6 +564,12 @@ async fn source_facts_survive_a_real_daemon_restart() {
 /// transaction commits), and then nothing else does. Reopening the store is
 /// the restart.
 ///
+/// Its counterpart is
+/// `a_crash_after_the_summary_but_before_confirmation_completes_the_scan`,
+/// which kills the process one boundary later and must reach the *opposite*
+/// answer. Read the two together: they are what pin reconciliation to the
+/// journal rather than to the `state` column.
+///
 /// Mutation this kills: promoting a generation to `confirmed` inside
 /// `stage_scan`, or letting a read path see a provisional one. Either change
 /// makes a half-finished scan answer as coverage, which is precisely what
@@ -580,10 +591,12 @@ async fn a_crash_between_the_rows_and_the_summary_reports_neither() {
         }
     };
 
-    // Even before any restart, nothing reads a provisional generation.
+    // Even before any restart, nothing reads a provisional generation. The
+    // state filter is what holds that, not the eviction — opening the store
+    // deliberately decides nothing, because the evidence that decides it is
+    // in the journal.
     {
         let db = AtlasDb::open(data.path()).expect("atlas");
-        // (Opening already reconciled it — assert on the state below.)
         assert!(
             db.confirmed_generation("notes")
                 .expect("generation")
@@ -639,6 +652,275 @@ async fn a_crash_between_the_rows_and_the_summary_reports_neither() {
     assert!(matches!(record, ScanRecord::Recorded { .. }), "{record:?}");
     assert!(!db.units("notes", 100).expect("units").is_empty());
     data.reap();
+}
+
+/// guard-map (**F1's other crash window — 2→3, not 1→2**): a process that
+/// dies *after* journaling the `source.scanned` summary but before the
+/// confirming transaction leaves the summary durable and already broadcast.
+/// Startup reconciliation must therefore **promote**, not evict: both-present
+/// is the rule in both directions, and journal-present/database-evicted
+/// breaks it exactly as badly as its mirror image — with the added insult
+/// that the eviction row would claim a missing summary that plainly exists.
+///
+/// The kill is at the other boundary from
+/// `a_crash_between_the_rows_and_the_summary_reports_neither`: `stage_scan`
+/// runs, the summary is appended with the real
+/// [`scan_summary`](sergeant_rs::runtime::atlas::record::scan_summary)
+/// payload the live path would have written, and then nothing else does.
+///
+/// Mutation this kills: reconciling against the database's `state` column
+/// alone (evict every provisional generation). That answer is right for the
+/// 1→2 window and wrong for this one — the column records the same value in
+/// both, so any reconciler that does not read the journal fails here.
+#[tokio::test]
+async fn a_crash_after_the_summary_but_before_confirmation_completes_the_scan() {
+    let data = support::DataDir::new();
+    let notes = knowledge_tree(&[("a.md", "# A\n\nbody\n"), ("b.md", "# B\n")]);
+    let source = source("notes", notes.path());
+
+    let (staged, summary_id) = {
+        let mut db = AtlasDb::open(data.path()).expect("atlas");
+        let mut journal = Journal::open(data.path()).expect("journal");
+        let scan = scan_local_knowledge(&source).expect("scan");
+        // Step 1.
+        let staged = match db.stage_scan(&scan).expect("stage") {
+            sergeant_rs::runtime::atlas::db::ScanCommit::Staged { generation_id } => generation_id,
+            other => panic!("expected a staged generation, got {other:?}"),
+        };
+        // Step 2 — the real payload, so the field the reconciler matches on
+        // is the field the writer emits.
+        let event = journal
+            .append(sergeant_rs::domain::event::EventDraft::new(
+                sergeant_rs::domain::event::EventSource::new("daemon", "atlas"),
+                KIND_SOURCE_SCANNED,
+                scan_summary(&scan, &staged),
+            ))
+            .expect("append");
+        // The process "dies" here: step 3 never runs.
+        (staged, event.id)
+    };
+    assert_eq!(
+        scan_summaries(data.path()).len(),
+        1,
+        "the fixture must have journaled exactly one summary"
+    );
+
+    // The restart.
+    start_and_stop(data.path()).await;
+
+    let db = AtlasDb::open(data.path()).expect("atlas after restart");
+    assert_eq!(
+        db.generation_states().expect("states").get(&staged),
+        Some(&"confirmed".to_string()),
+        "a generation whose summary is in the journal must be promoted, not \
+         evicted — the scan completed; only the confirming transaction was lost"
+    );
+    let standing = db
+        .confirmed_generation("notes")
+        .expect("generation")
+        .expect("the recovered generation must answer as confirmed");
+    assert_eq!(standing.id, staged);
+    assert!(
+        !db.units("notes", 100).expect("units").is_empty(),
+        "the rows the summary names must survive reconciliation"
+    );
+    // Both-present, and nothing pretending otherwise: no eviction row that
+    // claims this generation had no summary.
+    assert!(
+        !db.coverage("notes", 100)
+            .expect("coverage")
+            .iter()
+            .any(|c| c.row.status == Coverage::GenerationEvicted),
+        "a promoted generation must leave no eviction row"
+    );
+    assert_eq!(scan_summaries(data.path()).len(), 1, "no second summary");
+    assert_eq!(scan_summaries(data.path())[0].id, summary_id);
+
+    // And the recovered generation behaves exactly like a live-confirmed one:
+    // a re-scan of unchanged bytes reuses it rather than churning a new one.
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let again = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    assert!(
+        matches!(&again, ScanRecord::Unchanged { generation_id, .. } if *generation_id == staged),
+        "{again:?}"
+    );
+    data.reap();
+}
+
+/// guard-map (**ruling §4, the eviction rule's actual precondition**): a
+/// source whose root is temporarily unreachable — an unplugged drive, an
+/// unmounted share — must not supersede the generation derived from its
+/// bytes. The bytes did not change; the path did.
+///
+/// An empty scan of an unreadable root and a real scan of an emptied one are
+/// indistinguishable by content key (both hash an empty resource map), so the
+/// decision has to read the coverage row the walk already recorded.
+///
+/// Mutation this kills: dropping the `root_unavailable` guard in
+/// `AtlasDb::stage_scan`. Every transient mount failure would then stage an
+/// empty generation, and confirming it would evict the good one — deleting
+/// its units and files, and reporting the deletion as "the source bytes
+/// changed", which is false.
+#[test]
+fn an_unreachable_root_keeps_the_generation_it_cannot_rescan() {
+    let data = TempDir::new().expect("tempdir");
+    let outer = knowledge_tree(&[("docs/index.md", "# Index\n\nbody\n\n## Deep\n\nmore\n")]);
+    let root = outer.path().join("docs");
+    let source = source("notes", &root);
+
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let first = scan_and_record(&mut db, &mut journal, &source, None).expect("scan");
+    let ScanRecord::Recorded { generation_id, .. } = first else {
+        panic!("expected a recorded generation, got {first:?}");
+    };
+    let before = db.units("notes", 100).expect("units");
+    assert!(!before.is_empty(), "the fixture must produce units to lose");
+
+    // The drive goes away.
+    std::fs::remove_dir_all(&root).expect("remove the root");
+
+    let second = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    let ScanRecord::RootUnavailable {
+        generation_id: still,
+        detail,
+        ..
+    } = second
+    else {
+        panic!("an unreachable root must not supersede anything, got {second:?}");
+    };
+    assert_eq!(still, generation_id);
+    assert!(
+        detail.contains("no source bytes changed"),
+        "the record must say why nothing was evicted: {detail}"
+    );
+
+    // The derived facts F1 exists to preserve are still here.
+    assert_eq!(
+        db.units("notes", 100).expect("units"),
+        before,
+        "a transient mount failure must not destroy derived facts"
+    );
+    assert_eq!(
+        db.confirmed_generation("notes")
+            .expect("generation")
+            .expect("still standing")
+            .id,
+        generation_id
+    );
+    assert!(
+        !db.coverage("notes", 100)
+            .expect("coverage")
+            .iter()
+            .any(|c| c.row.status == Coverage::GenerationEvicted),
+        "nothing may be evicted: the bytes never changed, the path was unreachable"
+    );
+    // And the unavailability is evidence, not an absence.
+    let unavailable = db
+        .coverage("notes", 100)
+        .expect("coverage")
+        .into_iter()
+        .find(|c| c.row.status == Coverage::Unavailable)
+        .expect("the unreachable root must leave a coverage row");
+    assert_eq!(unavailable.generation_id, generation_id);
+    assert_eq!(
+        scan_summaries(data.path()).len(),
+        1,
+        "a scan that acquired nothing did not complete, so it journals no summary"
+    );
+
+    // The drive comes back, with the same bytes: still one generation, still
+    // no churn.
+    std::fs::create_dir_all(&root).expect("mkdir");
+    std::fs::write(
+        root.join("index.md"),
+        "# Index\n\nbody\n\n## Deep\n\nmore\n",
+    )
+    .expect("write");
+    let third = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    assert!(
+        matches!(&third, ScanRecord::Unchanged { generation_id: id, .. } if *id == generation_id),
+        "{third:?}"
+    );
+
+    // But a root that is genuinely readable and genuinely empty is a real
+    // observation, and it does supersede.
+    std::fs::remove_file(root.join("index.md")).expect("remove");
+    let fourth = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    assert!(
+        matches!(&fourth, ScanRecord::Recorded { evicted, .. } if evicted.as_deref() == Some(generation_id.as_str())),
+        "an emptied-but-readable root is evidence of emptiness: {fourth:?}"
+    );
+}
+
+/// guard-map (**F10, through the whole pipeline**): the secrets floor is at
+/// least as case-tolerant as the extractor routing behind it. `Secrets.md`,
+/// `CREDENTIALS.txt` and `ID_RSA` are refused at acquisition, and their bytes
+/// reach no unit, no file row and no journal payload.
+///
+/// Mutation this kills: compiling the deny globs case-sensitively (globset's
+/// default). Extractor selection lowercases the extension, so every one of
+/// these files would be opened, read, BLAKE3-hashed, extracted and persisted
+/// in full — the exact leak F10 exists to prevent, arriving by way of a shift
+/// key.
+#[test]
+fn case_variants_of_the_denied_families_never_reach_a_unit() {
+    let data = TempDir::new().expect("tempdir");
+    let notes = knowledge_tree(&[
+        ("keep.md", "# Keep\n\nordinary evidence\n"),
+        ("Secrets.md", "# Secrets\n\napi_token: hunter2\n"),
+        ("SECRETS.md", "shouting-hunter2\n"),
+        ("notes/CREDENTIALS.txt", "aws_secret_access_key = hunter2\n"),
+        (
+            "keys/ID_RSA",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nhunter2\n",
+        ),
+        ("Server.PEM", "-----BEGIN CERTIFICATE-----\nhunter2\n"),
+    ]);
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    scan_and_record(&mut db, &mut journal, &source("notes", notes.path()), None).expect("scan");
+
+    let units = db.units("notes", 100).expect("units");
+    assert!(
+        units.iter().any(|u| u.relative_path == "keep.md"),
+        "the ordinary document is still indexed"
+    );
+    assert!(
+        !units.iter().any(|u| u.body.contains("hunter2")),
+        "a denied file's bytes reached a unit: {units:?}"
+    );
+    assert!(
+        units.iter().all(|u| u.relative_path == "keep.md"),
+        "only the allowed file was acquired: {units:?}"
+    );
+
+    let coverage = db.coverage("notes", 100).expect("coverage");
+    for denied in [
+        "Secrets.md",
+        "SECRETS.md",
+        "notes/CREDENTIALS.txt",
+        "keys/ID_RSA",
+        "Server.PEM",
+    ] {
+        let row = coverage
+            .iter()
+            .find(|c| c.row.path.as_deref() == Some(denied))
+            .unwrap_or_else(|| panic!("no coverage row for {denied:?}"));
+        assert_eq!(
+            row.row.status,
+            Coverage::Excluded,
+            "{denied:?} must be refused at the acquisition boundary, not indexed"
+        );
+    }
+    let counts = db.coverage_counts("notes").expect("counts");
+    assert_eq!(counts.get(Coverage::Indexed.as_str()), Some(&1));
+    assert_eq!(counts.get(Coverage::Excluded.as_str()), Some(&5));
+
+    // And nothing leaked into the journal either.
+    let rendered = serde_json::to_string(&scan_summaries(data.path())[0].payload).expect("render");
+    assert!(!rendered.contains("hunter2"), "{rendered}");
 }
 
 /// guard-map: Atlas's file lives beside the journal, **not** inside the

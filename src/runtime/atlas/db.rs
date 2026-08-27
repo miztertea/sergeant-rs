@@ -60,17 +60,29 @@
 //! file filters on it:
 //!
 //! ```text
-//! provisional  rows are written, the `source.scanned` summary is not yet journaled
+//! provisional  rows are written, the `source.scanned` summary is not yet confirmed
 //! confirmed    the summary exists; this generation is what coverage reports
 //! evicted      superseded (bytes changed) or reconciled away (rows, no summary)
 //! ```
 //!
 //! Nothing reads a `provisional` generation — [`AtlasDb::stage_scan`] writes
-//! one, [`AtlasDb::confirm_scan`] promotes it, and [`AtlasDb::reconcile`]
-//! evicts any that a crash left behind. That is what makes a half-finished
-//! scan *neither-reported* rather than half-reported: the rows may exist for
-//! a while, but no read path can see them, and reconciliation removes them
-//! leaving a `generation_evicted` coverage row rather than a silent gap.
+//! one and [`AtlasDb::confirm_scan`] promotes it. That is what makes a
+//! half-finished scan *neither-reported* rather than half-reported: the rows
+//! may exist for a while, but no read path can see them.
+//!
+//! **Recovery is not in this file, and that is deliberate.** Whether a
+//! provisional generation a crash left behind should be promoted or evicted
+//! is a question about the *journal* — the summary either got appended or it
+//! did not — and this module owns a database, not a journal. So the state
+//! column and the two primitives are here
+//! ([`AtlasDb::provisional_generations`], [`AtlasDb::evict_provisional`]),
+//! and the adjudication is
+//! [`record::reconcile_sources`](crate::runtime::atlas::record::reconcile_sources),
+//! which is the only place both halves of the evidence are in scope. Opening
+//! this store therefore does **not** evict on its own: an evict-on-open would
+//! destroy exactly the generations whose summary is sitting in the journal,
+//! and "journal-present, database-evicted" is the same both-present violation
+//! as its mirror image, only harder to notice.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -134,6 +146,21 @@ pub enum AtlasError {
         /// The value as stored.
         value: String,
     },
+    /// [`AtlasDb::confirm_scan`] was handed a generation that is not
+    /// `provisional` — already confirmed, already evicted, or never staged.
+    ///
+    /// Refused rather than absorbed **because the same call evicts a
+    /// predecessor**. A promotion that matched no row would otherwise still
+    /// delete the standing confirmed generation's units and files, leaving
+    /// the source with nothing confirmed at all: data destroyed with nothing
+    /// promoted in its place. The predecessor may only be evicted by the
+    /// transaction that actually promoted its successor, so a promotion that
+    /// changed no row takes nothing with it.
+    #[error("atlas: generation {generation_id} is not awaiting confirmation")]
+    NotProvisional {
+        /// The generation the caller named.
+        generation_id: String,
+    },
 }
 
 /// The schema-namespace DDL, applied on every open.
@@ -155,8 +182,11 @@ CREATE SCHEMA IF NOT EXISTS context;\n";
 /// * `content_key` on a generation is what ruling §4's eviction rule is
 ///   phrased over — a re-scan producing the same key evicts nothing.
 /// * `summary_event_id` is nullable **on purpose**: its absence is precisely
-///   "rows exist, no `source.scanned` summary", which is the crash window
-///   [`AtlasDb::reconcile`] closes.
+///   "rows exist, this database has not seen a `source.scanned` summary" —
+///   which is the crash window
+///   [`record::reconcile_sources`](crate::runtime::atlas::record::reconcile_sources)
+///   closes, by asking the journal whether the summary exists rather than
+///   inferring from this column that it does not.
 /// * `mtime_millis` is nullable and is a hint. Nothing joins on it, nothing
 ///   keys on it, and no reuse decision reads it (F7).
 /// * `byte_start`/`byte_end` index the **original** file bytes, so a unit can
@@ -273,15 +303,13 @@ impl AtlasDb {
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         conn.execute_batch(SCHEMA_DDL)?;
         conn.execute_batch(TABLE_DDL)?;
-        let mut db = Self { conn, path };
-        // F1's startup reconciliation, run by the act of opening the store.
-        //
-        // Deliberately here rather than in one caller: "reconcile before
-        // anything reads" is a property of the store, and a caller that
-        // forgot would read a crash-window generation that no test of *that
-        // caller* would catch. Every opener — daemon, CLI, test — gets it.
-        db.reconcile()?;
-        Ok(db)
+        // No reconciliation here. A provisional generation is already
+        // unreadable — every read below filters on `state` — so nothing is
+        // exposed by leaving one standing until the journal can be consulted,
+        // and evicting one here would be a decision taken without the
+        // evidence that decides it (see this module's doc, and
+        // `record::reconcile_sources`, which the daemon runs at startup).
+        Ok(Self { conn, path })
     }
 
     /// Where this database lives (`:memory:` for [`AtlasDb::open_in_memory`]).
@@ -311,7 +339,7 @@ impl AtlasDb {
         Ok(out)
     }
 
-    /// Step 1 of [`scan_and_record`](crate::runtime::atlas::scan::scan_and_record):
+    /// Step 1 of [`scan_and_record`](crate::runtime::atlas::record::scan_and_record):
     /// write a whole scan's rows in **one transaction**, as a `provisional`
     /// generation.
     ///
@@ -321,11 +349,53 @@ impl AtlasDb {
     /// enforcement point: a generation is evicted only when source bytes
     /// changed, so an unchanged re-scan must not churn one.
     ///
+    /// Returns [`ScanCommit::RootUnavailable`], also without writing a
+    /// generation, when the walk could not read the source root at all and a
+    /// confirmed generation already stands — see
+    /// [`SourceScan::root_unavailable`]. An unplugged drive changed no source
+    /// bytes, so ruling §4 gives it no eviction: the standing generation is
+    /// what still has evidence behind it, and superseding it with an empty
+    /// scan would destroy exactly the derived facts F1 exists to keep across
+    /// restarts. The unavailability is recorded as a coverage row against the
+    /// generation that survived it, so "this source was unreachable at this
+    /// time, and we kept what we had" is queryable rather than inferred from
+    /// an absence.
+    ///
     /// One transaction is not an optimization. Partial rows for a generation
     /// nothing has confirmed would be indistinguishable from a completed one
     /// after the state column was promoted — the atomic batch is what makes
     /// "provisional" mean "all of it, or none of it, awaiting a summary".
     pub fn stage_scan(&mut self, scan: &SourceScan) -> Result<ScanCommit, AtlasError> {
+        // Asked before the `content_key` comparison below, because the two
+        // answers are indistinguishable by key: an unreachable root and an
+        // emptied one both hash an empty resource map, and only this row can
+        // tell them apart.
+        if let Some(unavailable) = scan.root_unavailable()
+            && let Some(current) = self.confirmed_generation(&scan.source_name)?
+        {
+            let detail = format!(
+                "the source root was unreadable on this scan ({}); \
+                 the confirmed generation was kept — no source bytes changed",
+                unavailable.detail.as_deref().unwrap_or("no detail")
+            );
+            insert_coverage(
+                &self.conn,
+                &current.id,
+                &scan.source_name,
+                &CoverageRow {
+                    path: None,
+                    status: Coverage::Unavailable,
+                    detail: Some(detail.clone()),
+                    bytes: None,
+                },
+                &scan.observed_at,
+            )?;
+            return Ok(ScanCommit::RootUnavailable {
+                generation_id: current.id,
+                content_key: current.content_key,
+                detail,
+            });
+        }
         if let Some(current) = self.confirmed_generation(&scan.source_name)?
             && current.content_key == scan.content_key
         {
@@ -382,6 +452,17 @@ impl AtlasDb {
     /// rather than at staging time is the deliberate half of F1's ordering:
     /// a crash before this point leaves the previous generation standing,
     /// which is the answer that still has evidence behind it.
+    ///
+    /// **The promotion is checked, not assumed.** The `UPDATE` is gated on
+    /// `state = 'provisional'`, and its affected-row count decides whether
+    /// the eviction runs at all: a caller naming a generation that is no
+    /// longer provisional — a stale id after a reconcile, a retry after a
+    /// partial failure — gets [`AtlasError::NotProvisional`] and an untouched
+    /// database, rather than a predecessor deleted on behalf of a successor
+    /// that was never promoted. Today's sole caller cannot reach that state;
+    /// this method is public on the store that owns the only copy of these
+    /// rows, and an invariant that only holds because of who happens to call
+    /// it is not an invariant.
     pub fn confirm_scan(
         &mut self,
         generation_id: &str,
@@ -397,7 +478,7 @@ impl AtlasDb {
         };
         let observed_at = crate::domain::event::rfc3339_utc_now();
         let tx = self.conn.transaction()?;
-        tx.execute(
+        let promoted = tx.execute(
             "UPDATE source.generations SET state = ?, summary_event_id = ? \
              WHERE generation_id = ? AND state = ?",
             duckdb::params![
@@ -407,6 +488,15 @@ impl AtlasDb {
                 STATE_PROVISIONAL
             ],
         )?;
+        if promoted == 0 {
+            // Nothing was promoted, so nothing may be evicted. Rolling back
+            // rather than committing an empty transaction keeps the two
+            // halves inseparable in both directions.
+            tx.rollback()?;
+            return Err(AtlasError::NotProvisional {
+                generation_id: generation_id.to_string(),
+            });
+        }
         if let (Some(previous), Some(name)) = (&superseded, &source_name) {
             evict(
                 &tx,
@@ -420,34 +510,54 @@ impl AtlasDb {
         Ok(superseded)
     }
 
-    /// F1's startup reconciliation: evict every generation whose rows exist
-    /// with no `source.scanned` summary.
+    /// Every generation still awaiting confirmation, newest first, as
+    /// `(generation_id, source_name)`.
     ///
-    /// Run by [`AtlasDb::open`] itself, so no caller can skip it. Each
-    /// eviction leaves an explicit `generation_evicted` coverage row —
-    /// ruling §4's "reported, never a silent gap" — naming the crash window
-    /// as the reason, so an operator reading coverage can tell a superseded
-    /// generation from one a crash cost them.
+    /// Half of F1's startup reconciliation — the half a database can answer.
+    /// The other half is whether the journal holds each one's
+    /// `source.scanned` summary, which decides promotion versus eviction and
+    /// is not this module's to know
+    /// ([`record::reconcile_sources`](crate::runtime::atlas::record::reconcile_sources)).
     ///
-    /// Returns the ids evicted, newest first.
-    pub fn reconcile(&mut self) -> Result<Vec<String>, AtlasError> {
-        let unconfirmed = self.generations_in_state(STATE_PROVISIONAL)?;
-        if unconfirmed.is_empty() {
+    /// The common answer is an empty vector, and that matters: it is what
+    /// lets the reconciler skip reading the journal entirely on every start
+    /// that did not follow a crash.
+    pub fn provisional_generations(&self) -> Result<Vec<(String, String)>, AtlasError> {
+        self.generations_in_state(STATE_PROVISIONAL)
+    }
+
+    /// Evict named generations that are still `provisional`, in one
+    /// transaction, each leaving an explicit `generation_evicted` coverage
+    /// row carrying `reason`.
+    ///
+    /// Ruling §4's "reported, never a silent gap": an operator reading
+    /// coverage can tell a superseded generation from one a crash cost them,
+    /// because the reason says which.
+    ///
+    /// Only `provisional` ids are touched. A confirmed generation is never
+    /// evictable this way — the sole path that supersedes one is
+    /// [`Self::confirm_scan`], in the same transaction that promotes its
+    /// replacement. Returns the ids actually evicted.
+    pub fn evict_provisional(
+        &mut self,
+        generation_ids: &[String],
+        reason: &str,
+    ) -> Result<Vec<String>, AtlasError> {
+        let awaiting = self.generations_in_state(STATE_PROVISIONAL)?;
+        let targets: Vec<(String, String)> = awaiting
+            .into_iter()
+            .filter(|(id, _)| generation_ids.iter().any(|wanted| wanted == id))
+            .collect();
+        if targets.is_empty() {
             return Ok(Vec::new());
         }
         let observed_at = crate::domain::event::rfc3339_utc_now();
         let tx = self.conn.transaction()?;
-        for (generation_id, source_name) in &unconfirmed {
-            evict(
-                &tx,
-                generation_id,
-                source_name,
-                "reconciled at startup: rows exist with no source.scanned summary",
-                &observed_at,
-            )?;
+        for (generation_id, source_name) in &targets {
+            evict(&tx, generation_id, source_name, reason, &observed_at)?;
         }
         tx.commit()?;
-        Ok(unconfirmed.into_iter().map(|(id, _)| id).collect())
+        Ok(targets.into_iter().map(|(id, _)| id).collect())
     }
 
     /// The newest **confirmed** generation for one source, if there is one.
@@ -767,6 +877,18 @@ pub enum ScanCommit {
         /// Its content identity.
         content_key: String,
     },
+    /// Nothing was written **and nothing was evicted**: the walk could not
+    /// read the source root, and a confirmed generation stands. Ruling §4
+    /// evicts only when the source bytes changed, and an unreachable path
+    /// changed none.
+    RootUnavailable {
+        /// The generation that still stands, untouched.
+        generation_id: String,
+        /// Its content identity.
+        content_key: String,
+        /// What was recorded as coverage against the surviving generation.
+        detail: String,
+    },
     /// Rows are written and awaiting their `source.scanned` summary.
     Staged {
         /// The new, provisional generation.
@@ -856,6 +978,220 @@ mod tests {
             path.display()
         );
         assert_eq!(path, data.join(ATLAS_DIR).join(ATLAS_DB_FILE));
+    }
+
+    /// A scan of `source` holding one file with `body`, built by hand: these
+    /// tests are about the store's own invariants, not about the walk.
+    fn scan_of(source: &str, body: &str) -> SourceScan {
+        use std::collections::BTreeSet;
+        let hash = crate::domain::source::content_hash(body.as_bytes());
+        let key = crate::domain::source::local_key(&hash, "markdown/v1");
+        SourceScan {
+            source_name: source.to_string(),
+            kind: SourceKind::LocalKnowledge,
+            authority: AuthorityClass::EstateReadonly,
+            content_key: hash.clone(),
+            observed_at: crate::domain::event::rfc3339_utc_now(),
+            files: vec![ScannedFile {
+                relative_path: "doc.md".to_string(),
+                content_hash: hash,
+                extractor: "markdown/v1".to_string(),
+                local_key: key,
+                byte_len: body.len() as u64,
+                mtime_millis: None,
+                units: vec![ScannedUnit {
+                    ordinal: 0,
+                    kind: UnitKind::Document,
+                    heading_level: None,
+                    title: None,
+                    byte_start: 0,
+                    byte_end: body.len() as u64,
+                    text: body.to_string(),
+                }],
+            }],
+            coverage: vec![CoverageRow {
+                path: Some("doc.md".to_string()),
+                status: Coverage::Indexed,
+                detail: Some("markdown/v1".to_string()),
+                bytes: Some(body.len() as u64),
+            }],
+            extractors: BTreeSet::from(["markdown/v1".to_string()]),
+        }
+    }
+
+    /// Stage and confirm one generation, returning its id.
+    fn record(db: &mut AtlasDb, scan: &SourceScan, event: &str) -> String {
+        let ScanCommit::Staged { generation_id } = db.stage_scan(scan).expect("stage") else {
+            panic!("expected a staged generation");
+        };
+        db.confirm_scan(&generation_id, event).expect("confirm");
+        generation_id
+    }
+
+    /// The predecessor may only be evicted by the transaction that actually
+    /// promoted its successor.
+    ///
+    /// `confirm_scan` computes the superseded generation *before* it promotes,
+    /// so a stale id — one already confirmed, already evicted, or never
+    /// staged — would otherwise evict a perfectly good confirmed generation on
+    /// behalf of a promotion that matched zero rows, leaving the source with
+    /// nothing confirmed at all. The affected-row count is what makes that
+    /// impossible; this is the test that would fail without it.
+    #[test]
+    fn confirming_a_generation_that_is_not_provisional_evicts_nothing() {
+        let mut atlas = AtlasDb::open_in_memory().expect("atlas");
+        let first = record(&mut atlas, &scan_of("notes", "# One\n"), "evt-1");
+        let second = record(&mut atlas, &scan_of("notes", "# Two\n"), "evt-2");
+        assert_eq!(
+            atlas.generation_states().expect("states").get(&first),
+            Some(&STATE_EVICTED.to_string()),
+            "the ordinary supersession still happens"
+        );
+
+        // Replaying the *first* confirmation: its generation is long evicted.
+        let err = atlas
+            .confirm_scan(&first, "evt-1")
+            .expect_err("a stale confirmation must be refused");
+        assert!(
+            matches!(&err, AtlasError::NotProvisional { generation_id } if *generation_id == first),
+            "{err:?}"
+        );
+        // And re-confirming the generation that currently stands, which is no
+        // longer provisional either.
+        assert!(matches!(
+            atlas.confirm_scan(&second, "evt-2"),
+            Err(AtlasError::NotProvisional { .. })
+        ));
+
+        // The standing generation survived both, rows and all.
+        let standing = atlas
+            .confirmed_generation("notes")
+            .expect("generation")
+            .expect("the confirmed generation must still stand");
+        assert_eq!(standing.id, second);
+        assert_eq!(atlas.units("notes", 100).expect("units").len(), 1);
+    }
+
+    /// Ruling §4 evicts a generation only when the source *bytes* changed. An
+    /// unreadable root changed none — so an empty scan of an unplugged drive
+    /// must not supersede a good generation, and the unavailability is
+    /// recorded rather than swallowed.
+    #[test]
+    fn an_unreadable_root_keeps_the_confirmed_generation_and_says_so() {
+        let mut atlas = AtlasDb::open_in_memory().expect("atlas");
+        let good = record(&mut atlas, &scan_of("notes", "# Kept\n"), "evt-1");
+
+        let mut unreachable = scan_of("notes", "");
+        unreachable.files.clear();
+        unreachable.extractors.clear();
+        unreachable.content_key = crate::domain::source::generation_key(&BTreeMap::new());
+        unreachable.coverage = vec![CoverageRow {
+            path: None,
+            status: Coverage::Unavailable,
+            detail: Some("the declared knowledge path cannot be read: no such file".to_string()),
+            bytes: None,
+        }];
+        assert!(unreachable.root_unavailable().is_some(), "fixture");
+
+        let commit = atlas.stage_scan(&unreachable).expect("stage");
+        assert!(
+            matches!(&commit, ScanCommit::RootUnavailable { generation_id, .. } if *generation_id == good),
+            "{commit:?}"
+        );
+        assert_eq!(
+            atlas
+                .confirmed_generation("notes")
+                .expect("generation")
+                .expect("still standing")
+                .id,
+            good
+        );
+        assert_eq!(
+            atlas.units("notes", 100).expect("units").len(),
+            1,
+            "a transient mount failure must not destroy derived facts"
+        );
+        let unavailable = atlas
+            .coverage("notes", 100)
+            .expect("coverage")
+            .into_iter()
+            .find(|c| c.row.status == Coverage::Unavailable)
+            .expect("the unavailability must be recorded, not swallowed");
+        assert_eq!(unavailable.generation_id, good);
+        assert!(
+            !atlas
+                .coverage("notes", 100)
+                .expect("coverage")
+                .iter()
+                .any(|c| c.row.status == Coverage::GenerationEvicted),
+            "no eviction: the source bytes did not change"
+        );
+
+        // A readable root that is genuinely empty is a different fact, and it
+        // does supersede — emptiness that was actually observed is evidence.
+        let mut emptied = scan_of("notes", "");
+        emptied.files.clear();
+        emptied.extractors.clear();
+        emptied.content_key = crate::domain::source::generation_key(&BTreeMap::new());
+        emptied.coverage.clear();
+        assert!(matches!(
+            atlas.stage_scan(&emptied).expect("stage"),
+            ScanCommit::Staged { .. }
+        ));
+    }
+
+    /// The store no longer evicts on open: a provisional generation is
+    /// unreadable, and whether it deserves promotion is a question only the
+    /// journal answers.
+    #[test]
+    fn opening_the_store_leaves_a_provisional_generation_for_the_journal_to_judge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staged = {
+            let mut atlas = AtlasDb::open(dir.path()).expect("atlas");
+            let ScanCommit::Staged { generation_id } = atlas
+                .stage_scan(&scan_of("notes", "# Pending\n"))
+                .expect("stage")
+            else {
+                panic!("expected a staged generation");
+            };
+            generation_id
+        };
+        let mut atlas = AtlasDb::open(dir.path()).expect("reopen");
+        assert_eq!(
+            atlas.generation_states().expect("states").get(&staged),
+            Some(&STATE_PROVISIONAL.to_string()),
+            "opening must not decide the crash window on its own"
+        );
+        assert!(
+            atlas
+                .confirmed_generation("notes")
+                .expect("generation")
+                .is_none(),
+            "and it is still unreadable while it waits"
+        );
+        assert_eq!(
+            atlas.provisional_generations().expect("awaiting"),
+            vec![(staged.clone(), "notes".to_string())]
+        );
+        // The eviction half, once something has consulted the journal.
+        assert_eq!(
+            atlas
+                .evict_provisional(std::slice::from_ref(&staged), "no summary")
+                .expect("evict"),
+            vec![staged.clone()]
+        );
+        assert_eq!(
+            atlas.generation_states().expect("states").get(&staged),
+            Some(&STATE_EVICTED.to_string())
+        );
+        // Idempotent: a second pass has nothing left to evict, and a
+        // confirmed generation is never reachable this way.
+        assert!(
+            atlas
+                .evict_provisional(&[staged], "no summary")
+                .expect("evict")
+                .is_empty()
+        );
     }
 
     #[test]
