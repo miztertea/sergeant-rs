@@ -91,15 +91,26 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// spawn (`cap_worker_address_space`) — the memory-fault class the deadline
 /// alone cannot close (module doc, "Memory containment").
 ///
-/// **512 MiB.** Sized generously for real document parsing — a worker
-/// holding a large document's whole decoded text plus working structures in
-/// memory at once comfortably fits well under this — while staying far
-/// below ordinary host headroom, so a legitimate worker never trips it and
-/// a runaway one dies on its own long before it could raise host-global
-/// pressure or contend with anything else running on the host. `pub` (not
-/// `pub(crate)`) so the deterministic memory-fault acceptance test
-/// (`tests/y1_worker_transport.rs`) can size its own deadline against the
-/// real value rather than duplicating it.
+/// **512 MiB, PROVISIONAL.** This build's own rule is that a numeric
+/// default is a suspect until traced to a dated measurement, and this one
+/// has not been: Y1 ships no real parser (the worker body is trivial), so
+/// there is no real document corpus to size this against yet. 512 MiB is a
+/// working bound chosen to be far below ordinary host headroom, not a
+/// validated ceiling. It **must be re-derived against a real corpus** once
+/// the first real parser (the Y2 Anydoc/Office adapter) lands, and this
+/// comment must be updated to cite that measurement when it does.
+///
+/// **This is a per-child cap, not a total.** Each worker child gets its own
+/// independent `RLIMIT_AS` of this size; workers run concurrently up to the
+/// intelligence lane's own concurrency cap
+/// ([`crate::runtime::engine::default_intelligence_lane_cap`]), so the real
+/// worst-case worker memory ceiling is `lane_cap * WORKER_ADDRESS_SPACE_LIMIT_BYTES`,
+/// not this constant alone. Any future sizing of this constant, or of the
+/// lane cap, must account for that product.
+///
+/// `pub` (not `pub(crate)`) so the deterministic memory-fault acceptance
+/// test (`tests/y1_worker_transport.rs`) can size its own deadline against
+/// the real value rather than duplicating it.
 pub const WORKER_ADDRESS_SPACE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 
 /// How long [`run_worker`] waits, after the child has already exited or been
@@ -398,14 +409,22 @@ enum WorkerFault {
     ///
     /// The kernel enforces the ceiling by failing the child's own
     /// allocation (`RLIMIT_AS` makes the mapping syscall behind it return
-    /// `ENOMEM`), so the worker still self-terminates by signal rather than
-    /// being `SIGKILL`'d from outside — [`fault_for_exit`] tells this apart
-    /// from an ordinary [`Self::Signaled`] by the allocator's own "memory
-    /// allocation of N bytes failed" message in `stderr_tail`, not by which
-    /// raw signal number the platform happens to raise for an aborted
-    /// allocation (that varies by target and Rust toolchain version, the
-    /// message does not).
-    MemoryLimitExceeded { signal: i32, stderr_tail: String },
+    /// `ENOMEM`), and what that failure does to the child varies by which
+    /// allocator hit it: Rust's default allocator aborts (the worker
+    /// self-terminates by signal, `signal` is `Some`); a fallible-allocation
+    /// path or a third-party C library's own OOM handler instead panics or
+    /// calls `_exit` and the process exits non-zero on its own (`signal` is
+    /// `None`, `code` is the exit code). [`fault_for_exit`] tells either
+    /// shape apart from an ordinary [`Self::Signaled`]/[`Self::ExitedNonZero`]
+    /// by matching a known allocation-failure signature in `stderr_tail`
+    /// (`matches_allocation_failure`), never by which raw signal number or
+    /// exit code the platform happens to produce (both vary by target,
+    /// allocator, and toolchain version; the message families do not).
+    MemoryLimitExceeded {
+        signal: Option<i32>,
+        code: Option<i32>,
+        stderr_tail: String,
+    },
     /// The worker exited on its own, with a non-zero status.
     ExitedNonZero {
         code: Option<i32>,
@@ -435,11 +454,19 @@ impl WorkerFault {
             ),
             Self::MemoryLimitExceeded {
                 signal,
+                code,
                 stderr_tail,
-            } => format!(
-                "supervised parse worker exceeded its {WORKER_ADDRESS_SPACE_LIMIT_BYTES}-byte \
-                 address-space limit and was terminated (signal {signal}); stderr: {stderr_tail}"
-            ),
+            } => {
+                let how = match (signal, code) {
+                    (Some(signal), _) => format!("signal {signal}"),
+                    (None, Some(code)) => format!("exit code {code}"),
+                    (None, None) => "an unknown exit".to_string(),
+                };
+                format!(
+                    "supervised parse worker exceeded its {WORKER_ADDRESS_SPACE_LIMIT_BYTES}-byte \
+                     address-space limit and was terminated ({how}); stderr: {stderr_tail}"
+                )
+            }
             Self::ExitedNonZero { code, stderr_tail } => format!(
                 "supervised parse worker exited with status {code:?}; stderr: {stderr_tail}"
             ),
@@ -641,24 +668,82 @@ fn cap_worker_address_space(command: &mut Command) {
 #[cfg(not(target_os = "linux"))]
 fn cap_worker_address_space(_command: &mut Command) {}
 
+/// Well-known allocation-failure message signatures, each expressed as the
+/// set of substrings that must **all** appear in a child's stderr tail for
+/// that signature to match ([`matches_allocation_failure`]).
+///
+/// Deliberately narrow: every entry is an exact fragment of a real
+/// allocator/runtime's own failure message, never a generic word ("error",
+/// "abort", "fatal") that an unrelated fault could also print. A multi-part
+/// entry requires every one of its fragments together, specifically so a
+/// message that merely shares one common word with a real signature (e.g.
+/// the standalone word "failed") cannot match on its own. Matching here only
+/// ever *upgrades* an exit or signal termination that is already known to be
+/// abnormal into the more specific [`WorkerFault::MemoryLimitExceeded`] — it
+/// is never consulted on a clean exit, so a false positive here can at worst
+/// relabel one already-bad outcome as another; it can never manufacture a
+/// fault, and it can never produce [`WorkerFault::TimedOut`] (the deadline
+/// path never calls this function at all).
+const ALLOCATION_FAILURE_SIGNATURES: &[&[&str]] = &[
+    // Rust's global-allocator abort (`alloc::alloc::handle_alloc_error`),
+    // hit when an infallible `Vec`/`Box`/`String`/`Arc` allocation's
+    // underlying `malloc`/mmap call returns null. The historical signature
+    // this classifier already matched.
+    &["memory allocation of", "failed"],
+    // Rust's *fallible* allocation path (`Vec::try_reserve`,
+    // `HashMap::try_reserve`, …) reports a real allocation failure as the
+    // `AllocError` variant of `TryReserveErrorKind` rather than aborting; an
+    // `.unwrap()`/`.expect()` on that `Err` panics (exit code 101, no
+    // signal) with both fragments in the message. `AllocError` is required
+    // alongside `TryReserveError` because the *other* variant of the same
+    // error type, `CapacityOverflow`, is a logic bug (an oversized
+    // `len * size_of::<T>()`) rather than a real allocation failure, and
+    // must not be misclassified as the memory cap.
+    &["TryReserveError", "AllocError"],
+    // An `mmap`/allocation call surfaced through `std::io::Error` renders an
+    // `ENOMEM` failure as libc's own `strerror(ENOMEM)` text — exact,
+    // OS-supplied wording, not a fragment this build invented.
+    &["Cannot allocate memory"],
+    // glibc's own malloc-arena OOM abort, hit by any third-party C/C++
+    // library linked into the worker (not only Rust code) — a real shape
+    // review found `RLIMIT_AS` can produce without the child being Rust at
+    // all.
+    &["malloc(): unable to allocate memory"],
+];
+
+/// Whether `stderr_tail` carries one of [`ALLOCATION_FAILURE_SIGNATURES`] in
+/// full (every fragment of at least one signature present).
+fn matches_allocation_failure(stderr_tail: &str) -> bool {
+    ALLOCATION_FAILURE_SIGNATURES.iter().any(|signature| {
+        signature
+            .iter()
+            .all(|fragment| stderr_tail.contains(fragment))
+    })
+}
+
 /// `None` for a clean exit; `Some` naming a signal termination or a
 /// non-zero status, stderr tail attached either way.
 ///
-/// A signal termination whose stderr carries Rust's own allocator-failure
-/// message ("memory allocation of ... bytes failed") is reported as
-/// [`WorkerFault::MemoryLimitExceeded`] rather than a plain
-/// [`WorkerFault::Signaled`] — the message, not the raw signal number
-/// (platform- and toolchain-dependent), is what reliably names an
-/// `RLIMIT_AS` kill.
+/// Either shape — signalled or a plain non-zero exit — is reported as
+/// [`WorkerFault::MemoryLimitExceeded`] instead of a plain
+/// [`WorkerFault::Signaled`]/[`WorkerFault::ExitedNonZero`] when its stderr
+/// carries a [`matches_allocation_failure`] signature: the message, not the
+/// raw signal number or exit code (both platform- and toolchain-dependent),
+/// is what reliably names an `RLIMIT_AS` kill, and an `RLIMIT_AS` kill does
+/// not always exit the same way (module doc; [`WorkerFault::MemoryLimitExceeded`]'s
+/// own doc). Absent a match, this falls back to the existing honest
+/// [`WorkerFault::Signaled`]/[`WorkerFault::ExitedNonZero`] label rather than
+/// guessing.
 fn fault_for_exit(status: ExitStatus, process: &mut std::process::Child) -> Option<WorkerFault> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
             let stderr_tail = drain_stderr(process);
-            if stderr_tail.contains("memory allocation of") && stderr_tail.contains("failed") {
+            if matches_allocation_failure(&stderr_tail) {
                 return Some(WorkerFault::MemoryLimitExceeded {
-                    signal,
+                    signal: Some(signal),
+                    code: None,
                     stderr_tail,
                 });
             }
@@ -669,10 +754,16 @@ fn fault_for_exit(status: ExitStatus, process: &mut std::process::Child) -> Opti
         }
     }
     if !status.success() {
-        return Some(WorkerFault::ExitedNonZero {
-            code: status.code(),
-            stderr_tail: drain_stderr(process),
-        });
+        let stderr_tail = drain_stderr(process);
+        let code = status.code();
+        if matches_allocation_failure(&stderr_tail) {
+            return Some(WorkerFault::MemoryLimitExceeded {
+                signal: None,
+                code,
+                stderr_tail,
+            });
+        }
+        return Some(WorkerFault::ExitedNonZero { code, stderr_tail });
     }
     None
 }
@@ -865,5 +956,189 @@ mod tests {
                 .contains("could not be spawned"),
             "{row:?}"
         );
+    }
+
+    // --------------------------------------------------------- FIX 2 tests
+    //
+    // `matches_allocation_failure` is exercised directly against crafted
+    // stderr text (no real memory exhaustion needed — the deterministic
+    // `--fault allocate` acceptance test in `tests/y1_worker_transport.rs`
+    // already proves the real RLIMIT_AS-kill path end to end). The
+    // `run_worker`-level tests below use `/bin/sh` to produce a *real*
+    // signalled/exited child whose stderr and exit shape are crafted, so
+    // `fault_for_exit` itself — not just the pure matcher — is proven for
+    // the two newly-classified shapes (a).(b) the review named.
+
+    #[test]
+    fn the_historical_rust_abort_message_matches() {
+        assert!(matches_allocation_failure(
+            "thread 'main' panicked at 'memory allocation of 4096 bytes failed'"
+        ));
+    }
+
+    #[test]
+    fn a_rust_try_reserve_alloc_error_matches() {
+        assert!(matches_allocation_failure(
+            "called `Result::unwrap()` on an `Err` value: TryReserveError(AllocError { \
+             layout: ..., non_exhaustive: () })"
+        ));
+    }
+
+    #[test]
+    fn a_try_reserve_capacity_overflow_does_not_match() {
+        // CapacityOverflow is a logic bug (an oversized `len * size_of::<T>()`
+        // computation), not a real allocation failure — must not be
+        // misclassified as the memory cap even though it shares the
+        // `TryReserveError` fragment.
+        assert!(!matches_allocation_failure(
+            "called `Result::unwrap()` on an `Err` value: TryReserveError(CapacityOverflow)"
+        ));
+    }
+
+    #[test]
+    fn an_enomem_io_error_matches() {
+        assert!(matches_allocation_failure(
+            "mmap failed: Cannot allocate memory (os error 12)"
+        ));
+    }
+
+    #[test]
+    fn a_glibc_malloc_abort_matches() {
+        assert!(matches_allocation_failure(
+            "malloc(): unable to allocate memory\nAborted"
+        ));
+    }
+
+    #[test]
+    fn unrelated_stderr_does_not_match() {
+        for stderr in [
+            "",
+            "failed",
+            "error: unexpected token",
+            "thread 'main' panicked at 'index out of bounds'",
+            "out of memory", // deliberately excluded: too generic on its own
+        ] {
+            assert!(
+                !matches_allocation_failure(stderr),
+                "{stderr:?} must not match an allocation-failure signature"
+            );
+        }
+    }
+
+    /// Shape (a) from the review: a Rust panic path (e.g. an unwrapped
+    /// `Vec::try_reserve` failure) exits non-zero (code 101, no signal) —
+    /// this must now be named the memory cap, not `ExitedNonZero`.
+    #[test]
+    fn a_nonzero_exit_with_an_allocation_signature_is_classified_as_the_memory_cap() {
+        let outcome = run_worker(
+            WorkerSpawn {
+                program: PathBuf::from("/bin/sh"),
+                args: vec![
+                    "-c".to_string(),
+                    "printf '%s' \"called \\`Result::unwrap()\\` on an \\`Err\\` value: \
+                     TryReserveError(AllocError)\" 1>&2; exit 101"
+                        .to_string(),
+                ],
+                input: Vec::new(),
+                deadline: Duration::from_secs(5),
+            },
+            &identity(),
+            &deny(),
+        );
+        let WorkerOutcome::Refused(row) = outcome else {
+            panic!("must be refused: {outcome:?}");
+        };
+        let detail = row.detail.unwrap_or_default();
+        assert!(
+            detail.contains("address-space limit") && detail.contains("exit code 101"),
+            "a panicking allocation failure must be named the memory cap: {detail:?}"
+        );
+    }
+
+    /// A non-zero exit whose stderr carries no allocation signature must
+    /// stay the honest `ExitedNonZero` label — the conservative fallback
+    /// the review required.
+    #[test]
+    fn a_nonzero_exit_without_an_allocation_signature_stays_exited_non_zero() {
+        let outcome = run_worker(
+            WorkerSpawn {
+                program: PathBuf::from("/bin/sh"),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'ordinary failure' 1>&2; exit 7".to_string(),
+                ],
+                input: Vec::new(),
+                deadline: Duration::from_secs(5),
+            },
+            &identity(),
+            &deny(),
+        );
+        let WorkerOutcome::Refused(row) = outcome else {
+            panic!("must be refused: {outcome:?}");
+        };
+        let detail = row.detail.unwrap_or_default();
+        assert!(
+            !detail.contains("address-space limit"),
+            "an unrelated non-zero exit must not be named the memory cap: {detail:?}"
+        );
+        assert!(detail.contains("exited with status"), "{detail:?}");
+    }
+
+    /// Shape (b) from the review: a third-party C library aborting on its
+    /// own OOM path with glibc's message, terminated by `SIGABRT` rather
+    /// than `RLIMIT_AS` directly — this must still be named the memory cap
+    /// when the evidence (the message) supports it.
+    #[test]
+    fn a_signalled_exit_with_a_glibc_allocation_signature_is_classified_as_the_memory_cap() {
+        let outcome = run_worker(
+            WorkerSpawn {
+                program: PathBuf::from("/bin/sh"),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'malloc(): unable to allocate memory' 1>&2; kill -ABRT $$".to_string(),
+                ],
+                input: Vec::new(),
+                deadline: Duration::from_secs(5),
+            },
+            &identity(),
+            &deny(),
+        );
+        let WorkerOutcome::Refused(row) = outcome else {
+            panic!("must be refused: {outcome:?}");
+        };
+        let detail = row.detail.unwrap_or_default();
+        assert!(
+            detail.contains("address-space limit") && detail.contains("signal"),
+            "a glibc allocation abort must be named the memory cap: {detail:?}"
+        );
+    }
+
+    /// A signalled exit whose stderr carries no allocation signature must
+    /// stay the honest `Signaled` label — same conservative fallback,
+    /// signal path this time.
+    #[test]
+    fn a_signalled_exit_without_an_allocation_signature_stays_signaled() {
+        let outcome = run_worker(
+            WorkerSpawn {
+                program: PathBuf::from("/bin/sh"),
+                args: vec![
+                    "-c".to_string(),
+                    "printf 'segfault, not an allocation failure' 1>&2; kill -SEGV $$".to_string(),
+                ],
+                input: Vec::new(),
+                deadline: Duration::from_secs(5),
+            },
+            &identity(),
+            &deny(),
+        );
+        let WorkerOutcome::Refused(row) = outcome else {
+            panic!("must be refused: {outcome:?}");
+        };
+        let detail = row.detail.unwrap_or_default();
+        assert!(
+            !detail.contains("address-space limit"),
+            "an unrelated signal must not be named the memory cap: {detail:?}"
+        );
+        assert!(detail.contains("terminated by signal"), "{detail:?}");
     }
 }
