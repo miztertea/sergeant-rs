@@ -184,6 +184,29 @@ enum Command {
         /// it — the operator types it for that submission or it is not set.
         #[arg(long)]
         override_git_preflight: bool,
+        /// Submit, then stay attached until this Work reaches a terminal
+        /// state (W1 §7/W1-10, S2 E9).
+        ///
+        /// Purely client-side: this is `sgt watch --follow <id>` running in
+        /// the same process, over the same API and event surfaces, after the
+        /// submission returns. No new engine state exists to hold a Work
+        /// open — the parent actor blocks, the daemon does not, and a
+        /// `--wait` that is interrupted leaves the Work running exactly as
+        /// an unwatched one would.
+        ///
+        /// Attention transitions (`needs_input`, `blocked`, `failed`,
+        /// `waiting`) are reported as they happen and do **not** end the
+        /// wait; only `completed`/`canceled` do — the same watch set and the
+        /// same exit rule `sgt watch --follow` already uses, including its
+        /// consequence that a Work which fails and is never retried keeps a
+        /// waiter attached after the `failed` notice.
+        ///
+        /// Under `--json` the stream is concatenated JSON documents: the
+        /// submit record exactly as `sgt run --json` already prints it,
+        /// then one compact notice per line, exactly as `sgt watch --json`
+        /// emits them.
+        #[arg(long)]
+        wait: bool,
     },
     /// Inspect work items.
     Work {
@@ -1063,6 +1086,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             turns,
             ceiling_secs,
             override_git_preflight,
+            wait,
         } => {
             // estate-root proposal §7.2: scope resolution is core-owned. The
             // CLI forwards `--repo`/`--group`/`--all` verbatim as
@@ -1135,7 +1159,41 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             } else {
                 print_work_line("submitted", &result);
             }
-            Ok(())
+            if !wait {
+                return Ok(());
+            }
+            // W1-10 / E9: submit **then observe**, over the API and event
+            // path that already exist. `crate::watch::watch` is called, not
+            // re-derived: its head-before-stream-before-read sequencing is
+            // what closes the race between the submission above and the
+            // subscription below, and inlining a poll loop here would either
+            // duplicate that or reopen it (m9 pins the module's own crate
+            // boundary; nothing in this arm crosses it).
+            let Some(id) = result["work"]["id"].as_str() else {
+                return Err(CliError::new(
+                    "the daemon accepted the submission but named no work id, so there is \
+                     nothing to wait on",
+                ));
+            };
+            let options = crate::watch::WatchOptions {
+                work_id: Some(id.to_string()),
+                follow: true,
+                estate_root: Some(estate_root(&estate)),
+            };
+            let json = sgt.json;
+            crate::watch::watch(&client, &options, |notice| {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(notice).expect("watch notice serializes")
+                    );
+                } else {
+                    println!("{}", crate::watch::render_human(notice));
+                }
+            })
+            .await
+            .map(|_exit| ())
+            .map_err(|e| CliError::new(e.to_string()))
         }
         Command::Respond { id, input } => {
             let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;

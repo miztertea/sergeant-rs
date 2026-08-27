@@ -397,6 +397,40 @@ async fn sgt_run(
     .expect("join the spawned CLI")
 }
 
+/// Every JSON document on a stdout stream, in order.
+///
+/// `sgt run --json --wait` prints the submit record exactly as `sgt run
+/// --json` always has — pretty, several lines — and then one compact watch
+/// notice per line, so the stream is concatenated JSON documents rather than
+/// strictly one per line.
+fn json_documents(stdout: &str) -> Vec<Value> {
+    serde_json::Deserializer::from_str(stdout)
+        .into_iter::<Value>()
+        .map(|document| document.expect("stdout is a stream of JSON documents"))
+        .collect()
+}
+
+/// [`sgt_run`] with `--wait`.
+async fn sgt_run_wait(data_dir: &Path, estate: &Path, intent: &str) -> std::process::Output {
+    let (data_dir, estate, intent) = (
+        data_dir.to_path_buf(),
+        estate.to_path_buf(),
+        intent.to_string(),
+    );
+    tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_sgt"))
+            .current_dir(&estate)
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .args(["--json", "run", &intent, "--backend", "fake", "--wait"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run sgt run --wait")
+    })
+    .await
+    .expect("join the spawned CLI")
+}
+
 /// W1 §13.5, the CLI half: `sgt run` reads the `SERGEANT_*` coordinates out
 /// of the environment it inherited and sends them as *claims*, and the daemon
 /// turns a good claim into a recorded relation.
@@ -470,4 +504,135 @@ async fn sgt_run_transports_the_inherited_causation_and_the_daemon_validates_it(
     );
 
     handle.shutdown().await;
+}
+
+/// E9 / W1-10: `--wait` is submit-then-observe. The parent actor blocks; the
+/// daemon does not. This drives a real `sgt run --wait` to a Work's terminal
+/// state and reads the terminal notice off its stdout.
+#[tokio::test]
+async fn sgt_run_wait_observes_a_child_to_terminal_and_prints_the_notice() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = support::DataDir::new();
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+
+    let (handle, _fake) = start_fake(data.path(), []).await;
+    let output = sgt_run_wait(data.path(), &estate, "a Work to wait on").await;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "sgt run --wait must return once the Work is terminal\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Line 1 is the submit record; every later line is a watch notice, the
+    // last of which is terminal (§9.1's JSONL, exactly as `sgt watch --json`
+    // emits it).
+    let lines = json_documents(&stdout);
+    assert!(
+        lines.len() >= 2,
+        "the submit record plus at least one notice: {stdout}"
+    );
+    let work_id = lines[0]["work"]["id"]
+        .as_str()
+        .expect("work id")
+        .to_string();
+    let last = lines.last().expect("a notice");
+    assert_eq!(
+        last["schema"], "sergeant.watch/v1",
+        "the terminal notice is an ordinary watch notice, not a second shape \
+         invented for this flag: {last}"
+    );
+    assert_eq!(last["snapshot"]["work"]["id"], work_id);
+    assert_eq!(
+        last["snapshot"]["work"]["state"], "completed",
+        "the wait ends on the terminal state, not on the submission: {last}"
+    );
+
+    handle.shutdown().await;
+}
+
+/// E9's negative half, stated as behaviour rather than as a promise: waiting
+/// introduces **no engine hold state**. The set of event kinds a `--wait`
+/// submission journals must be exactly the set an identical un-waited
+/// submission journals — a hold, a lease, a new parked state or a "waiter
+/// attached" record would all show up here as an extra kind.
+///
+/// Plus the structural half: `--wait` must *call* `crate::watch::watch`
+/// rather than re-derive its head-before-stream-before-read sequencing, and
+/// the engine must know nothing about the watch module at all.
+#[tokio::test]
+async fn waiting_adds_no_engine_state_and_re_derives_nothing() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = support::DataDir::new();
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+
+    let (handle, _fake) = start_fake(data.path(), []).await;
+    let waited = sgt_run_wait(data.path(), &estate, "waited").await;
+    assert_eq!(waited.status.code(), Some(0));
+    let plain = sgt_run(data.path(), &estate, "not waited", &[]).await;
+    assert_eq!(plain.status.code(), Some(0));
+    let id_of = |output: &std::process::Output| {
+        json_documents(&String::from_utf8_lossy(&output.stdout))[0]["work"]["id"]
+            .as_str()
+            .expect("work id")
+            .to_string()
+    };
+    let (waited_id, plain_id) = (id_of(&waited), id_of(&plain));
+
+    // Let the un-waited Work finish before reading the journal: without the
+    // wait, nothing in this test has synchronised with its completion.
+    let client = http();
+    for _ in 0..200 {
+        let view = get(&client, &handle, &format!("/v1/work/{plain_id}")).await;
+        if view["work"]["state"] == json!("completed") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    handle.shutdown().await;
+
+    let kinds_of = |work_id: &str| -> Vec<String> {
+        let mut kinds: Vec<String> = Journal::replay_data_dir(data.path())
+            .expect("replay")
+            .map(|e| e.expect("event"))
+            .filter(|e| e.work_id.as_deref() == Some(work_id))
+            .map(|e| e.kind)
+            .collect();
+        kinds.sort();
+        kinds.dedup();
+        kinds
+    };
+    assert_eq!(
+        kinds_of(&waited_id),
+        kinds_of(&plain_id),
+        "a waited submission must journal exactly what an un-waited one \
+         journals — waiting is a client behaviour (W1-10), so any extra \
+         event kind here is engine hold state that must not exist"
+    );
+
+    let cli = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cli.rs"))
+        .expect("read cli.rs");
+    assert!(
+        cli.contains("crate::watch::watch(&client, &options"),
+        "--wait must call the existing watch loop (R2), not re-derive it"
+    );
+    assert!(
+        !cli.contains("stream_events"),
+        "cli.rs must not reach for the event stream itself: that is exactly \
+         the head-before-stream-before-read sequencing watch.rs owns, and \
+         duplicating it reopens the race W1-10 closed"
+    );
+    let engine = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/runtime/engine.rs"
+    ))
+    .expect("read engine.rs");
+    assert!(
+        !engine.contains("crate::watch"),
+        "the engine must not know the watch module exists: --wait is client \
+         behaviour over the API, never a hold the engine takes"
+    );
 }
