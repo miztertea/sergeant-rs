@@ -76,6 +76,91 @@ release.
   figure that had been carried from an earlier, differently-provisioned
   environment).
 
+### Hierarchical execution (S2)
+
+- A workflow stage directory may now itself hold a `workflow.toml`: the
+  loader recurses (embedded and repository packages alike), splicing the
+  nested package's leaves into the parent's one flat `stages` list at the
+  container's position, with `parent/child` composed hierarchical stage
+  ids. The container itself is never a `StageDefinition` or a
+  `StageRecord` — it enters and completes no event of its own; a
+  container "completing" is simply its last flattened leaf completing.
+  Nesting is unbounded by design; a package that resolves to one of its
+  own ancestors (a symlink cycle) fails closed by name at load time
+  instead of overflowing the recursion. A stage directory carrying both
+  `workflow.toml` and `CONTEXT.md` is a load error — a container has no
+  actor, so its `CONTEXT.md` could never be read.
+- A closing container's own declared output contract is checked at its
+  boundary-closing leaf's completion, reusing the existing output-gate
+  mechanics verbatim: a bounded re-prompt of that leaf, then a park
+  naming the *container's* id if still unmet. A leaf that simultaneously
+  closes several ancestor containers gates them innermost first. Nested
+  leaves' own output/required-column/finalize contracts behave
+  identically to top-level ones and are never bypassed by container
+  completion.
+- Composed hierarchical stage ids journal, replay, and render correctly:
+  the analytics fold, `sgt work show`, and a daemon restarted mid-nest
+  all carry/reconstruct the exact composed id from the journal alone —
+  recovery needs no process tree, only the last `StageRecord`. The
+  workflow's own wire shape stays the flat leaf list (hierarchical ids as
+  opaque strings); the TUI's workflow rail draws that flat list as the
+  tree it is.
+- `sgt -C <estate> run` from inside a managed execution can create an
+  ordinary, separately admitted child Work. Every managed execution now
+  carries an estate/Work/execution causation triple
+  (`SERGEANT_ESTATE_ROOT`/`SERGEANT_WORK_ID`/`SERGEANT_EXECUTION_ID`,
+  distinct from the harness's own `SGT_ESTATE_ROOT`) to every adapter's
+  spawned process, survives a daemon restart, and — when the child's `sgt
+  run` inherits and spends it — the daemon validates the claimed parent
+  against its own journal before recording the relation. A claim that
+  fails validation is never refused: the submission proceeds as an
+  ordinary causation-less Work, and the daemon journals an explicit,
+  visible `causation_unverified` marker naming the failed claim (journal
+  is truth; substance is preserved by admission and explicit addressing
+  rather than by refusal). Child Work has fully independent scope,
+  surface, and lifecycle — parent completion, cancellation, or (there
+  being no merge primitive in the engine at all) any notion of merge
+  never cascades to it, and a bare `sgt run` from inside a Work surface
+  still refuses; only explicit `-C` addressing is exempt.
+- `sgt run --wait` observes the Work it just submitted through to a
+  terminal state client-side (the existing watch mechanism, scoped to
+  the new Work id) — no new engine hold state.
+- The Fleet TUI groups a child Work immediately under its own parent,
+  recursively, indenting the intent cell one level per ancestor hop — the
+  causal-child tree, derived entirely from a row's own already-projected
+  `parent` field (no second request per Work). A child whose parent
+  isn't currently visible (filtered out, or aged out of the daemon's
+  caches) renders as a root rather than being dropped.
+- `sgt doctor` gained a `workflow_stage_declarations` row: a
+  directory inside a workflow package that looks like a stage (holds
+  `CONTEXT.md`, `README.md`, or its own `workflow.toml`) but isn't named
+  in that package's declared `stages` warns, naming the package and the
+  directory (or, for an undeclared nested package, the whole unreachable
+  subtree) — a real directory on disk the loader will never reach. Warn,
+  not fail: this is an authoring-drift observation, not a broken
+  declaration.
+- Fixed a probe-child leak: a killed probe's own children (and their
+  children) now die with the probe and with the daemon instead of being
+  reparented and left running, orphaned. (#310)
+- The test suite runs roughly 40% faster: ten small no-daemon integration
+  suites consolidated into one harness binary (`c2_light`, paying one
+  link instead of ten), `cargo-nextest` adopted (exact-pinned) locally,
+  in CI, and in the coverage lane, and `ci.yml`'s fmt/clippy job split
+  from the test job so wall-clock is the slower of the two rather than
+  their sum. Fixed a cross-process-re-entrant OTLP-disabled test that the
+  consolidation surfaced. (#305)
+- Doctrine amendment: `AGENTS.md`'s ESTATE bullet 5 and `icm-policy.md`'s
+  rule 1 now point at the sanctioned child-Work path (`sgt -C run`) as
+  the real nesting/possession primitive, replacing an ambiguous
+  possession-vs-injection reading; a new `docs/concepts/
+  hierarchical-execution.md` page documents nested packages and child
+  Work for operators.
+- The W1 §13 acceptance battery (`tests/v4_w1_acceptance.rs`) walks all
+  nine acceptance criteria literally, citing the named pin for each
+  already-proven claim and adding one self-contained structural test for
+  the one gap (no merge primitive exists in the engine to cascade
+  through).
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain
