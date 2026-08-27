@@ -21,7 +21,7 @@
 //! 6. the supersession is narrow: a bare `sgt run` from inside a Work surface
 //!    still refuses.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -634,5 +634,565 @@ async fn waiting_adds_no_engine_state_and_re_derives_nothing() {
         !engine.contains("crate::watch"),
         "the engine must not know the watch module exists: --wait is client \
          behaviour over the API, never a hold the engine takes"
+    );
+}
+
+// ------------------------------- the end-to-end actor -> child Work case
+
+/// The claude flags [`sergeant_rs::backend::claude::REQUIRED_FLAGS`] probes
+/// for, echoed by the stub's `--help`.
+const CLAUDE_STUB_FLAGS: &[&str] = &[
+    "--print",
+    "--verbose",
+    "--output-format",
+    "--session-id",
+    "--resume",
+    "--setting-sources",
+    "--model",
+    "--permission-mode",
+];
+
+/// One recorded `claude` turn, so the stub's stdout is a real transcript
+/// rather than a shape invented here.
+const RECORDED_TURN: &str = include_str!("fixtures/claude-2.1.226-turn.jsonl");
+
+/// An actor that does what W1 §5 describes: on its first turn it runs the
+/// **real `sgt` binary**, addressing its estate with `-C
+/// "$SERGEANT_ESTATE_ROOT"` and carrying whatever `SERGEANT_*` it inherited,
+/// then replays an ordinary turn.
+///
+/// The one-shot marker matters: without it every later turn of the same
+/// conversation would submit another child.
+fn write_child_submitting_actor(dir: &Path, data_dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("claude-child-submitter");
+    let once = dir.join("submitted.marker");
+    let out = dir.join("child-stdout.json");
+    let err = dir.join("child-stderr.txt");
+    let replay = dir.join("turn.jsonl");
+    std::fs::write(&replay, RECORDED_TURN).expect("write replay");
+    let script = format!(
+        "#!/bin/sh\n\
+         case \"$1\" in\n  \
+           --version) echo '2.1.226 (Claude Code)';;\n  \
+           --help) echo '{flags}';;\n  \
+           *)\n    \
+             if [ ! -f '{once}' ]; then\n      \
+               : > '{once}'\n      \
+               '{sgt}' --data-dir '{data_dir}' -C \"$SERGEANT_ESTATE_ROOT\" --json \\\n        \
+                 run 'work the actor discovered' --backend fake \\\n        \
+                 > '{out}' 2> '{err}'\n      \
+               echo \"$?\" > '{err}.code'\n    \
+             fi\n    \
+             cat '{replay}'\n    \
+             exit 0;;\n\
+         esac\n",
+        flags = CLAUDE_STUB_FLAGS.join(" "),
+        once = once.display(),
+        sgt = env!("CARGO_BIN_EXE_sgt"),
+        data_dir = data_dir.display(),
+        out = out.display(),
+        err = err.display(),
+        replay = replay.display(),
+    );
+    std::fs::write(&path, script).expect("write actor stub");
+    let mut permissions = std::fs::metadata(&path).expect("stat").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).expect("chmod");
+    support::wait_until_executable(&path);
+    path
+}
+
+/// W1 §13.5 end to end, with no test-set environment anywhere in the chain:
+/// the daemon launches a real actor process, that process inherits the
+/// causation triple from its own environment, spends it on a real `sgt -C …
+/// run`, and the daemon validates the claim against its own journal.
+///
+/// This is the one test where every link is the real thing — engine, adapter,
+/// spawned process, CLI binary, HTTP submit, journal validation.
+#[tokio::test]
+async fn an_actor_process_submits_child_work_with_validated_causation() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = support::DataDir::new();
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+    let actor = write_child_submitting_actor(repos.path(), data.path());
+
+    let fake = Arc::new(FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::needs_input(
+            "the child parks, holding nothing open",
+        )],
+    ));
+    let mut claude = sergeant_rs::backend::claude::ClaudeConfig::new(data.path());
+    claude.executable = actor.clone();
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new().with(fake)),
+            default_backend: Some(sergeant_rs::backend::claude::CLAUDE_BACKEND_NAME.to_string()),
+            claude: Some(claude),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+
+    let client = http();
+    let (status, parent) = submit_with(&client, &handle, &estate, "the parent", json!({})).await;
+    assert_eq!(status, 201, "the parent is accepted: {parent}");
+    let parent_id = parent["work"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let parent_execution = parent["execution"]["execution_id"]
+        .as_str()
+        .expect("the parent really launched an execution")
+        .to_string();
+
+    // The actor's own `sgt run` is a separate process racing this one; wait
+    // for the child Work rather than for a wall clock.
+    let mut child = Value::Null;
+    for _ in 0..200 {
+        let fleet = get(&client, &handle, "/v1/work").await;
+        if let Some(found) = fleet["works"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|work| work["intent"] == json!("work the actor discovered"))
+        {
+            child = found.clone();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    handle.shutdown().await;
+
+    let stderr = std::fs::read_to_string(repos.path().join("child-stderr.txt")).unwrap_or_default();
+    assert!(
+        !child.is_null(),
+        "the actor's `sgt -C \"$SERGEANT_ESTATE_ROOT\" run` never produced a \
+         child Work; its stderr was: {stderr}"
+    );
+    assert_eq!(
+        child["parent_work_id"], parent_id,
+        "the child's lineage is the Work whose execution launched the actor: {child}"
+    );
+    assert_eq!(
+        child["parent_execution_id"], parent_execution,
+        "and the execution it actually ran in: {child}"
+    );
+    assert!(
+        child["causation_unverified"].is_null(),
+        "nothing about this claim needed a marker: {child}"
+    );
+    assert_ne!(
+        child["id"], parent["work"]["id"],
+        "the child is its own Work (W1 §7), not a stage of the parent"
+    );
+}
+
+/// W1 §5's supersession is **narrow** (deliverable 6): what it permits is
+/// `sgt -C "$SERGEANT_ESTATE_ROOT" run` from a Work surface — explicit
+/// addressing of a real estate — and nothing else. A bare `sgt run` from
+/// inside the same worktree, with no `-C`, still refuses exactly as it always
+/// has: the surface is not an estate root, sergeant does not search upward
+/// for one, and `SGT_ESTATE_ROOT` decorates that refusal without ever waiving
+/// it.
+///
+/// Both halves in one test on purpose: "still refuses" is only meaningful
+/// beside "and the sanctioned path from the very same directory works".
+#[tokio::test]
+async fn a_bare_sgt_run_from_a_work_surface_still_refuses_while_dash_c_works() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = support::DataDir::new();
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+
+    let (handle, _fake) = start_fake(data.path(), [FakeStep::needs_input("parked")]).await;
+    let client = http();
+    let (_, parent) = submit_with(&client, &handle, &estate, "the parent", json!({})).await;
+    let surface = parent["surface"]["bindings"][0]["worktree_path"]
+        .as_str()
+        .expect("the parent materialized a worktree")
+        .to_string();
+    let surface = PathBuf::from(surface);
+    assert!(surface.is_dir(), "the surface really exists: {surface:?}");
+
+    // Bare, from inside the surface. The harness variable is set too, since
+    // that is the shape a real session has — and it must still not waive
+    // anything.
+    let refused = tokio::task::spawn_blocking({
+        let (data_dir, surface, estate) =
+            (data.path().to_path_buf(), surface.clone(), estate.clone());
+        move || {
+            Command::new(env!("CARGO_BIN_EXE_sgt"))
+                .current_dir(&surface)
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .args([
+                    "run",
+                    "a child submitted the wrong way",
+                    "--backend",
+                    "fake",
+                ])
+                .env("SGT_ESTATE_ROOT", &estate)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("run sgt run")
+        }
+    })
+    .await
+    .expect("join");
+    let stderr = String::from_utf8_lossy(&refused.stderr).to_string();
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "a bare `sgt run` from a Work surface must refuse: {stderr}"
+    );
+    assert!(
+        stderr.contains("estate"),
+        "and say so in estate terms: {stderr}"
+    );
+
+    // The sanctioned path, from the identical cwd.
+    let accepted = tokio::task::spawn_blocking({
+        let (data_dir, surface, estate) =
+            (data.path().to_path_buf(), surface.clone(), estate.clone());
+        move || {
+            Command::new(env!("CARGO_BIN_EXE_sgt"))
+                .current_dir(&surface)
+                .arg("--data-dir")
+                .arg(&data_dir)
+                .arg("-C")
+                .arg(&estate)
+                .args([
+                    "--json",
+                    "run",
+                    "a child submitted the sanctioned way",
+                    "--backend",
+                    "fake",
+                ])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .expect("run sgt -C run")
+        }
+    })
+    .await
+    .expect("join");
+    handle.shutdown().await;
+    assert_eq!(
+        accepted.status.code(),
+        Some(0),
+        "`sgt -C <estate> run` from the same surface must be accepted: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+}
+
+/// W1 §7 / §13.6-§13.7, the independence pins (deliverable 4). Causation is
+/// evidence, never lifecycle ownership:
+///
+/// - parent **completion** does not cascade to the child;
+/// - parent **cancellation** does not cascade to the child;
+/// - child repository scope is not inherited from the parent (W1-11);
+/// - the child owns a different Work branch and worktree (W1 §8's last
+///   paragraph: no concurrent shared writers to one worktree).
+#[tokio::test]
+async fn a_child_work_is_independent_of_the_parent_that_caused_it() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("two-repo-estate");
+    support::scaffold_estate(&estate, "two", &["alpha", "beta"]);
+
+    let (handle, fake) = start_fake(
+        data.path(),
+        [
+            FakeStep::needs_input("parent parks"),
+            FakeStep::needs_input("child of the completing parent parks"),
+            FakeStep::needs_input("child of the canceled parent parks"),
+        ],
+    )
+    .await;
+    let client = http();
+
+    // A parent scoped to exactly one of the two repositories.
+    let (_, parent) = submit_with(
+        &client,
+        &handle,
+        &estate,
+        "the parent",
+        json!({"scope": {"repos": ["alpha"]}}),
+    )
+    .await;
+    let parent_id = parent["work"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let parent_execution = fake.starts()[0].execution_id.clone();
+    assert_eq!(parent["work"]["repositories"], json!(["alpha"]));
+
+    // The child names its own scope. Nothing is inherited: it targets the
+    // OTHER repository, and the daemon resolves that from the request alone.
+    let (status, child) = submit_with(
+        &client,
+        &handle,
+        &estate,
+        "the child",
+        json!({
+            "scope": {"repos": ["beta"]},
+            "claimed_parent_work_id": parent_id,
+            "claimed_parent_execution_id": parent_execution,
+        }),
+    )
+    .await;
+    assert_eq!(status, 201, "the child is accepted: {child}");
+    let child_id = child["work"]["id"].as_str().expect("child id").to_string();
+    assert_eq!(child["work"]["parent_work_id"], parent_id);
+    assert_eq!(
+        child["work"]["repositories"],
+        json!(["beta"]),
+        "W1-11: repository scope is the child's own, never inherited: {child}"
+    );
+
+    // W1 §8: its own branch and its own worktree, both distinct.
+    let branch_of = |view: &Value| {
+        view["surface"]["bindings"][0]["work_branch"]
+            .as_str()
+            .expect("a work branch")
+            .to_string()
+    };
+    let worktree_of = |view: &Value| {
+        view["surface"]["bindings"][0]["worktree_path"]
+            .as_str()
+            .expect("a worktree")
+            .to_string()
+    };
+    assert_ne!(branch_of(&parent), branch_of(&child));
+    assert_eq!(branch_of(&child), format!("sergeant/{child_id}"));
+    assert_ne!(worktree_of(&parent), worktree_of(&child));
+
+    // Parent cancellation does not cascade (W1-12). Completion's own
+    // non-cascade is pinned separately below, since the two arrive by
+    // different paths.
+    let child_before = get(&client, &handle, &format!("/v1/work/{child_id}")).await;
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{parent_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert!(status.is_success(), "the parent is cancelable");
+    let parent_after = get(&client, &handle, &format!("/v1/work/{parent_id}")).await;
+    assert_eq!(parent_after["work"]["state"], json!("canceled"));
+
+    let child_after = get(&client, &handle, &format!("/v1/work/{child_id}")).await;
+    assert_eq!(
+        child_after["work"]["state"], child_before["work"]["state"],
+        "W1-12: cancelling the parent must not cascade to the child: {child_after}"
+    );
+    assert_ne!(
+        child_after["work"]["state"],
+        json!("canceled"),
+        "and certainly must not cancel it: {child_after}"
+    );
+
+    // Its own terminal result, reached on its own. The child completes while
+    // its parent is already canceled — which is the whole point of W1 §7.
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{child_id}/cancel"),
+        json!({"command_id": ulid()}),
+    )
+    .await;
+    assert!(status.is_success());
+    let child_final = get(&client, &handle, &format!("/v1/work/{child_id}")).await;
+    assert_eq!(child_final["work"]["state"], json!("canceled"));
+    let parent_final = get(&client, &handle, &format!("/v1/work/{parent_id}")).await;
+    assert_eq!(
+        parent_final["work"]["state"],
+        json!("canceled"),
+        "and the child's own terminal outcome rewrites nothing on the parent"
+    );
+
+    handle.shutdown().await;
+}
+
+/// W1 §7's other non-cascade (deliverable 4): a parent that runs all the way
+/// to `completed` leaves its child exactly where it was. Separate from the
+/// cancellation pin above because completion arrives by a different path —
+/// the engine advancing stages, not a client verb — and a cascade bolted
+/// onto either one would not show up in the other's test.
+#[tokio::test]
+async fn a_parent_completing_does_not_cascade_to_its_child() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+
+    // One global FIFO of steps (the fake's own contract): the parent parks,
+    // the child parks, then the parent's four stages complete once it is
+    // answered.
+    let (handle, fake) = start_fake(
+        data.path(),
+        [
+            FakeStep::needs_input("parent parks"),
+            FakeStep::needs_input("child parks"),
+            FakeStep::complete(),
+            FakeStep::complete(),
+            FakeStep::complete(),
+            FakeStep::complete(),
+        ],
+    )
+    .await;
+    let client = http();
+
+    let (_, parent) = submit_with(&client, &handle, &estate, "the parent", json!({})).await;
+    let parent_id = parent["work"]["id"]
+        .as_str()
+        .expect("parent id")
+        .to_string();
+    let parent_execution = fake.starts()[0].execution_id.clone();
+    let (_, child) = submit_with(
+        &client,
+        &handle,
+        &estate,
+        "the child",
+        json!({
+            "claimed_parent_work_id": parent_id,
+            "claimed_parent_execution_id": parent_execution,
+        }),
+    )
+    .await;
+    let child_id = child["work"]["id"].as_str().expect("child id").to_string();
+    assert_eq!(child["work"]["parent_work_id"], parent_id);
+    let child_before = get(&client, &handle, &format!("/v1/work/{child_id}")).await;
+    assert_eq!(child_before["work"]["state"], json!("needs_input"));
+
+    let (status, _) = post(
+        &client,
+        &handle,
+        &format!("/v1/work/{parent_id}/input"),
+        json!({"command_id": ulid(), "input": "carry on"}),
+    )
+    .await;
+    assert!(status.is_success(), "the parked parent takes an answer");
+    let parent_after = get(&client, &handle, &format!("/v1/work/{parent_id}")).await;
+    assert_eq!(
+        parent_after["work"]["state"],
+        json!("completed"),
+        "the parent really reached a terminal state: {parent_after}"
+    );
+
+    let child_after = get(&client, &handle, &format!("/v1/work/{child_id}")).await;
+    handle.shutdown().await;
+    assert_eq!(
+        child_after["work"]["state"],
+        json!("needs_input"),
+        "a completed parent must leave its child exactly where it was — \
+         causation is evidence, not lifecycle ownership (W1 §9): {child_after}"
+    );
+    assert_eq!(
+        child_after["stage"]["stage_id"], child_before["stage"]["stage_id"],
+        "not even its stage may move: {child_after}"
+    );
+}
+
+/// W1-07's rung, named rather than silently shipped: the triple is **three
+/// values**, and binary discoverability is deliberately not a fourth.
+///
+/// A child resolves `sgt` off the PATH it inherited, exactly as the adapters
+/// already resolve `claude`/`codex`/`agy`/`opencode` off theirs, and a daemon
+/// started with a minimal PATH (a service manager, a container, a fresh CI
+/// runner) therefore hands its actors a PATH with no `sgt` on it. Recon
+/// flagged that as a real failure mode worth measuring rather than
+/// discovering live, so this measures it: the failure is the shell's own
+/// immediately-legible `not found` at exit 127, in the actor's own turn —
+/// never a hang, never a silent no-op, and never something sergeant swallows.
+///
+/// If this ever needs to become a fourth injected value, it will be because
+/// this test's diagnostic proved inadequate, not because nobody looked.
+#[tokio::test]
+async fn a_child_that_cannot_find_sgt_on_path_fails_legibly_and_not_silently() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repos = TempDir::new().expect("tempdir");
+    let data = support::DataDir::new();
+    let estate = repos.path().join("solo-estate");
+    support::scaffold_solo_estate(&estate, "solo");
+
+    // An actor that invokes `sgt` by name, under a PATH that has none.
+    let actor = repos.path().join("claude-pathless");
+    let err = repos.path().join("pathless-stderr.txt");
+    let code = repos.path().join("pathless-code.txt");
+    let replay = repos.path().join("pathless-turn.jsonl");
+    std::fs::write(&replay, RECORDED_TURN).expect("write replay");
+    std::fs::write(
+        &actor,
+        format!(
+            "#!/bin/sh\n\
+             case \"$1\" in\n  \
+               --version) echo '2.1.226 (Claude Code)';;\n  \
+               --help) echo '{flags}';;\n  \
+               *)\n    \
+                 PATH=/nonexistent-bin sgt -C \"$SERGEANT_ESTATE_ROOT\" run 'child' \
+2> '{err}'\n    \
+                 echo \"$?\" > '{code}'\n    \
+                 cat '{replay}'\n    \
+                 exit 0;;\n\
+             esac\n",
+            flags = CLAUDE_STUB_FLAGS.join(" "),
+            err = err.display(),
+            code = code.display(),
+            replay = replay.display(),
+        ),
+    )
+    .expect("write actor");
+    let mut permissions = std::fs::metadata(&actor).expect("stat").permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&actor, permissions).expect("chmod");
+    support::wait_until_executable(&actor);
+
+    let mut claude = sergeant_rs::backend::claude::ClaudeConfig::new(data.path());
+    claude.executable = actor.clone();
+    let handle = daemon::start_with(
+        data.path(),
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new()),
+            default_backend: Some(sergeant_rs::backend::claude::CLAUDE_BACKEND_NAME.to_string()),
+            claude: Some(claude),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+
+    let client = http();
+    let (status, parent) = submit_with(&client, &handle, &estate, "the parent", json!({})).await;
+    assert_eq!(status, 201, "the parent is accepted: {parent}");
+
+    for _ in 0..200 {
+        if code.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    handle.shutdown().await;
+
+    let exit = std::fs::read_to_string(&code)
+        .expect("the actor's turn really ran and recorded an exit code")
+        .trim()
+        .to_string();
+    let stderr = std::fs::read_to_string(&err).unwrap_or_default();
+    assert_eq!(
+        exit, "127",
+        "a PATH with no `sgt` fails as `command not found`, immediately and \
+         with a conventional exit code — not a hang and not a silent 0. \
+         stderr was: {stderr}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("not found"),
+        "and says so in words the actor can act on: {stderr:?}"
     );
 }
