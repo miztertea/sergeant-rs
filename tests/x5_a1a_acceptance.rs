@@ -736,8 +736,22 @@ fn tree_snapshot(root: &Path) -> BTreeSet<(String, Vec<u8>)> {
 fn a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped() {
     let atlas = repo_root().join("src/runtime/atlas");
     let mut claims = Vec::new();
-    for entry in fs::read_dir(&atlas).expect("read atlas dir") {
-        let path = entry.expect("entry").path();
+    // Recursive, not a flat read_dir: the tree is flat today, but S4's
+    // adapters may grow submodules, and a tripwire a new subdirectory
+    // silently escapes is no tripwire (aria X5 seat).
+    let mut dirs = vec![atlas];
+    let mut files = Vec::new();
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).expect("read atlas dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    for path in files {
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;
         }

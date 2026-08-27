@@ -73,7 +73,7 @@ A tabular row's *text* becomes a retrievable context unit only through an operat
 
 Every one of these is canned and parameterized. There is no client SQL, no client-named path, and no client-supplied match pattern — a client chooses a verb and supplies values, never a query. Every read is bounded by a row cap a client may lower and never raise. `map neighbors` and `map changed` are deliberately absent: they land with the work whose consumers need them, rather than shipping now as verbs with nothing behind them.
 
-The daemon is Atlas's writer. Clients ask it questions over the API; they do not open the store and reach in.
+The daemon is Atlas's writer. Clients ask it questions over the API; they do not open the store and reach in. The one diagnostic exception is `sgt doctor`'s `atlas` row, which reads the store file directly when no daemon holds it — it checks for the file first and never creates one, and when a running daemon has the store locked it says to ask the daemon instead.
 
 One thing this release does not yet include is a way to *start* a scan. Atlas's writers and its read surfaces both ship; nothing between them is wired to a command, a route, or a scheduled job. On a fresh installation the store is therefore empty, `sgt intelligence status` reports nothing indexed, and `sgt doctor`'s `atlas` row says so rather than implying a fault. That is stated here rather than left to be discovered.
 
