@@ -76,6 +76,136 @@ release.
   figure that had been carried from an earlier, differently-provisioned
   environment).
 
+### Hierarchical execution (S2)
+
+- A workflow stage directory may now itself hold a `workflow.toml`: the
+  loader recurses (embedded and repository packages alike), splicing the
+  nested package's leaves into the parent's one flat `stages` list at the
+  container's position, with `parent/child` composed hierarchical stage
+  ids. The container itself is never a `StageDefinition` or a
+  `StageRecord` — it enters and completes no event of its own; a
+  container "completing" is simply its last flattened leaf completing.
+  Nesting is unbounded by design; a package that resolves to one of its
+  own ancestors (a symlink cycle) fails closed by name at load time
+  instead of overflowing the recursion. A stage directory carrying both
+  `workflow.toml` and `CONTEXT.md` is a load error — a container has no
+  actor, so its `CONTEXT.md` could never be read.
+- A closing container's own declared output contract is checked at its
+  boundary-closing leaf's completion, reusing the existing output-gate
+  mechanics verbatim: a bounded re-prompt of that leaf, then a park
+  naming the *container's* id if still unmet. A leaf that simultaneously
+  closes several ancestor containers gates them innermost first. Nested
+  leaves' own output/required-column/finalize contracts behave
+  identically to top-level ones and are never bypassed by container
+  completion.
+- Composed hierarchical stage ids journal, replay, and render correctly:
+  the analytics fold, `sgt work show`, and a daemon restarted mid-nest
+  all carry/reconstruct the exact composed id from the journal alone —
+  recovery needs no process tree, only the last `StageRecord`. The
+  workflow's own wire shape stays the flat leaf list (hierarchical ids as
+  opaque strings); the TUI's workflow rail draws that flat list as the
+  tree it is.
+- `sgt -C <estate> run` from inside a managed execution can create an
+  ordinary, separately admitted child Work. Every managed execution now
+  carries an estate/Work/execution causation triple
+  (`SERGEANT_ESTATE_ROOT`/`SERGEANT_WORK_ID`/`SERGEANT_EXECUTION_ID`,
+  distinct from the harness's own `SGT_ESTATE_ROOT`) to every adapter's
+  spawned process, survives a daemon restart, and — when the child's `sgt
+  run` inherits and spends it — the daemon validates the claimed parent
+  against its own journal before recording the relation. A claim that
+  fails validation is never refused: the submission proceeds as an
+  ordinary causation-less Work, and the daemon journals an explicit,
+  visible `causation_unverified` marker naming the failed claim (journal
+  is truth; substance is preserved by admission and explicit addressing
+  rather than by refusal). Child Work has fully independent scope,
+  surface, and lifecycle — parent completion, cancellation, or (there
+  being no merge primitive in the engine at all) any notion of merge
+  never cascades to it, and a bare `sgt run` from inside a Work surface
+  still refuses; only explicit `-C` addressing is exempt.
+- `sgt run --wait` observes the Work it just submitted through to a
+  terminal state client-side (the existing watch mechanism, scoped to
+  the new Work id) — no new engine hold state.
+- The Fleet TUI groups a child Work immediately under its own parent,
+  recursively, indenting the intent cell one level per ancestor hop — the
+  causal-child tree, derived entirely from a row's own already-projected
+  `parent` field (no second request per Work). A child whose parent
+  isn't currently visible (filtered out, or aged out of the daemon's
+  caches) renders as a root rather than being dropped.
+- `sgt doctor` gained a `workflow_stage_declarations` row: a
+  directory inside a workflow package that looks like a stage (holds
+  `CONTEXT.md`, `README.md`, or its own `workflow.toml`) but isn't named
+  in that package's declared `stages` warns, naming the package and the
+  directory (or, for an undeclared nested package, the whole unreachable
+  subtree) — a real directory on disk the loader will never reach. Warn,
+  not fail: this is an authoring-drift observation, not a broken
+  declaration.
+- Fixed a probe-child leak: a killed probe's own children (and their
+  children) now die with the probe and with the daemon instead of being
+  reparented and left running, orphaned. (#310)
+- The test suite runs roughly 40% faster: ten small no-daemon integration
+  suites consolidated into one harness binary (`c2_light`, paying one
+  link instead of ten), `cargo-nextest` adopted (exact-pinned) locally,
+  in CI, and in the coverage lane, and `ci.yml`'s fmt/clippy job split
+  from the test job so wall-clock is the slower of the two rather than
+  their sum. Fixed a cross-process-re-entrant OTLP-disabled test that the
+  consolidation surfaced. (#305)
+- Doctrine amendment: `AGENTS.md`'s ESTATE bullet 5 and `icm-policy.md`'s
+  rule 1 now point at the sanctioned child-Work path (`sgt -C run`) as
+  the real nesting/possession primitive, replacing an ambiguous
+  possession-vs-injection reading; a new `docs/concepts/
+  hierarchical-execution.md` page documents nested packages and child
+  Work for operators.
+- The W1 §13 acceptance battery (`tests/v4_w1_acceptance.rs`) walks all
+  nine acceptance criteria literally, citing the named pin for each
+  already-proven claim and adding one self-contained structural test for
+  the one gap (no merge primitive exists in the engine to cascade
+  through); item 9's required-column half now has its own nested-leaf
+  test (`tests/m11_nested_workflow.rs::a_nested_leafs_required_column_contract_is_enforced_exactly_as_a_flat_ones_is`)
+  and its finalize half cites the pre-existing
+  `src/runtime/surface.rs::tests::the_finalize_sweep_reaches_a_nested_leafs_output`.
+
+#### V4 live evidence
+
+- **Opt-in live suites, serially, against the real `aria` opencode
+  endpoint** (`SERGEANT_OPENCODE_TESTS=1 cargo test --locked --test
+  opencode_backend -- --ignored --test-threads=1`): 8 passed, 0 failed
+  (`live_opencode_history_exports_the_whole_session`,
+  `live_opencode_minimal_turn_completes_with_usage`,
+  `live_opencode_probe_reports_the_installed_version`,
+  `live_opencode_resume_recalls_a_nonce_across_processes`,
+  `live_opencode_serve_abort_yields_an_interrupted_terminal_and_a_usable_session`,
+  `live_opencode_serve_actor_question_parks_and_resumes_on_answer`,
+  `live_opencode_serve_approval_round_trip_runs_the_gated_tool`,
+  `live_opencode_serve_minimal_turn_completes_with_usage`); finished in
+  140.55s. No capability differences from the measured `opencode`
+  admission row surfaced.
+- **Real end-to-end live proof** on a scratch estate
+  (`/var/tmp/hats2/v4-live-proof/estate`) against this box's real daemon
+  binary, bound to a scratch host-mode data dir via `SGT_DATA_DIR`
+  (`/var/tmp/hats2/v4-live-proof/data`) — never the estate's own
+  production journal. A real Work on the `opencode` backend (the `aria`
+  model) ran a workflow whose `CONTEXT.md` instructed the actor to submit
+  a child Work via the sanctioned `sgt -C "$SERGEANT_ESTATE_ROOT" run`
+  path; both parent (`01M10KPMV6K8JD6GYM1ZW0WA2V`) and child
+  (`01M10KR5W2ERFPCHMWH1ECQNNV`) reached `work.completed`. The child's own
+  `work.submitted` journal payload records the validated relation
+  verbatim: `"parent_work_id": "01M10KPMV6K8JD6GYM1ZW0WA2V"`,
+  `"parent_execution_id": "01M10KPQVS6ZJMT98CGBVP586S"` — no
+  `causation_unverified` marker, i.e. the claim validated clean against
+  the daemon's own journal, not merely accepted unverified.
+  - **A first attempt at this same proof produced no parent relation at
+    all** (neither `parent_work_id` nor a `causation_unverified` marker):
+    the actor's shell resolved the bare `sgt` on `$PATH` to a stale
+    installed binary (`~/.cargo/bin/sgt`, built before this sprint's
+    causation transport) rather than this branch's own build, so the
+    submitted child never claimed a parent to begin with. Not a
+    sergeant-rs defect — a live-environment `$PATH` artifact of this one
+    run — diagnosed by comparing binary contents (`strings … | grep
+    claimed_parent_work_id`) between the two, then re-run with the
+    branch's own build first on `$PATH`, which produced the clean result
+    above. Recorded here per the brief's own honesty requirement rather
+    than silently discarded as a bad take.
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain

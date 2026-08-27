@@ -128,3 +128,12 @@ cov_stage_end 1 "the w4c_service_doctor test binary must write its own profile (
 cov_stage_begin c2-c2_light
 cov_run cargo llvm-cov --no-report --test c2_light --locked || cov_fail "c2_light failed under instrumentation"
 cov_stage_end 1 "the c2_light test binary must write its own profile"
+
+# S2 V4 closeout: the W1 §13 acceptance battery, `w5_h1_acceptance.rs`'s own
+# precedent one wave later. Almost entirely comment checklist entries
+# pointing at m11/m12's own named pins; the one self-contained test
+# (criterion 7's merge half) reads source files in-process and spawns
+# nothing, so this sits in C2 rather than C3. Floor 1.
+cov_stage_begin c2-v4_w1_acceptance
+cov_run cargo llvm-cov --no-report --test v4_w1_acceptance --locked || cov_fail "v4_w1_acceptance failed under instrumentation"
+cov_stage_end 1 "the v4_w1_acceptance test binary must write its own profile"

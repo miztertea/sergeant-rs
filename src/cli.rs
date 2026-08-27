@@ -3534,6 +3534,11 @@ pub(crate) mod doctor {
         checks.push(network_access_check(admitted.as_deref()));
         checks.push(estate_check(admitted.as_deref()));
         checks.push(workflows_check(admitted.as_deref()));
+        // S2 V4 (owner-directed 2026-08-27): an authoring-drift observation
+        // distinct from workflows_check's own declared-package census above —
+        // a stage-shaped directory *inside* a package that no stages entry
+        // names. Same estate-root threading.
+        checks.push(undeclared_stage_dirs_check(admitted.as_deref()));
         // #261: the installed corpus must cite only routes that actually
         // resolve — deliberately not exempted from `healthy_for_init`, see
         // `doc_routes_check`'s own doc comment.
@@ -4079,6 +4084,137 @@ pub(crate) mod doctor {
                     names.len(),
                     names.join(", ")
                 ),
+            )
+        }
+    }
+
+    /// S2 V4 (owner-directed 2026-08-27): a directory *inside* a workflow
+    /// package that looks like a stage — it holds `CONTEXT.md`, `README.md`,
+    /// or its own `workflow.toml` — but is not named in that package's
+    /// declared `[workflow].stages` list is authoring drift: the directory
+    /// is really on disk, but no run will ever reach it (`check_stage_ids`,
+    /// `domain::workflow.rs`, only ever sees the declared list). Recurses
+    /// into a *declared* nested package (W1 §2/E1) against that package's
+    /// own `stages`, since the same drift can recur at any depth; an
+    /// entirely undeclared nested-package directory is not recursed into
+    /// further — one row names the whole unreachable subtree, since nothing
+    /// beneath it is reachable either.
+    ///
+    /// Warn, not fail: doctor's fail-closed rule is for a declaration that
+    /// is broken (a stage the loader cannot resolve); this is a directory
+    /// nobody declared anything about, broken or otherwise. A malformed
+    /// `workflow.toml` is silently skipped here — `workflows_check` and the
+    /// loader itself are where a parse failure is reported; this check only
+    /// ever adds warnings on top of a package it could parse.
+    fn undeclared_stage_dirs_check(estate_root: Option<&Path>) -> Check {
+        use crate::domain::workflow::{
+            CONTEXT_FILE, LOCAL_WORKFLOW_ROOT, WORKFLOW_FILE, WORKFLOW_ROOT,
+        };
+
+        const NAME: &str = "workflow_stage_declarations";
+
+        let Some(estate_root) = estate_root else {
+            return Check::ok(NAME, "not an estate root — nothing to check");
+        };
+
+        fn is_stage_shaped(dir: &Path) -> bool {
+            dir.join(CONTEXT_FILE).is_file()
+                || dir.join("README.md").is_file()
+                || dir.join(WORKFLOW_FILE).is_file()
+        }
+
+        fn declared_stages(package_dir: &Path) -> Option<std::collections::BTreeSet<String>> {
+            let text = std::fs::read_to_string(package_dir.join(WORKFLOW_FILE)).ok()?;
+            let value: toml::Value = toml::from_str(&text).ok()?;
+            let stages = value
+                .get("workflow")?
+                .get("stages")?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            Some(stages)
+        }
+
+        /// `label` is the warning's own package-plus-path prefix — composed
+        /// as recursion descends into a declared nested package, so a warn
+        /// two levels deep still names the whole path from the package root
+        /// an operator would recognize.
+        fn scan(label: &str, package_dir: &Path, warnings: &mut Vec<String>) {
+            let Some(declared) = declared_stages(package_dir) else {
+                return;
+            };
+            let Ok(entries) = std::fs::read_dir(package_dir) else {
+                return;
+            };
+            let mut children: Vec<_> = entries.flatten().collect();
+            children.sort_by_key(|e| e.file_name());
+            for entry in children {
+                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let path = entry.path();
+                if !is_stage_shaped(&path) {
+                    continue;
+                }
+                let nested_package = path.join(WORKFLOW_FILE).is_file();
+                if declared.contains(&name) {
+                    if nested_package {
+                        scan(&format!("{label}/{name}"), &path, warnings);
+                    }
+                    continue;
+                }
+                if nested_package {
+                    warnings.push(format!(
+                        "{label}: {name}/ (undeclared nested workflow package — the whole subtree is unreachable)"
+                    ));
+                } else {
+                    warnings.push(format!("{label}: {name}/"));
+                }
+            }
+        }
+
+        let mut warnings = Vec::new();
+        for root in [WORKFLOW_ROOT, LOCAL_WORKFLOW_ROOT] {
+            let workflows_dir = estate_root.join(root);
+            let Ok(entries) = std::fs::read_dir(&workflows_dir) else {
+                continue;
+            };
+            let mut packages: Vec<_> = entries.flatten().collect();
+            packages.sort_by_key(|e| e.file_name());
+            for entry in packages {
+                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let path = entry.path();
+                if !path.join(WORKFLOW_FILE).is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                scan(&format!("{root}/{name}"), &path, &mut warnings);
+            }
+        }
+
+        if warnings.is_empty() {
+            Check::ok(
+                NAME,
+                "every stage-shaped directory is declared in its package's workflow.toml",
+            )
+        } else {
+            Check::warn(
+                NAME,
+                format!(
+                    "{} undeclared stage-shaped director{}: {}",
+                    warnings.len(),
+                    if warnings.len() == 1 { "y" } else { "ies" },
+                    warnings.join("; "),
+                ),
+                "declare it in workflow.toml's stages, or move it out of the package (e.g. \
+                 .sergeant/drafts/)",
             )
         }
     }
@@ -5554,6 +5690,138 @@ pub(crate) mod doctor {
     mod tests {
         use super::*;
         use crate::platform::fs_locking::Reliability;
+
+        fn write_package(root: &Path, rel: &str, name: &str, stages: &[&str]) -> PathBuf {
+            let dir = root.join(rel).join(name);
+            std::fs::create_dir_all(&dir).expect("package dir");
+            std::fs::write(
+                dir.join("workflow.toml"),
+                format!(
+                    "[workflow]\nname = {name:?}\nversion = \"1.0.0\"\nstages = [{}]\n",
+                    stages
+                        .iter()
+                        .map(|s| format!("{s:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .expect("write workflow.toml");
+            dir
+        }
+
+        fn write_context_stage(package_dir: &Path, id: &str) {
+            let dir = package_dir.join(id);
+            std::fs::create_dir_all(&dir).expect("stage dir");
+            std::fs::write(dir.join("CONTEXT.md"), "stage context\n").expect("write CONTEXT.md");
+        }
+
+        /// A package whose every stage-shaped directory is named in `stages`
+        /// stays silent — the "declared-everything package is silent"
+        /// acceptance case.
+        #[test]
+        fn a_fully_declared_package_warns_about_nothing() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["00-only"]);
+            write_context_stage(&package, "00-only");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Ok, "{check:?}");
+        }
+
+        /// One stage-shaped directory nobody declared warns, naming both the
+        /// package and the directory — the "one undeclared leaf dir warns"
+        /// acceptance case.
+        #[test]
+        fn an_undeclared_leaf_directory_warns_naming_package_and_directory() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["00-only"]);
+            write_context_stage(&package, "00-only");
+            write_context_stage(&package, "05-orphan");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Warn, "{check:?}");
+            assert!(
+                check.detail.contains("solo") && check.detail.contains("05-orphan"),
+                "must name both the package and the orphaned directory: {}",
+                check.detail
+            );
+            assert!(
+                check
+                    .remedy
+                    .as_deref()
+                    .is_some_and(|r| r.contains("stages")),
+                "{check:?}"
+            );
+        }
+
+        /// An undeclared directory that is itself a nested package (its own
+        /// `workflow.toml`) warns once, naming it as the whole unreachable
+        /// subtree rather than silently saying nothing about what's under
+        /// it — the "undeclared nested-package dir warns naming the whole
+        /// subtree" acceptance case.
+        #[test]
+        fn an_undeclared_nested_package_warns_naming_the_whole_subtree() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["00-only"]);
+            write_context_stage(&package, "00-only");
+            let orphan_nested = write_package(&package, ".", "05-orphan-nested", &["00-inner"]);
+            write_context_stage(&orphan_nested, "00-inner");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Warn, "{check:?}");
+            assert!(
+                check.detail.contains("05-orphan-nested") && check.detail.contains("subtree"),
+                "must name the undeclared nested package and call out the whole subtree: {}",
+                check.detail
+            );
+            assert!(
+                !check.detail.contains("00-inner"),
+                "an undeclared nested package's own contents are not enumerated separately — \
+                 one row names the whole subtree: {}",
+                check.detail
+            );
+        }
+
+        /// Declared nesting recurses: a *declared* nested package's own
+        /// undeclared leaf still warns, naming the full path from the
+        /// package root.
+        #[test]
+        fn a_declared_nested_packages_own_undeclared_leaf_still_warns() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["10-nested"]);
+            let nested = write_package(&package, ".", "10-nested", &["00-inner"]);
+            write_context_stage(&nested, "00-inner");
+            write_context_stage(&nested, "05-inner-orphan");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Warn, "{check:?}");
+            assert!(
+                check.detail.contains("10-nested") && check.detail.contains("05-inner-orphan"),
+                "must name the full nested path: {}",
+                check.detail
+            );
+        }
+
+        /// A dot-directory (`.git`, editor swap dirs) inside a package is
+        /// never mistaken for an undeclared stage.
+        #[test]
+        fn a_dot_directory_inside_a_package_is_skipped() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["00-only"]);
+            write_context_stage(&package, "00-only");
+            write_context_stage(&package, ".hidden");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Ok, "{check:?}");
+        }
+
+        /// Outside an estate root, the check is silently a no-op — same
+        /// posture as every other estate-threaded row.
+        #[test]
+        fn outside_an_estate_root_the_check_is_a_silent_ok() {
+            let check = undeclared_stage_dirs_check(None);
+            assert_eq!(check.status, Status::Ok);
+        }
 
         /// #85, ADR 0003 D6: a confirmed-bad filesystem is `Fail`, and the
         /// remedy names the filesystem. Reverting the `Unreliable` match arm

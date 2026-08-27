@@ -1999,6 +1999,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // here because the fixture estate declares one; an estate with
             // none reads `warn`, which is `t3f`'s subject.
             "workflows",
+            // S2 V4 (owner-directed 2026-08-27): a directory inside a
+            // workflow package that looks like a stage but isn't declared
+            // in that package's `stages` list. Green here because the
+            // fixture estate's one package declares everything it has.
+            "workflow_stage_declarations",
             // #261: the installed corpus (AGENTS.md, skills/*/SKILL.md,
             // .sergeant/workflows/**, .sergeant/common/contexts/*.md)
             // cites only routes that resolve inside this estate.
