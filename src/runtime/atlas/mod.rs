@@ -99,6 +99,8 @@
 //! text    ── pure functions over bytes, and the structure-unit routing table
 //! syntax  ── the same, for symbols/imports: one grammar per claimed
 //!            language, and the symbol routing table (X3b)
+//! tabular ── the dataset routing table, F10a's column allowlist, and row
+//!            identity — all pure; the *reading* is db's (X4)
 //! scan    ── the walk: filesystem in, plain Rust out; no DB, no journal
 //! git     ── the same, from a pinned commit's Git objects (X3a)
 //! overlay ── a Work surface's changes, over a base tree (X3a)
@@ -106,6 +108,24 @@
 //! record  ── the thin three-step glue F1's crash window is stated over
 //! lane    ── the thin F6 glue: an intelligence permit and the blocking pool
 //! ```
+//!
+//! # A dataset is read in place, and that inverts one thing (X4)
+//!
+//! Every other extractor in this tree is Rust over bytes the walk already
+//! read. A tabular dataset is not: the walk registers it (path, streamed
+//! content hash, size) and never opens a row, and the reading happens later,
+//! **in place** — DuckDB opens the operator's own CSV/JSON/Parquet file
+//! through a canned parameterized query, bounded by a LIMIT and a row cap
+//! (F12), and no copy of those bytes lands in Atlas.
+//!
+//! That means the extractor for a dataset lives inside [`db`], because the
+//! reader *is* the database, and the one-owner rule says only [`db`] may name
+//! it. [`tabular`] holds everything about datasets that is not the read
+//! itself: which paths are datasets, F10a's column allowlist, and how a row is
+//! named. The result of a read is stored as derived evidence carrying its
+//! input generation, the identity of the query that produced it, and a hash of
+//! its own output (A1 §6.4) — so an answer can be checked rather than
+//! trusted.
 //!
 //! The dependency arrows run strictly downward through that list. `scan`,
 //! `git` and `overlay` do not import `db`; `db` does not import the journal;
@@ -129,4 +149,5 @@ pub mod overlay;
 pub mod record;
 pub mod scan;
 pub mod syntax;
+pub mod tabular;
 pub mod text;

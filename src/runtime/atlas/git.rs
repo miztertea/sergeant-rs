@@ -56,8 +56,10 @@ use crate::domain::event::rfc3339_utc_now;
 use crate::domain::source::{AuthorityClass, Coverage, CoverageRow, SourceKind};
 use crate::runtime::atlas::deny::{AcquisitionFilter, BadPattern, Verdict};
 use crate::runtime::atlas::scan::{
-    KeySpace, MAX_RESOURCE_BYTES, ScannedFile, SourceScan, UNCLAIMED, claims_for, extract_resource,
+    DATASET_NO_ROOT, KeySpace, MAX_RESOURCE_BYTES, ScannedFile, SourceScan, UNCLAIMED, claims_for,
+    extract_resource,
 };
+use crate::runtime::atlas::tabular::{ContextFields, format_for};
 use crate::runtime::atlas::text::as_text;
 use crate::runtime::git::{GitError, git, git_bytes, git_cat_file_batch};
 use crate::runtime::integrity::{DriftAttribution, EstateDriftObservation};
@@ -309,6 +311,12 @@ pub fn extract_tree(source: &EstateGitSource, tree: &GitTree) -> Result<SourceSc
         revision: Some(tree.commit_sha.clone()),
         observed_at: rfc3339_utc_now(),
         files: out.files,
+        // No dataset, no root, no allowlist: Git objects have no path to read
+        // in place, so this walk registers no tabular dataset at all and the
+        // F10a allowlist has nothing to gate (see [`DATASET_NO_ROOT`]).
+        datasets: Vec::new(),
+        root: None,
+        context_fields: ContextFields::none(),
         coverage: out.coverage,
         extractors: out.extractors,
     })
@@ -385,6 +393,19 @@ pub(crate) fn extract_blobs(
                 continue;
             }
             EntryKind::File => {}
+        }
+        // X4: a dataset in a repository is claimed by the tabular routing
+        // table but cannot be read the way that table reads — see
+        // [`DATASET_NO_ROOT`]. Reported by that name rather than as
+        // "unclaimed", which would be a false statement about the routing.
+        if format_for(&entry.path).is_some() {
+            out.coverage.push(CoverageRow {
+                path: Some(entry.path.clone()),
+                status: Coverage::Unsupported,
+                detail: Some(DATASET_NO_ROOT.to_string()),
+                bytes: Some(entry.size),
+            });
+            continue;
         }
         if claims_for(&entry.path).is_none() {
             out.coverage.push(CoverageRow {

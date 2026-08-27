@@ -182,3 +182,12 @@ cov_stage_end 1 "the x3b_tslp_corpus test binary must write its own profile"
 cov_stage_begin c2-x3b_syntax_wiring
 cov_run cargo llvm-cov --no-report --test x3b_syntax_wiring --locked || cov_fail "x3b_syntax_wiring failed under instrumentation"
 cov_stage_end 1 "the x3b_syntax_wiring test binary must write its own profile"
+
+# S3 X4: tabular datasets read in place, F4's network refusal, F10a's column
+# allowlist, F12's bounds. Builds knowledge directories and Atlas stores in
+# tempdirs and reads them through the ordinary recording path. It starts no
+# daemon and its only subprocess is `sgt --help` (F11's named-deferral pin),
+# which is why it is here rather than with the spawning suites. Floor 1.
+cov_stage_begin c2-x4_tabular_map
+cov_run cargo llvm-cov --no-report --test x4_tabular_map --locked || cov_fail "x4_tabular_map failed under instrumentation"
+cov_stage_end 1 "the x4_tabular_map test binary must write its own profile"

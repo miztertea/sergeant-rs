@@ -1966,6 +1966,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             "docker",
             "journal",
             "projection",
+            // S3 X4 (F8): Atlas's coverage row, beside the projection row it
+            // is deliberately unlike — one is disposable and refolded, the
+            // other persists and is re-derived only by re-reading sources.
+            "atlas",
             "daemon",
             // H1 §2/#276, W4c: is a native per-user service manager
             // reachable at all — a distinct question from `daemon`'s own

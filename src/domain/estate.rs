@@ -186,6 +186,23 @@ pub struct KnowledgeSpec {
     /// defaults it was protected by.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore: Vec<String>,
+    /// **F10a**: the columns of this source's tabular datasets whose text may
+    /// become retrievable context units. **Absent means none**, and that
+    /// default is the whole control.
+    ///
+    /// A separate axis from [`Self::ignore`] rather than an extension of it,
+    /// because the two govern different boundaries. `ignore` extends F10's
+    /// *acquisition* deny set — which bytes are read at all — and speaks in
+    /// paths. This governs *exposure* — which values may leave a dataset as
+    /// text — and speaks in columns, because a CSV of support tickets is an
+    /// ordinary knowledge source whose `email` column is not, and no path
+    /// pattern can express that.
+    ///
+    /// Registration is not exposure. A dataset with no allowlist is still
+    /// discovered, counted, and profiled in aggregate; what it does not do is
+    /// turn a row's text into something retrievable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_fields: Vec<String>,
 }
 
 /// A group of repositories declared under `[group.<name>]` (R-MVP1-3).
@@ -946,6 +963,11 @@ struct KnowledgeEntry {
     path: PathBuf,
     #[serde(default)]
     ignore: Vec<String>,
+    /// F10a. `#[serde(default)]` is the refusal: an operator who writes no
+    /// `context_fields` key has declared the empty allowlist, and the empty
+    /// allowlist exposes nothing.
+    #[serde(default)]
+    context_fields: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1212,6 +1234,7 @@ fn resolve_knowledge(
             name: entry.name,
             path: candidate,
             ignore: entry.ignore,
+            context_fields: entry.context_fields,
         });
     }
     Ok(resolved)

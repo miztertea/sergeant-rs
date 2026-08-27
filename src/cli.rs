@@ -292,6 +292,25 @@ enum Command {
         /// Query name (omit to list what is available).
         name: Option<String>,
     },
+    /// Report what Atlas has indexed, and how completely (S3, F8/F11).
+    ///
+    /// Coverage is the point: a status that only listed what was indexed
+    /// would say nothing about what was *excluded*, and F10's secrets posture
+    /// is only honest if an excluded byte is reported as excluded.
+    Intelligence {
+        #[command(subcommand)]
+        command: IntelligenceCommand,
+    },
+    /// Read the world map Atlas derived from the estate's sources (S3, F11).
+    ///
+    /// Canned reads over rows the daemon already holds — no client SQL, no
+    /// client-named path, no pattern. `map neighbors` and `map changed` are
+    /// deliberately absent: they land with the waves whose consumers need
+    /// them, rather than shipping now as verbs with nothing behind them.
+    Map {
+        #[command(subcommand)]
+        command: MapCommand,
+    },
     /// Open the TUI cockpit (ADR 0010, D6): a client like any other, so it
     /// never auto-spawns a daemon (ADR 0009's no-spawn set) — with none
     /// running it refuses and names `sgt doctor` as the remedy, rather than
@@ -454,6 +473,54 @@ enum RepoCommand {
     List,
 }
 
+/// `sgt intelligence ...` subcommands (S3 X4, F11).
+#[derive(Debug, Subcommand)]
+pub enum IntelligenceCommand {
+    /// Coverage and generation status for every indexed source (F8).
+    Status,
+}
+
+/// `sgt map ...` subcommands (S3 X4, F11's minimum honest set).
+///
+/// Every one of these addresses rows Atlas already holds. None of them takes
+/// SQL, a filesystem path, or a match pattern — `--source` and `--name` are
+/// bound as parameters and compared for equality.
+#[derive(Debug, Subcommand)]
+pub enum MapCommand {
+    /// Repository sources the map covers, with what each generation holds.
+    Repos,
+    /// What the map holds, per source and in total.
+    Stats,
+    /// One source's titled structure units, in document order.
+    Outline {
+        /// Declared source name.
+        source: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// The symbol index, by exact name.
+    Symbol {
+        /// Symbol name, matched exactly — never as a pattern.
+        name: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Recorded sites of one exact symbol name.
+    ///
+    /// **Definition sites**, which is what a grammar can state without
+    /// resolving anything (A1-09) — the answer says so rather than letting
+    /// the verb's name imply resolution this build does not do.
+    References {
+        /// Symbol name, matched exactly — never as a pattern.
+        name: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
+
 /// `sgt knowledge ...` subcommands (S3, F11's minimum honest set).
 ///
 /// Add and list, and deliberately nothing else yet. A `remove` verb, a
@@ -479,6 +546,17 @@ enum KnowledgeCommand {
         /// built-in secrets deny set; it can never narrow it.
         #[arg(long)]
         ignore: Vec<String>,
+        /// **F10a**: a tabular column whose text may become a retrievable
+        /// context unit, repeatable. Omit it and the answer is none — a
+        /// dataset is still registered, counted and profiled, but no row's
+        /// text is exposed.
+        ///
+        /// A different axis from `--ignore`, not an extension of it:
+        /// `--ignore` decides which bytes are read at all and speaks in
+        /// paths; this decides which values may leave a dataset as text and
+        /// speaks in columns.
+        #[arg(long = "context-field")]
+        context_field: Vec<String>,
     },
     /// List declared knowledge sources.
     List,
@@ -1506,6 +1584,58 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Intelligence { command } => {
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            let IntelligenceCommand::Status = command;
+            let result = client.get("/v1/intelligence/status").await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_intelligence_status(&result);
+            }
+            Ok(())
+        }
+        Command::Map { command } => {
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            // Every argument is a *query parameter*, url-encoded, never a
+            // path segment and never spliced into anything the daemon parses
+            // as a query language (F11).
+            let (path, key) = match &command {
+                MapCommand::Repos => ("/v1/map/repos".to_string(), "repos"),
+                MapCommand::Stats => ("/v1/map/stats".to_string(), "sources"),
+                MapCommand::Outline { source, limit } => (
+                    format!(
+                        "/v1/map/outline?source={}{}",
+                        crate::api::urlencode(source),
+                        limit_query(*limit)
+                    ),
+                    "outline",
+                ),
+                MapCommand::Symbol { name, limit } => (
+                    format!(
+                        "/v1/map/symbol?name={}{}",
+                        crate::api::urlencode(name),
+                        limit_query(*limit)
+                    ),
+                    "symbols",
+                ),
+                MapCommand::References { name, limit } => (
+                    format!(
+                        "/v1/map/references?name={}{}",
+                        crate::api::urlencode(name),
+                        limit_query(*limit)
+                    ),
+                    "references",
+                ),
+            };
+            let result = client.get(&path).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_map(&result, key);
+            }
+            Ok(())
+        }
         Command::Cancel { id } => {
             let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
@@ -1991,12 +2121,36 @@ async fn knowledge_command(
     command: KnowledgeCommand,
 ) -> Result<(), CliError> {
     match command {
-        KnowledgeCommand::Add { name, path, ignore } => {
-            crate::domain::manifest::add_knowledge(estate_root, &name, &path, &ignore)?;
+        KnowledgeCommand::Add {
+            name,
+            path,
+            ignore,
+            context_field,
+        } => {
+            crate::domain::manifest::add_knowledge(
+                estate_root,
+                &name,
+                &path,
+                &ignore,
+                &context_field,
+            )?;
             if json {
-                print_json(&json!({"added": name, "path": path, "ignore": ignore}));
+                print_json(&json!({
+                    "added": name,
+                    "path": path,
+                    "ignore": ignore,
+                    "context_fields": context_field,
+                }));
             } else {
                 println!("added knowledge source {name} at {}", path.display());
+                if context_field.is_empty() {
+                    println!(
+                        "  tabular context fields: none — this source's dataset rows expose \
+                         no text (F10a's default)"
+                    );
+                } else {
+                    println!("  tabular context fields: {}", context_field.join(", "));
+                }
             }
             Ok(())
         }
@@ -2014,6 +2168,11 @@ async fn knowledge_command(
                         "name": k.name,
                         "path": k.path,
                         "ignore": k.ignore,
+                        // F10a's declared exposure, read back. An allowlist an
+                        // operator cannot see is one they cannot audit, and
+                        // `[]` is a real answer here — the default-none
+                        // refusal — not an absent field.
+                        "context_fields": k.context_fields,
                     })).collect::<Vec<_>>(),
                 }));
             } else if estate.knowledge.is_empty() {
@@ -2021,13 +2180,18 @@ async fn knowledge_command(
             } else {
                 for source in &estate.knowledge {
                     println!(
-                        "{}  {}  ignore={}",
+                        "{}  {}  ignore={}  context_fields={}",
                         source.name,
                         source.path.display(),
                         if source.ignore.is_empty() {
                             "-".to_string()
                         } else {
                             source.ignore.join(",")
+                        },
+                        if source.context_fields.is_empty() {
+                            "none".to_string()
+                        } else {
+                            source.context_fields.join(",")
                         }
                     );
                 }
@@ -2435,6 +2599,126 @@ fn print_table(result: &Value) {
 }
 
 /// The questions this daemon answers, and how populated the projection is.
+/// The `&limit=` tail of a `map` request, or nothing when none was asked for.
+fn limit_query(limit: Option<usize>) -> String {
+    limit.map(|n| format!("&limit={n}")).unwrap_or_default()
+}
+
+/// `sgt intelligence status` as plain text (M6 owns presentation).
+///
+/// Coverage is printed for every source, including the zero counts: "0
+/// excluded" is a fact an operator checking F10's posture needs to see, and a
+/// renderer that hid empty statuses would hide exactly that.
+fn print_intelligence_status(result: &Value) {
+    let empty = Vec::new();
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!(
+            "{}",
+            result["detail"]
+                .as_str()
+                .unwrap_or("no source has been indexed on this host yet")
+        );
+        return;
+    }
+    let sources = result["sources"].as_array().unwrap_or(&empty);
+    if sources.is_empty() {
+        println!("atlas is present but no source has a confirmed generation");
+        return;
+    }
+    for source in sources {
+        println!(
+            "{} ({}, {})",
+            source["source"].as_str().unwrap_or("?"),
+            source["kind"].as_str().unwrap_or("?"),
+            source["authority"].as_str().unwrap_or("?"),
+        );
+        println!(
+            "  generation {}  observed {}",
+            source["generation"].as_str().unwrap_or("?"),
+            source["observed_at"].as_str().unwrap_or("?"),
+        );
+        println!(
+            "  files {}  units {}  symbols {}  occurrences {}  edges {}  datasets {}  \
+             row units {}",
+            source["files"],
+            source["units"],
+            source["symbols"],
+            source["occurrences"],
+            source["edges"],
+            source["datasets"],
+            source["row_units"],
+        );
+        let coverage = source["coverage"].as_object();
+        let rendered = coverage
+            .map(|map| {
+                map.iter()
+                    .map(|(status, count)| format!("{status} {count}"))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            })
+            .unwrap_or_default();
+        println!(
+            "  coverage: {}",
+            if rendered.is_empty() {
+                "none recorded".to_string()
+            } else {
+                rendered
+            }
+        );
+    }
+}
+
+/// A `map` answer as plain text: one line per row, keys in the order the
+/// daemon put them in the object.
+///
+/// Deliberately generic over the five verbs rather than five renderers: the
+/// answers are flat objects, and a renderer per verb would be five places for
+/// a field to be silently dropped.
+fn print_map(result: &Value, key: &str) {
+    let empty = Vec::new();
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!(
+            "{}",
+            result["detail"]
+                .as_str()
+                .unwrap_or("no source has been indexed on this host yet")
+        );
+        return;
+    }
+    if let Some(derivation) = result["derivation"].as_str() {
+        println!("({derivation})");
+    }
+    let rows = result[key].as_array().unwrap_or(&empty);
+    if rows.is_empty() {
+        println!("no rows");
+        return;
+    }
+    for row in rows {
+        let Some(fields) = row.as_object() else {
+            println!("{row}");
+            continue;
+        };
+        println!(
+            "{}",
+            fields
+                .iter()
+                .map(|(name, value)| format!("{name}={}", cell_text(value)))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+    if let Some(totals) = result["totals"].as_object() {
+        println!(
+            "totals: {}",
+            totals
+                .iter()
+                .map(|(name, value)| format!("{name}={}", cell_text(value)))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+}
+
 fn print_analytics_index(result: &Value) {
     let empty = Vec::new();
     println!("queries:");
@@ -3605,6 +3889,7 @@ pub(crate) mod doctor {
         let (journal_check, journal_ok, journal_events) = journal_check(data_dir);
         checks.push(journal_check);
         checks.push(projection_check(journal_ok, journal_events.as_deref()));
+        checks.push(atlas_coverage_check(data_dir));
         checks.push(daemon_check(data_dir).await);
         // H1 §2/#276: "is a native per-user service manager reachable at
         // all" — a distinct question from `daemon_check`'s per-data-dir
@@ -5575,6 +5860,77 @@ pub(crate) mod doctor {
                  journal is the source of truth and nothing has been lost",
             ),
         }
+    }
+
+    /// **F8's doctor row**: what Atlas has indexed, and what it could not.
+    ///
+    /// Coverage is the whole point of the row. A line that only counted
+    /// indexed files would be silent about the two statuses an operator
+    /// actually needs surfaced — `excluded`, which is F10's secrets posture
+    /// working, and `error`/`unavailable`, which is it failing — so both are
+    /// reported and the second warns.
+    ///
+    /// **A missing store is `ok`, not a warning.** An estate that has declared
+    /// no `[[knowledge]]` source has nothing to index, and a diagnostic that
+    /// nagged about an unused feature would train operators to ignore it.
+    /// Opening also *creates* the file, so this checks for the file first and
+    /// never brings one into existence to report on it.
+    fn atlas_coverage_check(data_dir: &Path) -> Check {
+        use crate::runtime::atlas::db::{AtlasDb, atlas_db_path};
+
+        let path = atlas_db_path(data_dir);
+        if !path.exists() {
+            return Check::ok(
+                "atlas",
+                "no source has been indexed on this host yet (nothing to report)",
+            );
+        }
+        let sources = match AtlasDb::open(data_dir).and_then(|db| db.indexed_sources()) {
+            Ok(sources) => sources,
+            // Almost always a running daemon holding the store, which is not
+            // a fault: the daemon is the surface that can answer, and the row
+            // says so rather than reporting a failure that is really a lock.
+            Err(e) => {
+                return Check::warn(
+                    "atlas",
+                    format!("{} could not be read from here: {e}", path.display()),
+                    "a running daemon holds this store; ask it instead with \
+                     `sgt intelligence status`",
+                );
+            }
+        };
+        if sources.is_empty() {
+            return Check::ok(
+                "atlas",
+                "atlas is present; no source has a confirmed generation",
+            );
+        }
+        let total = |status: &str| -> u64 {
+            sources
+                .iter()
+                .filter_map(|s| s.coverage.get(status))
+                .copied()
+                .sum()
+        };
+        let indexed = total("indexed");
+        let excluded = total("excluded");
+        let unsupported = total("unsupported");
+        let unavailable = total("unavailable");
+        let errored = total("error");
+        let detail = format!(
+            "{} source(s): indexed {indexed}, excluded {excluded}, unsupported {unsupported}, \
+             unavailable {unavailable}, error {errored}",
+            sources.len()
+        );
+        if errored + unavailable > 0 {
+            return Check::warn(
+                "atlas",
+                detail,
+                "some paths could not be read or extracted; `sgt intelligence status` names \
+                 the source, and the coverage row's detail names the reason",
+            );
+        }
+        Check::ok("atlas", detail)
     }
 
     /// §31: the runtime descriptor and whether a daemon is actually behind it.

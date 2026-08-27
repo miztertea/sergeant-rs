@@ -55,8 +55,10 @@ use crate::runtime::atlas::git::{
     extract_blobs, list_tree,
 };
 use crate::runtime::atlas::scan::{
-    KeySpace, MAX_RESOURCE_BYTES, ScannedFile, SourceScan, UNCLAIMED, claims_for, extract_resource,
+    DATASET_NO_ROOT, KeySpace, MAX_RESOURCE_BYTES, ScannedFile, SourceScan, UNCLAIMED, claims_for,
+    extract_resource,
 };
+use crate::runtime::atlas::tabular::{ContextFields, format_for};
 use crate::runtime::atlas::text::as_text;
 use crate::runtime::git::{GitError, git_bytes};
 
@@ -231,6 +233,12 @@ pub fn extract_overlay(
             revision: Some(base.commit_sha.clone()),
             observed_at: rfc3339_utc_now(),
             files: out.files,
+            // As in [`super::git`]: an overlay's unchanged bytes come from the
+            // base tree's objects, so this walk registers no dataset and has
+            // no allowlist to gate (see `scan::DATASET_NO_ROOT`).
+            datasets: Vec::new(),
+            root: None,
+            context_fields: ContextFields::none(),
             coverage: out.coverage,
             extractors: out.extractors,
         },
@@ -287,11 +295,23 @@ fn changed_file(overlay: &WorkOverlay, path: &str, out: &mut Extracted) -> Strin
         });
         return NOT_A_FILE_MARKER.to_string();
     }
-    let Some(claims) = claims_for(path) else {
+    let Some(claims) = (if format_for(path).is_some() {
+        // X4: claimed by the tabular table, unreadable by this walk — see
+        // `scan::DATASET_NO_ROOT`. An overlay's world is a base tree plus a
+        // surface's edits, and neither half is a path a reader may open as
+        // the estate's own evidence.
+        None
+    } else {
+        claims_for(path)
+    }) else {
         out.coverage.push(CoverageRow {
             path: Some(path.to_string()),
             status: Coverage::Unsupported,
-            detail: Some(UNCLAIMED.to_string()),
+            detail: Some(if format_for(path).is_some() {
+                DATASET_NO_ROOT.to_string()
+            } else {
+                UNCLAIMED.to_string()
+            }),
             bytes: Some(meta.len()),
         });
         // Still hashed: an unextractable file whose bytes changed changed the

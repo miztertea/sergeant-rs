@@ -339,6 +339,56 @@ release.
 - The declared minimum supported Rust version moves from 1.89 to 1.98,
   matching the toolchain this repository already pins.
 
+### Tabular sources and the map surface (S3)
+
+- CSV, JSON and Parquet files under a `[[knowledge]]` source are now indexed
+  as **tabular datasets, read in place**: DuckDB opens the operator's own
+  file through a canned, fully parameterized query and no copy of those bytes
+  lands in Sergeant's store. Each dataset records where it is, what it hashes
+  to, its columns, and a bounded row count; each canned query's answer is
+  stored as derived evidence carrying the generation it read, the identity of
+  the question (name, version and a digest of the SQL that ran) and a hash of
+  its own output, so an answer can be checked rather than trusted.
+- A deterministic per-column aggregate ships with it — rows, non-null rows
+  and exact distinct values per column — ordered by column name, so two runs
+  over an unchanged file produce byte-identical output.
+- **A tabular row's text becomes a retrievable context unit only through an
+  operator-declared column allowlist, and the default is none.**
+  `[[knowledge]] context_fields = [...]` (or `sgt knowledge add
+  --context-field`) names the columns that may be exposed; without it a
+  dataset is still discovered, registered, counted and profiled in aggregate,
+  and not one row's text is published. The declared columns are part of the
+  reader's identity, so *narrowing* the list supersedes the generation and
+  removes the units the wider one exposed rather than leaving them behind.
+  `sgt knowledge list` reports each source's declared allowlist (`--json`
+  included), so what a source may expose is auditable without opening
+  `sergeant.toml`.
+- A dataset file whose *path* contains a glob metacharacter (`*`, `?`, `[`)
+  is reported `unsupported` rather than read. A tabular reader takes its path
+  as a multi-file pattern, so such a name would make one read fan out across
+  sibling files the source's `ignore` globs and the built-in deny set had
+  excluded — recorded under provenance computed from only the named file.
+- Row identity is content-derived where the data permits it — a row keeps its
+  name when something above it is deleted — and honestly re-keyed where it
+  does not: rows the allowlist cannot tell apart are all re-keyed with their
+  position and labelled as such, so a consumer knows which claim it may make.
+- New read surfaces: `sgt intelligence status` reports every indexed source's
+  generation and its full coverage breakdown (including what was *excluded*,
+  which is what makes the secrets posture checkable), and `sgt map
+  repos|outline|symbol|references|stats` reads the derived world map. All of
+  them are canned and parameterized — no client SQL, no client-named path, no
+  match pattern — and every read is bounded, with a row cap a client can lower
+  but never raise. `map neighbors` and `map changed` are deliberately not
+  shipped: they land with the waves whose consumers need them.
+- `sgt doctor` gains an `atlas` row reporting indexed/excluded/unsupported/
+  unavailable/error counts across sources, and warning when paths could not be
+  read or extracted.
+- The `duckdb` dependency gains its `json` and `parquet` features. Both are
+  DuckDB's own readers compiled into the bundled library — **no new crate
+  joins the dependency graph** — and extension autoloading, autoinstalling and
+  community extensions are turned off and locked off on every connection, so
+  reading a dataset can never become a network fetch.
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain

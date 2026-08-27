@@ -1167,6 +1167,9 @@ pub async fn start_with(
         engine,
         estates,
         analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
+        // S3 X4: opened lazily by the first `map`/`intelligence` read that
+        // finds a file to open — see `ApiState::atlas`.
+        atlas: Arc::new(tokio::sync::Mutex::new(None)),
         prune_policy,
         sweep_interval: config.sweep_interval,
         last_swept: Arc::new(std::sync::Mutex::new(None)),
