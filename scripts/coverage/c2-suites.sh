@@ -191,3 +191,12 @@ cov_stage_end 1 "the x3b_syntax_wiring test binary must write its own profile"
 cov_stage_begin c2-x4_tabular_map
 cov_run cargo llvm-cov --no-report --test x4_tabular_map --locked || cov_fail "x4_tabular_map failed under instrumentation"
 cov_stage_end 1 "the x4_tabular_map test binary must write its own profile"
+
+# S3 X5: the A1a acceptance battery — the §17 walk, its own citation and
+# doc-table guards, and the three checks written where an item had none. Reads
+# this repository's own sources, drives one real knowledge scan in a tempdir,
+# and spawns `sgt` only for manifest-direct verbs and `--help` (no daemon),
+# which is why it is here rather than with the spawning suites. Floor 1.
+cov_stage_begin c2-x5_a1a_acceptance
+cov_run cargo llvm-cov --no-report --test x5_a1a_acceptance --locked || cov_fail "x5_a1a_acceptance failed under instrumentation"
+cov_stage_end 1 "the x5_a1a_acceptance test binary must write its own profile"

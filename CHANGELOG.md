@@ -220,9 +220,12 @@ release.
   They are never merged into one "either of these files may open a
   database" rule.
 - Atlas declares the `meta`, `source`, `git` and `context` schema
-  namespaces; no table yet. Every table lands in the change that lands its
-  writer, the same empty-table refusal doctrine the operations projection
-  already applies.
+  namespaces. Every table lands in the change that lands its writer — the
+  same empty-table refusal doctrine the operations projection already
+  applies — which is why `git` carries no table of its own: a repository, a
+  knowledge path and a Work overlay produce the same kind of fact, so
+  repository-derived rows live in `source.*` with the source kind as a
+  column rather than in a schema of their own.
 - The two stores do not share a rebuild discipline, and both module docs
   say so: the operations projection is deleted and re-folded from the
   journal on every daemon start, while Atlas's `source.*`, `git.*` and
@@ -316,11 +319,10 @@ release.
   grammar called the node — `function`, `struct`, `class`, `heading` — and an
   import's target is the text the file wrote, unresolved. Nothing follows a
   re-export or decides which definition a name meant, and nothing claims to.
-- Files whose extension only a grammar claims — `.rs`, `.toml`, `.py`, `.ts` —
-  are now `indexed` where they used to be reported `unsupported`. A language
-  no grammar in this build claims (`.tsx`, for instance) is still
-  `unsupported` and says so, rather than being parsed by an almost-right
-  grammar.
+- A file whose extension only a grammar claims — `.rs`, `.toml`, `.py`, `.ts` —
+  is `indexed` on the strength of that grammar alone. A language no grammar in
+  this build claims (`.tsx`, for instance) is `unsupported` and says so, rather
+  than being parsed by an almost-right grammar.
 - A file a grammar cannot parse is reported `error` and contributes **no**
   symbols at all. tree-sitter's error tolerance would otherwise produce a
   shorter symbol list that nothing downstream could distinguish from a
@@ -388,6 +390,41 @@ release.
   joins the dependency graph** — and extension autoloading, autoinstalling and
   community extensions are turned off and locked off on every connection, so
   reading a dataset can never become a network fetch.
+
+### Atlas closeout (S3)
+
+- `docs/concepts/atlas-and-knowledge.md` documents Atlas for operators: what
+  persists versus what refolds from the journal, how sources and generations
+  are identified, the coverage vocabulary and why an excluded byte is counted
+  rather than absent, what structural extraction does and does not claim, and
+  the bounded map surface.
+- An acceptance battery (`tests/x5_a1a_acceptance.rs`) walks all fourteen
+  contract acceptance items and holds itself to them: every verdict names a
+  decisive check, every citation is verified to still exist in the suite it
+  names, the documented walk table is checked against the executable register,
+  and the items belonging to later work are recorded as such rather than
+  quietly passed.
+- **Two limits the battery names rather than glosses.** Atlas ships its
+  writers, its readers and no trigger between them: no `sgt` verb, no route
+  and no daemon job starts a scan, so on a fresh installation the store is
+  empty and `sgt doctor`'s atlas row says exactly that. And a file a sync
+  client has listed but not materialized, which the filesystem presents as a
+  readable empty file, is indexed as the empty file it appears to be —
+  detecting that case is best-effort heuristics and is not shipped. Both are
+  pinned by tests that fail when the situation changes, so neither can close
+  or widen unnoticed.
+- Combined dependency footprint, measured once at the sprint boundary rather
+  than inferred by adding the two per-wave deltas: against the baseline before
+  the two heavy dependency additions — the integration head after X3a, the same
+  commit the X3b evidence measured, which already carries X1–X3a's own code —
+  `Cargo.lock` gains 10 packages, a cold `cargo build --tests` gains
+  ~15 s (+10%), dev `target/` gains 1.41 GB (+9.7%), the dev binary gains 12.5
+  MiB (+5.0%) and — measured for the first time this sprint — the **release**
+  binary gains 4.66 MiB (+6.9%), 67.8 MiB to 72.4 MiB. The grammar objects are
+  not in those binary numbers: nothing reachable from `sgt`'s own entry point
+  references a grammar yet, so the linker drops them. Forcing a reference and
+  reverting it (the binary returns byte-for-byte) measures what they will cost
+  when something does: a further 5.27 MiB, for a dev-binary total of 17.7 MiB.
 
 ## [0.2.4] - 2026-08-25
 

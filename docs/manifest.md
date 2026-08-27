@@ -5,7 +5,7 @@ This is the implementation manifest for the repository-native product manual. Th
 | Family | Pages | Owns | Verification |
 |---|---:|---|---|
 | home and tutorials | 6 | routing, install, first estate, first Work, Captain-first, CLI-first | link and example review |
-| concepts | 6 | Captain/Sergeant, estate/Git, host runtime, hierarchical execution, Work/workflow/durability, trust | source and doctrine review |
+| concepts | 7 | Captain/Sergeant, estate/Git, host runtime, hierarchical execution, Work/workflow/durability, Atlas/knowledge sources, trust | source and doctrine review |
 | guides | 6 | estates, Work, workflows, harnesses, operations, automation | scenario review |
 | workflow docs | 1 | published and embedded procedure selection | catalog completeness test |
 | reference | 9 | CLI, `sergeant.toml`, workflow schema, states, backends/profiles/skills, machine/runtime contracts, glossary/support | command graph, parser/source, and link tests |
