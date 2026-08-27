@@ -359,10 +359,25 @@ fn changed_file(overlay: &WorkOverlay, path: &str, out: &mut Extracted) -> Strin
 /// deletions; `ls-files --others --exclude-standard` covers files Git has
 /// never been told about, which the diff cannot see. `-z` on both, so a path
 /// containing a newline or a quote arrives verbatim.
+///
+/// **`--no-renames`, and not as a stylistic preference.** Git's default
+/// rename detection (`diff.renames`, true since 2.9, and configurable to
+/// `copies`) collapses `git mv a.md z.md` into one record naming only `z.md`.
+/// That is the right answer for a human reading a patch and the wrong one
+/// here twice over: the old path never enters the change set, so
+/// [`extract_overlay`] reads it out of the *base tree* and reports a file the
+/// Work deleted as `Indexed` — a pinned base blended with a false view of the
+/// working tree; and the digest omits the deletion, so "renamed `a.md` to
+/// `z.md`" and "kept `a.md`, added `z.md`" — two different worlds, one with a
+/// file the other has — produce the same generation key. A change set is a
+/// set of paths, not a story about them, so the similarity heuristic is
+/// turned off rather than interpreted. Passing the flag explicitly also makes
+/// the answer independent of whatever `diff.renames` the surface's config
+/// inherited.
 pub fn changed_paths(surface: &Path, base_sha: &str) -> Result<BTreeSet<String>, GitError> {
     let mut out = BTreeSet::new();
     for args in [
-        vec!["diff", "--name-only", "-z", base_sha, "--"],
+        vec!["diff", "--name-only", "--no-renames", "-z", base_sha, "--"],
         vec!["ls-files", "--others", "--exclude-standard", "-z"],
     ] {
         let raw = git_bytes(surface, &args)?;
@@ -630,5 +645,77 @@ mod tests {
         // Staging must not change the answer: a staged edit is still an edit.
         run_git(&surface, &["add", "untracked.md"]).expect("add");
         assert_eq!(changed_paths(&surface, &base).expect("staged"), changed);
+    }
+
+    /// A staged rename is a deletion *and* an addition, and the overlay must
+    /// see both halves.
+    ///
+    /// Git's own default answer here is one record naming only the new path.
+    /// Believing it would leave the old path outside the change set, where
+    /// [`extract_overlay`] extracts it from the base tree and reports a file
+    /// that is not on the surface as `Indexed` — the pinned base blended with
+    /// a false view of the working tree.
+    #[test]
+    fn a_staged_rename_reports_the_old_path_as_deleted() {
+        let (_dir, _mount, surface, base) =
+            mount_and_surface(&[("a.md", "# A\n"), ("b.md", "# B\n")]);
+        run_git(&surface, &["mv", "a.md", "z.md"]).expect("mv");
+
+        let changed = changed_paths(&surface, &base).expect("changed");
+        assert!(
+            changed.contains("a.md"),
+            "the vacated path is a change: {changed:?}"
+        );
+        assert!(changed.contains("z.md"), "so is the new one: {changed:?}");
+
+        let scanned = scan_work_overlay(&overlay(&surface, &base)).expect("overlay");
+        assert_eq!(row(&scanned.scan, "a.md").status, Coverage::Unavailable);
+        assert!(
+            row(&scanned.scan, "a.md")
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("deleted on this Work's surface"))
+        );
+        assert!(
+            !scanned.scan.files.iter().any(|f| f.relative_path == "a.md"),
+            "a path the Work vacated must not be extracted from the base tree"
+        );
+        assert_eq!(
+            file(&scanned.scan, "z.md").content_hash,
+            content_hash(b"# A\n")
+        );
+        assert_eq!(
+            scanned.overlay_digest,
+            overlay_digest(&BTreeMap::from([
+                ("a.md".to_string(), DELETED_MARKER.to_string()),
+                ("z.md".to_string(), content_hash(b"# A\n")),
+            ]))
+        );
+    }
+
+    /// The collision the same bug produces in the key: a rename and a copy
+    /// are different worlds — one still has the original file, the other does
+    /// not — and a change set that drops the vacated path cannot tell them
+    /// apart.
+    #[test]
+    fn a_rename_and_a_copy_do_not_share_a_generation_key() {
+        // One surface, walked from the copy world into the rename world, so
+        // the base commit is the same SHA by construction and the only thing
+        // that moves between the two keys is the vacated path.
+        let (_dir, _mount, surface, base) = mount_and_surface(&[("a.md", "# A\n")]);
+        std::fs::write(surface.join("z.md"), "# A\n").expect("write");
+        run_git(&surface, &["add", "-A"]).expect("add");
+        let copied = scan_work_overlay(&overlay(&surface, &base)).expect("overlay");
+
+        std::fs::remove_file(surface.join("a.md")).expect("remove");
+        run_git(&surface, &["add", "-A"]).expect("add");
+        let renamed = scan_work_overlay(&overlay(&surface, &base)).expect("overlay");
+
+        assert_ne!(
+            renamed.scan.content_key, copied.scan.content_key,
+            "a world missing a.md and a world keeping it are not one generation"
+        );
+        assert_eq!(copied.scan.files.len(), 2);
+        assert_eq!(renamed.scan.files.len(), 1);
     }
 }
