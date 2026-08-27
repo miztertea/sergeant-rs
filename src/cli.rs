@@ -2168,6 +2168,11 @@ async fn knowledge_command(
                         "name": k.name,
                         "path": k.path,
                         "ignore": k.ignore,
+                        // F10a's declared exposure, read back. An allowlist an
+                        // operator cannot see is one they cannot audit, and
+                        // `[]` is a real answer here — the default-none
+                        // refusal — not an absent field.
+                        "context_fields": k.context_fields,
                     })).collect::<Vec<_>>(),
                 }));
             } else if estate.knowledge.is_empty() {
@@ -2175,13 +2180,18 @@ async fn knowledge_command(
             } else {
                 for source in &estate.knowledge {
                     println!(
-                        "{}  {}  ignore={}",
+                        "{}  {}  ignore={}  context_fields={}",
                         source.name,
                         source.path.display(),
                         if source.ignore.is_empty() {
                             "-".to_string()
                         } else {
                             source.ignore.join(",")
+                        },
+                        if source.context_fields.is_empty() {
+                            "none".to_string()
+                        } else {
+                            source.context_fields.join(",")
                         }
                     );
                 }

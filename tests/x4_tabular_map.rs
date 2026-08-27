@@ -18,24 +18,43 @@
 //!   staleness machinery, because the allowlist rides in the extractor
 //!   identity.
 //! * `f12_every_dataset_read_is_bounded` feeds the reader more rows than the
-//!   cap and asserts the answer says so instead of quietly being complete.
+//!   cap and asserts the answer says so instead of quietly being complete,
+//!   and `f12_a_stored_fact_describes_the_query_that_actually_ran` is the
+//!   sharper half of the same claim: the `row_limit`/`truncated` envelope
+//!   stored beside an answer has to describe *that* answer's read, and an
+//!   aggregate's own answer shape can never supply the cap bit.
+//! * `f10_a_dataset_path_a_reader_would_glob_is_refused` is the acquisition
+//!   boundary's blind spot: a bound parameter stops SQL injection, not glob
+//!   expansion, so a filename carrying `*` would have made a reader open the
+//!   siblings F10's deny set excluded.
 //!
-//! Filesystem-light and daemon-free. The one subprocess is `sgt --help`,
-//! which is what pins F11's *named deferral* — `map neighbors` and `map
-//! changed` must not exist yet. The map/intelligence HTTP surface itself is
-//! tested against the handlers in `src/api.rs`'s own tests, where the state
-//! they read is constructible without a daemon.
+//! The last two sections leave the filesystem-light discipline on purpose,
+//! because the two surfaces they cover have no other honest test:
+//!
+//! * the operator's own F10a declaration path — `sgt knowledge add
+//!   --context-field` through the manifest and back out of `knowledge list`
+//!   — which every other F10a test bypasses by building the allowlist in
+//!   Rust, for a control whose default-none *is* the feature;
+//! * F11's routes over real HTTP against a started daemon, and one verb
+//!   driven end-to-end through the binary, because a path typo in the route
+//!   table or in the CLI's URL construction is invisible to a test that
+//!   calls the handler function directly.
+//!
+//! The `sgt map --help` subprocess still pins F11's *named deferral* —
+//! `map neighbors` and `map changed` must not exist yet.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
+use serde_json::Value;
 use tempfile::TempDir;
 
+use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::source::Coverage;
 use sergeant_rs::runtime::atlas::db::{
-    AtlasDb, DATASET_COLUMN_PROFILE, DATASET_QUERIES, DATASET_ROW_COUNT, MAX_ROWS, StoredDataset,
-    output_hash,
+    AtlasDb, DATASET_COLUMN_PROFILE, DATASET_GLOB_PATH, DATASET_QUERIES, DATASET_ROW_COUNT,
+    MAX_ROWS, StoredDataset, output_hash,
 };
 use sergeant_rs::runtime::atlas::record::{ScanRecord, scan_and_record};
 use sergeant_rs::runtime::atlas::scan::{
@@ -45,6 +64,8 @@ use sergeant_rs::runtime::atlas::tabular::{
     ContextFields, DatasetFormat, RowKeyBasis, format_for, reader_identity,
 };
 use sergeant_rs::runtime::journal::Journal;
+
+const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
 // ---------------------------------------------------------------- helpers
 
@@ -112,6 +133,82 @@ fn dataset<'a>(datasets: &'a [StoredDataset], path: &str) -> &'a StoredDataset {
                     .collect::<Vec<_>>()
             )
         })
+}
+
+/// One `sgt` invocation against a data dir, from a chosen working directory.
+struct Run {
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl Run {
+    fn assert_ok(&self, what: &str) -> &Self {
+        assert_eq!(
+            self.code,
+            Some(0),
+            "{what} must succeed\nstdout: {}\nstderr: {}",
+            self.stdout,
+            self.stderr
+        );
+        self
+    }
+
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.stdout)
+            .unwrap_or_else(|e| panic!("stdout is not JSON ({e}): {}", self.stdout))
+    }
+}
+
+fn sgt(cwd: &Path, data_dir: &Path, args: &[&str]) -> Run {
+    let output = Command::new(SGT)
+        .current_dir(cwd)
+        .arg("--data-dir")
+        .arg(data_dir)
+        .args(args)
+        .output()
+        .expect("run sgt");
+    Run {
+        code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    }
+}
+
+/// [`sgt`] from inside a test that is also hosting a daemon.
+///
+/// `spawn_blocking`, not a bare `Command::output()`: this daemon lives on the
+/// test's own runtime, and blocking a worker on a child process that is
+/// waiting for that daemon to answer `/healthz` deadlocks the pair.
+async fn sgt_while_serving(cwd: &Path, data_dir: &Path, args: &[&str]) -> Run {
+    let cwd = cwd.to_path_buf();
+    let data_dir = data_dir.to_path_buf();
+    let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        sgt(&cwd, &data_dir, &borrowed)
+    })
+    .await
+    .expect("join sgt")
+}
+
+/// One authenticated `GET` against a running daemon, as status + body.
+async fn get(handle: &DaemonHandle, path: &str) -> (reqwest::StatusCode, Value) {
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("client")
+        .get(format!("{}{path}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("request");
+    let status = response.status();
+    let body = response.text().await.expect("body");
+    (
+        status,
+        serde_json::from_str(&body).unwrap_or(Value::String(body)),
+    )
 }
 
 /// The `column_profile` answer as `column -> (rows, non_null, distinct)`.
@@ -565,6 +662,170 @@ fn f12_every_dataset_read_is_bounded() {
     assert_eq!(unbounded.len(), MAX_ROWS);
 }
 
+/// **A stored fact's F12 envelope describes the query that actually ran.**
+///
+/// `row_limit` is the limit the statement bound, and `truncated` is
+/// *dataset-level* — "the input had more rows than this bound covers" — not
+/// "the answer had more rows than the cap". The distinction is the whole
+/// point for an aggregate: `count(*)` returns one row whether it counted ten
+/// rows or ten thousand, and a column profile returns one row per column, so
+/// an envelope derived from the answer's own length says "not truncated"
+/// however much of the dataset the bound cut off.
+///
+/// Mutation this kills: reverting `truncated` to `rows.len() > MAX_ROWS`, or
+/// storing `row_limit: MAX_ROWS` beside a statement bound at `MAX_ROWS + 1`.
+/// Either one leaves A1 §6.4's envelope stating something untrue about the
+/// answer sitting next to it, with every other test still green.
+#[test]
+fn f12_a_stored_fact_describes_the_query_that_actually_ran() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut over = String::from("n,title\n");
+    for row in 0..(MAX_ROWS + 25) {
+        over.push_str(&format!("{row},row {row}\n"));
+    }
+    std::fs::write(dir.path().join("over.csv"), over).expect("write csv");
+    std::fs::write(dir.path().join("under.csv"), "n,title\n1,one\n2,two\n").expect("write csv");
+
+    let recorded = record(&source("bulk", dir.path(), &[]));
+    let facts = recorded.db.dataset_facts("bulk", MAX_ROWS).expect("facts");
+    assert_eq!(facts.len(), 2 * DATASET_QUERIES.len());
+
+    for fact in &facts {
+        assert_eq!(
+            fact.row_limit, MAX_ROWS as u64,
+            "{} on {} must store the bound its statement ran under",
+            fact.query, fact.relative_path
+        );
+        assert_eq!(
+            fact.truncated,
+            fact.relative_path == "over.csv",
+            "{} on {} must report *dataset-level* truncation, not its own answer's length",
+            fact.query,
+            fact.relative_path
+        );
+        assert_eq!(
+            fact.output_hash,
+            output_hash(&fact.columns, &fact.rows),
+            "the stored hash must cover the stored answer"
+        );
+    }
+
+    // And the row count stored is the count *under the stored bound* — the
+    // probe convention (cap + 1) is how the cap bit is learned, never what
+    // gets recorded as the answer.
+    let counted = |path: &str| -> u64 {
+        facts
+            .iter()
+            .find(|f| f.relative_path == path && f.query == DATASET_ROW_COUNT.name)
+            .expect("a row count")
+            .rows[0][0]
+            .clone()
+            .expect("a count is never null")
+            .parse::<u64>()
+            .expect("a count is a number")
+    };
+    assert_eq!(counted("over.csv"), MAX_ROWS as u64);
+    assert_eq!(counted("under.csv"), 2);
+
+    // The aggregate over the capped dataset is the aggregate over exactly the
+    // rows the bound covers — every column profiled `MAX_ROWS` rows, not
+    // `MAX_ROWS + 1` and not all of them.
+    let over_profile = profile(&recorded.db, "bulk", "over.csv");
+    for (column, (rows, _, _)) in &over_profile {
+        assert_eq!(
+            *rows, MAX_ROWS as u64,
+            "column {column} must be profiled over exactly the bounded rows"
+        );
+    }
+}
+
+// -------------------------------------------------------------- F10
+
+/// **A dataset path a reader would expand as a glob is refused, not read.**
+///
+/// F10's acquisition deny set and a source's `ignore` globs decide which bytes
+/// are read. DuckDB's `read_csv`/`read_json`/`read_parquet` take their path
+/// argument as a multi-file *pattern* — binding it as a parameter stops SQL
+/// injection and does nothing at all about that — so a file merely *named*
+/// `da*a.csv` would have made the reader open every sibling the pattern
+/// matched, including the `data.csv` this source explicitly ignores. The rows
+/// would then have been recorded under a `dataset_key` and `content_hash`
+/// computed by hashing only the glob-named file, so the stored provenance
+/// would describe bytes that were never hashed.
+///
+/// Mutation this kills: removing either guard — the walk's refusal to register
+/// such a path, or `read_dataset`'s last check before the reader call.
+#[test]
+fn f10_a_dataset_path_a_reader_would_glob_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The ignored sibling, with a value nothing in the store may ever hold.
+    std::fs::write(
+        dir.path().join("data.csv"),
+        "secret\nnobody-may-read-this\n",
+    )
+    .expect("write ignored csv");
+    // The glob-named file the pattern `da*a.csv` would match *both* of.
+    std::fs::write(dir.path().join("da*a.csv"), "harmless\nvisible\n").expect("write glob csv");
+
+    let declared = KnowledgeSource {
+        name: "notes".to_string(),
+        root: dir.path().to_path_buf(),
+        ignore: vec!["data.csv".to_string()],
+        context_fields: ContextFields::declared(&strings(&["secret", "harmless"])),
+    };
+    let scan = scan_local_knowledge(&declared).expect("scan");
+    assert!(
+        scan.datasets.is_empty(),
+        "a path a reader would glob must not be registered at all: {:?}",
+        scan.datasets
+    );
+    let glob_row = scan
+        .coverage
+        .iter()
+        .find(|c| c.path.as_deref() == Some("da*a.csv"))
+        .expect("a coverage row for the glob-named file");
+    assert_eq!(glob_row.status, Coverage::Unsupported);
+    assert_eq!(glob_row.detail.as_deref(), Some(DATASET_GLOB_PATH));
+
+    // End to end: nothing about the ignored sibling reaches the store — no
+    // dataset, no derived-evidence answer, no context unit.
+    let recorded = record(&declared);
+    assert!(
+        recorded
+            .db
+            .datasets("notes", MAX_ROWS)
+            .expect("datasets")
+            .is_empty()
+    );
+    assert!(
+        recorded
+            .db
+            .dataset_facts("notes", MAX_ROWS)
+            .expect("facts")
+            .is_empty()
+    );
+    let units = recorded.db.row_units("notes", MAX_ROWS).expect("row units");
+    assert!(
+        units.is_empty(),
+        "the ignored sibling's rows must not become context units: {units:?}"
+    );
+
+    // And the guard holds at the reader boundary too, not only at the walk —
+    // so no future caller can route around it.
+    let refusal = recorded
+        .db
+        .dataset_probe(
+            DatasetFormat::Csv,
+            dir.path().join("da*a.csv").to_str().expect("utf8"),
+            &DATASET_ROW_COUNT,
+        )
+        .expect_err("a glob path must be refused at the reader boundary");
+    assert!(
+        refusal.to_string().contains("glob metacharacter"),
+        "the refusal must name the reason: {refusal}"
+    );
+}
+
 // --------------------------------------------------------- honesty
 
 /// A dataset a reader cannot parse is a coverage fact, not a scan failure.
@@ -662,4 +923,242 @@ fn f11_map_ships_five_verbs_and_defers_neighbors_and_changed() {
         .expect("run sgt intelligence --help");
     assert!(status.status.success());
     assert!(String::from_utf8_lossy(&status.stdout).contains("status"));
+}
+
+/// **F10a's operator-facing path, end to end.** `sgt knowledge add
+/// --context-field` → `sergeant.toml` → the parser → the allowlist the
+/// scanner actually applies.
+///
+/// Every other F10a test in this file builds `ContextFields` in Rust, which
+/// skips the only route an operator has. For a control whose *default-none is
+/// the feature*, a dropped `#[serde(default)]`, a renamed TOML key, or a CLI
+/// flag that never reaches `add_knowledge` would ship with the whole suite
+/// green: the allowlist would silently read as empty (exposing nothing, and
+/// looking correct) or, worse, an operator's declaration would be lost and
+/// then re-added by hand somewhere less careful.
+///
+/// Mutation this kills: deleting the `context_fields` write in
+/// `domain::manifest::add_knowledge`, or the `#[serde(default)]` field on
+/// `KnowledgeEntry`, or the `ContextFields::declared` call in
+/// `From<&KnowledgeSpec> for KnowledgeSource`.
+#[test]
+fn f10a_the_declared_allowlist_survives_the_cli_the_manifest_and_the_parser() {
+    let estate = TempDir::new().expect("tempdir");
+    let data_dir = estate.path().join("data-dir");
+    let tickets = tempfile::tempdir().expect("source root");
+    std::fs::write(
+        tickets.path().join("rows.csv"),
+        "title,email\nlogin fails,user@example.com\n",
+    )
+    .expect("write csv");
+    let quiet = tempfile::tempdir().expect("source root");
+
+    sgt(estate.path(), &data_dir, &["init"]).assert_ok("init");
+    sgt(
+        estate.path(),
+        &data_dir,
+        &[
+            "knowledge",
+            "add",
+            "support",
+            tickets.path().to_str().expect("utf8"),
+            "--context-field",
+            "title",
+        ],
+    )
+    .assert_ok("knowledge add --context-field");
+    sgt(
+        estate.path(),
+        &data_dir,
+        &[
+            "knowledge",
+            "add",
+            "quiet",
+            quiet.path().to_str().expect("utf8"),
+        ],
+    )
+    .assert_ok("knowledge add with no allowlist");
+
+    // The manifest itself carries the declaration, under that key.
+    let manifest = std::fs::read_to_string(estate.path().join("sergeant.toml")).expect("manifest");
+    assert!(
+        manifest.contains("context_fields = [\"title\"]"),
+        "the declaration must reach sergeant.toml: {manifest}"
+    );
+    assert_eq!(
+        manifest.matches("context_fields").count(),
+        1,
+        "an undeclared allowlist writes no key — the absent key *is* the refusal: {manifest}"
+    );
+
+    // And the operator can read it back, which is what makes it auditable.
+    let listed = sgt(estate.path(), &data_dir, &["--json", "knowledge", "list"]);
+    listed.assert_ok("knowledge list");
+    let sources = listed.json();
+    let entry = |name: &str| -> Value {
+        sources["knowledge"]
+            .as_array()
+            .expect("knowledge array")
+            .iter()
+            .find(|k| k["name"] == name)
+            .unwrap_or_else(|| panic!("no {name} in {sources}"))
+            .clone()
+    };
+    assert_eq!(
+        entry("support")["context_fields"],
+        serde_json::json!(["title"])
+    );
+    assert_eq!(
+        entry("quiet")["context_fields"],
+        serde_json::json!([]),
+        "the empty allowlist is a real answer, not an absent field"
+    );
+
+    // The parser hands the scanner exactly what was declared.
+    let config = sergeant_rs::domain::estate::Estate::from_config_structural(
+        &estate.path().join("sergeant.toml"),
+    )
+    .expect("parse");
+    let declared: Vec<KnowledgeSource> =
+        config.knowledge.iter().map(KnowledgeSource::from).collect();
+    let support = declared
+        .iter()
+        .find(|s| s.name == "support")
+        .expect("support");
+    assert_eq!(
+        support.context_fields,
+        ContextFields::declared(&strings(&["title"]))
+    );
+    let quiet_source = declared.iter().find(|s| s.name == "quiet").expect("quiet");
+    assert_eq!(quiet_source.context_fields, ContextFields::none());
+    assert!(quiet_source.context_fields.exposes_nothing());
+
+    // And the allowlist that travelled that whole way is the one the read
+    // applies: the declared column becomes a unit, the undeclared one does
+    // not — asserted on the value, because "not listed" is not "not exposed".
+    let recorded = record(support);
+    let units = recorded
+        .db
+        .row_units("support", MAX_ROWS)
+        .expect("row units");
+    assert_eq!(units.len(), 1);
+    assert_eq!(units[0].body, "title: login fails");
+    assert!(
+        !units[0].body.contains('@'),
+        "the undeclared column must not be exposed: {}",
+        units[0].body
+    );
+}
+
+// ------------------------------------------------- F11 over real HTTP
+
+/// **F11's surface as an operator reaches it**: the route table, the `/v1`
+/// nest, axum's own query deserialization, and the CLI's URL construction —
+/// none of which a test that calls the handler function directly touches.
+///
+/// The source name carries a space on purpose: it is the one input that
+/// proves `?source=` is url-encoded on the way out and decoded on the way in,
+/// rather than being spliced into a URL and silently truncated at the space.
+///
+/// Mutation this kills: a typo in any `/v1/map/*` route registration, dropping
+/// the `/v1` nest, or a mismatched path in `Command::Map`'s URL builder. Every
+/// one of those leaves the handler tests green and the verb broken.
+#[tokio::test]
+async fn f11_the_map_surface_answers_over_http_and_through_the_verb() {
+    let data = TempDir::new().expect("data dir");
+    let root = tempfile::tempdir().expect("source root");
+    std::fs::write(
+        root.path().join("guide.md"),
+        "# Guide\n\ntext\n\n## Details\n\nmore\n",
+    )
+    .expect("write md");
+    std::fs::write(root.path().join("rows.csv"), "title\nalpha\n").expect("write csv");
+
+    // Recorded before the daemon opens its own journal: the journal is
+    // exclusively locked, and two holders is a test artefact, not a property
+    // under test.
+    {
+        let mut journal = Journal::open(data.path()).expect("journal");
+        let mut db = AtlasDb::open(data.path()).expect("atlas");
+        scan_and_record(
+            &mut db,
+            &mut journal,
+            &source("team notes", root.path(), &[]),
+            None,
+        )
+        .expect("scan and record");
+    }
+
+    let handle = daemon::start_with(data.path(), DaemonConfig::default())
+        .await
+        .expect("daemon start");
+
+    let (status, body) = get(&handle, "/v1/intelligence/status").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert_eq!(body["atlas"]["present"], serde_json::json!(true));
+    assert_eq!(body["sources"][0]["source"], "team notes");
+    assert_eq!(body["sources"][0]["datasets"], serde_json::json!(1));
+
+    // `?source=` url-encoded, `?limit=` parsed off the wire.
+    let (status, body) = get(&handle, "/v1/map/outline?source=team%20notes&limit=1").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert_eq!(
+        body["outline"].as_array().map(Vec::len),
+        Some(1),
+        "the wire `limit` must reach the read: {body}"
+    );
+
+    // A limit that is not a number is a refusal from axum's own extractor,
+    // not a panic and not a silent default.
+    let (status, _) = get(&handle, "/v1/map/outline?source=team%20notes&limit=abc").await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+
+    // And a missing `?source=` is this build's own 400, naming the remedy.
+    let (status, body) = get(&handle, "/v1/map/outline").await;
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "source_required");
+
+    // The verb, driven through the binary against that same daemon — which is
+    // what actually exercises `Command::Map`'s URL construction.
+    // `map` is estate-scoped, so the verb needs a root to run from; the
+    // manifest is written directly rather than through `sgt init`, because
+    // what is under test here is the URL the verb builds, not scaffolding.
+    let cwd = TempDir::new().expect("cwd");
+    std::fs::write(
+        cwd.path().join("sergeant.toml"),
+        "[estate]\nname = \"x4-map\"\n",
+    )
+    .expect("write manifest");
+    let out = sgt_while_serving(
+        cwd.path(),
+        data.path(),
+        &["--json", "map", "outline", "team notes", "--limit", "5"],
+    )
+    .await;
+    out.assert_ok("sgt map outline");
+    let titles: Vec<String> = out.json()["outline"]
+        .as_array()
+        .expect("outline")
+        .iter()
+        .filter_map(|u| u["title"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        titles.iter().any(|t| t == "Guide"),
+        "the verb must return the same rows the route does: {titles:?}"
+    );
+
+    let status_out = sgt_while_serving(
+        cwd.path(),
+        data.path(),
+        &["--json", "intelligence", "status"],
+    )
+    .await;
+    status_out.assert_ok("sgt intelligence status");
+    assert_eq!(
+        status_out.json()["sources"][0]["source"],
+        "team notes",
+        "the intelligence verb must reach the same route"
+    );
+
+    handle.shutdown().await;
 }

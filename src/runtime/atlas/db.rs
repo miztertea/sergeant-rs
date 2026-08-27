@@ -147,6 +147,17 @@ pub enum AtlasError {
     /// Filesystem failure around Atlas's directory.
     #[error("atlas io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A path handed to a tabular reader carries a glob metacharacter.
+    ///
+    /// Refused, never escaped: DuckDB's `read_csv`/`read_json`/`read_parquet`
+    /// expand their path argument as a multi-file pattern with no per-call way
+    /// to turn that off, so such a path would read siblings nobody named. See
+    /// [`GLOB_METACHARACTERS`].
+    #[error("atlas: {DATASET_GLOB_PATH}: {path}")]
+    GlobPath {
+        /// The path as it would have been handed to the reader.
+        path: String,
+    },
     /// A stored row spells a value this build does not know — almost always
     /// a database written by a newer version. Refused by name rather than
     /// guessed at or silently skipped: a vocabulary this reader cannot
@@ -273,7 +284,12 @@ SET lock_configuration = true;\n";
 ///   `output_hash` (a digest of the answer itself). `row_limit`/`truncated`
 ///   are F12's bound, stored beside the answer because "the first 10,000 rows"
 ///   and "all the rows" are different facts and a reader must not have to
-///   guess which one this is.
+///   guess which one this is. Two invariants make that envelope worth
+///   trusting: `row_limit` is the limit the statement *actually bound*, not a
+///   constant copied in beside it, and `truncated` is **dataset-level** — it
+///   says the input had more rows than `row_limit` covers, which is the only
+///   useful reading for an aggregate whose answer is one row however much it
+///   scanned.
 /// * **`context.row_units` is the F10a-gated bridge** and lives in the
 ///   `context` namespace because that is what it is: retrieval-facing text,
 ///   assembled from a source. It exists **only** for a dataset whose source
@@ -1363,21 +1379,43 @@ impl AtlasDb {
         path: &str,
         query: &DatasetQuery,
     ) -> Result<DatasetFact, AtlasError> {
+        if path.contains(GLOB_METACHARACTERS) {
+            return Err(AtlasError::GlobPath {
+                path: path.to_string(),
+            });
+        }
         let sql = sql_for(query, format);
+        let dataset = ScannedDataset {
+            relative_path: path.to_string(),
+            format,
+            content_hash: String::new(),
+            reader: format.reader_version().to_string(),
+            dataset_key: String::new(),
+            byte_len: 0,
+            mtime_millis: None,
+        };
+        // The same two-step [`read_dataset`] uses, for the same reason: the
+        // envelope a fact carries has to describe the read that produced it,
+        // and only the count probe can say whether the input outran the cap.
+        let (count_columns, row_count, truncated) = dataset_bound(&self.conn, format, path)?;
+        if query.name == DATASET_ROW_COUNT.name {
+            return Ok(counted_fact(
+                query,
+                &sql,
+                &dataset,
+                &count_columns,
+                row_count,
+                truncated,
+            ));
+        }
         dataset_fact(
             &self.conn,
             query,
             &sql,
-            &ScannedDataset {
-                relative_path: path.to_string(),
-                format,
-                content_hash: String::new(),
-                reader: format.reader_version().to_string(),
-                dataset_key: String::new(),
-                byte_len: 0,
-                mtime_millis: None,
-            },
+            &dataset,
             path,
+            MAX_ROWS as i64,
+            truncated,
         )
     }
 
@@ -1942,32 +1980,126 @@ fn fetch_text(
 
 /// Run one canned query against one dataset and turn the answer into derived
 /// evidence (A1 §6.4).
+///
+/// **`limit` is bound into the statement *and* stored as the fact's
+/// `row_limit`.** Those are the same number on purpose: a stored envelope that
+/// named a bound the statement did not run under would be a false statement
+/// about the answer beside it, which is exactly the thing A1 §6.4 exists to
+/// prevent.
+///
+/// `truncated` comes from the caller because **no aggregate's own answer shape
+/// can tell**. A `count(*)` returns one row whether it counted ten rows or ten
+/// thousand, and a column profile returns one row per column; comparing either
+/// answer's length against the row cap always says "not truncated", however
+/// much of the dataset the bound cut off. Dataset-level truncation is a fact
+/// about the *input*, established once by [`read_dataset`]'s probe and
+/// propagated to every answer derived under the same bound.
 fn dataset_fact(
     conn: &Connection,
     query: &DatasetQuery,
     sql: &str,
     dataset: &ScannedDataset,
     absolute: &str,
+    limit: i64,
+    truncated: bool,
 ) -> Result<DatasetFact, AtlasError> {
-    // `MAX_ROWS + 1` so the answer itself says whether the cap bit, rather
-    // than leaving "exactly MAX_ROWS" ambiguous between "that many" and "at
-    // least that many".
-    let probe = MAX_ROWS as i64 + 1;
-    let (columns, mut rows) = fetch_text(conn, sql, absolute, probe)?;
-    let truncated = rows.len() > MAX_ROWS;
+    let (columns, mut rows) = fetch_text(conn, sql, absolute, limit)?;
+    // An answer whose own shape overflows the cap — a profile of more columns
+    // than [`MAX_ROWS`] — is truncated too: the cap bounds what is stored as
+    // well as what was scanned.
+    let overflowed = rows.len() > MAX_ROWS;
     rows.truncate(MAX_ROWS);
     Ok(DatasetFact {
         relative_path: dataset.relative_path.clone(),
         dataset_key: dataset.dataset_key.clone(),
         query: query.name.to_string(),
         query_identity: query_identity(query, sql),
-        row_limit: MAX_ROWS as u64,
-        truncated,
+        row_limit: limit as u64,
+        truncated: truncated || overflowed,
         output_hash: output_hash(&columns, &rows),
         columns,
         rows,
     })
 }
+
+/// **The dataset-level bound**, established by one capped scan before any
+/// other question is asked of the file.
+///
+/// Returns the count query's column names, the row count clamped to
+/// [`MAX_ROWS`], and whether the input had more rows than that — the
+/// `truncated` bit every fact derived under the same bound reports.
+///
+/// `MAX_ROWS + 1` is bound here so the answer itself says whether the cap bit,
+/// rather than leaving "exactly `MAX_ROWS`" ambiguous between "that many" and
+/// "at least that many". Nothing stores this bound: it is the probe, and
+/// [`counted_fact`] turns its answer into evidence under the bound that is
+/// stored.
+fn dataset_bound(
+    conn: &Connection,
+    format: DatasetFormat,
+    absolute: &str,
+) -> Result<(Vec<String>, u64, bool), AtlasError> {
+    let sql = sql_for(&DATASET_ROW_COUNT, format);
+    let (columns, rows) = fetch_text(conn, &sql, absolute, MAX_ROWS as i64 + 1)?;
+    let observed = rows
+        .first()
+        .and_then(|row| row.first().cloned().flatten())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    Ok((
+        columns,
+        observed.min(MAX_ROWS as u64),
+        observed > MAX_ROWS as u64,
+    ))
+}
+
+/// [`DATASET_ROW_COUNT`]'s fact, built from the probe [`dataset_bound`] already
+/// ran instead of from a second scan of the same file.
+///
+/// The clamp is not an approximation. `count(*)` over `SELECT 1 FROM <reader>
+/// LIMIT k` is `min(rows, k)` by construction, so the probe's answer taken at
+/// `MAX_ROWS + 1` and then clamped to `MAX_ROWS` is *exactly* what the same
+/// statement returns bound at `MAX_ROWS` — the bound this fact stores. One
+/// capped scan answers both "how many, up to the cap" and "was there more",
+/// and the stored evidence still describes the bound it claims.
+fn counted_fact(
+    query: &DatasetQuery,
+    sql: &str,
+    dataset: &ScannedDataset,
+    columns: &[String],
+    row_count: u64,
+    truncated: bool,
+) -> DatasetFact {
+    let rows = vec![vec![Some(row_count.to_string())]];
+    DatasetFact {
+        relative_path: dataset.relative_path.clone(),
+        dataset_key: dataset.dataset_key.clone(),
+        query: query.name.to_string(),
+        query_identity: query_identity(query, sql),
+        row_limit: MAX_ROWS as u64,
+        truncated,
+        output_hash: output_hash(columns, &rows),
+        columns: columns.to_vec(),
+        rows,
+    }
+}
+
+/// The glob metacharacters DuckDB's multi-file readers interpret in a path
+/// argument: `*` (and `**`), `?`, and `[` opening a character class or range.
+///
+/// A bound parameter stops SQL injection; it does *not* stop this. `read_csv`,
+/// `read_json` and `read_parquet` expand their path argument as a glob however
+/// it arrived, so a file whose *name* contains one of these would make the
+/// reader open every sibling the pattern matched — including paths F10's deny
+/// set and a source's `ignore` globs deliberately excluded, under a
+/// `dataset_key` and `content_hash` computed by hashing only the one named
+/// file. There is no per-call "disable globbing" option to reach for, so a
+/// path carrying one of these is refused rather than escaped.
+pub const GLOB_METACHARACTERS: [char; 3] = ['*', '?', '['];
+
+/// The refusal a path with a glob metacharacter earns, naming the reason.
+pub const DATASET_GLOB_PATH: &str = "the path contains a glob metacharacter (* ? [), which a tabular reader would expand \
+     into other files";
 
 /// **One dataset's in-place read** — reads only, no write, no transaction.
 ///
@@ -1983,15 +2115,16 @@ fn dataset_fact(
 /// So the reads happen first, each failure captured as a value, and the
 /// transaction that follows writes only rows it already holds.
 fn read_dataset(conn: &Connection, scan: &SourceScan, dataset: &ScannedDataset) -> IngestedDataset {
-    let failed = |detail: String| IngestedDataset {
+    let refused = |status: Coverage, detail: String| IngestedDataset {
         columns: Vec::new(),
         row_count: 0,
         truncated: false,
         facts: Vec::new(),
         units: Vec::new(),
-        status: Coverage::Error,
+        status,
         detail,
     };
+    let failed = |detail: String| refused(Coverage::Error, detail);
     let Some(root) = scan.root.as_ref() else {
         // Unreachable from the three walks in this build — only a filesystem
         // walk registers datasets — but stated rather than assumed, because
@@ -2002,11 +2135,47 @@ fn read_dataset(conn: &Connection, scan: &SourceScan, dataset: &ScannedDataset) 
     let Some(absolute) = absolute.to_str().map(str::to_owned) else {
         return failed("the dataset's path is not valid UTF-8".to_string());
     };
+    // The last gate before a path reaches a reader that would glob it. The
+    // walk already refuses a *relative* path carrying one of these; this
+    // catches the rest of the string — a source root whose own directory name
+    // carries one — and holds the rule at the boundary that actually calls
+    // DuckDB, so no future caller can route around it. See
+    // [`GLOB_METACHARACTERS`] for why refusing beats escaping.
+    if absolute.contains(GLOB_METACHARACTERS) {
+        return refused(Coverage::Unsupported, DATASET_GLOB_PATH.to_string());
+    }
+
+    // The bound first, because everything below reports it: the row count up
+    // to the cap, and whether the input outran it.
+    let (count_columns, row_count, truncated) = match dataset_bound(conn, dataset.format, &absolute)
+    {
+        Ok(bound) => bound,
+        Err(e) => return failed(format!("{}: {e}", DATASET_ROW_COUNT.name)),
+    };
 
     let mut facts = Vec::with_capacity(DATASET_QUERIES.len());
     for query in DATASET_QUERIES {
         let sql = sql_for(query, dataset.format);
-        match dataset_fact(conn, query, &sql, dataset, &absolute) {
+        if query.name == DATASET_ROW_COUNT.name {
+            facts.push(counted_fact(
+                query,
+                &sql,
+                dataset,
+                &count_columns,
+                row_count,
+                truncated,
+            ));
+            continue;
+        }
+        match dataset_fact(
+            conn,
+            query,
+            &sql,
+            dataset,
+            &absolute,
+            MAX_ROWS as i64,
+            truncated,
+        ) {
             Ok(fact) => facts.push(fact),
             Err(e) => return failed(format!("{}: {e}", query.name)),
         }
@@ -2019,18 +2188,11 @@ fn read_dataset(conn: &Connection, scan: &SourceScan, dataset: &ScannedDataset) 
     // what is stored — and the schema is still learned, which is what lets a
     // dataset be registered honestly without being exposed.
     let exposes_nothing = scan.context_fields.exposes_nothing();
-    let row_bound = if exposes_nothing {
-        0
-    } else {
-        MAX_ROWS as i64 + 1
+    let row_bound = if exposes_nothing { 0 } else { MAX_ROWS as i64 };
+    let (columns, rows) = match fetch_text(conn, &rows_sql(dataset.format), &absolute, row_bound) {
+        Ok(answer) => answer,
+        Err(e) => return failed(format!("rows: {e}")),
     };
-    let (columns, mut rows) =
-        match fetch_text(conn, &rows_sql(dataset.format), &absolute, row_bound) {
-            Ok(answer) => answer,
-            Err(e) => return failed(format!("rows: {e}")),
-        };
-    let mut truncated = rows.len() > MAX_ROWS;
-    rows.truncate(MAX_ROWS);
     // `NULL` renders as the empty string for a context unit: a unit is text,
     // and one that spelled the word "NULL" would be indistinguishable from a
     // cell that literally said so.
@@ -2050,22 +2212,13 @@ fn read_dataset(conn: &Connection, scan: &SourceScan, dataset: &ScannedDataset) 
         &text,
     );
 
-    let row_count = facts
-        .iter()
-        .find(|fact| fact.query == DATASET_ROW_COUNT.name)
-        .and_then(|fact| fact.rows.first())
-        .and_then(|row| row.first().cloned().flatten())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let capped = row_count.min(MAX_ROWS as u64);
-    truncated = truncated || row_count > MAX_ROWS as u64;
     let detail = format!(
         "{} ({} column{}, {} row{}{}); context units: {}",
         dataset.reader,
         columns.len(),
         if columns.len() == 1 { "" } else { "s" },
-        capped,
-        if capped == 1 { "" } else { "s" },
+        row_count,
+        if row_count == 1 { "" } else { "s" },
         if truncated { ", capped" } else { "" },
         if exposes_nothing {
             "none — no context_fields declared for this source (F10a)".to_string()
@@ -2079,7 +2232,7 @@ fn read_dataset(conn: &Connection, scan: &SourceScan, dataset: &ScannedDataset) 
     );
     IngestedDataset {
         columns,
-        row_count: capped,
+        row_count,
         truncated,
         facts,
         units,

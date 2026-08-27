@@ -637,6 +637,16 @@ impl Walk<'_> {
     /// is answered later, in place, by the one module that owns a database
     /// connection — which is also the only place F10a's allowlist can be
     /// applied to a value, because it is the only place a value exists.
+    ///
+    /// **A path a reader would glob is refused here, before it is registered.**
+    /// Every tabular reader takes its path as a multi-file *pattern*, so a
+    /// filename carrying `*`, `?` or `[` would make the read fan out across
+    /// siblings this walk deliberately excluded — F10's deny set and the
+    /// source's own `ignore` globs would stop governing which bytes get read,
+    /// and the rows returned would be recorded under a `content_hash` computed
+    /// from one file. Registering it and refusing later would still leave a
+    /// dataset row promising a read that must never happen, so the refusal is
+    /// at the point of registration, fail-closed like every other row here.
     fn dataset(
         &mut self,
         path: &Path,
@@ -644,6 +654,15 @@ impl Walk<'_> {
         meta: std::fs::Metadata,
         format: crate::runtime::atlas::tabular::DatasetFormat,
     ) {
+        if relative.contains(crate::runtime::atlas::db::GLOB_METACHARACTERS) {
+            self.coverage.push(CoverageRow {
+                path: Some(relative),
+                status: Coverage::Unsupported,
+                detail: Some(crate::runtime::atlas::db::DATASET_GLOB_PATH.to_string()),
+                bytes: Some(meta.len()),
+            });
+            return;
+        }
         if meta.len() > MAX_DATASET_BYTES {
             self.coverage.push(CoverageRow {
                 path: Some(relative),

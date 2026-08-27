@@ -360,6 +360,14 @@ release.
   and not one row's text is published. The declared columns are part of the
   reader's identity, so *narrowing* the list supersedes the generation and
   removes the units the wider one exposed rather than leaving them behind.
+  `sgt knowledge list` reports each source's declared allowlist (`--json`
+  included), so what a source may expose is auditable without opening
+  `sergeant.toml`.
+- A dataset file whose *path* contains a glob metacharacter (`*`, `?`, `[`)
+  is reported `unsupported` rather than read. A tabular reader takes its path
+  as a multi-file pattern, so such a name would make one read fan out across
+  sibling files the source's `ignore` globs and the built-in deny set had
+  excluded — recorded under provenance computed from only the named file.
 - Row identity is content-derived where the data permits it — a row keeps its
   name when something above it is deleted — and honestly re-keyed where it
   does not: rows the allowlist cannot tell apart are all re-keyed with their
