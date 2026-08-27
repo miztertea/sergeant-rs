@@ -338,3 +338,71 @@ writer), the F7-keyed cache glue joining X3a's batched blob reads, extraction
 under the F6 intelligence-lane permit, and the `unsupported` coverage rows
 (F8) — is not in this record and not in these commits. `syntax.rs` is
 deliberately shaped to be called by that glue rather than to contain it.
+
+---
+
+# The wiring, and what it measured (X3b, 2026-08-27)
+
+The section above closes with a list of what the spike deliberately did not
+do. All of it is now done, and this section records the two things the wiring
+*measured* — because both are facts about real input that no amount of
+fixture-corpus green would have produced.
+
+## Self-scan of this repository
+
+One `scan_estate_git` + `record_scan` of sergeant-rs at
+`b6192480` (the spike's own head), on this host, measured by a throwaway test
+that was deleted after it answered:
+
+```text
+files         249            (acquired resources)
+bytes       8,654,274        (their content, as read)
+units             559        (source.units — one Document per code file,
+                              plus Markdown sections)
+symbols         6,819        (source.occurrences — symbol *sites*)
+distinct        5,401        (source.symbols — the index the sites roll up to)
+edges           1,409        (source.edges — imports)
+coverage          376 rows:  indexed 246, unsupported 70, discovered 52,
+                              excluded 4, error 3, unavailable 1
+scan            2,239 ms     (git ls-tree + batched cat-file + all extraction)
+write           7,452 ms     (one transaction, 8,800-odd rows)
+```
+
+**The write cost is the honest number, and it moved during this wave.** The
+first measurement was **17,493 ms**, because every insert went through
+`Connection::execute`, which prepares its SQL afresh each call — the
+connection's prepared-statement cache was configured in X2 and then used by
+nothing. Routing the six per-row inserts through `prepare_cached` took it to
+7,452 ms on the same input: **2.3x, no semantic change, one transaction
+still.** What remains is DuckDB's own per-row `INSERT` cost (~0.85 ms/row);
+this is an analytical engine, and its documented bulk path is the Appender.
+That is **not** taken here: the Appender's interaction with the explicit
+transaction F1's crash window is stated over is not something this wave
+verified, and trading that invariant for a second speedup at wave close is
+the wrong order. It is a named, measured follow-up with a number attached,
+not an unexamined gap.
+
+Scanning happens under an intelligence-lane permit on the blocking pool (F6),
+so neither figure is on a path that can slow Work execution.
+
+## A real-world grammar limitation, reported rather than smoothed over
+
+Three files in this repository fail their grammar. Two are the corpus's own
+deliberately malformed fixtures, which is the point of them. The third is
+real:
+
+```text
+scripts/perf/common.sh   syntax-bash/v1: bash: parse failed at byte 24149
+```
+
+Byte 24149 is `stat="$(< "/proc/$pid/stat")"` — bash's redirection-only
+command substitution, which `tree-sitter-bash` 0.25.1 does not accept. The
+file is therefore coverage-reported `error` and contributes **no** symbols,
+rather than contributing the symbols the parser found before it gave up. That
+is F5's no-silent-partial-parse rule doing its job on input nobody chose for
+it, which is better evidence than the malformed fixtures are: those prove the
+refusal is reachable, this proves it is *load-bearing*.
+
+The structure unit for that file is still written. The failure belongs to one
+extractor, not to the resource — and `text/v1; syntax-bash/v1: …` in its
+coverage detail says exactly that.

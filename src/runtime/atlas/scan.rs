@@ -24,7 +24,20 @@
 //!   nothing derived and editing one changes everything derived from it.
 //! * **F8 — every path seen leaves exactly one coverage row.** Indexed,
 //!   excluded, unavailable, unsupported or error: there is no sixth outcome
-//!   where a path is silently not mentioned.
+//!   where a path is silently not mentioned. One row per *path*, not one per
+//!   extractor: a resource two extractors claimed still has one row, whose
+//!   `detail` names both, and whose status is `error` if either failed.
+//!
+//! # The shared extraction (X3b)
+//!
+//! Three walks acquire bytes by three different routes — this module's
+//! filesystem walk, [`super::git`]'s object-store read, and
+//! [`super::overlay`]'s Work surface. They all extract through exactly two
+//! functions here: [`claims_for`], which decides from a path alone what claims
+//! it, and [`extract_resource`], which runs every claiming extractor over the
+//! bytes. Three copies of that would be three ways for F7's premise —
+//! identical bytes plus an identical extractor identity are one extraction —
+//! to stop being true.
 //!
 //! # F1's crash window
 //!
@@ -39,12 +52,13 @@ use std::time::UNIX_EPOCH;
 use crate::domain::estate::KnowledgeSpec;
 use crate::domain::event::rfc3339_utc_now;
 use crate::domain::source::{
-    AuthorityClass, Coverage, CoverageRow, SourceKind, UnitKind, content_hash, generation_key,
-    local_key,
+    AuthorityClass, Coverage, CoverageRow, SourceKind, UnitKind, content_hash, estate_git_key,
+    generation_key, local_key,
 };
 use crate::runtime::atlas::deny::{AcquisitionFilter, BadPattern, Verdict};
+use crate::runtime::atlas::syntax::{SyntaxLanguage, language_for};
 use crate::runtime::atlas::text::{
-    MARKDOWN_EXTRACTOR, as_text, extractor_for, markdown_units, plain_units,
+    MARKDOWN_EXTRACTOR, TEXT_EXTRACTOR, as_text, extractor_for, markdown_units, plain_units,
 };
 
 /// The largest resource this build reads into memory to extract.
@@ -100,6 +114,79 @@ pub struct ScannedUnit {
     pub text: String,
 }
 
+/// The only edge kind this build derives (X3b).
+///
+/// One constant rather than an enum because there is exactly one, and an enum
+/// with one reachable variant is the promise R1 says not to make. A second
+/// edge kind — a call, a containment, a reference — needs resolution this
+/// build does not do (A1-09), so it arrives with the wave that can actually
+/// derive it.
+pub const EDGE_IMPORT: &str = "import";
+
+/// One syntax-derived symbol *site*, positioned in the original bytes (X3b).
+///
+/// A site, not a symbol: two `count` methods in one file are two of these,
+/// and they roll up to one entry in the symbol index. What makes them one
+/// symbol is `(language, label, name)`, and nothing here claims they are the
+/// same *definition* — that would be resolution (A1-09).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedSymbol {
+    /// Position within its file's symbol list, in document order.
+    pub ordinal: u64,
+    /// What the grammar called it — `function`, `struct`, `heading`.
+    pub label: &'static str,
+    /// The name as written. Unresolved, unqualified, not deduplicated.
+    pub name: String,
+    /// Offset into the **original** file bytes.
+    pub byte_start: u64,
+    /// End offset into the original file bytes, exclusive.
+    pub byte_end: u64,
+}
+
+/// One syntax-derived edge out of a file (X3b).
+///
+/// Today that is exactly one shape: an import, whose `target` is the text the
+/// file wrote. Unresolved by construction — `./lib/common.sh` is a string, not
+/// a path this build claims to have found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedEdge {
+    /// Position within its file's edge list, in document order.
+    pub ordinal: u64,
+    /// The edge's syntax-derived kind — [`EDGE_IMPORT`] today.
+    pub kind: &'static str,
+    /// What the file named, exactly as written.
+    pub target: String,
+    /// Offset into the **original** file bytes.
+    pub byte_start: u64,
+    /// End offset into the original file bytes, exclusive.
+    pub byte_end: u64,
+}
+
+/// The syntax extraction of one resource: a **second** extraction of the same
+/// bytes, with its own extractor identity and its own F7 key (X3b).
+///
+/// Deliberately not folded into [`ScannedFile`]'s own `extractor`/`local_key`.
+/// F7 keys a derived row on content identity *plus extractor identity*, so a
+/// Markdown file read by both the structure extractor and the Markdown grammar
+/// is two extractions with two keys — never one extraction that could have
+/// been done two ways. Collapsing them would mean bumping the Markdown grammar
+/// invalidated every structure unit too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedSyntax {
+    /// The grammar's language name, as coverage and rows spell it.
+    pub language: &'static str,
+    /// The grammar's versioned extractor identity (F7's second key input).
+    pub extractor: String,
+    /// The reusable key for *this* extraction: content identity composed with
+    /// [`Self::extractor`], in whichever key space the source uses
+    /// ([`KeySpace`]).
+    pub syntax_key: String,
+    /// Symbol sites, in document order.
+    pub symbols: Vec<ScannedSymbol>,
+    /// Edges out of this file, in document order.
+    pub edges: Vec<ScannedEdge>,
+}
+
 /// One acquired resource and everything derived from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedFile {
@@ -120,6 +207,13 @@ pub struct ScannedFile {
     pub mtime_millis: Option<i64>,
     /// Units extracted from it, in document order.
     pub units: Vec<ScannedUnit>,
+    /// The syntax extraction, when a grammar in this build claims the path
+    /// **and parsed it** (X3b). `None` for a path no grammar claims, and
+    /// `None` for one whose parse failed — a failed parse carries no partial
+    /// symbol list, and the failure is a coverage fact
+    /// ([`Coverage::Error`]) rather than a shorter list nothing can
+    /// distinguish from a complete one.
+    pub syntax: Option<ScannedSyntax>,
 }
 
 /// Everything one completed walk observed. Plain data — no handle, no
@@ -173,6 +267,24 @@ impl SourceScan {
     /// Total units across every acquired file.
     pub fn unit_count(&self) -> u64 {
         self.files.iter().map(|f| f.units.len() as u64).sum()
+    }
+
+    /// Total syntax-derived symbol *sites* across every acquired file (X3b).
+    ///
+    /// Sites, not distinct symbols: the journal summary reports what was
+    /// written, and what was written is one row per site.
+    pub fn symbol_count(&self) -> u64 {
+        self.syntax().map(|s| s.symbols.len() as u64).sum()
+    }
+
+    /// Total syntax-derived edges across every acquired file (X3b).
+    pub fn edge_count(&self) -> u64 {
+        self.syntax().map(|s| s.edges.len() as u64).sum()
+    }
+
+    /// Every file's syntax extraction, skipping the files that have none.
+    fn syntax(&self) -> impl Iterator<Item = &ScannedSyntax> {
+        self.files.iter().filter_map(|f| f.syntax.as_ref())
     }
 
     /// The coverage row saying the **source root itself** could not be read,
@@ -375,11 +487,11 @@ impl Walk<'_> {
 
     /// Acquire and extract one regular file that passed the boundary.
     fn file(&mut self, path: &Path, relative: String, meta: std::fs::Metadata) {
-        let Some(extractor) = extractor_for(&relative) else {
+        let Some(claims) = claims_for(&relative) else {
             self.coverage.push(CoverageRow {
                 path: Some(relative),
                 status: Coverage::Unsupported,
-                detail: Some("no extractor in this build claims this extension".to_string()),
+                detail: Some(UNCLAIMED.to_string()),
                 bytes: Some(meta.len()),
             });
             return;
@@ -417,24 +529,214 @@ impl Walk<'_> {
             return;
         };
         let hash = content_hash(&bytes);
-        let units = extract_units(text, extractor);
-        self.extractors.insert(extractor.to_string());
+        let extracted = extract_resource(claims, text, &hash, KeySpace::Local);
+        self.extractors.extend(extracted.identities.iter().cloned());
         self.coverage.push(CoverageRow {
             path: Some(relative.clone()),
-            status: Coverage::Indexed,
-            detail: Some(extractor.to_string()),
+            status: extracted.status(),
+            detail: Some(extracted.detail()),
             bytes: Some(bytes.len() as u64),
         });
         self.files.push(ScannedFile {
             relative_path: relative,
-            local_key: local_key(&hash, extractor),
+            local_key: extracted.key,
             content_hash: hash,
-            extractor: extractor.to_string(),
+            extractor: extracted.extractor.to_string(),
             byte_len: bytes.len() as u64,
             mtime_millis: mtime_millis(&meta),
-            units,
+            units: extracted.units,
+            syntax: extracted.syntax,
         });
     }
+}
+
+/// The coverage detail for a path no extractor and no grammar claims (F8).
+///
+/// One constant, shared by all three walks, because "unsupported" has to mean
+/// the same thing whichever route the bytes arrived by — and because the
+/// sentence has to name *both* routing tables now that there are two.
+pub const UNCLAIMED: &str = "no extractor or grammar in this build claims this extension";
+
+/// Which key space a source's derived rows live in (F7).
+///
+/// The two halves of F7's cache-key rule, as a value the three walks can pass
+/// to one shared extractor instead of each spelling their own composition. The
+/// spaces are domain-separated by
+/// [`estate_git_key`]/[`local_key`] themselves — this enum only chooses
+/// between them, and cannot blur them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySpace {
+    /// BLAKE3 of the bytes plus extractor identity — a filesystem resource,
+    /// which no object store has already named.
+    Local,
+    /// Git blob OID plus extractor identity — **never a second hash of bytes
+    /// Git already hashed**.
+    EstateGit,
+}
+
+impl KeySpace {
+    /// Compose a content identity with an extractor identity in this space.
+    pub fn key(self, content_id: &str, extractor: &str) -> String {
+        match self {
+            Self::Local => local_key(content_id, extractor),
+            Self::EstateGit => estate_git_key(content_id, extractor),
+        }
+    }
+}
+
+/// What claims one path, decided from the path alone (X3b).
+///
+/// Two routing tables, unioned at exactly one place. [`extractor_for`] routes
+/// bytes to a structure-unit extractor; [`language_for`] routes them to a
+/// grammar. A path either table claims is acquired; a path neither claims is
+/// honestly `unsupported` (F8).
+///
+/// The union has one deliberate consequence worth naming: a path a *grammar*
+/// claims but the structure table does not — `main.rs`, `Cargo.toml` — is
+/// acquired with the plain-text structure extractor
+/// ([`TEXT_EXTRACTOR`]), so every acquired resource still has units and
+/// `source.files`' existing columns keep the meaning X2 gave them. The
+/// alternative — a `source.files` row whose `extractor` names a grammar and
+/// whose `unit_count` is zero — would have made one column mean two things
+/// depending on the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Claims {
+    /// The structure-unit extractor that will run.
+    pub structure: &'static str,
+    /// The grammar that will run too, when one claims this path.
+    pub language: Option<SyntaxLanguage>,
+}
+
+/// What claims `relative`, or `None` for a path nothing in this build claims.
+pub fn claims_for(relative: &str) -> Option<Claims> {
+    let language = language_for(relative);
+    let structure = extractor_for(relative).or(language.map(|_| TEXT_EXTRACTOR))?;
+    Some(Claims {
+        structure,
+        language,
+    })
+}
+
+/// Everything one resource's bytes yielded, for every extractor that claimed
+/// them (X3b).
+///
+/// **The one place a resource is extracted**, for all three walks — the
+/// filesystem one, the estate-git one and the Work-overlay one. Three copies
+/// of this would be three ways for F7's premise (identical bytes plus
+/// identical extractor identity are one extraction) to stop being true, which
+/// is the same argument [`extract_units`] already carries for its own loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceExtraction {
+    /// The structure extractor that ran, and the identity its units are keyed
+    /// by.
+    pub extractor: &'static str,
+    /// F7 key for the structure extraction.
+    pub key: String,
+    /// Structure units, in document order.
+    pub units: Vec<ScannedUnit>,
+    /// The syntax extraction, when a grammar claimed the path and parsed it.
+    pub syntax: Option<ScannedSyntax>,
+    /// Every extractor identity that actually produced rows, in the order they
+    /// ran. An extractor that failed is **not** here: the journal summary's
+    /// `extractors` list names what produced evidence, not what was attempted.
+    pub identities: Vec<String>,
+    /// Why a claimed extractor produced nothing, when one did. Its presence is
+    /// what turns this resource's coverage row from `indexed` into `error`
+    /// (F8).
+    pub failure: Option<String>,
+}
+
+impl ResourceExtraction {
+    /// The coverage status this extraction earns (F8).
+    pub fn status(&self) -> Coverage {
+        if self.failure.is_some() {
+            Coverage::Error
+        } else {
+            Coverage::Indexed
+        }
+    }
+
+    /// The coverage row's `detail`: which extractors produced rows, and what
+    /// failed if anything did.
+    pub fn detail(&self) -> String {
+        let ran = self.identities.join(",");
+        match &self.failure {
+            Some(failure) if ran.is_empty() => failure.clone(),
+            Some(failure) => format!("{ran}; {failure}"),
+            None => ran,
+        }
+    }
+}
+
+/// Run every extractor that claims `relative` over one resource's decoded
+/// text.
+///
+/// Pure (F6's adapter-shape mandate): no file is opened, no database is
+/// touched, no clock is read. `content_id` is the resource's already-computed
+/// content identity — a BLAKE3 hash for a filesystem resource, a blob OID for
+/// a Git one — and `keys` says which space to compose it in.
+///
+/// A grammar failure is not a scan failure. It leaves [`ResourceExtraction`]'s
+/// `syntax` empty and its `failure` set, and the structure units the other
+/// extractor produced are still real evidence about real bytes; refusing them
+/// too would discard a document's index because a parser disagreed with its
+/// code fences. What is never done is the middle case the grammar itself
+/// refuses — a *shorter* symbol list, indistinguishable from a complete one
+/// (see [`super::syntax`]).
+pub fn extract_resource(
+    claims: Claims,
+    text: &str,
+    content_id: &str,
+    keys: KeySpace,
+) -> ResourceExtraction {
+    let mut out = ResourceExtraction {
+        extractor: claims.structure,
+        key: keys.key(content_id, claims.structure),
+        units: extract_units(text, claims.structure),
+        syntax: None,
+        identities: vec![claims.structure.to_string()],
+        failure: None,
+    };
+    let Some(language) = claims.language else {
+        return out;
+    };
+    let extractor = language.extractor_identity();
+    match crate::runtime::atlas::syntax::extract(language, text.as_bytes()) {
+        Ok(facts) => {
+            out.syntax = Some(ScannedSyntax {
+                language: language.name(),
+                syntax_key: keys.key(content_id, &extractor),
+                symbols: facts
+                    .symbols
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ordinal, symbol)| ScannedSymbol {
+                        ordinal: ordinal as u64,
+                        label: symbol.label,
+                        name: symbol.name,
+                        byte_start: symbol.byte_start as u64,
+                        byte_end: symbol.byte_end as u64,
+                    })
+                    .collect(),
+                edges: facts
+                    .imports
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ordinal, import)| ScannedEdge {
+                        ordinal: ordinal as u64,
+                        kind: EDGE_IMPORT,
+                        target: import.target,
+                        byte_start: import.byte_start as u64,
+                        byte_end: import.byte_end as u64,
+                    })
+                    .collect(),
+                extractor: extractor.clone(),
+            });
+            out.identities.push(extractor);
+        }
+        Err(error) => out.failure = Some(format!("{extractor}: {error}")),
+    }
+    out
 }
 
 /// Run one extractor over decoded text and number its units.
@@ -541,9 +843,17 @@ mod tests {
         assert_eq!(row(&scan, "keys/server.pem").status, Coverage::Excluded);
         assert_eq!(row(&scan, "notes").status, Coverage::Discovered);
 
+        // Both routing tables ran. A Markdown file is claimed by the structure
+        // extractor *and* by the Markdown grammar, and that is two extractions
+        // of one blob with two F7 keys — never one extraction that could have
+        // been done two ways (X3b).
         assert_eq!(
             scan.extractors,
-            BTreeSet::from([MARKDOWN_EXTRACTOR.to_string(), TEXT_EXTRACTOR.to_string()])
+            BTreeSet::from([
+                MARKDOWN_EXTRACTOR.to_string(),
+                TEXT_EXTRACTOR.to_string(),
+                SyntaxLanguage::Markdown.extractor_identity(),
+            ])
         );
     }
 

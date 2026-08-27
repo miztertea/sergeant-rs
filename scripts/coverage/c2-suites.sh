@@ -173,3 +173,12 @@ cov_stage_end 1 "the x3a_scan_uses_only_local_reads test binary must write its o
 cov_stage_begin c2-x3b_tslp_corpus
 cov_run cargo llvm-cov --no-report --test x3b_tslp_corpus --locked || cov_fail "x3b_tslp_corpus failed under instrumentation"
 cov_stage_end 1 "the x3b_tslp_corpus test binary must write its own profile"
+
+# S3 X3b, the wiring: symbols/occurrences/edges written by the ordinary
+# recording path over real Git objects, plus the intelligence-lane consumer.
+# Builds throwaway repositories and Atlas stores in tempdirs and drives an
+# in-process Engine; it spawns no `sgt` and starts no daemon, which is why it
+# is here rather than with the spawning suites. Floor 1.
+cov_stage_begin c2-x3b_syntax_wiring
+cov_run cargo llvm-cov --no-report --test x3b_syntax_wiring --locked || cov_fail "x3b_syntax_wiring failed under instrumentation"
+cov_stage_end 1 "the x3b_syntax_wiring test binary must write its own profile"

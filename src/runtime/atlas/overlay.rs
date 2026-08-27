@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 
 use crate::domain::event::rfc3339_utc_now;
 use crate::domain::source::{
-    AuthorityClass, Coverage, CoverageRow, SourceKind, content_hash, local_key, overlay_digest,
+    AuthorityClass, Coverage, CoverageRow, SourceKind, content_hash, overlay_digest,
     overlay_generation_key,
 };
 use crate::runtime::atlas::deny::{AcquisitionFilter, Verdict};
@@ -54,8 +54,10 @@ use crate::runtime::atlas::git::{
     EstateGitSource, Extracted, GitScanError, GitTree, TreeEntry, directory_coverage,
     extract_blobs, list_tree,
 };
-use crate::runtime::atlas::scan::{MAX_RESOURCE_BYTES, ScannedFile, SourceScan, extract_units};
-use crate::runtime::atlas::text::{as_text, extractor_for};
+use crate::runtime::atlas::scan::{
+    KeySpace, MAX_RESOURCE_BYTES, ScannedFile, SourceScan, UNCLAIMED, claims_for, extract_resource,
+};
+use crate::runtime::atlas::text::as_text;
 use crate::runtime::git::{GitError, git_bytes};
 
 /// What an overlay digest records for a path the Work **deleted**.
@@ -285,11 +287,11 @@ fn changed_file(overlay: &WorkOverlay, path: &str, out: &mut Extracted) -> Strin
         });
         return NOT_A_FILE_MARKER.to_string();
     }
-    let Some(extractor) = extractor_for(path) else {
+    let Some(claims) = claims_for(path) else {
         out.coverage.push(CoverageRow {
             path: Some(path.to_string()),
             status: Coverage::Unsupported,
-            detail: Some("no extractor in this build claims this extension".to_string()),
+            detail: Some(UNCLAIMED.to_string()),
             bytes: Some(meta.len()),
         });
         // Still hashed: an unextractable file whose bytes changed changed the
@@ -332,21 +334,23 @@ fn changed_file(overlay: &WorkOverlay, path: &str, out: &mut Extracted) -> Strin
         });
         return hash;
     };
-    out.extractors.insert(extractor.to_string());
+    let extracted = extract_resource(claims, text, &hash, KeySpace::Local);
+    out.extractors.extend(extracted.identities.iter().cloned());
     out.coverage.push(CoverageRow {
         path: Some(path.to_string()),
-        status: Coverage::Indexed,
-        detail: Some(extractor.to_string()),
+        status: extracted.status(),
+        detail: Some(extracted.detail()),
         bytes: Some(bytes.len() as u64),
     });
     out.files.push(ScannedFile {
         relative_path: path.to_string(),
-        local_key: local_key(&hash, extractor),
+        local_key: extracted.key,
         content_hash: hash.clone(),
-        extractor: extractor.to_string(),
+        extractor: extracted.extractor.to_string(),
         byte_len: bytes.len() as u64,
         mtime_millis: None,
-        units: extract_units(text, extractor),
+        units: extracted.units,
+        syntax: extracted.syntax,
     });
     hash
 }
@@ -394,7 +398,7 @@ pub fn changed_paths(surface: &Path, base_sha: &str) -> Result<BTreeSet<String>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::source::estate_git_key;
+    use crate::domain::source::{estate_git_key, local_key};
     use crate::runtime::atlas::text::MARKDOWN_EXTRACTOR;
     use crate::runtime::git::git as run_git;
 

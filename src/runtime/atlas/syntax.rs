@@ -123,6 +123,19 @@ impl SyntaxLanguage {
         }
     }
 
+    /// Every label this language's grammar can produce, in table order.
+    ///
+    /// The *complete* set of what [`extract`] may put on a [`Symbol`] for this
+    /// language — which is what makes A1-09 checkable downstream rather than
+    /// merely asserted here: a consumer can compare the labels it stored
+    /// against this and see that nothing was classified, inferred or resolved
+    /// on the way. Duplicates are kept (several Rust node kinds are all
+    /// `function`), because this answers "what may a label be?" and not "how
+    /// many kinds are there?".
+    pub fn labels(self) -> impl Iterator<Item = &'static str> {
+        self.symbol_kinds().iter().map(|(_, label)| *label)
+    }
+
     fn grammar(self) -> tree_sitter::Language {
         match self {
             SyntaxLanguage::Rust => tree_sitter_rust::LANGUAGE.into(),

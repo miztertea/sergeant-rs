@@ -132,7 +132,11 @@ fn an_atlas_scan_runs_only_read_only_git_and_changes_nothing() {
     unsafe { std::env::remove_var(GIT_BIN_ENV) };
 
     let scanned = scanned.expect("the scan must succeed for the recording to mean anything");
-    assert_eq!(scanned.scan.files.len(), 3, "three extractable resources");
+    // Four since X3b: `src/main.rs` is claimed by a grammar, so it is an
+    // extractable resource rather than an unsupported one — and the extra
+    // resource is read out of the object store like the other three, which is
+    // exactly what this suite exists to keep true.
+    assert_eq!(scanned.scan.files.len(), 4, "four extractable resources");
     assert!(scanned.drift.is_none(), "HEAD never moved");
 
     // The committed bytes, not the working tree's.

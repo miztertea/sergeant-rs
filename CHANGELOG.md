@@ -305,6 +305,40 @@ release.
 - No new dependency: the existing Git-CLI module gained a batched object-read
   primitive rather than the codebase gaining a Git library.
 
+### Language-aware extraction (S3)
+
+- Source files are now parsed, not just read. Rust, TOML, Markdown, Python,
+  JavaScript, TypeScript and shell are indexed with tree-sitter grammars, and
+  what they yield lands in three new tables: a **symbol index**
+  (`source.symbols`), the **sites** that wrote each symbol
+  (`source.occurrences`), and **import edges** (`source.edges`).
+- Everything stored is **syntax, not semantics**. A symbol's label is what the
+  grammar called the node — `function`, `struct`, `class`, `heading` — and an
+  import's target is the text the file wrote, unresolved. Nothing follows a
+  re-export or decides which definition a name meant, and nothing claims to.
+- Files whose extension only a grammar claims — `.rs`, `.toml`, `.py`, `.ts` —
+  are now `indexed` where they used to be reported `unsupported`. A language
+  no grammar in this build claims (`.tsx`, for instance) is still
+  `unsupported` and says so, rather than being parsed by an almost-right
+  grammar.
+- A file a grammar cannot parse is reported `error` and contributes **no**
+  symbols at all. tree-sitter's error tolerance would otherwise produce a
+  shorter symbol list that nothing downstream could distinguish from a
+  complete one.
+- The syntax extraction of a file is cached separately from its structure
+  extraction: one blob read by two extractors is two extractions with two
+  keys, so revising a grammar re-derives symbols without invalidating a single
+  document unit. Repository content keys on Git's blob object id, exactly as
+  before; local knowledge keys on its content hash.
+- Extraction runs where the repository plumbing already ran — on the
+  intelligence lane, over batched blob reads — and the scan summary each
+  completed scan journals now carries symbol and edge counts.
+- Eight new dependencies, all from crates.io, all MIT, none vendored or
+  forked: `tree-sitter` and one grammar per indexed language. `cargo deny`
+  is green with them, with no new duplicate-version warning.
+- The declared minimum supported Rust version moves from 1.89 to 1.98,
+  matching the toolchain this repository already pins.
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain

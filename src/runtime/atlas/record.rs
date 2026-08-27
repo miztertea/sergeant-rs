@@ -329,6 +329,11 @@ pub fn scan_summary(scan: &SourceScan, generation_id: &str) -> serde_json::Value
         "observed_at": scan.observed_at,
         "files": scan.files.len(),
         "units": scan.unit_count(),
+        // Symbol *sites* and edges, matching what was written row for row —
+        // not the deduplicated symbol index, which is a rollup of these and
+        // would make the trail disagree with the table it describes (X3b).
+        "symbols": scan.symbol_count(),
+        "edges": scan.edge_count(),
         "coverage": scan.counts(),
         "extractors": scan.extractors.iter().collect::<Vec<_>>(),
     });

@@ -403,7 +403,13 @@ fn the_scan_summary_is_one_compact_event_with_provenance_and_no_path_list() {
         .iter()
         .map(|v| v.as_str().expect("str"))
         .collect();
-    assert_eq!(extractors, vec!["markdown/v1", "text/v1"]);
+    // The Markdown grammar joined the structure extractors in X3b: a `.md`
+    // blob is claimed by both routing tables, which F7 makes two extractions
+    // with two keys rather than one ambiguous extraction.
+    assert_eq!(
+        extractors,
+        vec!["markdown/v1", "syntax-markdown/v1", "text/v1"]
+    );
 
     // Compact: the summary names counts, not paths. The unit-level detail
     // lives in the table that can be queried.

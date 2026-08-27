@@ -51,12 +51,29 @@
 //!
 //! # Scope of what exists here today
 //!
-//! The four namespaces, and the four tables three walks now write:
-//! `source.generations`, `source.files`, `source.units` and `meta.coverage`.
-//! Local knowledge, an estate repository at an admission-pinned commit, and a
-//! Work surface overlaid on its base all land in the same four tables, because
-//! they produce the same kind of fact — a resource, its content identity, its
-//! extractor, and its units — and the source kind is a column, not a schema.
+//! The four namespaces, and the seven tables three walks now write:
+//! `source.generations`, `source.files`, `source.units`, `source.symbols`,
+//! `source.occurrences`, `source.edges` and `meta.coverage`. Local knowledge,
+//! an estate repository at an admission-pinned commit, and a Work surface
+//! overlaid on its base all land in the same tables, because they produce the
+//! same kind of fact — a resource, its content identity, its extractors, and
+//! what those extractors derived — and the source kind is a column, not a
+//! schema.
+//!
+//! # Two extractions of one resource, never one ambiguous extraction (X3b)
+//!
+//! A path may be claimed by two routing tables at once: [`text`]'s
+//! structure-unit extractor and [`syntax`]'s grammar. A Markdown file is
+//! claimed by both. That is not a conflict, because F7 keys a derived row on
+//! content identity **plus extractor identity** — so one blob read two ways is
+//! two extractions with two keys, and `source.units` and
+//! `source.occurrences`/`source.edges` are keyed independently. Bumping a
+//! grammar therefore re-derives symbols without invalidating a single
+//! structure unit, which is the whole point of the second key input.
+//!
+//! [`scan::claims_for`] is the one place the two tables are unioned, and
+//! [`scan::extract_resource`] the one place a resource is extracted, for all
+//! three walks.
 //!
 //! `git` and `context` are still empty namespaces, and deliberately so even
 //! now that estate-git bytes are indexed: the `git.*` namespace is for
