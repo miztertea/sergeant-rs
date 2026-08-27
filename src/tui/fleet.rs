@@ -38,12 +38,10 @@ pub struct WorkRow {
     /// row has aged out of the daemon's caches (the slim index row the
     /// evicted fleet row is built from carries no causation).
     ///
-    /// Exposure, not yet grouping: W1 §10's "Causal child Work" tree is V4's
-    /// integration item and needs both halves of the wave landed. This is the
-    /// coordinate it will group on, projected here so that render reads a
-    /// row it already has rather than issuing a second request per Work
-    /// (D6: the fleet endpoint returns everything, the TUI filters
-    /// client-side).
+    /// V4 (W1 §10): this is the coordinate `causal_tree` groups Fleet rows
+    /// on — projected here so render reads a row it already has rather than
+    /// issuing a second request per Work (D6: the fleet endpoint returns
+    /// everything, the TUI filters client-side).
     pub parent: String,
     pub created_at: String,
     /// The current stage's own detail text — a question when the state is
@@ -202,6 +200,22 @@ pub struct FleetScreen {
 
 impl FleetScreen {
     pub fn visible<'a>(&self, rows: &'a [WorkRow]) -> Vec<&'a WorkRow> {
+        causal_tree(&self.filtered(rows))
+            .into_iter()
+            .map(|(row, _depth)| row)
+            .collect()
+    }
+
+    /// [`visible`], paired with each row's causal depth — rendering's own
+    /// entry point, so indentation and selection walk the identical order
+    /// (W1 §10's causal-child tree; presentation only, same idiom as the
+    /// `estate`/`state` filters above: derived from rows already on hand,
+    /// never a second request).
+    pub fn visible_with_depth<'a>(&self, rows: &'a [WorkRow]) -> Vec<(&'a WorkRow, usize)> {
+        causal_tree(&self.filtered(rows))
+    }
+
+    fn filtered<'a>(&self, rows: &'a [WorkRow]) -> Vec<&'a WorkRow> {
         rows.iter()
             .filter(|row| self.filters.matches(row))
             .collect()
@@ -313,6 +327,58 @@ fn next_estate_filter(current: Option<&str>, rows: &[WorkRow]) -> Option<String>
     }
 }
 
+/// W1 §10's causal-child tree over an already-filtered row set: every
+/// top-level (root) Work in the order it arrived, each immediately followed
+/// by its own children (depth-first, one level of indent per hop), whose
+/// order among siblings is likewise preserved from `rows`.
+///
+/// A row whose `parent` doesn't resolve to another row *currently in
+/// `rows`* — an ordinary top-level Work (`parent == "-"`), or a child whose
+/// parent was filtered out or has aged out of the daemon's caches — is a
+/// root here: presentation never drops a row for a causal fact it can't
+/// currently show. A `seen` guard makes a malformed/cyclic parent chain
+/// (never expected of the daemon's own validated causation, W1-08/E8) a
+/// silent no-op rather than a hang or a duplicate row.
+fn causal_tree<'a>(rows: &[&'a WorkRow]) -> Vec<(&'a WorkRow, usize)> {
+    use std::collections::{HashMap, HashSet};
+
+    let ids: HashSet<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+    let mut children: HashMap<&str, Vec<&'a WorkRow>> = HashMap::new();
+    let mut roots: Vec<&'a WorkRow> = Vec::new();
+    for row in rows {
+        if row.parent != "-" && ids.contains(row.parent.as_str()) {
+            children.entry(row.parent.as_str()).or_default().push(row);
+        } else {
+            roots.push(row);
+        }
+    }
+
+    fn walk<'a>(
+        row: &'a WorkRow,
+        depth: usize,
+        children: &HashMap<&str, Vec<&'a WorkRow>>,
+        seen: &mut HashSet<&'a str>,
+        out: &mut Vec<(&'a WorkRow, usize)>,
+    ) {
+        if !seen.insert(row.id.as_str()) {
+            return;
+        }
+        out.push((row, depth));
+        if let Some(kids) = children.get(row.id.as_str()) {
+            for kid in kids {
+                walk(kid, depth + 1, children, seen, out);
+            }
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for root in roots {
+        walk(root, 0, &children, &mut seen, &mut out);
+    }
+    out
+}
+
 fn next_state_filter(current: Option<&str>) -> Option<String> {
     match current {
         None => Some(REPORTED_STATES[0].to_string()),
@@ -340,7 +406,7 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[WorkRow], screen: &FleetScr
         return;
     }
 
-    let visible = screen.visible(rows);
+    let visible = screen.visible_with_depth(rows);
     let title = format!(
         "Fleet — {} work{}{}",
         visible.len(),
@@ -395,7 +461,7 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[WorkRow], screen: &FleetScr
     }
 
     if let Some(preview_area) = preview_area {
-        let selected = visible.get(screen.selected).copied();
+        let selected = visible.get(screen.selected).map(|(row, _depth)| *row);
         super::work_view::render_preview(frame, preview_area, selected);
     }
 }
@@ -456,9 +522,28 @@ fn split_top(area: Rect, top: u16) -> (Rect, Rect) {
     (head, rest)
 }
 
+/// The causal-tree indent prefix for a row at `depth`: nothing at depth 0,
+/// else a `↳ ` (mirrors the estate-filter idiom of annotating the intent
+/// column rather than adding a new one — no geometry entry needed since no
+/// chrome changes, only cell content) preceded by two spaces per ancestor
+/// hop, cheap enough to compute per render rather than caching.
+fn indent_prefix(depth: usize) -> String {
+    if depth == 0 {
+        String::new()
+    } else {
+        format!("{}↳ ", "  ".repeat(depth - 1))
+    }
+}
+
 /// Wide/Medium: a `Table`, whose own constraints truncate every cell — never
 /// a hand-padded fixed-width string (§10.1's Decision T2-37).
-fn render_table(frame: &mut Frame, area: Rect, rows: &[&WorkRow], selected: usize, wide: bool) {
+fn render_table(
+    frame: &mut Frame,
+    area: Rect,
+    rows: &[(&WorkRow, usize)],
+    selected: usize,
+    wide: bool,
+) {
     let mut header = vec![
         "", "state", "intent", "stage", "target", "workflow", "turns",
     ];
@@ -488,13 +573,13 @@ fn render_table(frame: &mut Frame, area: Rect, rows: &[&WorkRow], selected: usiz
 
     let body_rows: Vec<Row> = rows
         .iter()
-        .map(|row| {
+        .map(|(row, depth)| {
             let mut cells = vec![
                 Cell::from(theme::state_glyph(&row.state))
                     .style(Style::default().fg(theme::state_token(&row.state).rgb())),
                 Cell::from(row.state.clone())
                     .style(Style::default().fg(theme::state_token(&row.state).rgb())),
-                Cell::from(row.intent.clone()),
+                Cell::from(format!("{}{}", indent_prefix(*depth), row.intent)),
                 Cell::from(row.stage.clone()),
                 Cell::from(target(row)),
                 // §8.1/§8.10: info/reference violet is reserved for
@@ -524,10 +609,10 @@ fn render_table(frame: &mut Frame, area: Rect, rows: &[&WorkRow], selected: usiz
 }
 
 /// Narrow: intent-first, two-line stacked rows (§10.1/§18.3).
-fn render_stacked(frame: &mut Frame, area: Rect, rows: &[&WorkRow], selected: usize) {
+fn render_stacked(frame: &mut Frame, area: Rect, rows: &[(&WorkRow, usize)], selected: usize) {
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|row| {
+        .map(|(row, depth)| {
             let glyph_style = Style::default().fg(theme::state_token(&row.state).rgb());
             ListItem::new(vec![
                 Line::from(vec![
@@ -535,7 +620,7 @@ fn render_stacked(frame: &mut Frame, area: Rect, rows: &[&WorkRow], selected: us
                     Span::raw(" "),
                     Span::styled(row.state.clone(), glyph_style),
                     Span::raw("  "),
-                    Span::raw(row.intent.clone()),
+                    Span::raw(format!("{}{}", indent_prefix(*depth), row.intent)),
                 ]),
                 Line::from(Span::styled(
                     format!(
@@ -655,6 +740,95 @@ mod tests {
         assert_eq!(
             rows[1].parent, "-",
             "an ordinary top-level Work claims no parent"
+        );
+    }
+
+    /// V4 handoff (W1 §10's causal-child tree): a child row is grouped
+    /// immediately after its parent, in causal order, even when the daemon's
+    /// own body listed it first — presentation groups by the validated
+    /// `parent` field, it does not merely trust arrival order.
+    #[test]
+    fn visible_groups_a_child_immediately_after_its_parent() {
+        let mut fleet = fleet_of(&[
+            ("parent", "active"),
+            ("unrelated", "active"),
+            ("child", "active"),
+        ]);
+        fleet["works"][2]["parent_work_id"] = json!("parent");
+        let rows = fleet_rows(&fleet);
+        let screen = FleetScreen::default();
+        let ids: Vec<&str> = screen
+            .visible(&rows)
+            .into_iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["parent", "child", "unrelated"],
+            "the child must immediately follow its parent, ahead of an unrelated root: {ids:?}"
+        );
+    }
+
+    /// Grandchildren nest one level deeper than their own parent, still
+    /// directly under it — recursive grouping, not just one hop.
+    #[test]
+    fn visible_groups_a_grandchild_under_its_own_parent_not_the_root() {
+        let mut fleet = fleet_of(&[
+            ("grandchild", "active"),
+            ("child", "active"),
+            ("root", "active"),
+        ]);
+        fleet["works"][0]["parent_work_id"] = json!("child");
+        fleet["works"][1]["parent_work_id"] = json!("root");
+        let rows = fleet_rows(&fleet);
+        let screen = FleetScreen::default();
+        let depths: Vec<(String, usize)> = screen
+            .visible_with_depth(&rows)
+            .into_iter()
+            .map(|(r, d)| (r.id.clone(), d))
+            .collect();
+        assert_eq!(
+            depths,
+            [
+                ("root".to_string(), 0),
+                ("child".to_string(), 1),
+                ("grandchild".to_string(), 2),
+            ]
+        );
+    }
+
+    /// A child whose parent isn't in the currently-visible set (filtered out,
+    /// or evicted from the daemon's caches) still renders — as a root, never
+    /// dropped for a causal fact presentation can't currently show.
+    #[test]
+    fn visible_treats_an_unresolvable_parent_as_a_root_rather_than_dropping_the_row() {
+        let mut fleet = fleet_of(&[("orphan", "active")]);
+        fleet["works"][0]["parent_work_id"] = json!("01SOMEEVICTEDPARENT");
+        let rows = fleet_rows(&fleet);
+        let screen = FleetScreen::default();
+        let depths: Vec<(String, usize)> = screen
+            .visible_with_depth(&rows)
+            .into_iter()
+            .map(|(r, d)| (r.id.clone(), d))
+            .collect();
+        assert_eq!(depths, [("orphan".to_string(), 0)]);
+    }
+
+    /// The rendered table indents a child's intent cell under its parent —
+    /// presentation only, no new chrome/geometry.
+    #[test]
+    fn wide_render_indents_a_childs_intent_under_its_parent() {
+        let mut fleet = fleet_of(&[("child", "active"), ("parent", "active")]);
+        fleet["works"][0]["parent_work_id"] = json!("parent");
+        let rows = fleet_rows(&fleet);
+        let screen = FleetScreen::default();
+        let text = render_text(&rows, &screen, Tier::Wide, 120);
+        let parent_line = text.lines().find(|l| l.contains("intent for parent"));
+        let child_line = text.lines().find(|l| l.contains("intent for child"));
+        assert!(parent_line.is_some(), "{text}");
+        assert!(
+            child_line.is_some_and(|l| l.contains("↳")),
+            "the child's row must carry the causal-tree indent glyph: {text}"
         );
     }
 
