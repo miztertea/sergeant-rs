@@ -742,6 +742,70 @@ fn agents_md_estate_bullets_state_the_sanctioned_child_work_path() {
     );
 }
 
+/// Aria-seat review (S2, adjudicated by the captain against host-atlas r3
+/// ratification ruling 2, the amended-E8 validation ruling, and the
+/// single-user trust ruling — J3) found the amended fifth bullet above
+/// left three things ambiguous: whether "possession of the triple" itself
+/// was the sanction (rather than the engine's act of injecting it), what
+/// the ellipsis after `sgt -C "$SERGEANT_ESTATE_ROOT" run` stood for, and
+/// whether "rather than by refusal" repealed Session start's root gate.
+/// This pins the resolving language.
+#[test]
+fn agents_md_estate_bullet_resolves_possession_vs_injection_and_the_root_gate() {
+    let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
+    let agents_md_flat = agents_md.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // (a) the sanction covers a managed execution acting on the
+    // engine-injected identity; a self-fabricated triple is not
+    // sanctioned and lands as journaled, adjudicable evidence.
+    assert!(
+        agents_md_flat.contains("the causation triple the ENGINE itself injected"),
+        "AGENTS.md must state the sanctioned triple is the one the ENGINE injected, not \
+         merely possessed by the worker"
+    );
+    assert!(
+        agents_md_flat.contains("a self-fabricated triple is not sanctioned"),
+        "AGENTS.md must state that a self-fabricated triple is not sanctioned"
+    );
+    assert!(
+        agents_md_flat.contains("causation_unverified")
+            && agents_md_flat.contains("reported and adjudicable, never silently honored"),
+        "AGENTS.md must state a self-fabricated claim lands as journaled \
+         `causation_unverified` evidence, reported and adjudicable, never silently honored"
+    );
+
+    // (b) the purpose clause is restated explicitly, not left as an
+    // ellipsis after the run command.
+    assert!(
+        agents_md_flat.contains("sgt -C \"$SERGEANT_ESTATE_ROOT\" run` to create child Work"),
+        "AGENTS.md must restate the purpose clause 'to create child Work' explicitly rather \
+         than eliding it after the run command"
+    );
+
+    // (c) the refusal statement is unambiguous: Session start's root gate
+    // still applies to bare invocation, the sanctioned path proceeds only
+    // via explicit `-C` addressing, and "rather than by refusal" is a
+    // statement about the daemon's treatment of the sanctioned path's
+    // claims, not a repeal of the root gate.
+    assert!(
+        agents_md_flat.contains(
+            "Session start's exact-root refusal still applies to any bare invocation from a \
+             surface"
+        ),
+        "AGENTS.md must state Session start's exact-root refusal still applies to any bare \
+         invocation from a surface"
+    );
+    assert!(
+        agents_md_flat.contains("proceeds only via explicit `-C`"),
+        "AGENTS.md must state the sanctioned path proceeds only via explicit `-C` addressing"
+    );
+    assert!(
+        agents_md_flat.contains("not a repeal of Session start's root gate"),
+        "AGENTS.md must state 'rather than by refusal' describes the daemon's treatment of \
+         the sanctioned path's claims, not a repeal of Session start's root gate"
+    );
+}
+
 // ------------------------------------------------ 7. citation-integrity skew
 //
 // split-hardening W2c made this repo product-documents-only: NORTH-STAR.md,
