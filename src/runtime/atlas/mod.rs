@@ -67,9 +67,20 @@
 //! claimed by both. That is not a conflict, because F7 keys a derived row on
 //! content identity **plus extractor identity** — so one blob read two ways is
 //! two extractions with two keys, and `source.units` and
-//! `source.occurrences`/`source.edges` are keyed independently. Bumping a
-//! grammar therefore re-derives symbols without invalidating a single
-//! structure unit, which is the whole point of the second key input.
+//! `source.occurrences`/`source.edges` are keyed independently. A structure
+//! unit's key is unchanged by a grammar bump, so its extraction stays reusable
+//! across the re-derivation, which is the whole point of the second key input.
+//!
+//! **The second key input decides staleness too, not only addressing.** A
+//! generation's own `content_key` is content-only by construction, so it cannot
+//! notice a parser that changed under unchanged bytes; on its own it would let
+//! a re-scan answer "unchanged" after a grammar upgrade and serve the previous
+//! parser's rows indefinitely. So [`db::AtlasDb::stage_scan`] compares the
+//! standing generation's stored extractor identities against the ones the scan
+//! actually ran, and treats a mismatch as a change: a new generation is staged,
+//! and ruling §4's eviction takes the old one with its rows — leaving an
+//! eviction row that says the extractors changed rather than claiming the
+//! source bytes did.
 //!
 //! [`scan::claims_for`] is the one place the two tables are unioned, and
 //! [`scan::extract_resource`] the one place a resource is extracted, for all

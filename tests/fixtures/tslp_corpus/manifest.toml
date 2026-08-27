@@ -21,6 +21,18 @@
 #   * markdown/sample.md `# not a heading` inside a fenced code block.
 #   * shell/sample.sh `set -euo pipefail` and `main "$@"` — commands that are
 #     not `source`/`.`, so not imports.
+#
+# Shapes the corpus deliberately includes because the extractor was once wrong
+# about them, and a corpus of only comfortable inputs makes "EXACT match" a
+# narrower guarantee than it reads:
+#   * python/multi_import.py — a comma list is ONE `import_statement` naming
+#     several modules; each name is its own edge.
+#   * typescript/import_require.ts — `import x = require("...")` is an
+#     `import_statement` whose source hides in an `import_require_clause`.
+#   * markdown/setext.md — `setext_heading` is a claimed kind, so it needs an
+#     instance.
+#   * rust/unicode.rs — multi-byte characters before AND inside extracted
+#     names, so the byte-offset provenance test slices non-trivial UTF-8.
 
 [[fixture]]
 path = "rust/sample.rs"
@@ -38,6 +50,17 @@ symbol_labels = [
   "struct", "macro", "function",
 ]
 import_targets = ["std::collections::HashMap", "std::fmt::{self, Display}"]
+
+# Multi-byte characters ahead of and inside every name here. A byte offset
+# mistaken for a character count lands mid-character and the slice fails.
+[[fixture]]
+path = "rust/unicode.rs"
+language = "rust"
+symbols = 3
+imports = 0
+symbol_names = ["Zähler", "café_fn", "GRÜSSE"]
+symbol_labels = ["struct", "function", "const"]
+import_targets = []
 
 [[fixture]]
 path = "toml/sample.toml"
@@ -65,6 +88,19 @@ symbol_names = [
 symbol_labels = ["heading", "heading", "heading", "heading"]
 import_targets = []
 
+# Two setext headings and one ATX heading. `setext_heading` is claimed by the
+# symbol table; without this fixture nothing exercised it.
+[[fixture]]
+path = "markdown/setext.md"
+language = "markdown"
+symbols = 3
+imports = 0
+symbol_names = [
+  "Setext Title", "Setext Subsection", "An ATX heading, for contrast",
+]
+symbol_labels = ["heading", "heading", "heading"]
+import_targets = []
+
 [[fixture]]
 path = "python/sample.py"
 language = "python"
@@ -79,6 +115,18 @@ symbol_labels = [
   "function", "function",
 ]
 import_targets = ["os", "sys", "collections", "typing"]
+
+# Five imports written across three statements: two comma lists (two names
+# each) and one `from` import (whose module is one name however many symbols it
+# binds). An extractor that answers once per statement records three.
+[[fixture]]
+path = "python/multi_import.py"
+language = "python"
+symbols = 1
+imports = 5
+symbol_names = ["uses"]
+symbol_labels = ["function"]
+import_targets = ["os", "sys", "json", "csv", "collections"]
 
 [[fixture]]
 path = "javascript/sample.js"
@@ -103,6 +151,17 @@ symbol_labels = [
   "function",
 ]
 import_targets = ["node:stream", "node:events"]
+
+# The CommonJS-interop import form beside an ordinary one, so the fixture
+# proves the two are both edges rather than proving only that the file parses.
+[[fixture]]
+path = "typescript/import_require.ts"
+language = "typescript"
+symbols = 1
+imports = 2
+symbol_names = ["reader"]
+symbol_labels = ["function"]
+import_targets = ["node:fs/promises", "node:events"]
 
 [[fixture]]
 path = "shell/sample.sh"

@@ -93,7 +93,7 @@
 //! and "journal-present, database-evicted" is the same both-present violation
 //! as its mirror image, only harder to notice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use duckdb::Connection;
@@ -410,9 +410,30 @@ impl AtlasDb {
     ///
     /// Returns [`ScanCommit::Unchanged`] without writing anything when the
     /// scan's `content_key` matches the source's newest confirmed
-    /// generation — ruling §4's eviction rule, enforced at its only
-    /// enforcement point: a generation is evicted only when source bytes
-    /// changed, so an unchanged re-scan must not churn one.
+    /// generation **and the same extractor identities produced it** — ruling
+    /// §4's eviction rule, enforced at its only enforcement point: a
+    /// generation is evicted only when the derived facts could have changed,
+    /// so an unchanged re-scan must not churn one.
+    ///
+    /// **Both halves of F7's key participate, not just the content half.**
+    /// F7 keys a derived row on content identity *plus extractor identity*,
+    /// and a staleness test that consults only `content_key` would make the
+    /// second half decorative: after a grammar or version bump, a re-scan of
+    /// byte-identical sources would answer `Unchanged`, the fresh extraction
+    /// would be discarded, and `symbols`/`occurrences`/`edges` would keep
+    /// serving the *old* parser's rows forever with no path back. The
+    /// identities the standing generation stored are therefore compared
+    /// against the ones this scan ran, and a mismatch is a change: a new
+    /// generation is staged and the old one evicted on confirmation, exactly
+    /// as a byte change would be.
+    ///
+    /// The two inputs stay separate values rather than being folded into one
+    /// hash. `content_key` answers "is this the same world?" and is
+    /// deliberately content-only (see
+    /// [`generation_key`](crate::domain::source::generation_key)); mixing an
+    /// extractor version into it would make a bumped parser look like changed
+    /// source bytes to every reader of that column, including the eviction
+    /// row that has to say *why* a generation was superseded.
     ///
     /// Returns [`ScanCommit::RootUnavailable`], also without writing a
     /// generation, when the walk could not read the source root at all and a
@@ -463,6 +484,7 @@ impl AtlasDb {
         }
         if let Some(current) = self.confirmed_generation(&scan.source_name)?
             && current.content_key == scan.content_key
+            && self.generation_extractors(&current.id)? == scan.extractors
         {
             return Ok(ScanCommit::Unchanged {
                 generation_id: current.id,
@@ -470,12 +492,7 @@ impl AtlasDb {
             });
         }
         let generation_id = ulid::Ulid::generate().to_string();
-        let extractors = scan
-            .extractors
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(",");
+        let extractors = join_extractors(&scan.extractors);
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO source.generations \
@@ -568,6 +585,21 @@ impl AtlasDb {
                 .filter(|id| id != generation_id),
             None => None,
         };
+        // Why the predecessor is going, decided from the evidence rather than
+        // assumed. `stage_scan` stages a successor for either of two reasons —
+        // the source bytes changed, or the extractor identities did — and the
+        // coverage row an eviction leaves is the durable record of which. A
+        // fixed "the source bytes changed" string would be a false statement on
+        // every grammar bump, in the one row a reader consults to find out.
+        let reason = match &superseded {
+            Some(previous)
+                if self.generation_content_key(previous)?
+                    == self.generation_content_key(generation_id)? =>
+            {
+                "superseded: the extractor identities changed (the source bytes did not)"
+            }
+            _ => "superseded: the source bytes changed",
+        };
         let observed_at = crate::domain::event::rfc3339_utc_now();
         let tx = self.conn.transaction()?;
         let promoted = tx.execute(
@@ -590,13 +622,7 @@ impl AtlasDb {
             });
         }
         if let (Some(previous), Some(name)) = (&superseded, &source_name) {
-            evict(
-                &tx,
-                previous,
-                name,
-                "superseded: the source bytes changed",
-                &observed_at,
-            )?;
+            evict(&tx, previous, name, reason, &observed_at)?;
         }
         tx.commit()?;
         Ok(superseded)
@@ -983,6 +1009,63 @@ impl AtlasDb {
             None => Ok(None),
         }
     }
+
+    /// The extractor identities a stored generation's rows were derived from —
+    /// the second half of F7's key, read back for [`Self::stage_scan`]'s
+    /// staleness test.
+    ///
+    /// Round-trips exactly what [`join_extractors`] wrote, so the comparison is
+    /// against a set and not against a formatting accident. An unknown
+    /// generation and one that recorded no extractors both answer with the
+    /// empty set, which is the same answer a scan that ran none produces —
+    /// correct in both cases, because neither could have derived a row.
+    fn generation_extractors(&self, generation_id: &str) -> Result<BTreeSet<String>, AtlasError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT extractors FROM source.generations WHERE generation_id = ?")?;
+        let mut rows = statement.query(duckdb::params![generation_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(BTreeSet::new());
+        };
+        Ok(split_extractors(&row.get::<usize, String>(0)?))
+    }
+
+    /// The stored `content_key` of any generation, in any state.
+    ///
+    /// [`Self::confirmed_generation`] cannot answer this for a generation that
+    /// is being superseded *by* the call asking, which is exactly when
+    /// [`Self::confirm_scan`] needs it to say honestly why the predecessor is
+    /// going.
+    fn generation_content_key(&self, generation_id: &str) -> Result<Option<String>, AtlasError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT content_key FROM source.generations WHERE generation_id = ?")?;
+        let mut rows = statement.query(duckdb::params![generation_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// The `extractors` column's stored form: identities, comma-joined, in the
+/// set's own sorted order.
+fn join_extractors(extractors: &BTreeSet<String>) -> String {
+    extractors
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// [`join_extractors`] backwards. Empty segments are dropped, so an empty
+/// column is the empty set rather than a set holding one empty name.
+fn split_extractors(stored: &str) -> BTreeSet<String> {
+    stored
+        .split(',')
+        .filter(|identity| !identity.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Insert one acquired file and its units.

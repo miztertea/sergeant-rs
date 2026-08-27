@@ -205,9 +205,10 @@ impl SyntaxLanguage {
 
     /// Node kinds inspected for an import.
     ///
-    /// A kind listed here is a *candidate*: [`import_target`] returns `None`
-    /// for a node that turns out not to be one (every Bash `command` is a
-    /// candidate; only `source` and `.` are imports).
+    /// A kind listed here is a *candidate*: [`imports_in`] returns an empty
+    /// list for a node that turns out not to be one (every Bash `command` is a
+    /// candidate; only `source` and `.` are imports). It may also return
+    /// *several* — one Python `import_statement` can name a whole comma list.
     fn import_kinds(self) -> &'static [&'static str] {
         match self {
             SyntaxLanguage::Rust => &["use_declaration", "extern_crate_declaration"],
@@ -349,14 +350,12 @@ pub fn extract(language: SyntaxLanguage, bytes: &[u8]) -> Result<SyntaxFacts, Sy
                         byte_end: node.end_byte(),
                     });
                 }
-            } else if import_kinds.contains(&kind)
-                && let Some(target) = import_target(language, node, text)
-            {
-                facts.imports.push(Import {
-                    target,
-                    byte_start: node.start_byte(),
-                    byte_end: node.end_byte(),
-                });
+            } else if import_kinds.contains(&kind) {
+                // `extend`, not `push`: one candidate node can name more than
+                // one import (`import os, sys`), and a signature that could
+                // only answer once would drop the rest silently — the partial
+                // answer this module's own doctrine refuses.
+                facts.imports.extend(imports_in(language, node, text));
             }
         }
 
@@ -434,34 +433,88 @@ fn symbol_name(language: SyntaxLanguage, node: Node<'_>, text: &str) -> Option<S
     }
 }
 
-/// The target an import node names, or `None` when the candidate node is not
-/// an import after all.
-fn import_target(language: SyntaxLanguage, node: Node<'_>, text: &str) -> Option<String> {
+/// Every import one candidate node names, in source order.
+///
+/// **A list, not an `Option`.** A single node can name several imports —
+/// Python's `import os, sys` is one `import_statement` carrying two `name`
+/// fields — and a signature that can answer only once turns "two imports" into
+/// "one import" with nothing downstream able to tell. That is a silent partial
+/// extraction of a claimed node, which is the same thing the module docs refuse
+/// for a partial parse, so it gets the same treatment: every name the node
+/// wrote becomes a row, or the extraction is wrong.
+///
+/// Empty is the honest answer for a candidate that is not an import after all
+/// (every Bash `command` is a candidate; only `source` and `.` are imports).
+/// Empty is never the answer for a node that *is* one.
+fn imports_in(language: SyntaxLanguage, node: Node<'_>, text: &str) -> Vec<Import> {
     match (language, node.kind()) {
-        (SyntaxLanguage::Rust, "use_declaration") => named_field(node, "argument", text),
-        (SyntaxLanguage::Rust, "extern_crate_declaration") => named_field(node, "name", text),
-        (SyntaxLanguage::Python, "import_from_statement") => named_field(node, "module_name", text),
+        (SyntaxLanguage::Rust, "use_declaration") => one(node, named_field(node, "argument", text)),
+        (SyntaxLanguage::Rust, "extern_crate_declaration") => {
+            one(node, named_field(node, "name", text))
+        }
+        (SyntaxLanguage::Python, "import_from_statement") => {
+            one(node, named_field(node, "module_name", text))
+        }
         (SyntaxLanguage::Python, "import_statement") => {
-            let name = node.child_by_field_name("name")?;
-            if name.kind() == "aliased_import" {
-                named_field(name, "name", text)
-            } else {
-                node_text(name, text)
-            }
+            // tree-sitter-python attaches the `name` field to EVERY entry of
+            // the comma list, so this iterates the field rather than asking for
+            // it once (`child_by_field_name` answers with the first only).
+            // Each entry carries its own span: two names in one statement are
+            // two facts written at two places, and giving both the statement's
+            // span would make them indistinguishable by position.
+            let mut cursor = node.walk();
+            node.children_by_field_name("name", &mut cursor)
+                .filter_map(|entry| {
+                    let target = if entry.kind() == "aliased_import" {
+                        named_field(entry, "name", text)?
+                    } else {
+                        node_text(entry, text)?
+                    };
+                    Some(at(entry, target))
+                })
+                .collect()
         }
         (SyntaxLanguage::JavaScript | SyntaxLanguage::TypeScript, "import_statement") => {
-            Some(unquote(named_field(node, "source", text)?))
+            // The ordinary form puts the module string on the statement's own
+            // `source` field. TypeScript's legacy CommonJS-interop form —
+            // `import foo = require("./x")` — is the same node kind with no
+            // `source` field of its own: the string sits inside an
+            // `import_require_clause` child. Both are unambiguously imports, so
+            // both produce an edge; only a node matching neither shape (which
+            // this grammar does not produce) answers empty.
+            let source = named_field(node, "source", text).or_else(|| {
+                let mut cursor = node.walk();
+                let clause = node
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "import_require_clause")?;
+                named_field(clause, "source", text)
+            });
+            one(node, source.map(unquote))
         }
         (SyntaxLanguage::Bash, "command") => {
             // Only `source X` and `. X` are imports; every other command is a
-            // candidate that answers `None`.
-            let name = named_field(node, "name", text)?;
-            if name != "source" && name != "." {
-                return None;
-            }
-            Some(unquote(named_field(node, "argument", text)?))
+            // candidate that answers empty.
+            let target = named_field(node, "name", text)
+                .filter(|name| name == "source" || name == ".")
+                .and_then(|_| named_field(node, "argument", text))
+                .map(unquote);
+            one(node, target)
         }
-        _ => None,
+        _ => Vec::new(),
+    }
+}
+
+/// The zero-or-one case of [`imports_in`], spanning the whole candidate node.
+fn one(node: Node<'_>, target: Option<String>) -> Vec<Import> {
+    target.map(|target| at(node, target)).into_iter().collect()
+}
+
+/// One import, positioned at `node`.
+fn at(node: Node<'_>, target: String) -> Import {
+    Import {
+        target,
+        byte_start: node.start_byte(),
+        byte_end: node.end_byte(),
     }
 }
 
@@ -536,6 +589,66 @@ mod tests {
                 }
             ),
             "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn every_name_in_a_python_comma_import_becomes_its_own_edge() {
+        let source = b"import os, sys\nimport a.b as ab, c\n";
+        let facts = extract(SyntaxLanguage::Python, source).expect("parses");
+        let targets: Vec<&str> = facts.imports.iter().map(|i| i.target.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["os", "sys", "a.b", "c"],
+            "a comma list must not lose every name after the first"
+        );
+        // And each one is positioned at the name it was written as, not at the
+        // statement, so two names in one statement are two distinguishable
+        // facts.
+        for import in &facts.imports {
+            let slice = std::str::from_utf8(&source[import.byte_start..import.byte_end])
+                .expect("span is UTF-8");
+            assert!(slice.contains(&import.target), "{slice:?}");
+        }
+        assert_ne!(
+            (facts.imports[0].byte_start, facts.imports[0].byte_end),
+            (facts.imports[1].byte_start, facts.imports[1].byte_end)
+        );
+    }
+
+    #[test]
+    fn a_typescript_import_require_is_an_edge_not_a_silent_drop() {
+        let source = b"import foo = require(\"./x\");\nimport bar from \"node:fs\";\n";
+        let facts = extract(SyntaxLanguage::TypeScript, source).expect("parses");
+        let targets: Vec<&str> = facts.imports.iter().map(|i| i.target.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["./x", "node:fs"],
+            "the CommonJS-interop form is claimed as an import_statement and must yield an edge"
+        );
+    }
+
+    #[test]
+    fn a_command_that_is_not_source_is_not_an_import() {
+        let facts = extract(
+            SyntaxLanguage::Bash,
+            b"set -euo pipefail\nsource ./lib.sh\n",
+        )
+        .expect("parses");
+        let targets: Vec<&str> = facts.imports.iter().map(|i| i.target.as_str()).collect();
+        assert_eq!(targets, vec!["./lib.sh"]);
+    }
+
+    #[test]
+    fn multi_byte_text_before_a_name_does_not_shift_its_span() {
+        let source = "// 日本語のコメント — em dash too\npub fn café_fn() {}\n".as_bytes();
+        let facts = extract(SyntaxLanguage::Rust, source).expect("parses");
+        assert_eq!(facts.symbols.len(), 1);
+        let symbol = &facts.symbols[0];
+        assert_eq!(symbol.name, "café_fn");
+        assert_eq!(
+            std::str::from_utf8(&source[symbol.byte_start..symbol.byte_end]).expect("UTF-8"),
+            "pub fn café_fn() {}"
         );
     }
 
