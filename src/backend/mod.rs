@@ -350,17 +350,56 @@ pub const SERGEANT_EXECUTION_ID_ENV: &str = "SERGEANT_EXECUTION_ID";
 /// context, or a pre-S2 journal line replayed) omits that one pair rather
 /// than inventing a root. The other two are always present.
 pub fn causation_env(request: &StartRequest) -> BTreeMap<String, String> {
+    causation_env_from_parts(
+        request.estate_root.as_deref(),
+        &request.work_id,
+        &request.execution_id,
+    )
+}
+
+/// The same triple as [`causation_env`], rebuilt on RESUME.
+///
+/// A restarted adapter's `resume()` has a [`ResumeRequest`] (which carries
+/// the re-supplied `estate_root`, S2 E6) and an [`ExecutionHandle`] (which
+/// already carries the execution id — `ResumeRequest` itself does not need a
+/// second copy of it). Before this helper existed, `resume()` had nothing to
+/// build the causation triple from and passed an empty map to
+/// `launch_config` instead — not just for the reconciliation snapshot but
+/// for the env cached for the rest of that execution's life, silently
+/// dropping causation for every turn spawned after a daemon restart. This is
+/// the fix: the same three values, re-supplied exactly as the model pin and
+/// the profile already are on the same path.
+pub fn resume_causation_env(
+    request: &ResumeRequest,
+    execution_id: &str,
+) -> BTreeMap<String, String> {
+    causation_env_from_parts(
+        request.estate_root.as_deref(),
+        &request.work_id,
+        execution_id,
+    )
+}
+
+/// Shared body for [`causation_env`] and [`resume_causation_env`] — one place
+/// that knows the three names and the omit-when-absent rule for the estate
+/// root, so START and RESUME cannot drift into building the triple two
+/// different ways.
+fn causation_env_from_parts(
+    estate_root: Option<&std::path::Path>,
+    work_id: &str,
+    execution_id: &str,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
-    if let Some(root) = &request.estate_root {
+    if let Some(root) = estate_root {
         env.insert(
             SERGEANT_ESTATE_ROOT_ENV.to_string(),
             root.to_string_lossy().into_owned(),
         );
     }
-    env.insert(SERGEANT_WORK_ID_ENV.to_string(), request.work_id.clone());
+    env.insert(SERGEANT_WORK_ID_ENV.to_string(), work_id.to_string());
     env.insert(
         SERGEANT_EXECUTION_ID_ENV.to_string(),
-        request.execution_id.clone(),
+        execution_id.to_string(),
     );
     env
 }
@@ -415,16 +454,29 @@ pub struct ResumeRequest {
     /// claim, not a claim of absence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<BindingSummary>,
+    /// S2 E6/W1 §6, re-supplied on RESUME for the same reason the model pin,
+    /// the profile, and the bindings are: [`causation_env`] needs it to
+    /// rebuild the `SERGEANT_ESTATE_ROOT`/`SERGEANT_WORK_ID`/
+    /// `SERGEANT_EXECUTION_ID` triple for every turn a restarted adapter
+    /// spawns after reattaching, not only for the reconciliation snapshot
+    /// itself. Before this field existed, an adapter's `resume()` had
+    /// nothing to build that triple from and cached an empty env for the
+    /// rest of the execution's life — silently dropping causation for every
+    /// turn after a daemon restart. Same source as
+    /// [`StartRequest::estate_root`]: the Work's own journaled estate root,
+    /// never re-derived from a worktree path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estate_root: Option<PathBuf>,
 }
 
 impl ResumeRequest {
     /// A resume request carrying only the two things every caller has: the
-    /// work and its surface. Model, profile and instruction policy all
-    /// default to `None` — "not re-supplied" — which adapters must treat as
-    /// absent, never invented; an adapter that needs *some* concrete policy
-    /// to launch under falls back to its own safe default (today,
-    /// `InstructionPolicy::default()` = `Suppress`) only at that point, not
-    /// here.
+    /// work and its surface. Model, profile, instruction policy, and estate
+    /// root all default to `None` — "not re-supplied" — which adapters must
+    /// treat as absent, never invented; an adapter that needs *some*
+    /// concrete policy to launch under falls back to its own safe default
+    /// (today, `InstructionPolicy::default()` = `Suppress`) only at that
+    /// point, not here.
     pub fn new(work_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             work_id: work_id.into(),
@@ -433,6 +485,7 @@ impl ResumeRequest {
             profile: None,
             instruction_policy: None,
             bindings: Vec::new(),
+            estate_root: None,
         }
     }
 }

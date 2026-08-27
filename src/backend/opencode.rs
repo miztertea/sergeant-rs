@@ -2623,9 +2623,13 @@ impl OpencodeBackend {
     /// [`Self::apply_env`], which is deliberately generic over "whatever env
     /// map was resolved" so a probe call and a turn can never read two
     /// different configurations — a probe reaches `apply_env` with the map
-    /// this function never touched. RESUME passes an empty map: a
-    /// `ResumeRequest` carries no execution or estate coordinate to rebuild
-    /// the triple from, and a partial triple would be worse than none.
+    /// this function never touched. RESUME rebuilds the triple via
+    /// [`crate::backend::resume_causation_env`] from
+    /// `ResumeRequest::estate_root` (re-supplied, S2 E6) and the execution id
+    /// on the `handle` every `resume()` already receives — the resolved env
+    /// this produces is what every later turn on the execution reuses, so an
+    /// empty map here silently dropped causation for the rest of the
+    /// execution's life, not only for the reconciliation snapshot.
     fn launch_config(
         &self,
         profile: Option<&Profile>,
@@ -4670,8 +4674,10 @@ impl Backend for OpencodeBackend {
                 return Ok(());
             }
         }
-        let LaunchConfig { executable, env } =
-            self.launch_config(request.profile.as_ref(), &BTreeMap::new())?;
+        let LaunchConfig { executable, env } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::resume_causation_env(request, &handle.execution_id),
+        )?;
         if run_export(
             &executable,
             &request.cwd,

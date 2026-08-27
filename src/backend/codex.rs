@@ -3231,13 +3231,17 @@ impl CodexBackend {
     /// off `self.config` at every LAUNCH call site, so no profile could ever
     /// change it.
     ///
-    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`]),
-    /// merged **after** the profile — the same last-writer-wins discipline
+    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`] at
+    /// START, [`crate::backend::resume_causation_env`] at RESUME), merged
+    /// **after** the profile — the same last-writer-wins discipline
     /// `CODEX_HOME` already gets at the spawn site, and for the same reason:
     /// a workflow-authored `Profile.env` key must not shadow what sergeant
-    /// itself intended to send. RESUME passes an empty map (a `ResumeRequest`
-    /// carries no execution or estate coordinate to rebuild the triple from,
-    /// and a partial triple would be worse than none).
+    /// itself intended to send. RESUME rebuilds the triple from
+    /// `ResumeRequest::estate_root` (re-supplied, S2 E6) and the execution id
+    /// on the `handle` every `resume()` already receives — the env this
+    /// produces is what every later turn on the execution reuses, so an
+    /// empty map here was a permanent loss of causation past the restart,
+    /// not just a gap in the reconciliation snapshot.
     fn launch_config(
         &self,
         profile: Option<&Profile>,
@@ -4677,7 +4681,10 @@ impl Backend for CodexBackend {
             env,
             codex_home,
             network_access,
-        } = self.launch_config(request.profile.as_ref(), &BTreeMap::new())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::resume_causation_env(request, &handle.execution_id),
+        )?;
         // #259: NOT resolved here. A re-adopted execution's `turns` starts
         // at 1, so the `execution.turns == 0` gate that reads this field for
         // argv construction never fires for it — the grant is provably dead

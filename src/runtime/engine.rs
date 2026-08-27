@@ -2425,7 +2425,7 @@ impl Engine {
                 execution,
                 backend,
                 input: input.to_string(),
-                resume: self.resume_request(&run, work_id),
+                resume: self.resume_request(core, &run, work_id),
             })),
             deferred: Deferred::new(),
         })
@@ -3160,7 +3160,7 @@ impl Engine {
                 execution,
                 backend,
                 input: prompt,
-                resume: self.resume_request(run, work_id),
+                resume: self.resume_request(core, run, work_id),
             }))));
         }
         // E4: the park names the CONTAINER when a container's contract is the
@@ -3276,7 +3276,7 @@ impl Engine {
                     "backend {:?} is not registered in this daemon",
                     execution.backend
                 )),
-                Some(backend) => match self.reattach(backend, &run, work_id, &execution) {
+                Some(backend) => match self.reattach(core, backend, &run, work_id, &execution) {
                     Err(detail) => ambiguous(detail),
                     Ok(did) => {
                         reattached = did;
@@ -3537,6 +3537,7 @@ impl Engine {
     /// journals `surface.materialized` before the first stage is entered.
     fn reattach(
         &self,
+        core: &Core,
         backend: &Arc<dyn Backend>,
         run: &WorkRun,
         work_id: &str,
@@ -3545,7 +3546,7 @@ impl Engine {
         if !backend.capabilities().resume {
             return Ok(false);
         }
-        let Some(request) = self.resume_request(run, work_id) else {
+        let Some(request) = self.resume_request(core, run, work_id) else {
             return Ok(false);
         };
         backend
@@ -3565,7 +3566,14 @@ impl Engine {
     /// and, since N3, the *stage's* decisions (§12.5). Re-adopting a stage 10
     /// execution under stage 00's profile would be the same fabrication, one
     /// field further in.
-    fn resume_request(&self, run: &WorkRun, work_id: &str) -> Option<ResumeRequest> {
+    ///
+    /// `estate_root` is read the same way `Engine::execute` reads it before
+    /// building a `StartRequest` — `Self::work_estate_root(core, work_id)`,
+    /// the Work's own journaled coordinate — so a resumed execution's
+    /// `causation_env` is built from the same root every turn before the
+    /// restart carried, not silently dropped (S2 E6, causation-after-resume
+    /// fix).
+    fn resume_request(&self, core: &Core, run: &WorkRun, work_id: &str) -> Option<ResumeRequest> {
         let surface = run.surface.as_ref()?;
         let stage_profile = run.current_stage_profile();
         Some(ResumeRequest {
@@ -3579,6 +3587,7 @@ impl Engine {
             // lost whatever it derived from it, and the Work's mutation
             // surface is not something it may re-invent from a bare cwd.
             bindings: surface.binding_summary(),
+            estate_root: Self::work_estate_root(core, work_id),
         })
     }
 

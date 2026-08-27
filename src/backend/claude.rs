@@ -1144,16 +1144,20 @@ impl ClaudeBackend {
     /// caller), so the launch boundary itself must still refuse an
     /// unrecognized mode rather than pass the raw string to the CLI.
     ///
-    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`]),
-    /// merged **after** the profile so a workflow-authored `Profile.env` key
-    /// cannot shadow what sergeant itself intended to send. That is hygiene,
-    /// not security — W1 §6 makes the daemon's journal the only authority on
+    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`] at
+    /// START, [`crate::backend::resume_causation_env`] at RESUME), merged
+    /// **after** the profile so a workflow-authored `Profile.env` key cannot
+    /// shadow what sergeant itself intended to send. That is hygiene, not
+    /// security — W1 §6 makes the daemon's journal the only authority on
     /// lineage — and it mirrors `CODEX_HOME`'s own deliberate
-    /// last-writer-wins precedent in the codex adapter. RESUME passes an
-    /// empty map: a re-adopted execution's causation triple was pinned into
-    /// the process START launched, and `ResumeRequest` carries no execution
-    /// or estate coordinate to rebuild it from, so nothing is injected rather
-    /// than a partial or invented triple.
+    /// last-writer-wins precedent in the codex adapter. RESUME rebuilds the
+    /// triple rather than passing an empty map: `ResumeRequest::estate_root`
+    /// re-supplies the estate coordinate (S2 E6) and the execution id comes
+    /// from the `handle` every `resume()` already receives, so nothing here
+    /// is invented — and, critically, the cached env this produces is what
+    /// every later turn on this execution reuses, not only the
+    /// reconciliation snapshot, so a dropped triple here was a permanent
+    /// loss of causation for the execution's remaining life.
     fn launch_config(
         &self,
         profile: Option<&Profile>,
@@ -2064,7 +2068,10 @@ impl Backend for ClaudeBackend {
             executable,
             env,
             permission_args,
-        } = self.launch_config(request.profile.as_ref(), &BTreeMap::new())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::resume_causation_env(request, &handle.execution_id),
+        )?;
         let mut state = self.lock();
         if let Some(existing) = state.executions.get(&handle.execution_id) {
             // Another thread adopted it while this one gathered evidence.

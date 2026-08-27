@@ -2870,6 +2870,7 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
                 }),
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect("re-adopt");
@@ -2920,6 +2921,85 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
             .all(|e| e.work_id.as_deref() == Some("01M4READOPT")),
         "post-restart events carry the work they serve: {events:?}"
     );
+}
+
+/// S2 E6 fix regression: the causation triple must not be a one-shot
+/// reconciliation courtesy. Before this fix, `resume()` passed an empty map
+/// to `launch_config`, which pins the *cached* env for the rest of the
+/// execution's life (§14: launch config is resolved once and replayed) — so
+/// the triple was silently dropped not only for the turn that reattaches,
+/// but for every turn after it, defeating causation for any conversation
+/// that outlives a daemon restart.
+///
+/// Two turns are sent after `resume()` re-adopts the execution, and both
+/// must still carry all three `SERGEANT_*` values — proving the fix threads
+/// `ResumeRequest::estate_root` and the handle's `execution_id` into the
+/// cached env, not only into a value read once and discarded.
+#[test]
+fn resume_re_supplies_the_causation_triple_for_every_turn_after_restart() {
+    let data = TempDir::new().expect("tempdir");
+    let home = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let session_id = "5a4b3c2d-1e0f-4a1b-8c2d-3e4f5a6b7c8e";
+    let project = home.path().join("projects").join("-work-surface");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").expect("transcript");
+
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn());
+    let mut config = ClaudeConfig::new(data.path());
+    config.claude_home = Some(home.path().to_path_buf());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let handle = ExecutionHandle {
+        execution_id: "e-causation-resumed".to_string(),
+        native_id: Some(session_id.to_string()),
+    };
+    backend
+        .resume(
+            &handle,
+            &ResumeRequest {
+                work_id: "01PARENTWORK".to_string(),
+                cwd: cwd.path().to_path_buf(),
+                model: None,
+                profile: None,
+                instruction_policy: Some(InstructionPolicy::default()),
+                bindings: Vec::new(),
+                // S2 E6: re-supplied from the journal exactly as
+                // `Engine::resume_request` does — this is the coordinate the
+                // fix threads through to `resume_causation_env`.
+                estate_root: Some(PathBuf::from("/home/dev/estate")),
+            },
+        )
+        .expect("re-adopt");
+
+    backend
+        .send(&handle, "first turn after restart")
+        .expect("send");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+    backend
+        .send(&handle, "second turn after restart")
+        .expect("send");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(2);
+    for (turn, launch) in launches.iter().enumerate() {
+        assert_eq!(
+            launch.env["SERGEANT_ESTATE_ROOT"], "/home/dev/estate",
+            "turn {turn} after resume: the estate coordinate must survive, \
+             not just the reconciliation snapshot"
+        );
+        assert_eq!(
+            launch.env["SERGEANT_WORK_ID"], "01PARENTWORK",
+            "turn {turn} after resume: the parent Work"
+        );
+        assert_eq!(
+            launch.env["SERGEANT_EXECUTION_ID"], "e-causation-resumed",
+            "turn {turn} after resume: the parent execution — from the \
+             handle, since ResumeRequest carries no execution id of its own"
+        );
+    }
 }
 
 // -------------------------------- §20 raw archive and §27 normalization
@@ -3471,6 +3551,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect_err("a provider-qualified pin is refused pre-flight at RESUME too");
@@ -3492,6 +3573,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect("re-adopt");
@@ -3753,6 +3835,7 @@ fn a4_restart_reattaches_a_surviving_session_and_blocks_with_resumable_evidence(
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect("re-adopt is idempotent");
@@ -5568,6 +5651,7 @@ fn a1_real_claude_session_identity_survives_turns_and_restart() {
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect("re-adopt from session evidence");
