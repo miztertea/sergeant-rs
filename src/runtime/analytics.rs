@@ -129,6 +129,9 @@ CREATE TABLE work (
     intent        VARCHAR,
     estate        VARCHAR,
     estate_root   VARCHAR,
+    parent_work_id      VARCHAR,
+    parent_execution_id VARCHAR,
+    causation_unverified VARCHAR,
     workflow      VARCHAR,
     backend       VARCHAR,
     route_source  VARCHAR,
@@ -473,6 +476,18 @@ struct WorkRow {
     /// `None` for a pre-Phase-C-shaped legacy line, whose envelope never
     /// carried the field at all — an honest "not recorded", not an error.
     estate_root: Option<String>,
+    /// W1-09 (S2 E8 as amended): the **validated** parent Work/execution,
+    /// folded from `work.submitted`'s own payload — W1's explicit
+    /// instruction to extend the existing envelope for durable query rather
+    /// than build a second agent-tree store. `None` for an ordinary
+    /// top-level submission and for every Work journaled before S2.
+    parent_work_id: Option<String>,
+    parent_execution_id: Option<String>,
+    /// The `causation_unverified` marker's `reason`, when a claim failed
+    /// validation — queryable beside the relation it is the absence of, so
+    /// "which submissions claimed a parent that did not check out" is one
+    /// question of one table rather than a journal scan.
+    causation_unverified: Option<String>,
     workflow: Option<String>,
     backend: Option<String>,
     route_source: Option<String>,
@@ -585,6 +600,9 @@ impl WorkRow {
             text(self.intent.as_deref()),
             text(self.estate.as_deref()),
             text(self.estate_root.as_deref()),
+            text(self.parent_work_id.as_deref()),
+            text(self.parent_execution_id.as_deref()),
+            text(self.causation_unverified.as_deref()),
             text(self.workflow.as_deref()),
             text(self.backend.as_deref()),
             text(self.route_source.as_deref()),
@@ -1000,6 +1018,13 @@ impl Analytics {
                             // from `work.submitted` onward, `None` for a
                             // legacy line whose envelope never carried it.
                             estate_root: event.workspace_id.clone(),
+                            // W1-09: the validated relation and the
+                            // unverified marker both come out of the one
+                            // compound `work.submitted` payload (L6), so
+                            // this fold cannot see one without the other.
+                            parent_work_id: string(&work["parent_work_id"]),
+                            parent_execution_id: string(&work["parent_execution_id"]),
+                            causation_unverified: string(&work["causation_unverified"]["reason"]),
                             workflow: string(&work["workflow"]),
                             backend: string(&work["backend"]),
                             route_source: None,

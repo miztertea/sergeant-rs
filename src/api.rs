@@ -44,10 +44,10 @@ use crate::domain::execution::{
 };
 use crate::domain::manifest::{self, ManifestError};
 use crate::domain::work::{
-    EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED,
-    KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT,
-    KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, ScopeRequest,
-    Work, WorkState,
+    CausationClaim, EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED,
+    KIND_WORK_BLOCKED, KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED,
+    KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED,
+    KIND_WORK_WAITING, ScopeRequest, Work, WorkState,
 };
 use crate::domain::workflow::{
     self, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
@@ -1590,6 +1590,25 @@ struct SubmitRequest {
     /// this `true`.
     #[serde(default)]
     override_git_preflight: bool,
+    /// W1 §6 (S2 E8 as amended): the parent Work this submission **claims**
+    /// to have come from, as `sgt run` read it out of `SERGEANT_WORK_ID`.
+    ///
+    /// Named `claimed_` on the wire on purpose. W1 §6: "environment
+    /// variables are a transport hint, not trusted lineage." Nothing about
+    /// this field is believed — [`validate_claimed_causation`] checks it
+    /// against this daemon's own journal before any relation is recorded on
+    /// the Work, and a claim that fails is journaled as a
+    /// `causation_unverified` marker while the submission proceeds
+    /// causation-less. `#[serde(default)]`: a client that claims nothing is
+    /// the ordinary top-level submission, not an error.
+    #[serde(default)]
+    claimed_parent_work_id: Option<String>,
+    /// The parent *execution* claimed, from `SERGEANT_EXECUTION_ID`. Same
+    /// "claimed, never believed" contract as the field above; an execution
+    /// claim without a Work claim cannot be validated against anything and
+    /// is recorded as unverified.
+    #[serde(default)]
+    claimed_parent_execution_id: Option<String>,
 }
 
 /// R-MVP1-7's envelope override, sanity-checked at submit: a turn cap of 0
@@ -1614,6 +1633,95 @@ fn envelope_out_of_range(req: &SubmitRequest) -> Option<String> {
         );
     }
     None
+}
+
+/// The validated parent coordinates for a submission, or the marker saying
+/// why the claim was not recorded (S2 E8 **as amended**, W1 §6/W1-08).
+///
+/// `Ok(None)` — nothing was claimed, the ordinary top-level submission.
+/// `Ok(Some(..))` — the claim checks out against this daemon's own journal.
+/// `Err(reason)` — it does not, and the reason is the marker's text.
+///
+/// **This never refuses a submission**, and the return type is shaped to make
+/// that hard to get wrong: `Err` here is the *marker's* content, not an
+/// error path, and the one caller journals it beside an accepted Work. The
+/// ratification's own clause is that W1 §5's substance is preserved "by
+/// ordinary admission, explicit addressing, and journal-validated causation
+/// **rather than by refusal**"; the sprint plan's E8 amendment names the
+/// concrete reason a refusal would be wrong rather than merely strict — no
+/// adapter `env_clear`s, so a long-lived actor session can genuinely outlive
+/// the execution whose `SERGEANT_*` coordinates it inherited, and refusing
+/// that submission would turn a stale environment into a broken command.
+///
+/// Three checks, in order, each answerable from the journal alone:
+///
+/// 1. the claimed Work exists in this daemon's journal (`work_index` is
+///    never evicted, so a miss is conclusive without a replay);
+/// 2. it belongs to the **addressed** estate — W1 §8: "a child Work belongs
+///    to exactly one explicitly addressed estate", and a parent in some
+///    other estate is precisely the cross-estate relation W1 does not add;
+/// 3. the claimed execution, when one is claimed, is that Work's own — its
+///    current execution or the one it has reserved. An execution claimed
+///    without a Work has nothing to be checked against and is unverifiable
+///    by construction.
+///
+/// Check 3 is deliberately "current or reserved" rather than "any execution
+/// this Work ever had": a `WorkRun` retains the execution it last started,
+/// which is exactly the execution whose environment a child submission can
+/// have been launched with, because the claim is validated synchronously
+/// while that execution is the one running. A claim naming an execution the
+/// parent has since moved past is stale — and stale is the case this
+/// amendment exists to handle gracefully, not to punish.
+fn validate_claimed_causation(
+    core: &Core,
+    addressed: Option<&std::path::Path>,
+    req: &SubmitRequest,
+) -> Result<Option<(String, Option<String>)>, String> {
+    let claimed_work = req.claimed_parent_work_id.as_deref();
+    let claimed_execution = req.claimed_parent_execution_id.as_deref();
+    let Some(parent_work_id) = claimed_work else {
+        return match claimed_execution {
+            None => Ok(None),
+            Some(execution) => Err(format!(
+                "claimed parent execution {execution:?} names no parent Work, so there is \
+                 nothing to validate it against"
+            )),
+        };
+    };
+    let registry = core.registry.state();
+    let Some(row) = registry.work_index.get(parent_work_id) else {
+        return Err(format!(
+            "claimed parent Work {parent_work_id:?} is not in this daemon's journal"
+        ));
+    };
+    let addressed = addressed.map(|root| root.to_string_lossy().into_owned());
+    if row.estate_root != addressed {
+        return Err(format!(
+            "claimed parent Work {parent_work_id:?} belongs to estate {:?}, not the addressed \
+             {:?}; W1 adds no cross-estate causation",
+            row.estate_root.as_deref().unwrap_or("(none recorded)"),
+            addressed.as_deref().unwrap_or("(none addressed)"),
+        ));
+    }
+    let Some(execution_id) = claimed_execution else {
+        // A Work claim alone validates; the relation is recorded one
+        // coordinate coarser rather than rejected for what it did not say.
+        return Ok(Some((parent_work_id.to_string(), None)));
+    };
+    let run = registry.run_view(parent_work_id);
+    let current = run.and_then(|run| run.execution.as_ref().map(|e| e.execution_id.as_str()));
+    let reserved = run.and_then(|run| run.reservation.as_ref().map(|r| r.execution_id.as_str()));
+    if current != Some(execution_id) && reserved != Some(execution_id) {
+        return Err(format!(
+            "claimed parent execution {execution_id:?} is not {parent_work_id:?}'s current \
+             execution ({}); the claim is stale or forged",
+            current.unwrap_or("none"),
+        ));
+    }
+    Ok(Some((
+        parent_work_id.to_string(),
+        Some(execution_id.to_string()),
+    )))
 }
 
 /// R-MVP1-6's submit-time agreement check: a structured elaboration that
@@ -1919,6 +2027,25 @@ async fn submit_work(
         }
     };
 
+    // S2 E8 as amended (W1 §6/W1-08): the claimed lineage is checked against
+    // this daemon's own journal here, under the guard, against the estate
+    // this submission actually addressed. Never a refusal — a failed claim
+    // becomes a marker on the accepted Work, one field over.
+    let (parent_work_id, parent_execution_id, causation_unverified) =
+        match validate_claimed_causation(&core, addressed.as_deref(), &req) {
+            Ok(None) => (None, None, None),
+            Ok(Some((work, execution))) => (Some(work), execution, None),
+            Err(reason) => (
+                None,
+                None,
+                Some(CausationClaim {
+                    parent_work_id: req.claimed_parent_work_id.clone(),
+                    parent_execution_id: req.claimed_parent_execution_id.clone(),
+                    reason,
+                }),
+            ),
+        };
+
     // §7.3: journaled twice — `scope_request` is exactly what was submitted;
     // `repositories` is what `plan` (when there was a estate to resolve
     // against at all) actually resolved it to. When there was no estate
@@ -1957,6 +2084,14 @@ async fn submit_work(
         envelope: req.envelope.filter(|e| !e.is_empty()),
         // §8.3: the authorization the operator gave for this one submission.
         git_preflight_override: req.override_git_preflight,
+        // W1-09 / L6: the validated relation and the unverified marker both
+        // ride inside the *one* `work.submitted` payload below, rather than a
+        // second event. A crash between the two would otherwise leave either
+        // a Work whose lineage is unexplained or a marker for a Work that
+        // does not exist; one compound append has no such window.
+        parent_work_id,
+        parent_execution_id,
+        causation_unverified,
         state: WorkState::Pending,
         created_by: req.created_by.unwrap_or_else(|| "api".to_string()),
         created_at: rfc3339_utc_now(),
@@ -2477,7 +2612,11 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
 /// the slim row), and the two timestamps. No `stage`/`resolved_backend`/
 /// `envelope`/`output` — those need the run, which a Work this old no
 /// longer has cached, and re-deriving it here would be the very per-row
-/// journal replay this cache exists to avoid. `"evicted": true` names the
+/// journal replay this cache exists to avoid. No causation either (S2 E8):
+/// `parent_work_id`/`causation_unverified` live on the full [`Work`], and the
+/// slim row keeps neither — a Work this old reads as causation-less to the
+/// TUI's grouping, which is the same bounded-cost tradeoff every other
+/// narrowed field here already is. `"evicted": true` names the
 /// narrowing explicitly rather than leaving a client to infer it from
 /// absent keys.
 ///

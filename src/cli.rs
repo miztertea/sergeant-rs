@@ -1090,6 +1090,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     ));
                 }
             };
+            let claimed = claimed_causation();
             let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let envelope = if turns.is_some() || ceiling_secs.is_some() {
                 Some(json!({"turn_cap": turns, "ceiling_secs": ceiling_secs}))
@@ -1118,6 +1119,15 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 "override_git_preflight": override_git_preflight,
                 "created_by": "cli",
                 "origin": origin(),
+                // W1 §5/§6 (S2 E8 as amended): when this invocation is itself
+                // running inside a managed execution, `claimed_causation()`
+                // carries the `SERGEANT_*` coordinates it inherited. Claimed,
+                // never asserted — the daemon validates them against its own
+                // journal and drops the relation (with a journaled marker) if
+                // they do not check out. Absent outside a managed execution,
+                // which is the ordinary top-level `sgt run`.
+                "claimed_parent_work_id": claimed.0,
+                "claimed_parent_execution_id": claimed.1,
             });
             let result = client.post("/v1/work", &body).await?;
             if sgt.json {
@@ -2332,6 +2342,37 @@ fn origin() -> Value {
         "client": client,
         "cwd": std::env::current_dir().ok(),
     })
+}
+
+/// W1 §6 (S2 E5/E8): the parent Work/execution this invocation **claims**,
+/// read out of the `SERGEANT_*` environment a managed execution was launched
+/// with ([`crate::backend::causation_env`] is what puts them there).
+///
+/// Read exactly the way [`origin`] above reads `SGT_ORIGIN_CLIENT` — the
+/// client owns its own environment, the daemon has none — and with exactly as
+/// much authority: none. W1 §6 calls these "a transport hint, not trusted
+/// lineage"; the daemon checks both against its own journal before recording
+/// any relation, and journals a `causation_unverified` marker (never a
+/// refusal) when they do not check out. An empty value is treated as absent,
+/// so an exported-but-blank variable claims nothing rather than claiming
+/// `""`.
+///
+/// **`SERGEANT_ESTATE_ROOT` is deliberately not read here.** The estate is
+/// resolved by ordinary `-C`/cwd admission before this function is ever
+/// reached (§4.3), and reading a *claimed* root would be exactly the implicit
+/// estate discovery from a Work surface that W1 §12 lists as a non-goal. The
+/// actor passes it as `-C`, where it is admitted like any other addressed
+/// root, or the command refuses.
+fn claimed_causation() -> (Option<String>, Option<String>) {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    (
+        read(crate::backend::SERGEANT_WORK_ID_ENV),
+        read(crate::backend::SERGEANT_EXECUTION_ID_ENV),
+    )
 }
 
 /// ASCII-art wordmark for the bare-`sgt` homepage (ADR 0010, D6).
