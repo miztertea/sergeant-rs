@@ -26,6 +26,7 @@ Sergeant turns accepted intent into durable, staged Work across one repository o
 - [Host runtime and estates](concepts/host-runtime.md)
 - [Hierarchical execution](concepts/hierarchical-execution.md)
 - [Work, workflows, and durability](concepts/work-and-workflows.md)
+- [Atlas and knowledge sources](concepts/atlas-and-knowledge.md)
 - [Security and trust](concepts/security-and-trust.md)
 
 ## Exact contracts
