@@ -314,6 +314,94 @@ fn fix_confirmed_context_states_the_commit_imperative() {
     );
 }
 
+/// W1's engine-level nesting (host-atlas r3 ratification ruling 2, J3)
+/// makes icm-policy.md §4 rule 1's "true nested workflows do not exist
+/// yet" clause stale: the rule's actual point — a `@@name` reference is
+/// context composition, never workflow composition, and must not be read
+/// as "run this as a sub-workflow" — still holds and must not be
+/// softened, but the dead-end "engine-gap claim" pointer is replaced with
+/// the two real primitives W1 ships (a stage directory carrying its own
+/// `workflow.toml` for engine-level recursion; child Work for a
+/// separately-durable need). This is a net-new pin — no test covered this
+/// text before S2 (confirmed by grep for "icm-policy" and "nested
+/// workflows do not exist" over `tests/`, both empty).
+///
+/// Written first against the pre-amendment text (the stale "do not exist
+/// yet; ... engine-gap claim" clause) to confirm it fails on that exact
+/// wording, then against the amended text to confirm it passes.
+#[test]
+fn icm_policy_rule_one_points_to_the_real_nesting_primitives() {
+    let icm_policy =
+        std::fs::read_to_string(repo_root().join(".sergeant/common/contexts/icm-policy.md"))
+            .expect("read icm-policy.md");
+    let icm_policy_flat = icm_policy.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The core prohibition — unsoftened — still stands.
+    assert!(
+        icm_policy_flat.contains(
+            "A `@@name` reference used to imply \"and then run that other procedure as a \
+             sub-workflow\" is a violation of scope"
+        ),
+        "icm-policy.md §4 rule 1 must still forbid reading `@@name` as workflow composition — \
+         W1 replaces only the stale 'do not exist yet' clause, not this prohibition"
+    );
+
+    // The amended clause names both real primitives.
+    assert!(
+        icm_policy_flat.contains("its own `workflow.toml`"),
+        "icm-policy.md §4 rule 1 must point an author who wants real nested execution at a \
+         stage directory carrying its own `workflow.toml`"
+    );
+    assert!(
+        icm_policy_flat.contains("child Work"),
+        "icm-policy.md §4 rule 1 must name child Work as the separately-durable alternative to \
+         a `@@name` reference"
+    );
+
+    // Regression guard: the stale claim is gone, not merely amended-around.
+    assert!(
+        !icm_policy_flat.contains("do not exist yet")
+            && !icm_policy_flat.contains("engine-gap claim"),
+        "icm-policy.md §4 rule 1 must not still carry the stale 'true nested workflows do not \
+         exist yet' / 'engine-gap claim' text now that W1 ships the real primitives"
+    );
+}
+
+/// Aria-seat review (S2, adjudicated by the captain, J3): icm-policy.md §4
+/// rule 1's child-Work pointer must not restand the preconditions
+/// AGENTS.md's ESTATE section already states — that reads as a second,
+/// standalone-looking sanction rather than a pointer to the one place the
+/// conditions actually live. It must instead point there by reference,
+/// and both primitives (workflow.toml recursion and child Work) must
+/// carry the ratification citation, since the same ruling ratified both.
+#[test]
+fn icm_policy_rule_one_points_to_agents_md_rather_than_restating_preconditions() {
+    let icm_policy =
+        std::fs::read_to_string(repo_root().join(".sergeant/common/contexts/icm-policy.md"))
+            .expect("read icm-policy.md");
+    let icm_policy_flat = icm_policy.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    assert!(
+        icm_policy_flat.contains("under the conditions AGENTS.md's ESTATE section states"),
+        "icm-policy.md §4 rule 1's child-Work pointer must reference AGENTS.md's ESTATE \
+         section's conditions rather than restating them"
+    );
+    assert!(
+        icm_policy_flat.contains("host-atlas r3 ratification, ruling 2")
+            && icm_policy_flat.contains("the same ruling ratified both primitives"),
+        "icm-policy.md §4 rule 1 must cite the ratification and say it ratified both \
+         primitives (workflow.toml recursion and child Work)"
+    );
+
+    // Regression guard: the standalone-looking restatement of child-Work's
+    // own preconditions is gone, not merely supplemented.
+    assert!(
+        !icm_policy_flat.contains("its own identity, journal-validated against the parent"),
+        "icm-policy.md §4 rule 1 must not still restate child Work's preconditions inline \
+         now that it points to AGENTS.md's ESTATE section for them"
+    );
+}
+
 // -------------------------------------------------- 2. embedded distro skew
 
 /// No `CONTEXT.md` under the embedded `.sergeant/workflows/` distro source
@@ -614,6 +702,142 @@ fn agents_md_states_the_ratified_mutation_surface_contract() {
             && !agents_md_flat.contains("enforced mutation surface")
             && !agents_md_flat.contains("mutation surface is enforced"),
         "AGENTS.md must state the mutation surface as declared and observed, never enforced"
+    );
+}
+
+/// W1's worker-supersession ratification (host-atlas-r3-ratification
+/// ruling 2, J3): the ESTATE section's fifth worker bullet is superseded
+/// "for this one sanctioned path only" — every other item in that list
+/// stands untouched. This pins the amended sentence naming the sanctioned
+/// `-C "$SERGEANT_ESTATE_ROOT" run` path AND, as a regression guard, that
+/// the other four bullets are still present verbatim — an edit that
+/// widens the amendment into removing one of those four would pass a pin
+/// on the new sentence alone but must not pass this one.
+///
+/// Written first against the pre-W1 text (the blanket "invoke an
+/// estate-scoped `sgt` command from its own surface" prohibition, no
+/// exception) to confirm it goes red on exactly that wording, then
+/// against the amended text to confirm green — the red-then-green
+/// discipline the wave brief requires or this pin is decorative rather
+/// than load-bearing.
+#[test]
+fn agents_md_estate_bullets_state_the_sanctioned_child_work_path() {
+    let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
+    let agents_md_flat = agents_md.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The other four bullets (295-298 at the integration ref) stand
+    // verbatim — the ratification is explicit only the fifth is narrowed.
+    for bullet in [
+        "edit a `repos/` mount;",
+        "create a replacement branch;",
+        "navigate into another Work's surface;",
+        "expand its own repository scope;",
+    ] {
+        assert!(
+            agents_md_flat.contains(bullet),
+            "AGENTS.md's ESTATE worker bullets must keep this untouched bullet verbatim: {bullet}"
+        );
+    }
+
+    // The amended fifth bullet names the one sanctioned path and the
+    // journal-validation the ratification requires before it narrows the
+    // prohibition.
+    assert!(
+        agents_md_flat.contains("sgt -C \"$SERGEANT_ESTATE_ROOT\" run"),
+        "AGENTS.md's amended worker bullet must name the sanctioned `-C \
+         \"$SERGEANT_ESTATE_ROOT\" run` path — the ratified exception, not a blanket refusal"
+    );
+    assert!(
+        agents_md_flat.contains("validates") && agents_md_flat.contains("journal"),
+        "AGENTS.md's amended worker bullet must state that the daemon validates the claimed \
+         causation against its own journal before recording the relation"
+    );
+
+    // The narrowing framing itself: a worker still must not silently
+    // become a nested Captain — preserved by admission/addressing/
+    // validated-causation now, not by a blanket refusal (ratification
+    // ruling 2's own words).
+    assert!(
+        agents_md_flat.contains("nested Captain"),
+        "AGENTS.md's amendment must restate the 'not a nested Captain' preservation clause so \
+         the change reads as a narrowing, not a removal of the worker-surface prohibition"
+    );
+
+    // Regression guard: the pre-W1 blanket prohibition text must be gone,
+    // not merely amended-around — a copy-paste-drifted edit that left the
+    // old unconditional sentence sitting beside the new exception would
+    // otherwise pass every assertion above.
+    assert!(
+        !agents_md_flat.contains(
+            "invoke an estate-scoped `sgt` command from its own surface — no `sergeant.toml` \
+             lives there, and Session start's refusal applies even from inside it."
+        ),
+        "AGENTS.md must not still carry the old unconditional worker-surface prohibition \
+         alongside the new sanctioned-path exception"
+    );
+}
+
+/// Aria-seat review (S2, adjudicated by the captain against host-atlas r3
+/// ratification ruling 2, the amended-E8 validation ruling, and the
+/// single-user trust ruling — J3) found the amended fifth bullet above
+/// left three things ambiguous: whether "possession of the triple" itself
+/// was the sanction (rather than the engine's act of injecting it), what
+/// the ellipsis after `sgt -C "$SERGEANT_ESTATE_ROOT" run` stood for, and
+/// whether "rather than by refusal" repealed Session start's root gate.
+/// This pins the resolving language.
+#[test]
+fn agents_md_estate_bullet_resolves_possession_vs_injection_and_the_root_gate() {
+    let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
+    let agents_md_flat = agents_md.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // (a) the sanction covers a managed execution acting on the
+    // engine-injected identity; a self-fabricated triple is not
+    // sanctioned and lands as journaled, adjudicable evidence.
+    assert!(
+        agents_md_flat.contains("the causation triple the ENGINE itself injected"),
+        "AGENTS.md must state the sanctioned triple is the one the ENGINE injected, not \
+         merely possessed by the worker"
+    );
+    assert!(
+        agents_md_flat.contains("a self-fabricated triple is not sanctioned"),
+        "AGENTS.md must state that a self-fabricated triple is not sanctioned"
+    );
+    assert!(
+        agents_md_flat.contains("causation_unverified")
+            && agents_md_flat.contains("reported and adjudicable, never silently honored"),
+        "AGENTS.md must state a self-fabricated claim lands as journaled \
+         `causation_unverified` evidence, reported and adjudicable, never silently honored"
+    );
+
+    // (b) the purpose clause is restated explicitly, not left as an
+    // ellipsis after the run command.
+    assert!(
+        agents_md_flat.contains("sgt -C \"$SERGEANT_ESTATE_ROOT\" run` to create child Work"),
+        "AGENTS.md must restate the purpose clause 'to create child Work' explicitly rather \
+         than eliding it after the run command"
+    );
+
+    // (c) the refusal statement is unambiguous: Session start's root gate
+    // still applies to bare invocation, the sanctioned path proceeds only
+    // via explicit `-C` addressing, and "rather than by refusal" is a
+    // statement about the daemon's treatment of the sanctioned path's
+    // claims, not a repeal of the root gate.
+    assert!(
+        agents_md_flat.contains(
+            "Session start's exact-root refusal still applies to any bare invocation from a \
+             surface"
+        ),
+        "AGENTS.md must state Session start's exact-root refusal still applies to any bare \
+         invocation from a surface"
+    );
+    assert!(
+        agents_md_flat.contains("proceeds only via explicit `-C`"),
+        "AGENTS.md must state the sanctioned path proceeds only via explicit `-C` addressing"
+    );
+    assert!(
+        agents_md_flat.contains("not a repeal of Session start's root gate"),
+        "AGENTS.md must state 'rather than by refusal' describes the daemon's treatment of \
+         the sanctioned path's claims, not a repeal of Session start's root gate"
     );
 }
 

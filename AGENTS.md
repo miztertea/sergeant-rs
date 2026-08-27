@@ -296,9 +296,27 @@ does not:
 - create a replacement branch;
 - navigate into another Work's surface;
 - expand its own repository scope;
-- invoke an estate-scoped `sgt` command from its own surface — no
-  `sergeant.toml` lives there, and Session start's refusal applies even
-  from inside it.
+- invoke an estate-scoped `sgt` command from its own surface — Session
+  start's exact-root refusal still applies to any bare invocation from a
+  surface: no `sergeant.toml` lives there, and that refusal is not
+  repealed. **The one sanctioned path** proceeds only via explicit `-C`
+  addressing, never by ambient discovery: a managed execution carrying
+  the causation triple the ENGINE itself injected
+  (`SERGEANT_ESTATE_ROOT`/`SERGEANT_WORK_ID`/`SERGEANT_EXECUTION_ID`) may
+  run `sgt -C "$SERGEANT_ESTATE_ROOT" run` to create child Work, and the
+  daemon validates the claimed parent Work/execution against its own
+  journal before the relation is recorded — a failed claim never refuses
+  the child Work itself, only the relation. The sanction covers a
+  managed execution acting on the identity the engine injected, never a
+  self-fabricated one: a self-fabricated triple is not sanctioned, and
+  its claim lands as journaled `causation_unverified` evidence — reported
+  and adjudicable, never silently honored. This narrows the prohibition;
+  it does not remove it: a worker must still never silently become a
+  nested Captain, which is now preserved by ordinary admission, explicit
+  `-C` addressing, and journal-validated causation rather than by refusal
+  (host-atlas r3 ratification, ruling 2) — that phrase describes how the
+  daemon treats the sanctioned path's claims, not a repeal of Session
+  start's root gate.
 
 A violation is reported dirty (the integrity disposition riding beside
 `sgt work show`'s terminal state), never silently treated as ordinary
