@@ -51,12 +51,40 @@
 //!
 //! # Scope of what exists here today
 //!
-//! The four namespaces, and the four tables three walks now write:
-//! `source.generations`, `source.files`, `source.units` and `meta.coverage`.
-//! Local knowledge, an estate repository at an admission-pinned commit, and a
-//! Work surface overlaid on its base all land in the same four tables, because
-//! they produce the same kind of fact — a resource, its content identity, its
-//! extractor, and its units — and the source kind is a column, not a schema.
+//! The four namespaces, and the seven tables three walks now write:
+//! `source.generations`, `source.files`, `source.units`, `source.symbols`,
+//! `source.occurrences`, `source.edges` and `meta.coverage`. Local knowledge,
+//! an estate repository at an admission-pinned commit, and a Work surface
+//! overlaid on its base all land in the same tables, because they produce the
+//! same kind of fact — a resource, its content identity, its extractors, and
+//! what those extractors derived — and the source kind is a column, not a
+//! schema.
+//!
+//! # Two extractions of one resource, never one ambiguous extraction (X3b)
+//!
+//! A path may be claimed by two routing tables at once: [`text`]'s
+//! structure-unit extractor and [`syntax`]'s grammar. A Markdown file is
+//! claimed by both. That is not a conflict, because F7 keys a derived row on
+//! content identity **plus extractor identity** — so one blob read two ways is
+//! two extractions with two keys, and `source.units` and
+//! `source.occurrences`/`source.edges` are keyed independently. A structure
+//! unit's key is unchanged by a grammar bump, so its extraction stays reusable
+//! across the re-derivation, which is the whole point of the second key input.
+//!
+//! **The second key input decides staleness too, not only addressing.** A
+//! generation's own `content_key` is content-only by construction, so it cannot
+//! notice a parser that changed under unchanged bytes; on its own it would let
+//! a re-scan answer "unchanged" after a grammar upgrade and serve the previous
+//! parser's rows indefinitely. So [`db::AtlasDb::stage_scan`] compares the
+//! standing generation's stored extractor identities against the ones the scan
+//! actually ran, and treats a mismatch as a change: a new generation is staged,
+//! and ruling §4's eviction takes the old one with its rows — leaving an
+//! eviction row that says the extractors changed rather than claiming the
+//! source bytes did.
+//!
+//! [`scan::claims_for`] is the one place the two tables are unioned, and
+//! [`scan::extract_resource`] the one place a resource is extracted, for all
+//! three walks.
 //!
 //! `git` and `context` are still empty namespaces, and deliberately so even
 //! now that estate-git bytes are indexed: the `git.*` namespace is for
@@ -68,7 +96,9 @@
 //!
 //! ```text
 //! deny    ── pure predicate over a path (F10, the acquisition boundary)
-//! text    ── pure functions over bytes, and the one extractor routing table
+//! text    ── pure functions over bytes, and the structure-unit routing table
+//! syntax  ── the same, for symbols/imports: one grammar per claimed
+//!            language, and the symbol routing table (X3b)
 //! scan    ── the walk: filesystem in, plain Rust out; no DB, no journal
 //! git     ── the same, from a pinned commit's Git objects (X3a)
 //! overlay ── a Work surface's changes, over a base tree (X3a)
@@ -98,4 +128,5 @@ pub mod lane;
 pub mod overlay;
 pub mod record;
 pub mod scan;
+pub mod syntax;
 pub mod text;

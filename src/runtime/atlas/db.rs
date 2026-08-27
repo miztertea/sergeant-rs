@@ -48,11 +48,20 @@
 //!
 //! # Scope today
 //!
-//! The four tables the local-knowledge scanner writes, and nothing else.
-//! Every table lands in the wave that lands its writer (the empty-table
-//! refusal doctrine); a declared-but-never populated table is a false
-//! promise, not completeness. `git.*` and `context.*` are still empty
-//! namespaces because nothing writes them yet.
+//! The seven tables the three walks write, and nothing else. Every table
+//! lands in the wave that lands its writer (the empty-table refusal
+//! doctrine); a declared-but-never populated table is a false promise, not
+//! completeness — which is why `source.symbols`, `source.occurrences` and
+//! `source.edges` arrive here in X3b, with the extraction that fills them,
+//! rather than having been declared empty in X1. `git.*` and `context.*` are
+//! still empty namespaces because nothing writes them yet.
+//!
+//! **These tables are only ever added to, never altered.** The store persists
+//! across restarts (F1) and the DDL is `IF NOT EXISTS`, so a column added to
+//! an existing table would simply not appear in a database that already has
+//! it — a silent schema drift with no migration behind it. X3b's rows
+//! therefore live in new tables that carry their own copy of the coordinates
+//! they need, and `source.files` keeps exactly the columns X2 gave it.
 //!
 //! # The confirmation protocol (F1's crash window)
 //!
@@ -84,7 +93,7 @@
 //! and "journal-present, database-evicted" is the same both-present violation
 //! as its mirror image, only harder to notice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use duckdb::Connection;
@@ -92,7 +101,7 @@ use duckdb::Connection;
 use crate::domain::source::{
     AuthorityClass, Coverage, CoverageRow, SourceGeneration, SourceKind, UnitKind,
 };
-use crate::runtime::atlas::scan::{ScannedFile, ScannedUnit, SourceScan};
+use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
 use crate::runtime::fsutil::create_dir_all_durable;
 
 /// Directory under the data dir holding Atlas's durable store.
@@ -174,10 +183,32 @@ CREATE SCHEMA IF NOT EXISTS source;\n\
 CREATE SCHEMA IF NOT EXISTS git;\n\
 CREATE SCHEMA IF NOT EXISTS context;\n";
 
-/// The tables the local-knowledge scanner writes (X2). Applied after
+/// The tables the scanners write — X2's four, plus X3b's three. Applied after
 /// [`SCHEMA_DDL`], on every open, for the same idempotency reason.
 ///
 /// Column choices worth stating, because each one is a contract:
+///
+/// * **`source.symbols` is the index; `source.occurrences` are the sites.**
+///   A symbol is `(language, label, name)` — two files defining `count` are
+///   one symbol row and two occurrence rows. The rollup is *syntactic*: it
+///   says two sites wrote the same name in the same language with the same
+///   grammar label, and it does **not** say they define the same thing, which
+///   would be the resolution A1-09 forbids claiming. `language` is part of the
+///   identity so two languages that spell a name alike are never merged.
+/// * **An occurrence is a definition site**, because that is what a grammar
+///   can tell you without resolving anything. Reference sites are absent
+///   rather than approximated: an unresolved token stream labelled
+///   "references" is exactly the false promise the empty-table doctrine
+///   exists to refuse, and the wave that can resolve them adds them.
+/// * **`syntax_key` is the F7 key of the *syntax* extraction**, which is not
+///   `source.files.local_key`: one blob read by a structure extractor and by
+///   a grammar is two extractions with two keys (see
+///   [`ScannedSyntax`](crate::runtime::atlas::scan::ScannedSyntax)). Both are
+///   derived from the same content identity — a blob OID for an estate-git
+///   source, a BLAKE3 hash for a local one — composed with different extractor
+///   identities.
+/// * **`source.edges.target` is unresolved text**, exactly as the file wrote
+///   it. `edge_kind` is `import`, the only kind this build derives.
 ///
 /// * `content_key` on a generation is what ruling §4's eviction rule is
 ///   phrased over — a re-scan producing the same key evicts nothing.
@@ -228,6 +259,40 @@ CREATE TABLE IF NOT EXISTS source.units (\n\
   byte_start    BIGINT NOT NULL,\n\
   byte_end      BIGINT NOT NULL,\n\
   body          TEXT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS source.symbols (\n\
+  generation_id TEXT NOT NULL,\n\
+  source_name   TEXT NOT NULL,\n\
+  language      TEXT NOT NULL,\n\
+  label         TEXT NOT NULL,\n\
+  name          TEXT NOT NULL,\n\
+  occurrences   BIGINT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS source.occurrences (\n\
+  generation_id TEXT NOT NULL,\n\
+  source_name   TEXT NOT NULL,\n\
+  relative_path TEXT NOT NULL,\n\
+  syntax_key    TEXT NOT NULL,\n\
+  extractor     TEXT NOT NULL,\n\
+  language      TEXT NOT NULL,\n\
+  ordinal       BIGINT NOT NULL,\n\
+  label         TEXT NOT NULL,\n\
+  name          TEXT NOT NULL,\n\
+  byte_start    BIGINT NOT NULL,\n\
+  byte_end      BIGINT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS source.edges (\n\
+  generation_id TEXT NOT NULL,\n\
+  source_name   TEXT NOT NULL,\n\
+  relative_path TEXT NOT NULL,\n\
+  syntax_key    TEXT NOT NULL,\n\
+  extractor     TEXT NOT NULL,\n\
+  language      TEXT NOT NULL,\n\
+  ordinal       BIGINT NOT NULL,\n\
+  edge_kind     TEXT NOT NULL,\n\
+  target        TEXT NOT NULL,\n\
+  byte_start    BIGINT NOT NULL,\n\
+  byte_end      BIGINT NOT NULL\n\
 );\n\
 CREATE TABLE IF NOT EXISTS meta.coverage (\n\
   generation_id TEXT NOT NULL,\n\
@@ -345,9 +410,30 @@ impl AtlasDb {
     ///
     /// Returns [`ScanCommit::Unchanged`] without writing anything when the
     /// scan's `content_key` matches the source's newest confirmed
-    /// generation — ruling §4's eviction rule, enforced at its only
-    /// enforcement point: a generation is evicted only when source bytes
-    /// changed, so an unchanged re-scan must not churn one.
+    /// generation **and the same extractor identities produced it** — ruling
+    /// §4's eviction rule, enforced at its only enforcement point: a
+    /// generation is evicted only when the derived facts could have changed,
+    /// so an unchanged re-scan must not churn one.
+    ///
+    /// **Both halves of F7's key participate, not just the content half.**
+    /// F7 keys a derived row on content identity *plus extractor identity*,
+    /// and a staleness test that consults only `content_key` would make the
+    /// second half decorative: after a grammar or version bump, a re-scan of
+    /// byte-identical sources would answer `Unchanged`, the fresh extraction
+    /// would be discarded, and `symbols`/`occurrences`/`edges` would keep
+    /// serving the *old* parser's rows forever with no path back. The
+    /// identities the standing generation stored are therefore compared
+    /// against the ones this scan ran, and a mismatch is a change: a new
+    /// generation is staged and the old one evicted on confirmation, exactly
+    /// as a byte change would be.
+    ///
+    /// The two inputs stay separate values rather than being folded into one
+    /// hash. `content_key` answers "is this the same world?" and is
+    /// deliberately content-only (see
+    /// [`generation_key`](crate::domain::source::generation_key)); mixing an
+    /// extractor version into it would make a bumped parser look like changed
+    /// source bytes to every reader of that column, including the eviction
+    /// row that has to say *why* a generation was superseded.
     ///
     /// Returns [`ScanCommit::RootUnavailable`], also without writing a
     /// generation, when the walk could not read the source root at all and a
@@ -398,6 +484,7 @@ impl AtlasDb {
         }
         if let Some(current) = self.confirmed_generation(&scan.source_name)?
             && current.content_key == scan.content_key
+            && self.generation_extractors(&current.id)? == scan.extractors
         {
             return Ok(ScanCommit::Unchanged {
                 generation_id: current.id,
@@ -405,12 +492,7 @@ impl AtlasDb {
             });
         }
         let generation_id = ulid::Ulid::generate().to_string();
-        let extractors = scan
-            .extractors
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join(",");
+        let extractors = join_extractors(&scan.extractors);
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO source.generations \
@@ -428,8 +510,35 @@ impl AtlasDb {
                 &extractors,
             ],
         )?;
+        // The symbol *index* is a rollup across the whole generation, so it is
+        // accumulated as the files are written and inserted once — not once
+        // per file, which would make `occurrences` a per-file count wearing a
+        // generation-wide column's name.
+        let mut index: BTreeMap<(&str, &str, &str), u64> = BTreeMap::new();
         for file in &scan.files {
             insert_file(&tx, &generation_id, &scan.source_name, file)?;
+            if let Some(syntax) = &file.syntax {
+                for symbol in &syntax.symbols {
+                    *index
+                        .entry((syntax.language, symbol.label, symbol.name.as_str()))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        for ((language, label, name), occurrences) in index {
+            tx.prepare_cached(
+                "INSERT INTO source.symbols \
+                 (generation_id, source_name, language, label, name, occurrences) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )?
+            .execute(duckdb::params![
+                &generation_id,
+                &scan.source_name,
+                language,
+                label,
+                name,
+                occurrences as i64,
+            ])?;
         }
         for row in &scan.coverage {
             insert_coverage(
@@ -476,6 +585,21 @@ impl AtlasDb {
                 .filter(|id| id != generation_id),
             None => None,
         };
+        // Why the predecessor is going, decided from the evidence rather than
+        // assumed. `stage_scan` stages a successor for either of two reasons —
+        // the source bytes changed, or the extractor identities did — and the
+        // coverage row an eviction leaves is the durable record of which. A
+        // fixed "the source bytes changed" string would be a false statement on
+        // every grammar bump, in the one row a reader consults to find out.
+        let reason = match &superseded {
+            Some(previous)
+                if self.generation_content_key(previous)?
+                    == self.generation_content_key(generation_id)? =>
+            {
+                "superseded: the extractor identities changed (the source bytes did not)"
+            }
+            _ => "superseded: the source bytes changed",
+        };
         let observed_at = crate::domain::event::rfc3339_utc_now();
         let tx = self.conn.transaction()?;
         let promoted = tx.execute(
@@ -498,13 +622,7 @@ impl AtlasDb {
             });
         }
         if let (Some(previous), Some(name)) = (&superseded, &source_name) {
-            evict(
-                &tx,
-                previous,
-                name,
-                "superseded: the source bytes changed",
-                &observed_at,
-            )?;
+            evict(&tx, previous, name, reason, &observed_at)?;
         }
         tx.commit()?;
         Ok(superseded)
@@ -698,6 +816,96 @@ impl AtlasDb {
         Ok(out)
     }
 
+    /// The symbol index of one source's confirmed generation, in
+    /// `(language, label, name)` order, bounded by `limit` (capped at
+    /// [`MAX_ROWS`], F12).
+    pub fn symbols(
+        &self,
+        source_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredSymbol>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT s.language, s.label, s.name, s.occurrences \
+             FROM source.symbols s JOIN source.generations g USING (generation_id) \
+             WHERE g.source_name = ? AND g.state = ? \
+             ORDER BY s.language, s.label, s.name LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredSymbol {
+                language: row.get(0)?,
+                label: row.get(1)?,
+                name: row.get(2)?,
+                occurrences: row.get::<usize, i64>(3)? as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Symbol sites of one source's confirmed generation, in path then
+    /// document order, bounded by `limit` (capped at [`MAX_ROWS`], F12).
+    pub fn occurrences(
+        &self,
+        source_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredOccurrence>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT o.relative_path, o.syntax_key, o.extractor, o.language, o.ordinal, \
+                    o.label, o.name, o.byte_start, o.byte_end \
+             FROM source.occurrences o JOIN source.generations g USING (generation_id) \
+             WHERE g.source_name = ? AND g.state = ? \
+             ORDER BY o.relative_path, o.ordinal LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredOccurrence {
+                relative_path: row.get(0)?,
+                syntax_key: row.get(1)?,
+                extractor: row.get(2)?,
+                language: row.get(3)?,
+                ordinal: row.get::<usize, i64>(4)? as u64,
+                label: row.get(5)?,
+                name: row.get(6)?,
+                byte_start: row.get::<usize, i64>(7)? as u64,
+                byte_end: row.get::<usize, i64>(8)? as u64,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Edges out of one source's confirmed generation, in path then document
+    /// order, bounded by `limit` (capped at [`MAX_ROWS`], F12).
+    pub fn edges(&self, source_name: &str, limit: usize) -> Result<Vec<StoredEdge>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT e.relative_path, e.syntax_key, e.extractor, e.language, e.ordinal, \
+                    e.edge_kind, e.target, e.byte_start, e.byte_end \
+             FROM source.edges e JOIN source.generations g USING (generation_id) \
+             WHERE g.source_name = ? AND g.state = ? \
+             ORDER BY e.relative_path, e.ordinal LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredEdge {
+                relative_path: row.get(0)?,
+                syntax_key: row.get(1)?,
+                extractor: row.get(2)?,
+                language: row.get(3)?,
+                ordinal: row.get::<usize, i64>(4)? as u64,
+                kind: row.get(5)?,
+                target: row.get(6)?,
+                byte_start: row.get::<usize, i64>(7)? as u64,
+                byte_end: row.get::<usize, i64>(8)? as u64,
+            });
+        }
+        Ok(out)
+    }
+
     /// Coverage rows for one source's confirmed generations, newest first,
     /// bounded by `limit` (capped at [`MAX_ROWS`], F12).
     ///
@@ -801,6 +1009,63 @@ impl AtlasDb {
             None => Ok(None),
         }
     }
+
+    /// The extractor identities a stored generation's rows were derived from —
+    /// the second half of F7's key, read back for [`Self::stage_scan`]'s
+    /// staleness test.
+    ///
+    /// Round-trips exactly what [`join_extractors`] wrote, so the comparison is
+    /// against a set and not against a formatting accident. An unknown
+    /// generation and one that recorded no extractors both answer with the
+    /// empty set, which is the same answer a scan that ran none produces —
+    /// correct in both cases, because neither could have derived a row.
+    fn generation_extractors(&self, generation_id: &str) -> Result<BTreeSet<String>, AtlasError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT extractors FROM source.generations WHERE generation_id = ?")?;
+        let mut rows = statement.query(duckdb::params![generation_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(BTreeSet::new());
+        };
+        Ok(split_extractors(&row.get::<usize, String>(0)?))
+    }
+
+    /// The stored `content_key` of any generation, in any state.
+    ///
+    /// [`Self::confirmed_generation`] cannot answer this for a generation that
+    /// is being superseded *by* the call asking, which is exactly when
+    /// [`Self::confirm_scan`] needs it to say honestly why the predecessor is
+    /// going.
+    fn generation_content_key(&self, generation_id: &str) -> Result<Option<String>, AtlasError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT content_key FROM source.generations WHERE generation_id = ?")?;
+        let mut rows = statement.query(duckdb::params![generation_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// The `extractors` column's stored form: identities, comma-joined, in the
+/// set's own sorted order.
+fn join_extractors(extractors: &BTreeSet<String>) -> String {
+    extractors
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// [`join_extractors`] backwards. Empty segments are dropped, so an empty
+/// column is the empty set rather than a set holding one empty name.
+fn split_extractors(stored: &str) -> BTreeSet<String> {
+    stored
+        .split(',')
+        .filter(|identity| !identity.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Insert one acquired file and its units.
@@ -810,25 +1075,85 @@ fn insert_file(
     source_name: &str,
     file: &ScannedFile,
 ) -> Result<(), AtlasError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO source.files \
          (generation_id, source_name, relative_path, content_hash, extractor, local_key, \
           byte_len, mtime_millis, unit_count) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        duckdb::params![
+    )?
+    .execute(duckdb::params![
+        generation_id,
+        source_name,
+        &file.relative_path,
+        &file.content_hash,
+        &file.extractor,
+        &file.local_key,
+        file.byte_len as i64,
+        file.mtime_millis,
+        file.units.len() as i64,
+    ])?;
+    for unit in &file.units {
+        insert_unit(conn, generation_id, source_name, file, unit)?;
+    }
+    if let Some(syntax) = &file.syntax {
+        insert_syntax(conn, generation_id, source_name, file, syntax)?;
+    }
+    Ok(())
+}
+
+/// Insert one file's syntax extraction: its symbol sites and its edges.
+///
+/// The symbol *index* is not written here — it is a rollup over the whole
+/// generation and belongs to the transaction that knows all of it
+/// ([`AtlasDb::stage_scan`]).
+fn insert_syntax(
+    conn: &Connection,
+    generation_id: &str,
+    source_name: &str,
+    file: &ScannedFile,
+    syntax: &ScannedSyntax,
+) -> Result<(), AtlasError> {
+    for symbol in &syntax.symbols {
+        conn.prepare_cached(
+            "INSERT INTO source.occurrences \
+             (generation_id, source_name, relative_path, syntax_key, extractor, language, \
+              ordinal, label, name, byte_start, byte_end) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )?
+        .execute(duckdb::params![
             generation_id,
             source_name,
             &file.relative_path,
-            &file.content_hash,
-            &file.extractor,
-            &file.local_key,
-            file.byte_len as i64,
-            file.mtime_millis,
-            file.units.len() as i64,
-        ],
-    )?;
-    for unit in &file.units {
-        insert_unit(conn, generation_id, source_name, file, unit)?;
+            &syntax.syntax_key,
+            &syntax.extractor,
+            syntax.language,
+            symbol.ordinal as i64,
+            symbol.label,
+            &symbol.name,
+            symbol.byte_start as i64,
+            symbol.byte_end as i64,
+        ])?;
+    }
+    for edge in &syntax.edges {
+        conn.prepare_cached(
+            "INSERT INTO source.edges \
+             (generation_id, source_name, relative_path, syntax_key, extractor, language, \
+              ordinal, edge_kind, target, byte_start, byte_end) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )?
+        .execute(duckdb::params![
+            generation_id,
+            source_name,
+            &file.relative_path,
+            &syntax.syntax_key,
+            &syntax.extractor,
+            syntax.language,
+            edge.ordinal as i64,
+            edge.kind,
+            &edge.target,
+            edge.byte_start as i64,
+            edge.byte_end as i64,
+        ])?;
     }
     Ok(())
 }
@@ -841,25 +1166,25 @@ fn insert_unit(
     file: &ScannedFile,
     unit: &ScannedUnit,
 ) -> Result<(), AtlasError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO source.units \
          (generation_id, source_name, relative_path, local_key, ordinal, unit_kind, \
           heading_level, title, byte_start, byte_end, body) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        duckdb::params![
-            generation_id,
-            source_name,
-            &file.relative_path,
-            &file.local_key,
-            unit.ordinal as i64,
-            unit.kind.as_str(),
-            unit.heading_level.map(i64::from),
-            unit.title.as_deref(),
-            unit.byte_start as i64,
-            unit.byte_end as i64,
-            &unit.text,
-        ],
-    )?;
+    )?
+    .execute(duckdb::params![
+        generation_id,
+        source_name,
+        &file.relative_path,
+        &file.local_key,
+        unit.ordinal as i64,
+        unit.kind.as_str(),
+        unit.heading_level.map(i64::from),
+        unit.title.as_deref(),
+        unit.byte_start as i64,
+        unit.byte_end as i64,
+        &unit.text,
+    ])?;
     Ok(())
 }
 
@@ -871,20 +1196,20 @@ fn insert_coverage(
     row: &CoverageRow,
     observed_at: &str,
 ) -> Result<(), AtlasError> {
-    conn.execute(
+    conn.prepare_cached(
         "INSERT INTO meta.coverage \
          (generation_id, source_name, path, status, detail, bytes, observed_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?)",
-        duckdb::params![
-            generation_id,
-            source_name,
-            row.path.as_deref(),
-            row.status.as_str(),
-            row.detail.as_deref(),
-            row.bytes.map(|b| b as i64),
-            observed_at,
-        ],
-    )?;
+    )?
+    .execute(duckdb::params![
+        generation_id,
+        source_name,
+        row.path.as_deref(),
+        row.status.as_str(),
+        row.detail.as_deref(),
+        row.bytes.map(|b| b as i64),
+        observed_at,
+    ])?;
     Ok(())
 }
 
@@ -903,6 +1228,18 @@ fn evict(
 ) -> Result<(), AtlasError> {
     conn.execute(
         "DELETE FROM source.units WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM source.occurrences WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM source.edges WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM source.symbols WHERE generation_id = ?",
         duckdb::params![generation_id],
     )?;
     conn.execute(
@@ -982,6 +1319,69 @@ pub struct StoredUnit {
     pub byte_end: u64,
     /// The unit's text.
     pub body: String,
+}
+
+/// One entry of the symbol index, read back out of the store.
+///
+/// A symbol is `(language, label, name)`. `occurrences` counts the sites in
+/// the same generation that wrote it — a syntactic rollup, never a claim that
+/// those sites define one thing (A1-09).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSymbol {
+    /// The grammar's language name.
+    pub language: String,
+    /// What the grammar called it.
+    pub label: String,
+    /// The name as written.
+    pub name: String,
+    /// How many sites in this generation wrote it.
+    pub occurrences: u64,
+}
+
+/// One symbol site, read back out of the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOccurrence {
+    /// Path relative to the source root.
+    pub relative_path: String,
+    /// F7 key of the *syntax* extraction this site came from.
+    pub syntax_key: String,
+    /// The grammar's versioned extractor identity.
+    pub extractor: String,
+    /// The grammar's language name.
+    pub language: String,
+    /// Position within its file's symbol list.
+    pub ordinal: u64,
+    /// What the grammar called it.
+    pub label: String,
+    /// The name as written.
+    pub name: String,
+    /// Offset into the original file bytes.
+    pub byte_start: u64,
+    /// End offset into the original file bytes, exclusive.
+    pub byte_end: u64,
+}
+
+/// One edge out of a file, read back out of the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEdge {
+    /// Path the edge leaves from, relative to the source root.
+    pub relative_path: String,
+    /// F7 key of the *syntax* extraction this edge came from.
+    pub syntax_key: String,
+    /// The grammar's versioned extractor identity.
+    pub extractor: String,
+    /// The grammar's language name.
+    pub language: String,
+    /// Position within its file's edge list.
+    pub ordinal: u64,
+    /// The edge's syntax-derived kind — `import` today.
+    pub kind: String,
+    /// What the file named, exactly as written. **Unresolved.**
+    pub target: String,
+    /// Offset into the original file bytes.
+    pub byte_start: u64,
+    /// End offset into the original file bytes, exclusive.
+    pub byte_end: u64,
 }
 
 /// One coverage row read back out of the store, with the generation it
@@ -1074,6 +1474,7 @@ mod tests {
                     byte_end: body.len() as u64,
                     text: body.to_string(),
                 }],
+                syntax: None,
             }],
             coverage: vec![CoverageRow {
                 path: Some("doc.md".to_string()),

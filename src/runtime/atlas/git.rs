@@ -53,10 +53,12 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::domain::event::rfc3339_utc_now;
-use crate::domain::source::{AuthorityClass, Coverage, CoverageRow, SourceKind, estate_git_key};
+use crate::domain::source::{AuthorityClass, Coverage, CoverageRow, SourceKind};
 use crate::runtime::atlas::deny::{AcquisitionFilter, BadPattern, Verdict};
-use crate::runtime::atlas::scan::{MAX_RESOURCE_BYTES, ScannedFile, SourceScan, extract_units};
-use crate::runtime::atlas::text::{as_text, extractor_for};
+use crate::runtime::atlas::scan::{
+    KeySpace, MAX_RESOURCE_BYTES, ScannedFile, SourceScan, UNCLAIMED, claims_for, extract_resource,
+};
+use crate::runtime::atlas::text::as_text;
 use crate::runtime::git::{GitError, git, git_bytes, git_cat_file_batch};
 use crate::runtime::integrity::{DriftAttribution, EstateDriftObservation};
 
@@ -384,11 +386,11 @@ pub(crate) fn extract_blobs(
             }
             EntryKind::File => {}
         }
-        if extractor_for(&entry.path).is_none() {
+        if claims_for(&entry.path).is_none() {
             out.coverage.push(CoverageRow {
                 path: Some(entry.path.clone()),
                 status: Coverage::Unsupported,
-                detail: Some("no extractor in this build claims this extension".to_string()),
+                detail: Some(UNCLAIMED.to_string()),
                 bytes: Some(entry.size),
             });
             continue;
@@ -411,7 +413,7 @@ pub(crate) fn extract_blobs(
         let oids: Vec<String> = batch.iter().map(|e| e.oid.clone()).collect();
         let objects = git_cat_file_batch(mount, &oids)?;
         for (entry, object) in batch.iter().zip(objects) {
-            let extractor = extractor_for(&entry.path).expect("filtered above");
+            let claims = claims_for(&entry.path).expect("filtered above");
             let Some(object) = object else {
                 out.coverage.push(CoverageRow {
                     path: Some(entry.path.clone()),
@@ -434,30 +436,32 @@ pub(crate) fn extract_blobs(
                 });
                 continue;
             };
-            let units = extract_units(text, extractor);
-            out.extractors.insert(extractor.to_string());
+            // **F7, estate-git half.** Every key below is the blob OID plus an
+            // extractor identity. The OID *is* Git's hash of exactly these
+            // bytes; hashing them again would produce a second name for one
+            // thing and cost a full pass over every byte in the repository to
+            // do it. [`KeySpace::EstateGit`] is that rule, passed to the one
+            // shared extractor rather than restated here.
+            let extracted = extract_resource(claims, text, &entry.oid, KeySpace::EstateGit);
+            out.extractors.extend(extracted.identities.iter().cloned());
             out.coverage.push(CoverageRow {
                 path: Some(entry.path.clone()),
-                status: Coverage::Indexed,
-                detail: Some(extractor.to_string()),
+                status: extracted.status(),
+                detail: Some(extracted.detail()),
                 bytes: Some(object.bytes.len() as u64),
             });
             out.files.push(ScannedFile {
                 relative_path: entry.path.clone(),
-                // **F7, estate-git half.** The key is the blob OID plus the
-                // extractor's identity. The OID *is* Git's hash of exactly
-                // these bytes; hashing them again would produce a second name
-                // for one thing and cost a full pass over every byte in the
-                // repository to do it.
-                local_key: estate_git_key(&entry.oid, extractor),
+                local_key: extracted.key,
                 content_hash: entry.oid.clone(),
-                extractor: extractor.to_string(),
+                extractor: extracted.extractor.to_string(),
                 byte_len: object.bytes.len() as u64,
                 // Not a fact a Git object has, and not one this path needs:
                 // F7 makes mtime a change hint for the *filesystem* scanner,
                 // and an object store has content identity instead.
                 mtime_millis: None,
-                units,
+                units: extracted.units,
+                syntax: extracted.syntax,
             });
         }
     }
@@ -583,6 +587,7 @@ pub fn observe_drift(source: &EstateGitSource, tree: &GitTree) -> Option<EstateD
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::source::estate_git_key;
     use crate::runtime::atlas::text::MARKDOWN_EXTRACTOR;
     use crate::runtime::git::git as run_git;
 
@@ -652,7 +657,9 @@ mod tests {
         assert_eq!(row(scan, "README.md").status, Coverage::Indexed);
         assert_eq!(row(scan, "docs/one.md").status, Coverage::Indexed);
         assert_eq!(row(scan, "docs/plain.txt").status, Coverage::Indexed);
-        assert_eq!(row(scan, "src/main.rs").status, Coverage::Unsupported);
+        // Claimed by a grammar since X3b, so `unsupported` would now be the
+        // dishonest answer — the file *is* indexed, and its symbols are rows.
+        assert_eq!(row(scan, "src/main.rs").status, Coverage::Indexed);
         assert_eq!(row(scan, "keys/server.pem").status, Coverage::Excluded);
         assert_eq!(row(scan, ".env").status, Coverage::Excluded);
         assert_eq!(row(scan, "docs").status, Coverage::Discovered);

@@ -5,7 +5,14 @@ edition = "2024"
 # Keep in sync with the `msrv` job's `env.MSRV` in .github/workflows/ci.yml
 # (W1 spec §E) — cargo has no way to read this field back into that job's
 # `run:` steps without added machinery, so the two are hand-synced.
-rust-version = "1.89.0"
+#
+# S3 X3b (F5d / A1-27): 1.89.0 -> 1.98.0. This is paperwork the A1 plan routed
+# onto the first A1-dependency PR, not a new constraint discovered here: the
+# pinned dev compiler in rust-toolchain.toml has been 1.98.0, and 1.89.0 was a
+# floor nothing had re-verified. The two fields cannot move independently —
+# `cargo +1.89 check` refuses outright once this says 1.98.0 — so ci.yml's
+# `env.MSRV` moves in the same commit.
+rust-version = "1.98.0"
 license = "MIT"
 repository = "https://github.com/miztertea/sergeant-rs"
 description = "Local execution surface for coding agents: durable work, isolated git worktrees, and a complete evidence trail behind one daemon"
@@ -68,6 +75,34 @@ toml = "1.1.4"
 toml_edit = { version = "0.25", features = ["parse", "display"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3"
+# S3 X3b (F5): language-aware symbol/import extraction. Rungs, in order: R2
+# fails (nothing in this crate parses source code; X2's `text.rs` splits
+# Markdown on heading bytes and answers a different question), R3 fails (std
+# has no parser for any of these languages), R4 fails (the OS offers none
+# either), R5 fails (nothing already in the graph parses source — `toml`/
+# `toml_edit` cover exactly one of the six languages and only as values, not
+# as a syntax tree with byte ranges, which is what `source.occurrences` is
+# keyed on), R6 fails (six hand-written parsers is the largest bug farm this
+# repo could adopt, and a regex "symbol finder" is precisely the silent
+# partial parse F5's exact-match criterion exists to forbid). R5-as-new-edge →
+# tree-sitter plus one grammar per language actually indexed.
+#
+# The grammar set is the LEAN one, not `tree-sitter-language-pack` (TSLP): the
+# pack resolves 143 crates for 371 languages and, at its default features
+# (`download` + `dynamic-loading`), FAILS this repo's `cargo deny` on MPL-2.0
+# (`option-ext` via `dirs`/`dirs-sys`) — recorded verbatim in
+# tests/fixtures/tslp_corpus/SPIKE-F5.md. Its `download` feature also fetches
+# parsers over the network at runtime, which is the same posture F4 forbids
+# for DuckDB extension autoload. Eight direct crates / ten new lock entries
+# buy the six languages F5 names and nothing else (R1 on the other 365).
+tree-sitter = "0.26.13"
+tree-sitter-bash = "0.25.1"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-md = "0.5.3"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
 ulid = "3.0.0"
 
 # #310: `prctl(PR_SET_PDEATHSIG, SIGKILL)` on a probe child, and nothing else.
@@ -115,7 +150,17 @@ debug = false
 # axum 0.8's own `http-body-util` dependency.
 http-body-util = "0.1"
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "testing"] }
+# S3 X3b: `tests/x3b_tslp_corpus.rs` reads its hand-verified expectations from
+# `tests/fixtures/tslp_corpus/manifest.toml`. Both crates are already direct
+# `[dependencies]` of this crate at these exact versions — an integration test
+# links the library plus dev-dependencies, not the library's own dependencies,
+# so naming them here adds two lines and ZERO packages to the resolved graph
+# (R5, verified: `Cargo.lock` package count is unchanged by these two entries).
+# The alternative, a hand-rolled parser for the manifest, is the R6/R7 bug farm
+# the rung order exists to prevent.
+serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3"
+toml = "1.1.4"
 
 # Packaging mechanics for release.yml (proposal §10: "`dist` may own packaging
 # mechanics. Sergeant owns release authority."). `ci = "github"` still selects
