@@ -296,9 +296,19 @@ does not:
 - create a replacement branch;
 - navigate into another Work's surface;
 - expand its own repository scope;
-- invoke an estate-scoped `sgt` command from its own surface — no
-  `sergeant.toml` lives there, and Session start's refusal applies even
-  from inside it.
+- invoke an estate-scoped `sgt` command from its own surface — prohibited
+  by default, since no `sergeant.toml` lives there and Session start's
+  refusal applies even from inside it, **except the one sanctioned
+  path**: a managed execution carrying its causation triple
+  (`SERGEANT_ESTATE_ROOT`/`SERGEANT_WORK_ID`/`SERGEANT_EXECUTION_ID`) may
+  run `sgt -C "$SERGEANT_ESTATE_ROOT" run ...`, and the daemon validates
+  the claimed parent Work/execution against its own journal before the
+  relation is recorded — a failed claim never refuses the child Work
+  itself, only the relation. This narrows the prohibition; it does not
+  remove it: a worker must still never silently become a nested Captain,
+  which is now preserved by ordinary admission, explicit addressing, and
+  journal-validated causation rather than by refusal (host-atlas r3
+  ratification, ruling 2).
 
 A violation is reported dirty (the integrity disposition riding beside
 `sgt work show`'s terminal state), never silently treated as ordinary

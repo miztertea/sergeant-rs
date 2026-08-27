@@ -617,6 +617,78 @@ fn agents_md_states_the_ratified_mutation_surface_contract() {
     );
 }
 
+/// W1's worker-supersession ratification (host-atlas-r3-ratification
+/// ruling 2, J3): the ESTATE section's fifth worker bullet is superseded
+/// "for this one sanctioned path only" — every other item in that list
+/// stands untouched. This pins the amended sentence naming the sanctioned
+/// `-C "$SERGEANT_ESTATE_ROOT" run` path AND, as a regression guard, that
+/// the other four bullets are still present verbatim — an edit that
+/// widens the amendment into removing one of those four would pass a pin
+/// on the new sentence alone but must not pass this one.
+///
+/// Written first against the pre-W1 text (the blanket "invoke an
+/// estate-scoped `sgt` command from its own surface" prohibition, no
+/// exception) to confirm it goes red on exactly that wording, then
+/// against the amended text to confirm green — the red-then-green
+/// discipline the wave brief requires or this pin is decorative rather
+/// than load-bearing.
+#[test]
+fn agents_md_estate_bullets_state_the_sanctioned_child_work_path() {
+    let agents_md = std::fs::read_to_string(repo_root().join("AGENTS.md")).expect("read AGENTS.md");
+    let agents_md_flat = agents_md.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    // The other four bullets (295-298 at the integration ref) stand
+    // verbatim — the ratification is explicit only the fifth is narrowed.
+    for bullet in [
+        "edit a `repos/` mount;",
+        "create a replacement branch;",
+        "navigate into another Work's surface;",
+        "expand its own repository scope;",
+    ] {
+        assert!(
+            agents_md_flat.contains(bullet),
+            "AGENTS.md's ESTATE worker bullets must keep this untouched bullet verbatim: {bullet}"
+        );
+    }
+
+    // The amended fifth bullet names the one sanctioned path and the
+    // journal-validation the ratification requires before it narrows the
+    // prohibition.
+    assert!(
+        agents_md_flat.contains("sgt -C \"$SERGEANT_ESTATE_ROOT\" run"),
+        "AGENTS.md's amended worker bullet must name the sanctioned `-C \
+         \"$SERGEANT_ESTATE_ROOT\" run` path — the ratified exception, not a blanket refusal"
+    );
+    assert!(
+        agents_md_flat.contains("validates") && agents_md_flat.contains("journal"),
+        "AGENTS.md's amended worker bullet must state that the daemon validates the claimed \
+         causation against its own journal before recording the relation"
+    );
+
+    // The narrowing framing itself: a worker still must not silently
+    // become a nested Captain — preserved by admission/addressing/
+    // validated-causation now, not by a blanket refusal (ratification
+    // ruling 2's own words).
+    assert!(
+        agents_md_flat.contains("nested Captain"),
+        "AGENTS.md's amendment must restate the 'not a nested Captain' preservation clause so \
+         the change reads as a narrowing, not a removal of the worker-surface prohibition"
+    );
+
+    // Regression guard: the pre-W1 blanket prohibition text must be gone,
+    // not merely amended-around — a copy-paste-drifted edit that left the
+    // old unconditional sentence sitting beside the new exception would
+    // otherwise pass every assertion above.
+    assert!(
+        !agents_md_flat.contains(
+            "invoke an estate-scoped `sgt` command from its own surface — no `sergeant.toml` \
+             lives there, and Session start's refusal applies even from inside it."
+        ),
+        "AGENTS.md must not still carry the old unconditional worker-surface prohibition \
+         alongside the new sanctioned-path exception"
+    );
+}
+
 // ------------------------------------------------ 7. citation-integrity skew
 //
 // split-hardening W2c made this repo product-documents-only: NORTH-STAR.md,
