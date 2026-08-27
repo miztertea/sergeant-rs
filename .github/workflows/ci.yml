@@ -150,31 +150,40 @@ jobs:
         run: cargo check --locked --all-targets
 
   msrv:
-    # W1 §E: measured floor, not recon's static 1.88.0 prediction — the
-    # extra minor version comes from this crate's own use of
+    # W1 §E: a measured floor, not recon's static 1.88.0 prediction — the
+    # extra minor version came from this crate's own use of
     # std::fs::File::try_lock/TryLockError (stabilized 1.89.0), which a
     # cargo-metadata pass over dependency rust-version fields cannot see.
-    # Verified empirically: cargo +1.89.0 check --locked --all-targets and
-    # cargo +1.89.0 test --locked both passed cleanly before this job and
-    # Cargo.toml's rust-version were added. Check only, no clippy — lint
-    # policy belongs to the pinned dev compiler (rust-toolchain.toml), not
-    # to this deliberately-older floor.
+    # Check only, no clippy — lint policy belongs to the pinned dev compiler
+    # (rust-toolchain.toml), not to this floor.
+    #
+    # S3 X3b (F5d / A1-27): the floor moved 1.89.0 -> 1.98.0 together with
+    # Cargo.toml's rust-version, and it had to move in the SAME commit —
+    # cargo refuses to build a package whose rust-version exceeds the invoked
+    # compiler, so a 1.89.0 floor against a 1.98.0 rust-version is not a stale
+    # comment, it is a red job.
+    #
+    # NOTE FOR REVIEW: the floor now equals rust-toolchain.toml's pin, so this
+    # job no longer exercises an *older* compiler than the rest of CI — as of
+    # this commit it is a duplicate `--locked --all-targets` check. Whether to
+    # retire it or to re-establish a genuinely older measured floor is a
+    # decision this wave had no authority to take, and did not take.
     runs-on: ubuntu-24.04
     env:
-      # Single source of truth for this job's two 1.89.0 uses below. Keep in
-      # sync with Cargo.toml's rust-version (see the comment there) — YAML
-      # and TOML can't share a literal without added machinery, so this only
-      # collapses the duplication within this job, from two sites to one.
-      MSRV: 1.89.0
+      # Single source of truth for this job's two uses below. Keep in sync
+      # with Cargo.toml's rust-version (see the comment there) — YAML and TOML
+      # can't share a literal without added machinery, so this only collapses
+      # the duplication within this job, from two sites to one.
+      MSRV: 1.98.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: rustup toolchain install (MSRV floor — deliberately older than rust-toolchain.toml's pin)
+      - name: rustup toolchain install (the declared MSRV floor)
         run: rustup toolchain install ${{ env.MSRV }} --profile minimal
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: cargo check --locked --all-targets (MSRV floor — check only, no clippy on an old compiler)
+      - name: cargo check --locked --all-targets (MSRV floor — check only, no clippy from this job)
         run: cargo +${{ env.MSRV }} check --locked --all-targets
 
   dependency-policy:

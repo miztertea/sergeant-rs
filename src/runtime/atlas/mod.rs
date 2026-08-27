@@ -68,7 +68,9 @@
 //!
 //! ```text
 //! deny    ── pure predicate over a path (F10, the acquisition boundary)
-//! text    ── pure functions over bytes, and the one extractor routing table
+//! text    ── pure functions over bytes, and the structure-unit routing table
+//! syntax  ── the same, for symbols/imports: one grammar per claimed
+//!            language, and the symbol routing table (X3b)
 //! scan    ── the walk: filesystem in, plain Rust out; no DB, no journal
 //! git     ── the same, from a pinned commit's Git objects (X3a)
 //! overlay ── a Work surface's changes, over a base tree (X3a)
@@ -98,4 +100,5 @@ pub mod lane;
 pub mod overlay;
 pub mod record;
 pub mod scan;
+pub mod syntax;
 pub mod text;

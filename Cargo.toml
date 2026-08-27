@@ -5,7 +5,14 @@ edition = "2024"
 # Keep in sync with the `msrv` job's `env.MSRV` in .github/workflows/ci.yml
 # (W1 spec §E) — cargo has no way to read this field back into that job's
 # `run:` steps without added machinery, so the two are hand-synced.
-rust-version = "1.89.0"
+#
+# S3 X3b (F5d / A1-27): 1.89.0 -> 1.98.0. This is paperwork the A1 plan routed
+# onto the first A1-dependency PR, not a new constraint discovered here: the
+# pinned dev compiler in rust-toolchain.toml has been 1.98.0, and 1.89.0 was a
+# floor nothing had re-verified. The two fields cannot move independently —
+# `cargo +1.89 check` refuses outright once this says 1.98.0 — so ci.yml's
+# `env.MSRV` moves in the same commit.
+rust-version = "1.98.0"
 license = "MIT"
 repository = "https://github.com/miztertea/sergeant-rs"
 description = "Local execution surface for coding agents: durable work, isolated git worktrees, and a complete evidence trail behind one daemon"
@@ -143,7 +150,17 @@ debug = false
 # axum 0.8's own `http-body-util` dependency.
 http-body-util = "0.1"
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "testing"] }
+# S3 X3b: `tests/x3b_tslp_corpus.rs` reads its hand-verified expectations from
+# `tests/fixtures/tslp_corpus/manifest.toml`. Both crates are already direct
+# `[dependencies]` of this crate at these exact versions — an integration test
+# links the library plus dev-dependencies, not the library's own dependencies,
+# so naming them here adds two lines and ZERO packages to the resolved graph
+# (R5, verified: `Cargo.lock` package count is unchanged by these two entries).
+# The alternative, a hand-rolled parser for the manifest, is the R6/R7 bug farm
+# the rung order exists to prevent.
+serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3"
+toml = "1.1.4"
 
 # Packaging mechanics for release.yml (proposal §10: "`dist` may own packaging
 # mechanics. Sergeant owns release authority."). `ci = "github"` still selects
