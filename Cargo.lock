@@ -3308,6 +3308,7 @@ dependencies = [
  "http-body-util",
  "include_dir",
  "libc",
+ "log",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

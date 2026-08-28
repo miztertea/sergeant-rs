@@ -36,7 +36,7 @@
 //! | 2 | estate Git indexing pins exact repo/base generations and Work overlays without changing Work authority | met | `x3a_git_plumbing::a_scan_stays_on_its_pinned_sha_while_head_advances` |
 //! | 3 | a declared read-only local knowledge Source indexes a cloud-synced ordinary directory without becoming `[[repo]]` or receiving a worktree | met | `x5_a1a_acceptance::a1a_item_3_a_knowledge_source_is_indexed_without_becoming_a_repo_or_getting_a_worktree` |
 //! | 4 | online-only/unreadable local resources are reported as coverage gaps, not silently indexed as empty | gap | `x5_a1a_acceptance::a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped` |
-//! | 5 | Markdown/text and at least one Office format normalize into document units with provenance | deferred-s4 | — |
+//! | 5 | Markdown/text and at least one Office format normalize into document units with provenance | met | `y2_office_adapter::a_docx_worker_returns_document_and_section_units_with_provenance` |
 //! | 6 | CSV/JSON/Parquet stay relational, with a deterministic aggregate and selected text-field context units sharing row identity | met | `x4_tabular_map::datasets_are_registered_and_read_in_place_as_derived_evidence` |
 //! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | deferred-s4 | — |
 //! | 8 | `.eml` or the chosen first mail format produces structured message evidence | deferred-s4 | — |
@@ -259,13 +259,40 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 5,
-        verdict: Verdict::DeferredS4,
-        checks: &[],
-        note: "S4's, per the ratified Host+Atlas re-cut ('Anydoc office/docs spike+adoption \
-               under S4') and the S3 sprint plan's panel adjudication finding 1, which corrected \
-               a commissioning line that had mis-claimed this item for S3. The Markdown/text \
-               half of the item does ship (see item 3's checks); the Office half — and with it \
-               the item — is S4's.",
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/y2_office_adapter.rs",
+                "a_docx_worker_returns_document_and_section_units_with_provenance",
+            ),
+            at(
+                "tests/y2_office_adapter.rs",
+                "a_real_parser_failure_leaves_the_daemon_up_the_permit_freed_and_a_named_coverage_row",
+            ),
+            at(
+                "tests/y2_office_boundary.rs",
+                "anydoc_is_named_nowhere_but_the_office_adapter",
+            ),
+        ],
+        note: "S4 Y2, closing the deferral the S3 sprint plan's panel adjudication finding 1 \
+               recorded here. The Markdown/text half shipped in S3 (see item 3's checks). The \
+               Office half ships now: `.docx` via a third-party document-conversion crate \
+               (owner ruling J4, dated 2026-08-27 — see the owner-rulings knowledge library), \
+               run inside Y1's supervised worker, proven through the real subprocess and the \
+               real parser — not a synthetic fixture. Provenance is A1 §6.3's own shape: \
+               normalizer identity + version (`office::DOCX_EXTRACTOR`), citation of the \
+               ORIGINAL resource (never a temp path), and a unit coordinate where recoverable \
+               — a structural `block:<n>` coordinate for an Office section rather than a byte \
+               offset, because the original bytes are a compressed container the normalizer \
+               has already unpacked by the time a unit is visible (see `runtime/atlas/office.rs`'s \
+               own module doc and `domain::source::UnitKind`'s doc for the full argument). Output is \
+               derived, never canonical (A1-12). NARROWING, not a deviation from what §17 asks: \
+               `.docx` is this wave's one adopted format (G3's gate order), so `office::extractor_for` \
+               claims nothing else yet — a second Office format is explicitly out of this \
+               sprint's scope. CROSS-CUTTING GAP applies, same as items 3/6/13: the adapter is \
+               invoked here through its own writer (the worker binary) and by tests, not yet by \
+               a shipped scan trigger — that daemon-side scheduling is Y5's (G8), same as it was \
+               for Y1's own worker transport.",
     },
     Item {
         number: 6,
@@ -500,8 +527,8 @@ fn every_contract_item_is_accounted_for() {
         .collect();
     assert_eq!(
         deferred,
-        BTreeSet::from([5, 7, 8, 9, 10]),
-        "exactly items 5 and 7-10 are S4's, per the ratified re-cut"
+        BTreeSet::from([7, 8, 9, 10]),
+        "items 7-10 are still S4's; item 5 closed in Y2 (register row 5 edit)"
     );
 
     // And every deferral has to say so in words a reader can check, not just

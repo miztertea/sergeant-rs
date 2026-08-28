@@ -200,3 +200,12 @@ cov_stage_end 1 "the x4_tabular_map test binary must write its own profile"
 cov_stage_begin c2-x5_a1a_acceptance
 cov_run cargo llvm-cov --no-report --test x5_a1a_acceptance --locked || cov_fail "x5_a1a_acceptance failed under instrumentation"
 cov_stage_end 1 "the x5_a1a_acceptance test binary must write its own profile"
+
+# S4 Y2, wired at birth (the #231 lesson, same as x1/x5 above): the
+# replaceability boundary's structural pin. A token scan of this repository's
+# own `.rs` sources under `src/`/`tests/` — no daemon, no estate, no
+# subprocess of any kind — which is why it is here rather than with the
+# spawning suites. Floor 1.
+cov_stage_begin c2-y2_office_boundary
+cov_run cargo llvm-cov --no-report --test y2_office_boundary --locked || cov_fail "y2_office_boundary failed under instrumentation"
+cov_stage_end 1 "the y2_office_boundary test binary must write its own profile"

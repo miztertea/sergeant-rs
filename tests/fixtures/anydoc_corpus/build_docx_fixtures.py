@@ -221,6 +221,23 @@ def build_05_malformed(out_dir):
         z.writestr("word/_rels/document.xml.rels", DOC_RELS_TEMPLATE.format(extra=""))
 
 
+def build_06_hostile_entry_expansion(out_dir):
+    # S4 Y2's hostile-input case (brief item 4's "consider also a hostile
+    # case that stresses the deadline or the memory cap through the real
+    # adapter path"): a genuinely well-formed .docx whose word/document.xml
+    # entry decompresses well past anydoc's own package::limits::MAX_ENTRY_BYTES
+    # (128 MiB, at the version this corpus was built against). One giant
+    # repeated-character run compresses to a tiny on-disk file via DEFLATE
+    # (classic zip-bomb ratio) while still being ordinary, well-formed OOXML
+    # -- distinct from fixture 05, which is hostile via malformed XML, not
+    # via size. Not part of manifest.json's exact-match corpus: this fixture
+    # proves a resource-limit *refusal*, not a content count.
+    target_decompressed_bytes = 140 * 1024 * 1024  # > MAX_ENTRY_BYTES (128 MiB)
+    huge_run = "A" * target_decompressed_bytes
+    body = para(huge_run)
+    write_docx(os.path.join(out_dir, "06-hostile-entry-expansion.docx"), body)
+
+
 if __name__ == "__main__":
     out_dir = sys.argv[1]
     os.makedirs(out_dir, exist_ok=True)
@@ -229,4 +246,5 @@ if __name__ == "__main__":
     build_03_table(out_dir)
     build_04_footnotes_headers_footers(out_dir)
     build_05_malformed(out_dir)
+    build_06_hostile_entry_expansion(out_dir)
     print("built fixtures in", out_dir)

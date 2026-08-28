@@ -1,4 +1,5 @@
-//! `sgt-atlas-worker` — the supervised parse-worker binary (S4 Y1, G2).
+//! `sgt-atlas-worker` — the supervised parse-worker binary (S4 Y1, G2; the
+//! real Office adapter, Y2, G3).
 //!
 //! Spawned by [`sergeant_rs::runtime::atlas::worker::run_worker`], never run
 //! directly by an operator: reads the resource bytes to extract from stdin,
@@ -7,16 +8,30 @@
 //! path to that database at all, which is what makes "a worker never opens
 //! the store" true structurally rather than by convention.
 //!
-//! # Y1's body is a seam, not a placeholder to delete
+//! # Extraction is chosen by `--extractor`, exactly as it is in-process
 //!
-//! No third-party parser exists until Y2's Anydoc spike, so the normal path
-//! below is deliberately trivial — one [`UnitKind::Document`] unit for
-//! UTF-8 input, none for anything else — while still exercising every real
-//! part of the wire contract (identity fields, declared children) that a
-//! Y2+ adapter will fill in for real. The CLI surface (bytes on stdin, a
-//! [`WorkerBatch`] on stdout, `--generation`/`--extractor` naming the job) is
-//! meant to outlive Y1; only the extraction inside `normal_batch` is meant to
-//! be replaced.
+//! `--extractor` is dispatched on, not merely echoed: a value equal to
+//! [`office::DOCX_EXTRACTOR`] runs the real Office adapter
+//! ([`office::docx_units`]) over stdin; anything else falls through to the
+//! trivial UTF-8-whole-document body Y1 shipped. This mirrors exactly how
+//! `runtime::atlas::scan::extract_units` already dispatches on the same
+//! extractor-identity strings in-process (R2) — the wire contract's
+//! `extractor` field was always meant to be the dispatch key, once a second
+//! real adapter existed to dispatch to.
+//!
+//! # A failed extraction exits non-zero — it never emits an empty batch
+//!
+//! [`office::docx_units`] returning `Err` is **not** reported as a
+//! `WorkerBatch` with zero units: that would be indistinguishable on the
+//! wire from a document that genuinely extracted to nothing, which is
+//! exactly the "silent empty" F8 forbids (coverage honesty, brief item 5).
+//! Instead this process prints the error and exits non-zero — the existing
+//! [`WorkerFault::ExitedNonZero`](sergeant_rs::runtime::atlas::worker)
+//! path Y1 already built, reused rather than given a second wire shape (R2):
+//! the daemon-side transport already turns any non-zero exit into a named
+//! `Coverage::Error` row with the stderr tail attached, which is exactly
+//! what a real parser failure needs and nothing a wire-schema change would
+//! add.
 //!
 //! # `--fault`: the test-only fixture modes Y1's acceptance needs
 //!
@@ -36,6 +51,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use sergeant_rs::domain::source::UnitKind;
+use sergeant_rs::runtime::atlas::office;
 use sergeant_rs::runtime::atlas::worker::{DeclaredChild, WorkerBatch, WorkerUnit};
 
 /// One process-level misbehavior this binary can perform on command, in
@@ -107,7 +123,19 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
 
-    let batch = normal_batch(&args, &input);
+    let batch = match normal_batch(&args, &input) {
+        Ok(batch) => batch,
+        Err(detail) => {
+            // Not an empty `WorkerBatch` — see this file's own module doc,
+            // "A failed extraction exits non-zero". `resource_hash`/
+            // `generation`/`extractor` are never emitted either, because
+            // nothing about this outcome is a batch: exiting non-zero here
+            // is what turns into `WorkerFault::ExitedNonZero` daemon-side,
+            // the same fault class Y1's own fixture modes already exercise.
+            eprintln!("sgt-atlas-worker: extraction failed: {detail}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let Ok(json) = serde_json::to_vec(&batch) else {
         eprintln!("sgt-atlas-worker: could not serialize its own batch");
         return std::process::ExitCode::FAILURE;
@@ -119,29 +147,64 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-/// Y1's trivial, honestly-labeled body: one [`UnitKind::Document`] unit
-/// spanning the whole input when it decodes as UTF-8, no units when it does
-/// not. `resource_hash` is computed here, independently of anything the
-/// daemon sent — the whole point of [`sergeant_rs::runtime::atlas::worker::validate_batch`]
-/// is that the daemon never simply trusts this value back.
-fn normal_batch(args: &Args, input: &[u8]) -> WorkerBatch {
+/// Extraction, dispatched on `--extractor` (this file's own module doc).
+/// `resource_hash` is computed here, independently of anything the daemon
+/// sent — the whole point of
+/// [`sergeant_rs::runtime::atlas::worker::validate_batch`] is that the
+/// daemon never simply trusts this value back.
+///
+/// `Err` names why extraction failed, in one line — this process's `main`
+/// prints it to stderr and exits non-zero rather than ever emitting a batch
+/// (F8 coverage honesty: no partial units, never a silent empty).
+fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
     let resource_hash = blake3::hash(input).to_hex().to_string();
-    let units = match std::str::from_utf8(input) {
-        Ok(text) => vec![WorkerUnit {
-            kind: UnitKind::Document,
-            byte_start: 0,
-            byte_end: input.len() as u64,
-            text: text.to_string(),
-        }],
-        Err(_) => Vec::new(),
+    let units = if args.extractor == office::DOCX_EXTRACTOR {
+        office::docx_units(input)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|unit| {
+                // The whole-document unit truthfully spans the whole input,
+                // in any container format — that much is always recoverable,
+                // matching Y1's own whole-resource convention. A Section
+                // unit is not byte-recoverable (`office::OfficeUnit`'s own
+                // doc): `0`/`0` names "not applicable" honestly rather than
+                // a real span, and `coordinate` carries what actually is
+                // recoverable for it.
+                let (byte_start, byte_end) = match unit.kind {
+                    UnitKind::Document => (0, input.len() as u64),
+                    UnitKind::Section => (0, 0),
+                };
+                WorkerUnit {
+                    kind: unit.kind,
+                    byte_start,
+                    byte_end,
+                    coordinate: unit.coordinate,
+                    text: unit.text,
+                }
+            })
+            .collect()
+    } else {
+        // Y1's trivial, honestly-labeled fallback body: one
+        // [`UnitKind::Document`] unit spanning the whole input when it
+        // decodes as UTF-8, no units when it does not.
+        match std::str::from_utf8(input) {
+            Ok(text) => vec![WorkerUnit {
+                kind: UnitKind::Document,
+                byte_start: 0,
+                byte_end: input.len() as u64,
+                coordinate: None,
+                text: text.to_string(),
+            }],
+            Err(_) => Vec::new(),
+        }
     };
-    WorkerBatch {
+    Ok(WorkerBatch {
         generation_id: args.generation.clone(),
         resource_hash,
         extractor: args.extractor.clone(),
         units,
         declared_children: args.declared_children.clone(),
-    }
+    })
 }
 
 /// Perform one fixture fault and end the process — every arm ends this

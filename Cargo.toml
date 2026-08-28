@@ -95,6 +95,22 @@ duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
 # build, plus `bstr` and `fnv`.
 globset = { version = "0.4.20", default-features = false }
 include_dir = { version = "0.7.4", default-features = false }
+# S4 Y2 (G3): the office adapter's own recovery watch
+# (`runtime/atlas/office.rs`) needs the `log` facade directly — anydoc's own
+# module doc names it as the sanctioned signal ("Recovery and skipped-content
+# events are reported through the log facade (debug/warn level)"), and the
+# adapter installs a tiny in-process `log::Log` that notices whether anydoc
+# had to *recover* from a well-formedness problem (a mismatched/unclosed
+# element) rather than trusting its lenient default of returning `Ok` with
+# partially-repaired content — see that module for why gate (b)'s fixture 05
+# requires this. Rungs: R2 fails (nothing in this crate already watches a log
+# facade for this), R3/R4 fail (no such signal exists outside the crate that
+# emits it), R5 rather than R7 — `log` is already resolved in this graph
+# (anydoc's own dependency), so declaring it directly adds a line here and
+# ZERO packages to `Cargo.lock` (verified: package count unchanged). Pinned to
+# the same `0.4` line anydoc itself resolves to, so there is one `log` in the
+# graph, not a second one Cargo could resolve differently.
+log = "0.4"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"] }

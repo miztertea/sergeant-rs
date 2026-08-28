@@ -59,6 +59,33 @@ not a partial credit.
 Every exact count is in `manifest.json`, not restated here, so there is
 exactly one place that can drift.
 
+## Fixture 06 — hostile entry expansion (not part of the exact-match corpus)
+
+Added in S4 Y2, alongside the adapter itself, for the wave brief's own
+"consider also a hostile case that stresses the deadline or the memory cap
+through the real adapter path." `06-hostile-entry-expansion.docx` is a
+genuinely well-formed OOXML package — it is not testing malformed-XML
+detection, fixture 05 already does that — whose `word/document.xml` entry
+holds one giant repeated-character text run (140 MiB of the byte `A`,
+`build_docx_fixtures.py`'s `build_06_hostile_entry_expansion`) that DEFLATE
+compresses to ~140 KB on disk: a classic zip-bomb ratio, chosen specifically
+to land past `anydoc::package::limits::MAX_ENTRY_BYTES` (128 MiB at the
+version this corpus was built against) while staying comfortably under the
+supervised worker's own 512 MiB `RLIMIT_AS` address-space cap
+(`runtime/atlas/worker.rs::WORKER_ADDRESS_SPACE_LIMIT_BYTES`) — so the
+failure this fixture proves is deterministic (a bounded-read size check, not
+a race against host memory pressure or a deadline), and it proves anydoc's
+*own* resource-limit defense on the real parser path, one layer inside the
+worker's outer memory cap.
+
+Not in `manifest.json` and not subject to gate (b)'s exact-match criterion —
+there is no hand-verifiable "correct" paragraph/heading count for a
+document whose whole point is that no extractor should ever finish
+extracting it. Its own pass criterion is stated where it is tested:
+`runtime/atlas/office.rs`'s `hostile_entry_expansion_trips_anydocs_own_resource_limit`
+(direct, in-process) and `tests/y2_office_adapter.rs` (through the real
+supervised worker subprocess).
+
 ## Independent cross-check (reproducible)
 
 Run from this directory:

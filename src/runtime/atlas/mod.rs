@@ -97,6 +97,11 @@
 //! ```text
 //! deny    ── pure predicate over a path (F10, the acquisition boundary)
 //! text    ── pure functions over bytes, and the structure-unit routing table
+//! office  ── the same, for Office documents (S4 Y2, G3): the one module
+//!            that may name the third-party document-conversion crate it
+//!            adopts, pinned structurally by `tests/y2_office_boundary.rs`
+//!            — bytes in, our own Document/Section vocabulary out, no type
+//!            of that crate crossing the boundary
 //! syntax  ── the same, for symbols/imports: one grammar per claimed
 //!            language, and the symbol routing table (X3b)
 //! tabular ── the dataset routing table, F10a's column allowlist, and row
@@ -148,6 +153,7 @@ pub mod db;
 pub mod deny;
 pub mod git;
 pub mod lane;
+pub mod office;
 pub mod overlay;
 pub mod record;
 pub mod scan;

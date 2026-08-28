@@ -124,3 +124,17 @@ cov_stage_end 2 "y1_worker_transport spawns real sgt-atlas-worker subprocesses i
 and batch-refusal cases; more than the test binary's own profile must arrive, or no subprocess \
 flushed (the abort/hang/allocate fault cases are expected to flush nothing, by the same logic \
 v1d's SIGKILLed daemons do not)"
+
+# S4 Y2, wired at birth (the #231 lesson, same as y1 above): the real-parser
+# supervision proof, through the real `sgt-atlas-worker` subprocess and the
+# real Office adapter — the happy path and every malformed/hostile fixture
+# case. Unlike y1's fault-injection modes, none of these cases are SIGKILLed
+# or SIGABRTed: a bad document is refused by an ordinary non-zero exit, so
+# every case here is expected to flush a subprocess profile. Floor 2, not
+# higher, for the same reason y1's is: the test binary's own profile plus at
+# least one flushed worker.
+cov_stage_begin c3-y2_office_adapter
+cov_run cargo llvm-cov --no-report --test y2_office_adapter --locked || cov_fail "y2_office_adapter failed under instrumentation"
+cov_stage_end 2 "y2_office_adapter spawns real sgt-atlas-worker subprocesses in every case \
+(the happy path and both real-parser failure fixtures all exit normally, none are signalled); \
+more than the test binary's own profile must arrive, or no subprocess flushed"
