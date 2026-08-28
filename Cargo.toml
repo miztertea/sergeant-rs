@@ -111,6 +111,15 @@ include_dir = { version = "0.7.4", default-features = false }
 # the same `0.4` line anydoc itself resolves to, so there is one `log` in the
 # graph, not a second one Cargo could resolve differently.
 log = "0.4"
+# S4 Y4 (G4, gate a — PROVISIONAL pending gates b/c): `.eml` message
+# parsing. `mail-parser` is the contract's named candidate
+# (brief-y4-mail.md; sprint-plan-2026-08-27.md's G4), not pre-ratified
+# (A1-16) — evaluated here, not assumed. `full_encoding` pulls
+# `encoding_rs` so non-UTF-8 charsets (gate (b)'s encoding-zoo fixture)
+# decode rather than lossy-replace; `default` alone has no charset
+# fallback beyond UTF-8/ASCII per the crate's own feature table
+# (`cargo info mail-parser`). Record: tests/fixtures/mail_corpus/SPIKE-G4.md.
+mail-parser = { version = "0.11.8", features = ["full_encoding"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"] }

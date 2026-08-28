@@ -1,0 +1,20 @@
+From: Grace Grant <grace@example.com>
+To: Henry Huang <henry@example.com>
+Subject: Report attached
+Date: Wed, 14 Jan 2026 08:30:00 +0000
+Message-ID: <fixture03-attach@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="MIX-BOUNDARY-03"
+
+--MIX-BOUNDARY-03
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+Please find the attached report.
+--MIX-BOUNDARY-03
+Content-Type: text/plain; name="report.txt"
+Content-Disposition: attachment; filename="report.txt"
+Content-Transfer-Encoding: base64
+
+UmVwb3J0IGJvZHkgbGluZSBvbmUuClJlcG9ydCBib2R5IGxpbmUgdHdvLg==
+--MIX-BOUNDARY-03--

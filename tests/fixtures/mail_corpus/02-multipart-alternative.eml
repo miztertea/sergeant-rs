@@ -1,0 +1,21 @@
+From: Carol Chen <carol@example.com>
+To: Dave Diallo <dave@example.com>, Elena Petrova <elena@example.com>
+Cc: Frank Osei <frank@example.com>
+Subject: Alternative body demo
+Date: Tue, 13 Jan 2026 11:00:00 +0000
+Message-ID: <fixture02-alt@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="ALT-BOUNDARY-02"
+
+This is a multi-part message in MIME format.
+--ALT-BOUNDARY-02
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+Plain-text alternative body.
+--ALT-BOUNDARY-02
+Content-Type: text/html; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+<html><body><p>HTML alternative body.</p></body></html>
+--ALT-BOUNDARY-02--

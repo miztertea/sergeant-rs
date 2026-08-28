@@ -1,0 +1,5 @@
+This file is not shaped like an RFC 5322 message at all.
+There is no header block above a blank-line body separator --
+every line here is prose, none of them is a Name-colon-value pair,
+so a conformant parser has no header field to recover and must
+refuse to produce a Message rather than guess one into existence.

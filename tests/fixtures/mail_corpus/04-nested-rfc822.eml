@@ -1,0 +1,28 @@
+From: Irene Ionescu <irene@example.com>
+To: Jack Jensen <jack@example.com>
+Subject: Forwarded thread
+Date: Thu, 15 Jan 2026 10:00:00 +0000
+Message-ID: <fixture04-outer@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="NEST-BOUNDARY-04"
+
+--NEST-BOUNDARY-04
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+See the forwarded message below.
+--NEST-BOUNDARY-04
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="original.eml"
+
+From: Karen Kowalski <karen@example.com>
+To: Irene Ionescu <irene@example.com>
+Subject: Original note
+Date: Wed, 14 Jan 2026 09:00:00 +0000
+Message-ID: <fixture04-inner@example.com>
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+This is the original message text, now nested one level deep.
+
+--NEST-BOUNDARY-04--
