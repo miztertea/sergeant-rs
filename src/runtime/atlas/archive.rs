@@ -119,14 +119,39 @@
 //! normalised rewrite of it, matches this codebase's "derived output cites
 //! the original" rule (A1-12) applied to a container entry's own identity.
 //!
-//! Known, stated limitation: `str::to_lowercase` performs Unicode's default
-//! (locale-independent) case conversion, which does not special-case a
-//! handful of locale-specific mappings (Turkish dotless ı, for instance).
-//! Accepted as an honest approximation — the same posture this codebase
-//! already takes for provisional numeric ceilings (module doc, "Bounds") —
-//! rather than pulling in a full locale-aware case-folding stack for a
-//! collision heuristic whose authoritative defence is the byte-identical
-//! duplicate-name check above it, not this one.
+//! Known, stated limitation, kept rather than closed (J2 — delegated,
+//! bounded review judgment: weighed below, not auto-applied): `str::
+//! to_lowercase` is Unicode *default case conversion*, not full Unicode
+//! *case folding* (Unicode's own `CaseFolding.txt`), and the two
+//! deliberately disagree on some pairs. Two concrete pairs that collide
+//! under full case folding but do not collide here: German `ß` folds to
+//! `ss`, which is also what `SS`/`Ss` fold to, but `to_lowercase` leaves
+//! `ß` as `ß` (it has no simple lowercase mapping), so `straße.txt` and
+//! `STRASSE.txt` are correctly *not* flagged as colliding by this check;
+//! Greek final sigma `ς` folds identically to medial sigma `σ`, but
+//! `to_lowercase` on capital `Σ` always yields `σ` regardless of word
+//! position, so a name using `ς` and one using `σ` in the corresponding
+//! spot are likewise left undeduplicated. `to_lowercase` also performs
+//! Unicode's *locale-independent* mapping, so a handful of locale-specific
+//! conversions (Turkish dotless `ı`/dotted `İ`) are out of scope the same
+//! way.
+//!
+//! Kept rather than closed: this codebase never writes an admitted entry
+//! to disk (module doc, "Bounds" — everything downstream reads the byte
+//! stream this module already validated), so the filesystem-overwrite
+//! scenario a case-folding collision usually defends against does not
+//! apply here — the only consequence of missing one of these pairs is
+//! that two entries this check would rather have deduplicated are both
+//! admitted as distinct children, not that one silently clobbers the
+//! other on disk. Closing it means adding a new dependency (full Unicode
+//! case folding is not in `str`, `unicode-normalization`, or anything
+//! else already in this graph — R5 fails) for a heuristic whose
+//! authoritative defence is the byte-identical duplicate-name check
+//! above it, not this one. An honest, precisely-scoped limitation is
+//! judged the better trade than that dependency for this low-stakes a
+//! gap; if the stakes here ever change (e.g. this module starts writing
+//! admitted entries to a case-insensitive or fold-aware destination),
+//! this judgment should be revisited.
 //!
 //! # Closing the research's open item: quines and overlapping entries
 //!
@@ -188,8 +213,17 @@
 //! independently-tuned numbers with evidence for neither.
 //!
 //! * [`MAX_ZIP_ENTRIES`] — refuses the WHOLE archive, before any entry
-//!   opens, when the central directory declares more than this many records.
-//!   **Not** a defence against the archive-open cost itself: a central
+//!   opens AND before the `has_overlapping_files` scan above runs, when the
+//!   central directory declares more than this many records. That second
+//!   half is load-bearing, not incidental: `has_overlapping_files` is
+//!   quadratic in entry count (its own doc comment above), so this cap has
+//!   to be the very first thing checked once the archive opens — checked
+//!   from `archive.len()`, an O(1) read of the central directory this
+//!   module already parsed to open the archive, never from re-scanning
+//!   anything — or a small, cheaply-constructed archive with an inflated
+//!   entry count could force that O(N²) scan to completion before this
+//!   refusal ever got a chance to fire. **Not** a defence against the
+//!   archive-open cost itself: a central
 //!   directory this large needs real backing bytes on disk (each record is
 //!   a real struct plus a real filename string, unlike `size()`, which is a
 //!   single lied-about integer disconnected from any real content) — so the
@@ -536,9 +570,46 @@ fn expand_at_depth(
         }
     };
 
+    // The entry-count ceiling is checked FIRST, before any other
+    // post-open work — including the overlap scan below. `archive.len()`
+    // is `self.shared.files.len()` (VERIFIED against `zip` 8.6.0's own
+    // `read/zip_archive.rs`): an O(1) read of the central directory this
+    // module already had to parse to open the archive at all, so nothing
+    // unbounded runs ahead of this refusal. This ordering is load-bearing,
+    // not cosmetic: `has_overlapping_files` (moved below, module doc
+    // "Closing the research's open item") is quadratic in entry count —
+    // VERIFIED against the same source, it compares each entry's data
+    // range against every previously registered range — so a small,
+    // well-formed archive declaring an entry count far past this ceiling
+    // (tens of thousands of empty entries costs an attacker almost
+    // nothing to construct) previously forced that O(N²) scan to
+    // completion before this cheap cap ever got a chance to refuse it.
+    // Putting the cap first is what makes it the cheap gate the rest of
+    // this function's cost analysis assumes.
+    let declared_count = archive.len();
+    if declared_count > MAX_ZIP_ENTRIES {
+        coverage.push(CoverageRow {
+            path: None,
+            status: Coverage::Unsupported,
+            detail: Some(format!(
+                "archive declares {declared_count} entries, exceeding the \
+                 {MAX_ZIP_ENTRIES}-entry MAX_ZIP_ENTRIES ceiling; refused before any entry was \
+                 opened and before the overlap scan ran"
+            )),
+            bytes: Some(bytes.len() as u64),
+        });
+        return ZipExpansion {
+            children,
+            coverage,
+            total_expanded_bytes: 0,
+        };
+    }
+
     // Close the research's open item BEFORE any entry is opened (module
     // doc, "Closing the research's open item"): a quine/overlap-shaped
-    // archive refuses whole, never partially.
+    // archive refuses whole, never partially. Runs AFTER the entry-count
+    // cap immediately above — see that check's own comment for why the
+    // order matters.
     match archive.has_overlapping_files() {
         Ok(true) => {
             coverage.push(CoverageRow {
@@ -576,25 +647,6 @@ fn expand_at_depth(
                 total_expanded_bytes: 0,
             };
         }
-    }
-
-    let declared_count = archive.len();
-    if declared_count > MAX_ZIP_ENTRIES {
-        coverage.push(CoverageRow {
-            path: None,
-            status: Coverage::Unsupported,
-            detail: Some(format!(
-                "archive declares {declared_count} entries, exceeding the \
-                 {MAX_ZIP_ENTRIES}-entry MAX_ZIP_ENTRIES ceiling; refused before any entry was \
-                 opened"
-            )),
-            bytes: Some(bytes.len() as u64),
-        });
-        return ZipExpansion {
-            children,
-            coverage,
-            total_expanded_bytes: 0,
-        };
     }
 
     let mut seen_paths: BTreeSet<String> = BTreeSet::new();
@@ -1892,6 +1944,123 @@ mod tests {
                 .unwrap_or_default()
                 .contains("overlapping"),
             "{row:?}"
+        );
+    }
+
+    /// FIX 1 regression: the entry-count cap must be checked BEFORE the
+    /// quadratic `has_overlapping_files` scan, not after it. A fixture that
+    /// is both over the [`MAX_ZIP_ENTRIES`] cap AND contains a genuine
+    /// overlapping pair is the decisive test for the ORDER, not just the
+    /// outcome — an archive this shaped is refused either way (both checks
+    /// independently refuse it), so a test that only asserts "no children
+    /// admitted" would pass under the old, wrong order too. What actually
+    /// distinguishes the two orderings is WHICH coverage row fires: under
+    /// the old order (overlap scan first) this fixture is refused by the
+    /// overlap row; under the fixed order (cap first) it is refused by the
+    /// entry-count row, and the quadratic overlap scan never runs at all.
+    /// Asserting the entry-count row is therefore a test that would have
+    /// FAILED against the pre-fix code (it would have observed the overlap
+    /// row instead) — a true regression test for the reordering, not a
+    /// restatement of "both checks work."
+    #[test]
+    fn entry_count_cap_is_checked_before_the_overlap_scan_not_after_it() {
+        // Entry 0 carries real (non-empty) content — `has_overlapping_files`
+        // skips any entry whose `compressed_size == 0` outright (`zip`
+        // 8.6.0's own `read/zip_archive.rs`), so an overlap fixture needs at
+        // least one non-empty pair to have anything for that scan to catch.
+        // Every filler entry after it is empty and cheap to construct.
+        let mut owned: Vec<(String, Vec<u8>)> =
+            vec![("first.bin".to_string(), b"payload".to_vec())];
+        owned.extend((1..=MAX_ZIP_ENTRIES).map(|i| (format!("f{i}.txt"), Vec::new())));
+        let entries: Vec<(&str, &[u8])> = owned
+            .iter()
+            .map(|(name, content)| (name.as_str(), content.as_slice()))
+            .collect();
+        let bytes = build(&entries);
+        assert_eq!(entries.len(), MAX_ZIP_ENTRIES + 1, "already over the cap");
+
+        // Hand-splice a duplicate of entry 0's own central-directory record
+        // (same technique as the overlap test above) so a second entry
+        // claims entry 0's identical compressed-data byte range, WITHOUT
+        // disturbing any of the other central-directory records already
+        // present — this must land as one MORE record on top of the
+        // over-the-cap count above, not a replacement fixture.
+        let cd_signature = [0x50, 0x4B, 0x01, 0x02];
+        let cd_start = bytes
+            .windows(4)
+            .position(|w| w == cd_signature)
+            .expect("at least one central directory record");
+        let name_len = u16::from_le_bytes([bytes[cd_start + 28], bytes[cd_start + 29]]) as usize;
+        assert_eq!(
+            &bytes[cd_start + 46..cd_start + 46 + name_len],
+            b"first.bin",
+            "the first CD signature found must belong to entry 0"
+        );
+        let first_record_end = cd_start + 46 + name_len;
+        let mut duplicate_record = bytes[cd_start..first_record_end].to_vec();
+        let new_name = b"dup-of-first.bin";
+        duplicate_record[28..30].copy_from_slice(&(new_name.len() as u16).to_le_bytes());
+        duplicate_record.truncate(46);
+        duplicate_record.extend_from_slice(new_name);
+
+        let mut spliced = bytes[..first_record_end].to_vec();
+        spliced.extend_from_slice(&duplicate_record);
+        spliced.extend_from_slice(&bytes[first_record_end..]);
+
+        // Patch the (unique — no filename in this fixture contains
+        // `PK\x05\x06`) end-of-central-directory record: entry count +1,
+        // central-directory size grown by the duplicate record's length.
+        let eocd_signature = [0x50, 0x4B, 0x05, 0x06];
+        let eocd_start = spliced
+            .windows(4)
+            .position(|w| w == eocd_signature)
+            .expect("end-of-central-directory record");
+        let old_total: u16 =
+            u16::from_le_bytes([spliced[eocd_start + 10], spliced[eocd_start + 11]]);
+        let new_total = old_total + 1;
+        spliced[eocd_start + 8..eocd_start + 10].copy_from_slice(&new_total.to_le_bytes());
+        spliced[eocd_start + 10..eocd_start + 12].copy_from_slice(&new_total.to_le_bytes());
+        let old_cd_size = u32::from_le_bytes([
+            spliced[eocd_start + 12],
+            spliced[eocd_start + 13],
+            spliced[eocd_start + 14],
+            spliced[eocd_start + 15],
+        ]);
+        let new_cd_size = old_cd_size + duplicate_record.len() as u32;
+        spliced[eocd_start + 12..eocd_start + 16].copy_from_slice(&new_cd_size.to_le_bytes());
+
+        // Fixture sanity: `zip` itself must see this as both over the cap
+        // AND genuinely overlapping, or this test proves nothing about
+        // ordering.
+        let mut sanity =
+            zip::ZipArchive::new(Cursor::new(&spliced)).expect("the spliced archive must open");
+        assert_eq!(
+            sanity.len(),
+            MAX_ZIP_ENTRIES + 2,
+            "over the cap by construction"
+        );
+        assert!(
+            sanity.has_overlapping_files().expect("overlap check runs"),
+            "fixture sanity: the crate itself must observe the overlap"
+        );
+
+        let expansion = expand(&spliced, "parent-key");
+        assert!(expansion.children.is_empty(), "{:?}", expansion.children);
+        assert_eq!(expansion.coverage.len(), 1, "{:?}", expansion.coverage);
+        let row = &expansion.coverage[0];
+        assert_eq!(row.path, None, "an archive-level refusal");
+        assert_eq!(row.status, Coverage::Unsupported);
+        let detail = row.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("MAX_ZIP_ENTRIES"),
+            "the entry-count cap must fire FIRST — a pre-fix build would instead observe an \
+             \"overlapping\" row here, because the quadratic overlap scan ran before this cap \
+             ever got a chance to refuse the archive: {row:?}"
+        );
+        assert!(
+            !detail.contains("overlapping"),
+            "the overlap scan must never run once the entry-count cap has already refused the \
+             archive: {row:?}"
         );
     }
 
