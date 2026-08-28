@@ -334,6 +334,13 @@ pub fn git_fetch_restricted(
     deadline: std::time::Duration,
 ) -> Result<String, GitError> {
     let local_ref = "refs/heads/_external_fetch_";
+    // Recovery from a SIGKILL'd prior attempt (review finding, S4 Y5 fix):
+    // [`run_supervised`] kills a fetch's whole process group on either a
+    // timeout or a daemon restart racing an in-flight fetch, and a
+    // SIGKILL'd `git` cannot run its own lock-file cleanup. Cleared before
+    // every attempt, not only after a timeout caught here, because the
+    // process that left one behind may not have been this call at all.
+    clear_stale_fetch_locks(dest_path, local_ref);
     let args_owned = [
         "fetch".to_string(),
         "--depth".to_string(),
@@ -346,6 +353,54 @@ pub fn git_fetch_restricted(
     let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
     run_supervised(dest_path, &args_ref, allow_protocol, deadline)?;
     git(dest_path, &["rev-parse", "--verify", local_ref])
+}
+
+/// Remove the lock files a `git fetch --depth 1` into a bare repository can
+/// leave behind when it is killed mid-write, rather than exiting normally
+/// (review finding, S4 Y5 fix — a killed fetch permanently wedges the cache
+/// with no recovery verb). Git's own locking discipline for every one of
+/// these paths is write-then-rename-on-success: a `<name>.lock` file next to
+/// `<name>`, held for the duration of the update and renamed over `<name>`
+/// only on success. A process that exits normally (including a normal
+/// failure — a rejected ref, a network error) always reaches that rename or
+/// explicitly unlinks its own lock; only a `SIGKILL` — [`kill_process_group`]
+/// on [`run_supervised`]'s timeout path, or a daemon process itself killed
+/// mid-fetch — skips both, leaving the lock sitting in the repository. Git
+/// does not detect or clear a stale lock itself; it refuses to fetch into a
+/// directory that already holds one ("File exists"). So this call removes
+/// each of them, best-effort, before every attempt (not only after a
+/// timeout this process itself observed): the previous holder may have been
+/// a different process entirely (a daemon restart racing an in-flight
+/// fetch), and there is nothing else in this codebase that ever clears one.
+///
+/// [`kill_process_group`]: crate::backend::child::kill_process_group
+///
+/// Named rather than a directory-wide sweep: these four are every lock file
+/// this call's own `git fetch --depth 1 --no-tags -- <locator>
+/// <refspec>:<local_ref>` can create for a bare repository with no other
+/// concurrent writer —
+/// [`shallow`](https://github.com/git/git/blob/master/Documentation/technical/shallow.adoc)
+/// (the `--depth 1` history boundary, rewritten via `shallow.lock` on every
+/// shallow fetch), `FETCH_HEAD` (written on every fetch), `packed-refs`
+/// (rewritten if the fetch packs refs), and `<local_ref>.lock` (the fixed
+/// local ref this module always updates) — never a wildcard removal of
+/// anything matching `*.lock`, which could delete a lock a concurrent,
+/// still-running Git process legitimately holds.
+///
+/// A removal failure (permissions, or — the ordinary case — the lock simply
+/// not being there) is not itself an error: this is recovery from a state
+/// that usually does not exist, and if a lock genuinely cannot be cleared
+/// the fetch below fails with Git's own "File exists" diagnostic anyway,
+/// which is a more useful report than one manufactured here.
+fn clear_stale_fetch_locks(dest_path: &Path, local_ref: &str) {
+    for candidate in [
+        dest_path.join("shallow.lock"),
+        dest_path.join("FETCH_HEAD.lock"),
+        dest_path.join("packed-refs.lock"),
+        dest_path.join(format!("{local_ref}.lock")),
+    ] {
+        let _ = std::fs::remove_file(candidate);
+    }
 }
 
 /// One supervised Git invocation: hardened (own process group,
@@ -767,6 +822,59 @@ mod tests {
         assert!(
             !cache.path().join("a.txt").exists(),
             "a bare fetch never materializes a working tree"
+        );
+    }
+
+    /// A killed prior fetch's residue must not permanently wedge the cache
+    /// (review finding, S4 Y5 fix): a `shallow.lock` and a
+    /// `refs/heads/_external_fetch_.lock` planted in the bare cache BEFORE
+    /// this call — standing in for exactly what a `SIGKILL`'d earlier
+    /// `git_fetch_restricted` mid-write would have left behind, since a
+    /// killed process cannot run its own lock-file cleanup — must not stop
+    /// this attempt from succeeding. Without [`clear_stale_fetch_locks`],
+    /// Git refuses with "File exists" and the mount is wedged with no
+    /// recovery short of a manual filesystem edit; this proves the next
+    /// acquisition of the same source recovers on its own.
+    #[test]
+    fn a_stale_lock_left_by_a_killed_prior_fetch_does_not_wedge_the_next_one() {
+        let origin = tempfile::TempDir::new().expect("origin dir");
+        git(origin.path(), &["init", "--initial-branch=main"]).expect("init");
+        git(origin.path(), &["config", "user.email", "t@example.com"]).expect("email");
+        git(origin.path(), &["config", "user.name", "T"]).expect("name");
+        std::fs::write(origin.path().join("a.txt"), "one").expect("write");
+        git(origin.path(), &["add", "-A"]).expect("add");
+        git(origin.path(), &["commit", "-m", "one"]).expect("commit");
+        let tip = git(origin.path(), &["rev-parse", "HEAD"]).expect("rev-parse");
+
+        let cache = tempfile::TempDir::new().expect("cache dir");
+        git_init_bare(cache.path()).expect("init bare");
+
+        // Plant the exact residue a SIGKILL mid-fetch leaves: a shallow-file
+        // lock (this fetch always runs `--depth 1`) and a lock on the fixed
+        // local ref this module always updates — both still open (never
+        // renamed over their target), because the process that held them
+        // never got to finish.
+        std::fs::write(cache.path().join("shallow.lock"), b"stale").expect("plant shallow.lock");
+        std::fs::create_dir_all(cache.path().join("refs/heads")).expect("mkdir refs/heads");
+        std::fs::write(
+            cache.path().join("refs/heads/_external_fetch_.lock"),
+            b"stale",
+        )
+        .expect("plant ref lock");
+
+        let origin_url = format!("file://{}", origin.path().display());
+        let resolved = git_fetch_restricted(
+            cache.path(),
+            &origin_url,
+            "main",
+            "file",
+            std::time::Duration::from_secs(10),
+        )
+        .expect("a stale lock from a killed prior attempt must not wedge this one");
+        assert_eq!(resolved, tip, "the fetch still resolves the origin's tip");
+        assert!(
+            !cache.path().join("shallow.lock").exists(),
+            "the stale lock must actually be gone, not merely bypassed"
         );
     }
 

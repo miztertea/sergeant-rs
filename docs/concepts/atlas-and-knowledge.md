@@ -88,10 +88,10 @@ The daemon is Atlas's writer. Clients ask it questions over the API; they do not
 | D5 | Repositories are indexed from the object store at the admission-pinned commit; a `HEAD` that moves mid-scan is reported as drift, never blended into the result. |
 | D6 | A generation is superseded on either of two triggers — the bytes it was derived from changed, or the extractor identities that read them changed — and the superseded generation leaves an explicit eviction row rather than vanishing. A re-scan finding the same bytes *and* the same extractors writes and evicts nothing. |
 | D7 | `sgt knowledge scan` is the scan trigger; scheduling and cadence stay unbuilt on purpose. `sgt intelligence add`/`list` acquires an external Git source into a bare, no-working-tree host cache outside every estate, at an allowlisted `https://`/`ssh://` locator only — refused before Git ever sees anything else — and reads it through the identical object-store plumbing a `[[repo]]` mount already uses. |
-| D7 | Cached facts key on content identity **plus** extractor identity, so a changed parser re-derives under unchanged bytes and one file read two ways is two independent extractions. |
-| D8 | Every path a scan sees leaves exactly one coverage row. Excluded bytes are counted and reported as excluded; there is no silently-skipped state. |
-| D9 | Structural extraction is syntax-derived and labeled as such. A file a grammar cannot parse is an `error` with no symbols, never a partial parse. |
-| D10 | Tabular data stays relational and is read in place. A row's text is exposed as a context unit only through an operator-declared column allowlist whose default is none. |
-| D11 | Query surfaces are canned, parameterized and bounded. No client SQL, no client-named path, no client pattern — and the daemon is the sole writer. |
+| D8 | Cached facts key on content identity **plus** extractor identity, so a changed parser re-derives under unchanged bytes and one file read two ways is two independent extractions. |
+| D9 | Every path a scan sees leaves exactly one coverage row. Excluded bytes are counted and reported as excluded; there is no silently-skipped state. |
+| D10 | Structural extraction is syntax-derived and labeled as such. A file a grammar cannot parse is an `error` with no symbols, never a partial parse. |
+| D11 | Tabular data stays relational and is read in place. A row's text is exposed as a context unit only through an operator-declared column allowlist whose default is none. |
+| D12 | Query surfaces are canned, parameterized and bounded. No client SQL, no client-named path, no client pattern — and the daemon is the sole writer. |
 
 See [estates and Git surfaces](estates-and-git.md) for the repository and Work-surface boundary Atlas reads without disturbing, [host runtime and estates](host-runtime.md) for the daemon that owns the store, [security and trust](security-and-trust.md) for the trust model the secrets posture sits inside, and [`sergeant.toml`](../reference/sergeant-toml.md) for the exact `[[knowledge]]` schema.

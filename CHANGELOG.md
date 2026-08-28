@@ -778,23 +778,31 @@ trigger, and a second source kind (`external_git`) alongside
   reaching it for the first time. Full reasoning:
   `src/runtime/atlas/syntax.rs`'s own module doc, "G2's revisit trigger,
   answered".
-- **Doctrine amendment, ADR first (ADR 0023, the S2 shape).** `AGENTS.md`'s
-  "`sgt` never fetches" sentence is scoped to admission by its own words,
-  but external-Git acquisition now genuinely does fetch, deliberately, in
-  a different subsystem with no Work authority — never touching a
-  repository mount, a Work surface, or admission's own preflight. ADR
-  0023 records the scoped meaning; `AGENTS.md`'s CAN section cites it in
-  place, unweakened for admission itself; a red-then-green test
+- **Doctrine amendment, ADR filed (ADR 0023, workspace-native).**
+  `AGENTS.md`'s "`sgt` never fetches" sentence is scoped to admission by its
+  own words, but external-Git acquisition now genuinely does fetch,
+  deliberately, in a different subsystem with no Work authority — never
+  touching a repository mount, a Work surface, or admission's own
+  preflight. `AGENTS.md`'s CAN section cites "ADR 0023" in place for the
+  scoped meaning, unweakened for admission itself; a red-then-green test
   (`tests/y5_doctrine_never_fetches_is_scoped.rs`) pins both the doctrine
   text and the structural boundary (admission/materialization never
-  references the external-git fetch surface). Sergeant-rs has been
-  product-documents-only since v0.2.4 (no `docs/adr/` here any longer), so
-  this ADR's binding statement is this changelog entry itself, dated and
-  numbered in the sequence the workspace knowledge library's own
-  `knowledge/rulings/adr/` archive continues (0001–0022 already filed
-  there); the fuller argument is captain's to land there as its own
-  numbered record, landing here first per ADR 0014 decision 17's
-  extraction rule.
+  references the external-git fetch surface). An earlier version of this
+  entry claimed the changelog paragraph itself was the ADR's binding
+  statement, then a later revision correctly retracted that (a changelog
+  paragraph is not a filed, numbered, Status/Context/Decisions record) but
+  treated the gap as an unresolved J0 conflict awaiting a fresh owner
+  ruling. It was not: the conflict was already settled five days earlier by
+  the split-hardening sprint's own Amendment 9
+  (`knowledge/evidence/resources/split-hardening-series/sprint-
+  plan-2026-08-24.md`), which pre-names this exact number and rules that
+  "W1's ADR 0023/0024/0025 are **not authored as product ADRs** — binding
+  text homes in `AGENTS.md`... and workspace rulings." Per that settled
+  record (J3), the ADR is filed directly in the workspace —
+  `knowledge/rulings/adr/0023-external-git-acquisition-scopes-never-
+  fetches.md` — with no corresponding `sergeant-rs` file, and this
+  changelog entry, `AGENTS.md`'s citation, and the module docs citing "ADR
+  0023" now resolve to that record.
 - **Register.** Row 10 (external Git) moves from `deferred-s4` to `met`,
   citing `src/runtime/atlas/external_git.rs`'s own acquisition-mechanics
   tests and `tests/y5_external_git_triggers.rs`'s HTTP-surface proof. Row

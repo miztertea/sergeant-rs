@@ -130,14 +130,21 @@ pub fn purls_by_package(packages: &[LockedPackage]) -> BTreeMap<(String, String)
 /// bytes" means it must be correct for bytes it does not expect to see, not
 /// merely for the bytes it usually gets.
 fn purl_encode(segment: &str) -> String {
+    // Walk `char`s, never raw `bytes()`: a multi-byte UTF-8 sequence fed
+    // byte-by-byte through `byte as char` reinterprets each byte as its own
+    // Latin-1 code point instead of the one character those bytes together
+    // encode, corrupting the segment. Pushing the `char` itself re-encodes it
+    // to its correct UTF-8 bytes in `out`, which is what "correct for bytes
+    // it does not expect to see" (this function's own doc) actually
+    // requires.
     let mut out = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        match byte {
-            b'/' | b'#' | b'?' | b'@' | b' ' => {
+    for ch in segment.chars() {
+        match ch {
+            '/' | '#' | '?' | '@' | ' ' => {
                 out.push('%');
-                out.push_str(&format!("{byte:02X}"));
+                out.push_str(&format!("{:02X}", ch as u32));
             }
-            _ => out.push(byte as char),
+            _ => out.push(ch),
         }
     }
     out
@@ -258,5 +265,29 @@ version = "0.0.1"
             source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
         };
         assert_eq!(rand.purl().as_deref(), Some("pkg:cargo/rand@0.8.5"));
+    }
+
+    /// A pathological non-ASCII byte in a name or version must round-trip as
+    /// the character it actually is, never be reinterpreted byte-by-byte as
+    /// Latin-1 (`byte as char`'s exact failure mode) — the "correct for
+    /// bytes it does not expect to see" guarantee this function's own doc
+    /// claims, exercised rather than only asserted.
+    #[test]
+    fn a_non_ascii_byte_round_trips_instead_of_being_corrupted_as_latin1() {
+        let odd = LockedPackage {
+            name: "café".to_string(),
+            version: "1.0.0-β".to_string(),
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+        };
+        let purl = odd.purl().expect("registry source has a purl");
+        assert_eq!(purl, "pkg:cargo/café@1.0.0-β");
+        // A corrupted encode would instead have emitted the UTF-8 bytes of
+        // 'é' (0xC3 0xA9) each reinterpreted as its own Latin-1 codepoint
+        // (Ã©), so the *character* 'é' surviving intact is the load-bearing
+        // assertion above; this just names the failure mode it rules out.
+        assert!(
+            !purl.contains('Ã'),
+            "a byte must not be split into two mis-decoded characters: {purl}"
+        );
     }
 }
