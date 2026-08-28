@@ -132,15 +132,64 @@ fn a_docx_worker_returns_document_and_section_units_with_provenance() {
             "an Office section is not byte-recoverable — coordinate carries its position instead"
         );
         assert!(
-            section
-                .coordinate
-                .as_deref()
-                .is_some_and(|c| c.starts_with("block:")),
-            "{section:?}"
+            section.coordinate.as_deref().is_some_and(|c| !c.is_empty()),
+            "an Office section must carry a non-empty coordinate (the wire/office contract — \
+             see office.rs's module doc, \"The contract, in our own terms\" — never a \
+             particular string shape): {section:?}"
         );
     }
+    // Contract property (2): unique per document. Not a prefix check — no
+    // particular string shape is part of the contract, only that two
+    // different sections of the same parse never share a coordinate.
+    let coordinates: Vec<&str> = sections
+        .iter()
+        .filter_map(|s| s.coordinate.as_deref())
+        .collect();
+    let mut distinct = coordinates.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        coordinates.len(),
+        "every section's coordinate must be unique within one document: {coordinates:?}"
+    );
     assert!(sections[0].text.contains("first body paragraph"));
     assert!(sections[1].text.contains("A single body paragraph"));
+
+    // Contract property (3): deterministic — re-running the same extractor
+    // identity against the same bytes reproduces the identical coordinate
+    // for the corresponding unit. `docx_units`'s own purity is proven
+    // directly in office.rs's own tests (`extraction_is_a_pure_function_of_its_input`);
+    // this re-proves it through the wire shape this test actually asserts
+    // against, on the real subprocess.
+    let identity_again = identity_for(&fixture("01-plain-headings-paragraphs.docx"));
+    let outcome_again = run_worker(
+        spawn(
+            fixture("01-plain-headings-paragraphs.docx"),
+            &identity_again,
+            REAL_PARSE_DEADLINE,
+        ),
+        &identity_again,
+        &deny(),
+    );
+    let WorkerOutcome::Accepted(batch_again) = outcome_again else {
+        panic!("a well-formed docx must be accepted on a second run too: {outcome_again:?}");
+    };
+    let coordinates_again: Vec<Option<&str>> = batch_again
+        .units
+        .iter()
+        .filter(|u| u.kind == UnitKind::Section)
+        .map(|u| u.coordinate.as_deref())
+        .collect();
+    assert_eq!(
+        coordinates_again,
+        vec![
+            sections[0].coordinate.as_deref(),
+            sections[1].coordinate.as_deref()
+        ],
+        "the same bytes under the same extractor identity must round-trip to the same \
+         coordinates across two independent runs"
+    );
 }
 
 // ------------------------------------------------- the real-parser supervision proof

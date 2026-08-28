@@ -397,16 +397,24 @@ fn an_allocating_worker_is_killed_by_its_address_space_cap_not_the_deadline() {
     );
 
     // Distinguishes cap-kill from deadline-kill by *when* it happened, not
-    // only by what the row says: a deadline-kill could not possibly return
-    // before MEMORY_CAP_TEST_DEADLINE elapsed, so landing well inside half
-    // of it is proof the cap — not the clock — ended the child. RLIMIT_AS
-    // bounds virtual address space, not resident memory, so this timing is
-    // independent of host memory pressure and safe to assert without
-    // flaking under load.
+    // only by what the row says: a deadline-kill cannot possibly return
+    // before MEMORY_CAP_TEST_DEADLINE has fully elapsed, so landing clearly
+    // *before* the deadline — with a fixed, modest safety margin, not a
+    // fraction of the budget — is proof the cap, not the clock, ended the
+    // child. That is the actual, hardware-independent discriminator; "under
+    // half the deadline" is not, and did flake on a CI runner that simply
+    // allocates the fixture's 8 MiB steps more slowly than this workstation
+    // (killed at 4.324s against a 4s budget, still comfortably under the 8s
+    // deadline). A fixed margin below the deadline itself stays valid on any
+    // host slow enough to still finish before the deadline at all — which it
+    // must, since the whole test's premise is that the cap fires before the
+    // clock does.
+    const CAP_KILL_SAFETY_MARGIN: Duration = Duration::from_secs(1);
     assert!(
-        elapsed < MEMORY_CAP_TEST_DEADLINE / 2,
-        "the address-space cap must fire well inside the deadline budget, not race it: killed \
-         after {elapsed:?}, deadline was {MEMORY_CAP_TEST_DEADLINE:?}"
+        elapsed + CAP_KILL_SAFETY_MARGIN < MEMORY_CAP_TEST_DEADLINE,
+        "the address-space cap must fire before the deadline budget, not race it: killed after \
+         {elapsed:?}, deadline was {MEMORY_CAP_TEST_DEADLINE:?} (required margin: \
+         {CAP_KILL_SAFETY_MARGIN:?})"
     );
 }
 

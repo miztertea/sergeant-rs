@@ -56,14 +56,43 @@
 //! model maps back to a byte offset in the ZIP's compressed stream — the
 //! normalization is exactly what "any doc" buys, and losing byte-exact
 //! back-reference is the honest cost of it. So [`OfficeUnit::coordinate`]
-//! carries a **structural** coordinate instead — `block:<index>`, the
-//! section's starting position in anydoc's own top-level block sequence —
-//! recoverable and stable across runs of the same extractor version, but
-//! explicitly not a byte offset. [`super::worker::WorkerUnit::coordinate`]
-//! is the wire field this rides on; the Document unit needs no coordinate
-//! more specific than "the whole resource" (`None`), exactly as text.rs's
-//! own Document unit carries no `heading_level`/`title` beyond what its first
-//! heading lends it.
+//! carries a **structural** coordinate instead.
+//!
+//! **The contract, in our own terms — not anydoc's.** A coordinate is
+//! nothing more than: a stable, opaque, per-unit address that round-trips to
+//! the same unit for the same bytes under the same extractor identity
+//! ([`DOCX_EXTRACTOR`]). Concretely, any adapter behind this contract —
+//! anydoc today, a replacement tomorrow — must produce a coordinate such
+//! that:
+//!
+//! 1. it is `Some` for every unit that is not the whole-document unit (the
+//!    whole-document unit needs nothing more specific than "the whole
+//!    resource", so it stays `None`, exactly as text.rs's own Document unit
+//!    carries no `heading_level`/`title` beyond what its first heading
+//!    lends it);
+//! 2. it is unique among the units of one document — two different
+//!    sections of the same parse never share a coordinate;
+//! 3. it is deterministic — re-running the same extractor identity against
+//!    the same bytes reproduces the identical coordinate for the
+//!    corresponding unit ([`docx_units`]'s own purity guarantee, F6, makes
+//!    this automatic rather than a separate promise to keep);
+//! 4. it makes no write-back claim — a coordinate identifies a position for
+//!    *citation*, never a position a caller could use to mutate the
+//!    original resource (A1-12, "derived, not canonical" — see "Spreadsheet
+//!    formats claim no write-back coordinates" below).
+//!
+//! Nothing in this contract requires any particular string shape. This
+//! adapter happens to spell its coordinates `block:<index>` — the section's
+//! starting position in anydoc's own top-level block sequence — because that
+//! is the cheapest opaque address anydoc's own model hands back satisfying
+//! the four properties above, not because `block:<n>` is part of the
+//! contract itself. A tree-shaped replacement adapter is free to spell its
+//! own coordinates however its own model makes cheapest (a dotted path, a
+//! node id, anything opaque) as long as the four properties hold; nothing
+//! downstream may assume the `block:` prefix, and
+//! `tests/y2_office_adapter.rs` asserts the four properties, not the prefix.
+//! [`super::worker::WorkerUnit::coordinate`] is the wire field this rides
+//! on, and states the same contract in its own doc.
 //!
 //! Output is derived, never canonical (A1-12): re-running this extractor
 //! against the same bytes and the same anydoc version reproduces the same
@@ -176,9 +205,13 @@ pub struct OfficeUnit {
     pub heading_level: Option<u8>,
     /// Heading text, trimmed; `None` when there is none.
     pub title: Option<String>,
-    /// A structural coordinate into the normalized document (`block:<n>`),
-    /// or `None` for the whole-document unit, which needs nothing more
-    /// specific. Never a byte offset — see the module doc.
+    /// A stable, opaque, per-unit address into the normalized document —
+    /// see the module doc's "The contract, in our own terms" for the four
+    /// properties this must hold (present, unique per document, deterministic,
+    /// no write-back claim). `None` for the whole-document unit, which needs
+    /// nothing more specific. This adapter spells it `block:<n>`; that
+    /// spelling is not itself the contract — never a byte offset either
+    /// way.
     pub coordinate: Option<String>,
     /// The unit's own rendered text.
     pub text: String,
@@ -546,20 +579,42 @@ static RECOVERY_WATCH: RecoveryWatch = RecoveryWatch {
 /// Safe to call from every caller of [`docx_units`] in this process,
 /// including repeatedly across calls (idempotent via [`Once`]) and including
 /// concurrently (`log::set_logger` itself is the synchronization point).
-/// Never called from the `sgt` daemon binary — only [`super::super::atlas`]'s
-/// worker binary (`src/bin/atlas_worker.rs`) links this path, and that binary
-/// installs no other logger (`tracing_subscriber::fmt().init()` is `sgt`'s
-/// own `cli.rs`, a different process), so there is nothing here to conflict
-/// with.
+/// Intended to be called only from [`super::super::atlas`]'s worker binary
+/// (`src/bin/atlas_worker.rs`), which installs no other `log::Log` — never
+/// from the `sgt` daemon binary, which owns the process-global logger slot
+/// for its own `tracing_subscriber::fmt().init()` (`cli.rs`).
+///
+/// That "never in-process in the daemon" half used to be prose only — a
+/// promise nothing checked. It is checkable now: `log::set_logger` itself
+/// fails if a *different* logger already occupies the process-global slot,
+/// and `office.rs` is `pub mod`, reachable from the daemon binary today even
+/// though nothing currently calls [`docx_units`] there. Previously that
+/// failure was silently swallowed (`let _ = log::set_logger(..)`), which
+/// would have let a future in-process call from the daemon either silently
+/// lose this module's own recovery-watch signal (if the daemon's logger won
+/// the race) or silently hijack the daemon's own logging (if this module's
+/// `Once` ran first) — a race, either way, never an error. Now the first
+/// caller in a process that already has a foreign logger installed panics
+/// loudly instead: whoever removes the subprocess indirection this
+/// invariant depends on trips this the moment `docx_units` first runs
+/// in-process next to another logger, rather than racing it unnoticed. A
+/// second call from *this* module's own `Once` — the expected, safe,
+/// repeated-call case documented above — never reaches `set_logger` twice in
+/// the first place, so it cannot trip this.
 fn install_recovery_watch() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        // A second `set_logger` call after this one (there is none in this
-        // binary, but `set_logger` itself is fallible for exactly that
-        // reason) would return `Err` — ignored deliberately: the watch is
-        // already installed by the first caller, which is all any caller in
-        // this process needs.
-        let _ = log::set_logger(&RECOVERY_WATCH);
+        log::set_logger(&RECOVERY_WATCH).unwrap_or_else(|e| {
+            panic!(
+                "docx_units tried to install its recovery-watch logger, but a different \
+                 `log::Log` is already installed in this process ({e}). This function must \
+                 only ever run inside the sgt-atlas-worker subprocess, never in-process \
+                 alongside another logger (e.g. the sgt daemon's own tracing_subscriber) — \
+                 see this function's own doc. If this fired, something now calls docx_units \
+                 in-process next to another logger; that invariant no longer holds and must be \
+                 fixed before this call is safe."
+            )
+        });
         log::set_max_level(log::LevelFilter::Warn);
     });
 }

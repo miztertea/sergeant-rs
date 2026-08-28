@@ -50,6 +50,44 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+// -------------------------------------------------- crate-root path coverage
+//
+// The token scan above only ever walks `src/` and `tests/` — hardcoded, not
+// discovered. A `build.rs` at the crate root, or an `examples/`/`benches/`
+// directory Cargo would also compile and link into this crate, would evade
+// the whole scan without either test above ever noticing, because neither
+// looks anywhere else. Rather than silently trusting that no such path is
+// ever added, this fails loudly the moment one appears, so a future PR
+// adding `build.rs`/`examples/`/`benches/` is forced to extend the scan
+// (or explain why the new path cannot name anydoc) instead of silently
+// riding past this boundary.
+#[test]
+fn no_uncovered_compiled_source_path_exists_at_the_crate_root() {
+    let root = crate_root();
+    if root.join("build.rs").exists() {
+        panic!(
+            "build.rs now exists at the crate root and is NOT scanned by \
+             anydoc_is_named_nowhere_but_the_office_adapter — a build script can name anydoc \
+             (or alias it, or generate code that does) without the token scan ever seeing it. \
+             Either extend that scan to cover build.rs, or state explicitly why this path \
+             cannot cross the replaceability boundary, before this test is allowed to pass \
+             again."
+        );
+    }
+    for dir in ["examples", "benches"] {
+        if root.join(dir).is_dir() {
+            panic!(
+                "a `{dir}/` directory now exists at the crate root and is NOT scanned by \
+                 anydoc_is_named_nowhere_but_the_office_adapter — Cargo compiles and links \
+                 files under {dir}/ into this crate just as it does src/ and tests/, so anydoc \
+                 could be named there without the token scan ever seeing it. Either extend that \
+                 scan to cover {dir}/, or state explicitly why this path cannot cross the \
+                 replaceability boundary, before this test is allowed to pass again."
+            );
+        }
+    }
+}
+
 /// A token scan, not a fixed-pattern grep — exactly
 /// `tests/x1_atlas_substrate.rs`'s own `names_the_crate` (R2): however the
 /// import is spelled (`use anydoc::...`, `anydoc::Format`, a re-export), the
@@ -229,4 +267,210 @@ fn the_office_adapters_public_api_is_pinned() {
          replaceability boundary under a different name), update EXPECTED_PUBLIC_API in this \
          test to match"
     );
+}
+
+// ---------------------------------------------------- the manifest-level pin
+//
+// The two token-scan tests above prove no `.rs` file other than [`OWNER`]
+// spells the literal identifier `anydoc` — but a dependency does not have to
+// be *named* "anydoc" to resolve to the anydoc crate. Cargo's own renaming
+// feature (`docmodel = { package = "anydoc", version = "0.2.4" }`) adds a
+// second entry to `[dependencies]` that resolves to the exact same package,
+// importable everywhere in the crate as `docmodel::...`, without the token
+// "anydoc" ever appearing in a single `.rs` file. This compiles today and
+// would pass both tests above unmodified — the token scan operates one
+// abstraction layer below where an alias is introduced. What follows checks
+// the layer the alias actually lives in: dependency resolution itself, via
+// `cargo metadata`, which reports both a dependency's local (possibly
+// renamed) extern name AND the real package it resolves to.
+
+/// One edge from this crate's own root package to a dependency, as
+/// `cargo metadata --format-version=1` resolves it: `extern_name` is
+/// whatever this crate's own `Cargo.toml` calls it (the renamed name for an
+/// aliased entry, otherwise the crate's own name), `resolved_package` is the
+/// package that edge actually resolves to, independent of what it is called
+/// here.
+struct DependencyEdge {
+    extern_name: String,
+    resolved_package: String,
+}
+
+/// Every direct dependency edge from this crate's own root package —
+/// `[dependencies]`, `[dev-dependencies]`, and `[build-dependencies]` alike,
+/// because `cargo metadata`'s resolve graph does not separate them and an
+/// alias could just as well be smuggled into any of the three tables. Shells
+/// out to `cargo metadata` rather than hand-parsing `Cargo.toml`/`Cargo.lock`
+/// (R2/R5: this crate already has no TOML-object-graph-to-dependency-
+/// resolution logic of its own to reuse, and reimplementing Cargo's own
+/// alias/feature/target-cfg resolution by hand is exactly the kind of bug
+/// farm Ponytail's R6/R7 exists to head off) — `--offline --locked` so this
+/// never touches the network and never silently re-resolves against a
+/// `Cargo.lock` this run didn't check in.
+fn root_dependency_edges() -> Vec<DependencyEdge> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version=1", "--offline", "--locked"])
+        .current_dir(manifest_dir)
+        .output()
+        .expect("run cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed (status {:?}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse cargo metadata JSON");
+
+    let root_id = metadata["resolve"]["root"]
+        .as_str()
+        .expect("cargo metadata must report a single root package for this crate")
+        .to_string();
+
+    // Package id -> real package name, from the flat `packages` list (this
+    // is where an alias's *true* identity lives — the resolve graph's own
+    // `deps[].pkg` is a package id, not a name, precisely so this lookup is
+    // required rather than optional).
+    let packages = metadata["packages"]
+        .as_array()
+        .expect("cargo metadata must report a packages array");
+    let package_name_by_id = |id: &str| -> String {
+        packages
+            .iter()
+            .find(|p| p["id"].as_str() == Some(id))
+            .and_then(|p| p["name"].as_str())
+            .unwrap_or_else(|| panic!("cargo metadata's packages array has no entry for {id}"))
+            .to_string()
+    };
+
+    let nodes = metadata["resolve"]["nodes"]
+        .as_array()
+        .expect("cargo metadata must report a resolve.nodes array");
+    let root_node = nodes
+        .iter()
+        .find(|n| n["id"].as_str() == Some(root_id.as_str()))
+        .expect("the root package must have its own resolve node");
+
+    root_node["deps"]
+        .as_array()
+        .expect("the root resolve node must report a deps array")
+        .iter()
+        .map(|dep| DependencyEdge {
+            extern_name: dep["name"]
+                .as_str()
+                .expect("each dep entry must report its extern name")
+                .to_string(),
+            resolved_package: package_name_by_id(
+                dep["pkg"]
+                    .as_str()
+                    .expect("each dep entry must report the package id it resolves to"),
+            ),
+        })
+        .collect()
+}
+
+/// **The manifest-level half of the boundary**: exactly one dependency edge
+/// out of this crate's own root package may resolve to the `anydoc`
+/// package — the one direct `[dependencies]` entry named `anydoc` itself —
+/// and that edge's own extern name must be `anydoc`, not a rename. A second
+/// edge resolving to the same package under any other local name (Cargo's
+/// `package = "anydoc"` rename feature) is exactly the alias bypass this
+/// test exists to catch, and fails here regardless of what string that
+/// second entry happens to be called — this does not match on the one alias
+/// a reviewer happened to name (`docmodel`), it matches on *any* dependency
+/// edge whose resolved package is `anydoc`, beyond the one known-good one.
+///
+/// Demonstrated failing against the alias bypass named in review: adding
+/// `docmodel = { package = "anydoc", version = "0.2.4" }` to `[dependencies]`
+/// and re-running this test fails it with exactly the two-edges message
+/// below, naming both `anydoc` and `docmodel` as edges resolving to the
+/// `anydoc` package — recorded verbatim in this fix's commit message.
+#[test]
+fn exactly_one_dependency_edge_resolves_to_the_anydoc_package() {
+    let edges = root_dependency_edges();
+    let anydoc_edges: Vec<&DependencyEdge> = edges
+        .iter()
+        .filter(|e| e.resolved_package == "anydoc")
+        .collect();
+
+    let names: Vec<&str> = anydoc_edges
+        .iter()
+        .map(|e| e.extern_name.as_str())
+        .collect();
+    assert_eq!(
+        anydoc_edges.len(),
+        1,
+        "exactly one dependency edge from this crate's own manifest may resolve to the anydoc \
+         package — found {}: {names:?}. A second edge resolving to anydoc under any local name \
+         (Cargo's `package = \"...\"` rename feature, e.g. `docmodel = {{ package = \"anydoc\", \
+         version = \"0.2.4\" }}`) is a second, real route to anydoc's API that the token scan in \
+         anydoc_is_named_nowhere_but_the_office_adapter cannot see, because no `.rs` file needs \
+         to write the word \"anydoc\" to use it. Remove the extra manifest entry — {OWNER} is \
+         the one file allowed to depend on anydoc, under its own name.",
+        anydoc_edges.len()
+    );
+    assert_eq!(
+        anydoc_edges[0].extern_name, "anydoc",
+        "the one dependency edge resolving to the anydoc package must be named `anydoc` in this \
+         crate's own manifest, not renamed via `package = \"anydoc\"`: {:?}",
+        anydoc_edges[0].extern_name
+    );
+}
+
+/// **Demonstration that the check above actually fires for the alias
+/// bypass — not just against the one name a reviewer happened to name.**
+///
+/// Two ways this was proven, both recorded here rather than left as a claim:
+///
+/// 1. Empirically, against the real bypass named in review: adding
+///    `docmodel = { package = "anydoc", version = "0.2.4" }` to this crate's
+///    actual `[dependencies]` and running `cargo metadata --offline --locked`
+///    (what [`root_dependency_edges`] shells out to) fails outright, before
+///    [`exactly_one_dependency_edge_resolves_to_the_anydoc_package`] even
+///    gets to run its own assertion:
+///    `error: the crate `sergeant-rs v0.3.0 (...)` depends on crate `anydoc
+///    v0.2.4` multiple times with different names` — Cargo's own resolver
+///    refuses a manifest that names the exact same resolved package twice
+///    under two different local names, which is a *stronger* failure than a
+///    test assertion (nothing downstream even builds). Recorded verbatim in
+///    this fix's commit message, and reverted before commit — this repo's
+///    own `Cargo.toml`/`Cargo.lock` are never left carrying the alias.
+/// 2. Structurally, offline and deterministic (this test): Cargo's own
+///    refusal above is specific to an alias at the *exact same version* as
+///    the real entry — a second alias at a different, semver-incompatible
+///    anydoc version would resolve to a genuinely different graph node and
+///    Cargo would permit it to coexist (the same mechanism that lets a crate
+///    depend on `rand 0.7` and `rand 0.8` under two different names at
+///    once). [`root_dependency_edges`]'s own filter — "does this edge's
+///    resolved package name equal `anydoc`" — does not care about version,
+///    so it still catches that case. This test proves the filtering logic
+///    itself trips for *any* second edge resolving to `anydoc`, under *any*
+///    local name, without depending on which anydoc version crates.io (or
+///    this offline sandbox's registry cache) happens to have available.
+#[test]
+fn the_check_catches_an_alias_under_any_name_not_just_docmodel() {
+    for alias in ["docmodel", "totally_unrelated_name", "office_docs_lib"] {
+        let edges = [
+            DependencyEdge {
+                extern_name: "anydoc".to_string(),
+                resolved_package: "anydoc".to_string(),
+            },
+            DependencyEdge {
+                extern_name: alias.to_string(),
+                resolved_package: "anydoc".to_string(),
+            },
+        ];
+        let anydoc_edges: Vec<&DependencyEdge> = edges
+            .iter()
+            .filter(|e| e.resolved_package == "anydoc")
+            .collect();
+        assert_eq!(
+            anydoc_edges.len(),
+            2,
+            "the real check (exactly_one_dependency_edge_resolves_to_the_anydoc_package) fails \
+             exactly here: a second edge resolving to anydoc trips its `assert_eq!(.., 1, ..)` \
+             regardless of what that second edge is locally named ({alias:?} here) — proving the \
+             check is not a string match on the one alias a reviewer happened to name"
+        );
+    }
 }
