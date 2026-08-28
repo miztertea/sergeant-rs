@@ -503,24 +503,46 @@ release.
   path-STRING validator only: it rejects NUL bytes, absolute paths, drive
   letters, UNC prefixes and `..` traversal, and says nothing about entry
   TYPE. This wave adds the checks it does not cover, each its own named,
-  never-silent refusal: a symlink or any non-regular-file entry, an empty
+  never-silent refusal: a symlink (checked first and unconditionally of the
+  entry's raw name, so a symlink whose name happens to end in `/` cannot be
+  misfiled as a directory marker), or any other non-regular-file entry —
+  FIFO, character device, block device, socket — refused by masking the
+  entry's own Unix mode bits directly rather than trusting `zip`'s own
+  `is_file()`, which does not check for a regular file at all; an empty
   name, a name that duplicates one already admitted, and a name that
   collides with one already admitted once both are canonicalised (Unicode
   NFC normalisation, then full Unicode case conversion — not a bare
   `to_lowercase()`, which would miss a normalisation-form mismatch on its
   own).
-- **Every bound is enforced by counting bytes as they stream out of the
-  decompressor — never by trusting the archive's own declared size.**
-  `size()`/`compressed_size()` are attacker-controlled header fields,
-  reconciled with reality only by a CRC-32 check performed after the whole
-  entry is already decompressed. Five named ceilings — entry count,
+- **The two size bounds that matter under a lying header are enforced by
+  counting bytes as they stream out of the decompressor — never by
+  trusting the archive's own declared size.** `size()`/`compressed_size()`
+  are attacker-controlled header fields, reconciled with reality only by a
+  CRC-32 check performed after the whole entry is already decompressed;
   per-entry uncompressed size (reused outright from the existing
   whole-resource size ceiling, rather than a second independently-tuned
-  number), cumulative expanded size, a header-declared compression-ratio
-  pre-filter, and archive-within-archive nesting depth — each name the
-  specific bomb shape they defend against and are stated as provisional and
-  unmeasured except the reused one, the same honesty this codebase already
-  applies to its other unvalidated numeric ceilings.
+  number) and cumulative expanded size are both checked against the actual
+  streamed byte count, never the header. Two further bounds are honestly
+  labelled differently rather than folded into that same claim: entry
+  count is checked against the central directory's own real record count
+  (each record is a real struct plus a real filename string, not a single
+  lied-about integer, so it is not attacker-inflatable the way a declared
+  size is) — refusing the whole archive before any entry opens; the
+  compression-ratio bound is an ADVISORY pre-filter computed from the two
+  declared header fields themselves, before any byte is decompressed —
+  cheap triage in front of the per-entry streamed check, which is what
+  actually holds under a header that lies about the ratio too. Every
+  ceiling names the specific bomb shape it defends against and is stated
+  as provisional and unmeasured except the reused per-entry-size one, the
+  same honesty this codebase already applies to its other unvalidated
+  numeric ceilings — **including that the cumulative expanded-size ceiling
+  is scoped to one archive LEVEL, not summed across nested levels**: a
+  nested archive gets its own fresh 128 MiB budget at each depth it is
+  opened, so the aggregate memory a nested (but within the depth ceiling)
+  archive can force scales with the per-level ceiling raised to the depth
+  cap, not with one whole-tree total; the worker's own process-level
+  address-space limit is the actual backstop for that aggregate shape, not
+  this ceiling.
 - **A prior open research question is now closed: this crate does not
   reject overlapping or self-referential (quine-shaped) archive
   constructions on its own.** Its own documentation says so verbatim for
@@ -535,15 +557,18 @@ release.
   silently collapses them to one entry, last-write-wins, before the archive
   even reports how many entries it holds. Both findings are pinned by their
   own decisive tests, not merely asserted.
-- **Child resources keep parent provenance**, composed rather than
-  restated: every admitted entry's cache key folds in its immediate
-  parent's own key — a top-level archive's, or (for an entry that is itself
-  a nested archive) that entry's own composed key — so a grandchild's key
-  already encodes its whole ancestry without this crate storing an explicit
-  chain, and cannot collide with an unrelated top-level resource that
-  happens to share a content hash. A nested archive within the depth
-  ceiling recurses; one past it still becomes its own child resource, just
-  not opened further.
+- **Child resources keep parent provenance in the adapter's own return
+  value** — parent archive source/resource, entry path, entry content
+  hash, and entry adapter identity — composed rather than restated: every
+  admitted entry's cache key folds in its immediate parent's own key — a
+  top-level archive's, or (for an entry that is itself a nested archive)
+  that entry's own composed key — so a grandchild's key already encodes
+  its whole ancestry without this crate storing an explicit chain, and
+  cannot collide with an unrelated top-level resource that happens to
+  share a content hash. A nested archive within the depth ceiling recurses;
+  one past it still becomes its own child resource, just not opened
+  further. **Only entry path reaches the worker→daemon wire today** — see
+  the named-seam bullet below for the other three fields.
 - No entry is ever executed, and nothing this adapter produces is written
   to a real filesystem path — expansion produces bytes and structured
   records only.

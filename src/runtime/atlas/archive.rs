@@ -25,12 +25,32 @@
 //! module's [`expand`] adds exactly those checks, each its own named
 //! [`CoverageRow`], layered on top rather than in place of it:
 //!
-//! 1. **Entry type** — [`zip::read::ZipFile::is_symlink`]/`is_file` (both
-//!    read the entry's Unix mode off the central-directory external
-//!    attributes, VERIFIED directly against `zip` 8.6.0's own
-//!    `src/read.rs`): a symlink or anything that is neither a regular file
-//!    nor a directory is refused. A symlink's "content" is its link-target
-//!    TEXT, not file bytes — treating it as a symlink and creating one is a
+//! 1. **Entry type** — a symlink or anything that is neither a regular file
+//!    nor a directory is refused. **Not** by composing `zip`'s own
+//!    [`zip::read::ZipFile::is_symlink`]/`is_dir`/`is_file` — a panel finding
+//!    caught that `is_file()` is defined as `!is_dir() && !is_symlink()`
+//!    (VERIFIED, `zip` 8.6.0's own `src/read.rs`) and never checks
+//!    `S_IFREG`, so a FIFO/char-device/block-device/socket entry (none of
+//!    which is a directory or a symlink under those two checks) passed it
+//!    silently; and that `is_dir()` is a pure name-suffix check
+//!    (`name().ends_with('/')`, VERIFIED against `src/spec.rs`) independent
+//!    of `is_symlink()`'s external-attributes read, so a symlink entry whose
+//!    raw name happened to end in `/` could be misfiled as a directory
+//!    marker if `is_dir()` were checked first. [`expand_at_depth`] instead
+//!    checks `is_symlink()` first, unconditionally, then masks the entry's
+//!    own Unix mode bits (`S_IFMT`) directly and refuses only the four
+//!    genuinely dangerous special-file types — FIFO, character device,
+//!    block device, socket ([`is_dangerous_unix_type`]) — admitting
+//!    `S_IFREG` AND a masked value of `0` alike (`S_IFDIR` and a missing
+//!    mode both route to the same directory-marker path `is_dir()` always
+//!    did). The `0`-is-permissive choice is itself a correction pinned
+//!    while building this fix's own test fixtures: a strict "admit only
+//!    `S_IFREG`" version refused every ordinary entry in this build's real
+//!    `zip_corpus` fixture corpus, none of which sets the `S_IFREG` bit at
+//!    all (mode `0o600`, permission bits only — [`is_dangerous_unix_type`]'s
+//!    own doc has the full accounting). A symlink's "content" is its
+//!    link-target TEXT, not file bytes — treating it as a symlink and
+//!    creating one is a
 //!    traversal primitive by another route (the amendment's own wording),
 //!    and this module never creates a filesystem symlink at all (deliverable
 //!    (d): nothing here writes to a real path, symlink or otherwise).
@@ -194,11 +214,22 @@
 //!   accumulated output all at once, so the container-level ceiling is set
 //!   with headroom under the process-level one rather than racing it.
 //!   Prevents the "distributed bomb" shape: many entries, each individually
-//!   under the per-entry cap, that together still exhaust memory. **This is
-//!   the least-grounded number in this file** — the research note names it
-//!   explicitly as having no existing whole-archive-scope precedent in this
-//!   codebase to size against, and this module inherits that honesty rather
-//!   than implying a validated figure.
+//!   under the per-entry cap, that together still exhaust memory. **This
+//!   bound is a WHOLE-TREE cumulative ceiling, not a per-archive-level one**
+//!   — an earlier version of this module checked it against a counter
+//!   re-initialised to zero on every recursive call, which let a nested
+//!   archive tree demand `(128 MiB)^depth`, not `128 MiB`, before anything
+//!   tripped; [`expand`] now threads one `cumulative_expanded_bytes`
+//!   accumulator, by mutable reference, through every level of
+//!   [`expand_at_depth`]'s own recursion (see that function's doc), so this
+//!   ceiling genuinely bounds the sum of every admitted entry's bytes across
+//!   the whole tree, at any nesting depth the walk actually opens. **This is
+//!   still the least-grounded NUMBER in this file** — the research note
+//!   names it explicitly as having no existing whole-archive-scope
+//!   precedent in this codebase to size against, and this module inherits
+//!   that honesty rather than implying a validated figure; only the
+//!   cumulative-vs-per-level SCOPING is what this fix corrected, not the
+//!   128 MiB figure's own provenance.
 //! * [`MAX_COMPRESSION_RATIO`] — 200:1, an ADVISORY pre-filter only, computed
 //!   from the two attacker-declared header fields before any byte is
 //!   decompressed. Cheap triage in front of the expensive
@@ -210,12 +241,18 @@
 //!   cases too).
 //! * [`MAX_NESTING_DEPTH`] — 2 levels, reasoned rather than measured: a
 //!   legitimate knowledge source rarely nests an archive inside an archive
-//!   more than once; 42.zip-shaped multiplicative bombs need depth, and a
-//!   shallow cap makes the multiplication impossible regardless of what any
-//!   single level's own bounds allow (research §3's own "a naive
-//!   implementation... recurses without limit still falls to this" case).
-//!   A nested archive past the cap still becomes its own child resource
-//!   (hash, key, provenance) — it is simply not opened further.
+//!   more than once; 42.zip-shaped multiplicative bombs need unbounded
+//!   depth, and a shallow cap stops the walk from recursing forever
+//!   (research §3's own "a naive implementation... recurses without limit
+//!   still falls to this" case) regardless of what the total-bytes ceiling
+//!   alone would allow. It is [`MAX_TOTAL_EXPANDED_BYTES`]'s own
+//!   whole-tree-cumulative counter (see that bullet, and [`expand_at_depth`]'s
+//!   doc) that keeps a bounded-depth tree from still demanding
+//!   `(per-level ceiling)^depth` bytes — depth alone bounds how many times
+//!   the walk recurses, not how many bytes it may admit in total; the two
+//!   ceilings are complementary, not substitutes for each other. A nested
+//!   archive past the cap still becomes its own child resource (hash, key,
+//!   provenance) — it is simply not opened further.
 //!
 //! # Provenance and F7 child keys (G9)
 //!
@@ -314,6 +351,74 @@ pub const MAX_COMPRESSION_RATIO: u64 = 200;
 /// module doc for the 42.zip argument this specifically defends against.
 pub const MAX_NESTING_DEPTH: u32 = 2;
 
+// --------------------------------------------------- Unix entry-type bits
+//
+// `zip`'s own type-bit constants (`ffi::S_IFDIR`/`S_IFREG`/`S_IFLNK`, etc.)
+// are `pub(crate)` and not visible outside the crate (VERIFIED, `zip`
+// 8.6.0's own `src/types.rs`), so this module names its own copies of the
+// standard POSIX `S_IFMT` values it needs to classify an entry's actual
+// Unix file type directly (see the "Entry type" comment in [`expand_at_depth`]
+// for why this module does not trust `is_file()`/`is_dir()` in combination
+// for this).
+
+/// Mask isolating the file-type bits from a full Unix mode word.
+const UNIX_S_IFMT: u32 = 0o170_000;
+/// FIFO (named pipe).
+const UNIX_S_IFIFO: u32 = 0o010_000;
+/// Character device.
+const UNIX_S_IFCHR: u32 = 0o020_000;
+/// Directory.
+const UNIX_S_IFDIR: u32 = 0o040_000;
+/// Block device.
+const UNIX_S_IFBLK: u32 = 0o060_000;
+/// Regular file. Admitted, along with a masked value of `0` (module doc,
+/// [`is_dangerous_unix_type`]) — a Unix mode with no `S_IFMT` type bits set
+/// at all is common in real-world archives and is not, on its own,
+/// evidence of a special-file entry.
+const UNIX_S_IFREG: u32 = 0o100_000;
+/// Symlink — checked via `zip`'s own [`zip::read::ZipFile::is_symlink`]
+/// before this mask is ever consulted; named here only so
+/// [`unix_file_type_name`] can label it if it is ever reached.
+const UNIX_S_IFLNK: u32 = 0o120_000;
+/// Socket.
+const UNIX_S_IFSOCK: u32 = 0o140_000;
+
+/// `true` only for a masked Unix type this module actively refuses: FIFO,
+/// character device, block device, or socket. **Deliberately excludes a
+/// masked value of `0`** (no recognized type bits at all) — a panel finding
+/// caught that a strict "admit only `S_IFREG`, refuse everything else"
+/// version of this check refused every ordinary entry in this build's own
+/// real fixture corpus (`tests/fixtures/zip_corpus/zip_fixtures/*.zip`):
+/// every regular-file entry there — built by a tool other than this crate's
+/// own writer (`unzip -lv`/`python3 -m zipfile` both show mode `0o600` with
+/// no `S_IFREG` bit set at all) — carries a Unix mode that is nothing but
+/// permission bits, no type bits whatsoever. Refusing on an all-zero type
+/// mask would refuse those honestly-authored real-world archives outright,
+/// which is not this module's intent: the attack surface the amendment
+/// actually names is a symlink (handled separately and unconditionally,
+/// before this mask is ever consulted) and the four special-file types
+/// below — not "a tool that never bothered setting `S_IFREG`."
+fn is_dangerous_unix_type(masked_type: u32) -> bool {
+    matches!(
+        masked_type,
+        UNIX_S_IFIFO | UNIX_S_IFCHR | UNIX_S_IFBLK | UNIX_S_IFSOCK
+    )
+}
+
+/// Human-readable label for a masked Unix file-type value, used only in a
+/// refusal [`CoverageRow`]'s own detail text — so only ever called with a
+/// value [`is_dangerous_unix_type`] already accepted.
+fn unix_file_type_name(masked_type: u32) -> &'static str {
+    match masked_type {
+        UNIX_S_IFIFO => "a FIFO (named pipe)",
+        UNIX_S_IFCHR => "a character device",
+        UNIX_S_IFBLK => "a block device",
+        UNIX_S_IFSOCK => "a socket",
+        UNIX_S_IFLNK => "a symlink",
+        _ => "an unrecognized Unix file type",
+    }
+}
+
 // ------------------------------------------------------------ output shape
 
 /// One admitted archive entry, in this crate's own vocabulary — no `zip::`
@@ -365,8 +470,13 @@ pub struct ZipExpansion {
     /// Every refusal, at the archive level and at the entry level, this
     /// level's own walk produced.
     pub coverage: Vec<CoverageRow>,
-    /// This level's own cumulative admitted-entry byte count (module doc:
-    /// scoped to this level, not summed across nesting).
+    /// This level's own cumulative admitted-entry byte count, reported for
+    /// this level alone. **This is not the value [`MAX_TOTAL_EXPANDED_BYTES`]
+    /// is checked against** — that check runs against a cumulative counter
+    /// shared across the whole recursion tree (see [`expand_at_depth`]'s own
+    /// doc), so the ceiling bounds the ENTIRE expansion, not any one level
+    /// in isolation; this field exists purely for a caller that wants one
+    /// level's own contribution.
     pub total_expanded_bytes: u64,
 }
 
@@ -381,10 +491,28 @@ pub struct ZipExpansion {
 /// touched. Two calls on equal bytes and an equal `parent_key` are equal —
 /// proven directly below, the same way `office.rs`'s own purity test does.
 pub fn expand(bytes: &[u8], parent_key: &str) -> ZipExpansion {
-    expand_at_depth(bytes, parent_key, 0)
+    let mut cumulative_expanded_bytes: u64 = 0;
+    expand_at_depth(bytes, parent_key, 0, &mut cumulative_expanded_bytes)
 }
 
-fn expand_at_depth(bytes: &[u8], parent_key: &str, depth: u32) -> ZipExpansion {
+/// `cumulative_expanded_bytes` is shared, by mutable reference, across this
+/// ENTIRE recursion tree — one archive-level call's own local
+/// `total_expanded_bytes` (below) is scoped to that one level for
+/// reporting, but [`MAX_TOTAL_EXPANDED_BYTES`] is checked against
+/// `cumulative_expanded_bytes`, which every level and every nested archive
+/// increments through the same counter its caller passed down. Threading it
+/// this way (rather than re-zeroing a local counter on each recursive call,
+/// an earlier version of this module's own bug — a per-level-only budget
+/// that let a nested-archive tree demand `(per-level ceiling)^depth` bytes
+/// rather than one whole-tree ceiling) is what makes
+/// [`MAX_TOTAL_EXPANDED_BYTES`] a real bound on the whole expansion, not
+/// merely on whichever level is currently being walked.
+fn expand_at_depth(
+    bytes: &[u8],
+    parent_key: &str,
+    depth: u32,
+    cumulative_expanded_bytes: &mut u64,
+) -> ZipExpansion {
     let mut coverage = Vec::new();
     let mut children = Vec::new();
 
@@ -518,7 +646,51 @@ fn expand_at_depth(bytes: &[u8], parent_key: &str, depth: u32) -> ZipExpansion {
         }
         let path = enclosed.to_string_lossy().replace('\\', "/");
 
-        if entry.is_dir() {
+        // Entry-type classification: this module masks the entry's own Unix
+        // mode bits (S_IFMT) directly rather than composing `zip`'s
+        // `is_dir()`/`is_symlink()`/`is_file()` predicates the way an earlier
+        // version of this module did. Two failure shapes that combination
+        // let through, found in panel review and fixed here: (1) `is_file()`
+        // is defined as `!is_dir() && !is_symlink()` (VERIFIED, `zip` 8.6.0's
+        // own `src/read.rs`) and never checks `S_IFREG` at all, so a
+        // FIFO/char-device/block-device/socket entry — none of which is a
+        // directory or a symlink under those two checks — passed `is_file()`
+        // and was admitted as an ordinary child with its bytes read as
+        // content; (2) `is_dir()` is a pure name-suffix check
+        // (`name().ends_with('/')`, VERIFIED against `zip`'s own
+        // `src/spec.rs`) completely independent of `is_symlink()`'s Unix
+        // external-attributes read, so a symlink entry whose raw name
+        // happened to end in `/` had `is_dir()==true` too — checking
+        // `is_dir()` first (the prior order) filed it as an innocuous
+        // directory marker and the symlink refusal below it never ran.
+        // Symlink is therefore checked FIRST and unconditionally of the
+        // name, and every other type is decided from the entry's actual mode
+        // bits when `zip` reports any; a Windows-authored entry (no Unix
+        // mode bits at all) falls back to the name-suffix `is_dir()` check —
+        // there are no type bits there to distrust.
+        if entry.is_symlink() {
+            coverage.push(CoverageRow {
+                path: Some(path),
+                status: Coverage::Excluded,
+                detail: Some(
+                    "entry is a symlink; refused unconditionally — its enclosed name is safe \
+                     but its content is a link-TARGET string, not file bytes, and treating it \
+                     as a symlink is a traversal primitive by another route (G5 amendment); \
+                     checked before any directory-name-suffix classification so a symlink whose \
+                     raw name happens to end in `/` cannot be misfiled as a directory marker"
+                        .to_string(),
+                ),
+                bytes: None,
+            });
+            continue;
+        }
+
+        let file_type_bits = entry.unix_mode().map(|mode| mode & UNIX_S_IFMT);
+        let is_directory_marker = match file_type_bits {
+            Some(UNIX_S_IFDIR) => true,
+            _ => entry.is_dir(),
+        };
+        if is_directory_marker {
             // A directory marker carries no content of its own — recorded
             // once, honestly, rather than silently absorbed (F8's "no
             // eighth silent skip"), but it is bookkeeping, not a child.
@@ -530,33 +702,36 @@ fn expand_at_depth(bytes: &[u8], parent_key: &str, depth: u32) -> ZipExpansion {
             });
             continue;
         }
-        if entry.is_symlink() {
-            coverage.push(CoverageRow {
-                path: Some(path),
-                status: Coverage::Excluded,
-                detail: Some(
-                    "entry is a symlink; refused unconditionally — its enclosed name is safe \
-                     but its content is a link-TARGET string, not file bytes, and treating it \
-                     as a symlink is a traversal primitive by another route (G5 amendment)"
-                        .to_string(),
-                ),
-                bytes: None,
-            });
-            continue;
-        }
-        if !entry.is_file() {
+
+        if let Some(type_bits) = file_type_bits
+            && is_dangerous_unix_type(type_bits)
+        {
             coverage.push(CoverageRow {
                 path: Some(path),
                 status: Coverage::Excluded,
                 detail: Some(format!(
-                    "entry is not a regular file (unix mode {:?} names neither a directory nor \
-                     a symlink); refused",
-                    entry.unix_mode()
+                    "entry is {} (unix mode {:#o} masked to type {:#o}), not a regular file; \
+                     refused — `zip`'s own `is_file()` is `!is_dir() && !is_symlink()` and does \
+                     not check S_IFREG, so this module masks the entry's own Unix-mode type \
+                     bits directly rather than trusting it",
+                    unix_file_type_name(type_bits),
+                    entry.unix_mode().unwrap_or(0),
+                    type_bits
                 )),
                 bytes: None,
             });
             continue;
         }
+        // `type_bits == Some(UNIX_S_IFREG)` and `type_bits == Some(0)` both
+        // fall through here and are admitted as regular files — see
+        // `is_dangerous_unix_type`'s own doc for why an all-zero type mask
+        // is treated as "no type information", not as a refusal, alongside
+        // the `file_type_bits == None` case already handled above.
+        debug_assert!(
+            matches!(file_type_bits, None | Some(0) | Some(UNIX_S_IFREG)),
+            "every admission path above this point must have refused or continued past any \
+             other masked Unix type before an entry's bytes are ever read: {file_type_bits:?}"
+        );
 
         if !seen_paths.insert(path.clone()) {
             coverage.push(CoverageRow {
@@ -633,21 +808,23 @@ fn expand_at_depth(bytes: &[u8], parent_key: &str, depth: u32) -> ZipExpansion {
         }
 
         let entry_len = content.len() as u64;
-        if total_expanded_bytes.saturating_add(entry_len) > MAX_TOTAL_EXPANDED_BYTES {
+        if cumulative_expanded_bytes.saturating_add(entry_len) > MAX_TOTAL_EXPANDED_BYTES {
             coverage.push(CoverageRow {
                 path: Some(path),
                 status: Coverage::Unsupported,
                 detail: Some(format!(
-                    "archive's cumulative expanded size exceeded the \
+                    "expansion's WHOLE-TREE cumulative expanded size (this archive level plus \
+                     every ancestor and prior sibling level already walked) exceeded the \
                      {MAX_TOTAL_EXPANDED_BYTES}-byte MAX_TOTAL_EXPANDED_BYTES ceiling at this \
-                     entry ({} of {declared_count} declared entries opened); remaining entries \
-                     were never opened",
+                     entry ({} of {declared_count} declared entries opened at this level); \
+                     remaining entries at this level were never opened",
                     index + 1
                 )),
                 bytes: Some(entry_len),
             });
             break;
         }
+        *cumulative_expanded_bytes += entry_len;
         total_expanded_bytes += entry_len;
 
         let hash = content_hash(&content);
@@ -669,7 +846,12 @@ fn expand_at_depth(bytes: &[u8], parent_key: &str, depth: u32) -> ZipExpansion {
                 });
                 None
             } else {
-                Some(Box::new(expand_at_depth(&content, &key, depth + 1)))
+                Some(Box::new(expand_at_depth(
+                    &content,
+                    &key,
+                    depth + 1,
+                    cumulative_expanded_bytes,
+                )))
             }
         } else {
             None
@@ -920,6 +1102,178 @@ mod tests {
                 .unwrap_or_default()
                 .contains("symlink")
         );
+    }
+
+    /// **A panel finding, pinned as a decisive check**: `is_dir()` is a pure
+    /// name-suffix check (`name().ends_with('/')`), completely independent
+    /// of `is_symlink()`'s Unix external-attributes read — an entry can have
+    /// BOTH `is_dir()==true` and `is_symlink()==true` at once. Checking
+    /// `is_dir()` first (this module's own earlier order) filed such an
+    /// entry as an innocuous directory marker and never reached the symlink
+    /// refusal at all; this module now checks `is_symlink()` first,
+    /// unconditionally of the entry's name.
+    #[test]
+    fn a_symlink_entry_whose_raw_name_ends_in_a_slash_is_still_refused_as_a_symlink() {
+        let mut buffer = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buffer));
+            let options = zip::write::SimpleFileOptions::default();
+            writer
+                .add_symlink("escape/", "../../etc/passwd", options)
+                .expect("add_symlink");
+            writer.finish().expect("finish archive");
+        }
+        // Fixture sanity: the crate itself must report BOTH predicates true
+        // for this entry, or this test would prove nothing about the
+        // ordering bug it exists to catch.
+        {
+            let mut sanity = zip::ZipArchive::new(Cursor::new(&buffer)).expect("archive opens");
+            let entry = sanity.by_index(0).expect("the one entry");
+            assert!(entry.is_dir(), "fixture sanity: raw name ends in '/'");
+            assert!(entry.is_symlink(), "fixture sanity: entry is a symlink");
+        }
+
+        let expansion = expand(&buffer, "parent-key");
+        assert!(expansion.children.is_empty(), "{:?}", expansion.children);
+        assert_eq!(
+            expansion.coverage.len(),
+            1,
+            "exactly one entry, one coverage row: {:?}",
+            expansion.coverage
+        );
+        let row = &expansion.coverage[0];
+        // `enclosed_name()` rebuilds the path from its own component parse,
+        // which drops the trailing separator — so `path` here is "escape",
+        // not the raw "escape/" name; the decisive claim is `status` and
+        // `detail`, not the exact string.
+        assert_eq!(
+            row.status,
+            Coverage::Excluded,
+            "must be refused as a symlink, never recorded as Coverage::Discovered (a directory \
+             marker): {row:?}"
+        );
+        assert!(
+            row.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("symlink"),
+            "{row:?}"
+        );
+    }
+
+    /// **A panel finding, pinned as a decisive check**: `zip`'s own
+    /// `is_file()` is defined as `!is_dir() && !is_symlink()` and never
+    /// checks `S_IFREG` — a FIFO, character device, block device, or socket
+    /// entry is neither a directory nor a symlink under those two checks,
+    /// so it silently passed `is_file()` and would have been admitted as an
+    /// ordinary child with its attacker-controlled bytes as content. This
+    /// module now masks the entry's own Unix mode bits directly instead.
+    #[test]
+    fn a_fifo_entry_is_refused_not_admitted_as_a_child() {
+        // No writer API in this crate can produce a FIFO-typed entry
+        // (`unix_permissions` masks its input with `& 0o777`, discarding
+        // type bits — VERIFIED, `zip`'s own `src/write.rs` doc comment; only
+        // `add_symlink`/`add_directory`/the default `S_IFREG` set higher
+        // mode bits at all), so this fixture is built honestly through the
+        // writer and then hand-spliced: the one entry's central-directory
+        // external file attributes are overwritten in place with a
+        // FIFO-typed Unix mode, a fixed-size field so no other offset in
+        // the archive shifts.
+        let mut buffer = build(&[("device", b"not really file content")]);
+        let fifo_mode: u32 = UNIX_S_IFIFO | 0o644;
+        set_unix_mode_in_only_central_directory_record(&mut buffer, fifo_mode);
+
+        // Fixture sanity: the crate must actually report this entry as
+        // neither a directory nor a symlink (so a naive `is_file()` gate
+        // WOULD wrongly admit it), or this test proves nothing about the
+        // mode-masking fix it exists to pin.
+        {
+            let mut sanity = zip::ZipArchive::new(Cursor::new(&buffer)).expect("archive opens");
+            let entry = sanity.by_index(0).expect("the one entry");
+            assert!(!entry.is_dir());
+            assert!(!entry.is_symlink());
+            assert!(
+                entry.is_file(),
+                "fixture sanity: `zip`'s own is_file() must (wrongly) accept this FIFO entry, \
+                 or this test does not exercise the gap this module's fix closes"
+            );
+            assert_eq!(entry.unix_mode(), Some(fifo_mode));
+        }
+
+        let expansion = expand(&buffer, "parent-key");
+        assert!(
+            expansion.children.is_empty(),
+            "a FIFO entry must never become a child: {:?}",
+            expansion.children
+        );
+        let row = expansion
+            .coverage
+            .iter()
+            .find(|r| r.path.as_deref() == Some("device"))
+            .expect("a coverage row for the FIFO entry");
+        assert_eq!(row.status, Coverage::Excluded);
+        assert!(
+            row.detail.as_deref().unwrap_or_default().contains("FIFO"),
+            "{row:?}"
+        );
+    }
+
+    /// **A real-world regression this module's own fix first broke, then
+    /// corrected** (`is_dangerous_unix_type`'s own doc has the full
+    /// account): a strict "admit only `S_IFREG`" version of the entry-type
+    /// mask refused every entry in this build's own real
+    /// `tests/fixtures/zip_corpus/zip_fixtures/*.zip` corpus, because none
+    /// of them sets the `S_IFREG` bit — every regular-file entry there
+    /// carries mode `0o600`, permission bits only, no type bits at all
+    /// (VERIFIED directly against the fixtures via `python3 -m zipfile`'s
+    /// own `external_attr >> 16`). This fixture reproduces that exact shape
+    /// by hand-splicing the same masked-to-zero mode onto an entry, and
+    /// pins that it is admitted, not refused.
+    #[test]
+    fn a_permission_only_unix_mode_with_no_type_bits_is_still_admitted() {
+        let mut buffer = build(&[("readme.txt", b"hello")]);
+        let permission_only_mode: u32 = 0o600; // masked to UNIX_S_IFMT == 0
+        set_unix_mode_in_only_central_directory_record(&mut buffer, permission_only_mode);
+
+        {
+            let mut sanity = zip::ZipArchive::new(Cursor::new(&buffer)).expect("archive opens");
+            let entry = sanity.by_index(0).expect("the one entry");
+            assert_eq!(
+                entry.unix_mode().map(|m| m & UNIX_S_IFMT),
+                Some(0),
+                "fixture sanity: the masked type must be zero, or this test does not reproduce \
+                 the real fixture corpus's own shape"
+            );
+        }
+
+        let expansion = expand(&buffer, "parent-key");
+        assert_eq!(
+            expansion.children.len(),
+            1,
+            "a permission-only Unix mode (no S_IFMT type bits) must be admitted as an ordinary \
+             regular file, matching this build's own real fixture corpus: {:?}",
+            expansion.coverage
+        );
+        assert_eq!(expansion.children[0].relative_path, "readme.txt");
+        assert_eq!(expansion.children[0].content, b"hello");
+    }
+
+    /// Overwrites the external-file-attributes field (bytes 38..42 of the
+    /// central-directory record, APPNOTE's fixed layout — the same field
+    /// this module's own [`hand_built_empty_name_zip`] spells out
+    /// byte-for-byte) of the archive's ONE central-directory record with
+    /// `new_unix_mode` folded into its upper 16 bits, preserving whatever
+    /// DOS-attribute low word was already there — in place, fixed-size, so
+    /// no other offset in the archive shifts.
+    fn set_unix_mode_in_only_central_directory_record(bytes: &mut [u8], new_unix_mode: u32) {
+        let cd_signature = [0x50, 0x4B, 0x01, 0x02];
+        let cd_start = bytes
+            .windows(4)
+            .position(|w| w == cd_signature)
+            .expect("one central directory record");
+        let dos_low_word = u16::from_le_bytes([bytes[cd_start + 38], bytes[cd_start + 39]]);
+        let external_attributes = (new_unix_mode << 16) | dos_low_word as u32;
+        bytes[cd_start + 38..cd_start + 42].copy_from_slice(&external_attributes.to_le_bytes());
     }
 
     #[test]
@@ -1253,6 +1607,91 @@ mod tests {
             row.path.as_deref(),
             Some(format!("e{per_entry_admitted}.txt").as_str()),
             "names the one entry that tripped it — the declared_count-th, past the ceiling"
+        );
+    }
+
+    /// **A panel finding, pinned as a decisive check**: an earlier version
+    /// of this module checked [`MAX_TOTAL_EXPANDED_BYTES`] against a local
+    /// counter re-initialised to zero on every call to `expand_at_depth`
+    /// (including the recursive calls a nested archive triggers), so the
+    /// ceiling bounded each archive LEVEL independently rather than the
+    /// whole expansion tree — a nested-archive structure could demand
+    /// `(128 MiB)^depth`, not 128 MiB. This test calls the private
+    /// `expand_at_depth` directly with a pre-SEEDED counter, which only
+    /// proves anything if the counter it seeds is the SAME one every
+    /// level's admission check reads — a re-zeroed-per-call counter could
+    /// never observe a seeded value's effect at the top level at all.
+    #[test]
+    fn the_total_bytes_ceiling_reads_a_caller_supplied_counter_not_a_fresh_one() {
+        let bytes = build_stored(&[("a.txt", &vec![b'A'; 1000]), ("b.txt", &vec![b'B'; 1000])]);
+        let mut seeded_cumulative_bytes = MAX_TOTAL_EXPANDED_BYTES - 500; // < one entry's room
+        let expansion = expand_at_depth(&bytes, "parent-key", 0, &mut seeded_cumulative_bytes);
+        assert!(
+            expansion.children.is_empty(),
+            "the first entry alone (1000 bytes) already exceeds the 500 bytes of headroom left \
+             in the seeded counter, so even the TOP level must refuse it: {:?}",
+            expansion.children
+        );
+        let row = expansion
+            .coverage
+            .iter()
+            .find(|r| r.status == Coverage::Unsupported)
+            .expect("a total-size coverage row");
+        assert!(
+            row.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("MAX_TOTAL_EXPANDED_BYTES"),
+            "{row:?}"
+        );
+    }
+
+    /// **The decisive nested-tree check** for the same finding: the
+    /// SHARED counter must carry forward from an outer level into a nested
+    /// archive's own recursive call, not reset at the recursion boundary —
+    /// the exact multiplication the finding named. A pre-fix per-level-only
+    /// counter would have let the inner archive's own small entry through
+    /// regardless of what the outer level had already spent.
+    #[test]
+    fn nested_archives_share_one_cumulative_budget_not_a_fresh_one_per_level() {
+        let inner = build_stored(&[("leaf.txt", &vec![b'L'; 1000])]);
+        let outer = build_stored(&[("inner.zip", &inner)]);
+        // Leave only ~100 bytes of shared headroom AFTER the outer level's
+        // own entry (the whole `inner.zip` blob) is admitted.
+        let mut seeded_cumulative_bytes = MAX_TOTAL_EXPANDED_BYTES - (inner.len() as u64) - 100;
+        let expansion = expand_at_depth(&outer, "root-key", 0, &mut seeded_cumulative_bytes);
+
+        assert_eq!(
+            expansion.children.len(),
+            1,
+            "the outer level's own single entry still fits: {:?}",
+            expansion.children
+        );
+        let nested_child = &expansion.children[0];
+        assert!(nested_child.is_nested_archive);
+        let grandchildren = nested_child
+            .nested
+            .as_ref()
+            .expect("depth 1 is within MAX_NESTING_DEPTH");
+        assert!(
+            grandchildren.children.is_empty(),
+            "the inner archive's own 1000-byte entry must be refused: only ~100 bytes of the \
+             SHARED budget remained once the outer level's own entry was admitted — a fresh \
+             per-level counter would have wrongly admitted it here: {:?}",
+            grandchildren.children
+        );
+        let refusal = grandchildren
+            .coverage
+            .iter()
+            .find(|r| r.status == Coverage::Unsupported)
+            .expect("a total-size coverage row at the NESTED level");
+        assert!(
+            refusal
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("MAX_TOTAL_EXPANDED_BYTES"),
+            "{refusal:?}"
         );
     }
 

@@ -347,8 +347,12 @@ const WALK: &[Item] = &[
         note: "S4 Y3 (G5 as AMENDED 2026-08-28). `enclosed_name` is a path-STRING validator only \
                (research note beside the sprint plan, VERIFIED against zip2's source); this wave \
                adds explicit checks on top with their own named coverage rows: entry TYPE \
-               (symlink/non-regular refused via `is_symlink`/`is_file`, VERIFIED against `zip` \
-               8.6.0's own `src/read.rs`), non-empty name, name uniqueness, and a Unicode \
+               (symlink refused via `is_symlink`, checked first and unconditionally of the \
+               entry's name; every other non-regular type — FIFO, char/block device, socket — \
+               refused by masking the entry's own Unix mode bits (`S_IFMT`) directly rather than \
+               trusting `zip`'s `is_file()`, which is `!is_dir() && !is_symlink()` and does not \
+               check `S_IFREG` at all, VERIFIED against `zip` 8.6.0's own `src/read.rs`), \
+               non-empty name, name uniqueness, and a Unicode \
                NFC-then-case-fold normalisation rule (not a bare `to_lowercase()`) for \
                case-insensitive/NFC-NFD-folding collisions. Five bounds — entry count, per-entry \
                uncompressed size (reused from `scan::MAX_RESOURCE_BYTES`, R2), total expanded \
