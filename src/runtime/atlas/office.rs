@@ -95,13 +95,20 @@
 //! are, empirically, **not recoverable through anydoc's normalized model**,
 //! and this module says so rather than fabricating an answer:
 //!
-//! * `numId`/`ilvl` per list paragraph — anydoc resolves numbering into an
-//!   actual nested [`List`]/[`ListItem`] tree (marker kind, start, nesting by
-//!   containment) rather than preserving the OOXML numbering identity that
-//!   produced it. That is the abstraction working as designed — "any doc"
-//!   means normalizing across formats that do not all *have* an `numId` — and
-//!   asserting it back here would put an OOXML-specific concept in our own
-//!   vocabulary, which the boundary above forbids anyway.
+//! * `numId`/`ilvl` per list paragraph, specifically — anydoc resolves
+//!   numbering into an actual nested [`List`]/[`ListItem`] tree (marker
+//!   kind, start, nesting by containment) rather than preserving the OOXML
+//!   numbering identity that produced it. That is the abstraction working
+//!   as designed — "any doc" means normalizing across formats that do not
+//!   all *have* a `numId` — and asserting the raw id back here would put an
+//!   OOXML-specific concept in our own vocabulary, which the boundary above
+//!   forbids anyway. What that tree *does* carry — nesting depth, and
+//!   ordered-vs-bulleted marker kind — is not part of this gap:
+//!   [`render_list`] renders it back out as an indent-and-marker textual
+//!   proxy (two spaces per level, [`MarkerKind::label`](anydoc::model::MarkerKind::label)
+//!   per item), so a numbered top-level item and a bulleted second-level
+//!   item stay visually and texturally distinguishable in [`OfficeUnit::text`],
+//!   even though the source `numId` that drove them is gone.
 //! * `header_parts`/`footer_parts` — anydoc's `model::Document` carries body
 //!   content and notes only; page headers/footers are DOCX package parts
 //!   outside the main reading flow, and anydoc's docx frontend does not parse
@@ -245,10 +252,24 @@ pub fn docx_units(bytes: &[u8]) -> Result<Vec<OfficeUnit>, OfficeError> {
     // "recovered from a well-formedness problem" and "read cleanly" are not
     // the same claim, and F8 promises the honest one. `log`'s own message
     // text is explicitly *not* a stable API (anydoc's `lib.rs` doc says so),
-    // so this counts *whether anything logged at WARN or above fired at
-    // all* during this call — never matches on wording — which is exactly
-    // the signal anydoc's own doc names as the sanctioned one ("Recovery and
-    // skipped-content events are reported through the log facade").
+    // so this counts *whether the specific xml-recovery event fired* —
+    // never matches on wording. It does NOT count every WARN in the call
+    // tree: anydoc's own doc names two different event classes sharing this
+    // one facade ("Recovery and skipped-content events are reported through
+    // the log facade"), and only the first is a well-formedness problem.
+    // Verified directly against anydoc 0.2.4's source: a *benign*,
+    // by-design skip — a dangling relationship target
+    // (`package/relationships.rs`), a corrupt optional part
+    // (`package/archive.rs`), an unresolvable related-part path
+    // (`formats/docx/mod.rs`), a numbering instance referencing an unknown
+    // abstract id (`formats/docx/numbering.rs`), or a corrupt chart/diagram
+    // part (`formats/docx/content.rs`) — also logs at WARN, on a document
+    // anydoc still returns fully well-formed. Only `package::xml`'s own
+    // `log::warn!("recovered malformed xml …")` (`package/xml.rs`) is the
+    // well-formedness-recovery signal; [`RecoveryWatch::log`] below matches
+    // on that module's own log target (`module_path!()`, the default target
+    // when a macro call names none — confirmed against the `log` crate's
+    // own docs), not on level alone.
     if RECOVERY_WATCH.warned.swap(false, Ordering::SeqCst) {
         return Err(OfficeError::Malformed(
             "anydoc recovered from a well-formedness problem while parsing this document \
@@ -386,10 +407,48 @@ fn render_block(block: &anydoc::model::Block, out: &mut String) {
     }
 }
 
+/// Renders one list level's items, in order. Each item gets a rendered
+/// marker — the list's own [`MarkerKind::label`](anydoc::model::MarkerKind::label)
+/// at its resolved ordinal, or the item's literal `marker_label` override
+/// for composite source numbering anydoc can't reproduce from marker+
+/// position alone — and a nested list's own item lines are indented two
+/// spaces past their parent item's marker, one "  " added at each level as
+/// the recursion unwinds. This recovers, as a textual proxy, the
+/// containment hierarchy and the ordered/bulleted marker family anydoc's
+/// own model retains (module doc, "known, honest gap": what it still can't
+/// recover is the *raw* `numId`/`ilvl` identity that produced this
+/// hierarchy, an OOXML-specific concept the boundary above forbids keeping
+/// anyway — the hierarchy and marker kind those numbers produced are not
+/// the same claim as the numbers themselves, and only the latter is lost).
 fn render_list(list: &anydoc::model::List, out: &mut String) {
-    for item in &list.items {
+    for (position, item) in list.items.iter().enumerate() {
+        let ordinal = list.start + position as u64;
+        let marker = item
+            .marker_label
+            .clone()
+            .unwrap_or_else(|| list.marker.label(ordinal));
+
+        let mut item_text = String::new();
         for child in &item.blocks {
-            render_block(child, out);
+            render_block(child, &mut item_text);
+        }
+        if item_text.is_empty() {
+            push_line(out, &marker);
+            continue;
+        }
+        let mut lines = item_text.lines();
+        let first = lines.next().unwrap_or_default();
+        push_line(out, &format!("{marker} {first}"));
+        for line in lines {
+            // `line` may itself already be a nested list's own marker line
+            // (`render_block` above dispatches a `Block::List` child right
+            // back into this function) — either way it gets exactly one
+            // more "  " than it arrived with, which is what accumulates
+            // into a full per-depth indent as the recursion returns.
+            // `push_line` trims both ends, which would strip this
+            // indentation right back off, so this uses the raw pusher
+            // instead.
+            push_indented_line(out, &format!("  {line}"));
         }
     }
 }
@@ -422,13 +481,31 @@ fn push_line(out: &mut String, text: &str) {
     out.push_str(text.trim());
 }
 
+/// [`push_line`] without the trim — for a line whose leading whitespace is
+/// deliberate (a [`render_list`] indent step), not incidental source
+/// formatting to be discarded.
+fn push_indented_line(out: &mut String, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(text);
+}
+
 // ------------------------------------------------------- the recovery watch
 
-/// A process-global `log::Log` whose only job is to notice whether *anything*
-/// logged at [`log::Level::Warn`] or above during one [`docx_units`] call —
-/// see that function's own doc for why. Message text is never inspected
-/// (anydoc's own doc: log wording is not a stable API), only whether an
-/// event at this severity fired.
+/// A process-global `log::Log` whose only job is to notice whether the one
+/// well-formedness-recovery event fired during one [`docx_units`] call — see
+/// that function's own doc for why, and for why this is narrower than "any
+/// WARN": anydoc's docx pipeline logs an unrelated, benign class of
+/// "skipped content" WARN too (a dangling relationship target, a corrupt
+/// optional part, an unresolvable numbering instance, …), and those must
+/// never trip this adapter's stricter refusal. Message text is never
+/// inspected (anydoc's own doc: log wording is not a stable API); only the
+/// event's *target* — `anydoc::package::xml`, the one module that logs the
+/// actual recovery — is.
 struct RecoveryWatch {
     warned: AtomicBool,
 }
@@ -439,13 +516,26 @@ impl log::Log for RecoveryWatch {
     }
 
     fn log(&self, record: &log::Record<'_>) {
-        if record.level() <= log::Level::Warn {
+        // `enabled` above is a level-only gate (the cheap filter every
+        // caller of the `log` macros consults before even building a
+        // `Record`); the target check that actually distinguishes
+        // well-formedness recovery from a benign skipped-content WARN has
+        // to happen here, once a `Record` exists to inspect.
+        if record.level() <= log::Level::Warn && record.target() == XML_RECOVERY_LOG_TARGET {
             self.warned.store(true, Ordering::SeqCst);
         }
     }
 
     fn flush(&self) {}
 }
+
+/// The one module whose `log::warn!` call is the well-formedness-recovery
+/// signal (`anydoc::package::xml`'s own `parse_xml`, verified against
+/// anydoc 0.2.4's source — see [`docx_units`]'s doc). `log`'s default
+/// target is the call site's `module_path!()` (confirmed against the `log`
+/// crate's own docs), so this is exactly what a bare, target-less
+/// `log::warn!` inside that module produces.
+const XML_RECOVERY_LOG_TARGET: &str = "anydoc::package::xml";
 
 static RECOVERY_WATCH: RecoveryWatch = RecoveryWatch {
     warned: AtomicBool::new(false),
@@ -483,6 +573,50 @@ mod tests {
             .join("tests/fixtures/anydoc_corpus/docx_fixtures")
             .join(name);
         std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// Regression pin for the recovery-watch narrowing: a benign
+    /// skipped-content WARN from elsewhere in anydoc's docx pipeline must
+    /// not trip the watch, but the actual `anydoc::package::xml`
+    /// well-formedness-recovery event still must. Exercised directly
+    /// against [`RecoveryWatch::log`] with hand-built [`log::Record`]s
+    /// (rather than a corpus fixture) because the distinguishing signal is
+    /// the log target, not anything a parsed document's own shape can
+    /// assert on.
+    #[test]
+    fn recovery_watch_ignores_benign_warn_events_outside_xml_recovery() {
+        use log::Log as _;
+
+        let watch = RecoveryWatch {
+            warned: AtomicBool::new(false),
+        };
+
+        let benign = log::Record::builder()
+            .level(log::Level::Warn)
+            .target("anydoc::formats::docx::numbering")
+            .args(format_args!(
+                "numbering instance 3 references unknown abstract 7"
+            ))
+            .build();
+        watch.log(&benign);
+        assert!(
+            !watch.warned.load(Ordering::SeqCst),
+            "a benign skipped-content WARN outside {XML_RECOVERY_LOG_TARGET} must not trip the \
+             recovery watch"
+        );
+
+        let recovery = log::Record::builder()
+            .level(log::Level::Warn)
+            .target(XML_RECOVERY_LOG_TARGET)
+            .args(format_args!(
+                "recovered malformed xml (unclosed or mismatched elements)"
+            ))
+            .build();
+        watch.log(&recovery);
+        assert!(
+            watch.warned.load(Ordering::SeqCst),
+            "the actual xml well-formedness recovery signal must still trip the watch"
+        );
     }
 
     /// F6, stated exactly as `text.rs`'s own test states it: two calls on
@@ -552,10 +686,11 @@ mod tests {
     }
 
     /// Fixture 02: a two-level nested list under one heading — the manifest's
-    /// `numId`/`ilvl` fields are the one thing this adapter's vocabulary
-    /// cannot recover (module doc); item text and count are.
+    /// raw `numId`/`ilvl` identity is the one thing this adapter's
+    /// vocabulary cannot recover (module doc); item text, count, nesting
+    /// depth, and marker kind all are.
     #[test]
-    fn fixture_02_nested_list_items_are_flattened_in_order() {
+    fn fixture_02_nested_list_preserves_marker_kind_and_nesting_depth() {
         let units = docx_units(&fixture("02-nested-list-numbering.docx")).expect("parses");
         let sections: Vec<_> = units
             .iter()
@@ -570,6 +705,20 @@ mod tests {
                 sections[0].text
             );
         }
+        // The manifest's own numId/ilvl gap (module doc) is about the raw
+        // OOXML identity, not the nesting/marker *shape* that identity
+        // produced — the fixture's numbering.xml pins level 0 as decimal
+        // and level 1 as lowerLetter (`build_docx_fixtures.py`), and per
+        // OOXML's default level-restart behavior each new level-0 item
+        // restarts its own level-1 counter, so "Apples"/"Bananas" are
+        // `a.`/`b.` under "Produce" and "Milk" is `a.` again under "Dairy",
+        // not `c.` This is the exact shape [`render_list`] must reproduce
+        // as a textual proxy, not just the bag of item words checked above.
+        assert_eq!(
+            sections[0].text,
+            "Shopping list\n1. Produce\n  a. Apples\n  b. Bananas\n2. Dairy\n  a. Milk",
+            "nesting depth and marker kind must survive rendering, not just item text"
+        );
         assert_eq!(
             count_body_paragraphs(&raw_document(&fixture("02-nested-list-numbering.docx"))),
             6,
