@@ -221,6 +221,66 @@ pub fn estate_git_key(blob_oid: &str, extractor: &str) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
+/// **F7's child-resource key (G9)**: a container entry's key is composed from
+/// its *immediate* parent's own key, never re-derived from a top-level
+/// resource identity and never a bare content hash.
+///
+/// `parent_key` is whatever key produced the container this entry was read
+/// out of: [`local_key`]/[`estate_git_key`] for a top-level archive, or
+/// another call to [`child_key`] for an entry nested inside an entry that was
+/// itself a container. That is the whole of "chained, not resolved-to-root"
+/// (S4 Y3's research note, "Nested archive provenance must chain, not
+/// collapse"): a grandchild's key already folds in its parent's key, which
+/// already folded in *its* parent's, so the full ancestry is baked into one
+/// fixed-width digest without this crate ever storing an explicit chain of
+/// hops. Two different parents (two different archives, or two different
+/// entries of the same archive) that happen to contain byte-identical
+/// content produce two *different* child keys, because `parent_key` and
+/// `entry_path` differ — which is correct: "this file lives at path `x`
+/// inside archive `A`" and "this file lives at path `y` inside archive `B`"
+/// are two different facts about the world even when the bytes match, and
+/// collapsing them onto one key (as a bare `local_key(content_hash,
+/// extractor)` call would) would erase that.
+///
+/// **Domain-separated from every other key in this module, on purpose** — the
+/// same reasoning [`estate_git_key`]'s own doc gives for its own separator:
+/// a bare hash of the same four inputs under a different label could, in
+/// principle, collide with something computed elsewhere for another
+/// purpose. Folding `parent_key` in as one of the four hashed inputs also
+/// means a child key can never collide with a *top-level* [`local_key`]/
+/// [`estate_git_key`] value by construction — those functions take exactly
+/// two inputs (content hash, extractor) and never take a `parent_key`, so
+/// their output never enters this function's own input transcript, and this
+/// function's distinct prefix means its output never re-enters theirs
+/// either.
+///
+/// `extractor` is the CHILD's own extractor identity — whatever downstream
+/// adapter claims the entry's bytes (`text::extractor_for`,
+/// `office::extractor_for`, this module's own container routing for a
+/// nested archive, or a placeholder naming "no adapter claims this
+/// extension yet") — never the container adapter that unpacked the entry.
+/// Recording every archive-derived child under one constant "extractor =
+/// zip" would erase exactly the information F7's own key is built to carry
+/// (S4 Y3's research note, "`entry adapter` provenance must name the
+/// specific extractor that ran on the child, not the container format").
+pub fn child_key(
+    parent_key: &str,
+    entry_path: &str,
+    content_hash: &str,
+    extractor: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sergeant.atlas.child-key/v1\n");
+    hasher.update(parent_key.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(entry_path.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(content_hash.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(extractor.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 /// The content identity of a Work overlay's *changed* paths: BLAKE3 over each
 /// changed path and what the overlay recorded for it, in path order.
 ///
@@ -479,6 +539,73 @@ mod tests {
         assert_ne!(local_key(&a, "markdown/v1"), local_key(&b, "markdown/v1"));
         // And the key is never just the content hash handed back.
         assert_ne!(local_key(&a, "markdown/v1"), a);
+    }
+
+    /// F7/G9: a child key moves when ANY of its four inputs move, and it is
+    /// never reducible to a bare content-hash-plus-extractor call — the
+    /// property that distinguishes it from [`local_key`].
+    #[test]
+    fn a_child_key_is_parent_and_path_and_content_and_extractor_and_never_content_alone() {
+        let parent = local_key(&content_hash(b"archive bytes"), "zip/v1");
+        let entry_a = content_hash(b"hello");
+        let entry_b = content_hash(b"world");
+
+        let base = child_key(&parent, "notes/a.md", &entry_a, "markdown/v1");
+        assert_eq!(
+            base,
+            child_key(&parent, "notes/a.md", &entry_a, "markdown/v1"),
+            "deterministic: same four inputs, same key"
+        );
+        assert_ne!(
+            base,
+            child_key(&parent, "notes/b.md", &entry_a, "markdown/v1"),
+            "a different entry path must move the key even with identical content"
+        );
+        assert_ne!(
+            base,
+            child_key(&parent, "notes/a.md", &entry_b, "markdown/v1"),
+            "different content must move the key even at the identical path"
+        );
+        assert_ne!(
+            base,
+            child_key(&parent, "notes/a.md", &entry_a, "text/v1"),
+            "a different child extractor must move the key"
+        );
+        let other_parent = local_key(&content_hash(b"a different archive"), "zip/v1");
+        assert_ne!(
+            base,
+            child_key(&other_parent, "notes/a.md", &entry_a, "markdown/v1"),
+            "a different parent must move the key even with an identical entry"
+        );
+
+        // And never the same as calling `local_key` directly on the entry's
+        // own content hash + extractor — the mistake the research note names
+        // ("keying purely on content hash... is wrong for the resource's
+        // identity/provenance").
+        assert_ne!(base, local_key(&entry_a, "markdown/v1"));
+    }
+
+    /// G9's own words: chained, not resolved-to-root. A grandchild's key is
+    /// computed by feeding the CHILD's own key back in as `parent_key`, and
+    /// that must differ from naively keying the grandchild against the
+    /// top-level archive's key directly (which would flatten a two-level
+    /// nesting into one hop and lose which nested archive it came through).
+    #[test]
+    fn a_grandchild_key_chains_through_its_own_parent_not_the_root() {
+        let root = local_key(&content_hash(b"outer.zip bytes"), "zip/v1");
+        let nested_archive_hash = content_hash(b"inner.zip bytes");
+        let nested_key = child_key(&root, "inner.zip", &nested_archive_hash, "zip/v1");
+
+        let grandchild_hash = content_hash(b"leaf content");
+        let chained = child_key(&nested_key, "leaf.md", &grandchild_hash, "markdown/v1");
+        let flattened_to_root = child_key(&root, "leaf.md", &grandchild_hash, "markdown/v1");
+        assert_ne!(
+            chained, flattened_to_root,
+            "keying a grandchild against the ROOT archive's key must differ from keying it \
+             against its own immediate parent (the nested archive) — collapsing the chain would \
+             make two different nested archives that happen to share a leaf path and content \
+             collide"
+        );
     }
 
     /// The domain-separation prefix is not decoration: without it, a caller

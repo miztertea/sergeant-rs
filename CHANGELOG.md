@@ -494,6 +494,67 @@ release.
   one above), with expected counts written down and independently
   cross-checked before any extractor existed, backs every claim above.
 
+### Bounded ZIP containers (S4)
+
+- ZIP archives now expand into child resources — bytes in, admitted
+  entries out — running the `zip` crate (the maintained `zip2` fork) behind
+  a pure-function adapter inside the same supervised worker transport the
+  Office adapter uses. `enclosed_name` (already cited for path safety) is a
+  path-STRING validator only: it rejects NUL bytes, absolute paths, drive
+  letters, UNC prefixes and `..` traversal, and says nothing about entry
+  TYPE. This wave adds the checks it does not cover, each its own named,
+  never-silent refusal: a symlink or any non-regular-file entry, an empty
+  name, a name that duplicates one already admitted, and a name that
+  collides with one already admitted once both are canonicalised (Unicode
+  NFC normalisation, then full Unicode case conversion — not a bare
+  `to_lowercase()`, which would miss a normalisation-form mismatch on its
+  own).
+- **Every bound is enforced by counting bytes as they stream out of the
+  decompressor — never by trusting the archive's own declared size.**
+  `size()`/`compressed_size()` are attacker-controlled header fields,
+  reconciled with reality only by a CRC-32 check performed after the whole
+  entry is already decompressed. Five named ceilings — entry count,
+  per-entry uncompressed size (reused outright from the existing
+  whole-resource size ceiling, rather than a second independently-tuned
+  number), cumulative expanded size, a header-declared compression-ratio
+  pre-filter, and archive-within-archive nesting depth — each name the
+  specific bomb shape they defend against and are stated as provisional and
+  unmeasured except the reused one, the same honesty this codebase already
+  applies to its other unvalidated numeric ceilings.
+- **A prior open research question is now closed: this crate does not
+  reject overlapping or self-referential (quine-shaped) archive
+  constructions on its own.** Its own documentation says so verbatim for
+  the one relevant diagnostic it ships, which is opt-in, not automatic. The
+  adapter calls that diagnostic itself, before opening any entry, and
+  refuses the whole archive rather than any single entry when it fires —
+  proven against a hand-crafted fixture whose central directory legitimately
+  points two entries at the identical compressed-data byte range. A second,
+  narrower correction surfaced while building this wave's own fixtures:
+  two central-directory records sharing byte-identical raw names do not
+  both survive to be visited at all — the crate's own internal bookkeeping
+  silently collapses them to one entry, last-write-wins, before the archive
+  even reports how many entries it holds. Both findings are pinned by their
+  own decisive tests, not merely asserted.
+- **Child resources keep parent provenance**, composed rather than
+  restated: every admitted entry's cache key folds in its immediate
+  parent's own key — a top-level archive's, or (for an entry that is itself
+  a nested archive) that entry's own composed key — so a grandchild's key
+  already encodes its whole ancestry without this crate storing an explicit
+  chain, and cannot collide with an unrelated top-level resource that
+  happens to share a content hash. A nested archive within the depth
+  ceiling recurses; one past it still becomes its own child resource, just
+  not opened further.
+- No entry is ever executed, and nothing this adapter produces is written
+  to a real filesystem path — expansion produces bytes and structured
+  records only.
+- **A named seam, not a silent one**: the worker's wire contract does not
+  yet carry a child's content bytes, hash, or composed key — only its name
+  and path, the shape the transport already had. Every admission, bounds
+  and provenance claim above is proven exhaustively against the adapter's
+  own return value; widening the shared wire type to carry a child's real
+  bytes end to end is left, explicitly, to the wave that wires real
+  daemon-side persistence for archive children.
+
 ### Atlas closeout (S3)
 
 - `docs/concepts/atlas-and-knowledge.md` documents Atlas for operators: what

@@ -149,6 +149,7 @@
 //! name. That is the one-owner rule biting its own documentation, which is
 //! the correct direction for it to bite.)
 
+pub mod archive;
 pub mod db;
 pub mod deny;
 pub mod git;
