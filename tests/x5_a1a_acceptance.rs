@@ -354,11 +354,17 @@ const WALK: &[Item] = &[
                check `S_IFREG` at all, VERIFIED against `zip` 8.6.0's own `src/read.rs`), \
                non-empty name, name uniqueness, and a Unicode \
                NFC-then-case-fold normalisation rule (not a bare `to_lowercase()`) for \
-               case-insensitive/NFC-NFD-folding collisions. Five bounds — entry count, per-entry \
-               uncompressed size (reused from `scan::MAX_RESOURCE_BYTES`, R2), total expanded \
-               size, a header-declared-ratio pre-filter, and nesting depth — are ENFORCED BY \
-               COUNTING STREAMED BYTES (`Read::take`), never by trusting the attacker-controlled \
-               `size()`/`compressed_size()` header fields; every ceiling but the reused one is \
+               case-insensitive/NFC-NFD-folding collisions. Two size bounds — per-entry \
+               uncompressed size (reused from `scan::MAX_RESOURCE_BYTES`, R2) and total expanded \
+               size — are ENFORCED BY COUNTING STREAMED BYTES (`Read::take`), never by trusting \
+               the attacker-controlled `size()`/`compressed_size()` header fields. The other two \
+               named bounds are honestly different, not folded into that same claim: entry count \
+               is checked against the central directory's own real record count, not an \
+               attacker-inflatable declared integer; the compression-ratio bound is an ADVISORY \
+               pre-filter computed from those same declared header fields BEFORE any byte \
+               streams — cheap triage in front of the streamed per-entry check that actually \
+               holds under a header that lies about the ratio too. Nesting depth caps recursion, \
+               not bytes. Every ceiling but the reused per-entry one is named PROVISIONAL and \
                named PROVISIONAL and unmeasured (Y1's memory-cap precedent, #325). CLOSES THE \
                RESEARCH'S OPEN ITEM: `zip` 8.6.0 does NOT reject overlapping/self-referential \
                (quine-shaped) constructions on its own — its own `has_overlapping_files` doc says \
