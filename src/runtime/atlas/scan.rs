@@ -23,10 +23,38 @@
 //!   as a *change hint* and is part of no key, so touching a file changes
 //!   nothing derived and editing one changes everything derived from it.
 //! * **F8 — every path seen leaves exactly one coverage row.** Indexed,
-//!   excluded, unavailable, unsupported or error: there is no sixth outcome
-//!   where a path is silently not mentioned. One row per *path*, not one per
-//!   extractor: a resource two extractors claimed still has one row, whose
-//!   `detail` names both, and whose status is `error` if either failed.
+//!   excluded, unavailable, unsupported, online-only or error: there is no
+//!   seventh outcome where a path is silently not mentioned. One row per
+//!   *path*, not one per extractor: a resource two extractors claimed still
+//!   has one row, whose `detail` names both, and whose status is `error` if
+//!   either failed.
+//!
+//! # Online-only / cloud-placeholder detection (S4 Y6, G7/A1-06)
+//!
+//! [`suspected_online_only`] runs on the [`std::fs::Metadata`] the walker
+//! already fetched for every entry (`symlink_metadata`, one `lstat` per
+//! path) — never a second syscall, and specifically never `open()`. That is
+//! not an optimization; it is the whole safety property. A1 §7 forbids
+//! auto-hydrating a library, and on several cloud-sync filesystems `open()`
+//! is exactly what triggers a hydration download of a placeholder's real
+//! bytes. So classification happens strictly before [`Walk::file`] or
+//! [`Walk::dataset`] reads a single byte, using metadata that was going to be
+//! fetched regardless (every other coverage decision needs it too), and a
+//! file this check flags is never opened at all — the byte-read boundary
+//! ([`std::fs::read`] in `file`, [`hash_file`] in `dataset`) is downstream of
+//! the check, not upstream.
+//!
+//! **The permitted syscall set is exactly `lstat`/`stat`** (via
+//! `std::fs::symlink_metadata`, already called). `listxattr`/`getxattr` were
+//! investigated as a second signal (candidates the wave's own brief named)
+//! and deliberately not adopted: this build's targets (Linux, macOS —
+//! `Cargo.toml` names no Windows-only dependency and CI runs neither) have no
+//! single documented, verifiable-via-real-documentation xattr convention for
+//! a cloud-sync placeholder the way Windows' NTFS reparse-point attribute is
+//! documented for OneDrive Files On-Demand. Guessing one would repeat
+//! exactly the mistake S4's own record already made once with
+//! `enclosed_name`'s assumed guarantees — so the heuristic stays to the one
+//! signal this wave could actually verify.
 //!
 //! # The shared extraction (X3b)
 //!
@@ -101,6 +129,52 @@ const DATASET_HASH_CHUNK: usize = 64 * 1024;
 /// consumer for repository-resident datasets can decide what to do about it.
 pub const DATASET_NO_ROOT: &str =
     "tabular datasets are read in place, and this source's bytes have no path to read in place";
+
+/// [`Coverage::OnlineOnly`]'s own detail text — the honesty the acceptance
+/// item's own scope names as the deliverable, not a caveat: stated as a
+/// signal, never a certainty, every time the row is written rather than only
+/// in a doc comment a reader of the coverage table never sees.
+pub const ONLINE_ONLY_DETAIL: &str = "best-effort (S4 Y6, G7/A1-06): zero allocated blocks with a non-zero reported size \
+     (st_blocks == 0, st_size > 0) — the signature of an online-only/cloud-sync placeholder, \
+     but also of an ordinary sparse file, so this can be a false positive; a placeholder a sync \
+     client reports with full block allocation before the byte is fetched is not caught at all, \
+     so this can also be a false negative. Content was not opened to check further, because on \
+     several cloud filesystems open() is what triggers a hydration download (A1 §7 forbids \
+     auto-hydrating a library)";
+
+/// The heuristic itself (S4 Y6, G7/A1-06): does this entry's already-fetched
+/// metadata look like a cloud-sync placeholder rather than ordinary content?
+///
+/// **Reads no more than the [`std::fs::Metadata`] the caller already has.**
+/// No `open()`, no second `stat`, nothing beyond the two POSIX fields this
+/// module's own doc explains: `st_blocks == 0` (nothing allocated on disk)
+/// with `st_size > 0` (the filesystem still reports real content). Verified
+/// against the Rust standard library's own documentation for
+/// [`std::os::unix::fs::MetadataExt::blocks`], which states a file with
+/// holes reports fewer blocks than its size would otherwise imply — the
+/// exact divergence this checks for, taken to its extreme (zero blocks at
+/// all).
+///
+/// A genuinely empty file (`st_size == 0`) is never flagged: it has nothing
+/// to have failed to fetch, and calling it a placeholder would be the
+/// opposite dishonesty from the one this heuristic exists to fix.
+///
+/// `false` unconditionally off `cfg(unix)` — this build's targets are Linux
+/// and macOS (`Cargo.toml` names no Windows-only dependency, and CI runs
+/// neither), and `MetadataExt` is a Unix-only trait; a platform this heuristic
+/// has not been verified against gets the honest "not detected" answer
+/// rather than a guess.
+#[cfg(unix)]
+fn suspected_online_only(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    meta.size() > 0 && meta.blocks() == 0
+}
+
+/// See the `cfg(unix)` twin's doc — unverified off Unix, so honestly `false`.
+#[cfg(not(unix))]
+fn suspected_online_only(_meta: &std::fs::Metadata) -> bool {
+    false
+}
 
 /// One source to scan: the manifest's declaration, resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -576,6 +650,18 @@ impl Walk<'_> {
             });
             return;
         };
+        // Classified from metadata already in hand, strictly before the
+        // byte-read boundary below — see the module doc's own section on
+        // why this order is the whole safety property, not an optimization.
+        if suspected_online_only(&meta) {
+            self.coverage.push(CoverageRow {
+                path: Some(relative),
+                status: Coverage::OnlineOnly,
+                detail: Some(ONLINE_ONLY_DETAIL.to_string()),
+                bytes: Some(meta.len()),
+            });
+            return;
+        }
         if meta.len() > MAX_RESOURCE_BYTES {
             self.coverage.push(CoverageRow {
                 path: Some(relative),
@@ -654,6 +740,18 @@ impl Walk<'_> {
         meta: std::fs::Metadata,
         format: crate::runtime::atlas::tabular::DatasetFormat,
     ) {
+        // Same rule as `file`'s, checked before `hash_file` ever opens the
+        // path: a dataset's streaming hash is a read too, and this is the
+        // one place in this function that would trigger hydration.
+        if suspected_online_only(&meta) {
+            self.coverage.push(CoverageRow {
+                path: Some(relative),
+                status: Coverage::OnlineOnly,
+                detail: Some(ONLINE_ONLY_DETAIL.to_string()),
+                bytes: Some(meta.len()),
+            });
+            return;
+        }
         if relative.contains(crate::runtime::atlas::db::GLOB_METACHARACTERS) {
             self.coverage.push(CoverageRow {
                 path: Some(relative),
@@ -1252,5 +1350,129 @@ mod tests {
         assert_eq!(first.coverage, second.coverage);
         assert_eq!(first.files, second.files);
         assert_eq!(first.content_key, second.content_key);
+    }
+
+    // --------------------------------- S4 Y6, G7/A1-06: online-only detection
+
+    /// A sparse file — `st_size > 0`, `st_blocks == 0` — is `truncate`'s own
+    /// documented effect on ext4/most Linux filesystems (verified in this
+    /// wave's own sandbox, not merely assumed), so it is the honest stand-in
+    /// the brief asked for: it exercises the exact stat divergence the
+    /// heuristic reads, but it is **not** a true cloud placeholder — nothing
+    /// synced it, nothing would hydrate it, and a real placeholder on a real
+    /// cloud-sync client might diverge from this shape (the false-negative
+    /// case [`ONLINE_ONLY_DETAIL`] itself names). Said here plainly rather
+    /// than left for a reader to assume otherwise.
+    ///
+    /// Probe-gated per `CONTRIBUTING.md`'s two-environment rule: a
+    /// filesystem that does not actually leave the hole unallocated (some
+    /// non-ext4 CI mount, a copy-on-write remount) makes this a fact about
+    /// the environment, not the code under test, so the assertion is
+    /// skipped loudly rather than failing on a precondition nothing in this
+    /// build controls.
+    #[cfg(unix)]
+    fn make_sparse_file(path: &Path, apparent_len: u64) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let file = std::fs::File::create(path).expect("create");
+        file.set_len(apparent_len).expect("set_len");
+        drop(file);
+        let meta = std::fs::symlink_metadata(path).expect("stat");
+        meta.size() == apparent_len && meta.blocks() == 0
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_suspected_placeholder_is_never_indexed_as_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("report.md");
+        if !make_sparse_file(&path, 1_048_576) {
+            eprintln!(
+                "SKIPPED-ENV: this filesystem did not leave a sparse file unallocated \
+                 (st_blocks != 0 after set_len) — the divergence this test exercises is a \
+                 property of the filesystem, not of the code under test"
+            );
+            return;
+        }
+        let source = KnowledgeSource {
+            name: "notes".to_string(),
+            root: dir.path().to_path_buf(),
+            ignore: Vec::new(),
+            context_fields: ContextFields::none(),
+        };
+        let scan = scan_local_knowledge(&source).expect("scan");
+        let entry = row(&scan, "report.md");
+        assert_eq!(
+            entry.status,
+            Coverage::OnlineOnly,
+            "a suspected placeholder must never be reported Indexed with zero units — the \
+             exact 'silently indexed as empty' case acceptance item 4 forbids: {entry:?}"
+        );
+        assert!(
+            entry
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("best-effort") && d.contains("false")),
+            "the row's own detail must state the heuristic's honesty, not just a doc comment: \
+             {entry:?}"
+        );
+        assert!(
+            scan.files.is_empty(),
+            "a suspected placeholder must never be opened — files should be empty, not a \
+             zero-unit entry: {:?}",
+            scan.files
+        );
+    }
+
+    /// The mirror negative: a real, ordinary empty file is not a placeholder
+    /// and must not be misreported as one. `Indexed` with zero units is the
+    /// TRUE answer for a file that really is empty — turning it into
+    /// `online_only` would be the opposite dishonesty.
+    #[test]
+    fn a_genuinely_empty_file_is_indexed_not_flagged_online_only() {
+        let (_dir, scan) = scan_tree(&[("empty.md", b"")], &[]);
+        let entry = row(&scan, "empty.md");
+        assert_eq!(entry.status, Coverage::Indexed, "{entry:?}");
+    }
+
+    /// The same detection, over the dataset path (`file()`'s `dataset()`
+    /// twin): a sparse CSV is caught before [`hash_file`] would open it, not
+    /// registered as a dataset with a hash of nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_suspected_placeholder_dataset_is_never_registered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rows.csv");
+        if !make_sparse_file(&path, 65_536) {
+            eprintln!(
+                "SKIPPED-ENV: this filesystem did not leave a sparse file unallocated — see \
+                 `a_suspected_placeholder_is_never_indexed_as_empty`'s own note"
+            );
+            return;
+        }
+        let source = KnowledgeSource {
+            name: "notes".to_string(),
+            root: dir.path().to_path_buf(),
+            ignore: Vec::new(),
+            context_fields: ContextFields::none(),
+        };
+        let scan = scan_local_knowledge(&source).expect("scan");
+        let entry = row(&scan, "rows.csv");
+        assert_eq!(entry.status, Coverage::OnlineOnly, "{entry:?}");
+        assert!(
+            scan.datasets.is_empty(),
+            "a suspected placeholder must never be registered as a dataset: {:?}",
+            scan.datasets
+        );
+    }
+
+    /// The coverage vocabulary check item 4's own tripwire used to pin now
+    /// lives beside the row it describes rather than as a negative
+    /// assertion elsewhere — see `tests/x5_a1a_acceptance.rs`'s updated
+    /// register row 4 for the acceptance-level pin.
+    #[test]
+    fn online_only_is_a_named_coverage_state_with_its_own_wire_spelling() {
+        assert_eq!(Coverage::OnlineOnly.as_str(), "online_only");
+        assert_eq!(Coverage::parse("online_only"), Some(Coverage::OnlineOnly));
+        assert!(Coverage::ALL.contains(&Coverage::OnlineOnly));
     }
 }

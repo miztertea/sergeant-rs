@@ -812,6 +812,115 @@ trigger, and a second source kind (`external_git`) alongside
   the ruling cited. Both are documentation corrections to where an item
   already lived, not scope changes.
 
+### The scan trigger becomes estate-scoped, and online-only detection ships (S4 Y6)
+
+The owner correction **"estate intelligence is the feature. Not index a
+knowledge repo"**
+(`knowledge/rulings/owner-rulings/estate-intelligence-is-the-feature-2026-08-28.md`
+in the workspace estate) named a gap S4 Y5's own scan trigger left open: it
+iterated `[[knowledge]]` sources only, even though S3's X3a had already
+shipped the entire `estate_git` extraction path
+(`scan_estate_git`/`scan_estate_git_on_lane`) with no production caller. A
+copy of `sergeant-rs` had to be declared as a knowledge source to get any
+code intelligence over it at all — losing blob-OID keys, the pinned SHA,
+Work overlays and drift observation, every property X3a exists to provide.
+This closes that, as G8's own completion rather than new scope, and ships
+the wave's other named item alongside it.
+
+- **`sgt intelligence scan` — the estate-scoped trigger.** `POST
+  /v1/intelligence/scan` now scans everything the addressed estate
+  declares, across all three A1 §2 source kinds, in one call:
+  - **`estate_git`** — every declared `[[repo]]` repository, through the
+    identical Git path (`scan_estate_git_on_lane`) an admitted Work
+    already reads through: `git rev-parse HEAD` at the mount for the
+    pinned SHA (plain plumbing, run off the intelligence lane — extraction
+    itself still queues on the lane's own permit), then `ls-tree`/
+    `cat-file --batch` at that exact commit. **Repository bytes never go
+    through the folder walker** — routing them there would lose blob-OID
+    content keys, the pinned SHA, Work-overlay hashing and drift
+    observation, which is a bug this correction closes rather than an
+    accepted alternative. A mount whose HEAD moved since the scan pinned
+    it is reported as a drift observation riding beside its row, the same
+    §11.4 vocabulary Work retirement already uses.
+  - **`local_knowledge`** — every declared `[[knowledge]]` source, through
+    the folder walker (S4 Y5, unchanged).
+  - **`external_git`** — every external-Git source already recorded on
+    this host, refreshed through Y5's own acquisition. Host-scoped, not
+    estate-scoped (Atlas has no per-estate association for these yet, so
+    an estate-scoped scan refreshes every one the host holds) — named
+    here rather than silently assumed; a finer per-estate binding is
+    unbuilt scope.
+
+  Each row in the report now also names its `kind`, so per-source coverage
+  is honestly distinguishable across all three — the ruling's own "one
+  world model over one estate, reporting per-source coverage across all
+  kinds" requirement.
+
+  **Naming.** `sgt intelligence scan` is the primary spelling — an
+  intelligence/estate verb belongs beside `sgt intelligence status`/
+  `add`/`list` and `sgt map`, argued in this wave's own commit body, not
+  `sgt knowledge scan`'s knowledge-folder-only vocabulary describing a
+  now-estate-wide capability. **`sgt knowledge scan` keeps working,
+  unchanged spelling**, and now runs the identical widened scan — nothing
+  that already used it stops working or starts doing less.
+
+  **Proven end to end**, not merely at the pure-function level
+  (`tests/y6a_estate_scoped_scan.rs`): a real `[[repo]]` mount holding this
+  build's own `src/` tree, scanned through the real daemon trigger, with
+  `sgt map symbol`/`map references` resolving a real function
+  (`scan_estate_git`) at its real path — and the reported `content_key`
+  asserted **exactly equal** to `git rev-parse <pinned-sha>^{tree}`
+  computed independently on the mount, proving the generation is keyed on
+  the pinned commit's tree OID (X3a's own identity) rather than any
+  content hash a working-tree walk could have produced.
+
+- **Online-only / cloud-sync placeholder detection (G7, A1-06)** — the
+  wave's other named item, item 4's own open GAP since S3 close. A
+  synced-but-not-materialized file (a OneDrive/Dropbox/iCloud "online-only"
+  placeholder) now gets its own named coverage state, `online_only`,
+  **never** `indexed` with the file counted as though its bytes had
+  actually been read — the exact "silently indexed as empty" shape item 4
+  forbids.
+  - **Signal**: `st_blocks == 0` with `st_size > 0` — verified against the
+    Rust standard library's own documentation for
+    `std::os::unix::fs::MetadataExt::blocks` (a file with holes reports
+    fewer blocks than its size implies), not assumed. Read from the
+    `symlink_metadata` call the walker already makes for every entry —
+    **no additional syscall**.
+  - **Permitted syscall set, settled and checkable**: exactly `lstat`/
+    `stat`. `open()`/`read()` are never attempted on a path this check
+    flags — the classification runs strictly before the byte-read
+    boundary in both the document and dataset paths
+    (`src/runtime/atlas/scan.rs`'s `Walk::file`/`Walk::dataset`), because
+    A1 §7 forbids auto-hydrating a library and `open()` is the documented
+    hydration trigger on several cloud filesystems.
+    `listxattr`/`getxattr` were investigated and **not adopted**: no
+    single verifiable-via-documentation xattr convention for a cloud
+    placeholder covers this build's Linux/macOS targets, and guessing one
+    would repeat the `enclosed_name` mistake already made once this
+    sprint.
+  - **Honest about being a heuristic, in the coverage row's own `detail`
+    text every time, not only in a doc comment**: a legitimate sparse file
+    (a disk image, a punched-out log) reads identically and is a false
+    positive; a placeholder a sync client reports with full block
+    allocation before the byte is fetched is not caught at all and is a
+    false negative. A genuinely empty file (`st_size == 0`) is never
+    flagged — flagging it would be the opposite dishonesty.
+  - **Proven end to end through the real trigger**
+    (`tests/y6b_online_only.rs`): a sparse stand-in file (`truncate`'s own
+    documented effect on ext4, verified in this wave's own sandbox rather
+    than assumed) scanned via `POST /v1/intelligence/scan` lands
+    `online_only` in the real, daemon-recorded coverage — stated plainly
+    as a stand-in for a true cloud placeholder, not a claim that this
+    proves detection against a real sync client.
+  - **Register row 4 updated, not deleted**: `gap` -> `met`, citing the
+    new end-to-end and unit tests; the negative tripwire that used to pin
+    the gap (`a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped`)
+    is retired per its own assertion message's instruction and replaced
+    with a positive vocabulary pin
+    (`a1a_item_4_the_coverage_vocabulary_now_names_online_only`), the same
+    pattern the cross-cutting-gap tripwire already set at S4 Y5.
+
 ### Atlas closeout (S3)
 
 - `docs/concepts/atlas-and-knowledge.md` documents Atlas for operators: what

@@ -10,10 +10,13 @@
 //! could:
 //!
 //! 1. **No silent pass.** An item that cannot be proven is recorded as a gap
-//!    with a destination sprint, never as "met". Item 4 is such a row, and
-//!    [`a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped`] is its
-//!    tripwire: it fails the day someone ships the heuristic without updating
-//!    the walk, so the gap cannot quietly close or quietly widen.
+//!    with a destination sprint, never as "met". Item 4 was such a row from
+//!    S3 close through S4 Y5: its tripwire,
+//!    `a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped`, failed
+//!    the day someone shipped the heuristic without updating the walk, so
+//!    the gap could not quietly close or quietly widen. S4 Y6 shipped it —
+//!    see [`a1a_item_4_the_coverage_vocabulary_now_names_online_only`] for
+//!    the update that landed in the tripwire's place.
 //! 2. **No dangling citation.** [`every_named_check_exists_in_the_suite_it_names`]
 //!    reads every referenced file and fails if a named test was renamed or
 //!    deleted. A green suite that no longer contains the test the walk cites
@@ -35,7 +38,7 @@
 //! | 1 | one daemon-owned `atlas.duckdb` holds independently rebuildable `ops/source/git/context/meta` families | met-with-deviation | `x1_atlas_substrate::opening_atlas_declares_the_four_schema_namespaces` |
 //! | 2 | estate Git indexing pins exact repo/base generations and Work overlays without changing Work authority | met | `x3a_git_plumbing::a_scan_stays_on_its_pinned_sha_while_head_advances` |
 //! | 3 | a declared read-only local knowledge Source indexes a cloud-synced ordinary directory without becoming `[[repo]]` or receiving a worktree | met | `x5_a1a_acceptance::a1a_item_3_a_knowledge_source_is_indexed_without_becoming_a_repo_or_getting_a_worktree` |
-//! | 4 | online-only/unreadable local resources are reported as coverage gaps, not silently indexed as empty | gap | `x5_a1a_acceptance::a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped` |
+//! | 4 | online-only/unreadable local resources are reported as coverage gaps, not silently indexed as empty | met | `y6b_online_only::an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_trigger` |
 //! | 5 | Markdown/text and at least one Office format normalize into document units with provenance | met | `y2_office_adapter::a_docx_worker_returns_document_and_section_units_with_provenance` |
 //! | 6 | CSV/JSON/Parquet stay relational, with a deterministic aggregate and selected text-field context units sharing row identity | met | `x4_tabular_map::datasets_are_registered_and_read_in_place_as_derived_evidence` |
 //! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | met | `y3_zip_adapter::a_zip_worker_declares_admitted_children_through_the_real_subprocess` |
@@ -58,8 +61,8 @@
 //! scan, so on a real installation Atlas stayed empty until a test invoked
 //! it — a fact this file used to pin with a tripwire
 //! (`a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan`) precisely so
-//! it could not close silently. **It has closed.** `sgt knowledge scan` (`POST
-//! /v1/intelligence/scan`) drives a full scan of an estate's declared
+//! it could not close silently. **It has closed.** `sgt intelligence scan`
+//! (`POST /v1/intelligence/scan`) drives a full scan of an estate's declared
 //! `[[knowledge]]` sources through the daemon, on the intelligence lane,
 //! reporting from each source's own coverage counts; `sgt intelligence
 //! add`/`list` (`POST`/`GET /v1/intelligence/sources`) is item 10's own
@@ -73,6 +76,19 @@
 //! for the replacement pin. Scheduling and cadence remain deliberately
 //! unbuilt (G10): this is one call, one scan, one report — a recurring
 //! trigger is S5+'s, when retrieval needs one.
+//!
+//! **S4 Y6 widened the trigger to the whole estate** (the owner correction
+//! `estate-intelligence-is-the-feature-2026-08-28.md`, carried as G8's own
+//! completion rather than new scope): the identical endpoint now also
+//! scans every declared `[[repo]]` repository through the Git path at its
+//! pinned SHA, and refreshes every external-Git source already recorded on
+//! this host — see [`intelligence_scan`](../src/api.rs)'s own doc for the
+//! full per-kind shape, and `tests/y6a_estate_scoped_scan.rs` for the
+//! end-to-end proof this file's own item-2/item-4 checks do not attempt.
+//! `sgt intelligence scan` is the verb's primary spelling now (argued in
+//! [`the_intelligence_verb_set_now_includes_the_trigger_and_the_acquisition_surface`]'s
+//! own update); `sgt knowledge scan` still runs the same widened scan
+//! rather than being narrowed to match its own name.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -246,11 +262,27 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 4,
-        verdict: Verdict::Gap,
+        verdict: Verdict::Met,
         checks: &[
             at(
+                "tests/y6b_online_only.rs",
+                "an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_trigger",
+            ),
+            at(
+                "tests/y6b_online_only.rs",
+                "a_genuinely_empty_file_is_not_misreported_as_a_placeholder_through_the_real_scan_trigger",
+            ),
+            at(
                 "tests/x5_a1a_acceptance.rs",
-                "a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped",
+                "a1a_item_4_the_coverage_vocabulary_now_names_online_only",
+            ),
+            at(
+                "src/runtime/atlas/scan.rs",
+                "a_suspected_placeholder_is_never_indexed_as_empty",
+            ),
+            at(
+                "src/runtime/atlas/scan.rs",
+                "a_suspected_placeholder_dataset_is_never_registered",
             ),
             at(
                 "tests/x2_knowledge_sources.rs",
@@ -265,14 +297,34 @@ const WALK: &[Item] = &[
                 "a_file_a_grammar_cannot_parse_is_an_error_row_with_no_partial_symbols",
             ),
         ],
-        note: "THE UNREADABLE HALF IS MET: unreadable roots, unreadable datasets, unparseable \
-               files and excluded paths all leave a named coverage row, never a silent absence. \
-               THE ONLINE-ONLY HALF IS A GAP: F8's best-effort cloud-placeholder heuristic is \
-               NOT shipped. A synced-but-not-materialized file that the filesystem answers as a \
-               readable zero-byte file is indexed today with zero units — exactly the \
-               'silently indexed as empty' case this item forbids. DESTINATION: S4, beside the \
-               Office/Anydoc work that gives the heuristic its first real corpus. Not deferred \
-               by a ruling; named here as unfinished A1a scope.",
+        note: "UPDATED S4 Y6 (G7/A1-06): this row was a named GAP at S3/S4-Y5 close (see this \
+               file's own git history for the retired verdict and note) — the tripwire that \
+               pinned it, `a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped`, is \
+               retired per its own assertion message's instruction ('update ... rather than \
+               deleting'): the register row below is the update, and the vocabulary/behavior it \
+               used to forbid now has its own positive checks, cited above. \
+               THE UNREADABLE HALF stays met, unchanged: unreadable roots, unreadable datasets, \
+               unparseable files and excluded paths all leave a named coverage row. \
+               THE ONLINE-ONLY HALF NOW SHIPS, as a best-effort heuristic honestly labelled — \
+               which is the acceptance item's own literal wording, not a stronger claim than it \
+               makes. SIGNAL: `st_blocks == 0` with `st_size > 0`, read from the \
+               `symlink_metadata` call the walker already makes per entry (no added syscall). \
+               PERMITTED SYSCALL SET: exactly `lstat`/`stat` — `open()`/`read()` are never \
+               attempted on a path this check flags, checked strictly before the byte-read \
+               boundary in both `Walk::file` and `Walk::dataset` \
+               (`src/runtime/atlas/scan.rs`), because A1 §7 forbids auto-hydrating a library and \
+               `open()` is the documented hydration trigger on several cloud filesystems. \
+               `listxattr`/`getxattr` were investigated and NOT adopted: no single \
+               verifiable-via-documentation xattr convention for a cloud placeholder covers this \
+               build's Linux/macOS targets, and guessing one would repeat the `enclosed_name` \
+               mistake S4's own record already made once. HONEST LIMITS, named in the coverage \
+               row's own `detail` text every time, not just here: a legitimate sparse file (a \
+               disk image, a punched-out log) reads identically and is a FALSE POSITIVE; a \
+               placeholder a sync client reports with full block allocation before the byte is \
+               fetched is not caught at all and is a FALSE NEGATIVE. A genuinely empty file \
+               (`st_size == 0`) is never flagged — flagging it would be the opposite dishonesty. \
+               PROVEN END TO END through the real trigger \
+               (`tests/y6b_online_only.rs`), not only at the pure-function level.",
     },
     Item {
         number: 5,
@@ -988,75 +1040,28 @@ fn tree_snapshot(root: &Path) -> BTreeSet<(String, Vec<u8>)> {
     out
 }
 
-// ------------------------------------------------------- item 4: the tripwire
+// ------------------------------------ item 4: the online-only heuristic, now shipped
 
-/// §17.4's **named gap**, held open so it cannot close silently.
+/// §17.4's **named gap, now closed** (S4 Y6, G7/A1-06).
 ///
-/// F8 promised best-effort cloud-placeholder detection, honestly labeled. S3
-/// did not ship it: nothing in the Atlas tree reasons about a file that is
-/// present-but-not-materialized, so such a file is read as the empty file the
-/// filesystem presents and reported `indexed` with no units.
+/// This replaces `a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped`,
+/// which pinned the gap as a negative tripwire: it failed the day Atlas
+/// started reasoning about cloud placeholders at all, by name, so its own
+/// assertion message said what to do next — "update this file's register
+/// row 4 — verdict, note and decisive check — instead of deleting this
+/// tripwire". This is that update, following the identical pattern the
+/// cross-cutting-gap tripwire below it already set: the old function is
+/// retired rather than left to assert a claim that stopped being true, and
+/// its replacement proves the positive the old one only ever forbade the
+/// negative of.
 ///
-/// This test asserts the gap is exactly that shape — no detection, and no
-/// coverage vocabulary pretending to describe one. It is deliberately a
-/// tripwire, not a proof of absence: the day S4 lands the heuristic this
-/// fails, and whoever lands it must come here, change the verdict, and name
-/// the real check. That is the intended cost.
+/// Proves the vocabulary grew the named state (not a re-proof of the
+/// heuristic's own behavior — [`src/runtime/atlas/scan.rs`]'s own unit tests
+/// and `tests/y6b_online_only.rs`'s end-to-end trigger test own that; this
+/// is the acceptance-register-level pin that the wire spelling exists and
+/// stays exactly what F8 always promised, no more and no fewer states).
 #[test]
-fn a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped() {
-    let atlas = repo_root().join("src/runtime/atlas");
-    let mut claims = Vec::new();
-    // Recursive, not a flat read_dir: the tree is flat today, but S4's
-    // adapters may grow submodules, and a tripwire a new subdirectory
-    // silently escapes is no tripwire (aria X5 seat).
-    let mut dirs = vec![atlas];
-    let mut files = Vec::new();
-    while let Some(dir) = dirs.pop() {
-        for entry in fs::read_dir(&dir).expect("read atlas dir") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else {
-                files.push(path);
-            }
-        }
-    }
-    for path in files {
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let text = fs::read_to_string(&path)
-            .expect("read module")
-            .to_lowercase();
-        // Phrases specific to the unshipped feature. Deliberately not the bare
-        // word "placeholder", which the store already uses in an unrelated
-        // sense (the coverage row a walk leaves for a path a later step
-        // replaces).
-        for needle in [
-            "cloud placeholder",
-            "cloud-placeholder",
-            "online-only",
-            "online_only",
-            "onedrive",
-            "dehydrat",
-            "reparse",
-        ] {
-            if text.contains(needle) {
-                claims.push(format!("{} names {needle}", path.display()));
-            }
-        }
-    }
-    assert!(
-        claims.is_empty(),
-        "Atlas now appears to reason about cloud placeholders ({claims:?}). §17 item 4's \
-         online-only half was walked at S3 close as an OPEN GAP with destination S4. If it \
-         has been closed, update this file's register row 4 — verdict, note and decisive \
-         check — instead of deleting this tripwire."
-    );
-
-    // The half that IS met, stated here too so the row is not purely negative:
-    // the coverage vocabulary has a word for every way a resource can fail to
-    // be indexed, and no word for "skipped".
+fn a1a_item_4_the_coverage_vocabulary_now_names_online_only() {
     let vocabulary: BTreeSet<&str> = Coverage::ALL.iter().map(|c| c.as_str()).collect();
     assert_eq!(
         vocabulary,
@@ -1067,9 +1072,12 @@ fn a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped() {
             "unavailable",
             "unsupported",
             "error",
+            "online_only",
             "generation_evicted",
         ]),
-        "F8's coverage vocabulary is what makes an unreadable resource a reported gap"
+        "F8's coverage vocabulary is what makes an unreadable OR unmaterialized resource a \
+         reported gap — `online_only` is S4 Y6's own addition, and nothing else in the \
+         vocabulary should have moved"
     );
 }
 
@@ -1139,13 +1147,16 @@ fn the_intelligence_verb_set_now_includes_the_trigger_and_the_acquisition_surfac
         .collect();
     assert_eq!(
         verbs,
-        BTreeSet::from(["status", "add", "list"]),
-        "`sgt intelligence` must ship exactly status/add/list: {text}"
+        BTreeSet::from(["status", "add", "list", "scan"]),
+        "`sgt intelligence` must ship exactly status/add/list/scan: {text}"
     );
 
-    // And `sgt knowledge` itself grew the trigger verb (G8's own CLI-design
-    // spelling — a scan of DECLARED LOCAL sources belongs beside the verb
-    // group that already owns declaring them).
+    // And `sgt knowledge` kept its own scan spelling working (S4 Y6, G8
+    // correction: the trigger is now estate-scoped, not
+    // declared-local-sources-only, so `sgt intelligence scan` — beside
+    // `status`/`add`/`list`, the verb group that already covers every
+    // source kind — is the primary name; `sgt knowledge scan` still runs
+    // the identical scan rather than being narrowed or removed).
     let help = Command::new(SGT)
         .args(["knowledge", "--help"])
         .output()
