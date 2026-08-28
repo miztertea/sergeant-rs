@@ -38,7 +38,7 @@
 //! | 4 | online-only/unreadable local resources are reported as coverage gaps, not silently indexed as empty | gap | `x5_a1a_acceptance::a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped` |
 //! | 5 | Markdown/text and at least one Office format normalize into document units with provenance | met | `y2_office_adapter::a_docx_worker_returns_document_and_section_units_with_provenance` |
 //! | 6 | CSV/JSON/Parquet stay relational, with a deterministic aggregate and selected text-field context units sharing row identity | met | `x4_tabular_map::datasets_are_registered_and_read_in_place_as_derived_evidence` |
-//! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | deferred-s4 | — |
+//! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | met | `y3_zip_adapter::a_zip_worker_declares_admitted_children_through_the_real_subprocess` |
 //! | 8 | `.eml` or the chosen first mail format produces structured message evidence | deferred-s4 | — |
 //! | 9 | image/scanned evidence enters the OCR fallback with page/region/engine provenance | deferred-s4 | — |
 //! | 10 | external Git acquisition resolves an exact commit in a no-Work-checkout cache | deferred-s4 | — |
@@ -325,10 +325,74 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 7,
-        verdict: Verdict::DeferredS4,
-        checks: &[],
-        note: "Bounded ZIP / container adapters are S4's (adapters and external Git), per the \
-               S3 sprint plan's commissioning line and panel finding 1.",
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/y3_zip_adapter.rs",
+                "a_zip_worker_declares_admitted_children_through_the_real_subprocess",
+            ),
+            at(
+                "tests/y3_zip_adapter.rs",
+                "an_archive_level_refusal_fails_its_own_worker_alone",
+            ),
+            at(
+                "src/runtime/atlas/archive.rs",
+                "overlapping_files_refuse_the_whole_archive_before_any_entry_opens",
+            ),
+            at(
+                "src/domain/source.rs",
+                "a_grandchild_key_chains_through_its_own_parent_not_the_root",
+            ),
+        ],
+        note: "S4 Y3 (G5 as AMENDED 2026-08-28). `enclosed_name` is a path-STRING validator only \
+               (research note beside the sprint plan, VERIFIED against zip2's source); this wave \
+               adds explicit checks on top with their own named coverage rows: entry TYPE \
+               (symlink refused via `is_symlink`, checked first and unconditionally of the \
+               entry's name; every other non-regular type — FIFO, char/block device, socket — \
+               refused by masking the entry's own Unix mode bits (`S_IFMT`) directly rather than \
+               trusting `zip`'s `is_file()`, which is `!is_dir() && !is_symlink()` and does not \
+               check `S_IFREG` at all, VERIFIED against `zip` 8.6.0's own `src/read.rs`), \
+               non-empty name, name uniqueness, and a Unicode \
+               NFC-then-case-fold normalisation rule (not a bare `to_lowercase()`) for \
+               case-insensitive/NFC-NFD-folding collisions. Two size bounds — per-entry \
+               uncompressed size (reused from `scan::MAX_RESOURCE_BYTES`, R2) and total expanded \
+               size — are ENFORCED BY COUNTING STREAMED BYTES (`Read::take`), never by trusting \
+               the attacker-controlled `size()`/`compressed_size()` header fields. The other two \
+               named bounds are honestly different, not folded into that same claim: entry count \
+               is checked against the central directory's own real record count, not an \
+               attacker-inflatable declared integer; the compression-ratio bound is an ADVISORY \
+               pre-filter computed from those same declared header fields BEFORE any byte \
+               streams — cheap triage in front of the streamed per-entry check that actually \
+               holds under a header that lies about the ratio too. Nesting depth caps recursion, \
+               not bytes. Every ceiling but the reused per-entry one is named PROVISIONAL and \
+               named PROVISIONAL and unmeasured (Y1's memory-cap precedent, #325). CLOSES THE \
+               RESEARCH'S OPEN ITEM: `zip` 8.6.0 does NOT reject overlapping/self-referential \
+               (quine-shaped) constructions on its own — its own `has_overlapping_files` doc says \
+               so verbatim ('this doesn't make the archive invalid') — so this wave calls it \
+               itself, before opening any entry, and refuses the whole archive when it fires \
+               (VERIFIED against a hand-crafted overlapping fixture, sanity-checked against the \
+               crate's own diagnostic before asserting anything about this wave's own defence). \
+               A SECOND correction to the research note, found while building this wave's own \
+               fixtures rather than merely read from source: two central-directory records with \
+               BYTE-IDENTICAL raw names do not both survive to be visited at all — the crate's \
+               own `IndexMap`-keyed construction collapses them to one entry, silently, \
+               last-write-wins, before `len()`/`by_index` are ever called, which is a stronger \
+               (and different) claim than the research's 'hidden from by_name, visible by index'. \
+               Child resources keep parent provenance (G9): every admitted child carries a \
+               content hash and a COMPOSED F7 key (`domain::source::child_key`) built from its \
+               IMMEDIATE parent's own key — chained, not resolved to the root archive, so a \
+               grandchild's key encodes its whole ancestry without a stored chain. No entry is \
+               ever executed and nothing is written to a real path (deliverable d): the adapter \
+               is pure bytes-in/structs-out, never touches a filesystem. NAMED SEAM, not a \
+               silent gap: `worker::DeclaredChild`/`WorkerBatch` do not yet carry a child's \
+               content bytes, hash, or composed key on the wire — only `name`/`relative_path`, \
+               Y1's own original shape — so per-entry coverage rows and F7 provenance are proven \
+               exhaustively against `archive::expand`'s own return value (in-process) but do not \
+               yet reach the daemon; widening that shared wire type is left to the wave that \
+               wires real daemon-side persistence (rides G8's trigger, Y5), stated explicitly in \
+               `archive.rs`'s own module doc rather than silently deferred. CROSS-CUTTING GAP \
+               applies, same as items 3/5/6/13: the adapter is invoked here through the real \
+               worker binary and by tests, not yet by a shipped scan trigger.",
     },
     Item {
         number: 8,
@@ -527,8 +591,9 @@ fn every_contract_item_is_accounted_for() {
         .collect();
     assert_eq!(
         deferred,
-        BTreeSet::from([7, 8, 9, 10]),
-        "items 7-10 are still S4's; item 5 closed in Y2 (register row 5 edit)"
+        BTreeSet::from([8, 9, 10]),
+        "items 8-10 are still S4's; item 5 closed in Y2 (register row 5 edit), item 7 closed in \
+         Y3 (register row 7 edit)"
     );
 
     // And every deferral has to say so in words a reader can check, not just

@@ -170,6 +170,45 @@ tree-sitter-rust = "0.24.2"
 tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
 ulid = "3.0.0"
+# S4 Y3 (G5): a justified normalisation rule for archive-entry name
+# collisions, not a hand-rolled `to_lowercase()`. Rungs: R2 fails (nothing in
+# this crate does Unicode canonical normalisation — `content_hash`/`local_key`
+# hash bytes, they never compare text identity); R3/R4 fail (`std` has no NFC
+# implementation, and no OS API does either); R5 rather than R7 —
+# `unicode-normalization` is already resolved in this graph (transitively,
+# via `anydoc` -> `pdf-inspector` and via `stringprep`), so declaring it
+# directly adds a line here and ZERO packages to `Cargo.lock` (same footprint
+# argument `log`'s own comment above makes). See `runtime/atlas/archive.rs`'s
+# module doc for why NFC alone is not the whole rule (case-folding rides on
+# top of it) and why that combination, not a bare `to_lowercase()`, is what
+# the wave brief asked to be "justified".
+unicode-normalization = "0.1.25"
+
+# S4 Y3 (G5): bounded ZIP container expansion. Published under the crate name
+# `zip` (the maintained `zip-rs/zip2` fork "the zip crate" now means in
+# practice — `y3-zip-bounds-research.md` §"Crate identity" confirms no `zip`
+# dependency existed before this wave and that Context7/crates.io both
+# resolve "zip"/"zip2" to this one fork). Rungs: R2/R3/R4 fail (nothing in
+# this crate reads the ZIP central-directory format, and neither the
+# standard library nor the OS exposes one); R5 fails (two `zip` versions sit
+# in `Cargo.lock` already, but as ORPHANED entries nothing depends on — `grep
+# -c '"zip",' Cargo.lock` was empty before this wave, so there is no existing
+# edge to reuse, only a stale resolver artifact); R6 fails (a hand-rolled ZIP
+# central-directory parser is exactly the bug farm R7 exists to avoid, for a
+# format with real structural hazards — see `archive.rs`'s own module doc).
+# R7: minimum feature surface, not the crate's default one. `default-features
+# = false` plus exactly `deflate` — the one compression method this crate's
+# own fixtures and every realistic knowledge-source ZIP (docx-style OOXML
+# packages included) actually use — deliberately excludes `bzip2`/`lzma`/
+# `xz`/`zstd`/`ppmd`: the research note's own flag is that a codec with a
+# steeper worst-case compression ratio than deflate's would make
+# `MAX_COMPRESSION_RATIO`'s pre-filter (tuned for deflate) too generous, so
+# not enabling those codecs at all is the honest way to keep that ceiling
+# meaning what it claims rather than widening it defensively per codec this
+# wave never measured. Also excludes `aes-crypto` — an encrypted entry is
+# refused as unsupported (§NeedsOcr's sibling: content this build declines
+# to open), never decrypted.
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # #310: `prctl(PR_SET_PDEATHSIG, SIGKILL)` on a probe child, and nothing else.
 # R3/R4 fail — neither the standard library nor any process API this crate

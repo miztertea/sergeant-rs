@@ -280,36 +280,60 @@ fn the_office_adapters_public_api_is_pinned() {
 // "anydoc" ever appearing in a single `.rs` file. This compiles today and
 // would pass both tests above unmodified — the token scan operates one
 // abstraction layer below where an alias is introduced. What follows checks
-// the layer the alias actually lives in: dependency resolution itself, via
-// `cargo metadata`, which reports both a dependency's local (possibly
-// renamed) extern name AND the real package it resolves to.
+// the layer the alias actually lives in: this crate's own manifest, via
+// `cargo metadata --no-deps`, which reports each declared dependency's real
+// package `name` alongside its `rename` (the local alias `package = "..."`
+// sets, `null` when there is none) — exactly the two facts the alias check
+// needs, and nothing past them.
+//
+// `--no-deps` (not the full resolve graph the previous version of this test
+// shelled out to) is what makes this hermetic and cache-independent. Per
+// `cargo-metadata`'s own docs ("output information only about the workspace
+// members, excluding any fetched dependencies") and confirmed empirically
+// against this crate (`resolve` comes back `null`), `--no-deps` never
+// resolves or fetches the transitive dependency graph — it only reads and
+// echoes this crate's own already-parsed manifest. That is why a cold
+// registry/crate cache cannot break it: the previous `cargo metadata`
+// (without `--no-deps`) had to resolve every transitive dependency to build
+// `resolve.nodes`, which on a cold cache means downloading every crate in
+// the graph just to determine, three fields deep, that only one edge named
+// `anydoc` — work this check never needed, since the alias signal
+// (`name`/`rename`) lives on the direct dependency declaration itself,
+// visible without resolving anything beyond it. `--no-deps` reads only
+// `Cargo.toml` (already on disk, checked in) and needs neither the network
+// nor a warm `~/.cargo/registry` cache to produce it, on a cold cache or
+// otherwise. `--offline` is kept anyway, as a second, redundant guarantee
+// that this process cannot make an HTTP request even if that changed;
+// `--locked` is dropped because `--no-deps` never resolves against
+// `Cargo.lock` in the first place (confirmed empirically: identical output
+// with and without it), so keeping it would only imply a lock-consistency
+// check that does not actually happen here.
 
-/// One edge from this crate's own root package to a dependency, as
-/// `cargo metadata --format-version=1` resolves it: `extern_name` is
-/// whatever this crate's own `Cargo.toml` calls it (the renamed name for an
-/// aliased entry, otherwise the crate's own name), `resolved_package` is the
-/// package that edge actually resolves to, independent of what it is called
-/// here.
+/// One dependency declared directly in this crate's own `Cargo.toml` —
+/// `[dependencies]`, `[dev-dependencies]`, or `[build-dependencies]`, `cargo
+/// metadata --no-deps` does not distinguish them and an alias could just as
+/// well be smuggled into any of the three — as that file reports it:
+/// `extern_name` is whatever this crate calls it locally (the renamed name
+/// for an aliased entry, otherwise the crate's own name), `resolved_package`
+/// is the real package name that entry resolves to, independent of what it
+/// is called here.
 struct DependencyEdge {
     extern_name: String,
     resolved_package: String,
 }
 
-/// Every direct dependency edge from this crate's own root package —
-/// `[dependencies]`, `[dev-dependencies]`, and `[build-dependencies]` alike,
-/// because `cargo metadata`'s resolve graph does not separate them and an
-/// alias could just as well be smuggled into any of the three tables. Shells
-/// out to `cargo metadata` rather than hand-parsing `Cargo.toml`/`Cargo.lock`
-/// (R2/R5: this crate already has no TOML-object-graph-to-dependency-
-/// resolution logic of its own to reuse, and reimplementing Cargo's own
-/// alias/feature/target-cfg resolution by hand is exactly the kind of bug
-/// farm Ponytail's R6/R7 exists to head off) — `--offline --locked` so this
-/// never touches the network and never silently re-resolves against a
-/// `Cargo.lock` this run didn't check in.
+/// Every direct dependency edge from this crate's own manifest. Shells out
+/// to `cargo metadata --no-deps` rather than hand-parsing `Cargo.toml` (R2/
+/// R5: this crate already has no TOML-object-graph parsing logic of its own
+/// to reuse, and reimplementing Cargo's own alias/feature/target-cfg parsing
+/// by hand is exactly the kind of bug farm Ponytail's R6/R7 exists to head
+/// off) — see the module-level comment above for why `--no-deps` in
+/// particular makes this hermetic and cache-independent rather than merely
+/// offline.
 fn root_dependency_edges() -> Vec<DependencyEdge> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let output = std::process::Command::new(env!("CARGO"))
-        .args(["metadata", "--format-version=1", "--offline", "--locked"])
+        .args(["metadata", "--format-version=1", "--no-deps", "--offline"])
         .current_dir(manifest_dir)
         .output()
         .expect("run cargo metadata");
@@ -322,49 +346,40 @@ fn root_dependency_edges() -> Vec<DependencyEdge> {
     let metadata: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse cargo metadata JSON");
 
-    let root_id = metadata["resolve"]["root"]
-        .as_str()
-        .expect("cargo metadata must report a single root package for this crate")
-        .to_string();
-
-    // Package id -> real package name, from the flat `packages` list (this
-    // is where an alias's *true* identity lives — the resolve graph's own
-    // `deps[].pkg` is a package id, not a name, precisely so this lookup is
-    // required rather than optional).
     let packages = metadata["packages"]
         .as_array()
-        .expect("cargo metadata must report a packages array");
-    let package_name_by_id = |id: &str| -> String {
-        packages
-            .iter()
-            .find(|p| p["id"].as_str() == Some(id))
-            .and_then(|p| p["name"].as_str())
-            .unwrap_or_else(|| panic!("cargo metadata's packages array has no entry for {id}"))
-            .to_string()
-    };
-
-    let nodes = metadata["resolve"]["nodes"]
-        .as_array()
-        .expect("cargo metadata must report a resolve.nodes array");
-    let root_node = nodes
+        .expect("cargo metadata --no-deps must report a packages array");
+    let crate_name = env!("CARGO_PKG_NAME");
+    let matching: Vec<&serde_json::Value> = packages
         .iter()
-        .find(|n| n["id"].as_str() == Some(root_id.as_str()))
-        .expect("the root package must have its own resolve node");
+        .filter(|p| p["name"].as_str() == Some(crate_name))
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "cargo metadata --no-deps must report exactly one workspace member named {crate_name}, \
+         found {}: {packages:#?}",
+        matching.len()
+    );
+    let root = matching[0];
 
-    root_node["deps"]
+    root["dependencies"]
         .as_array()
-        .expect("the root resolve node must report a deps array")
+        .expect("the root package must report a dependencies array")
         .iter()
-        .map(|dep| DependencyEdge {
-            extern_name: dep["name"]
+        .map(|dep| {
+            let resolved_package = dep["name"]
                 .as_str()
-                .expect("each dep entry must report its extern name")
-                .to_string(),
-            resolved_package: package_name_by_id(
-                dep["pkg"]
-                    .as_str()
-                    .expect("each dep entry must report the package id it resolves to"),
-            ),
+                .expect("each dependency entry must report its real package name")
+                .to_string();
+            let extern_name = dep["rename"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| resolved_package.clone());
+            DependencyEdge {
+                extern_name,
+                resolved_package,
+            }
         })
         .collect()
 }
@@ -424,29 +439,37 @@ fn exactly_one_dependency_edge_resolves_to_the_anydoc_package() {
 ///
 /// 1. Empirically, against the real bypass named in review: adding
 ///    `docmodel = { package = "anydoc", version = "0.2.4" }` to this crate's
-///    actual `[dependencies]` and running `cargo metadata --offline --locked`
-///    (what [`root_dependency_edges`] shells out to) fails outright, before
-///    [`exactly_one_dependency_edge_resolves_to_the_anydoc_package`] even
-///    gets to run its own assertion:
-///    `error: the crate `sergeant-rs v0.3.0 (...)` depends on crate `anydoc
-///    v0.2.4` multiple times with different names` — Cargo's own resolver
-///    refuses a manifest that names the exact same resolved package twice
-///    under two different local names, which is a *stronger* failure than a
-///    test assertion (nothing downstream even builds). Recorded verbatim in
-///    this fix's commit message, and reverted before commit — this repo's
-///    own `Cargo.toml`/`Cargo.lock` are never left carrying the alias.
+///    actual `[dependencies]` and running either `cargo test` or `cargo
+///    nextest run` (which must build this very test binary before any test
+///    body, including this one's own assertion, ever executes) fails
+///    outright at the build step: `error: the crate `sergeant-rs v0.3.0
+///    (...)` depends on crate `anydoc v0.2.4` multiple times with different
+///    names` — Cargo's own resolver refuses a manifest that names the exact
+///    same resolved package twice, at the exact same version, under two
+///    different local names, which is a *stronger* failure than a test
+///    assertion (nothing downstream even compiles). This refusal happens
+///    during ordinary crate-graph resolution, not inside
+///    [`root_dependency_edges`] — that function's own `cargo metadata
+///    --no-deps` call tolerates the duplicate manifest entry just fine (it
+///    never resolves anything), but nothing gets far enough to invoke it,
+///    because Cargo refuses to build the test binary at all first.
+///    Recorded verbatim in this fix's commit message, and reverted before
+///    commit — this repo's own `Cargo.toml`/`Cargo.lock` are never left
+///    carrying the alias.
 /// 2. Structurally, offline and deterministic (this test): Cargo's own
 ///    refusal above is specific to an alias at the *exact same version* as
 ///    the real entry — a second alias at a different, semver-incompatible
 ///    anydoc version would resolve to a genuinely different graph node and
-///    Cargo would permit it to coexist (the same mechanism that lets a crate
-///    depend on `rand 0.7` and `rand 0.8` under two different names at
-///    once). [`root_dependency_edges`]'s own filter — "does this edge's
-///    resolved package name equal `anydoc`" — does not care about version,
-///    so it still catches that case. This test proves the filtering logic
-///    itself trips for *any* second edge resolving to `anydoc`, under *any*
-///    local name, without depending on which anydoc version crates.io (or
-///    this offline sandbox's registry cache) happens to have available.
+///    Cargo would permit it to coexist and build (the same mechanism that
+///    lets a crate depend on `rand 0.7` and `rand 0.8` under two different
+///    names at once), and [`root_dependency_edges`]'s `--no-deps` read would
+///    then faithfully report both manifest entries. [`root_dependency_edges`]'s
+///    own filter — "does this edge's resolved package name equal `anydoc`" —
+///    does not care about version, so it still catches that case. This test
+///    proves the filtering logic itself trips for *any* second edge
+///    resolving to `anydoc`, under *any* local name, without depending on
+///    which anydoc version crates.io (or this offline sandbox's registry
+///    cache) happens to have available.
 #[test]
 fn the_check_catches_an_alias_under_any_name_not_just_docmodel() {
     for alias in ["docmodel", "totally_unrelated_name", "office_docs_lib"] {

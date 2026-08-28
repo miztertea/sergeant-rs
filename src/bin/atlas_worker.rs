@@ -12,12 +12,32 @@
 //!
 //! `--extractor` is dispatched on, not merely echoed: a value equal to
 //! [`office::DOCX_EXTRACTOR`] runs the real Office adapter
-//! ([`office::docx_units`]) over stdin; anything else falls through to the
-//! trivial UTF-8-whole-document body Y1 shipped. This mirrors exactly how
-//! `runtime::atlas::scan::extract_units` already dispatches on the same
+//! ([`office::docx_units`]) over stdin; a value equal to
+//! [`archive::ZIP_EXTRACTOR`] runs the real bounded-ZIP adapter
+//! ([`archive::expand`], S4 Y3) over stdin; anything else falls through to
+//! the trivial UTF-8-whole-document body Y1 shipped. This mirrors exactly
+//! how `runtime::atlas::scan::extract_units` already dispatches on the same
 //! extractor-identity strings in-process (R2) — the wire contract's
 //! `extractor` field was always meant to be the dispatch key, once a second
 //! real adapter existed to dispatch to.
+//!
+//! # A named gap: per-entry ZIP coverage has nowhere to go on the wire yet
+//!
+//! [`WorkerBatch`] carries `units` and `declared_children` — no field for a
+//! [`CoverageRow`](sergeant_rs::domain::source::CoverageRow) at all. When the
+//! ZIP adapter refuses the WHOLE archive (a malformed central directory, the
+//! entry-count ceiling, or the overlapping/quine defence — all archive-level
+//! refusals `archive::expand` reports as a `path: None` row), this process
+//! exits non-zero with that row's own detail text, exactly as a malformed
+//! Office document does — the existing `WorkerFault::ExitedNonZero` path
+//! turns that into a named `Coverage::Error` row daemon-side. But a
+//! WELL-FORMED archive that refuses only SOME entries (a symlink, a
+//! duplicate name, one oversized entry) still SUCCEEDS as a batch — its
+//! admitted children are declared, and the per-entry refusal detail
+//! `archive::expand`'s own return value carries (proven exhaustively in
+//! `archive.rs`'s own tests) does not reach this wire at all. Named here
+//! rather than silently dropped — see `archive.rs`'s own module doc, "A
+//! named seam", for the same gap stated from the adapter's side.
 //!
 //! # A failed extraction exits non-zero — it never emits an empty batch
 //!
@@ -51,6 +71,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use sergeant_rs::domain::source::UnitKind;
+use sergeant_rs::runtime::atlas::archive;
 use sergeant_rs::runtime::atlas::office;
 use sergeant_rs::runtime::atlas::worker::{DeclaredChild, WorkerBatch, WorkerUnit};
 
@@ -158,6 +179,12 @@ fn main() -> std::process::ExitCode {
 /// (F8 coverage honesty: no partial units, never a silent empty).
 fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
     let resource_hash = blake3::hash(input).to_hex().to_string();
+    // `--declare-child` (test-only, module doc) and the real ZIP adapter
+    // below are additive, not exclusive: a test can still hand the daemon-
+    // side validator synthetic declarations under any extractor, and a real
+    // archive's own admitted children are appended to whatever the flag
+    // already supplied.
+    let mut declared_children = args.declared_children.clone();
     let units = if args.extractor == office::DOCX_EXTRACTOR {
         office::docx_units(input)
             .map_err(|e| e.to_string())?
@@ -183,6 +210,35 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
                 }
             })
             .collect()
+    } else if args.extractor == archive::ZIP_EXTRACTOR {
+        // `parent_key` composes every declared child's F7 key
+        // (`archive.rs`'s own module doc), but no field on `DeclaredChild`
+        // carries a composed key onto today's wire (the named seam, this
+        // file's own module doc) — `resource_hash` is used here only so
+        // `archive::expand`'s pure signature is satisfiable and its
+        // internally-computed keys stay self-consistent; nothing this
+        // process emits depends on its exact value.
+        let expansion = archive::expand(input, &resource_hash);
+        if let Some(refusal) = expansion.coverage.iter().find(|row| row.path.is_none()) {
+            // An archive-level refusal (malformed open, the entry-count
+            // ceiling, or the overlapping/quine defence) fails this whole
+            // worker call — the same "no partial batch" shape a malformed
+            // Office document already gets, above.
+            return Err(refusal
+                .detail
+                .clone()
+                .unwrap_or_else(|| "archive refused".to_string()));
+        }
+        declared_children.extend(expansion.children.iter().map(|child| DeclaredChild {
+            name: entry_basename(&child.relative_path),
+            relative_path: child.relative_path.clone(),
+        }));
+        // A container's own body carries no text unit of its own — its
+        // whole content is in its declared children. An empty `units` here
+        // is the honest answer for a ZIP resource, not a placeholder this
+        // build forgot to fill (Y1's own "no wire field nothing ever sets"
+        // doctrine, restated for the opposite field).
+        Vec::new()
     } else {
         // Y1's trivial, honestly-labeled fallback body: one
         // [`UnitKind::Document`] unit spanning the whole input when it
@@ -203,8 +259,19 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
         resource_hash,
         extractor: args.extractor.clone(),
         units,
-        declared_children: args.declared_children.clone(),
+        declared_children,
     })
+}
+
+/// The final path component of a ZIP entry's own enclosed path, for
+/// [`DeclaredChild::name`] — falls back to the whole path only if it somehow
+/// has no final component (unreachable in practice: `archive::expand`
+/// already refuses an empty enclosed name before a child is ever produced).
+fn entry_basename(relative_path: &str) -> String {
+    std::path::Path::new(relative_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| relative_path.to_string())
 }
 
 /// Perform one fixture fault and end the process — every arm ends this
