@@ -39,7 +39,7 @@
 //! | 5 | Markdown/text and at least one Office format normalize into document units with provenance | met | `y2_office_adapter::a_docx_worker_returns_document_and_section_units_with_provenance` |
 //! | 6 | CSV/JSON/Parquet stay relational, with a deterministic aggregate and selected text-field context units sharing row identity | met | `x4_tabular_map::datasets_are_registered_and_read_in_place_as_derived_evidence` |
 //! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | met | `y3_zip_adapter::a_zip_worker_declares_admitted_children_through_the_real_subprocess` |
-//! | 8 | `.eml` or the chosen first mail format produces structured message evidence | deferred-s4 | — |
+//! | 8 | `.eml` or the chosen first mail format produces structured message evidence | met | `y4_mail_adapter::a_mail_worker_returns_message_shape_and_attachment_with_provenance` |
 //! | 9 | image/scanned evidence enters the OCR fallback with page/region/engine provenance | deferred-s4 | — |
 //! | 10 | external Git acquisition resolves an exact commit in a no-Work-checkout cache | deferred-s4 | — |
 //! | 11 | source parsing uses content/extractor identity so unchanged resources reuse cached facts | met | `x2_knowledge_sources::a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one` |
@@ -396,10 +396,84 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 8,
-        verdict: Verdict::DeferredS4,
-        checks: &[],
-        note: "Mail (`.eml`) evidence is S4's, same citation as item 7 — and gated behind its \
-               own candidate spike in the contract's own wording.",
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/y4_mail_adapter.rs",
+                "a_mail_worker_returns_message_shape_and_attachment_with_provenance",
+            ),
+            at(
+                "tests/y4_mail_adapter.rs",
+                "a_real_parser_failure_leaves_the_daemon_up_the_permit_freed_and_a_named_coverage_row",
+            ),
+            at(
+                "tests/y4_mail_adapter.rs",
+                "a_genuine_html_body_reaches_the_wire_and_a_synthesized_one_does_not",
+            ),
+            at(
+                "src/domain/source.rs",
+                "a_grandchild_key_chains_through_its_own_parent_not_the_root",
+            ),
+        ],
+        note: "S4 Y4 (G4 — ADOPT, tests/fixtures/mail_corpus/SPIKE-G4.md). `mail-parser` 0.11.8 \
+               (`full_encoding` feature) via the same gate order G3/G5 used: deny gate FIRST \
+               (zero new advisory/license/ban/source failure, diffed against the pre-existing \
+               yanked-chacha20 baseline, #328, untouched), a hand-verified 6-fixture corpus \
+               cross-checked independently with Python's stdlib `email` package BEFORE \
+               mail-parser ever ran, footprint (+2 packages, +0.89 MiB linked binary once linker \
+               nondeterminism is corrected out). Message shape is A1 §6.5 verbatim: from/to/cc, \
+               sent timestamp (RFC3339), subject, text AND html bodies, message id, thread \
+               (References + In-Reply-To folded, deduplicated), attachments — provenance carries \
+               parser identity + version (`mail::MAIL_EXTRACTOR`). TWO caveats the spike found \
+               empirically are CLOSED, not merely named as downstream work: (1) a synthesized \
+               HTML body (`mail-parser` aliases the SAME MessagePartId into both `text_body` and \
+               `html_body` when no genuine alternative exists — VERIFIED against `mail-parser`'s \
+               own source, `parsers/message.rs`, not merely observed) is detected by comparing \
+               the raw part indices and reported as absent, matching `manifest.json`'s own \
+               wire-bytes-only definition of `body_html_present`; (2) a message-shaped-but-broken \
+               input (an unterminated MIME boundary) that `mail-parser` silently downgrades into \
+               a nameless attachment (SPIKE-G4.md's own diagnostic finding) is detected — any \
+               leaf, non-message attachment with no recoverable name — and refuses the WHOLE \
+               message, no partial units (F8). A structurally encrypted/S-MIME message \
+               (`multipart/encrypted`, `application/pkcs7-mime`) gets its own honest \
+               `MailError::Sealed` status, never a garbage-body silent success — `mail-parser` \
+               has zero PKCS#7/S-MIME awareness of its own (VERIFIED: no match anywhere in its \
+               source for pkcs7/smime/encrypted), so this is detected structurally from the \
+               message's own declared Content-Type, never by decrypting or verifying anything. \
+               Attachments recurse through Y3's container machinery exactly as the brief \
+               requires: a `message/rfc822` attachment recurses via THIS module's own \
+               `build_mail_message` using mail-parser's OWN already-parsed embedded value (a \
+               design correction made while building this wave's own tests: re-serializing to \
+               raw bytes and re-parsing picked up a boundary-adjacent CRLF a second parse read \
+               as body content, disagreeing with the hand-verified, stdlib-cross-checked \
+               manifest — corrected in manifest.json with the full argument, not silently \
+               patched around); an attachment that is itself a ZIP recurses via \
+               `archive::expand_at_depth` — the SAME function `archive.rs` calls on itself, \
+               widened to `pub(crate)` (R2) so mail and archive nesting share ONE depth counter \
+               and ONE whole-tree cumulative-bytes budget, never two independently-sized ones. \
+               THE SAME ADMISSION DISCIPLINE AS Y3 (brief item 3): empty-name refusal, \
+               path-safety per `/`-component via `domain::is_plain_name`, name uniqueness, and \
+               the identical Unicode NFC-then-case-fold collision rule via \
+               `archive::collision_key` — reused outright (R2), not a second copy. BOUNDS \
+               reused wholesale from `archive.rs` (R2) rather than three new independently-tuned \
+               numbers: `MAX_ENTRY_UNCOMPRESSED_BYTES` per attachment, \
+               `MAX_TOTAL_EXPANDED_BYTES` cumulative, `MAX_ZIP_ENTRIES` reused as an \
+               attachment-count ceiling — all PROVISIONAL, same footing as Y1's memory cap \
+               (#325). HONEST GAP, STATED not glossed: unlike ZIP's `Read::take` streaming, \
+               `mail-parser` decodes every part eagerly before this adapter's own bounds ever \
+               run, so these are POST-decode admission checks, not pre-allocation stream bounds \
+               — the worker's own `RLIMIT_AS` (Y1) is the real backstop against a single \
+               oversized decode, named plainly rather than implied as equivalent to the ZIP \
+               case; separately, MIME transfer encodings have no ZIP-class decompression-bomb \
+               ratio (base64 ~4:3, quoted-printable at most ~3:1), so the gap is materially \
+               smaller than it would be for a compressed container. NO REPLACEABILITY BOUNDARY \
+               for `mail_parser` (J1, stated per the brief's own instruction): Office's boundary \
+               exists to discharge a specific owner ruling over a RUSTSEC advisory G4's own deny \
+               gate did not find; Y3's `archive.rs` (a second real container adapter) already set \
+               the precedent of no dedicated one-owner test, which this wave follows rather than \
+               diverging from unprompted. CROSS-CUTTING GAP applies, same as items 3/5/6/7/13: \
+               the adapter is invoked here through the real worker binary and by tests, not yet \
+               by a shipped scan trigger.",
     },
     Item {
         number: 9,
@@ -591,9 +665,9 @@ fn every_contract_item_is_accounted_for() {
         .collect();
     assert_eq!(
         deferred,
-        BTreeSet::from([8, 9, 10]),
-        "items 8-10 are still S4's; item 5 closed in Y2 (register row 5 edit), item 7 closed in \
-         Y3 (register row 7 edit)"
+        BTreeSet::from([9, 10]),
+        "items 9-10 are still S4's; item 5 closed in Y2 (register row 5 edit), item 7 closed in \
+         Y3 (register row 7 edit), item 8 closed in Y4 (register row 8 edit)"
     );
 
     // And every deferral has to say so in words a reader can check, not just

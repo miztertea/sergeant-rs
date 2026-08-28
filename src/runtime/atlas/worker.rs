@@ -154,7 +154,10 @@ pub struct WorkerUnit {
     /// derived-not-canonical) — is our own, not any one extractor's; see
     /// [`super::office`]'s module doc, "The contract, in our own terms", for
     /// the full statement and for why no particular string shape (e.g. the
-    /// Office adapter's own `block:<n>`) is part of it.
+    /// Office adapter's own `block:<n>`) is part of it. The mail adapter
+    /// (S4 Y4) reuses the same contract for a different asymmetry — two
+    /// independent `Document`-kind units per message, distinguished by
+    /// `"text-body"`/`"html-body"` — see [`super::mail`]'s own module doc.
     #[serde(default)]
     pub coordinate: Option<String>,
     /// The unit's own text.

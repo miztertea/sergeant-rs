@@ -84,7 +84,8 @@
         "header_names": ["From", "To", "Subject", "Date", "Message-ID", "Content-Type", "Content-Transfer-Encoding"],
         "subject_decoded": "Original note",
         "body_text_present": true,
-        "body_text_decoded": "This is the original message text, now nested one level deep."
+        "body_text_decoded": "This is the original message text, now nested one level deep.\r\n",
+        "body_text_decoded_correction_note": "Y4 (G4 adoption, not the spike): the fixture's own bytes carry TWO CRLFs before --NEST-BOUNDARY-04-- (one blank line), and RFC 2046 5.1.1 consumes only the LAST CRLF as the boundary delimiter -- the other is the body's own final line terminator and is real content, not a spike or adapter artifact. VERIFIED two ways, independent of mail-parser: a direct hex read of the fixture bytes, and Python's stdlib `email` package (the SAME independent cross-check tool build_mail_fixtures.py/verify_with_stdlib_email.py already use) decoding this exact nested payload -- both agree the trailing \\r\\n belongs. The original value here (no trailing \\r\\n) was this field's own hand-verification miss, corrected in the wave that first exercises this fixture programmatically (src/runtime/atlas/mail.rs's own test suite), per this codebase's own precedent for a correction found while building real code against a research note or fixture (see archive.rs's module doc for the same shape of correction). No other field on this fixture, and no other fixture's fields, are affected."
       }
     },
     {

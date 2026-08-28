@@ -326,6 +326,20 @@
 //! shape, so [`super::worker::validate_batch`]'s daemon-side authority (path
 //! safety, F10 deny-set membership) already runs, for real, against a real
 //! container adapter's real output — see `tests/y3_zip_adapter.rs`.
+//!
+//! # Reused by Y4's mail adapter (R2)
+//!
+//! [`expand_at_depth`], [`classify`], [`collision_key`] and
+//! [`UNSUPPORTED_CHILD_EXTRACTOR`] are `pub(crate)` — not `fn`-private — so
+//! [`super::mail`] can recurse into an archive found *inside* a mail
+//! attachment through the identical function this module already uses for an
+//! archive found inside another archive, sharing the same depth counter and
+//! the same whole-tree cumulative-bytes accumulator rather than opening a
+//! second, independently-budgeted recursion (see `mail.rs`'s own module doc,
+//! "Container recursion is one shared budget"). `classify`/`collision_key`
+//! are reused outright for the identical reason `office.rs`'s own routing
+//! logic already is: one "what claims this extension" table, one
+//! normalisation rule, never two copies that could drift.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
@@ -541,7 +555,7 @@ pub fn expand(bytes: &[u8], parent_key: &str) -> ZipExpansion {
 /// rather than one whole-tree ceiling) is what makes
 /// [`MAX_TOTAL_EXPANDED_BYTES`] a real bound on the whole expansion, not
 /// merely on whichever level is currently being walked.
-fn expand_at_depth(
+pub(crate) fn expand_at_depth(
     bytes: &[u8],
     parent_key: &str,
     depth: u32,
@@ -932,13 +946,13 @@ fn expand_at_depth(
 /// rather than an empty string, so the key still moves the day a real
 /// adapter starts claiming that extension (which changes what this
 /// placeholder would otherwise have silently stood in for).
-const UNSUPPORTED_CHILD_EXTRACTOR: &str = "unsupported/v1";
+pub(crate) const UNSUPPORTED_CHILD_EXTRACTOR: &str = "unsupported/v1";
 
 /// The CHILD's own downstream adapter, by extension — reusing the exact
 /// routing functions a top-level scan would consult (R2), never a
 /// zip-specific guess. `(None, false)` when nothing claims it and it is not
 /// itself an archive.
-fn classify(relative_path: &str) -> (Option<&'static str>, bool) {
+pub(crate) fn classify(relative_path: &str) -> (Option<&'static str>, bool) {
     if extractor_for(relative_path).is_some() {
         return (None, true);
     }
@@ -970,7 +984,7 @@ fn ratio_trips(declared_size: u64, declared_compressed: u64) -> bool {
 
 /// The normalisation-collision key (module doc: NFC first, then Unicode
 /// default case conversion — never a bare `to_lowercase()` on its own).
-fn collision_key(enclosed_path: &str) -> String {
+pub(crate) fn collision_key(enclosed_path: &str) -> String {
     enclosed_path.nfc().collect::<String>().to_lowercase()
 }
 

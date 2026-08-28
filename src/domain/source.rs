@@ -486,6 +486,24 @@ pub struct CoverageRow {
 /// module doc for the full argument, including why a spreadsheet format (not
 /// adopted this wave) must never claim a write-back cell coordinate through
 /// this same field.
+///
+/// # The Y4 decision: a mail message's two bodies are two `Document` units
+/// (S4, G4)
+///
+/// The same reuse call, for a different asymmetry: a `.eml` message can
+/// carry up to two independent bodies (A1 §6.5's "text/html body"), and
+/// `UnitKind` grows no third variant to say so — both are `Document`
+/// (each is a whole, independently-meaningful rendering of the same
+/// resource, not a span *within* one), distinguished on the wire by
+/// [`crate::runtime::atlas::worker::WorkerUnit::coordinate`]
+/// (`"text-body"`/`"html-body"`) exactly the way an Office section's
+/// coordinate distinguishes it from the whole-document unit above. Neither
+/// carries a real `byte_start`/`byte_end` either, for the identical
+/// reason an Office section does not: a body already decoded past its
+/// `Content-Transfer-Encoding` has no byte-exact back-reference into the
+/// original wire bytes. See [`crate::runtime::atlas::mail`]'s own module
+/// doc for the adapter's full argument, including the two `mail-parser`
+/// caveats this coordinate distinction exists to keep honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitKind {

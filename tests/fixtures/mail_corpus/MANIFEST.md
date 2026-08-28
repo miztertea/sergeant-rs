@@ -52,6 +52,25 @@ produce a message at all is the only passing outcome — any body/attachment
 output, partial or otherwise, is a failure of that fixture, not a skip and
 not partial credit.
 
+## One field corrected in Y4 (the adoption wave, not this spike)
+
+`04-nested-rfc822.eml`'s `nested_message.body_text_decoded` originally read
+with no trailing `\r\n`. Building `src/runtime/atlas/mail.rs`'s own test
+suite against this fixture found the fixture's own bytes carry two CRLFs
+before `--NEST-BOUNDARY-04--` (one blank line); RFC 2046 §5.1.1 consumes only
+the LAST CRLF as the boundary delimiter, so the other is the nested body's
+own final line terminator — real content, not a parser artifact. Verified
+two ways, independent of `mail-parser`: a direct read of the fixture's raw
+bytes, and Python's stdlib `email` package (the same independent tool
+`verify_with_stdlib_email.py` already uses) decoding this exact nested
+payload — both agree the trailing `\r\n` belongs. Corrected in place, with
+the full reasoning recorded beside the field itself
+(`manifest.json`'s own `body_text_decoded_correction_note`), per this
+codebase's own precedent for a correction found while building real code
+against a fixture (`archive.rs`'s own module doc carries the same shape of
+correction against its research note). No other field, on this fixture or
+any other, is affected.
+
 ## What each fixture covers
 
 | Fixture | Covers |

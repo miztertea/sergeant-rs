@@ -536,13 +536,13 @@ release.
   as provisional and unmeasured except the reused per-entry-size one, the
   same honesty this codebase already applies to its other unvalidated
   numeric ceilings — **including that the cumulative expanded-size ceiling
-  is scoped to one archive LEVEL, not summed across nested levels**: a
-  nested archive gets its own fresh 128 MiB budget at each depth it is
-  opened, so the aggregate memory a nested (but within the depth ceiling)
-  archive can force scales with the per-level ceiling raised to the depth
-  cap, not with one whole-tree total; the worker's own process-level
-  address-space limit is the actual backstop for that aggregate shape, not
-  this ceiling.
+  is a single WHOLE-TREE budget, not a per-level one** (corrected here,
+  Y4: an earlier draft of this bullet described a per-level budget that
+  does not match the shipped code, which threads one accumulator by
+  mutable reference through the whole recursive walk — see `archive.rs`'s
+  own module doc for the fix and the bug it closed: a nested archive tree
+  demanding the per-level ceiling raised to the depth power before
+  anything tripped).
 - **A prior open research question is now closed: this crate does not
   reject overlapping or self-referential (quine-shaped) archive
   constructions on its own.** Its own documentation says so verbatim for
@@ -579,6 +579,75 @@ release.
   own return value; widening the shared wire type to carry a child's real
   bytes end to end is left, explicitly, to the wave that wires real
   daemon-side persistence for archive children.
+
+### Mail (`.eml`) adoption (S4)
+
+- `.eml` messages now normalize into message shape (A1 §6.5) — from/to/cc,
+  sent timestamp (RFC3339), subject, text AND html bodies, message id, and
+  thread identifiers (References plus any In-Reply-To id not already
+  present) — running the `mail-parser` crate (0.11.8, `full_encoding`
+  feature) behind a pure-function adapter inside the same supervised worker
+  transport the Office and ZIP adapters use. Adopted after the same
+  candidate-spike gate order those two used: deny gate first (zero new
+  advisory/license/ban/source failure, diffed against the pre-existing
+  yanked-`chacha20` baseline this crate does not own), a hand-verified
+  six-fixture corpus with every count cross-checked independently against
+  Python's stdlib `email` package before `mail-parser` ever ran, then
+  footprint (two new packages, well under noise once linker
+  nondeterminism is corrected out of the linked-binary measurement).
+- **Two gaps the spike found in `mail-parser`'s own lenient behavior are
+  closed, not merely documented.** First: `mail-parser` synthesizes an
+  HTML body from a plain-text-only message by aliasing the identical
+  internal part index into both its text and HTML body lists rather than
+  fabricating separate content — this build detects that alias and reports
+  no HTML body at all rather than one the wire bytes never declared.
+  Second: a message that is MIME-shaped but structurally broken (an
+  unterminated multipart boundary) does not fail this crate's own parse at
+  all — the body part that should have been read normally instead
+  reappears as an attachment with no recoverable name. Any such nameless
+  attachment is treated as evidence of exactly this silent downgrade and
+  refuses the WHOLE message, coverage-honest rather than a partial or
+  wrong-shaped success — the one narrow, stated exception being a
+  `message/rfc822` attachment, which legitimately carries no filename far
+  more often than an ordinary attachment does.
+- **A structurally encrypted or S/MIME-sealed message gets its own honest
+  refused status**, never a body of decoded-looking garbage: `mail-parser`
+  has no PKCS#7/S-MIME awareness of its own, so this adapter detects
+  `multipart/encrypted` and `application/pkcs7-mime` from the message's own
+  declared Content-Type before treating it as ordinarily readable — never
+  by attempting to decrypt or verify anything.
+- **Attachments recurse through the same container machinery the ZIP wave
+  built**, with a parent-message coordinate: a `message/rfc822` attachment
+  is a nested message, parsed directly from `mail-parser`'s own
+  already-parsed embedded value rather than re-serialized to raw bytes and
+  parsed a second time (an early draft did the latter and picked up a
+  boundary-adjacent line ending the second parse mis-attributed to body
+  content — caught and corrected, including a matching correction to the
+  pre-existing test fixture's own hand-verified answer, before it shipped).
+  An attachment that is itself a ZIP archive chains through the identical
+  ZIP-recursion function the ZIP wave uses on itself, sharing one nesting-
+  depth ceiling and one whole-tree cumulative-bytes budget across mail and
+  archive nesting alike, never two independently sized ones. The same
+  admission discipline the ZIP wave established applies unchanged:
+  empty-name refusal, path safety, name uniqueness, and the identical
+  Unicode NFC-then-case-fold collision rule, all reused outright rather
+  than rebuilt.
+- **Every size bound is reused outright from the ZIP wave's own ceilings**
+  rather than three new, independently-tuned numbers — all still
+  PROVISIONAL, same footing as this program's other unmeasured ceilings.
+  **Named honestly, not glossed over**: unlike the ZIP adapter's streamed
+  read, `mail-parser` decodes every message part into memory before this
+  adapter's own bounds ever run, so these are admission checks over what
+  was already decoded, not a guarantee against the decode itself
+  allocating — the supervised worker's own per-child address-space limit
+  is the real backstop for that, exactly as it already is for a worker
+  that never returns a batch at all. Considered separately: ordinary mail
+  transfer encodings expand by at most a small, fixed ratio, nowhere near
+  a compressed container's achievable worst case, so this gap is
+  materially smaller than the equivalent would be for ZIP.
+- Register row 8 (`.eml`/mail message evidence) moves from deferred to met,
+  citing the real subprocess acceptance proof the same way rows 5 and 7
+  already do.
 
 ### Atlas closeout (S3)
 
