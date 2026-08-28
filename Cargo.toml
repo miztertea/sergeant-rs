@@ -36,6 +36,27 @@ name = "sgt-atlas-worker"
 path = "src/bin/atlas_worker.rs"
 
 [dependencies]
+# S4 Y2 (G3, gate a — SETTLED by owner ruling, J4): Office/document
+# normalization. `anydoc` is the recon's leading candidate
+# (recon-anydoc-office.md §2.1) and the only one satisfying A1 §6.3's
+# breadth requirement without hand-rolling per-format parsers (R2/R3/R4/R5
+# all fail for the same reasons the spike recorded — no existing crate in
+# this graph reads Office containers, and the OS/stdlib do not either).
+# The deny gate's first run FAILED on this addition: `anydoc` pulls
+# `pdf-inspector` -> `lopdf` -> `ttf-parser` 0.25.1 unconditionally (no
+# feature flag drops it), and `ttf-parser` is unmaintained
+# (RUSTSEC-2026-0192, no safe upgrade). Full record:
+# tests/fixtures/anydoc_corpus/SPIKE-G3.md.
+#
+# The owner ruled ADOPT anydoc anyway
+# (knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md, J4):
+# per-format composition defeats the "any doc" capability itself, and the
+# advisory is accepted risk in a pre-alpha MIT harness, conditioned on (1)
+# a scoped/dated/narrow deny.toml exception — see the `[advisories.ignore]`
+# entry for RUSTSEC-2026-0192 in deny.toml, which does NOT broaden past
+# this one advisory — and (2) a replaceability boundary (this wave's
+# adapter module, not yet implemented as of this line landing).
+anydoc = "0.2.4"
 axum = "0.8"
 blake3 = "1.8.6"
 clap = { version = "4.6.6", features = ["derive"] }

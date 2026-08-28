@@ -17,6 +17,56 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 
+# S4 Y2 (G3, gate a): scoped, dated exception for a single named advisory,
+# not a broadened rule and not a disabled gate.
+#
+# RUSTSEC-2026-0192 — `ttf-parser` 0.25.1 is unmaintained, no safe upgrade.
+# Reached unconditionally via anydoc -> pdf-inspector -> lopdf -> ttf-parser
+# (font metadata for `pdf-inspector`'s PDF leg; `anydoc` ships no feature
+# flag to drop `pdf-inspector` from the build). Recorded/reverted spike:
+# tests/fixtures/anydoc_corpus/SPIKE-G3.md.
+#
+# Owner ruling (J4), 2026-08-27:
+# knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md — ADOPT
+# anydoc; the advisory is accepted risk in a pre-alpha, open-source, MIT
+# harness because per-format composition would defeat the "any doc"
+# capability itself (A1 §6.3). The ruling's condition (2) is a
+# replaceability boundary — anydoc lives behind a narrow adapter contract
+# so it stays swappable; that is proved structurally by this wave's
+# one-owner adapter test, not by this file.
+#
+# This entry ignores exactly this one advisory ID. It does NOT ignore the
+# `ttf-parser` crate, the `anydoc`/`pdf-inspector`/`lopdf` crates, or any
+# other advisory ID — cargo-deny's `ignore` list matches by RUSTSEC ID, so a
+# different advisory reaching the graph through the same subtree (a new ID
+# against ttf-parser, lopdf, pdf-inspector, anydoc, or anything else the
+# anydoc dependency edge pulls in) still fails `cargo deny check` under this
+# same config. Proven, not just asserted, against this exact file, by
+# `tests/fixtures/anydoc_corpus/prove-exception-is-scoped.sh` (rerunnable;
+# last recorded run: `tests/fixtures/anydoc_corpus/G3-exception-narrowness-proof.md`) —
+# it runs `cargo deny check advisories` against THIS file with a synthetic
+# advisory injected against `lopdf` (a sibling of `ttf-parser` under
+# `anydoc -> pdf-inspector -> lopdf`) under a fresh id this entry has never
+# heard of, and asserts that advisory still fails the gate while
+# RUSTSEC-2026-0192 stays ignored.
+#
+# Revisit triggers (ruling, "Revisit triggers" section — any one reopens
+# this decision):
+# - an `anydoc`/`pdf-inspector` release drops or replaces `ttf-parser`, or a
+#   `ttf-parser` release resolves RUSTSEC-2026-0192 with a safe upgrade;
+# - a NEW advisory arrives through the anydoc subtree (by design, this
+#   entry will not suppress it — the gate goes red and that redness is the
+#   trigger firing, not a bug in this exception);
+# - `anydoc` itself becomes unmaintained, at which point the replaceability
+#   boundary is what gets exercised.
+#
+# NOT covered by this entry: the pre-existing, unrelated yanked `chacha20`
+# via `ulid` -> `rand` (sergeant-rs#328) stays a live failure of its own —
+# this exception does not touch it and does not suppress it.
+ignore = [
+  { id = "RUSTSEC-2026-0192", reason = "anydoc's pdf-inspector->lopdf leg pulls unmaintained ttf-parser unconditionally; accepted risk per owner ruling knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md (J4), scoped to this one advisory ID only — see the comment above for revisit triggers." },
+]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"

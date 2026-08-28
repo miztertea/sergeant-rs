@@ -1,0 +1,96 @@
+{
+  "$comment": "S4 Y2 gate (b) — hand-verified fixture corpus. Written and independently cross-checked BEFORE any Office extractor exists in this repo (see MANIFEST.md for how, and for the exact definition of every field). A future extractor's test suite loads this file and asserts EXACT MATCH per fixture, per field. A parse error on any fixture whose `valid` is true is a FAILURE, never a skip. `valid: false` fixtures MUST fail to parse (or MUST be reported as a coverage `error` row with zero units, per the wave brief's F8 coverage-honesty rule) — any partial output from one is a failure of the extractor, not a pass.",
+  "counting_rules": {
+    "body_top_level_paragraphs": "Count of <w:p> elements that are DIRECT CHILDREN of <w:body> in word/document.xml — i.e. paragraphs in the document's main reading flow, NOT paragraphs nested inside a table cell (<w:tc>). Verify: unzip the fixture, open word/document.xml, count top-level <w:p> siblings under <w:body> (a table's own <w:tbl> element is one sibling regardless of how many cells/paragraphs it contains).",
+    "heading_paragraphs": "The subset of body_top_level_paragraphs whose <w:pPr><w:pStyle w:val=\"...\"/> names a heading style (Heading1, Heading2, ...). Listed with style id and exact text.",
+    "list_paragraphs": "The subset of body_top_level_paragraphs carrying a <w:numPr> (numbering properties) — i.e. a list item — listed with its numId and ilvl (indent/nesting level; 0 = outermost).",
+    "tables": "Count of <w:tbl> elements anywhere in word/document.xml (this corpus only ever places them at the top level of <w:body>, never nested). Each table's shape is given as rows x the column count of its first row (this corpus uses only rectangular tables).",
+    "table_cell_paragraphs": "Total <w:p> elements nested inside ANY <w:tc> across all tables in the fixture — i.e. every table cell's own paragraph. Distinct from and NOT included in body_top_level_paragraphs.",
+    "footnote_references_in_body": "Count of <w:footnoteReference> elements inside word/document.xml's body flow — i.e. how many footnote markers the reading text actually contains.",
+    "footnote_content_entries": "Count of <w:footnote> elements in word/footnotes.xml EXCLUDING the two structural placeholders every Word-produced footnotes part carries (w:type=\"separator\" and w:type=\"continuationSeparator\", id -1 and 0) — i.e. only footnotes carrying actual author content, matched 1:1 against footnote_references_in_body by design in this fixture.",
+    "header_parts": "Count of distinct word/headerN.xml parts present in the package and referenced from word/_rels/document.xml.rels.",
+    "footer_parts": "Count of distinct word/footerN.xml parts present in the package and referenced from word/_rels/document.xml.rels."
+  },
+  "fixtures": [
+    {
+      "file": "docx_fixtures/01-plain-headings-paragraphs.docx",
+      "valid": true,
+      "covers": "plain headings and paragraphs",
+      "body_top_level_paragraphs": 5,
+      "heading_paragraphs": [
+        { "style": "Heading1", "text": "Introduction" },
+        { "style": "Heading2", "text": "Background" }
+      ],
+      "list_paragraphs": [],
+      "tables": [],
+      "table_cell_paragraphs": 0,
+      "footnote_references_in_body": 0,
+      "footnote_content_entries": 0,
+      "header_parts": 0,
+      "footer_parts": 0
+    },
+    {
+      "file": "docx_fixtures/02-nested-list-numbering.docx",
+      "valid": true,
+      "covers": "nested list numbering (two levels)",
+      "body_top_level_paragraphs": 6,
+      "heading_paragraphs": [
+        { "style": "Heading1", "text": "Shopping list" }
+      ],
+      "list_paragraphs": [
+        { "numId": 1, "ilvl": 0, "text": "Produce" },
+        { "numId": 1, "ilvl": 1, "text": "Apples" },
+        { "numId": 1, "ilvl": 1, "text": "Bananas" },
+        { "numId": 1, "ilvl": 0, "text": "Dairy" },
+        { "numId": 1, "ilvl": 1, "text": "Milk" }
+      ],
+      "tables": [],
+      "table_cell_paragraphs": 0,
+      "footnote_references_in_body": 0,
+      "footnote_content_entries": 0,
+      "header_parts": 0,
+      "footer_parts": 0
+    },
+    {
+      "file": "docx_fixtures/03-table.docx",
+      "valid": true,
+      "covers": "a table",
+      "body_top_level_paragraphs": 3,
+      "heading_paragraphs": [
+        { "style": "Heading1", "text": "Inventory" }
+      ],
+      "list_paragraphs": [],
+      "tables": [
+        { "rows": 3, "cols": 2, "cell_text_row_major": [["Name","Quantity"],["Widget","12"],["Gadget","7"]] }
+      ],
+      "table_cell_paragraphs": 6,
+      "footnote_references_in_body": 0,
+      "footnote_content_entries": 0,
+      "header_parts": 0,
+      "footer_parts": 0
+    },
+    {
+      "file": "docx_fixtures/04-footnotes-headers-footers.docx",
+      "valid": true,
+      "covers": "footnotes, header, and footer",
+      "body_top_level_paragraphs": 3,
+      "heading_paragraphs": [
+        { "style": "Heading1", "text": "Findings" }
+      ],
+      "list_paragraphs": [],
+      "tables": [],
+      "table_cell_paragraphs": 0,
+      "footnote_references_in_body": 2,
+      "footnote_content_entries": 2,
+      "header_parts": 1,
+      "footer_parts": 1
+    },
+    {
+      "file": "docx_fixtures/05-malformed-unclosed-element.docx",
+      "valid": false,
+      "covers": "deliberately malformed — an unclosed <w:p> element inside an otherwise well-formed zip/OOXML package",
+      "expected_behavior": "word/document.xml is not well-formed XML (mismatched tag). A conformant extractor MUST fail this fixture outright — a coverage `error` row with zero units (F8) — and MUST NOT yield any paragraph, heading, or partial output. Any non-empty output, or a silent empty-success result, is a gate (b) FAILURE for this fixture, not a pass and not a skip.",
+      "verified_parse_error": "Python xml.etree.ElementTree.fromstring on word/document.xml raises xml.etree.ElementTree.ParseError: mismatched tag: line 6, column 4 (independently reproducible — see MANIFEST.md)."
+    }
+  ]
+}
