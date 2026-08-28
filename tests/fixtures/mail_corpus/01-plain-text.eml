@@ -1,0 +1,15 @@
+From: Alice Adams <alice@example.com>
+To: Bob Bianchi <bob@example.com>
+Subject: Plain text status update
+Date: Mon, 12 Jan 2026 09:15:00 +0000
+Message-ID: <fixture01-plain@example.com>
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+Hello Bob,
+
+This is a plain text message with no MIME structure beyond the single
+text/plain body. Three paragraphs total, this being the second.
+
+Regards,
+Alice

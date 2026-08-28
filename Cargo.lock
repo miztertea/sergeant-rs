@@ -1436,6 +1436,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hashify"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd1246c0e5493286aeb2dde35b1f4eb9c4ce00e628641210a5e553fc001a1f26"
+dependencies = [
+ "indexmap",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "hashlink"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2115,6 +2127,16 @@ checksum = "c0aeb26bf5e836cc1c341c8106051b573f1766dfa05aa87f0b98be5e51b02303"
 dependencies = [
  "nix",
  "winapi",
+]
+
+[[package]]
+name = "mail-parser"
+version = "0.11.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b3a9080c1fb8190e232df37a10aa1b3d6b08be084e537069913f025e0ce86c5"
+dependencies = [
+ "encoding_rs",
+ "hashify",
 ]
 
 [[package]]
@@ -3309,6 +3331,7 @@ dependencies = [
  "include_dir",
  "libc",
  "log",
+ "mail-parser",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

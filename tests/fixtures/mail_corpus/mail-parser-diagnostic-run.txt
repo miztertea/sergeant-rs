@@ -1,0 +1,74 @@
+=== 01-plain-text.eml ===
+  parse() -> Some(Message)
+  header count: 7
+  subject: Some("Plain text status update")
+  from: Some("List([Addr { name: Some(\"Alice Adams\"), address: Some(\"alice@example.com\") }])")
+  body_text(0): Some("Hello Bob,\r\n\r\nThis is a plain text message with no MIME structure beyond the single\r\ntext/plain body. Three paragraphs total, this being the second.\r\n\r\nRegards,\r\nAlice\r\n")
+  body_html(0): Some("<html><body>Hello Bob,<br/><br/>This is a plain text message with no MIME structure beyond the single<br/>text/plain body. Three paragraphs total, this being the second.<br/><br/>Regards,<br/>Alice<br/></body></html>")
+  text_body count: 1
+  html_body count: 1
+  attachment count: 0
+
+=== 02-multipart-alternative.eml ===
+  parse() -> Some(Message)
+  header count: 8
+  subject: Some("Alternative body demo")
+  from: Some("List([Addr { name: Some(\"Carol Chen\"), address: Some(\"carol@example.com\") }])")
+  body_text(0): Some("Plain-text alternative body.")
+  body_html(0): Some("<html><body><p>HTML alternative body.</p></body></html>")
+  text_body count: 1
+  html_body count: 1
+  attachment count: 0
+
+=== 03-with-attachment.eml ===
+  parse() -> Some(Message)
+  header count: 7
+  subject: Some("Report attached")
+  from: Some("List([Addr { name: Some(\"Grace Grant\"), address: Some(\"grace@example.com\") }])")
+  body_text(0): Some("Please find the attached report.")
+  body_html(0): Some("<html><body>Please find the attached report.</body></html>")
+  text_body count: 1
+  html_body count: 1
+  attachment count: 1
+    attachment[0] name=Some("report.txt") len=43
+
+=== 04-nested-rfc822.eml ===
+  parse() -> Some(Message)
+  header count: 7
+  subject: Some("Forwarded thread")
+  from: Some("List([Addr { name: Some(\"Irene Ionescu\"), address: Some(\"irene@example.com\") }])")
+  body_text(0): Some("See the forwarded message below.")
+  body_html(0): Some("<html><body>See the forwarded message below.</body></html>")
+  text_body count: 1
+  html_body count: 1
+  attachment count: 1
+    attachment[0] name=Some("original.eml") len=329
+      nested message subject=Some("Original note") body_text(0)=Some("This is the original message text, now nested one level deep.\r\n")
+
+=== 05-encoding-zoo.eml ===
+  parse() -> Some(Message)
+  header count: 7
+  subject: Some("Café update ☕")
+  from: Some("List([Addr { name: Some(\"René Dupont\"), address: Some(\"rene@example.com\") }])")
+  body_text(0): Some("Prix unitaire: 12€ le café.\nTotal: 24€.")
+  body_html(0): Some("<html><body>Prix unitaire: 12€ le café.<br/>Total: 24€.</body></html>")
+  text_body count: 1
+  html_body count: 1
+  attachment count: 1
+    attachment[0] name=Some("blob.bin") len=8
+
+=== 06-malformed-no-headers.eml ===
+  parse() -> None (no headers found)
+
+=== 07-broken-mime-diagnostic-only.eml ===
+  parse() -> Some(Message)
+  header count: 7
+  subject: Some("Unterminated boundary probe")
+  from: Some("List([Addr { name: Some(\"Test Sender\"), address: Some(\"test@example.com\") }])")
+  body_text(0): None
+  body_html(0): None
+  text_body count: 0
+  html_body count: 0
+  attachment count: 1
+    attachment[0] name=None len=48
+

@@ -1,0 +1,45 @@
+=== 01-plain-text.eml ===
+headers: ['From', 'To', 'Subject', 'Date', 'Message-ID', 'Content-Type', 'Content-Transfer-Encoding'] count= 7
+is_multipart: False
+content-type: text/plain
+body: 'Hello Bob,\n\nThis is a plain text message with no MIME structure beyond the single\ntext/plain body. Three paragraphs total, this being the second.\n\nRegards,\nAlice\n'
+
+=== 02-multipart-alternative.eml ===
+headers: ['From', 'To', 'Cc', 'Subject', 'Date', 'Message-ID', 'MIME-Version', 'Content-Type'] count= 8
+to-addr-count: 2
+cc-addr-count: 1
+leaf part count: 2
+ - text/plain 'Plain-text alternative body.'
+ - text/html '<html><body><p>HTML alternative body.</p></body></html>'
+
+=== 03-with-attachment.eml ===
+headers count= 7
+leaf part count: 2
+attachment count: 1
+ attachment filename: report.txt decoded bytes: 'Report body line one.\nReport body line two.' len= 43
+
+=== 04-nested-rfc822.eml ===
+outer headers count= 7
+outer top-level part count: 2
+nested message/rfc822 count: 1
+  inner headers count= 7
+  inner subject: Original note
+  inner body: 'This is the original message text, now nested one level deep.\n'
+
+=== 05-encoding-zoo.eml ===
+headers count= 7
+decoded Subject: Café update ☕
+raw Subject header object: 'Café update ☕'
+decoded From: René Dupont <rene@example.com>
+From addresses: [('René Dupont', 'rene@example.com')]
+leaf part count: 2
+ text/plain charset param: windows-1252
+ text/plain decoded content: 'Prix unitaire: 12€ le café.\nTotal: 24€.'
+ attachment blob.bin decoded len= 8 b'\x00\x01\x02\xff\xfe\x10 0'
+
+=== 06-malformed-no-headers.eml ===
+headers found: [] count= 0
+defects: [MissingHeaderBodySeparatorDefect()]
+is_multipart: False
+content as body (if any headers were found, first bytes fell into body):
+'This file is not shaped like an RFC 5322 message at all.\nThere is no header block above a blank-line body separator --\nevery line here is prose, none of them is a Name-colon-value pair,\nso a confo

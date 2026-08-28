@@ -154,7 +154,10 @@ pub struct WorkerUnit {
     /// derived-not-canonical) — is our own, not any one extractor's; see
     /// [`super::office`]'s module doc, "The contract, in our own terms", for
     /// the full statement and for why no particular string shape (e.g. the
-    /// Office adapter's own `block:<n>`) is part of it.
+    /// Office adapter's own `block:<n>`) is part of it. The mail adapter
+    /// (S4 Y4) reuses the same contract for a different asymmetry — two
+    /// independent `Document`-kind units per message, distinguished by
+    /// `"text-body"`/`"html-body"` — see [`super::mail`]'s own module doc.
     #[serde(default)]
     pub coordinate: Option<String>,
     /// The unit's own text.
@@ -945,6 +948,23 @@ mod tests {
             assert!(
                 enclosed_relative_path(safe_path),
                 "{safe_path:?} must be enclosed-safe"
+            );
+        }
+    }
+
+    /// A review finding: this AUTHORITY recheck is the daemon-side backstop
+    /// against a worker-declared child path/name — `Path::new("C:")
+    /// .components().count() == 1` on the Unix host this build runs on, so a
+    /// Windows drive-letter-absolute path was, before the fix in
+    /// [`crate::domain::is_plain_name`], admitted component-by-component as
+    /// "plain" despite this module's own doc claiming `enclosed_name`
+    /// semantics ("a relative path with no absolute component").
+    #[test]
+    fn enclosed_relative_path_rejects_a_windows_drive_letter_absolute_path() {
+        for unsafe_path in ["C:/Windows/System32/evil.zip", "c:/evil.txt", "D:/x"] {
+            assert!(
+                !enclosed_relative_path(unsafe_path),
+                "{unsafe_path:?} must not be enclosed-safe"
             );
         }
     }

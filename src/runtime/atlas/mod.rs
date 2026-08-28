@@ -154,6 +154,7 @@ pub mod db;
 pub mod deny;
 pub mod git;
 pub mod lane;
+pub mod mail;
 pub mod office;
 pub mod overlay;
 pub mod record;

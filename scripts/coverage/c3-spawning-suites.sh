@@ -151,3 +151,17 @@ cov_run cargo llvm-cov --no-report --test y3_zip_adapter --locked || cov_fail "y
 cov_stage_end 2 "y3_zip_adapter spawns real sgt-atlas-worker subprocesses in every case (the \
 happy path, the nested-archive case, and the archive-level-refusal case all exit normally, none \
 are signalled); more than the test binary's own profile must arrive, or no subprocess flushed"
+
+# S4 Y4, wired at birth (the #231 lesson, same as y1/y2/y3 above): the mail
+# adapter, through the real sgt-atlas-worker subprocess — the happy path, the
+# genuine-vs-synthesized HTML case, and every honest-refusal case (unparseable,
+# degraded, sealed). All exit normally (none are signalled), so every case is
+# expected to flush a subprocess profile. Floor 2, not higher, for the same
+# reason y1/y2/y3's is: the test binary's own profile plus at least one
+# flushed worker.
+cov_stage_begin c3-y4_mail_adapter
+cov_run cargo llvm-cov --no-report --test y4_mail_adapter --locked || cov_fail "y4_mail_adapter failed under instrumentation"
+cov_stage_end 2 "y4_mail_adapter spawns real sgt-atlas-worker subprocesses in every case (the \
+happy path, the genuine-vs-synthesized-HTML case, and every honest-refusal case all exit \
+normally, none are signalled); more than the test binary's own profile must arrive, or no \
+subprocess flushed"

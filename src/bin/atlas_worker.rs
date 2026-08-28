@@ -14,8 +14,10 @@
 //! [`office::DOCX_EXTRACTOR`] runs the real Office adapter
 //! ([`office::docx_units`]) over stdin; a value equal to
 //! [`archive::ZIP_EXTRACTOR`] runs the real bounded-ZIP adapter
-//! ([`archive::expand`], S4 Y3) over stdin; anything else falls through to
-//! the trivial UTF-8-whole-document body Y1 shipped. This mirrors exactly
+//! ([`archive::expand`], S4 Y3) over stdin; a value equal to
+//! [`mail::MAIL_EXTRACTOR`] runs the real mail adapter
+//! ([`mail::parse_message`], S4 Y4) over stdin; anything else falls through
+//! to the trivial UTF-8-whole-document body Y1 shipped. This mirrors exactly
 //! how `runtime::atlas::scan::extract_units` already dispatches on the same
 //! extractor-identity strings in-process (R2) — the wire contract's
 //! `extractor` field was always meant to be the dispatch key, once a second
@@ -72,6 +74,7 @@ use clap::Parser;
 
 use sergeant_rs::domain::source::UnitKind;
 use sergeant_rs::runtime::atlas::archive;
+use sergeant_rs::runtime::atlas::mail;
 use sergeant_rs::runtime::atlas::office;
 use sergeant_rs::runtime::atlas::worker::{DeclaredChild, WorkerBatch, WorkerUnit};
 
@@ -239,6 +242,52 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
         // build forgot to fill (Y1's own "no wire field nothing ever sets"
         // doctrine, restated for the opposite field).
         Vec::new()
+    } else if args.extractor == mail::MAIL_EXTRACTOR {
+        // `parent_key` composes every declared attachment's F7 key
+        // (`mail.rs`'s own module doc) exactly as the ZIP branch above does
+        // for `archive::expand` — same reasoning, same named seam: no field
+        // on `DeclaredChild` carries a composed key onto today's wire yet.
+        let message = mail::parse_message(input, &resource_hash).map_err(|e| e.to_string())?;
+        // Two Document-kind units, not one — the wave's own schema decision
+        // (mirrors office.rs's own "no new UnitKind variant" call, `mail.rs`'s
+        // module doc): a mail message genuinely has up to two independent
+        // bodies (A1 §6.5), and `coordinate` names which. Neither is
+        // byte-exact recoverable into the original wire bytes (a decoded
+        // Content-Transfer-Encoding is a transform, the same reason an
+        // Office section carries a coordinate rather than a byte range), so
+        // both get `0`/`0` — the same honest "not applicable" `office.rs`'s
+        // own Section units already use.
+        let mut mail_units = Vec::new();
+        if let Some(text) = message.text_body.clone() {
+            mail_units.push(WorkerUnit {
+                kind: UnitKind::Document,
+                byte_start: 0,
+                byte_end: 0,
+                coordinate: Some("text-body".to_string()),
+                text,
+            });
+        }
+        if let Some(html) = message.html_body.clone() {
+            mail_units.push(WorkerUnit {
+                kind: UnitKind::Document,
+                byte_start: 0,
+                byte_end: 0,
+                coordinate: Some("html-body".to_string()),
+                text: html,
+            });
+        }
+        // Named seam, identical shape to the ZIP branch above: only this
+        // message's own TOP-LEVEL attachments are declared onto today's
+        // wire; a grandchild nested inside an attachment's own
+        // `nested_message`/`nested_archive` stays internal to
+        // `mail::parse_message`'s own return value, proven in-process
+        // (`mail.rs`'s own tests), not yet reachable daemon-side — the same
+        // gap `archive.rs`'s module doc names for a nested ZIP entry.
+        declared_children.extend(message.attachments.iter().map(|attachment| DeclaredChild {
+            name: attachment.filename.clone(),
+            relative_path: attachment.filename.clone(),
+        }));
+        mail_units
     } else {
         // Y1's trivial, honestly-labeled fallback body: one
         // [`UnitKind::Document`] unit spanning the whole input when it
