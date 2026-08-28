@@ -134,10 +134,29 @@ const STDOUT_DRAIN_GRACE: Duration = Duration::from_secs(5);
 pub struct WorkerUnit {
     /// Whole resource, or a container-defined span.
     pub kind: UnitKind,
-    /// Offset into the original resource bytes.
+    /// Offset into the original resource bytes. `0` when this extractor
+    /// cannot recover a byte-exact position (see `coordinate` below) — a
+    /// text/Markdown extractor always can, so this stays the byte offset it
+    /// always was for those.
     pub byte_start: u64,
-    /// End offset into the original resource bytes, exclusive.
+    /// End offset into the original resource bytes, exclusive. Same caveat
+    /// as `byte_start`.
     pub byte_end: u64,
+    /// A stable, opaque, per-unit address into the *normalized* document
+    /// (S4 Y2, A1 §6.3's provenance requirement) — `None` when
+    /// `byte_start`/`byte_end` already say where this unit is (every text/
+    /// Markdown unit), `Some` when they cannot: an Office container's
+    /// original bytes are compressed and unpacked before extraction, so no
+    /// byte offset in them corresponds to a position in the extracted unit.
+    /// The contract a `Some` value must satisfy — present, unique per
+    /// document, deterministic for the same bytes and extractor identity,
+    /// and never a write-back claim into the original resource (A1-12,
+    /// derived-not-canonical) — is our own, not any one extractor's; see
+    /// [`super::office`]'s module doc, "The contract, in our own terms", for
+    /// the full statement and for why no particular string shape (e.g. the
+    /// Office adapter's own `block:<n>`) is part of it.
+    #[serde(default)]
+    pub coordinate: Option<String>,
     /// The unit's own text.
     pub text: String,
 }

@@ -448,6 +448,52 @@ release.
   behaviour is otherwise unchanged — it still checks for the file first, and
   still defers to the daemon when a running daemon holds the store.
 
+### Office document adoption (S4)
+
+- `.docx` documents now normalize into document units, running the `anydoc`
+  crate behind a narrow adapter — bytes in, our own vocabulary out — inside
+  the supervised worker transport the previous entry shipped. The owner
+  ruled to adopt anydoc past a RUSTSEC advisory reached through one of its
+  optional PDF-conversion dependencies
+  (`knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md`): a
+  per-format alternative would have defeated the "any doc" capability the
+  contract actually asks for, and the advisory is accepted risk in a
+  pre-alpha, open-source, MIT harness. `deny.toml` records the exception
+  scoped to that one advisory ID, with a proof that a *different* advisory
+  reached through the same dependency subtree still fails the gate.
+- **The replaceability boundary the ruling conditioned adoption on is
+  structural, not promised.** No anydoc type, error, or concept crosses out
+  of the adapter's own module — a dedicated test scans every source and test
+  file in the crate and fails if the crate's name appears anywhere else, the
+  same shape the existing one-owner `duckdb` tests already use. Document
+  units carry provenance in this crate's own terms: a normalizer identity
+  and version, the original resource (never a temp path), and — where
+  recoverable — a coordinate. For an Office section that coordinate is
+  structural (`block:<n>`) rather than a byte range: the original bytes are
+  a compressed container the normalizer has already unpacked, so no byte
+  offset in them corresponds to a position in the extracted text, unlike
+  plain text or Markdown, which keep exact byte offsets as before.
+- **No new schema variant.** Office units stay `Document`/`Section` — the
+  same two kinds Markdown already produces — because a `.docx` normalizes
+  into the identical shape: one whole-resource unit, plus flat sections
+  delimited by headings. The decision and its reasoning are recorded on the
+  schema type itself, not left as an implementation detail.
+- **This is also where a real parser first runs inside the supervised
+  worker**, and the previous entry's supervision contract is proven against
+  it: a genuinely malformed document (well-formed ZIP, invalid XML) and a
+  genuinely hostile one (a small file that decompresses far past the
+  adapter's own internal size ceiling — a classic zip-bomb ratio) each fail
+  their worker alone. The worker process exits, the coverage row names why,
+  no partial units are ever written, and the process supervising it stays
+  up and reusable. The adapter is stricter than anydoc's own default:
+  anydoc's XML layer will *repair* a well-formedness problem rather than
+  fail outright, and the adapter treats a document that needed repair the
+  same as one that could not be read at all, rather than trusting a
+  silently patched result.
+- A hand-verified `.docx` fixture corpus (five documents plus the hostile
+  one above), with expected counts written down and independently
+  cross-checked before any extractor existed, backs every claim above.
+
 ### Atlas closeout (S3)
 
 - `docs/concepts/atlas-and-knowledge.md` documents Atlas for operators: what

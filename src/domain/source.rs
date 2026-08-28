@@ -383,6 +383,49 @@ pub struct CoverageRow {
 }
 
 /// The kind of structure unit an extractor produced (§3's `EvidenceUnit`).
+///
+/// # The Y2 decision: Office units stay Document/Section (S4, G3)
+///
+/// **Schema decision, recorded where a schema decision belongs — not an
+/// implementation detail of whichever extractor happens to produce one.**
+/// When Office document support (`.docx` via the adapter behind
+/// [`crate::runtime::atlas::office`]) landed, the question this wave had to
+/// answer was whether it needed a third variant (`OfficeDocument`/
+/// `OfficeSection`, or similar) or whether the two that already exist were
+/// enough.
+///
+/// **Decided: no new variant.** A `.docx`, normalized, decomposes into
+/// exactly the same shape Markdown already has — one unit for the whole
+/// resource, plus flat, heading-delimited sections tiling what came after
+/// it — because `office::docx_units` walks the normalizer's own heading
+/// transitions the identical way `text::markdown_units` walks ATX heading
+/// transitions.
+/// Reusing `Document`/`Section` is R1/R2 (Ponytail): a format-specific pair
+/// of variants would not model anything a *content-kind* axis (this module's
+/// own doc already reserves one — "not modelled yet... lands with the wave
+/// that lands a second family") does not already own, and adding them now
+/// would be growing the enum to say "this section came from a `.docx`" when
+/// the row's own `source.files.extractor` column already says that, more
+/// precisely, via the extractor identity (F7) — a second place to encode the
+/// same fact is a second place for it to drift from the first.
+///
+/// **What does NOT carry over from text/Markdown, and is the actual cost of
+/// this decision:** a `Section` extracted from a `.docx` cannot claim a byte
+/// range into the *original* resource the way a Markdown section can — the
+/// original bytes are a compressed container the normalizer has already
+/// unpacked and resolved by the time a heading block is visible, and no
+/// position in the normalized model maps back to a byte offset in the ZIP
+/// stream. So the
+/// wire carrying these units ([`crate::runtime::atlas::worker::WorkerUnit`])
+/// grew a `coordinate: Option<String>` field alongside its existing
+/// `byte_start`/`byte_end` — `None` and real byte offsets for every text/
+/// Markdown unit exactly as before, `Some` and `0`/`0` for an Office
+/// section, naming a structural position (`block:<n>`) instead. `UnitKind`
+/// itself did not need to grow to carry that asymmetry; the wire type did,
+/// in one small, additive way. See [`crate::runtime::atlas::office`]'s own
+/// module doc for the full argument, including why a spreadsheet format (not
+/// adopted this wave) must never claim a write-back cell coordinate through
+/// this same field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitKind {
