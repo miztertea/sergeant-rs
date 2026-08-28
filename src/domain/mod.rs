@@ -5,6 +5,7 @@ pub mod estate;
 pub mod event;
 pub mod execution;
 pub mod manifest;
+pub mod package;
 pub mod profile;
 pub mod source;
 pub mod work;

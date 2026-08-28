@@ -58,6 +58,11 @@ use crate::domain::workflow::{
 };
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::atlas::db::{self as atlas_db, AtlasDb, AtlasError, SourceStatus};
+use crate::runtime::atlas::external_git::ExternalGitSource;
+use crate::runtime::atlas::lane::{acquire_external_git_on_lane, scan_local_knowledge_on_lane};
+use crate::runtime::atlas::locator;
+use crate::runtime::atlas::record::{ScanRecord, record_external_git_scan, record_scan};
+use crate::runtime::atlas::scan::KnowledgeSource;
 use crate::runtime::engine::{
     Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
     Next as EngineNext, Step, SubmitContext,
@@ -531,6 +536,12 @@ pub fn router(state: ApiState) -> Router {
         // and `map changed` are deliberately absent — S5 and S6 own them,
         // where their consumers exist (F11's named deferral).
         .route("/intelligence/status", get(intelligence_status))
+        // S4 Y5, G8/G6: the scan trigger, and item 10's acquisition surface.
+        .route("/intelligence/scan", post(intelligence_scan))
+        .route(
+            "/intelligence/sources",
+            get(intelligence_sources).post(intelligence_add_source),
+        )
         .route("/map/repos", get(map_repos))
         .route("/map/stats", get(map_stats))
         .route("/map/outline", get(map_outline))
@@ -4572,8 +4583,14 @@ fn atlas_absent() -> Response {
 }
 
 /// One source's status, as `sgt intelligence status` renders it (F8).
+///
+/// `provenance` is present only for an `external_git` source (A1 §9, S4 Y5)
+/// — every other kind's row omits the key entirely rather than carrying an
+/// explicit `null`, the same "absence over a false null" rule
+/// [`intelligence_status`]'s own sibling handlers already follow for
+/// `revision`.
 fn source_status_json(status: &SourceStatus) -> Value {
-    json!({
+    let mut value = json!({
         "source": status.source_name,
         "kind": status.kind.as_str(),
         "authority": status.authority.as_str(),
@@ -4589,7 +4606,21 @@ fn source_status_json(status: &SourceStatus) -> Value {
         "datasets": status.datasets,
         "row_units": status.row_units,
         "coverage": status.coverage,
-    })
+    });
+    if let Some(provenance) = &status.provenance
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "provenance".to_string(),
+            json!({
+                "origin": provenance.origin,
+                "requested_ref": provenance.requested_ref,
+                "resolved_commit": provenance.resolved_commit,
+                "retrieved_at": provenance.retrieved_at,
+            }),
+        );
+    }
+    value
 }
 
 /// `GET /v1/intelligence/status` — F8's coverage, per indexed source.
@@ -4599,6 +4630,304 @@ async fn intelligence_status(State(state): State<ApiState>) -> Response {
         Ok(Some(sources)) => Json(json!({
             "atlas": {"present": true},
             "sources": sources.iter().map(source_status_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanRequest {
+    command_id: String,
+    /// D4: the estate whose declared `[[knowledge]]` sources this scan
+    /// addresses.
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
+}
+
+/// Open (creating if absent) the mutable Atlas handle under `state.atlas`'s
+/// lock, run `f`, and turn a store failure into this file's one error shape.
+/// The write-side twin of [`with_atlas`] — that function refuses to create
+/// the file for a mere read; a scan is the one call site allowed to bring
+/// the store into existence, because writing to it is the entire point of
+/// calling this.
+async fn with_atlas_write<T>(
+    state: &ApiState,
+    f: impl FnOnce(&mut AtlasDb) -> T,
+) -> Result<T, AtlasError> {
+    let mut guard = state.atlas.lock().await;
+    if guard.is_none() {
+        *guard = Some(AtlasDb::open(&state.data_dir)?);
+    }
+    Ok(f(guard.as_mut().expect("opened above")))
+}
+
+/// `POST /v1/intelligence/scan` — S4 Y5's G8: a full scan of the addressed
+/// estate's declared `[[knowledge]]` sources, on the intelligence lane,
+/// bounded by the lane's own concurrency (each source's walk acquires its
+/// own permit — [`scan_local_knowledge_on_lane`]). Reports what was indexed
+/// and what was not **from each source's own coverage counts**, never a
+/// guess — the tripwire this endpoint's existence retires
+/// (`tests/x5_a1a_acceptance.rs`'s former
+/// `a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan`).
+///
+/// Scheduling and cadence are deliberately not here (G10): one call, one
+/// scan, one report — a recurring trigger is a later wave's, when retrieval
+/// needs one.
+async fn intelligence_scan(
+    State(state): State<ApiState>,
+    body: Result<Json<ScanRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let root = match estate_root_or_error(&state, req.estate_root.as_deref(), "scanning") {
+        Ok(root) => root,
+        Err((status, body)) => return (status, Json(body)).into_response(),
+    };
+    let estate =
+        match Estate::from_config_allow_empty(&root.join(crate::domain::estate::MANIFEST_FILE)) {
+            Ok(estate) => estate,
+            Err(e) => {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_estate",
+                    e.to_string(),
+                );
+            }
+        };
+    if estate.knowledge.is_empty() {
+        return Json(json!({
+            "scanned": [],
+            "detail": "no [[knowledge]] sources are declared for this estate",
+        }))
+        .into_response();
+    }
+
+    // Bounded concurrency: one task per source, each queueing on the
+    // intelligence lane's own semaphore — the lane's existing promise (F6),
+    // not a second concurrency cap invented here.
+    let mut walks = tokio::task::JoinSet::new();
+    for spec in &estate.knowledge {
+        let engine = state.engine.clone();
+        let source = KnowledgeSource::from(spec);
+        let name = source.name.clone();
+        walks.spawn(async move { (name, scan_local_knowledge_on_lane(&engine, source).await) });
+    }
+
+    let mut report = Vec::new();
+    while let Some(joined) = walks.join_next().await {
+        let (name, outcome) = match joined {
+            Ok(pair) => pair,
+            Err(e) => {
+                report.push(json!({"source": "?", "error": format!("scan task panicked: {e}")}));
+                continue;
+            }
+        };
+        let scan = match outcome {
+            Ok(scan) => scan,
+            Err(e) => {
+                report.push(json!({"source": name, "error": e.to_string()}));
+                continue;
+            }
+        };
+        let counts = scan.counts();
+        // One `CoreGuard` acquire covers the whole of `record_scan`'s three
+        // steps (stage, journal, confirm — R2, not re-derived here): the
+        // journal's own summary write needs `&mut core.journal`, and the
+        // guard's `Drop` is what fsyncs it durable before this loop moves to
+        // the next source.
+        let mut core = CoreGuard::acquire(&state.core).await;
+        let outcome = with_atlas_write(&state, |atlas| {
+            record_scan(atlas, &mut core.journal, &scan, None)
+        })
+        .await;
+        drop(core);
+        match outcome {
+            Ok(Ok(record)) => report.push(scan_record_json(&name, &record, &counts)),
+            Ok(Err(e)) => report.push(json!({"source": name, "error": e.to_string()})),
+            Err(e) => {
+                report.push(json!({"source": name, "error": format!("atlas unavailable: {e}")}))
+            }
+        }
+    }
+    Json(json!({"scanned": report})).into_response()
+}
+
+/// One [`ScanRecord`] rendered for `POST /v1/intelligence/scan`'s report —
+/// the outcome plus the coverage counts the report is required to answer
+/// from (G8), never a guess.
+fn scan_record_json(
+    source: &str,
+    record: &ScanRecord,
+    coverage: &BTreeMap<&'static str, u64>,
+) -> Value {
+    let coverage: BTreeMap<&str, u64> = coverage.clone();
+    match record {
+        ScanRecord::Unchanged {
+            generation_id,
+            content_key,
+        } => json!({
+            "source": source, "outcome": "unchanged",
+            "generation": generation_id, "content_key": content_key, "coverage": coverage,
+        }),
+        ScanRecord::RootUnavailable {
+            generation_id,
+            content_key,
+            detail,
+        } => json!({
+            "source": source, "outcome": "root_unavailable",
+            "generation": generation_id, "content_key": content_key, "detail": detail,
+            "coverage": coverage,
+        }),
+        ScanRecord::Recorded {
+            generation_id,
+            content_key,
+            evicted,
+            ..
+        } => json!({
+            "source": source, "outcome": "recorded",
+            "generation": generation_id, "content_key": content_key,
+            "evicted": evicted, "coverage": coverage,
+        }),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AddExternalGitRequest {
+    command_id: String,
+    url: String,
+    #[serde(rename = "ref", default)]
+    git_ref: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A safe default source name derived from a locator's final path segment
+/// (`.git` stripped), when that segment is itself
+/// [`crate::domain::is_plain_name`]. `None` when it is not — an operator
+/// whose locator's last segment is not a safe name must name the source
+/// explicitly rather than have one guessed at.
+fn default_source_name(locator: &str) -> Option<String> {
+    let last = locator.rsplit(['/', ':']).next().unwrap_or("");
+    let trimmed = last.strip_suffix(".git").unwrap_or(last);
+    if crate::domain::is_plain_name(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// `POST /v1/intelligence/sources` — S4 Y5's G6, item 10's acquisition
+/// surface: validate the locator, fetch it into this host's own bare cache
+/// under the intelligence lane's permit
+/// ([`acquire_external_git_on_lane`]) — which is where
+/// [`crate::runtime::git::git_fetch_restricted`]'s own #310 supervision
+/// runs — then record it exactly as any other source kind (A1 §9's
+/// provenance, staged atomically).
+///
+/// Host-scoped, not estate-scoped (Atlas itself is host-scoped —
+/// [`ApiState::data_dir`]'s own doc): no `estate_root` is read from the
+/// request at all.
+async fn intelligence_add_source(
+    State(state): State<ApiState>,
+    body: Result<Json<AddExternalGitRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let locator = match locator::validate(&req.url) {
+        Ok(locator) => locator,
+        Err(e) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_locator",
+                e.to_string(),
+            );
+        }
+    };
+    let name = match req.name.clone().or_else(|| default_source_name(&req.url)) {
+        Some(name) if crate::domain::is_plain_name(&name) => name,
+        Some(name) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_name",
+                format!("{name:?} is not a plain name"),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_name",
+                "no --name was given and the locator's own last segment is not a safe name",
+            );
+        }
+    };
+    let source = ExternalGitSource {
+        name,
+        locator,
+        requested_ref: req.git_ref.clone(),
+        cache_root: crate::runtime::atlas::external_git::default_cache_root(&state.data_dir),
+        ignore: Vec::new(),
+    };
+    let acquired = match acquire_external_git_on_lane(&state.engine, source).await {
+        Ok(acquired) => acquired,
+        Err(e) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "acquisition_failed",
+                e.to_string(),
+            );
+        }
+    };
+    let coverage = acquired.scan.counts();
+    let mut core = CoreGuard::acquire(&state.core).await;
+    let recorded = with_atlas_write(&state, |atlas| {
+        record_external_git_scan(atlas, &mut core.journal, &acquired, None)
+    })
+    .await;
+    match recorded {
+        Ok(Ok(record)) => Json(scan_record_json(
+            &acquired.scan.source_name,
+            &record,
+            &coverage,
+        ))
+        .into_response(),
+        Ok(Err(e)) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "atlas_unavailable",
+            e.to_string(),
+        ),
+        Err(e) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "atlas_unavailable",
+            e.to_string(),
+        ),
+    }
+}
+
+/// `GET /v1/intelligence/sources` — every declared external Git source,
+/// with its provenance (A1 §9): [`intelligence_status`]'s own list, filtered
+/// to `external_git`, the identical shape [`map_repos`] already gives
+/// `estate_git`.
+async fn intelligence_sources(State(state): State<ApiState>) -> Response {
+    match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sources)) => Json(json!({
+            "atlas": {"present": true},
+            "sources": sources
+                .iter()
+                .filter(|s| s.kind == SourceKind::ExternalGit)
+                .map(source_status_json)
+                .collect::<Vec<_>>(),
         }))
         .into_response(),
         Err(response) => *response,

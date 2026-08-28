@@ -75,7 +75,7 @@ Every one of these is canned and parameterized. There is no client SQL, no clien
 
 The daemon is Atlas's writer. Clients ask it questions over the API; they do not open the store and reach in. The one diagnostic exception is `sgt doctor`'s `atlas` row, which reads the store file directly when no daemon holds it — it checks for the file first and never creates one, and when a running daemon has the store locked it says to ask the daemon instead.
 
-One thing this release does not yet include is a way to *start* a scan. Atlas's writers and its read surfaces both ship; nothing between them is wired to a command, a route, or a scheduled job. On a fresh installation the store is therefore empty, `sgt intelligence status` reports nothing indexed, and `sgt doctor`'s `atlas` row says so rather than implying a fault. That is stated here rather than left to be discovered.
+`sgt knowledge scan` drives a full scan of an estate's declared `[[knowledge]]` sources through the daemon, on the intelligence lane, reporting what it indexed and what it could not from the coverage rows the scan itself produced. On a fresh installation the store is still empty until this (or `sgt intelligence add`, below) is run at least once, and `sgt doctor`'s `atlas` row says so rather than implying a fault — but the trigger itself now exists; an earlier note here said it did not, and this replaces it. Scheduling and cadence are not built: this is one call, one scan, one report, and a recurring trigger is later work's, when retrieval needs one.
 
 ## Decisions
 
@@ -87,10 +87,11 @@ One thing this release does not yet include is a way to *start* a scan. Atlas's 
 | D4 | A knowledge source is read-only evidence and never a mount: nothing is cloned, no worktree is cut, nothing is written back, and a path inside the estate's own mutable territory is refused by name. |
 | D5 | Repositories are indexed from the object store at the admission-pinned commit; a `HEAD` that moves mid-scan is reported as drift, never blended into the result. |
 | D6 | A generation is superseded on either of two triggers — the bytes it was derived from changed, or the extractor identities that read them changed — and the superseded generation leaves an explicit eviction row rather than vanishing. A re-scan finding the same bytes *and* the same extractors writes and evicts nothing. |
-| D7 | Cached facts key on content identity **plus** extractor identity, so a changed parser re-derives under unchanged bytes and one file read two ways is two independent extractions. |
-| D8 | Every path a scan sees leaves exactly one coverage row. Excluded bytes are counted and reported as excluded; there is no silently-skipped state. |
-| D9 | Structural extraction is syntax-derived and labeled as such. A file a grammar cannot parse is an `error` with no symbols, never a partial parse. |
-| D10 | Tabular data stays relational and is read in place. A row's text is exposed as a context unit only through an operator-declared column allowlist whose default is none. |
-| D11 | Query surfaces are canned, parameterized and bounded. No client SQL, no client-named path, no client pattern — and the daemon is the sole writer. |
+| D7 | `sgt knowledge scan` is the scan trigger; scheduling and cadence stay unbuilt on purpose. `sgt intelligence add`/`list` acquires an external Git source into a bare, no-working-tree host cache outside every estate, at an allowlisted `https://`/`ssh://` locator only — refused before Git ever sees anything else — and reads it through the identical object-store plumbing a `[[repo]]` mount already uses. |
+| D8 | Cached facts key on content identity **plus** extractor identity, so a changed parser re-derives under unchanged bytes and one file read two ways is two independent extractions. |
+| D9 | Every path a scan sees leaves exactly one coverage row. Excluded bytes are counted and reported as excluded; there is no silently-skipped state. |
+| D10 | Structural extraction is syntax-derived and labeled as such. A file a grammar cannot parse is an `error` with no symbols, never a partial parse. |
+| D11 | Tabular data stays relational and is read in place. A row's text is exposed as a context unit only through an operator-declared column allowlist whose default is none. |
+| D12 | Query surfaces are canned, parameterized and bounded. No client SQL, no client-named path, no client pattern — and the daemon is the sole writer. |
 
 See [estates and Git surfaces](estates-and-git.md) for the repository and Work-surface boundary Atlas reads without disturbing, [host runtime and estates](host-runtime.md) for the daemon that owns the store, [security and trust](security-and-trust.md) for the trust model the secrets posture sits inside, and [`sergeant.toml`](../reference/sergeant-toml.md) for the exact `[[knowledge]]` schema.

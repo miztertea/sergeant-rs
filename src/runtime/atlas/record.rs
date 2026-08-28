@@ -24,6 +24,7 @@ use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::source::KIND_SOURCE_SCANNED;
 use crate::runtime::atlas::db::{AtlasDb, AtlasError, ScanCommit};
 use crate::runtime::atlas::deny::BadPattern;
+use crate::runtime::atlas::external_git::{ExternalGitError, ExternalGitSource, acquire_and_scan};
 use crate::runtime::atlas::git::{EstateGitSource, GitScanError, scan_estate_git};
 use crate::runtime::atlas::overlay::{WorkOverlay, scan_work_overlay};
 use crate::runtime::atlas::scan::{KnowledgeSource, SourceScan, scan_local_knowledge};
@@ -86,6 +87,10 @@ pub enum ScanRecordError {
     /// The journal refused the summary.
     #[error(transparent)]
     Journal(#[from] JournalError),
+    /// An external-git acquisition failed — the locator, the fetch, or the
+    /// extraction (S4 Y5, G6).
+    #[error(transparent)]
+    ExternalGit(#[from] ExternalGitError),
 }
 
 /// Scan one source and record it — **F1's crash-window coupling, in three
@@ -156,6 +161,60 @@ pub fn scan_and_record_estate_git(
     Ok((record, scanned.drift))
 }
 
+/// [`scan_and_record`] for one external Git source (S4 Y5, G6): acquire
+/// (fetch into the host cache, resolve the exact commit), extract through
+/// the normal adapters, then the identical three-step stage/journal/confirm
+/// discipline — with A1 §9's provenance written atomically alongside the
+/// staged generation ([`AtlasDb::stage_external_git_scan`]).
+///
+/// **Refresh, and the honest answer to "pinned Works keep theirs" (G6).**
+/// A source whose bytes changed since the last acquisition produces a new
+/// generation exactly as any other source kind's does (ruling §4: the
+/// content-key comparison is source-kind-agnostic), and the superseded
+/// generation is evicted the identical way — `git.provenance`'s own row
+/// goes with it ([`AtlasDb`]'s `evict`). What makes this safe for a Work
+/// that already "has" an external source's evidence is that **nothing in
+/// this build creates that binding in the first place**: Atlas here is
+/// read-only evidence with no consumer yet (S4's own cross-cutting gap,
+/// closed for triggering but not for consumption — S5's retrieval work is
+/// what would actually pin a Work to a generation). So the promise is kept
+/// trivially today, not by new pinning machinery this wave has no consumer
+/// to justify building: there is nothing yet that a refresh could pull out
+/// from under.
+pub fn scan_and_record_external_git(
+    db: &mut AtlasDb,
+    journal: &mut Journal,
+    source: &ExternalGitSource,
+    workspace_id: Option<&str>,
+) -> Result<ScanRecord, ScanRecordError> {
+    let acquired = acquire_and_scan(source)?;
+    record_external_git_scan(db, journal, &acquired, workspace_id)
+}
+
+/// [`record_scan`] for an **already-acquired** external-git scan —
+/// [`scan_and_record_external_git`]'s own second half, split out so a
+/// daemon caller can run acquisition on the intelligence lane
+/// ([`crate::runtime::atlas::lane::acquire_external_git_on_lane`]) and then
+/// record the result separately, the same two-step shape every other
+/// lane-bounded source kind already uses (this module stays engine-agnostic;
+/// [`super::lane`] is the thin glue that adds a permit around the expensive
+/// half). [`scan_and_record_external_git`] itself is the un-lane-bounded
+/// convenience for a caller — a test, a script — that does not need one.
+pub fn record_external_git_scan(
+    db: &mut AtlasDb,
+    journal: &mut Journal,
+    acquired: &crate::runtime::atlas::external_git::ExternalGitScan,
+    workspace_id: Option<&str>,
+) -> Result<ScanRecord, ScanRecordError> {
+    record_scan_impl(
+        db,
+        journal,
+        &acquired.scan,
+        workspace_id,
+        Some(&acquired.provenance),
+    )
+}
+
 /// [`scan_and_record`] for one Work overlay — same three steps again.
 ///
 /// The generation this writes is scoped to its Work and removed by
@@ -180,7 +239,26 @@ pub fn record_scan(
     scan: &SourceScan,
     workspace_id: Option<&str>,
 ) -> Result<ScanRecord, ScanRecordError> {
-    let staged = match db.stage_scan(scan)? {
+    record_scan_impl(db, journal, scan, workspace_id, None)
+}
+
+/// [`record_scan`]'s actual body, widened to carry
+/// [`scan_and_record_external_git`]'s provenance through to
+/// [`AtlasDb::stage_external_git_scan`] when present — everything else
+/// (staging, the journal summary, confirming) is identical regardless of
+/// source kind, exactly as F1's own argument says it must be.
+fn record_scan_impl(
+    db: &mut AtlasDb,
+    journal: &mut Journal,
+    scan: &SourceScan,
+    workspace_id: Option<&str>,
+    provenance: Option<&crate::runtime::atlas::external_git::ExternalGitProvenance>,
+) -> Result<ScanRecord, ScanRecordError> {
+    let staged = match provenance {
+        Some(provenance) => db.stage_external_git_scan(scan, provenance)?,
+        None => db.stage_scan(scan)?,
+    };
+    let staged = match staged {
         ScanCommit::Unchanged {
             generation_id,
             content_key,
@@ -347,4 +425,45 @@ pub fn scan_summary(scan: &SourceScan, generation_id: &str) -> serde_json::Value
         object.insert("revision".to_string(), revision.as_str().into());
     }
     summary
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::atlas::locator::{ExternalGitLocator, LocatorForm};
+
+    /// `scan_and_record_external_git`'s own acquisition failure — a locator
+    /// that only reaches this function by bypassing
+    /// [`crate::runtime::atlas::locator::validate`] (exactly the way this
+    /// module's own defense-in-depth re-check is meant to catch — see
+    /// [`crate::runtime::atlas::external_git`]'s tests for the same trick) —
+    /// surfaces as [`ScanRecordError::ExternalGit`], never a panic and never
+    /// a silent no-op. The success path is exercised where it belongs:
+    /// `acquire_and_scan`'s own mechanics in `external_git.rs`'s tests, and
+    /// the provenance-staging half in `db.rs`'s `stage_external_git_scan`
+    /// tests — this function is two lines of glue joining both, and this
+    /// test is the glue's own failure-propagation proof, not a re-proof of
+    /// either half. A live `https://`/`ssh://` acquisition end to end needs
+    /// network access this sandbox does not have; the two components it
+    /// joins are proven independently instead.
+    #[test]
+    fn an_acquisition_failure_surfaces_as_scan_record_error_not_a_panic() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut db = AtlasDb::open(dir.path()).expect("open atlas");
+        let mut journal = Journal::open(dir.path()).expect("open journal");
+        let cache_root = tempfile::TempDir::new().expect("cache root");
+        let source = crate::runtime::atlas::external_git::ExternalGitSource {
+            name: "upstream".to_string(),
+            locator: ExternalGitLocator {
+                raw: "file:///not/a/real/thing".to_string(),
+                form: LocatorForm::Https,
+            },
+            requested_ref: None,
+            cache_root: cache_root.path().to_path_buf(),
+            ignore: Vec::new(),
+        };
+        let err = scan_and_record_external_git(&mut db, &mut journal, &source, None)
+            .expect_err("an unallowlisted locator must be refused");
+        assert!(matches!(err, ScanRecordError::ExternalGit(_)), "{err}");
+    }
 }

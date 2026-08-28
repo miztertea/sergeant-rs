@@ -40,8 +40,8 @@
 //! | 6 | CSV/JSON/Parquet stay relational, with a deterministic aggregate and selected text-field context units sharing row identity | met | `x4_tabular_map::datasets_are_registered_and_read_in_place_as_derived_evidence` |
 //! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | met | `y3_zip_adapter::a_zip_worker_declares_admitted_children_through_the_real_subprocess` |
 //! | 8 | `.eml` or the chosen first mail format produces structured message evidence | met | `y4_mail_adapter::a_mail_worker_returns_message_shape_and_attachment_with_provenance` |
-//! | 9 | image/scanned evidence enters the OCR fallback with page/region/engine provenance | deferred-s4 | — |
-//! | 10 | external Git acquisition resolves an exact commit in a no-Work-checkout cache | deferred-s4 | — |
+//! | 9 | image/scanned evidence enters the OCR fallback with page/region/engine provenance | deferred-post-s4 | — |
+//! | 10 | external Git acquisition resolves an exact commit in a no-Work-checkout cache | met | `src/runtime/atlas/external_git::a_refresh_resolves_the_origins_new_tip_over_the_same_cache` |
 //! | 11 | source parsing uses content/extractor identity so unchanged resources reuse cached facts | met | `x2_knowledge_sources::a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one` |
 //! | 12 | daemon remains sole Atlas writer and worker failure cannot corrupt journal authority | met | `x5_a1a_acceptance::a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli` |
 //! | 13 | `sgt map`/status surfaces expose source/generation/coverage rather than arbitrary SQL | met | `x5_a1a_acceptance::a1a_item_13_no_client_sql_reaches_the_store` |
@@ -51,19 +51,28 @@
 //! readable; every row's full check list — several rows carry four — is in
 //! [`WALK`] below, and each one is verified to exist.
 //!
-//! ## One cross-cutting gap, named once
+//! ## One cross-cutting gap, closed (S4 Y5, G8)
 //!
-//! Every capability item above is met **as a capability**: the writers exist,
-//! they are called through their real entry points, and the read surfaces
-//! answer over the wire and through the verb. What S3 did not ship is an
-//! operator-reachable *trigger*: no CLI verb, no route, and no daemon job
-//! calls a scan, so on a real installation Atlas stays empty until something
-//! invokes it, and `sgt doctor` correctly says so. That is not a defect in any
-//! one item — it is the seam the intelligence consumer will land on — but it
-//! is exactly the sort of thing an acceptance walk exists to say out loud, so
-//! [`a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan`] pins it and
-//! items 3, 6 and 13 name it. Destination: the wave that owns the first
-//! consumer of derived evidence (S5's retrieval work at the earliest).
+//! S3 shipped Atlas's writers and Atlas's readers with no operator-reachable
+//! *trigger* between them: no CLI verb, no route, and no daemon job called a
+//! scan, so on a real installation Atlas stayed empty until a test invoked
+//! it — a fact this file used to pin with a tripwire
+//! (`a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan`) precisely so
+//! it could not close silently. **It has closed.** `sgt knowledge scan` (`POST
+//! /v1/intelligence/scan`) drives a full scan of an estate's declared
+//! `[[knowledge]]` sources through the daemon, on the intelligence lane,
+//! reporting from each source's own coverage counts; `sgt intelligence
+//! add`/`list` (`POST`/`GET /v1/intelligence/sources`) is item 10's own
+//! acquisition surface. This supersedes the settled J3 record the tripwire
+//! encoded and the concept page's "no way to start a scan" sentence — both
+//! edited in this same wave, per the authority chain S4's plan (G8) states
+//! rather than merely asserts: the owner's explicit ordering delegation plus
+//! S4's own acceptance being unprovable without a trigger. `sgt intelligence`
+//! is no longer a read-only verb set — see
+//! [`the_intelligence_verb_set_now_includes_the_trigger_and_the_acquisition_surface`]
+//! for the replacement pin. Scheduling and cadence remain deliberately
+//! unbuilt (G10): this is one call, one scan, one report — a recurring
+//! trigger is S5+'s, when retrieval needs one.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -104,6 +113,13 @@ enum Verdict {
     Gap,
     /// Out of A1a's scope by a ratified re-cut, cited in the `note`.
     DeferredS4,
+    /// Out of A1a's scope AND out of S4's own scope, cited in the `note` —
+    /// distinct from [`Self::DeferredS4`] because "lands in S4" and "lands
+    /// after S4" are different destinations and a reader must not have to
+    /// infer which one a row means (S4 Y5's register correction, item 9:
+    /// the register's earlier "S4's" was a mis-citation — owner ruling 3 and
+    /// the ratified re-cut place OCR after S4).
+    DeferredPostS4,
 }
 
 impl Verdict {
@@ -113,6 +129,7 @@ impl Verdict {
             Self::MetWithDeviation => "met-with-deviation",
             Self::Gap => "gap",
             Self::DeferredS4 => "deferred-s4",
+            Self::DeferredPostS4 => "deferred-post-s4",
         }
     }
 }
@@ -487,18 +504,55 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 9,
-        verdict: Verdict::DeferredS4,
+        verdict: Verdict::DeferredPostS4,
         checks: &[],
-        note: "OCR fallback is S4's, same citation as item 7, and likewise gated behind the OCR \
-               candidate spike the item itself names.",
+        // S4 Y5's correction: the previous note here read "S4's, same
+        // citation as item 7" — a mis-citation. Owner ruling 3 and the
+        // ratified S4/S5+ re-cut both place OCR/layout evaluation AFTER S4
+        // (feature-gate vs. worker-binary, ONNX excluded), not inside it; S4
+        // ships items 4/5/7/8/10 + §10 package identity and item 9 is not
+        // among them (G1). Corrected in-sprint per J5 (governing ruling)
+        // over J3 (an unmoved register note) rather than left standing.
+        note: "OCR/layout evidence enters post-S4, not S4 — owner ruling 3 plus the ratified S4 \
+               re-cut (G1) name the destination explicitly; the earlier \"S4's, same citation as \
+               item 7\" note was a mis-citation, corrected here (S4 Y5).",
     },
     Item {
         number: 10,
-        verdict: Verdict::DeferredS4,
-        checks: &[],
-        note: "External Git acquisition is S4's, same citation as item 7. The seam it will land \
-               on exists and is named today (`SourceKind`'s external-git variant, `domain/\
-               source.rs`), which is why S3 could pin generation identity without it.",
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "src/runtime/atlas/external_git.rs",
+                "a_refresh_resolves_the_origins_new_tip_over_the_same_cache",
+            ),
+            at(
+                "src/runtime/atlas/external_git.rs",
+                "the_cache_is_bare_and_never_grows_a_working_tree",
+            ),
+            at(
+                "src/runtime/atlas/external_git.rs",
+                "an_external_agents_md_becomes_ordinary_indexed_text_never_instructions",
+            ),
+            at(
+                "src/runtime/atlas/locator.rs",
+                "ext_remote_helper_is_refused",
+            ),
+            at(
+                "tests/y5_external_git_triggers.rs",
+                "an_unallowlisted_locator_is_refused_by_the_api_before_git_runs",
+            ),
+        ],
+        note: "S4 Y5 (G6): locator allowlist BEFORE Git sees the string, bare no-working-tree \
+               host cache outside every estate, exact-commit resolution over the identical \
+               ls-tree/cat-file plumbing X3a already reads estate-git through, full A1 §9 \
+               provenance (origin/requested_ref/resolved_commit/retrieved_at) in a new \
+               git.provenance table, `sgt intelligence add/list` as the CLI surface. A live \
+               `https://`/`ssh://` acquisition end to end needs network access this suite's \
+               sandbox does not have; the acquisition mechanism itself is proven against a \
+               local origin with the protocol allowlist deliberately widened for the test only \
+               (never in production code — a separate test proves the production entry point \
+               never does this), and the allowlist decision itself is proven exhaustively, \
+               separately, in `locator.rs`.",
     },
     Item {
         number: 11,
@@ -652,7 +706,7 @@ fn every_contract_item_is_accounted_for() {
             item.number
         );
         match item.verdict {
-            Verdict::DeferredS4 => assert!(
+            Verdict::DeferredS4 | Verdict::DeferredPostS4 => assert!(
                 item.checks.is_empty(),
                 "item {} is deferred; it must not claim a check",
                 item.number
@@ -668,21 +722,39 @@ fn every_contract_item_is_accounted_for() {
 
     // The re-cut's own boundary, pinned so a later edit cannot quietly pull an
     // S4 item back into A1a's "accepted" column (or push an S3 one out).
-    let deferred: BTreeSet<u8> = WALK
+    // Item 9 (OCR) moved from `DeferredS4` to `DeferredPostS4` in S4 Y5's own
+    // register correction (the earlier "S4's" note was a mis-citation —
+    // owner ruling 3 places it after S4); item 10 (external Git) closed in
+    // Y5 itself, exactly as items 5/7/8 closed in Y2/Y3/Y4.
+    let deferred_s4: BTreeSet<u8> = WALK
         .iter()
         .filter(|item| item.verdict == Verdict::DeferredS4)
         .map(|item| item.number)
         .collect();
     assert_eq!(
-        deferred,
-        BTreeSet::from([9, 10]),
-        "items 9-10 are still S4's; item 5 closed in Y2 (register row 5 edit), item 7 closed in \
-         Y3 (register row 7 edit), item 8 closed in Y4 (register row 8 edit)"
+        deferred_s4,
+        BTreeSet::new(),
+        "S4 has no remaining `deferred-s4` items: item 5 closed in Y2, item 7 in Y3, item 8 in \
+         Y4, item 10 in Y5 (register row edits each time); item 9 moved to deferred-post-s4 \
+         (S4 Y5's own correction), never simply dropped"
+    );
+    let deferred_post_s4: BTreeSet<u8> = WALK
+        .iter()
+        .filter(|item| item.verdict == Verdict::DeferredPostS4)
+        .map(|item| item.number)
+        .collect();
+    assert_eq!(
+        deferred_post_s4,
+        BTreeSet::from([9]),
+        "item 9 (OCR) is the sole post-S4 deferral, corrected here from its earlier mis-citation"
     );
 
     // And every deferral has to say so in words a reader can check, not just
     // by its enum.
-    for item in WALK.iter().filter(|i| i.verdict == Verdict::DeferredS4) {
+    for item in WALK
+        .iter()
+        .filter(|i| i.verdict == Verdict::DeferredS4 || i.verdict == Verdict::DeferredPostS4)
+    {
         assert!(
             item.note.contains("S4"),
             "item {}'s deferral must cite where it went",
@@ -756,7 +828,7 @@ fn the_documented_walk_table_matches_the_register() {
             item.number
         );
         match item.verdict {
-            Verdict::DeferredS4 => assert_eq!(
+            Verdict::DeferredS4 | Verdict::DeferredPostS4 => assert_eq!(
                 cells[3], "—",
                 "a deferred item names no check in the table either"
             ),
@@ -1001,49 +1073,54 @@ fn a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped() {
     );
 }
 
-// ------------------------------------------- the cross-cutting gap, pinned
+// -------------------------------------- the cross-cutting gap, now closed
 
-/// S3 shipped Atlas's writers and Atlas's readers and **no trigger between
-/// them**.
+/// S4 Y5 (G8): the trigger this file's former tripwire
+/// (`a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan`) said did not
+/// exist now does — the retired test's exact handshake, completed rather
+/// than routed around.
 ///
-/// Stated as a test rather than as a sentence in a report, because a sentence
-/// cannot notice when it stops being true. Nothing an operator can run — no
-/// `sgt` verb, no route, no daemon job — starts a scan today; the only callers
-/// of the record entry points outside the Atlas tree are tests. On a real
-/// installation that means the store stays empty, `sgt intelligence status`
-/// reports nothing indexed, and `sgt doctor`'s atlas row says so plainly,
-/// which is honest but is not the same as being wired.
-///
-/// When the trigger lands, this fails. Whoever lands it should delete this
-/// test and update the register's cross-cutting note — that is the intended
-/// handshake, not a chore to route around.
+/// Proves the positive this time: `record_scan`/`record_external_git_scan`
+/// (the Atlas writer entry points) really are reachable from production
+/// code in `src/api.rs` — a scan trigger that only ever called them from a
+/// test module would be the same false claim the old tripwire existed to
+/// catch, inverted. Item 12's own boundary (the CLI process itself never
+/// writes; only the daemon does) is unweakened — see
+/// [`a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli`], which this
+/// test does not relax.
 #[test]
-fn a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan() {
-    // Neither client-facing surface offers one.
-    for (file, what) in [("src/cli.rs", "the CLI"), ("src/daemon.rs", "the daemon")] {
-        let text = read(file);
-        assert!(
-            !text.contains("scan_and_record"),
-            "{what} now triggers an Atlas scan; §17's cross-cutting gap has closed — update \
-             the register instead of deleting this test"
-        );
-    }
-
-    // The API references the writer only from its own test module.
+fn the_trigger_is_reachable_from_production_code_not_only_a_test_module() {
     let api = read("src/api.rs");
-    let first_test_module = api
-        .find("#[cfg(test)]")
+    // The real test module boundary — not the first `#[cfg(test)]` in the
+    // file, which (as of this wave) also gates a standalone test-only helper
+    // function well before this module and would wrongly mark production
+    // code between the two as "test-only".
+    let test_module = api
+        .find("\nmod tests {")
         .expect("api.rs must have a test module for this check to mean anything");
-    for (index, _) in api.match_indices("scan_and_record") {
-        assert!(
-            index > first_test_module,
-            "src/api.rs calls the Atlas writer from production code; the cross-cutting gap \
-             has closed — update the register"
-        );
+    let mut production_callers = 0;
+    for name in ["record_scan(", "record_external_git_scan("] {
+        for (index, _) in api.match_indices(name) {
+            if index < test_module {
+                production_callers += 1;
+            }
+        }
     }
+    assert!(
+        production_callers >= 2,
+        "src/api.rs must call the Atlas writer entry points from production code (one for \
+         `sgt knowledge scan`, one for `sgt intelligence add`), not only from its own test \
+         module"
+    );
+}
 
-    // And `sgt intelligence` still offers reading only — the verb set itself,
-    // not the prose around it, which legitimately says "indexed" all over.
+/// `sgt intelligence` now offers `status`, `add` and `list` — the read
+/// surface S3 shipped plus item 10's acquisition surface (G6, G8). The
+/// retired tripwire asserted the verb set was exactly `{status}`; this is
+/// its direct successor, asserting the earned superset rather than merely
+/// "more than one verb".
+#[test]
+fn the_intelligence_verb_set_now_includes_the_trigger_and_the_acquisition_surface() {
     let help = Command::new(SGT)
         .args(["intelligence", "--help"])
         .output()
@@ -1062,8 +1139,33 @@ fn a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan() {
         .collect();
     assert_eq!(
         verbs,
-        BTreeSet::from(["status"]),
-        "`sgt intelligence` ships exactly one, read-only verb: {text}"
+        BTreeSet::from(["status", "add", "list"]),
+        "`sgt intelligence` must ship exactly status/add/list: {text}"
+    );
+
+    // And `sgt knowledge` itself grew the trigger verb (G8's own CLI-design
+    // spelling — a scan of DECLARED LOCAL sources belongs beside the verb
+    // group that already owns declaring them).
+    let help = Command::new(SGT)
+        .args(["knowledge", "--help"])
+        .output()
+        .expect("sgt knowledge --help");
+    let text = String::from_utf8_lossy(&help.stdout);
+    let verbs: BTreeSet<&str> = text
+        .split("Commands:")
+        .nth(1)
+        .unwrap_or("")
+        .split("Options:")
+        .next()
+        .unwrap_or("")
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|verb| *verb != "help")
+        .collect();
+    assert_eq!(
+        verbs,
+        BTreeSet::from(["add", "list", "scan"]),
+        "`sgt knowledge` must ship exactly add/list/scan: {text}"
     );
 }
 

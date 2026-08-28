@@ -209,3 +209,20 @@ cov_stage_end 1 "the x5_a1a_acceptance test binary must write its own profile"
 cov_stage_begin c2-y2_office_boundary
 cov_run cargo llvm-cov --no-report --test y2_office_boundary --locked || cov_fail "y2_office_boundary failed under instrumentation"
 cov_stage_end 1 "the y2_office_boundary test binary must write its own profile"
+
+# S4 Y5, wired at birth (the #231 lesson, same as x5/y2 above): the scan
+# trigger and external-git acquisition's HTTP surface, driven against a real
+# in-process daemon (`daemon::start_with`, the identical shape
+# e_admission_uses_no_network_git.rs and x5_a1a_acceptance.rs already use) —
+# no separate daemon PROCESS, so no second profile to expect. `sgt` itself is
+# spawned only for `--help`. Floor 1.
+cov_stage_begin c2-y5_external_git_triggers
+cov_run cargo llvm-cov --no-report --test y5_external_git_triggers --locked || cov_fail "y5_external_git_triggers failed under instrumentation"
+cov_stage_end 1 "the y5_external_git_triggers test binary must write its own profile"
+
+# S4 Y5's doctrine-amendment pin (G6): a token scan of `AGENTS.md` and
+# `src/runtime/surface.rs` — no daemon, no estate, no subprocess of any kind.
+# Floor 1.
+cov_stage_begin c2-y5_doctrine_never_fetches_is_scoped
+cov_run cargo llvm-cov --no-report --test y5_doctrine_never_fetches_is_scoped --locked || cov_fail "y5_doctrine_never_fetches_is_scoped failed under instrumentation"
+cov_stage_end 1 "the y5_doctrine_never_fetches_is_scoped test binary must write its own profile"

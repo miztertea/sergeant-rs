@@ -101,6 +101,7 @@ use duckdb::{Connection, Statement};
 use crate::domain::source::{
     AuthorityClass, Coverage, CoverageRow, SourceGeneration, SourceKind, UnitKind,
 };
+use crate::runtime::atlas::external_git::ExternalGitProvenance;
 use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
 use crate::runtime::atlas::tabular::{
     DatasetFormat, RowKeyBasis, RowUnit, ScannedDataset, row_units,
@@ -290,6 +291,24 @@ SET lock_configuration = true;\n";
 ///   says the input had more rows than `row_limit` covers, which is the only
 ///   useful reading for an aggregate whose answer is one row however much it
 ///   scanned.
+/// * **`git.provenance` (S4 Y5, G6) is the first writer into the `git.*`
+///   namespace** X1 declared and left empty. One row per `external_git`
+///   generation, carrying A1 §9's provenance quintet minus the two fields
+///   `source.generations` already has (`authority_class`, and the row's own
+///   join key `source_name`): `origin` (verbatim, never normalized —
+///   [`crate::runtime::atlas::locator`]'s own doc explains why),
+///   `requested_ref` (`"HEAD"` when the operator asked for none, named
+///   rather than left as an absent value a reader would have to interpret),
+///   `resolved_commit` (a duplicate of `source.generations`' own eviction-safe
+///   `content_key`'s revision half — this table's whole reason to exist is
+///   X3b's rule two bullets up: "only ever added to, never altered" means a
+///   new *fact* about a generation is a new table with its own copy of the
+///   coordinates it needs, never a column bolted onto an existing one), and
+///   `retrieved_at`. Written inside [`AtlasDb::stage_scan`]'s own staging
+///   transaction ([`AtlasDb::stage_external_git_scan`]'s thin wrapper), so a
+///   generation can never exist with no provenance row — the same
+///   all-or-nothing atomicity F1 already gives every other row a generation
+///   stages.
 /// * **`context.row_units` is the F10a-gated bridge** and lives in the
 ///   `context` namespace because that is what it is: retrieval-facing text,
 ///   assembled from a source. It exists **only** for a dataset whose source
@@ -404,6 +423,14 @@ CREATE TABLE IF NOT EXISTS source.dataset_facts (\n\
   rows           TEXT NOT NULL,\n\
   output_hash    TEXT NOT NULL,\n\
   observed_at    TEXT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS git.provenance (\n\
+  generation_id   TEXT NOT NULL,\n\
+  source_name     TEXT NOT NULL,\n\
+  origin          TEXT NOT NULL,\n\
+  requested_ref   TEXT NOT NULL,\n\
+  resolved_commit TEXT NOT NULL,\n\
+  retrieved_at    TEXT NOT NULL\n\
 );\n\
 CREATE TABLE IF NOT EXISTS context.row_units (\n\
   generation_id TEXT NOT NULL,\n\
@@ -811,6 +838,29 @@ impl AtlasDb {
     /// after the state column was promoted — the atomic batch is what makes
     /// "provisional" mean "all of it, or none of it, awaiting a summary".
     pub fn stage_scan(&mut self, scan: &SourceScan) -> Result<ScanCommit, AtlasError> {
+        self.stage_scan_impl(scan, None)
+    }
+
+    /// [`Self::stage_scan`] for an `external_git` scan, with A1 §9's
+    /// provenance written **inside the same staging transaction** — see the
+    /// module doc's `git.provenance` bullet for why this cannot be a
+    /// follow-up write after [`Self::stage_scan`] returns. Same
+    /// [`ScanCommit`] outcomes, same unchanged/root-unavailable/staged
+    /// three-way split; `provenance` is written only for the `Staged` case,
+    /// exactly like every other row this transaction produces.
+    pub fn stage_external_git_scan(
+        &mut self,
+        scan: &SourceScan,
+        provenance: &ExternalGitProvenance,
+    ) -> Result<ScanCommit, AtlasError> {
+        self.stage_scan_impl(scan, Some(provenance))
+    }
+
+    fn stage_scan_impl(
+        &mut self,
+        scan: &SourceScan,
+        provenance: Option<&ExternalGitProvenance>,
+    ) -> Result<ScanCommit, AtlasError> {
         // Asked before the `content_key` comparison below, because the two
         // answers are indistinguishable by key: an unreachable root and an
         // emptied one both hash an empty resource map, and only this row can
@@ -935,6 +985,22 @@ impl AtlasDb {
                 &scan.source_name,
                 row,
                 &scan.observed_at,
+            )?;
+        }
+        if let Some(provenance) = provenance {
+            tx.execute(
+                "INSERT INTO git.provenance \
+                 (generation_id, source_name, origin, requested_ref, resolved_commit, \
+                  retrieved_at) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                duckdb::params![
+                    &generation_id,
+                    &scan.source_name,
+                    &provenance.origin,
+                    &provenance.requested_ref,
+                    &provenance.resolved_commit,
+                    &provenance.retrieved_at,
+                ],
             )?;
         }
         tx.commit()?;
@@ -1597,8 +1663,11 @@ impl AtlasDb {
                     (SELECT count(*) FROM source.datasets d \
                        WHERE d.generation_id = g.generation_id) AS datasets, \
                     (SELECT count(*) FROM context.row_units r \
-                       WHERE r.generation_id = g.generation_id) AS row_units \
-             FROM source.generations g WHERE g.state = ? \
+                       WHERE r.generation_id = g.generation_id) AS row_units, \
+                    p.origin, p.requested_ref, p.resolved_commit, p.retrieved_at \
+             FROM source.generations g \
+             LEFT JOIN git.provenance p ON p.generation_id = g.generation_id \
+             WHERE g.state = ? \
              ORDER BY g.source_name LIMIT ?",
         )?;
         let mut rows = statement.query(duckdb::params![STATE_CONFIRMED, MAX_ROWS as i64])?;
@@ -1606,6 +1675,21 @@ impl AtlasDb {
         while let Some(row) = rows.next()? {
             let kind: String = row.get(1)?;
             let authority: String = row.get(2)?;
+            let origin: Option<String> = row.get(14)?;
+            let requested_ref: Option<String> = row.get(15)?;
+            let resolved_commit: Option<String> = row.get(16)?;
+            let retrieved_at: Option<String> = row.get(17)?;
+            let provenance = match (origin, requested_ref, resolved_commit, retrieved_at) {
+                (Some(origin), Some(requested_ref), Some(resolved_commit), Some(retrieved_at)) => {
+                    Some(SourceProvenance {
+                        origin,
+                        requested_ref,
+                        resolved_commit,
+                        retrieved_at,
+                    })
+                }
+                _ => None,
+            };
             out.push(SourceStatus {
                 source_name: row.get(0)?,
                 kind: SourceKind::parse(&kind).ok_or_else(|| AtlasError::UnknownValue {
@@ -1632,6 +1716,7 @@ impl AtlasDb {
                 datasets: row.get::<usize, i64>(12)? as u64,
                 row_units: row.get::<usize, i64>(13)? as u64,
                 coverage: BTreeMap::new(),
+                provenance,
             });
         }
         drop(rows);
@@ -2499,6 +2584,14 @@ fn evict(
         "DELETE FROM context.row_units WHERE generation_id = ?",
         duckdb::params![generation_id],
     )?;
+    // A no-op DELETE for every non-`external_git` generation (the table has
+    // no row to match), and the eviction half of `git.provenance`'s own
+    // atomicity promise for one that is: a superseded external source's old
+    // origin/ref/commit does not linger once its rows are gone.
+    conn.execute(
+        "DELETE FROM git.provenance WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
     conn.execute(
         "DELETE FROM meta.coverage WHERE generation_id = ? AND path IS NOT NULL",
         duckdb::params![generation_id],
@@ -2756,6 +2849,27 @@ pub struct SourceStatus {
     /// F8's coverage counts by status — including `excluded`, which is the
     /// number that makes the secrets posture checkable rather than claimed.
     pub coverage: BTreeMap<String, u64>,
+    /// A1 §9's provenance, for an `external_git` generation only — `None`
+    /// for every other [`SourceKind`], which never writes a `git.provenance`
+    /// row at all (S4 Y5, G6).
+    pub provenance: Option<SourceProvenance>,
+}
+
+/// A1 §9's provenance quintet, as read back — the query-side twin of
+/// [`crate::runtime::atlas::external_git::ExternalGitProvenance`]. A separate
+/// type rather than reusing that one directly: that struct is the walk
+/// layer's *input* to staging, and this is what a `git.provenance` row reads
+/// back as, which is a query-surface concern living beside [`SourceStatus`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceProvenance {
+    /// Exactly what the operator typed.
+    pub origin: String,
+    /// The ref that was actually fetched.
+    pub requested_ref: String,
+    /// The exact commit SHA the fetch resolved to.
+    pub resolved_commit: String,
+    /// When the fetch completed (RFC3339 UTC).
+    pub retrieved_at: String,
 }
 
 /// One symbol-index hit, with the source it belongs to.
@@ -2941,6 +3055,149 @@ mod tests {
         };
         db.confirm_scan(&generation_id, event).expect("confirm");
         generation_id
+    }
+
+    /// [`scan_of`], stamped `external_git`/`external` — the S4 Y5 shape.
+    fn external_scan_of(source: &str, body: &str, tree_oid: &str) -> SourceScan {
+        let mut scan = scan_of(source, body);
+        scan.kind = SourceKind::ExternalGit;
+        scan.authority = AuthorityClass::External;
+        scan.content_key = tree_oid.to_string();
+        scan
+    }
+
+    fn provenance(commit: &str) -> ExternalGitProvenance {
+        ExternalGitProvenance {
+            origin: "https://example.com/upstream.git".to_string(),
+            requested_ref: "HEAD".to_string(),
+            resolved_commit: commit.to_string(),
+            retrieved_at: crate::domain::event::rfc3339_utc_now(),
+        }
+    }
+
+    /// A1 §9's provenance quintet is written atomically with everything
+    /// else a generation stages, and reads back through
+    /// `indexed_sources` — the `git.provenance` table this wave adds.
+    #[test]
+    fn external_git_provenance_is_staged_atomically_and_reads_back() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut db = AtlasDb::open(dir.path()).expect("open");
+        let scan = external_scan_of("upstream", "# One\n", "tree-oid-1");
+        let expected = provenance("commit-sha-1");
+        let ScanCommit::Staged { generation_id } =
+            db.stage_external_git_scan(&scan, &expected).expect("stage")
+        else {
+            panic!("expected staged");
+        };
+        db.confirm_scan(&generation_id, "evt-1").expect("confirm");
+
+        let sources = db.indexed_sources().expect("indexed sources");
+        let row = sources
+            .iter()
+            .find(|s| s.source_name == "upstream")
+            .expect("the source is present");
+        assert_eq!(row.kind, SourceKind::ExternalGit);
+        assert_eq!(row.authority, AuthorityClass::External);
+        let found = row.provenance.as_ref().expect("provenance is present");
+        assert_eq!(
+            found,
+            &SourceProvenance {
+                origin: expected.origin.clone(),
+                requested_ref: expected.requested_ref.clone(),
+                resolved_commit: expected.resolved_commit.clone(),
+                retrieved_at: expected.retrieved_at.clone(),
+            }
+        );
+    }
+
+    /// Every non-`external_git` source's `provenance` reads back `None` —
+    /// the `LEFT JOIN`'s honest negative, not an empty-but-present row.
+    #[test]
+    fn a_non_external_source_has_no_provenance_row() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut db = AtlasDb::open(dir.path()).expect("open");
+        record(&mut db, &scan_of("notes", "# Notes\n"), "evt-1");
+        let sources = db.indexed_sources().expect("indexed sources");
+        let row = sources
+            .iter()
+            .find(|s| s.source_name == "notes")
+            .expect("present");
+        assert!(row.provenance.is_none());
+    }
+
+    /// A refresh (a new generation whose tree changed) evicts the OLD
+    /// generation's provenance row along with everything else eviction
+    /// takes — `git.provenance` follows `source.generations`' own lifetime,
+    /// never lingering for a generation the store no longer serves.
+    #[test]
+    fn a_refresh_evicts_the_superseded_generations_provenance() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut db = AtlasDb::open(dir.path()).expect("open");
+        let first = external_scan_of("upstream", "# One\n", "tree-oid-1");
+        let ScanCommit::Staged {
+            generation_id: first_id,
+        } = db
+            .stage_external_git_scan(&first, &provenance("commit-1"))
+            .expect("stage first")
+        else {
+            panic!("expected staged");
+        };
+        db.confirm_scan(&first_id, "evt-1").expect("confirm first");
+
+        let second = external_scan_of("upstream", "# Two\n", "tree-oid-2");
+        let ScanCommit::Staged {
+            generation_id: second_id,
+        } = db
+            .stage_external_git_scan(&second, &provenance("commit-2"))
+            .expect("stage second")
+        else {
+            panic!("expected staged");
+        };
+        let evicted = db
+            .confirm_scan(&second_id, "evt-2")
+            .expect("confirm second");
+        assert_eq!(evicted.as_deref(), Some(first_id.as_str()));
+
+        let sources = db.indexed_sources().expect("indexed sources");
+        let row = sources
+            .iter()
+            .find(|s| s.source_name == "upstream")
+            .expect("present");
+        assert_eq!(
+            row.provenance.as_ref().map(|p| p.resolved_commit.as_str()),
+            Some("commit-2"),
+            "only the surviving generation's provenance is served"
+        );
+        // The evicted generation's own provenance row is gone, not merely
+        // unserved — checked directly against the count rather than through
+        // `indexed_sources` (which only ever shows the confirmed row).
+        let orphaned: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM git.provenance WHERE generation_id = ?",
+                duckdb::params![first_id],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            orphaned, 0,
+            "the evicted generation's provenance row was deleted"
+        );
+    }
+
+    /// [`AtlasDb::stage_scan`] (the plain path, no provenance) never writes
+    /// `git.provenance` — the table stays truthfully empty for every source
+    /// kind that has no provenance to report.
+    #[test]
+    fn plain_stage_scan_writes_no_provenance_row() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut db = AtlasDb::open(dir.path()).expect("open");
+        record(&mut db, &scan_of("notes", "# Notes\n"), "evt-1");
+        let count: i64 = db
+            .conn
+            .query_row("SELECT count(*) FROM git.provenance", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 0);
     }
 
     /// The predecessor may only be evicted by the transaction that actually

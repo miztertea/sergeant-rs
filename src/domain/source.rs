@@ -29,15 +29,18 @@
 //!
 //! # Reserved, deliberately behaviourless
 //!
-//! [`SourceKind::ExternalGit`] is named here and produced by nothing: S4 owns
-//! external-Git acquisition (the ratified re-cut's adapters/external-git
-//! items). It exists as a variant rather than a comment so the S4 seam is a
-//! compile-time obligation — a `match` that grows a third source kind fails
-//! to build rather than silently treating an external source as an estate
-//! one. `content_kind` (§4's `code | document | tabular | ...` axis) is
-//! **not** modelled yet: X2 indexes exactly one content family, so an enum
-//! with one reachable variant would be a promise, not a model (R1). It lands
-//! with the wave that lands a second family.
+//! [`SourceKind::ExternalGit`] was named here ahead of its own producer: S4
+//! Y5's [`crate::runtime::atlas::external_git`] is now that producer,
+//! constructing and staging both this variant and
+//! [`AuthorityClass::External`] for a fetched external Git source (S4 Y5
+//! G6). It was still worth landing as a variant rather than a comment before
+//! Y5 shipped, so the S4 seam was a compile-time obligation in the meantime —
+//! a `match` that grows a third source kind failed to build rather than
+//! silently treating an external source as an estate one; that obligation is
+//! now discharged. `content_kind` (§4's `code | document | tabular | ...`
+//! axis) is **not** modelled yet: X2 indexes exactly one content family, so
+//! an enum with one reachable variant would be a promise, not a model (R1).
+//! It lands with the wave that lands a second family.
 
 use std::collections::BTreeMap;
 
@@ -63,9 +66,11 @@ pub enum SourceKind {
     /// on the local filesystem, scanned rather than pinned (A1-03 — never a
     /// mount, and it grants no mutation authority).
     LocalKnowledge,
-    /// A repository acquired from outside the estate. **S4 seam: nothing in
-    /// this build produces one.** Named so the match arms that will need it
-    /// are structurally visible now (see this module's own doc).
+    /// A repository acquired from outside the estate: S4 Y5's
+    /// [`crate::runtime::atlas::external_git::acquire_and_scan`] fetches it
+    /// into a bare, no-working-tree host cache and stamps the resulting
+    /// [`crate::runtime::atlas::scan::SourceScan`] with this kind (see this
+    /// module's own doc).
     ExternalGit,
 }
 
@@ -112,8 +117,10 @@ pub enum AuthorityClass {
     /// Declared by the estate, read by the estate, mutated by nothing here —
     /// every `[[knowledge]]` source (A1-03).
     EstateReadonly,
-    /// Acquired from outside the estate. Reserved with
-    /// [`SourceKind::ExternalGit`]; nothing produces it yet.
+    /// Acquired from outside the estate. Paired with
+    /// [`SourceKind::ExternalGit`]; S4 Y5's
+    /// [`crate::runtime::atlas::external_git::acquire_and_scan`] is now the
+    /// one producer of it.
     External,
 }
 
