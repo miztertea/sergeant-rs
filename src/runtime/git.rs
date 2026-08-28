@@ -63,6 +63,18 @@ pub enum GitError {
         /// Trimmed stderr from Git.
         stderr: String,
     },
+    /// A supervised invocation ([`git_fetch_restricted`]) exceeded its
+    /// deadline; its process group was killed and reaped (#310 discipline,
+    /// S4 Y5 G2's amendment: a remote is attacker-influenced input).
+    #[error("git {args:?} in {dir} exceeded its {deadline_secs}s deadline and was killed")]
+    TimedOut {
+        /// Arguments of the timed-out invocation.
+        args: Vec<String>,
+        /// Working directory of the timed-out invocation.
+        dir: String,
+        /// The deadline that was exceeded, in seconds.
+        deadline_secs: u64,
+    },
 }
 
 /// `git rev-parse --path-format=absolute --git-common-dir` in `dir`,
@@ -241,6 +253,199 @@ pub fn git_submodule_update(dir: &Path) -> Result<String, GitError> {
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// `git init --bare` at `dest_path` — the empty, no-working-tree object store
+/// [`git_fetch_restricted`] then fills. Idempotent in the sense every caller
+/// needs: `git init` on an already-initialized bare directory is a no-op
+/// success, never an error, so a host cache directory that already exists
+/// from a previous acquisition is reused rather than refused.
+pub fn git_init_bare(dest_path: &Path) -> Result<(), GitError> {
+    // `Command::current_dir` (this module's own `command()` builder) fails
+    // to spawn at all against a directory that does not exist yet — unlike
+    // `git clone <dest>`, `git init` does not create a missing leaf
+    // directory when run *inside* it rather than given it as an argument.
+    // The one caller of this function is a fresh host-cache directory that
+    // may not exist yet on a source's first acquisition, so this creates it
+    // first; a directory that already exists (a refresh) is left untouched.
+    std::fs::create_dir_all(dest_path).map_err(|source| GitError::Spawn {
+        args: vec!["init".to_string(), "--bare".to_string()],
+        dir: dest_path.display().to_string(),
+        source,
+    })?;
+    git(dest_path, &["init", "--bare", "--initial-branch=main"]).map(|_| ())
+}
+
+/// `git fetch` a **locator this codebase does not otherwise trust** into an
+/// existing bare repository, restricted to exactly `allow_protocol` — S4 Y5's
+/// second control, beside the string-level allowlist
+/// ([`crate::runtime::atlas::locator`]) that must already have accepted
+/// `locator` before this is ever called.
+///
+/// **`GIT_ALLOW_PROTOCOL` overrides configuration, not merely defaults it**
+/// (`git-config`'s own words for the variable: it "overrid[es] any existing
+/// configuration" for exactly the protocols named). That is the property this
+/// function leans on: even an operator's own `~/.gitconfig` `insteadOf`
+/// rewrite that retargets `locator` to an `ext::` or `file://` address
+/// underneath this call is refused by Git itself, not merely by the string
+/// this codebase already validated. `allow_protocol` is a caller-supplied
+/// colon-separated allowlist rather than a constant here so this plumbing
+/// stays independently testable (a test fixture is a `file://` repository,
+/// which the real caller's allowlist never permits); the one production
+/// caller — [`crate::runtime::atlas::external_git`] — always passes exactly
+/// `"https:ssh"`, matching [`crate::runtime::atlas::locator`]'s own
+/// allowlist and no wider (deliberately **narrower** than [`git_clone`]'s
+/// own default, which includes `file` and `git` for an estate's own trusted
+/// `[[repo]] --origin` — an external-git intelligence source is
+/// attacker-influenced input, S4 Y5 G2's amendment, and gets no such
+/// allowance).
+///
+/// `--depth 1`: only the tip of `refspec` is fetched. Nothing downstream of
+/// this call ([`crate::runtime::atlas::git::list_tree`]/`extract_blobs`)
+/// reads history, so a shallow fetch is both cheaper and a real bound on
+/// acquisition cost — provisional in the same sense every unmeasured ceiling
+/// this sprint ships is provisional (#325's precedent): a real external
+/// repository corpus may argue for a different number later.
+///
+/// `refspec:refs/heads/_external_fetch_` names one fixed local ref so a
+/// refetch always lands somewhere `git rev-parse` can find regardless of
+/// what `refspec` names on the far end (a branch, a tag, or `HEAD`) — the
+/// caller resolves the exact commit from that local ref afterward, which is
+/// where "exact-commit resolution" (A1 §9) actually happens, not here.
+///
+/// **Supervised like a parse worker** (S4 Y5 G2's amendment: "a remote is
+/// attacker-influenced input"): own process group plus `PR_SET_PDEATHSIG`
+/// (`child::harden_probe_child`, #310's exact mechanism), and `deadline`
+/// bounds how long the fetch may run before its whole process group is
+/// killed and reaped — the identical kill-the-group-then-reap discipline
+/// [`crate::runtime::atlas::worker::run_worker`] applies to a parse worker,
+/// applied here to the one other subprocess this wave feeds
+/// attacker-influenced bytes to. No address-space cap: `git fetch` is the
+/// trusted, memory-safe binary this whole codebase already shells out to
+/// (proposal §11) rather than a generated grammar parsing untrusted bytes
+/// in-process, which is the risk class the parse-worker memory cap exists
+/// for (S4 Y1 G2) — the deadline alone is this call's hang guard, matching
+/// what #310 itself requires and no more.
+pub fn git_fetch_restricted(
+    dest_path: &Path,
+    locator: &str,
+    refspec: &str,
+    allow_protocol: &str,
+    deadline: std::time::Duration,
+) -> Result<String, GitError> {
+    let local_ref = "refs/heads/_external_fetch_";
+    let args_owned = [
+        "fetch".to_string(),
+        "--depth".to_string(),
+        "1".to_string(),
+        "--no-tags".to_string(),
+        "--".to_string(),
+        locator.to_string(),
+        format!("{refspec}:{local_ref}"),
+    ];
+    let args_ref: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+    run_supervised(dest_path, &args_ref, allow_protocol, deadline)?;
+    git(dest_path, &["rev-parse", "--verify", local_ref])
+}
+
+/// One supervised Git invocation: hardened (own process group,
+/// `PR_SET_PDEATHSIG`), `GIT_ALLOW_PROTOCOL` set to `allow_protocol`, killed
+/// and reaped if it outlives `deadline`. The whole of [`git_fetch_restricted`]'s
+/// supervision, factored out so the fetch call above stays about *what* it
+/// runs rather than *how* it is supervised.
+fn run_supervised(
+    dir: &Path,
+    args: &[&str],
+    allow_protocol: &str,
+    deadline: std::time::Duration,
+) -> Result<std::process::Output, GitError> {
+    let mut cmd = command(dir, args);
+    cmd.env("GIT_ALLOW_PROTOCOL", allow_protocol)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::backend::child::harden_probe_child(&mut cmd);
+    let mut process = cmd.spawn().map_err(|source| GitError::Spawn {
+        args: owned(args),
+        dir: dir.display().to_string(),
+        source,
+    })?;
+    let pgid = process.id();
+    let registration = crate::backend::child::register_probe_child(pgid);
+
+    // Drained concurrently on their own threads, exactly as
+    // `worker::spawn_and_collect` drains a parse worker's stdout: a fetch
+    // whose stderr exceeds the pipe buffer before it exits (an unexpectedly
+    // chatty remote, an askpass retry loop) must not deadlock this poll loop
+    // by blocking the child on a write nobody is reading.
+    use std::io::Read;
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    if let Some(mut out) = process.stdout.take() {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = out.read_to_end(&mut buffer);
+            let _ = stdout_tx.send(buffer);
+        });
+    } else {
+        let _ = stdout_tx.send(Vec::new());
+    }
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    if let Some(mut err) = process.stderr.take() {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = err.read_to_end(&mut buffer);
+            let _ = stderr_tx.send(buffer);
+        });
+    } else {
+        let _ = stderr_tx.send(Vec::new());
+    }
+
+    let deadline_at = std::time::Instant::now() + deadline;
+    let status = loop {
+        match process.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline_at {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => break None,
+        }
+    };
+
+    let Some(status) = status else {
+        crate::backend::child::kill_process_group(Some(pgid));
+        let _ = process.kill();
+        let _ = process.wait();
+        drop(registration);
+        return Err(GitError::TimedOut {
+            args: owned(args),
+            dir: dir.display().to_string(),
+            deadline_secs: deadline.as_secs(),
+        });
+    };
+    // Kill the group on every exit path, not only the timeout one (#310): a
+    // fetch that forked a helper (an askpass prompt, a credential helper)
+    // before exiting leaves that helper in the same pgid otherwise.
+    crate::backend::child::kill_process_group(Some(pgid));
+    drop(registration);
+
+    let grace = std::time::Duration::from_secs(5);
+    let stdout = stdout_rx.recv_timeout(grace).unwrap_or_default();
+    let stderr = stderr_rx.recv_timeout(grace).unwrap_or_default();
+    if !status.success() {
+        return Err(GitError::Failed {
+            args: owned(args),
+            dir: dir.display().to_string(),
+            status: status.to_string(),
+            stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
+        });
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// The remote name a declared `[[repo]] upstream` is written to (#112).
@@ -518,6 +723,122 @@ mod tests {
         assert!(objects[2].as_ref().expect("c").bytes.is_empty());
         assert!(objects[3].is_none());
         assert!(git_cat_file_batch(root, &[]).expect("empty").is_empty());
+    }
+
+    /// A bare cache initialized, fetched shallow from a `file://` source
+    /// (protocol widened for this test only — see [`git_fetch_restricted`]'s
+    /// own doc for why `allow_protocol` is a parameter), lands its tip at the
+    /// fixed local ref and resolves.
+    #[test]
+    fn a_bare_cache_fetches_shallow_and_resolves_the_fixed_local_ref() {
+        let origin = tempfile::TempDir::new().expect("origin dir");
+        git(origin.path(), &["init", "--initial-branch=main"]).expect("init");
+        git(origin.path(), &["config", "user.email", "t@example.com"]).expect("email");
+        git(origin.path(), &["config", "user.name", "T"]).expect("name");
+        std::fs::write(origin.path().join("a.txt"), "one").expect("write");
+        git(origin.path(), &["add", "-A"]).expect("add");
+        git(origin.path(), &["commit", "-m", "one"]).expect("commit");
+        let tip = git(origin.path(), &["rev-parse", "HEAD"]).expect("rev-parse");
+
+        let cache = tempfile::TempDir::new().expect("cache dir");
+        git_init_bare(cache.path()).expect("init bare");
+        // Idempotent: a second init on the same directory is not an error.
+        git_init_bare(cache.path()).expect("init bare again");
+
+        let origin_url = format!("file://{}", origin.path().display());
+        let resolved = git_fetch_restricted(
+            cache.path(),
+            &origin_url,
+            "main",
+            "file",
+            std::time::Duration::from_secs(10),
+        )
+        .expect("fetch restricted");
+        assert_eq!(
+            resolved, tip,
+            "the fetched ref resolves to the origin's tip"
+        );
+
+        // Bare: no working tree, no index.
+        assert!(
+            !cache.path().join(".git").exists(),
+            "the cache dir IS the git dir (bare)"
+        );
+        assert!(
+            !cache.path().join("a.txt").exists(),
+            "a bare fetch never materializes a working tree"
+        );
+    }
+
+    /// `GIT_ALLOW_PROTOCOL` is the second control (module doc): a `file://`
+    /// source is refused when the caller's own allowlist does not name
+    /// `file`, exactly the restriction [`crate::runtime::atlas::external_git`]
+    /// relies on by always passing `"https:ssh"`.
+    #[test]
+    fn a_protocol_not_in_the_allowlist_is_refused_by_git_itself() {
+        let origin = tempfile::TempDir::new().expect("origin dir");
+        git(origin.path(), &["init", "--initial-branch=main"]).expect("init");
+        git(origin.path(), &["config", "user.email", "t@example.com"]).expect("email");
+        git(origin.path(), &["config", "user.name", "T"]).expect("name");
+        std::fs::write(origin.path().join("a.txt"), "one").expect("write");
+        git(origin.path(), &["add", "-A"]).expect("add");
+        git(origin.path(), &["commit", "-m", "one"]).expect("commit");
+
+        let cache = tempfile::TempDir::new().expect("cache dir");
+        git_init_bare(cache.path()).expect("init bare");
+        let origin_url = format!("file://{}", origin.path().display());
+        let err = git_fetch_restricted(
+            cache.path(),
+            &origin_url,
+            "main",
+            "https:ssh",
+            std::time::Duration::from_secs(10),
+        )
+        .expect_err("file must be refused when not in the allowlist");
+        assert!(matches!(err, GitError::Failed { .. }), "{err}");
+    }
+
+    /// A fetch that outlives its deadline is killed and reaped, not left to
+    /// hang — the timeout half of [`run_supervised`]'s discipline. A `git
+    /// fetch` that never gets a byte back (an origin that accepts the TCP
+    /// connection but never speaks the protocol) is the shape a bounded
+    /// deadline exists for.
+    #[test]
+    fn a_fetch_past_its_deadline_is_killed_and_reported_as_timed_out() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port that never answers");
+        let port = listener.local_addr().expect("addr").port();
+        // Accept and hold the connection open without ever writing a byte —
+        // enough to make `git fetch` block indefinitely waiting on the
+        // remote's first protocol line.
+        std::thread::spawn(move || {
+            // Held, not dropped: dropping the accepted stream immediately
+            // closes the connection, which `git` reads as EOF and fails
+            // fast on — the opposite of the stall this test needs.
+            if let Ok((stream, _addr)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                drop(stream);
+            }
+        });
+
+        let cache = tempfile::TempDir::new().expect("cache dir");
+        git_init_bare(cache.path()).expect("init bare");
+        let stalled_url = format!("git://127.0.0.1:{port}/repo.git");
+        let started = std::time::Instant::now();
+        let err = git_fetch_restricted(
+            cache.path(),
+            &stalled_url,
+            "main",
+            "git",
+            std::time::Duration::from_millis(500),
+        )
+        .expect_err("a stalled remote must time out, not hang");
+        assert!(matches!(err, GitError::TimedOut { .. }), "{err}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the deadline, not the test harness, must be what ends this: took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -47,6 +47,76 @@
 //! "fewer symbols" and "all the symbols" are indistinguishable to every
 //! downstream consumer. F5's corpus gate is the standing proof that this path
 //! is reachable rather than vacuous.
+//!
+//! # G2's revisit trigger, answered (S4 Y5)
+//!
+//! G2 kept this module in-process as a **named accepted risk** — tree-sitter
+//! is generated C grammars fed arbitrary bytes, squarely §12's
+//! malformed-input class, held in-process anyway on the stated predicate
+//! "inputs are local/estate-owned rather than attacker-chosen" — with a
+//! revisit trigger: *the first syntax-lane crash, or the first external-git
+//! source feeding it remote bytes (Y5), whichever comes first.* Y5 is
+//! exactly the second condition, and this is that decision, made explicitly
+//! rather than left to pass silently.
+//!
+//! **Decided: stays in-process for this wave.** Not because the predicate
+//! still holds — it does not, and pretending otherwise would be the exact
+//! erosion the trigger exists to catch — but because every mitigating fact
+//! the predicate's replacement rests on is independently true and already
+//! enforced, upstream of this module, on the identical code path external-git
+//! bytes now share with every other source kind:
+//!
+//! 1. **The bytes that reach [`extract`] are never raw remote bytes.**
+//!    [`super::git::extract_blobs`] — the *one* function this module's caller
+//!    shares across `estate_git` and `external_git` alike (S4 Y5's reuse: an
+//!    external source reads through the identical `list_tree`/`extract_blobs`
+//!    an estate mount always has) — refuses anything over
+//!    [`super::scan::MAX_RESOURCE_BYTES`] and anything that fails
+//!    [`super::text::as_text`]'s UTF-8 check *before* a byte reaches an
+//!    extractor of any kind. What lands here is therefore always
+//!    size-bounded, valid-UTF-8 text — the same envelope every `estate_git`
+//!    and `local_knowledge` byte already had, not a wider one an external
+//!    source gets to skip.
+//! 2. **tree-sitter's own design goal is robustness to adversarial-looking
+//!    input, not merely well-formed input** — it is built to re-read
+//!    syntactically-invalid source on every keystroke of a live editing
+//!    session, which is a stronger adversarial-input posture than a
+//!    general-purpose format parser (the ttf-parser/docx class §12's own
+//!    rationale names) ever claims. That is a property of the parser, not of
+//!    who supplied the bytes, so it does not weaken when the byte's origin
+//!    changes.
+//! 3. **The crash record is over the identical code path, not a proxy for
+//!    it.** `estate_git` bytes have run through this exact module since X3b
+//!    with zero crashes across S3's and S4's own corpora — external-git
+//!    reuses that path byte-for-byte rather than adding a new one, so there
+//!    is no new code here for a new risk to hide in.
+//! 4. **The git subprocess that acquires external bytes is itself supervised**
+//!    (G2's own amendment, [`crate::runtime::git::git_fetch_restricted`]) —
+//!    a defense that does not reach this module's own risk class but does
+//!    mean the *acquisition* half of "attacker-chosen bytes" already sits
+//!    behind a bounded, killable process boundary before extraction ever
+//!    starts.
+//!
+//! **What was NOT done, and why not this wave.** Moving syntax extraction
+//! worker-side for external-git bytes specifically — the trigger's other
+//! named option — was considered and set aside rather than attempted: it
+//! would mean splitting [`super::scan::extract_resource`]'s single call into
+//! two different execution shapes keyed on source kind (in-process for
+//! `estate_git`/`local_knowledge`, worker-routed for `external_git`), a real
+//! architecture change to the one place every source kind currently shares,
+//! attempted at the tail of an already-large wave (locator allowlist, host
+//! cache, provenance, package identity, the scan trigger, this doctrine
+//! amendment). A change to a shared extraction path deserves its own
+//! reviewed wave, not a rider on this one's remaining budget.
+//!
+//! **The trigger is re-armed, not spent.** G2's original OR had two legs;
+//! the external-git leg is answered here, not struck. What remains standing
+//! — verbatim — is *the first syntax-lane crash*, and it is now armed with
+//! genuinely attacker-influenced bytes flowing through it for the first
+//! time, which is a strictly sharper test of the same trigger than S3 ever
+//! ran. The worker-side move stays the obvious next step the day that
+//! trigger fires, or the day a consumer of external-git syntax data
+//! (S5+) makes the cost of moving it worth paying up front.
 
 use tree_sitter::{Node, Parser};
 

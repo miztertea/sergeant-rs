@@ -661,6 +661,149 @@ release.
   citing the real subprocess acceptance proof the same way rows 5 and 7
   already do.
 
+### External Git, package identity, and the scan trigger (S4 Y5)
+
+Atlas stops being writers-and-readers with nothing between them: a scan
+trigger, and a second source kind (`external_git`) alongside
+`estate_git`/`local_knowledge`.
+
+- **`sgt knowledge scan` (`POST /v1/intelligence/scan`, G8)** drives a full
+  scan of an estate's declared `[[knowledge]]` sources through the daemon,
+  on the intelligence lane, with each source's own walk queuing on the
+  lane's existing permit — bounded concurrency, not a second cap invented
+  here. Reports what it indexed and what it could not **from each source's
+  own coverage counts**, never a guess. Scheduling and cadence stay
+  deliberately unbuilt (G10): a recurring trigger is later work's, when
+  retrieval needs one. This supersedes two settled records, both edited in
+  this same PR as in-scope work rather than left to drift: the acceptance
+  register's tripwire asserting no production caller of the scan pipeline
+  existed (it was built to fail on exactly this day — see the register
+  edit below), and `docs/concepts/atlas-and-knowledge.md`'s "no way to
+  start a scan" sentence.
+- **`sgt intelligence add <url> [--ref <ref>] [--name <name>]` / `list`**
+  (`POST`/`GET /v1/intelligence/sources`, G6, A1 §9, item 10) — external
+  Git acquisition:
+  - **Locator allowlist BEFORE Git ever sees the string** (A1-24), the
+    primary control, researched against Git's own documentation rather
+    than recalled: exactly `https://…` and `ssh://…`/`user@host:path`
+    (scp-like, `user@` required) are accepted; `ext::`/any other
+    `<transport>::` remote-helper form, `file://`, a bare local path,
+    `git://`, and `ftp[s]://` are all refused by name. An embedded
+    credential (`user:pass@…`) is refused outright — the operator's
+    ambient git/ssh credential helper is the only accepted auth path.
+    Second, independent control: every acquisition subprocess sets
+    `GIT_ALLOW_PROTOCOL=https:ssh` — narrower than `sgt repo add`'s own
+    default — which Git's own documentation states overrides even a
+    `~/.gitconfig` `insteadOf` rewrite, closing that class of bypass even
+    if the string-level allowlist ever had a bug.
+  - **Bare, no-working-tree host cache** outside every estate
+    (`<data-dir>/atlas/external-git/<name>`), one per declared source,
+    reused across refreshes. Exact-commit resolution: the requested ref
+    (default the remote's own `HEAD`) is fetched shallow (`--depth 1`)
+    into a fixed local ref and resolved to a full commit SHA, which is
+    what every downstream row keys on.
+  - **Reads through the estate-git plumbing verbatim (R2)** — the fetched
+    bare repository is listed and extracted through the identical
+    `list_tree`/`extract_blobs`/`directory_coverage` an admitted `[[repo]]`
+    mount already uses; the only new code is getting bytes into the cache
+    and stamping the result `external_git`/`external` instead of
+    `estate_git`/`estate_mutable`.
+  - **Provenance** (origin, requested ref, resolved commit, retrieved at,
+    `authority_class=external`) lands in a new table, `git.provenance` —
+    the first writer into the `git.*` namespace X1 reserved and left
+    empty — never a column bolted onto `source.generations`, which is
+    "only ever added to, never altered" by this store's own standing rule.
+    Written atomically inside the same staging transaction as every other
+    row a generation gets.
+  - **External content is DATA, never instructions (A1-25), proven, not
+    merely asserted**: a fetched repository's `AGENTS.md` is claimed by
+    the ordinary Markdown extractor and lands as `Document`/`Section`
+    units — the identical treatment any other `.md` file gets — and
+    nothing here executes anything a fetched byte says. A bare repository
+    has no working tree to check anything out into, so there is no
+    hook-triggering operation for the fetched repository's own configured
+    hooks to ride, and reads go through `cat-file --batch`, never
+    `--filters` (confirmed against Git's own documentation: `--filters` is
+    the one `cat-file` mode that invokes a clean/smudge filter driver, and
+    this build never passes it).
+  - **The git subprocess runs supervised**, the same #310 discipline a
+    parse worker gets (own process group, `PR_SET_PDEATHSIG`, killed and
+    reaped past a deadline) — S4 Y5's own reading of G2's amendment: a
+    remote is attacker-influenced input. No address-space cap: `git` is
+    the trusted, memory-safe binary this codebase already shells out to
+    everywhere, not a generated grammar parsing untrusted bytes in-process
+    — that risk class is what the parse-worker memory cap exists for, and
+    it does not apply here. Fetch deadline: 120s, PROVISIONAL (#325's
+    precedent), chosen generous rather than measured against a corpus that
+    does not exist yet.
+  - **Refresh = a new `SourceGeneration`**, ruling §4's ordinary rule,
+    unmodified for this source kind: an unchanged tree writes and evicts
+    nothing, a changed one evicts the superseded generation (its
+    `git.provenance` row goes with it). "Pinned Works keep theirs" (G6) is
+    honest by construction rather than by new machinery: nothing in this
+    build binds a Work to a source generation yet — Atlas is still
+    read-only evidence with no consumer (S5's retrieval work is what would
+    actually create that binding), so there is nothing a refresh could
+    pull out from under one.
+- **PURL-shaped package identity (A1-26, §10)**: `Cargo.lock` parsed into
+  `(name, version, source)` per locked package, with a purl
+  (`pkg:cargo/<name>@<version>`) derived for a plain registry dependency —
+  verified against the `package-url` project's own reference examples,
+  not recalled — and named `None`, honestly, for a git-sourced or path
+  dependency rather than guessing a purl shape the specification does not
+  cleanly define for either. Ships as a tested, pure derivation
+  (`domain::package`); no CLI verb or table wires it yet, because no
+  register item or consumer commissions one this wave and an unused
+  surface is the same false promise an empty table is (R1) — the
+  derivation itself is what §10 actually asks A1 to be able to do.
+- **G2's revisit trigger, answered rather than left to pass silently.**
+  G2 kept the tree-sitter syntax extractor in-process on the stated
+  predicate "inputs are local/estate-owned rather than attacker-chosen",
+  with a revisit trigger naming the first external-git source feeding it
+  remote bytes as one of two conditions. That condition is this wave.
+  **Decided: stays in-process.** Not because the predicate still holds —
+  it does not — but because the bytes that reach it are already
+  size-bounded, UTF-8-checked text on the identical code path
+  `estate_git` bytes have run through with a clean crash record since X3b
+  (external-git reuses `extract_blobs` verbatim rather than adding a new
+  path), tree-sitter's own design goal is robustness to adversarial input
+  (not merely well-formed input, a stronger posture than the general
+  parser class §12 actually targets), and the acquisition half already
+  runs supervised. Moving it worker-side was considered and set aside for
+  this wave specifically — it would mean splitting one shared extraction
+  call into two execution shapes keyed on source kind, a real change to
+  code every source kind currently relies on, not a safe rider on an
+  already-large wave. The trigger's other leg — the first syntax-lane
+  crash — stays armed, now with genuinely attacker-influenced bytes
+  reaching it for the first time. Full reasoning:
+  `src/runtime/atlas/syntax.rs`'s own module doc, "G2's revisit trigger,
+  answered".
+- **Doctrine amendment, ADR first (ADR 0023, the S2 shape).** `AGENTS.md`'s
+  "`sgt` never fetches" sentence is scoped to admission by its own words,
+  but external-Git acquisition now genuinely does fetch, deliberately, in
+  a different subsystem with no Work authority — never touching a
+  repository mount, a Work surface, or admission's own preflight. ADR
+  0023 records the scoped meaning; `AGENTS.md`'s CAN section cites it in
+  place, unweakened for admission itself; a red-then-green test
+  (`tests/y5_doctrine_never_fetches_is_scoped.rs`) pins both the doctrine
+  text and the structural boundary (admission/materialization never
+  references the external-git fetch surface). Sergeant-rs has been
+  product-documents-only since v0.2.4 (no `docs/adr/` here any longer), so
+  this ADR's binding statement is this changelog entry itself, dated and
+  numbered in the sequence the workspace knowledge library's own
+  `knowledge/rulings/adr/` archive continues (0001–0022 already filed
+  there); the fuller argument is captain's to land there as its own
+  numbered record, landing here first per ADR 0014 decision 17's
+  extraction rule.
+- **Register.** Row 10 (external Git) moves from `deferred-s4` to `met`,
+  citing `src/runtime/atlas/external_git.rs`'s own acquisition-mechanics
+  tests and `tests/y5_external_git_triggers.rs`'s HTTP-surface proof. Row
+  9 (OCR)'s citation is corrected: owner ruling 3 and the ratified S4 re-cut
+  place OCR **after** S4, not inside it — the register's earlier "S4's,
+  same citation as item 7" was a mis-citation, now `deferred-post-s4` with
+  the ruling cited. Both are documentation corrections to where an item
+  already lived, not scope changes.
+
 ### Atlas closeout (S3)
 
 - `docs/concepts/atlas-and-knowledge.md` documents Atlas for operators: what

@@ -473,11 +473,43 @@ enum RepoCommand {
     List,
 }
 
-/// `sgt intelligence ...` subcommands (S3 X4, F11).
+/// `sgt intelligence ...` subcommands (S3 X4, F11; `Add`/`List` added S4
+/// Y5, G6/G8 item 10).
 #[derive(Debug, Subcommand)]
 pub enum IntelligenceCommand {
     /// Coverage and generation status for every indexed source (F8).
     Status,
+    /// Acquire (or refresh) one external Git source: fetch it into this
+    /// host's own bare, no-working-tree cache, resolve the exact commit,
+    /// and extract it through the normal adapters (A1 §9, S4 Y5 G6) —
+    /// item 10's acquisition surface.
+    ///
+    /// The locator is validated against an HTTPS/SSH allowlist **before**
+    /// Git ever sees it (`ext::`, `file://`, and every other transport form
+    /// are refused by name, not silently coerced). A second `add` of an
+    /// already-declared name refreshes it: a new `SourceGeneration` is
+    /// written when the tree changed, and nothing is written when it did
+    /// not (ruling §4).
+    Add {
+        /// The Git locator: `https://…` or `ssh://…`/`user@host:path`.
+        /// Nothing else is accepted — see the allowlist's own refusal
+        /// message for exactly why a given string was refused.
+        url: String,
+        /// A branch or tag to fetch. Omit to fetch the remote's own default
+        /// branch.
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// Declared name (source coordinate, and the cache directory's own
+        /// name). Defaults to the locator's final path segment with a
+        /// trailing `.git` stripped, when that segment is itself a safe
+        /// plain name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List every declared external Git source, with its provenance (A1
+    /// §9): origin, requested ref, resolved commit, and when it was last
+    /// retrieved.
+    List,
 }
 
 /// `sgt map ...` subcommands (S3 X4, F11's minimum honest set).
@@ -521,12 +553,15 @@ pub enum MapCommand {
     },
 }
 
-/// `sgt knowledge ...` subcommands (S3, F11's minimum honest set).
+/// `sgt knowledge ...` subcommands (S3, F11's minimum honest set; `Scan`
+/// added S4 Y5, G8).
 ///
-/// Add and list, and deliberately nothing else yet. A `remove` verb, a
-/// `scan` verb and a coverage report are all real needs with real consumers
-/// — in later waves. Shipping a verb whose output nothing yet produces would
-/// be the same false promise as an empty table (R1).
+/// Add, list, and — since S4 Y5 — the trigger that actually populates what
+/// `Add`/`List` only ever declared. A `remove` verb and a per-source
+/// coverage report are still real needs with no consumer yet, and stay
+/// unbuilt on the same R1 terms this doc comment always stated: shipping a
+/// verb whose output nothing yet produces is the same false promise as an
+/// empty table.
 #[derive(Subcommand, Debug)]
 enum KnowledgeCommand {
     /// Declare a local path as read-only evidence. Nothing is cloned,
@@ -560,6 +595,18 @@ enum KnowledgeCommand {
     },
     /// List declared knowledge sources.
     List,
+    /// Drive a full scan of every declared local knowledge source through
+    /// the daemon, on the intelligence lane, with the lane's own bounded
+    /// concurrency (S4 Y5, G8) — the trigger `tests/x5_a1a_acceptance.rs`'s
+    /// cross-cutting-gap tripwire named as missing. Reports what was
+    /// indexed and what was not **from the coverage rows the scan actually
+    /// produced**, never a guess: each source's own outcome
+    /// (recorded/unchanged/root-unavailable) plus its coverage counts.
+    ///
+    /// Scheduling and cadence are deliberately NOT here (G10): this runs
+    /// once, when invoked, and returns. A recurring scan is a later wave's,
+    /// when retrieval needs one.
+    Scan,
 }
 
 /// `sgt group ...` subcommands (MVP-3).
@@ -1586,14 +1633,41 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         }
         Command::Intelligence { command } => {
             let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
-            let IntelligenceCommand::Status = command;
-            let result = client.get("/v1/intelligence/status").await?;
-            if sgt.json {
-                print_json(&result);
-            } else {
-                print_intelligence_status(&result);
+            match command {
+                IntelligenceCommand::Status => {
+                    let result = client.get("/v1/intelligence/status").await?;
+                    if sgt.json {
+                        print_json(&result);
+                    } else {
+                        print_intelligence_status(&result);
+                    }
+                    Ok(())
+                }
+                IntelligenceCommand::Add { url, git_ref, name } => {
+                    let body = json!({
+                        "command_id": ulid::Ulid::generate().to_string(),
+                        "url": url,
+                        "ref": git_ref,
+                        "name": name,
+                    });
+                    let result = client.post("/v1/intelligence/sources", &body).await?;
+                    if sgt.json {
+                        print_json(&result);
+                    } else {
+                        print_external_git_added(&result);
+                    }
+                    Ok(())
+                }
+                IntelligenceCommand::List => {
+                    let result = client.get("/v1/intelligence/sources").await?;
+                    if sgt.json {
+                        print_json(&result);
+                    } else {
+                        print_external_git_sources(&result);
+                    }
+                    Ok(())
+                }
             }
-            Ok(())
         }
         Command::Map { command } => {
             let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
@@ -1886,6 +1960,25 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
         }
         Command::Repo { command } => repo_command(sgt.json, &estate_root(&estate), command).await,
+        // `Scan` is the one `KnowledgeCommand` that talks to the daemon
+        // (S4 Y5, G8) — matched before the generic arm below, which stays
+        // the pure-manifest path `Add`/`List` always were.
+        Command::Knowledge {
+            command: KnowledgeCommand::Scan,
+        } => {
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            let body = json!({
+                "command_id": ulid::Ulid::generate().to_string(),
+                "estate_root": estate_root_opt(&estate),
+            });
+            let result = client.post("/v1/intelligence/scan", &body).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_knowledge_scan(&result);
+            }
+            Ok(())
+        }
         Command::Knowledge { command } => {
             knowledge_command(sgt.json, &estate_root(&estate), command).await
         }
@@ -2198,6 +2291,10 @@ async fn knowledge_command(
             }
             Ok(())
         }
+        // Handled by its own dedicated arm above, in `dispatch` — never
+        // reachable here (it needs a daemon connection this function's
+        // signature has no client for).
+        KnowledgeCommand::Scan => unreachable!("scan is matched before this arm"),
     }
 }
 
@@ -2664,6 +2761,90 @@ fn print_intelligence_status(result: &Value) {
             } else {
                 rendered
             }
+        );
+    }
+}
+
+/// One scan-record row (the daemon's `{source, outcome, generation,
+/// content_key, coverage, ...}` shape), rendered as plain text — shared by
+/// `sgt knowledge scan`'s per-source rows and `sgt intelligence add`'s
+/// single one.
+fn print_scan_record_row(row: &Value) {
+    let source = row["source"].as_str().unwrap_or("?");
+    if let Some(error) = row["error"].as_str() {
+        println!("{source}: ERROR — {error}");
+        return;
+    }
+    let outcome = row["outcome"].as_str().unwrap_or("?");
+    println!(
+        "{source}: {outcome}  generation={}  content_key={}",
+        row["generation"].as_str().unwrap_or("?"),
+        row["content_key"].as_str().unwrap_or("?"),
+    );
+    if let Some(detail) = row["detail"].as_str() {
+        println!("  {detail}");
+    }
+    if let Some(evicted) = row["evicted"].as_str() {
+        println!("  superseded generation {evicted}");
+    }
+    if let Some(coverage) = row["coverage"].as_object()
+        && !coverage.is_empty()
+    {
+        let rendered = coverage
+            .iter()
+            .map(|(status, count)| format!("{status} {count}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("  coverage: {rendered}");
+    }
+}
+
+/// `sgt knowledge scan`'s plain-text report (S4 Y5, G8): one row per
+/// declared local source, from the coverage the scan actually produced.
+fn print_knowledge_scan(result: &Value) {
+    let empty = Vec::new();
+    let scanned = result["scanned"].as_array().unwrap_or(&empty);
+    if scanned.is_empty() {
+        println!(
+            "{}",
+            result["detail"]
+                .as_str()
+                .unwrap_or("no [[knowledge]] sources are declared")
+        );
+        return;
+    }
+    for row in scanned {
+        print_scan_record_row(row);
+    }
+}
+
+/// `sgt intelligence add`'s plain-text report (S4 Y5, G6).
+fn print_external_git_added(result: &Value) {
+    print_scan_record_row(result);
+}
+
+/// `sgt intelligence list`'s plain-text report: every declared external Git
+/// source with its provenance (A1 §9).
+fn print_external_git_sources(result: &Value) {
+    let empty = Vec::new();
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!("no source has been indexed on this host yet");
+        return;
+    }
+    let sources = result["sources"].as_array().unwrap_or(&empty);
+    if sources.is_empty() {
+        println!("no external Git sources declared");
+        return;
+    }
+    for source in sources {
+        let provenance = &source["provenance"];
+        println!(
+            "{}  origin={}  ref={}  commit={}  retrieved={}",
+            source["source"].as_str().unwrap_or("?"),
+            provenance["origin"].as_str().unwrap_or("?"),
+            provenance["requested_ref"].as_str().unwrap_or("?"),
+            provenance["resolved_commit"].as_str().unwrap_or("?"),
+            provenance["retrieved_at"].as_str().unwrap_or("?"),
         );
     }
 }

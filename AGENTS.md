@@ -435,7 +435,13 @@ gap between them is where judgment (the ladders above) does its work.
   its exact SHA; `sgt` never fetches, pulls, switches branches, or infers
   a remote default to get there — a dirty or detached mount is refused
   unless the operator types the one bounded `--override-git-preflight`
-  for that submission.
+  for that submission. **Scoped to admission** (ADR 0023): the Atlas
+  intelligence store's own external-Git acquisition (`sgt intelligence
+  add`) does fetch, deliberately — into a bare, no-working-tree host
+  cache outside every estate, at an allowlisted locator, never touching
+  a Work surface, a repository mount, or admission's own preflight. The
+  two are different subjects sharing a word, not an exception to this
+  rule.
 - A Work's output branch (`sergeant/<work-id>`) is retained after every
   terminal outcome; nothing here deletes it automatically.
 - A manifest edit that would leave `sergeant.toml` invalid, or a start
