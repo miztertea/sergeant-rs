@@ -169,6 +169,11 @@ async fn a_knowledge_scan_indexes_declared_sources_and_reports_from_coverage() {
 
 /// The empty case is a real, honest answer — never a silent no-op that
 /// looks identical to a scan that indexed something.
+///
+/// S4 Y6 widened the trigger to every declared source kind (the owner
+/// correction `estate-intelligence-is-the-feature-2026-08-28.md`), so the
+/// honest empty answer now names all three kinds an estate could have
+/// declared, not `[[knowledge]]` alone — this estate declares none of them.
 #[tokio::test]
 async fn a_scan_of_an_estate_with_no_knowledge_sources_reports_so_honestly() {
     let estate_dir = TempDir::new().expect("estate dir");
@@ -191,7 +196,7 @@ async fn a_scan_of_an_estate_with_no_knowledge_sources_reports_so_honestly() {
     assert!(
         response["detail"]
             .as_str()
-            .is_some_and(|d| d.contains("no [[knowledge]] sources")),
+            .is_some_and(|d| d.contains("[[repo]]") && d.contains("[[knowledge]]")),
         "{response}"
     );
 

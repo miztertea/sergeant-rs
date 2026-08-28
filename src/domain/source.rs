@@ -387,6 +387,23 @@ pub enum Coverage {
     Unsupported,
     /// An extractor was chosen and failed.
     Error,
+    /// **Best-effort** (S4 Y6, G7/A1-06): the walker suspects this path is a
+    /// cloud-sync placeholder — content declared present by the filesystem
+    /// but not actually materialized locally (a OneDrive/Dropbox/iCloud
+    /// "online-only" file) — and, on that suspicion, never opened it. A
+    /// named coverage state precisely so this case is never `Indexed` with
+    /// zero units, which is the "silently indexed as empty" acceptance item
+    /// 4 forbids.
+    ///
+    /// **Not a certainty.** The signal ([`crate::runtime::atlas::scan`]'s
+    /// `suspected_online_only`) is `st_blocks == 0` with `st_size > 0` — the
+    /// same divergence an ordinary sparse file produces, so a ragged disk
+    /// image or a punched-out log can be misclassified here too (a false
+    /// positive); a placeholder a sync client fully materializes in `stat`
+    /// answers before the byte is fetched is not caught at all (a false
+    /// negative). The row's own `detail` says so every time, not just this
+    /// doc comment.
+    OnlineOnly,
     /// A whole generation's rows were removed — either because the source
     /// bytes changed (ruling §4's eviction) or because reconciliation found
     /// rows with no `source.scanned` summary (F1's crash window). Reported,
@@ -404,6 +421,7 @@ impl Coverage {
             Self::Unavailable => "unavailable",
             Self::Unsupported => "unsupported",
             Self::Error => "error",
+            Self::OnlineOnly => "online_only",
             Self::GenerationEvicted => "generation_evicted",
         }
     }
@@ -421,6 +439,7 @@ impl Coverage {
         Coverage::Unavailable,
         Coverage::Unsupported,
         Coverage::Error,
+        Coverage::OnlineOnly,
         Coverage::GenerationEvicted,
     ];
 }
@@ -719,6 +738,7 @@ mod tests {
                 "unavailable",
                 "unsupported",
                 "error",
+                "online_only",
                 "generation_evicted",
             ]
         );

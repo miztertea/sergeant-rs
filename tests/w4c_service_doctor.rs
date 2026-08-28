@@ -17,6 +17,11 @@ use std::process::Command;
 
 use serde_json::Value;
 
+use sergeant_rs::runtime::atlas::db::AtlasDb;
+use sergeant_rs::runtime::atlas::record::scan_and_record;
+use sergeant_rs::runtime::atlas::scan::KnowledgeSource;
+use sergeant_rs::runtime::journal::Journal;
+
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
 // ---------------------------------------------------------------- helpers
@@ -671,6 +676,109 @@ fn doc_routes_still_fails_when_the_managed_block_itself_cites_the_workspace() {
     assert!(
         detail.contains("sergeant-rs-workspace"),
         "the detail must still name the offending citation, got: {detail}"
+    );
+    assert!(row["remedy"].as_str().is_some());
+}
+
+// ---------------------------------------------------- panel fix: online_only
+
+/// A sparse file: `set_len` on a freshly created file, which on ext4 (and
+/// most Linux filesystems) leaves the hole unallocated — `st_size` equal to
+/// `apparent_len`, `st_blocks == 0`. Returns whether the filesystem actually
+/// behaved that way, so the caller can skip honestly rather than assume it —
+/// mirrors `tests/y6b_online_only.rs`'s own probe exactly (R2).
+#[cfg(unix)]
+fn make_sparse_file(path: &Path, apparent_len: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::File::create(path).expect("create");
+    file.set_len(apparent_len).expect("set_len");
+    drop(file);
+    let meta = std::fs::symlink_metadata(path).expect("stat");
+    meta.size() == apparent_len && meta.blocks() == 0
+}
+
+/// Panel fix (S4 Y6 review): `sgt doctor`'s atlas row used to tally only
+/// `indexed`/`excluded`/`unsupported`/`unavailable`/`error`, so a source
+/// whose coverage rows were entirely `online_only` (a cloud-sync placeholder
+/// the walker correctly never opened, S4 Y6 G7/A1-06) tallied zero in every
+/// counted bucket and the row printed `ok` — indistinguishable from "nothing
+/// to report", which is exactly the silent-gap failure F8's own row exists
+/// to prevent.
+///
+/// Declared through the real manifest, scanned through the real writer
+/// (`scan_and_record`, the same one `sgt intelligence scan` calls — item 3's
+/// own acceptance-test precedent for "declare through the real thing, scan
+/// through the real writer"), then read back through the real `sgt doctor`
+/// CLI: the atlas row must name `online_only` in its `detail` and must warn,
+/// not `ok`.
+#[test]
+#[cfg(unix)]
+fn atlas_doctor_row_names_online_only_and_warns_when_it_is_the_only_gap() {
+    let root = tempfile::TempDir::new().expect("tempdir");
+    let notes = root.path().join("notes");
+    std::fs::create_dir_all(&notes).expect("notes dir");
+    // A claimed extension (`.md`), matching `tests/y6b_online_only.rs`'s own
+    // fixture — an unclaimed extension never reaches the online-only check
+    // at all (`Walk::file` routes it to `Coverage::Unsupported` first).
+    let placeholder = notes.join("placeholder.md");
+    if !make_sparse_file(&placeholder, 4096) {
+        eprintln!(
+            "SKIPPED-ENV: {} did not leave a sparse hole (st_blocks != 0) — this filesystem \
+             does not exhibit the divergence the online-only heuristic reads, so this test \
+             cannot exercise it here",
+            placeholder.display()
+        );
+        return;
+    }
+    std::fs::write(
+        root.path().join("sergeant.toml"),
+        "[estate]\nname = \"atlas-online-only-doctor-test\"\n\n\
+         [[knowledge]]\nname = \"notes\"\npath = \"notes\"\n",
+    )
+    .expect("write sergeant.toml with a declared knowledge source");
+    let data_dir = root.path().join("data-dir");
+
+    // Scan through the real writer, in-process — the same `scan_and_record`
+    // `sgt intelligence scan` calls — then drop the writable handle before
+    // `sgt doctor` opens the store read-only (register row 12's rider: a
+    // read-write and a read-only connection to the same DuckDB file may not
+    // coexist).
+    {
+        let mut db = AtlasDb::open(&data_dir).expect("open atlas");
+        let mut journal = Journal::open(&data_dir).expect("open journal");
+        let source = KnowledgeSource {
+            name: "notes".to_string(),
+            root: notes.clone(),
+            ignore: Vec::new(),
+            context_fields: Default::default(),
+        };
+        scan_and_record(&mut db, &mut journal, &source, None).expect("scan and record");
+    }
+
+    let home = tempfile::TempDir::new().expect("fake home");
+    let out = run(
+        root.path(),
+        Some(&data_dir),
+        &[("HOME", home.path().to_str().expect("utf8"))],
+        &["--json", "doctor"],
+    );
+    let json = out.json();
+    let row = json["checks"]
+        .as_array()
+        .expect("checks")
+        .iter()
+        .find(|c| c["name"] == "atlas")
+        .expect("atlas row present");
+    let detail = row["detail"].as_str().expect("detail present");
+    assert!(
+        detail.contains("online_only 1"),
+        "the atlas row must name the online_only placeholder, got: {detail}"
+    );
+    assert_eq!(
+        row["status"].as_str(),
+        Some("warn"),
+        "a source that is entirely online_only must not read as `ok` — that is \
+         indistinguishable from nothing having been reported at all: {row}"
     );
     assert!(row["remedy"].as_str().is_some());
 }

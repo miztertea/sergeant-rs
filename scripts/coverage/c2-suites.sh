@@ -220,6 +220,20 @@ cov_stage_begin c2-y5_external_git_triggers
 cov_run cargo llvm-cov --no-report --test y5_external_git_triggers --locked || cov_fail "y5_external_git_triggers failed under instrumentation"
 cov_stage_end 1 "the y5_external_git_triggers test binary must write its own profile"
 
+# S4 Y6, wired at birth (the #231 lesson, same as x5/y2/y5 above): the
+# estate-scoped scan trigger (Y6a — a real [[repo]] mount, git-plumbing
+# only, no clone/fetch) and the online-only heuristic (Y6b), both driven
+# against a real in-process daemon (the identical y5_external_git_triggers
+# shape) — no separate daemon PROCESS, so no second profile to expect.
+# `sgt` itself is spawned only for `--help`. Floor 1.
+cov_stage_begin c2-y6a_estate_scoped_scan
+cov_run cargo llvm-cov --no-report --test y6a_estate_scoped_scan --locked || cov_fail "y6a_estate_scoped_scan failed under instrumentation"
+cov_stage_end 1 "the y6a_estate_scoped_scan test binary must write its own profile"
+
+cov_stage_begin c2-y6b_online_only
+cov_run cargo llvm-cov --no-report --test y6b_online_only --locked || cov_fail "y6b_online_only failed under instrumentation"
+cov_stage_end 1 "the y6b_online_only test binary must write its own profile"
+
 # S4 Y5's doctrine-amendment pin (G6): a token scan of `AGENTS.md` and
 # `src/runtime/surface.rs` — no daemon, no estate, no subprocess of any kind.
 # Floor 1.

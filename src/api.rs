@@ -59,7 +59,10 @@ use crate::domain::workflow::{
 use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::atlas::db::{self as atlas_db, AtlasDb, AtlasError, SourceStatus};
 use crate::runtime::atlas::external_git::ExternalGitSource;
-use crate::runtime::atlas::lane::{acquire_external_git_on_lane, scan_local_knowledge_on_lane};
+use crate::runtime::atlas::git::EstateGitSource;
+use crate::runtime::atlas::lane::{
+    acquire_external_git_on_lane, scan_estate_git_on_lane, scan_local_knowledge_on_lane,
+};
 use crate::runtime::atlas::locator;
 use crate::runtime::atlas::record::{ScanRecord, record_external_git_scan, record_scan};
 use crate::runtime::atlas::scan::KnowledgeSource;
@@ -4639,8 +4642,11 @@ async fn intelligence_status(State(state): State<ApiState>) -> Response {
 #[derive(Debug, Deserialize)]
 struct ScanRequest {
     command_id: String,
-    /// D4: the estate whose declared `[[knowledge]]` sources this scan
-    /// addresses.
+    /// D4: the estate this scan addresses — every declared `[[repo]]`
+    /// repository, every declared `[[knowledge]]` source, and every
+    /// external-Git source already recorded on this host (S4 Y6, G8
+    /// correction: widened from `[[knowledge]]` alone — see
+    /// [`intelligence_scan`]'s own doc).
     #[serde(default)]
     estate_root: Option<PathBuf>,
 }
@@ -4662,14 +4668,47 @@ async fn with_atlas_write<T>(
     Ok(f(guard.as_mut().expect("opened above")))
 }
 
-/// `POST /v1/intelligence/scan` — S4 Y5's G8: a full scan of the addressed
-/// estate's declared `[[knowledge]]` sources, on the intelligence lane,
+/// `POST /v1/intelligence/scan` — **estate-scoped** (S4 Y6, G8 correction of
+/// S4 Y5's own G8): a full scan of everything the addressed estate
+/// declares, across all three A1 §2 source kinds, on the intelligence lane,
 /// bounded by the lane's own concurrency (each source's walk acquires its
-/// own permit — [`scan_local_knowledge_on_lane`]). Reports what was indexed
-/// and what was not **from each source's own coverage counts**, never a
-/// guess — the tripwire this endpoint's existence retires
-/// (`tests/x5_a1a_acceptance.rs`'s former
-/// `a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan`).
+/// own permit). Reports what was indexed and what was not **from each
+/// source's own coverage counts**, never a guess.
+///
+/// ```text
+/// estate_git       every [[repo]] repository, through the Git path
+///                  (scan_estate_git_on_lane) at its mount's own committed
+///                  HEAD — never the folder walker. Repository bytes losing
+///                  blob-OID keys, the pinned SHA, Work overlays and drift
+///                  observation by being routed through a directory walk is
+///                  the bug this correction exists to close (the owner
+///                  ruling this wave carries: `estate-intelligence-is-the-
+///                  feature-2026-08-28.md`), not an accepted alternative.
+/// local_knowledge  every [[knowledge]] source, through the folder walker
+///                  (scan_local_knowledge_on_lane) — S4 Y5's own G8,
+///                  unchanged.
+/// external_git     every external-Git source already recorded on this
+///                  host, refreshed through Y5's acquisition
+///                  (acquire_external_git_on_lane). Host-scoped, not
+///                  estate-scoped (A1 §9: intelligence_add_source's own
+///                  doc) — Atlas has no per-estate association for these
+///                  yet, so an estate-scoped scan refreshes every one this
+///                  host holds. Named here rather than silently assumed: a
+///                  finer per-estate binding is unbuilt scope.
+/// ```
+///
+/// **A missing or invalid `[[repo]]` mount fails the whole request before
+/// any of this runs** — `Estate::from_config_allow_empty` already refuses a
+/// declared repository whose mount does not validate (§6.1's
+/// `validate_mount`, called at estate-parse time, above), the same
+/// `422 invalid_estate` every other estate-scoped route gives that failure.
+/// The per-source error row below is for what estate parsing cannot catch:
+/// a validated mount with no commits yet (`git rev-parse HEAD` on a
+/// freshly-`init`'d repository has nothing to resolve), or a mount removed
+/// in the window between that validation and this scan actually reading it
+/// — reported as its own row rather than failing the whole scan, the same
+/// one-bad-source-does-not-block-the-rest posture the knowledge path
+/// already had.
 ///
 /// Scheduling and cadence are deliberately not here (G10): one call, one
 /// scan, one report — a recurring trigger is a later wave's, when retrieval
@@ -4700,38 +4739,145 @@ async fn intelligence_scan(
                 );
             }
         };
-    if estate.knowledge.is_empty() {
+
+    // Read, not create (R1): a fresh install with nothing scanned yet must
+    // not gain an Atlas store file merely to learn there is nothing to
+    // refresh.
+    let external_sources: Vec<SourceStatus> =
+        match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+            Ok(Some(sources)) => sources
+                .into_iter()
+                .filter(|s| s.kind == SourceKind::ExternalGit)
+                .collect(),
+            Ok(None) => Vec::new(),
+            Err(resp) => return *resp,
+        };
+
+    if estate.repositories.is_empty() && estate.knowledge.is_empty() && external_sources.is_empty()
+    {
         return Json(json!({
             "scanned": [],
-            "detail": "no [[knowledge]] sources are declared for this estate",
+            "detail": "no [[repo]] repositories, [[knowledge]] sources, or external Git \
+                       sources are declared for this estate",
         }))
         .into_response();
     }
 
-    // Bounded concurrency: one task per source, each queueing on the
-    // intelligence lane's own semaphore — the lane's existing promise (F6),
-    // not a second concurrency cap invented here.
-    let mut walks = tokio::task::JoinSet::new();
+    let mut report = Vec::new();
+
+    // ---- estate_git: registered repos, through the Git path at the
+    // mount's own committed HEAD (X3a's plumbing) — never the folder
+    // walker. `git rev-parse HEAD` is plain plumbing, not extraction, so it
+    // runs on a blocking-safe worker (`blocking`) rather than under the
+    // intelligence lane's permit; the lane still bounds the extraction
+    // itself via `scan_estate_git_on_lane`.
+    let mut repo_walks = tokio::task::JoinSet::new();
+    for spec in &estate.repositories {
+        let engine = state.engine.clone();
+        let name = spec.name.clone();
+        let mount = spec.path.clone();
+        repo_walks.spawn(async move {
+            let pin_mount = mount.clone();
+            let pinned =
+                blocking(move || crate::runtime::git::git(&pin_mount, &["rev-parse", "HEAD"]))
+                    .await;
+            let pinned_sha = match pinned {
+                Ok(sha) => sha,
+                Err(e) => {
+                    return (
+                        name,
+                        Err(format!("cannot resolve the mount's pinned HEAD: {e}")),
+                    );
+                }
+            };
+            let source = EstateGitSource {
+                name: name.clone(),
+                mount,
+                pinned_sha,
+                ignore: Vec::new(),
+            };
+            let outcome = scan_estate_git_on_lane(&engine, source)
+                .await
+                .map_err(|e| e.to_string());
+            (name, outcome)
+        });
+    }
+    while let Some(joined) = repo_walks.join_next().await {
+        let (name, outcome) = match joined {
+            Ok(pair) => pair,
+            Err(e) => {
+                report.push(json!({
+                    "source": "?", "kind": "estate_git",
+                    "error": format!("scan task panicked: {e}"),
+                }));
+                continue;
+            }
+        };
+        let scanned = match outcome {
+            Ok(scanned) => scanned,
+            Err(e) => {
+                report.push(json!({"source": name, "kind": "estate_git", "error": e}));
+                continue;
+            }
+        };
+        let counts = scanned.scan.counts();
+        let mut core = CoreGuard::acquire(&state.core).await;
+        let outcome = with_atlas_write(&state, |atlas| {
+            record_scan(atlas, &mut core.journal, &scanned.scan, None)
+        })
+        .await;
+        drop(core);
+        match outcome {
+            Ok(Ok(record)) => report.push(scan_record_json(
+                "estate_git",
+                &name,
+                &record,
+                &counts,
+                scanned.drift.as_ref(),
+            )),
+            Ok(Err(e)) => {
+                report.push(json!({"source": name, "kind": "estate_git", "error": e.to_string()}))
+            }
+            Err(e) => report.push(json!({
+                "source": name, "kind": "estate_git", "error": format!("atlas unavailable: {e}"),
+            })),
+        }
+    }
+
+    // ---- local_knowledge: declared [[knowledge]] sources, through the
+    // folder walker (S4 Y5, G8 — unchanged). Bounded concurrency: one task
+    // per source, each queueing on the intelligence lane's own semaphore —
+    // the lane's existing promise (F6), not a second concurrency cap
+    // invented here.
+    let mut knowledge_walks = tokio::task::JoinSet::new();
     for spec in &estate.knowledge {
         let engine = state.engine.clone();
         let source = KnowledgeSource::from(spec);
         let name = source.name.clone();
-        walks.spawn(async move { (name, scan_local_knowledge_on_lane(&engine, source).await) });
+        knowledge_walks.spawn(async move {
+            (
+                name,
+                scan_local_knowledge_on_lane(&engine, source)
+                    .await
+                    .map_err(|e| e.to_string()),
+            )
+        });
     }
-
-    let mut report = Vec::new();
-    while let Some(joined) = walks.join_next().await {
+    while let Some(joined) = knowledge_walks.join_next().await {
         let (name, outcome) = match joined {
             Ok(pair) => pair,
             Err(e) => {
-                report.push(json!({"source": "?", "error": format!("scan task panicked: {e}")}));
+                report.push(json!({
+                    "source": "?", "kind": "local_knowledge",
+                    "error": format!("scan task panicked: {e}"),
+                }));
                 continue;
             }
         };
         let scan = match outcome {
             Ok(scan) => scan,
             Err(e) => {
-                report.push(json!({"source": name, "error": e.to_string()}));
+                report.push(json!({"source": name, "kind": "local_knowledge", "error": e}));
                 continue;
             }
         };
@@ -4748,31 +4894,138 @@ async fn intelligence_scan(
         .await;
         drop(core);
         match outcome {
-            Ok(Ok(record)) => report.push(scan_record_json(&name, &record, &counts)),
-            Ok(Err(e)) => report.push(json!({"source": name, "error": e.to_string()})),
-            Err(e) => {
-                report.push(json!({"source": name, "error": format!("atlas unavailable: {e}")}))
-            }
+            Ok(Ok(record)) => report.push(scan_record_json(
+                "local_knowledge",
+                &name,
+                &record,
+                &counts,
+                None,
+            )),
+            Ok(Err(e)) => report
+                .push(json!({"source": name, "kind": "local_knowledge", "error": e.to_string()})),
+            Err(e) => report.push(json!({
+                "source": name, "kind": "local_knowledge",
+                "error": format!("atlas unavailable: {e}"),
+            })),
         }
     }
+
+    // ---- external_git: sources already recorded on this host (A1 §9),
+    // refreshed through Y5's own acquisition.
+    let mut external_walks = tokio::task::JoinSet::new();
+    for status in &external_sources {
+        let name = status.source_name.clone();
+        let Some(provenance) = status.provenance.clone() else {
+            // Cannot happen today: filtered to `ExternalGit` above, and
+            // `stage_external_git_scan` writes `git.provenance` in the same
+            // transaction as the generation it belongs to (db.rs's own
+            // atomic-write guarantee) — so every confirmed `external_git`
+            // generation has one. Surfaced rather than silently skipped in
+            // case that guarantee is ever weakened by a future migration.
+            report.push(json!({
+                "source": name, "kind": "external_git",
+                "error": "an external_git generation has no provenance row to refresh from",
+            }));
+            continue;
+        };
+        let locator = match locator::validate(&provenance.origin) {
+            Ok(locator) => locator,
+            Err(e) => {
+                report
+                    .push(json!({"source": name, "kind": "external_git", "error": e.to_string()}));
+                continue;
+            }
+        };
+        // `"HEAD"` is `intelligence_add_source`'s own sentinel for "nothing
+        // was requested" (A1-24's `ExternalGitProvenance::requested_ref`
+        // doc) — resolved back to `None` so a refresh asks for the remote's
+        // own default branch again, exactly as the original request did.
+        let requested_ref =
+            (provenance.requested_ref != "HEAD").then_some(provenance.requested_ref.clone());
+        let engine = state.engine.clone();
+        let source = ExternalGitSource {
+            name: name.clone(),
+            locator,
+            requested_ref,
+            cache_root: crate::runtime::atlas::external_git::default_cache_root(&state.data_dir),
+            ignore: Vec::new(),
+        };
+        external_walks.spawn(async move {
+            (
+                name,
+                acquire_external_git_on_lane(&engine, source)
+                    .await
+                    .map_err(|e| e.to_string()),
+            )
+        });
+    }
+    while let Some(joined) = external_walks.join_next().await {
+        let (name, outcome) = match joined {
+            Ok(pair) => pair,
+            Err(e) => {
+                report.push(json!({
+                    "source": "?", "kind": "external_git",
+                    "error": format!("scan task panicked: {e}"),
+                }));
+                continue;
+            }
+        };
+        let acquired = match outcome {
+            Ok(acquired) => acquired,
+            Err(e) => {
+                report.push(json!({"source": name, "kind": "external_git", "error": e}));
+                continue;
+            }
+        };
+        let counts = acquired.scan.counts();
+        let mut core = CoreGuard::acquire(&state.core).await;
+        let outcome = with_atlas_write(&state, |atlas| {
+            record_external_git_scan(atlas, &mut core.journal, &acquired, None)
+        })
+        .await;
+        drop(core);
+        match outcome {
+            Ok(Ok(record)) => report.push(scan_record_json(
+                "external_git",
+                &name,
+                &record,
+                &counts,
+                None,
+            )),
+            Ok(Err(e)) => {
+                report.push(json!({"source": name, "kind": "external_git", "error": e.to_string()}))
+            }
+            Err(e) => report.push(json!({
+                "source": name, "kind": "external_git",
+                "error": format!("atlas unavailable: {e}"),
+            })),
+        }
+    }
+
     Json(json!({"scanned": report})).into_response()
 }
 
 /// One [`ScanRecord`] rendered for `POST /v1/intelligence/scan`'s report —
 /// the outcome plus the coverage counts the report is required to answer
-/// from (G8), never a guess.
+/// from (G8), never a guess. `kind` is supplied by the caller rather than
+/// re-derived from `record` (`ScanRecord::Unchanged`/`RootUnavailable`
+/// carry no kind of their own), and `drift` rides beside the row exactly as
+/// it rides beside the scan (`EstateGitScan`'s own doc) — a fact about the
+/// mount, never folded into the generation.
 fn scan_record_json(
+    kind: &str,
     source: &str,
     record: &ScanRecord,
     coverage: &BTreeMap<&'static str, u64>,
+    drift: Option<&crate::runtime::integrity::EstateDriftObservation>,
 ) -> Value {
     let coverage: BTreeMap<&str, u64> = coverage.clone();
-    match record {
+    let mut row = match record {
         ScanRecord::Unchanged {
             generation_id,
             content_key,
         } => json!({
-            "source": source, "outcome": "unchanged",
+            "source": source, "kind": kind, "outcome": "unchanged",
             "generation": generation_id, "content_key": content_key, "coverage": coverage,
         }),
         ScanRecord::RootUnavailable {
@@ -4780,7 +5033,7 @@ fn scan_record_json(
             content_key,
             detail,
         } => json!({
-            "source": source, "outcome": "root_unavailable",
+            "source": source, "kind": kind, "outcome": "root_unavailable",
             "generation": generation_id, "content_key": content_key, "detail": detail,
             "coverage": coverage,
         }),
@@ -4790,11 +5043,20 @@ fn scan_record_json(
             evicted,
             ..
         } => json!({
-            "source": source, "outcome": "recorded",
+            "source": source, "kind": kind, "outcome": "recorded",
             "generation": generation_id, "content_key": content_key,
             "evicted": evicted, "coverage": coverage,
         }),
+    };
+    if let Some(drift) = drift
+        && let Some(object) = row.as_object_mut()
+    {
+        object.insert(
+            "drift".to_string(),
+            serde_json::to_value(drift).unwrap_or(Value::Null),
+        );
     }
+    row
 }
 
 #[derive(Debug, Deserialize)]
@@ -4896,9 +5158,11 @@ async fn intelligence_add_source(
     .await;
     match recorded {
         Ok(Ok(record)) => Json(scan_record_json(
+            "external_git",
             &acquired.scan.source_name,
             &record,
             &coverage,
+            None,
         ))
         .into_response(),
         Ok(Err(e)) => error_response(

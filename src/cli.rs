@@ -474,7 +474,8 @@ enum RepoCommand {
 }
 
 /// `sgt intelligence ...` subcommands (S3 X4, F11; `Add`/`List` added S4
-/// Y5, G6/G8 item 10).
+/// Y5, G6/G8 item 10; `Scan` added S4 Y6, G8's correction of S4 Y5's own
+/// G8 — the estate-scoped trigger's primary home).
 #[derive(Debug, Subcommand)]
 pub enum IntelligenceCommand {
     /// Coverage and generation status for every indexed source (F8).
@@ -510,6 +511,31 @@ pub enum IntelligenceCommand {
     /// §9): origin, requested ref, resolved commit, and when it was last
     /// retrieved.
     List,
+    /// Drive a full scan of everything this estate declares — every
+    /// `[[repo]]` repository through the Git path at its mount's own
+    /// committed HEAD, every `[[knowledge]]` source through the folder
+    /// walker, and every external Git source already added on this host
+    /// refreshed through `add`'s own acquisition — on the daemon's
+    /// intelligence lane, with the lane's own bounded concurrency (S4 Y6,
+    /// G8 correction of S4 Y5's own G8).
+    ///
+    /// **This is the estate-scoped verb** — the reason `sgt intelligence`
+    /// rather than `sgt knowledge` is where it now lives, argued in this
+    /// wave's own commit body: a scan whose whole point is that a
+    /// registered repository is not a knowledge folder should not live
+    /// under the verb group that only ever declares knowledge folders.
+    /// `sgt knowledge scan` still runs the identical scan — nothing that
+    /// already used that spelling stops working — but this is the name a
+    /// new script should reach for.
+    ///
+    /// Reports what was indexed and what was not **from the coverage rows
+    /// the scan actually produced**, never a guess: each source's own kind,
+    /// outcome (recorded/unchanged/root_unavailable) and coverage counts.
+    ///
+    /// Scheduling and cadence are deliberately NOT here (G10): this runs
+    /// once, when invoked, and returns. A recurring scan is a later wave's,
+    /// when retrieval needs one.
+    Scan,
 }
 
 /// `sgt map ...` subcommands (S3 X4, F11's minimum honest set).
@@ -554,14 +580,15 @@ pub enum MapCommand {
 }
 
 /// `sgt knowledge ...` subcommands (S3, F11's minimum honest set; `Scan`
-/// added S4 Y5, G8).
+/// added S4 Y5, G8, widened to estate scope and given a second, primary
+/// spelling at `sgt intelligence scan` in S4 Y6, G8's own correction).
 ///
-/// Add, list, and — since S4 Y5 — the trigger that actually populates what
-/// `Add`/`List` only ever declared. A `remove` verb and a per-source
-/// coverage report are still real needs with no consumer yet, and stay
-/// unbuilt on the same R1 terms this doc comment always stated: shipping a
-/// verb whose output nothing yet produces is the same false promise as an
-/// empty table.
+/// Add, list, and the trigger verb kept here as a working alias — see
+/// `Scan`'s own doc for why it is no longer this verb group's exclusive
+/// scan trigger. A `remove` verb and a per-source coverage report are still
+/// real needs with no consumer yet, and stay unbuilt on the same R1 terms
+/// this doc comment always stated: shipping a verb whose output nothing yet
+/// produces is the same false promise as an empty table.
 #[derive(Subcommand, Debug)]
 enum KnowledgeCommand {
     /// Declare a local path as read-only evidence. Nothing is cloned,
@@ -595,17 +622,20 @@ enum KnowledgeCommand {
     },
     /// List declared knowledge sources.
     List,
-    /// Drive a full scan of every declared local knowledge source through
-    /// the daemon, on the intelligence lane, with the lane's own bounded
-    /// concurrency (S4 Y5, G8) — the trigger `tests/x5_a1a_acceptance.rs`'s
-    /// cross-cutting-gap tripwire named as missing. Reports what was
-    /// indexed and what was not **from the coverage rows the scan actually
-    /// produced**, never a guess: each source's own outcome
-    /// (recorded/unchanged/root-unavailable) plus its coverage counts.
-    ///
-    /// Scheduling and cadence are deliberately NOT here (G10): this runs
-    /// once, when invoked, and returns. A recurring scan is a later wave's,
-    /// when retrieval needs one.
+    /// **Kept working, unchanged spelling** (S4 Y6, G8 correction): this
+    /// verb used to scan only `[[knowledge]]` sources (S4 Y5, G8), the
+    /// gap the owner ruling `estate-intelligence-is-the-feature-2026-08-28`
+    /// names — a scan whose trigger sat under the verb group that only
+    /// ever *declares* knowledge folders had no way to also cover the
+    /// estate's own registered repositories. It now runs the same
+    /// estate-scoped scan `sgt intelligence scan` does — every `[[repo]]`,
+    /// every `[[knowledge]]` source and every already-added external Git
+    /// source — because nobody who already typed `sgt knowledge scan`
+    /// should have it silently start doing less than before, and `sgt
+    /// intelligence scan` (see [`IntelligenceCommand::Scan`]'s own doc) is
+    /// the coherent name for what the verb now does. Prefer that spelling
+    /// in anything new; this one is not deprecated, just no longer the
+    /// primary name.
     Scan,
 }
 
@@ -1667,6 +1697,9 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     }
                     Ok(())
                 }
+                IntelligenceCommand::Scan => {
+                    run_intelligence_scan(&client, estate_root_opt(&estate), sgt.json).await
+                }
             }
         }
         Command::Map { command } => {
@@ -1962,22 +1995,15 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         Command::Repo { command } => repo_command(sgt.json, &estate_root(&estate), command).await,
         // `Scan` is the one `KnowledgeCommand` that talks to the daemon
         // (S4 Y5, G8) — matched before the generic arm below, which stays
-        // the pure-manifest path `Add`/`List` always were.
+        // the pure-manifest path `Add`/`List` always were. It runs the
+        // identical scan `IntelligenceCommand::Scan` does, above — see
+        // `KnowledgeCommand::Scan`'s own doc for why both spellings work
+        // (S4 Y6, G8 correction).
         Command::Knowledge {
             command: KnowledgeCommand::Scan,
         } => {
             let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
-            let body = json!({
-                "command_id": ulid::Ulid::generate().to_string(),
-                "estate_root": estate_root_opt(&estate),
-            });
-            let result = client.post("/v1/intelligence/scan", &body).await?;
-            if sgt.json {
-                print_json(&result);
-            } else {
-                print_knowledge_scan(&result);
-            }
-            Ok(())
+            run_intelligence_scan(&client, estate_root_opt(&estate), sgt.json).await
         }
         Command::Knowledge { command } => {
             knowledge_command(sgt.json, &estate_root(&estate), command).await
@@ -2203,6 +2229,32 @@ async fn repo_command(
             Ok(())
         }
     }
+}
+
+/// `POST /v1/intelligence/scan`, then print the report — shared by the two
+/// spellings that reach it (`sgt intelligence scan`'s own match arm, and
+/// `sgt knowledge scan`'s separate one — two arms rather than one combined
+/// pattern, because `Command::Intelligence { command }`'s generic arm
+/// already sits earlier in [`dispatch`]'s match and would make a combined
+/// arm's `Intelligence` half unreachable) so there is exactly one place
+/// that builds the request body and picks the renderer, never two copies to
+/// let drift apart (S4 Y6, G8 correction).
+async fn run_intelligence_scan(
+    client: &ApiClient,
+    estate_root: Option<&Path>,
+    json: bool,
+) -> Result<(), CliError> {
+    let body = json!({
+        "command_id": ulid::Ulid::generate().to_string(),
+        "estate_root": estate_root,
+    });
+    let result = client.post("/v1/intelligence/scan", &body).await?;
+    if json {
+        print_json(&result);
+    } else {
+        print_intelligence_scan(&result);
+    }
+    Ok(())
 }
 
 /// `sgt knowledge add/list` (S3 F11): a pure manifest edit/read, same
@@ -2765,19 +2817,20 @@ fn print_intelligence_status(result: &Value) {
     }
 }
 
-/// One scan-record row (the daemon's `{source, outcome, generation,
-/// content_key, coverage, ...}` shape), rendered as plain text — shared by
-/// `sgt knowledge scan`'s per-source rows and `sgt intelligence add`'s
-/// single one.
+/// One scan-record row (the daemon's `{source, kind, outcome, generation,
+/// content_key, coverage, drift?, ...}` shape), rendered as plain text —
+/// shared by `sgt intelligence scan`'s per-source rows and `sgt
+/// intelligence add`'s single one.
 fn print_scan_record_row(row: &Value) {
     let source = row["source"].as_str().unwrap_or("?");
+    let kind = row["kind"].as_str().unwrap_or("?");
     if let Some(error) = row["error"].as_str() {
-        println!("{source}: ERROR — {error}");
+        println!("{source} ({kind}): ERROR — {error}");
         return;
     }
     let outcome = row["outcome"].as_str().unwrap_or("?");
     println!(
-        "{source}: {outcome}  generation={}  content_key={}",
+        "{source} ({kind}): {outcome}  generation={}  content_key={}",
         row["generation"].as_str().unwrap_or("?"),
         row["content_key"].as_str().unwrap_or("?"),
     );
@@ -2797,19 +2850,34 @@ fn print_scan_record_row(row: &Value) {
             .join("  ");
         println!("  coverage: {rendered}");
     }
+    // Only an `estate_git` row ever carries this (§11.4's observation, see
+    // `EstateDriftObservation`) — absent everywhere else, so this prints
+    // nothing extra for `local_knowledge`/`external_git` rows.
+    if let Some(drift) = row["drift"].as_object() {
+        println!(
+            "  drift: mount is now at {}, pinned scan read {}",
+            drift["observed"].as_str().unwrap_or("?"),
+            drift["before"].as_str().unwrap_or("?"),
+        );
+    }
 }
 
-/// `sgt knowledge scan`'s plain-text report (S4 Y5, G8): one row per
-/// declared local source, from the coverage the scan actually produced.
-fn print_knowledge_scan(result: &Value) {
+/// `sgt intelligence scan`'s plain-text report (S4 Y6, G8 correction): one
+/// row per source the estate-scoped scan actually covered — every
+/// `[[repo]]`, every `[[knowledge]]` source, every already-added external
+/// Git source — from the coverage each one actually produced. Also `sgt
+/// knowledge scan`'s report, since it drives the identical scan (see
+/// `KnowledgeCommand::Scan`'s own doc).
+fn print_intelligence_scan(result: &Value) {
     let empty = Vec::new();
     let scanned = result["scanned"].as_array().unwrap_or(&empty);
     if scanned.is_empty() {
         println!(
             "{}",
-            result["detail"]
-                .as_str()
-                .unwrap_or("no [[knowledge]] sources are declared")
+            result["detail"].as_str().unwrap_or(
+                "no [[repo]] repositories, [[knowledge]] sources, or external Git sources are \
+                 declared for this estate"
+            )
         );
         return;
     }
@@ -6046,10 +6114,22 @@ pub(crate) mod doctor {
     /// **F8's doctor row**: what Atlas has indexed, and what it could not.
     ///
     /// Coverage is the whole point of the row. A line that only counted
-    /// indexed files would be silent about the two statuses an operator
-    /// actually needs surfaced — `excluded`, which is F10's secrets posture
-    /// working, and `error`/`unavailable`, which is it failing — so both are
-    /// reported and the second warns.
+    /// indexed files would be silent about the statuses an operator actually
+    /// needs surfaced — `excluded`, which is F10's secrets posture working;
+    /// `error`/`unavailable`, which is it failing; and `online_only`, which
+    /// is a cloud-sync placeholder that was correctly *not* opened (S4 Y6,
+    /// G7/A1-06) but still was not indexed — so all of them are reported,
+    /// and the ones that mean an operator is missing content they think they
+    /// have (`error`, `unavailable`, `online_only`) warn.
+    ///
+    /// Tallied over [`Coverage::ALL`] rather than a hand-picked subset of
+    /// statuses: a source whose coverage rows are entirely `online_only` (an
+    /// estate synced from a cloud client that has hydrated nothing) used to
+    /// tally zero in every counted bucket and print `ok` — indistinguishable
+    /// from "nothing to report", exactly the silent-gap failure this row
+    /// exists to prevent. Iterating the whole enum also means a coverage
+    /// status added later cannot repeat this omission by simply being
+    /// forgotten here.
     ///
     /// **A missing store is `ok`, not a warning.** An estate that has declared
     /// no `[[knowledge]]` source has nothing to index, and a diagnostic that
@@ -6061,6 +6141,7 @@ pub(crate) mod doctor {
     /// the one caller outside the daemon that reads this store may not hold
     /// a connection that could write it, "IF NOT EXISTS" DDL included.
     fn atlas_coverage_check(data_dir: &Path) -> Check {
+        use crate::domain::source::Coverage;
         use crate::runtime::atlas::db::{AtlasDb, atlas_db_path};
 
         let path = atlas_db_path(data_dir);
@@ -6090,29 +6171,39 @@ pub(crate) mod doctor {
                 "atlas is present; no source has a confirmed generation",
             );
         }
-        let total = |status: &str| -> u64 {
+        let total = |status: Coverage| -> u64 {
             sources
                 .iter()
-                .filter_map(|s| s.coverage.get(status))
+                .filter_map(|s| s.coverage.get(status.as_str()))
                 .copied()
                 .sum()
         };
-        let indexed = total("indexed");
-        let excluded = total("excluded");
-        let unsupported = total("unsupported");
-        let unavailable = total("unavailable");
-        let errored = total("error");
+        let counts: Vec<(Coverage, u64)> = Coverage::ALL.iter().map(|&c| (c, total(c))).collect();
         let detail = format!(
-            "{} source(s): indexed {indexed}, excluded {excluded}, unsupported {unsupported}, \
-             unavailable {unavailable}, error {errored}",
-            sources.len()
+            "{} source(s): {}",
+            sources.len(),
+            counts
+                .iter()
+                .map(|(c, n)| format!("{} {n}", c.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        if errored + unavailable > 0 {
+        // A named, reported gap in content an operator would otherwise
+        // believe they have (missing, unreadable, or unhydrated) warns.
+        // `generation_evicted` is excluded on purpose: an eviction is
+        // ordinary lifecycle (the source changed, or a crash-window rebuild
+        // ran), not a fault — it is tallied above for visibility, never for
+        // severity.
+        let reported_gap =
+            total(Coverage::Error) + total(Coverage::Unavailable) + total(Coverage::OnlineOnly);
+        if reported_gap > 0 {
             return Check::warn(
                 "atlas",
                 detail,
-                "some paths could not be read or extracted; `sgt intelligence status` names \
-                 the source, and the coverage row's detail names the reason",
+                "some paths could not be read or extracted, or were suspected cloud-sync \
+                 placeholders never opened for that reason (best-effort, honestly labelled — \
+                 see the coverage row's own `detail`); `sgt intelligence status` names the \
+                 source",
             );
         }
         Check::ok("atlas", detail)
