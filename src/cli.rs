@@ -6114,10 +6114,22 @@ pub(crate) mod doctor {
     /// **F8's doctor row**: what Atlas has indexed, and what it could not.
     ///
     /// Coverage is the whole point of the row. A line that only counted
-    /// indexed files would be silent about the two statuses an operator
-    /// actually needs surfaced — `excluded`, which is F10's secrets posture
-    /// working, and `error`/`unavailable`, which is it failing — so both are
-    /// reported and the second warns.
+    /// indexed files would be silent about the statuses an operator actually
+    /// needs surfaced — `excluded`, which is F10's secrets posture working;
+    /// `error`/`unavailable`, which is it failing; and `online_only`, which
+    /// is a cloud-sync placeholder that was correctly *not* opened (S4 Y6,
+    /// G7/A1-06) but still was not indexed — so all of them are reported,
+    /// and the ones that mean an operator is missing content they think they
+    /// have (`error`, `unavailable`, `online_only`) warn.
+    ///
+    /// Tallied over [`Coverage::ALL`] rather than a hand-picked subset of
+    /// statuses: a source whose coverage rows are entirely `online_only` (an
+    /// estate synced from a cloud client that has hydrated nothing) used to
+    /// tally zero in every counted bucket and print `ok` — indistinguishable
+    /// from "nothing to report", exactly the silent-gap failure this row
+    /// exists to prevent. Iterating the whole enum also means a coverage
+    /// status added later cannot repeat this omission by simply being
+    /// forgotten here.
     ///
     /// **A missing store is `ok`, not a warning.** An estate that has declared
     /// no `[[knowledge]]` source has nothing to index, and a diagnostic that
@@ -6129,6 +6141,7 @@ pub(crate) mod doctor {
     /// the one caller outside the daemon that reads this store may not hold
     /// a connection that could write it, "IF NOT EXISTS" DDL included.
     fn atlas_coverage_check(data_dir: &Path) -> Check {
+        use crate::domain::source::Coverage;
         use crate::runtime::atlas::db::{AtlasDb, atlas_db_path};
 
         let path = atlas_db_path(data_dir);
@@ -6158,29 +6171,39 @@ pub(crate) mod doctor {
                 "atlas is present; no source has a confirmed generation",
             );
         }
-        let total = |status: &str| -> u64 {
+        let total = |status: Coverage| -> u64 {
             sources
                 .iter()
-                .filter_map(|s| s.coverage.get(status))
+                .filter_map(|s| s.coverage.get(status.as_str()))
                 .copied()
                 .sum()
         };
-        let indexed = total("indexed");
-        let excluded = total("excluded");
-        let unsupported = total("unsupported");
-        let unavailable = total("unavailable");
-        let errored = total("error");
+        let counts: Vec<(Coverage, u64)> = Coverage::ALL.iter().map(|&c| (c, total(c))).collect();
         let detail = format!(
-            "{} source(s): indexed {indexed}, excluded {excluded}, unsupported {unsupported}, \
-             unavailable {unavailable}, error {errored}",
-            sources.len()
+            "{} source(s): {}",
+            sources.len(),
+            counts
+                .iter()
+                .map(|(c, n)| format!("{} {n}", c.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        if errored + unavailable > 0 {
+        // A named, reported gap in content an operator would otherwise
+        // believe they have (missing, unreadable, or unhydrated) warns.
+        // `generation_evicted` is excluded on purpose: an eviction is
+        // ordinary lifecycle (the source changed, or a crash-window rebuild
+        // ran), not a fault — it is tallied above for visibility, never for
+        // severity.
+        let reported_gap =
+            total(Coverage::Error) + total(Coverage::Unavailable) + total(Coverage::OnlineOnly);
+        if reported_gap > 0 {
             return Check::warn(
                 "atlas",
                 detail,
-                "some paths could not be read or extracted; `sgt intelligence status` names \
-                 the source, and the coverage row's detail names the reason",
+                "some paths could not be read or extracted, or were suspected cloud-sync \
+                 placeholders never opened for that reason (best-effort, honestly labelled — \
+                 see the coverage row's own `detail`); `sgt intelligence status` names the \
+                 source",
             );
         }
         Check::ok("atlas", detail)

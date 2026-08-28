@@ -36,7 +36,7 @@
 //! | # | Contract claim (§17) | Verdict | Decisive check |
 //! |---|---|---|---|
 //! | 1 | one daemon-owned `atlas.duckdb` holds independently rebuildable `ops/source/git/context/meta` families | met-with-deviation | `x1_atlas_substrate::opening_atlas_declares_the_four_schema_namespaces` |
-//! | 2 | estate Git indexing pins exact repo/base generations and Work overlays without changing Work authority | met | `x3a_git_plumbing::a_scan_stays_on_its_pinned_sha_while_head_advances` |
+//! | 2 | estate Git indexing pins exact repo/base generations and Work overlays without changing Work authority | met-with-deviation | `x3a_git_plumbing::a_scan_stays_on_its_pinned_sha_while_head_advances` |
 //! | 3 | a declared read-only local knowledge Source indexes a cloud-synced ordinary directory without becoming `[[repo]]` or receiving a worktree | met | `x5_a1a_acceptance::a1a_item_3_a_knowledge_source_is_indexed_without_becoming_a_repo_or_getting_a_worktree` |
 //! | 4 | online-only/unreadable local resources are reported as coverage gaps, not silently indexed as empty | met | `y6b_online_only::an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_trigger` |
 //! | 5 | Markdown/text and at least one Office format normalize into document units with provenance | met | `y2_office_adapter::a_docx_worker_returns_document_and_section_units_with_provenance` |
@@ -207,7 +207,7 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 2,
-        verdict: Verdict::Met,
+        verdict: Verdict::MetWithDeviation,
         checks: &[
             at(
                 "tests/x3a_git_plumbing.rs",
@@ -225,10 +225,38 @@ const WALK: &[Item] = &[
                 "tests/x3a_scan_uses_only_local_reads.rs",
                 "an_atlas_scan_runs_only_read_only_git_and_changes_nothing",
             ),
+            at(
+                "tests/y6a_estate_scoped_scan.rs",
+                "a_registered_repository_is_scanned_through_the_git_path_and_map_symbol_resolves_a_real_function",
+            ),
+            at(
+                "tests/x5_a1a_acceptance.rs",
+                "a1a_item_2_gap_work_overlay_scan_has_no_production_trigger",
+            ),
         ],
         note: "'Without changing Work authority' is the read-only half: the scan runs only \
                read-only git plumbing, touches no branch, no index and no worktree, and an \
-               overlay's lifetime is its Work's.",
+               overlay's lifetime is its Work's. THE BASE-REPO HALF IS FULLY MET (S4 Y6, G8 \
+               correction): `scan_estate_git_on_lane` now has a real production caller — \
+               `POST /v1/intelligence/scan`/`sgt intelligence scan` — proven end to end in \
+               `tests/y6a_estate_scoped_scan.rs`, closing exactly the 'built but unreachable' \
+               defect S4 Y5 left. DEVIATION, review panel finding: the sibling half of this \
+               claim — 'Work overlays' — is NOT met the same way. `scan_work_overlay`, \
+               `scan_work_overlay_on_lane` and `scan_and_record_overlay` \
+               (`src/runtime/atlas/overlay.rs`, `lane.rs`, `record.rs`) exist, are correct at \
+               the unit level (the three `x3a_git_plumbing.rs` checks above), and are proven \
+               read-only at the plumbing level — but have ZERO production callers: no HTTP \
+               route, no `sgt` verb, and no Work-lifecycle hook (admission or retirement) ever \
+               invokes them outside a test. A real Work's overlay evidence — files it changed, \
+               hashed live over its base tree — cannot actually be produced or recorded on a \
+               real installation today; the capability exists only at the unit-test level, \
+               exactly the shape the base-repo half was in before this same wave closed it. \
+               TRIPWIRE, not deleted when closed: \
+               `a1a_item_2_gap_work_overlay_scan_has_no_production_trigger` fails the day a \
+               production caller is wired, so this note's own claim is checked rather than \
+               merely asserted — update this row's verdict back to `met` and its note when \
+               that caller lands, per this file's own no-silent-pass rule (see item 4's own \
+               precedent for the shape of that update).",
     },
     Item {
         number: 3,
@@ -898,6 +926,51 @@ fn the_documented_walk_table_matches_the_register() {
                 );
             }
         }
+    }
+}
+
+// ------------------------------------------------- item 2: the overlay tripwire
+
+/// §17.2's tripwire for the half of the claim that is NOT met: "Work
+/// overlays" (a Work surface's changes, hashed live over its base tree) has
+/// no production caller anywhere `sgt` actually runs.
+///
+/// [`sergeant_rs::runtime::atlas::overlay::scan_work_overlay`],
+/// [`sergeant_rs::runtime::atlas::lane::scan_work_overlay_on_lane`] and
+/// [`sergeant_rs::runtime::atlas::record::scan_and_record_overlay`] are
+/// exercised only from test files (`tests/x3a_git_plumbing.rs` and this
+/// suite's own `checks` list) — never from `src/api.rs`'s router or
+/// `src/cli.rs`'s command dispatch, which is where every other shipped
+/// scan path (`scan_estate_git_on_lane`, `scan_local_knowledge_on_lane`,
+/// `acquire_external_git_on_lane`) is actually called from. This mirrors
+/// exactly the "function with no production caller" shape S4 Y5 left for
+/// `scan_estate_git_on_lane`, which this same wave (Y6a) closed — this
+/// tripwire is what keeps the overlay half from being reported closed
+/// alongside it by accident.
+///
+/// **If this test fails**, someone wired a production trigger for
+/// Work-overlay scanning (an API parameter, a CLI verb, or a Work-lifecycle
+/// hook). That is good news — update this row's verdict from
+/// `met-with-deviation` back to `met`, rewrite the note, and either delete
+/// this tripwire or repoint it at the new caller, per this file's own
+/// no-silent-pass rule (`item 4`'s history is the precedent for exactly
+/// this kind of update, not a deletion).
+#[test]
+fn a1a_item_2_gap_work_overlay_scan_has_no_production_trigger() {
+    let api = read("src/api.rs");
+    let cli = read("src/cli.rs");
+    for needle in [
+        "scan_work_overlay_on_lane",
+        "scan_and_record_overlay",
+        "scan_work_overlay(",
+    ] {
+        assert!(
+            !api.contains(needle) && !cli.contains(needle),
+            "src/api.rs or src/cli.rs now calls `{needle}` — a production trigger for \
+             Work-overlay scanning appears to have landed. §17 item 2's register row 2 must be \
+             updated (verdict + note) to reflect this instead of leaving it as a \
+             met-with-deviation gap; see this test's own doc comment for what to do."
+        );
     }
 }
 

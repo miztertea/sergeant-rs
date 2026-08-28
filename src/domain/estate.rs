@@ -751,6 +751,27 @@ pub enum EstateError {
         /// The repeated name.
         name: String,
     },
+    /// Panel fix (S4 Y6 review): a `[[knowledge]]` source declares the same
+    /// name as a `[[repo]]` repository. Atlas's `source.generations` table
+    /// keys a source's confirmed generation by `source_name` alone, with no
+    /// column for which of the three A1 §2 source kinds produced it — so a
+    /// same-named repo and knowledge source would silently contend for one
+    /// generation lineage, each scan evicting the other kind's evidence
+    /// rather than recording either durably. Refused here, at manifest-parse
+    /// station, the same way [`Self::DuplicateRepository`] and
+    /// [`Self::DuplicateKnowledge`] already refuse a same-kind collision —
+    /// this is the cross-kind twin of both.
+    #[error(
+        "{file} declares knowledge source name {name:?}, which is already a repository name; \
+         Atlas indexes both kinds under one source-name table, so a repository and a knowledge \
+         source may not share a name — rename one"
+    )]
+    KnowledgeNameCollidesWithRepository {
+        /// Config file that declared it.
+        file: String,
+        /// The name shared with a `[[repo]]` entry.
+        name: String,
+    },
     /// F9's path-containment refusal (panel finding 6): a `[[knowledge]]`
     /// path that canonicalizes to a location inside a declared repository
     /// mount, inside `surfaces_dir`, or inside `data_dir`.
@@ -1144,11 +1165,14 @@ fn canonical_best_effort(path: &Path) -> PathBuf {
 /// structural parsers so the two can never disagree about what a knowledge
 /// declaration means.
 ///
-/// Three checks, all at manifest-parse station:
+/// Four checks, all at manifest-parse station:
 ///
 /// 1. plain-name (mirrors [`EstateError::InvalidRepositoryName`]),
 /// 2. no duplicate names (mirrors [`EstateError::DuplicateRepository`]),
-/// 3. **path containment** — [`EstateError::KnowledgePathInsideEstate`],
+/// 3. no name shared with a `[[repo]]` entry —
+///    [`EstateError::KnowledgeNameCollidesWithRepository`], the cross-kind
+///    twin of check 2 (S4 Y6 review panel fix),
+/// 4. **path containment** — [`EstateError::KnowledgePathInsideEstate`],
 ///    panel finding 6.
 ///
 /// Existence is deliberately *not* checked: a knowledge path that is not
@@ -1195,11 +1219,25 @@ fn resolve_knowledge(
         }),
     ));
 
+    // Panel fix (S4 Y6 review): a knowledge entry is checked against
+    // `repositories`' own names *before* the knowledge-only duplicate check
+    // below, so a knowledge source sharing a repository's name is refused as
+    // plainly as two knowledge sources sharing a name — see
+    // [`EstateError::KnowledgeNameCollidesWithRepository`]'s own doc for why
+    // silently allowing it would be a real, live data-loss hazard rather
+    // than a cosmetic one: Atlas keys a confirmed generation by
+    // `source_name` alone, with no column for source kind.
     let mut seen = BTreeSet::new();
     let mut resolved = Vec::with_capacity(entries.len());
     for entry in entries {
         if !is_plain_name(&entry.name) {
             return Err(EstateError::InvalidKnowledgeName {
+                file: file.to_string(),
+                name: entry.name,
+            });
+        }
+        if repositories.iter().any(|r| r.name == entry.name) {
+            return Err(EstateError::KnowledgeNameCollidesWithRepository {
                 file: file.to_string(),
                 name: entry.name,
             });
@@ -2405,6 +2443,40 @@ mod tests {
         .expect_err("a repeated name must be refused");
         assert!(
             matches!(&err, EstateError::DuplicateRepository { name, .. } if name == "same"),
+            "got {err}"
+        );
+    }
+
+    /// Panel fix (S4 Y6 review): a `[[knowledge]]` source may not declare
+    /// the same name as a `[[repo]]` repository, either. Atlas keys a
+    /// confirmed generation by `source_name` alone with no source-kind
+    /// column, so a same-named repo and knowledge source would silently
+    /// contend for one generation lineage — each scan of one evicting the
+    /// other's evidence — exactly the cross-kind twin of
+    /// [`two_repositories_may_not_share_a_name`].
+    #[test]
+    fn a_knowledge_source_may_not_share_a_name_with_a_repository() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(&mount_path(root, "same"));
+        let notes = root.join("notes");
+        std::fs::create_dir_all(&notes).expect("notes dir");
+
+        let err = parse(
+            root,
+            &format!(
+                "[estate]\nname = \"w\"\n\n\
+                 [[repo]]\nname = \"same\"\n\n\
+                 [[knowledge]]\nname = \"same\"\npath = {:?}\n",
+                notes.display()
+            ),
+        )
+        .expect_err("a knowledge source named after a repository must be refused");
+        assert!(
+            matches!(
+                &err,
+                EstateError::KnowledgeNameCollidesWithRepository { name, .. } if name == "same"
+            ),
             "got {err}"
         );
     }

@@ -40,6 +40,18 @@
 //! object store at the pinned SHA, exactly as [`super::git`] reads it, so an
 //! overlay and a plain estate-git scan of the same base agree on every
 //! unchanged path by construction rather than by coincidence.
+//!
+//! # Not yet reachable from a real installation (review panel finding, S4 Y6)
+//!
+//! [`scan_work_overlay`] is correct and proven at the unit level
+//! (`tests/x3a_git_plumbing.rs`), but nothing in `src/api.rs` or
+//! `src/cli.rs` calls it, [`super::lane::scan_work_overlay_on_lane`], or
+//! [`super::record::scan_and_record_overlay`] — no HTTP route, no `sgt`
+//! verb, no Work-lifecycle hook. A real Work's overlay evidence cannot
+//! actually be produced today outside a test. See §17 item 2's register row
+//! in `tests/x5_a1a_acceptance.rs` (verdict `met-with-deviation`) and its
+//! tripwire `a1a_item_2_gap_work_overlay_scan_has_no_production_trigger`
+//! for the honest accounting of this gap and what closes it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

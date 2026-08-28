@@ -921,6 +921,49 @@ the wave's other named item alongside it.
     (`a1a_item_4_the_coverage_vocabulary_now_names_online_only`), the same
     pattern the cross-cutting-gap tripwire already set at S4 Y5.
 
+### Review-panel fixes (S4 Y6)
+
+Three findings from this wave's own review, fixed against the commit above
+rather than folded silently into it:
+
+- **Register row 2 corrected: honest about the Work-overlay half.** The
+  estate-scoped trigger above wires a real production caller for the
+  `estate_git` **base-repo** half of item 2's claim
+  (`scan_estate_git_on_lane`, proven in `tests/y6a_estate_scoped_scan.rs`) —
+  but the sibling **Work-overlay** half (`scan_work_overlay`,
+  `scan_work_overlay_on_lane`, `scan_and_record_overlay`) still has zero
+  production callers: no route, no verb, no Work-lifecycle hook, only test
+  callers. Row 2's verdict moves from `met` to `met-with-deviation`, its
+  note says so plainly, and a new tripwire
+  (`a1a_item_2_gap_work_overlay_scan_has_no_production_trigger`) fails the
+  day a production caller lands, so this gap cannot be reported closed by
+  accident the way the base-repo half almost was. Wiring an actual trigger
+  (a Work-lifecycle hook, or an explicit scan parameter) is CLI/API design
+  work this wave's own brief reserves for argument in review — not decided
+  unilaterally here (A1 §14).
+- **Cross-kind source-name collision refused at manifest-parse time.**
+  `source.generations` keys a confirmed generation by `source_name` alone,
+  with no column for which of the three source kinds produced it — so a
+  `[[repo]]` and a `[[knowledge]]` entry sharing a declared name silently
+  contended for one generation lineage, each scan of one kind evicting the
+  other's evidence. `resolve_knowledge` now refuses a knowledge entry named
+  after an already-declared repository
+  (`EstateError::KnowledgeNameCollidesWithRepository`), the cross-kind twin
+  of the same-kind `DuplicateRepository`/`DuplicateKnowledge` refusals that
+  already existed — closed before either scan can run, not detected after.
+- **`sgt doctor`'s atlas row surfaces `online_only` (and every other
+  coverage state).** The row's tally used to hand-pick five coverage
+  statuses; a source whose rows were entirely `online_only` (an estate
+  synced from a cloud client that has hydrated nothing) tallied zero in
+  every counted bucket and printed `ok` — indistinguishable from "nothing
+  to report", the exact silent-gap failure this row exists to prevent. The
+  tally now iterates `Coverage::ALL` (so a status added later cannot repeat
+  this omission by being forgotten here), the detail string names every
+  one including `online_only` and `generation_evicted`, and a nonzero
+  `online_only`/`error`/`unavailable` count now warns
+  (`generation_evicted` stays reported-but-not-warned: an eviction is
+  ordinary lifecycle, not a fault).
+
 ### Atlas closeout (S3)
 
 - `docs/concepts/atlas-and-knowledge.md` documents Atlas for operators: what
