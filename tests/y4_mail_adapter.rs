@@ -167,6 +167,34 @@ fn a_genuine_html_body_reaches_the_wire_and_a_synthesized_one_does_not() {
         .iter()
         .filter_map(|u| u.coordinate.as_deref())
         .collect();
+    // The mirror case (a review finding): a genuinely HTML-only message
+    // (single physically-HTML part, no `multipart/alternative` wrapper)
+    // aliases the SAME way `01-plain-text.eml` does, but in the opposite
+    // direction — the real HTML must reach the wire, and mail-parser's own
+    // `html_to_text`-converted rendering must NOT be mistaken for a genuine
+    // text body.
+    let html_only = fixture("07-genuine-html-only.eml");
+    let html_only_identity = identity_for(&html_only);
+    let html_only_outcome = run_worker(
+        spawn(html_only, &html_only_identity, REAL_RUN_DEADLINE),
+        &html_only_identity,
+        &deny(),
+    );
+    let WorkerOutcome::Accepted(html_only_batch) = html_only_outcome else {
+        panic!("must be accepted: {html_only_outcome:?}");
+    };
+    let html_only_coordinates: Vec<&str> = html_only_batch
+        .units
+        .iter()
+        .filter_map(|u| u.coordinate.as_deref())
+        .collect();
+    assert_eq!(
+        html_only_coordinates,
+        vec!["html-body"],
+        "a genuinely HTML-only message must carry its real html-body unit and must NOT gain a \
+         fabricated text-body unit (caveat 2, corrected direction): {html_only_coordinates:?}"
+    );
+
     assert_eq!(
         plain_coordinates,
         vec!["text-body"],

@@ -596,11 +596,16 @@ release.
   footprint (two new packages, well under noise once linker
   nondeterminism is corrected out of the linked-binary measurement).
 - **Two gaps the spike found in `mail-parser`'s own lenient behavior are
-  closed, not merely documented.** First: `mail-parser` synthesizes an
-  HTML body from a plain-text-only message by aliasing the identical
-  internal part index into both its text and HTML body lists rather than
-  fabricating separate content — this build detects that alias and reports
-  no HTML body at all rather than one the wire bytes never declared.
+  closed, not merely documented.** First: `mail-parser` synthesizes a
+  missing text OR html body from the message's one real part by aliasing
+  the identical internal part index into both its text and HTML body lists
+  rather than fabricating separate content — this build inspects the
+  aliased part's own physical type to tell which side is genuine and
+  reports the OTHER side absent, rather than one the wire bytes never
+  declared. (An earlier version of this fix only checked which build
+  applied to a plain-text-only message and got a genuinely HTML-only
+  message backwards — caught in review and corrected before release; both
+  directions now have their own regression fixture.)
   Second: a message that is MIME-shaped but structurally broken (an
   unterminated multipart boundary) does not fail this crate's own parse at
   all — the body part that should have been read normally instead
@@ -627,8 +632,15 @@ release.
   An attachment that is itself a ZIP archive chains through the identical
   ZIP-recursion function the ZIP wave uses on itself, sharing one nesting-
   depth ceiling and one whole-tree cumulative-bytes budget across mail and
-  archive nesting alike, never two independently sized ones. The same
-  admission discipline the ZIP wave established applies unchanged:
+  archive nesting alike, never two independently sized ones. **The reverse
+  direction chains too**: a ZIP entry named `.eml` recurses back into this
+  same mail adapter (`archive::classify` now routes `.eml`, closing a gap a
+  review finding caught — a `.eml` entry inside a ZIP previously fell
+  through to `unsupported` instead), through the same shared depth/budget —
+  so a mail-inside-a-zip-inside-a-mail chain is bounded by one ceiling and
+  one budget across the whole tree, whichever container kind each level
+  happens to be. The same admission discipline the ZIP wave established
+  applies unchanged:
   empty-name refusal, path safety, name uniqueness, and the identical
   Unicode NFC-then-case-fold collision rule, all reused outright rather
   than rebuilt.

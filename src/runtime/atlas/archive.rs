@@ -327,7 +327,7 @@
 //! safety, F10 deny-set membership) already runs, for real, against a real
 //! container adapter's real output — see `tests/y3_zip_adapter.rs`.
 //!
-//! # Reused by Y4's mail adapter (R2)
+//! # Reused by Y4's mail adapter (R2) — and the reverse direction wired here
 //!
 //! [`expand_at_depth`], [`classify`], [`collision_key`] and
 //! [`UNSUPPORTED_CHILD_EXTRACTOR`] are `pub(crate)` — not `fn`-private — so
@@ -340,6 +340,16 @@
 //! are reused outright for the identical reason `office.rs`'s own routing
 //! logic already is: one "what claims this extension" table, one
 //! normalisation rule, never two copies that could drift.
+//!
+//! The reverse direction is wired the same way, in this module: [`classify`]
+//! also recognizes a `.eml`-named entry ([`super::mail::extractor_for`]), and
+//! [`expand_at_depth`]'s own entry loop re-enters
+//! [`super::mail::parse_at_depth`] on that entry's bytes — [`ZipChild::nested_mail`]
+//! — through the SAME shared `depth`/`cumulative_expanded_bytes` this
+//! function already threads for `nested`. This is what makes a
+//! mail-inside-a-zip-inside-a-mail chain real: both container directions
+//! recurse through one function each, sharing one budget, never a second
+//! independently-sized one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
@@ -505,6 +515,23 @@ pub struct ZipChild {
     /// `ZipChild` with its own hash/key — see the module doc's
     /// `MAX_NESTING_DEPTH` bullet).
     pub nested: Option<Box<ZipExpansion>>,
+    /// Whether this entry is itself a `.eml` message by extension (module
+    /// doc, "Reused by Y4's mail adapter") — the reverse direction of
+    /// [`super::mail::MailAttachment::is_archive`].
+    pub is_nested_mail: bool,
+    /// `Some` when `is_nested_mail` is true, [`MAX_NESTING_DEPTH`] allowed
+    /// opening it, AND the nested message itself parsed cleanly — the
+    /// recursive re-entry into [`super::mail::parse_at_depth`] on this
+    /// entry's own bytes, sharing the SAME `depth`/
+    /// `cumulative_expanded_bytes` this whole recursion tree already
+    /// threads. `None` for an ordinary leaf entry, for a nested message
+    /// refused recursion by the depth ceiling, and for a nested message
+    /// that failed its own parse — both of the latter two still admit this
+    /// entry as an ordinary `ZipChild` (hash/key), naming the refusal as
+    /// its own [`CoverageRow`] rather than poisoning this level's walk
+    /// (the same "still a child, just not opened further" shape
+    /// `is_nested_archive`'s own depth-ceiling handling already keeps).
+    pub nested_mail: Option<Box<super::mail::MailMessage>>,
 }
 
 /// One archive level's whole answer: every admitted child, plus a named
@@ -894,8 +921,12 @@ pub(crate) fn expand_at_depth(
         total_expanded_bytes += entry_len;
 
         let hash = content_hash(&content);
-        let (entry_adapter, is_nested_archive) = classify(&path);
-        let key_extractor = entry_adapter.unwrap_or(UNSUPPORTED_CHILD_EXTRACTOR);
+        let (entry_adapter, is_nested_archive, is_nested_mail) = classify(&path);
+        let key_extractor = if is_nested_mail {
+            super::mail::MAIL_EXTRACTOR
+        } else {
+            entry_adapter.unwrap_or(UNSUPPORTED_CHILD_EXTRACTOR)
+        };
         let key = child_key(parent_key, &path, &hash, key_extractor);
 
         let nested = if is_nested_archive {
@@ -923,6 +954,44 @@ pub(crate) fn expand_at_depth(
             None
         };
 
+        let nested_mail = if is_nested_mail {
+            if depth + 1 > MAX_NESTING_DEPTH {
+                coverage.push(CoverageRow {
+                    path: Some(path.clone()),
+                    status: Coverage::Unsupported,
+                    detail: Some(format!(
+                        "nested message at {path:?} not opened: opening it would exceed the \
+                         {MAX_NESTING_DEPTH}-level MAX_NESTING_DEPTH ceiling; the entry itself \
+                         is still admitted as a child resource, just not recursively parsed"
+                    )),
+                    bytes: Some(entry_len),
+                });
+                None
+            } else {
+                match super::mail::parse_at_depth(
+                    &content,
+                    &key,
+                    depth + 1,
+                    cumulative_expanded_bytes,
+                ) {
+                    Ok(built) => Some(Box::new(built)),
+                    Err(error) => {
+                        coverage.push(CoverageRow {
+                            path: Some(path.clone()),
+                            status: Coverage::Error,
+                            detail: Some(format!(
+                                "nested message at {path:?} could not be parsed: {error}"
+                            )),
+                            bytes: Some(entry_len),
+                        });
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+
         children.push(ZipChild {
             relative_path: path,
             content,
@@ -931,6 +1000,8 @@ pub(crate) fn expand_at_depth(
             entry_adapter,
             is_nested_archive,
             nested,
+            is_nested_mail,
+            nested_mail,
         });
     }
 
@@ -950,19 +1021,31 @@ pub(crate) const UNSUPPORTED_CHILD_EXTRACTOR: &str = "unsupported/v1";
 
 /// The CHILD's own downstream adapter, by extension — reusing the exact
 /// routing functions a top-level scan would consult (R2), never a
-/// zip-specific guess. `(None, false)` when nothing claims it and it is not
-/// itself an archive.
-pub(crate) fn classify(relative_path: &str) -> (Option<&'static str>, bool) {
+/// zip-specific guess. Returns `(entry_adapter, is_nested_archive,
+/// is_nested_mail)`: `entry_adapter` is `None` for either container kind
+/// (a container's own identity is carried by `is_nested_archive`/
+/// `is_nested_mail`, never by `entry_adapter` — the same warning against
+/// recording every child as `adapter=zip` this module's own doc already
+/// states, extended to `.eml`), and `(None, false, false)` when nothing
+/// claims the extension and it is not itself a container of either kind.
+/// `.eml` routes to [`super::mail::parse_at_depth`] exactly the way a
+/// nested `.zip` routes to [`expand_at_depth`] — module doc, "Reused by
+/// Y4's mail adapter": one shared depth/cumulative-bytes budget, whichever
+/// container kind each level happens to be.
+pub(crate) fn classify(relative_path: &str) -> (Option<&'static str>, bool, bool) {
     if extractor_for(relative_path).is_some() {
-        return (None, true);
+        return (None, true, false);
+    }
+    if super::mail::extractor_for(relative_path).is_some() {
+        return (None, false, true);
     }
     if let Some(extractor) = super::text::extractor_for(relative_path) {
-        return (Some(extractor), false);
+        return (Some(extractor), false, false);
     }
     if let Some(extractor) = super::office::extractor_for(relative_path) {
-        return (Some(extractor), false);
+        return (Some(extractor), false, false);
     }
-    (None, false)
+    (None, false, false)
 }
 
 /// Advisory pre-filter (module doc): `true` when the header-declared ratio
@@ -1757,6 +1840,93 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("MAX_TOTAL_EXPANDED_BYTES"),
+            "{refusal:?}"
+        );
+    }
+
+    /// The reverse direction of `mail.rs`'s own
+    /// `fixture_04_nested_rfc822_recurses_via_the_same_function` test: a ZIP
+    /// entry named `.eml` must actually re-enter [`super::mail::parse_at_depth`],
+    /// not merely fall through to [`UNSUPPORTED_CHILD_EXTRACTOR`] — the exact
+    /// gap a review finding caught (module doc's own "whichever container
+    /// kind each level happens to be" claim was, before this fix, only true
+    /// one direction).
+    #[test]
+    fn a_zip_entry_named_eml_recurses_into_mail_parsing() {
+        let eml = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: nested in zip\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nMessage-ID: <in-zip@example.com>\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\nHello from inside a zip.\r\n";
+        let bytes = build(&[("message.eml", eml)]);
+        let expansion = expand(&bytes, "parent-key");
+        assert!(
+            expansion
+                .coverage
+                .iter()
+                .all(|row| row.status != Coverage::Error),
+            "no refusal expected: {:?}",
+            expansion.coverage
+        );
+        assert_eq!(expansion.children.len(), 1, "{:?}", expansion.children);
+        let child = &expansion.children[0];
+        assert!(
+            child.is_nested_mail,
+            "a .eml-named entry must be classified as nested mail"
+        );
+        assert!(!child.is_nested_archive);
+        assert_eq!(
+            child.entry_adapter, None,
+            "a container's identity is carried by is_nested_mail/nested_mail, never entry_adapter \
+             (the same warning against `adapter=zip` this module's own doc states, extended to mail)"
+        );
+        let nested = child
+            .nested_mail
+            .as_deref()
+            .expect("depth 1 is within MAX_NESTING_DEPTH and the fixture parses cleanly");
+        assert_eq!(nested.subject.as_deref(), Some("nested in zip"));
+        assert_eq!(
+            nested.text_body.as_deref(),
+            Some("Hello from inside a zip.\r\n")
+        );
+        assert_eq!(
+            child.key,
+            child_key(
+                "parent-key",
+                "message.eml",
+                &child.content_hash,
+                super::super::mail::MAIL_EXTRACTOR
+            ),
+            "a nested message's own key uses MAIL_EXTRACTOR, not the container's identity"
+        );
+    }
+
+    /// The depth ceiling applies to a mail entry exactly as it does to a
+    /// nested archive entry (module doc, "one shared budget"): a `.eml`
+    /// entry past [`MAX_NESTING_DEPTH`] is still admitted as a `ZipChild`,
+    /// just not recursively parsed, and the refusal is its own named
+    /// [`CoverageRow`].
+    #[test]
+    fn a_zip_entry_named_eml_past_the_depth_ceiling_is_admitted_but_not_parsed() {
+        let eml = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: too deep\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\ntoo deep\r\n";
+        let bytes = build(&[("too-deep.eml", eml)]);
+        let mut cumulative = 0u64;
+        let expansion = expand_at_depth(&bytes, "parent-key", MAX_NESTING_DEPTH, &mut cumulative);
+        assert_eq!(expansion.children.len(), 1, "{:?}", expansion.children);
+        let child = &expansion.children[0];
+        assert!(child.is_nested_mail);
+        assert!(
+            child.nested_mail.is_none(),
+            "depth exceeded MAX_NESTING_DEPTH: must not recurse"
+        );
+        let refusal = expansion
+            .coverage
+            .iter()
+            .find(|r| r.path.as_deref() == Some("too-deep.eml"))
+            .expect("a coverage row names the refusal");
+        assert_eq!(refusal.status, Coverage::Unsupported);
+        assert!(
+            refusal
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("MAX_NESTING_DEPTH"),
             "{refusal:?}"
         );
     }

@@ -426,11 +426,16 @@ const WALK: &[Item] = &[
                (References + In-Reply-To folded, deduplicated), attachments — provenance carries \
                parser identity + version (`mail::MAIL_EXTRACTOR`). TWO caveats the spike found \
                empirically are CLOSED, not merely named as downstream work: (1) a synthesized \
-               HTML body (`mail-parser` aliases the SAME MessagePartId into both `text_body` and \
-               `html_body` when no genuine alternative exists — VERIFIED against `mail-parser`'s \
-               own source, `parsers/message.rs`, not merely observed) is detected by comparing \
-               the raw part indices and reported as absent, matching `manifest.json`'s own \
-               wire-bytes-only definition of `body_html_present`; (2) a message-shaped-but-broken \
+               text or HTML body (`mail-parser` aliases the SAME MessagePartId into both \
+               `text_body` and `html_body` when no genuine alternative exists — VERIFIED against \
+               `mail-parser`'s own source, `parsers/message.rs`, not merely observed) is detected \
+               by inspecting the aliased part's own physical PartType (not index equality alone \
+               — an index-only version shipped a direction bug, caught in review, that discarded \
+               a genuinely HTML-only message's real HTML and reported mail-parser's own \
+               html_to_text-converted rendering as a genuine text body) and reports whichever \
+               side is the synthesized alias absent, matching `manifest.json`'s own \
+               wire-bytes-only definition of `body_html_present`/`body_text_present`; (2) a \
+               message-shaped-but-broken \
                input (an unterminated MIME boundary) that `mail-parser` silently downgrades into \
                a nameless attachment (SPIKE-G4.md's own diagnostic finding) is detected — any \
                leaf, non-message attachment with no recoverable name — and refuses the WHOLE \
@@ -451,7 +456,12 @@ const WALK: &[Item] = &[
                `archive::expand_at_depth` — the SAME function `archive.rs` calls on itself, \
                widened to `pub(crate)` (R2) so mail and archive nesting share ONE depth counter \
                and ONE whole-tree cumulative-bytes budget, never two independently-sized ones. \
-               THE SAME ADMISSION DISCIPLINE AS Y3 (brief item 3): empty-name refusal, \
+               THE REVERSE DIRECTION CHAINS TOO (a review finding, closed here, not merely \
+               documented): `archive::classify` now routes a `.eml`-named ZIP entry back into \
+               THIS module's own `parse_at_depth`, through the same shared depth/budget — a \
+               `.eml` entry inside a ZIP previously fell through to `unsupported` despite this \
+               module's own doc already claiming the chain worked whichever container kind each \
+               level happens to be. THE SAME ADMISSION DISCIPLINE AS Y3 (brief item 3): empty-name refusal, \
                path-safety per `/`-component via `domain::is_plain_name`, name uniqueness, and \
                the identical Unicode NFC-then-case-fold collision rule via \
                `archive::collision_key` — reused outright (R2), not a second copy. BOUNDS \

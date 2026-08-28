@@ -169,10 +169,14 @@ passes.
 
 ## (b) Hand-verified `.eml` fixture corpus
 
-**Result: PASS.** Full methodology, per-fixture coverage table, and the
-exact-match counts live in `MANIFEST.md` and `manifest.json` beside this
-file — not restated here so there is one place that can drift. Summary of
-what was done, in order:
+**Result: PASS**, against `manifest.json`'s CURRENT (corrected) values, not
+against every value this file originally reported here at spike time — see
+step 3 below and `MANIFEST.md`'s own "One field corrected in Y4" section for
+the one field that did not match at spike time and was fixed downstream.
+Full methodology, per-fixture coverage table, and the exact-match counts
+live in `MANIFEST.md` and `manifest.json` beside this file — not restated
+here so there is one place that can drift. Summary of what was done, in
+order:
 
 1. Six `.eml` fixtures hand-authored as raw bytes (`build_mail_fixtures.py`)
    covering: plain text; `multipart/alternative` (text+HTML); an attachment;
@@ -185,10 +189,31 @@ what was done, in order:
 3. Independently cross-checked with Python's stdlib `email` package
    (`verify_with_stdlib_email.py`; transcript `stdlib-email-crosscheck.txt`)
    — a different implementation from both the authoring script and from
-   `mail-parser`. Every value matched exactly: header counts, address
-   counts, decoded Subject/From (RFC 2047), decoded body text (including
-   the windows-1252→Unicode round-trip through quoted-printable), and
-   attachment byte lengths.
+   `mail-parser`. Header counts, address counts, decoded Subject/From (RFC
+   2047), the windows-1252→Unicode round-trip through quoted-printable, and
+   attachment byte lengths all matched exactly. **One field did not**:
+   fixture `04-nested-rfc822.eml`'s `nested_message.body_text_decoded`, as
+   originally hand-typed into `manifest.json` at spike time, read with no
+   trailing `\r\n`; `stdlib-email-crosscheck.txt` (this same commit,
+   `a6e21c3d`) already shows a trailing newline on this exact field
+   (`'...now nested one level deep.\n'`), and the diagnostic `mail-parser`
+   run below (step 4, same commit) shows `\r\n` — both independent sources
+   disagreed with the hand-authored manifest value at the moment this gate
+   was recorded, which this file did not say at the time. **This is a
+   correction to what this gate actually found, not a new re-run**: this
+   file originally claimed an exact three-way match here, and that claim
+   was false against artifacts committed in this very commit. The field was
+   fixed downstream, in the adoption wave, after a direct re-read of the
+   fixture's own raw bytes settled which trailing terminator RFC 2046
+   §5.1.1 actually assigns to the boundary versus the body (`MANIFEST.md`'s
+   own "One field corrected in Y4" section, `manifest.json`'s own
+   `body_text_decoded_correction_note`) — the corrected value is
+   independently re-verified (a direct hex read of the fixture plus stdlib
+   `email`) and is very likely correct, so this is a correction to this
+   record's own claim, not a reason to revisit the adopt decision. No other
+   field, on this fixture or any other, is affected — see the full
+   per-field comparison in `stdlib-email-crosscheck.txt` and
+   `mail-parser-diagnostic-run.txt`, both committed alongside this file.
 4. **Only then**, `mail-parser` was run once, diagnostically, from a
    throwaway scratch crate **outside this repository**
    (`/var/tmp/hats4-mailspike-scratch/`, never part of `hats4/y4`'s git
@@ -197,18 +222,23 @@ what was done, in order:
    source kept for the record: `mail-parser-diagnostic-probe.rs`,
    `mail-parser-diagnostic-probe.Cargo.toml.txt`.
 
-### The diagnostic run — all five valid fixtures matched exactly
+### The diagnostic run — four of five valid fixtures matched exactly; one field on the fifth did not, at the time
 
-For fixtures `01`–`05`, `mail-parser`'s header counts, decoded Subject/From,
-decoded body text, and attachment name/length matched `manifest.json`'s
-independently-verified values **exactly**, including the full encoding-zoo
-round-trip (`Café update ☕` recovered from the B-encoded Subject, `René
-Dupont` from the Q-encoded From, and `Prix unitaire: 12€ le café.\nTotal:
-24€.` recovered byte-correct from windows-1252 quoted-printable — the same
-three values `verify_with_stdlib_email.py` independently produced). Fixture
-`04`'s nested `message/rfc822` was reached via `attachment.message()`
-exactly as ctx7's docs described, with the inner message's own subject and
-body both correct.
+For fixtures `01`–`03` and `05`, `mail-parser`'s header counts, decoded
+Subject/From, decoded body text, and attachment name/length matched
+`manifest.json`'s independently-verified values **exactly**, including the
+full encoding-zoo round-trip (`Café update ☕` recovered from the B-encoded
+Subject, `René Dupont` from the Q-encoded From, and `Prix unitaire: 12€ le
+café.\nTotal: 24€.` recovered byte-correct from windows-1252
+quoted-printable — the same three values `verify_with_stdlib_email.py`
+independently produced). Fixture `04`'s nested `message/rfc822` was reached
+via `attachment.message()` exactly as ctx7's docs described, with the inner
+message's own subject correct — **but its decoded body text, as this file
+originally reported here, was NOT an exact match against the hand-authored
+manifest value at spike time**: `mail-parser` produced a trailing `\r\n`
+`manifest.json` did not have (see gate (b) step 3, above, for the full
+correction and why the corrected value — not the original manifest
+value — is the one independently re-verified as correct).
 
 ### Fixture 06 passed its own requirement
 

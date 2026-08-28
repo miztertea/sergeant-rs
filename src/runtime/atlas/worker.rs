@@ -952,6 +952,23 @@ mod tests {
         }
     }
 
+    /// A review finding: this AUTHORITY recheck is the daemon-side backstop
+    /// against a worker-declared child path/name — `Path::new("C:")
+    /// .components().count() == 1` on the Unix host this build runs on, so a
+    /// Windows drive-letter-absolute path was, before the fix in
+    /// [`crate::domain::is_plain_name`], admitted component-by-component as
+    /// "plain" despite this module's own doc claiming `enclosed_name`
+    /// semantics ("a relative path with no absolute component").
+    #[test]
+    fn enclosed_relative_path_rejects_a_windows_drive_letter_absolute_path() {
+        for unsafe_path in ["C:/Windows/System32/evil.zip", "c:/evil.txt", "D:/x"] {
+            assert!(
+                !enclosed_relative_path(unsafe_path),
+                "{unsafe_path:?} must not be enclosed-safe"
+            );
+        }
+    }
+
     /// A worker binary that does not exist at all is a spawn failure, not a
     /// panic and not a hang — the same "reported, never absorbed" rule every
     /// other Atlas failure mode already follows.

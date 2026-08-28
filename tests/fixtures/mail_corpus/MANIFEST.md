@@ -102,6 +102,24 @@ adopt/escalate call — see `SPIKE-G4.md`, gate (b), "A caveat found
 empirically." Recorded here as a byte-exact fixture rather than only
 described in prose, so the claim is checkable.
 
+## `07-genuine-html-only.eml` — not part of the exact-match corpus
+
+Not one of the six required fixtures, and `manifest.json` makes no claim
+about it (same status as `diagnostic-not-manifest-broken-mime.eml`,
+above). Added downstream of the spike, in the adoption wave, as a
+regression pin for a review finding: a single part, physically
+`text/html`, with no `multipart/alternative` wrapper and no `text/plain`
+part anywhere in the wire bytes — the mirror image of `01-plain-text.eml`.
+`mail-parser` aliases this single part into both `text_body` and
+`html_body` exactly as it does for `01`'s plain-text part (module doc on
+`mail.rs`, caveat 2, case (a)), so `mail.rs`'s own genuineness check must
+tell the two shapes apart by the aliased part's own physical type, not by
+index equality alone — an earlier version of that check always trusted
+the text side on a collision, which is right for `01` and backwards for
+this fixture. See `src/runtime/atlas/mail.rs`'s own
+`fixture_07_html_only_message_keeps_genuine_html_and_never_gains_fake_text`
+test.
+
 ## Reproducing this corpus
 
 ```sh

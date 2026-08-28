@@ -41,14 +41,35 @@
 //! part only" blocks copy the found vector's part ids into the *missing*
 //! vector verbatim. Either way, the tell is identical and checkable without
 //! inspecting content at all: **the same [`mail_parser::MessagePartId`]
-//! present at the front of both `text_body` and `html_body` means the "HTML"
-//! is an alias of the plain-text part, not a part the wire bytes actually
-//! declared `Content-Type: text/html`.** [`genuine_html`] is exactly this
-//! check. `manifest.json`'s own `body_html_present` field is defined against
-//! the wire bytes for the identical reason (`MANIFEST.md`'s own
-//! `counting_rules`), so this module's `html_body: None` on a synthesized
-//! case is what keeps [`MailMessage`] answering the *same* question the
-//! fixture corpus's own ground truth answers.
+//! present at the front of both `text_body` and `html_body` means ONE side
+//! is an alias of the other, not a part the wire bytes actually declared on
+//! that side.**
+//!
+//! **Which side is the alias is not implied by index equality alone, and an
+//! earlier version of this module got that direction wrong** — case (a) is
+//! symmetric: a single physically-`text/html` part with no
+//! `multipart/alternative` wrapper ALSO defaults `need_html_body`/
+//! `need_text_body` both `true`, so a genuinely HTML-only message hits the
+//! identical index-collision shape a bare `text/plain` message does. Always
+//! trusting `text_body` as the genuine side on a collision (an earlier
+//! version of [`genuine_bodies`], then named `genuine_html`, did exactly
+//! this) silently discarded that message's own real HTML and surfaced
+//! `mail-parser`'s own `html_to_text`-converted rendering as `text_body`,
+//! labeled genuine — backwards. [`genuine_bodies`] fixes this by inspecting
+//! the aliased part's own [`mail_parser::PartType`] directly
+//! (`Message::part`) on a collision, rather than assuming a direction; see
+//! its own doc for the full case analysis. `manifest.json`'s own
+//! `body_html_present` field is defined against the wire bytes for the
+//! identical reason (`MANIFEST.md`'s own `counting_rules`), so this
+//! module's `None` on whichever field is the synthesized side is what
+//! keeps [`MailMessage`] answering the *same* question the fixture
+//! corpus's own ground truth answers — now correctly for BOTH directions of
+//! the alias, not only the one the original fixture corpus exercised
+//! (fixture 01, plain-text-only; the mirror case, fixture
+//! `07-genuine-html-only.eml`, a regression pin for exactly this finding,
+//! is not part of the exact-match corpus for the same reason
+//! `diagnostic-not-manifest-broken-mime.eml` is not — `MANIFEST.md`'s own
+//! "not part of the exact-match corpus" precedent).
 //!
 //! ## 2. Silent degraded-parse recovery (caveat 1) — a narrow, stated
 //! heuristic, not a general strict mode
@@ -328,11 +349,13 @@ pub struct MailMessage {
     pub sent: Option<String>,
     /// The `Subject:` header, RFC 2047-decoded, when present.
     pub subject: Option<String>,
-    /// The genuine `text/plain` body, when this message has one.
+    /// The genuine `text/plain` body, when this message has one — **never**
+    /// a body `mail-parser` synthesized from an HTML-only source (module
+    /// doc, caveat 2; [`genuine_bodies`]).
     pub text_body: Option<String>,
     /// The genuine `text/html` body — **never** a body `mail-parser`
-    /// synthesized from a plain-text-only source (module doc, caveat 1;
-    /// [`genuine_html`]).
+    /// synthesized from a plain-text-only source (module doc, caveat 2;
+    /// [`genuine_bodies`]).
     pub html_body: Option<String>,
     /// The `Message-ID:` header, when present.
     pub message_id: Option<String>,
@@ -417,7 +440,7 @@ pub fn parse_message(bytes: &[u8], parent_key: &str) -> Result<MailMessage, Mail
 /// into mail); [`build_mail_message`] is for an already-parsed
 /// `mail_parser::Message`, which a `message/rfc822` attachment always is by
 /// the time this module ever sees it.
-fn parse_at_depth(
+pub(crate) fn parse_at_depth(
     bytes: &[u8],
     parent_key: &str,
     depth: u32,
@@ -450,10 +473,13 @@ fn build_mail_message(
 
     let text_index = message.text_body.first().copied();
     let html_index = message.html_body.first().copied();
-    let text_body = text_index
-        .and_then(|_| message.body_text(0))
-        .map(|c| c.into_owned());
-    let html_body = if genuine_html(text_index, html_index) {
+    let (genuine_text, genuine_html) = genuine_bodies(message, text_index, html_index);
+    let text_body = if genuine_text {
+        message.body_text(0).map(|c| c.into_owned())
+    } else {
+        None
+    };
+    let html_body = if genuine_html {
         message.body_html(0).map(|c| c.into_owned())
     } else {
         None
@@ -588,11 +614,20 @@ fn build_mail_message(
 
         let content_type = content_type_string(part);
         let hash = content_hash(&content);
-        let is_archive = !is_message && archive::classify(&filename).1;
+        // `.2` (archive::classify's own filename-driven mail detection) is
+        // irrelevant here: an attachment's `is_message` already comes from
+        // mail-parser's own actual MIME structure
+        // (`part.is_message()`) via `Content-Type: message/rfc822`, which is
+        // strictly more authoritative than a `.eml` filename — a container
+        // ZIP entry has no MIME Content-Type at all, which is exactly why
+        // `archive::expand_at_depth` needs `.2` for its own filename-driven
+        // classification and this loop does not.
+        let (classified_adapter, classified_archive, _) = archive::classify(&filename);
+        let is_archive = !is_message && classified_archive;
         let entry_adapter = if is_message || is_archive {
             None
         } else {
-            archive::classify(&filename).0
+            classified_adapter
         };
         let key_extractor = if is_message {
             MAIL_EXTRACTOR
@@ -609,11 +644,24 @@ fn build_mail_message(
 
         if is_message {
             if depth + 1 > MAX_NESTING_DEPTH {
-                nested_message_error = Some(format!(
+                let detail = format!(
                     "nested message at {filename:?} not opened: opening it would exceed the \
                      {MAX_NESTING_DEPTH}-level MAX_NESTING_DEPTH ceiling; the attachment itself \
                      is still admitted as a child resource, just not recursively parsed"
-                ));
+                );
+                // Its own named CoverageRow, mirroring exactly what the
+                // parallel nested-archive depth-ceiling branch below already
+                // does — module doc's own "never a silent skip" claim for
+                // `coverage`, and the brief's "each refusal its own named
+                // coverage row" (a review finding: this row was previously
+                // missing, recorded only in `nested_message_error`).
+                coverage.push(CoverageRow {
+                    path: Some(filename.clone()),
+                    status: Coverage::Unsupported,
+                    detail: Some(detail.clone()),
+                    bytes: Some(entry_len),
+                });
+                nested_message_error = Some(detail);
             } else {
                 // `part.message()` is `mail-parser`'s OWN already-parsed
                 // embedded value (module doc on `parse_at_depth`, and this
@@ -628,18 +676,36 @@ fn build_mail_message(
                         {
                             Ok(built) => nested_message = Some(Box::new(built)),
                             Err(error) => {
-                                nested_message_error = Some(format!(
+                                let detail = format!(
                                     "nested message at {filename:?} could not be parsed: {error}"
-                                ));
+                                );
+                                // Its own named CoverageRow (Error, not
+                                // Unsupported — the inner message WAS opened
+                                // and failed to parse, not merely refused by
+                                // a ceiling), same discipline as above.
+                                coverage.push(CoverageRow {
+                                    path: Some(filename.clone()),
+                                    status: Coverage::Error,
+                                    detail: Some(detail.clone()),
+                                    bytes: Some(entry_len),
+                                });
+                                nested_message_error = Some(detail);
                             }
                         }
                     }
                     None => {
-                        nested_message_error = Some(format!(
+                        let detail = format!(
                             "nested message at {filename:?}: mail-parser reported \
                              `is_message()` true but embedded no parsed message \
                              (unreachable in practice — recorded rather than panicking)"
-                        ));
+                        );
+                        coverage.push(CoverageRow {
+                            path: Some(filename.clone()),
+                            status: Coverage::Error,
+                            detail: Some(detail.clone()),
+                            bytes: Some(entry_len),
+                        });
+                        nested_message_error = Some(detail);
                     }
                 }
             }
@@ -696,18 +762,60 @@ fn build_mail_message(
     })
 }
 
-/// Caveat 2's own detection (module doc): the SAME [`mail_parser::MessagePartId`]
-/// at the front of both `text_body` and `html_body` means the HTML is an
-/// alias `mail-parser` synthesized, never a part the wire bytes declared
-/// `Content-Type: text/html`. `(None, Some(_))` (HTML present, no text part
-/// at all — an HTML-only message) is genuine: the synthesis code paths
-/// (module doc) only ever fire from an EXISTING part shared into the
-/// opposite vector, never fabricate one from nothing.
-fn genuine_html(text_index: Option<u32>, html_index: Option<u32>) -> bool {
+/// Caveat 2's own detection (module doc), corrected by a review finding: the
+/// SAME [`mail_parser::MessagePartId`] at the front of both `text_body` and
+/// `html_body` means ONE of the two is an alias `mail-parser` synthesized
+/// from the OTHER, never a part the wire bytes declared `Content-Type:
+/// text/html` — but index equality alone cannot say WHICH side is the alias.
+///
+/// The bug this replaces: the prior version always treated `html_body` as
+/// the fake side and `text_body` as genuine on an index collision. That is
+/// correct for case (a)'s bare-`text/plain` shape (module doc: a single
+/// `text/plain` part, no alternative, gets pushed onto both vectors), but
+/// case (a) is symmetric — a single, physically-HTML part with no
+/// `multipart/alternative` wrapper at all ALSO defaults `need_html_body`/
+/// `need_text_body` both `true`, so it is pushed onto both vectors too. On
+/// THAT shape the prior version discarded the message's own real
+/// `text/html` content (nulling `html_body`) and instead surfaced
+/// `mail-parser`'s own `html_to_text`-converted rendering as `text_body`,
+/// labeled genuine — exactly backwards, for a genuinely HTML-only message.
+///
+/// Fixed by inspecting the aliased part's own [`mail_parser::PartType`]
+/// directly ([`mail_parser::Message::part`]) rather than guessing from
+/// indices alone: `PartType::Html` means the HTML side is genuine and the
+/// text side is `mail-parser`'s own synthesized rendering (nulled here, not
+/// merely left unlabeled — module doc's own "never a body mail-parser
+/// synthesized" claim, applied to BOTH fields now, not only `html_body`);
+/// `PartType::Text` is the reverse, matching the prior (correct-for-that-case)
+/// behavior.
+///
+/// `(Some(_), Some(_))` with DISTINCT indices is a real `multipart/alternative`
+/// supplying both bodies — both genuine. `(None, Some(_))`/`(Some(_), None)`
+/// with only one vector populated at all (no aliasing possible: the missing
+/// side truly has no part id) is genuine on the present side, nothing on the
+/// absent side — the synthesis code paths (module doc) only ever fire from
+/// an EXISTING part shared into the OPPOSITE vector, never fabricate a part
+/// id from nothing.
+fn genuine_bodies(
+    message: &mail_parser::Message<'_>,
+    text_index: Option<u32>,
+    html_index: Option<u32>,
+) -> (bool, bool) {
     match (text_index, html_index) {
-        (Some(text), Some(html)) => text != html,
-        (None, Some(_)) => true,
-        _ => false,
+        (Some(text), Some(html)) if text == html => match message.part(text).map(|p| &p.body) {
+            Some(mail_parser::PartType::Html(_)) => (false, true),
+            Some(mail_parser::PartType::Text(_)) => (true, false),
+            // Unreachable in practice (a part id only ever lands in
+            // `text_body`/`html_body` for a Text or Html part — mail-parser's
+            // own `parsers/message.rs`), but a body part of any other
+            // physical shape is honestly neither side's genuine content, so
+            // neither is admitted, rather than guessing.
+            _ => (false, false),
+        },
+        (Some(_), Some(_)) => (true, true),
+        (Some(_), None) => (true, false),
+        (None, Some(_)) => (false, true),
+        (None, None) => (false, false),
     }
 }
 
@@ -827,6 +935,33 @@ mod tests {
         assert!(message.attachments.is_empty());
     }
 
+    /// The mirror image of `fixture_01_plain_text_message_shape` (a review
+    /// finding): a genuinely HTML-only message — single part, no
+    /// `multipart/alternative` wrapper, no `text/plain` part anywhere in
+    /// the wire bytes — must keep its real `html_body` and must NOT gain a
+    /// fabricated `text_body` labeled genuine.
+    #[test]
+    fn fixture_07_html_only_message_keeps_genuine_html_and_never_gains_fake_text() {
+        let bytes = fixture("07-genuine-html-only.eml");
+        let message = parse_message(&bytes, "parent-key").expect("parses");
+        assert!(
+            message
+                .html_body
+                .as_deref()
+                .unwrap_or_default()
+                .contains("<b>no</b> multipart/alternative wrapper"),
+            "the message's own real text/html part must not be discarded: {:?}",
+            message.html_body
+        );
+        assert_eq!(
+            message.text_body, None,
+            "no genuine text/plain in the wire bytes — mail-parser's own html_to_text-converted \
+             rendering must read as absent, never as a genuine text body (caveat 2, corrected \
+             direction)"
+        );
+        assert_eq!(message.subject.as_deref(), Some("HTML-only status update"));
+    }
+
     #[test]
     fn fixture_02_multipart_alternative_both_bodies_are_genuine() {
         let bytes = fixture("02-multipart-alternative.eml");
@@ -913,6 +1048,90 @@ mod tests {
         );
     }
 
+    /// A mail-inside-a-zip-inside-a-mail chain (module doc, "Container
+    /// recursion is one shared budget"): an attachment that is a ZIP
+    /// containing a `.eml` entry must have that entry recurse back into
+    /// [`parse_message`] — the reverse direction of
+    /// `fixture_04_nested_rfc822_recurses_via_the_same_function`'s own
+    /// mail-inside-a-mail case, closing the gap a review finding caught in
+    /// [`super::archive::classify`].
+    #[test]
+    fn an_attachment_zip_containing_an_eml_entry_recurses_all_the_way_in() {
+        let inner_eml = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: deep inside\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nContent-Type: text/plain; charset=us-ascii\r\n\r\ndeep inside\r\n";
+        let mut zip_bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_bytes));
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            writer.start_file("inner.eml", options).expect("start_file");
+            std::io::Write::write_all(&mut writer, inner_eml).expect("write entry");
+            writer.finish().expect("finish archive");
+        }
+
+        // A minimal RFC 4648 base64 encoder, local to this test: no crate in
+        // this build's own Cargo.toml exposes base64 as a direct dependency
+        // (R1 — it is only ever present transitively, via mail-parser's own
+        // dependency tree, and Rust does not let this crate's own code use a
+        // dependency it never declared), and a raw binary
+        // `Content-Transfer-Encoding` risks the ZIP's own bytes colliding
+        // with the `--B` boundary delimiter, so encoding it is the honest
+        // way to embed arbitrary binary content in a hand-built MIME fixture.
+        fn base64_encode(data: &[u8]) -> String {
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+            for chunk in data.chunks(3) {
+                let b0 = chunk[0];
+                let b1 = chunk.get(1).copied();
+                let b2 = chunk.get(2).copied();
+                let n =
+                    (b0 as u32) << 16 | (b1.unwrap_or(0) as u32) << 8 | (b2.unwrap_or(0) as u32);
+                out.push(ALPHABET[(n >> 18 & 0x3F) as usize] as char);
+                out.push(ALPHABET[(n >> 12 & 0x3F) as usize] as char);
+                out.push(if b1.is_some() {
+                    ALPHABET[(n >> 6 & 0x3F) as usize] as char
+                } else {
+                    '='
+                });
+                out.push(if b2.is_some() {
+                    ALPHABET[(n & 0x3F) as usize] as char
+                } else {
+                    '='
+                });
+            }
+            out
+        }
+
+        let raw = [
+            b"From: a@example.com\r\nTo: b@example.com\r\nSubject: outer\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"B\"\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nbody\r\n--B\r\nContent-Type: application/zip; name=\"bundle.zip\"\r\nContent-Disposition: attachment; filename=\"bundle.zip\"\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+                .to_vec(),
+            base64_encode(&zip_bytes).into_bytes(),
+            b"\r\n--B--\r\n".to_vec(),
+        ]
+        .concat();
+
+        let message = parse_message(&raw, "parent-key").expect("outer message parses");
+        assert_eq!(message.attachments.len(), 1, "{:?}", message.attachments);
+        let attachment = &message.attachments[0];
+        assert!(attachment.is_archive);
+        let expansion = attachment
+            .nested_archive
+            .as_deref()
+            .expect("depth 1 is within MAX_NESTING_DEPTH");
+        assert_eq!(expansion.children.len(), 1, "{:?}", expansion.children);
+        let zip_entry = &expansion.children[0];
+        assert!(
+            zip_entry.is_nested_mail,
+            "the .eml entry inside the attachment ZIP must be classified as nested mail"
+        );
+        let nested = zip_entry
+            .nested_mail
+            .as_deref()
+            .expect("depth 2 is within MAX_NESTING_DEPTH and the entry parses cleanly");
+        assert_eq!(nested.subject.as_deref(), Some("deep inside"));
+        assert_eq!(nested.text_body.as_deref(), Some("deep inside\r\n"));
+    }
+
     #[test]
     fn fixture_05_encoding_zoo_round_trips_byte_correct() {
         let bytes = fixture("05-encoding-zoo.eml");
@@ -963,24 +1182,160 @@ mod tests {
         );
     }
 
+    // ----------------------------------------- nested-message refusal coverage
+
+    /// A review finding: the parallel case to
+    /// `nested_archives_share_one_cumulative_budget_not_a_fresh_one_per_level`
+    /// (`archive.rs`) and its own depth-ceiling coverage row — a
+    /// `message/rfc822` attachment past [`MAX_NESTING_DEPTH`] must get its
+    /// OWN named [`CoverageRow`], not only the per-attachment
+    /// `nested_message_error` string.
+    #[test]
+    fn nested_message_past_the_depth_ceiling_gets_its_own_coverage_row() {
+        let bytes = fixture("04-nested-rfc822.eml");
+        let mut cumulative_expanded_bytes = 0u64;
+        let message = parse_at_depth(
+            &bytes,
+            "parent-key",
+            MAX_NESTING_DEPTH,
+            &mut cumulative_expanded_bytes,
+        )
+        .expect("outer message parses");
+        assert_eq!(message.attachments.len(), 1, "{:?}", message.attachments);
+        let attachment = &message.attachments[0];
+        assert!(
+            attachment.nested_message.is_none(),
+            "depth exceeded MAX_NESTING_DEPTH: must not recurse"
+        );
+        assert!(attachment.nested_message_error.is_some());
+        let row = message
+            .coverage
+            .iter()
+            .find(|r| r.path.as_deref() == Some("original.eml"))
+            .expect("a coverage row names the refusal, mirroring the nested-archive case");
+        assert_eq!(row.status, Coverage::Unsupported);
+        assert!(
+            row.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("MAX_NESTING_DEPTH"),
+            "{row:?}"
+        );
+    }
+
+    /// The other half of the same finding: an inner message that fails its
+    /// OWN parse (here, `Sealed` — an S/MIME-enveloped nested message) must
+    /// ALSO get its own named [`CoverageRow`] (`Coverage::Error`, since the
+    /// inner message WAS opened and failed, not merely refused by a
+    /// ceiling), not only `nested_message_error`.
+    #[test]
+    fn nested_message_whose_own_parse_fails_gets_its_own_coverage_row() {
+        let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: outer\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"B\"\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nbody\r\n--B\r\nContent-Type: message/rfc822\r\nContent-Disposition: attachment; filename=\"sealed.eml\"\r\n\r\nFrom: x@example.com\r\nTo: y@example.com\r\nSubject: sealed inner\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data\r\nContent-Transfer-Encoding: base64\r\n\r\nAAAA\r\n--B--\r\n";
+        let message = parse_message(raw, "parent-key").expect("outer message parses");
+        assert_eq!(message.attachments.len(), 1, "{:?}", message.attachments);
+        let attachment = &message.attachments[0];
+        assert!(attachment.is_message);
+        assert!(
+            attachment.nested_message.is_none(),
+            "the inner message's own parse must fail (it is S/MIME-sealed)"
+        );
+        let error_text = attachment
+            .nested_message_error
+            .as_deref()
+            .expect("named on the attachment");
+        assert!(error_text.contains("could not be parsed"), "{error_text:?}");
+        let row = message
+            .coverage
+            .iter()
+            .find(|r| r.path.as_deref() == Some("sealed.eml"))
+            .expect("a coverage row names the refusal, mirroring the nested-archive case");
+        assert_eq!(row.status, Coverage::Error);
+    }
+
     // ------------------------------------------------------- caveat 2, directly
 
     #[test]
-    fn genuine_html_rejects_a_shared_index_and_admits_a_distinct_one() {
-        assert!(
-            !genuine_html(Some(3), Some(3)),
-            "the same part index in both vectors is a synthesized alias"
+    fn genuine_bodies_distinct_indices_are_both_genuine() {
+        let bytes = fixture("02-multipart-alternative.eml");
+        let message = MessageParser::default().parse(&bytes).expect("parses");
+        let text_index = message.text_body.first().copied();
+        let html_index = message.html_body.first().copied();
+        assert_ne!(
+            text_index, html_index,
+            "fixture 02 declares two distinct, separately-declared parts"
         );
-        assert!(
-            genuine_html(Some(1), Some(2)),
-            "distinct indices are two real, separately-declared parts"
+        assert_eq!(
+            genuine_bodies(&message, text_index, html_index),
+            (true, true)
         );
-        assert!(
-            genuine_html(None, Some(2)),
+    }
+
+    /// The bug this finding caught, pinned directly: a single, physically
+    /// `text/html` part with no `multipart/alternative` wrapper is aliased
+    /// into BOTH `text_body` and `html_body` (module doc, case (a)) exactly
+    /// as a bare `text/plain` message is — the HTML side must be admitted as
+    /// genuine and the text side (mail-parser's own `html_to_text`-converted
+    /// rendering) must NOT be, which an earlier version of this function got
+    /// backwards.
+    #[test]
+    fn genuine_bodies_an_aliased_html_only_part_is_html_genuine_text_synthesized() {
+        let bytes = fixture("07-genuine-html-only.eml");
+        let message = MessageParser::default().parse(&bytes).expect("parses");
+        let text_index = message.text_body.first().copied();
+        let html_index = message.html_body.first().copied();
+        assert_eq!(
+            text_index, html_index,
+            "the single physically-HTML part must be aliased into both vectors"
+        );
+        assert!(text_index.is_some());
+        assert_eq!(
+            genuine_bodies(&message, text_index, html_index),
+            (false, true),
+            "the HTML side is the genuine wire content; the text side is mail-parser's own \
+             html_to_text-converted rendering, not real declared content"
+        );
+    }
+
+    /// The mirror of the above, and the case an earlier version of this
+    /// function DID get right: a bare `text/plain` message aliases the
+    /// same way, but the text side is genuine and the HTML side is
+    /// synthesized.
+    #[test]
+    fn genuine_bodies_an_aliased_text_only_part_is_text_genuine_html_synthesized() {
+        let bytes = fixture("01-plain-text.eml");
+        let message = MessageParser::default().parse(&bytes).expect("parses");
+        let text_index = message.text_body.first().copied();
+        let html_index = message.html_body.first().copied();
+        assert_eq!(text_index, html_index);
+        assert!(text_index.is_some());
+        assert_eq!(
+            genuine_bodies(&message, text_index, html_index),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn genuine_bodies_one_sided_and_absent_cases() {
+        // `message` content is irrelevant to these three arms — none of
+        // them read through `Message::part` — so any already-parsed message
+        // stands in.
+        let bytes = fixture("07-genuine-html-only.eml");
+        let message = MessageParser::default().parse(&bytes).expect("parses");
+        assert_eq!(
+            genuine_bodies(&message, None, Some(2)),
+            (false, true),
             "HTML with no text part at all is a genuine HTML-only message"
         );
-        assert!(!genuine_html(Some(1), None), "no HTML at all");
-        assert!(!genuine_html(None, None), "no body at all");
+        assert_eq!(
+            genuine_bodies(&message, Some(1), None),
+            (true, false),
+            "text with no HTML part at all is genuine, and there is no HTML to admit"
+        );
+        assert_eq!(
+            genuine_bodies(&message, None, None),
+            (false, false),
+            "no body at all"
+        );
     }
 
     // --------------------------------------------------------- admission discipline
@@ -998,6 +1353,30 @@ mod tests {
             .coverage
             .iter()
             .find(|r| r.path.as_deref() == Some("../../etc/passwd"))
+            .expect("a coverage row names the refusal");
+        assert_eq!(row.status, Coverage::Excluded);
+    }
+
+    /// A review finding: a Windows drive-letter-absolute attachment name
+    /// (`C:/Windows/System32/evil.zip`) is legal MIME `filename=` syntax and
+    /// must be refused by the SAME `enclosed_name`-semantics check a `../`
+    /// traversal name is refused by
+    /// (`an_attachment_with_a_traversal_name_is_refused`, above) — never
+    /// reaching [`archive::expand_at_depth`] as an admitted archive
+    /// attachment.
+    #[test]
+    fn an_attachment_with_a_drive_letter_absolute_name_is_refused() {
+        let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: x\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"B\"\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nbody\r\n--B\r\nContent-Type: application/zip; name=\"C:/Windows/System32/evil.zip\"\r\nContent-Disposition: attachment; filename=\"C:/Windows/System32/evil.zip\"\r\nContent-Transfer-Encoding: base64\r\n\r\nAAAA\r\n--B--\r\n";
+        let message = parse_message(raw, "parent-key").expect("outer message parses");
+        assert!(
+            message.attachments.is_empty(),
+            "a drive-letter-absolute name must never be admitted: {:?}",
+            message.attachments
+        );
+        let row = message
+            .coverage
+            .iter()
+            .find(|r| r.path.as_deref() == Some("C:/Windows/System32/evil.zip"))
             .expect("a coverage row names the refusal");
         assert_eq!(row.status, Coverage::Excluded);
     }
