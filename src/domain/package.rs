@@ -290,4 +290,48 @@ version = "0.0.1"
             "a byte must not be split into two mis-decoded characters: {purl}"
         );
     }
+
+    /// **S4 Y7 closeout, boundary/sweep audit.** §10's own package-identity
+    /// derivation (A1-26) is exactly the sprint's own signature defect,
+    /// found unpinned: built, tested at the unit level (every test above),
+    /// and reachable from **nowhere** production — no `git.*` table (the
+    /// schema in `runtime/atlas/db.rs` has no `package_dependencies` table
+    /// at all), no CLI verb, no API route ever calls `parse_cargo_lock`,
+    /// `LockedPackage::purl` or `purls_by_package` outside this file's own
+    /// tests. The `[0.3.0]` CHANGELOG already says so honestly ("no CLI
+    /// verb or table wires it yet") — but nothing failed the day that
+    /// stopped being true, the same gap item 2's Work-overlay tripwire
+    /// closed for a sibling case. This is that tripwire, watched red by
+    /// hand before landing (a temporary reference to `parse_cargo_lock`
+    /// inserted into `src/api.rs` failed this assertion, then was
+    /// reverted) rather than assumed to work from the shape alone.
+    ///
+    /// **If this test fails**, something now calls this module from
+    /// production code — good news: name the destination this comment and
+    /// the CHANGELOG both currently leave as "unbuilt scope, whichever wave
+    /// first commissions a `git.*` consumer for lockfile-derived package
+    /// identity", and delete or repoint this tripwire rather than leaving
+    /// it stale.
+    #[test]
+    fn the_derivation_has_no_production_caller_yet() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for relative in ["src/api.rs", "src/cli.rs", "src/runtime/atlas/db.rs"] {
+            let path = root.join(relative);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for needle in [
+                "domain::package",
+                "parse_cargo_lock",
+                "purls_by_package",
+                "LockedPackage",
+                "package_dependencies",
+            ] {
+                assert!(
+                    !text.contains(needle),
+                    "{relative} now names `{needle}` — package identity appears to have a \
+                     production caller. See this test's own doc comment for what to do."
+                );
+            }
+        }
+    }
 }

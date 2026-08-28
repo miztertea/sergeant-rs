@@ -1180,4 +1180,55 @@ mod tests {
         );
         assert!(detail.contains("terminated by signal"), "{detail:?}");
     }
+
+    /// **S4 Y7 closeout, boundary audit.** "A worker never opens the store"
+    /// was asserted only in `src/bin/atlas_worker.rs`'s own module doc
+    /// ("Never opens Atlas's store ... which is what makes ... true
+    /// structurally rather than by convention") — a comment claiming a
+    /// structural fact, not a test proving one. Item 12's own check
+    /// (`x5_a1a_acceptance::a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli`)
+    /// pins the CLI-never-writes half of the daemon-sole-writer boundary;
+    /// nothing pinned this sibling claim about the worker process. This is
+    /// that pin, in the same token-scan style the one-owner DuckDB-crate
+    /// tests use (`x1_atlas_substrate::atlas_database_has_exactly_one_owner`,
+    /// `m5_projections::t2_the_duckdb_file_has_exactly_one_owner`) — watched
+    /// red by hand before landing (a temporary `AtlasDb` token inserted into
+    /// each file in turn failed this assertion, then was reverted) rather
+    /// than assumed to work from the shape alone.
+    #[test]
+    fn a_worker_never_names_the_atlas_store() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Needle spelled from parts so this test's own source does not trip
+        // its own check the way scanning `worker.rs` in full — the file
+        // this very test lives in — would (the same self-reference problem
+        // `x5_a1a_acceptance.rs`'s production-caller check solves by cutting
+        // its scan off at `\nmod tests {`).
+        let needles = ["Atlas", "Db"].concat();
+        for (relative, text) in [
+            (
+                "src/bin/atlas_worker.rs",
+                std::fs::read_to_string(root.join("src/bin/atlas_worker.rs")),
+            ),
+            (
+                "src/runtime/atlas/worker.rs (production code only)",
+                std::fs::read_to_string(root.join("src/runtime/atlas/worker.rs")).map(|whole| {
+                    let cut = whole
+                        .find("\n#[cfg(test)]\nmod tests {")
+                        .unwrap_or(whole.len());
+                    whole[..cut].to_string()
+                }),
+            ),
+        ] {
+            let text = text.unwrap_or_else(|e| panic!("read {relative}: {e}"));
+            assert!(
+                !text.contains(&needles),
+                "{relative} names the Atlas store type — a worker process must have no path to \
+                 Atlas's store at all; the daemon is the sole writer AND the sole opener"
+            );
+            assert!(
+                !text.contains("atlas::db::"),
+                "{relative} names the store module path directly"
+            );
+        }
+    }
 }

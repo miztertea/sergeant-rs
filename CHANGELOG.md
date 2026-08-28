@@ -400,9 +400,20 @@ release.
   community extensions are turned off and locked off on every connection, so
   reading a dataset can never become a network fetch.
 
-### Supervised parse workers (S4)
+### Atlas adapters, indexing, and the scan trigger (S4)
 
-- Third-party document parsing moves out of the daemon and into supervised
+Atlas goes from a daemon-owned substrate with two demonstrated source kinds
+and no operator-reachable trigger (S3) to an estate-wide indexing surface
+with a real scan behind it: a supervised worker transport carries three real
+content adapters (Office, ZIP, mail) out of the daemon's own process; a
+fourth source kind (`external Git`) and a package-identity derivation join
+`estate_git`/`local_knowledge`; and `sgt intelligence scan` finally gives an
+operator something to run — across all three source kinds, not only the one
+S4 Y5 first wired — with a cloud-sync placeholder finally reported honestly
+instead of silently as empty. What follows is the one arc, in the order it
+was built.
+
+**Supervised parse workers.** Third-party document parsing moves out of the daemon and into supervised
   child processes: a worker takes bytes and returns a normalized batch, and
   the daemon remains the only writer Atlas has. The adapters themselves did
   not change shape — they were already pure functions over bytes — so this
@@ -448,9 +459,7 @@ release.
   behaviour is otherwise unchanged — it still checks for the file first, and
   still defers to the daemon when a running daemon holds the store.
 
-### Office document adoption (S4)
-
-- `.docx` documents now normalize into document units, running the `anydoc`
+**Office document adoption.** `.docx` documents now normalize into document units, running the `anydoc`
   crate behind a narrow adapter — bytes in, our own vocabulary out — inside
   the supervised worker transport the previous entry shipped. The owner
   ruled to adopt anydoc past a RUSTSEC advisory reached through one of its
@@ -494,9 +503,7 @@ release.
   one above), with expected counts written down and independently
   cross-checked before any extractor existed, backs every claim above.
 
-### Bounded ZIP containers (S4)
-
-- ZIP archives now expand into child resources — bytes in, admitted
+**Bounded ZIP containers.** ZIP archives now expand into child resources — bytes in, admitted
   entries out — running the `zip` crate (the maintained `zip2` fork) behind
   a pure-function adapter inside the same supervised worker transport the
   Office adapter uses. `enclosed_name` (already cited for path safety) is a
@@ -580,9 +587,7 @@ release.
   bytes end to end is left, explicitly, to the wave that wires real
   daemon-side persistence for archive children.
 
-### Mail (`.eml`) adoption (S4)
-
-- `.eml` messages now normalize into message shape (A1 §6.5) — from/to/cc,
+**Mail (`.eml`) adoption.** `.eml` messages now normalize into message shape (A1 §6.5) — from/to/cc,
   sent timestamp (RFC3339), subject, text AND html bodies, message id, and
   thread identifiers (References plus any In-Reply-To id not already
   present) — running the `mail-parser` crate (0.11.8, `full_encoding`
@@ -661,9 +666,7 @@ release.
   citing the real subprocess acceptance proof the same way rows 5 and 7
   already do.
 
-### External Git, package identity, and the scan trigger (S4 Y5)
-
-Atlas stops being writers-and-readers with nothing between them: a scan
+**External Git, package identity, and the scan trigger.** Atlas stops being writers-and-readers with nothing between them: a scan
 trigger, and a second source kind (`external_git`) alongside
 `estate_git`/`local_knowledge`.
 
@@ -755,7 +758,16 @@ trigger, and a second source kind (`external_git`) alongside
   (`domain::package`); no CLI verb or table wires it yet, because no
   register item or consumer commissions one this wave and an unused
   surface is the same false promise an empty table is (R1) — the
-  derivation itself is what §10 actually asks A1 to be able to do.
+  derivation itself is what §10 actually asks A1 to be able to do. **S4 Y7
+  closeout correction**: this was itself an unpinned instance of the
+  sprint's own signature defect (built, tested, zero production caller —
+  no `git.package_dependencies` table, no CLI verb, no API route ever
+  calls `domain::package`) and had no tripwire holding it to that fact,
+  unlike row 2's Work-overlay gap. A tripwire now does
+  (`domain::package::the_derivation_has_no_production_caller_yet`,
+  `src/domain/package.rs`); the destination is unbuilt scope, named rather
+  than guessed at — whichever wave first commissions a `git.*` consumer
+  for lockfile-derived package identity.
 - **G2's revisit trigger, answered rather than left to pass silently.**
   G2 kept the tree-sitter syntax extractor in-process on the stated
   predicate "inputs are local/estate-owned rather than attacker-chosen",
@@ -812,9 +824,7 @@ trigger, and a second source kind (`external_git`) alongside
   the ruling cited. Both are documentation corrections to where an item
   already lived, not scope changes.
 
-### The scan trigger becomes estate-scoped, and online-only detection ships (S4 Y6)
-
-The owner correction **"estate intelligence is the feature. Not index a
+**The scan trigger becomes estate-scoped, and online-only detection ships.** The owner correction **"estate intelligence is the feature. Not index a
 knowledge repo"**
 (`knowledge/rulings/owner-rulings/estate-intelligence-is-the-feature-2026-08-28.md`
 in the workspace estate) named a gap S4 Y5's own scan trigger left open: it
@@ -921,9 +931,7 @@ the wave's other named item alongside it.
     (`a1a_item_4_the_coverage_vocabulary_now_names_online_only`), the same
     pattern the cross-cutting-gap tripwire already set at S4 Y5.
 
-### Review-panel fixes (S4 Y6)
-
-Three findings from this wave's own review, fixed against the commit above
+**Review-panel fixes.** Three findings from this wave's own review, fixed against the commit above
 rather than folded silently into it:
 
 - **Register row 2 corrected: honest about the Work-overlay half.** The
@@ -963,6 +971,49 @@ rather than folded silently into it:
   `online_only`/`error`/`unavailable` count now warns
   (`generation_evicted` stays reported-but-not-warned: an eviction is
   ordinary lifecycle, not a fault).
+
+**S4 Y7 closeout — the contract walk, not the wave ledger.** This sprint
+shipped its own signature defect twice before this closeout (Y5's
+`estate_git` scan built with no production caller, closed by Y6; Y6's own
+review then caught Work-overlay scanning in the identical shape). The
+closeout's own brief: don't check work against its own brief again — walk
+`A1-ATLAS-WORLD-INTELLIGENCE.md` directly and deliberately search for a
+third instance. There was one.
+
+- **Package identity (§10, A1-26) was the third instance, unpinned.**
+  `domain::package`'s derivation — tested at the unit level since S4 Y5 —
+  has zero production callers: no `git.package_dependencies` table, no CLI
+  verb, no API route. This CHANGELOG already said so honestly at Y5; what
+  it lacked was a tripwire holding it to that fact the way row 2's
+  Work-overlay gap has one. `domain::package::the_derivation_has_no_production_caller_yet`
+  is that tripwire now, watched red by hand (a temporary reference from
+  `src/api.rs`, reverted) before landing.
+- **"A worker never opens the store" was asserted only in a comment.**
+  `src/bin/atlas_worker.rs`'s own module doc claimed this structurally; no
+  test checked it. `runtime::atlas::worker::tests::a_worker_never_names_the_atlas_store`
+  now does, watched red against both the worker binary and its own module
+  before landing, the same discipline the one-owner `duckdb` tests already
+  set.
+- **`docs/concepts/atlas-and-knowledge.md` silently implied Work-overlay
+  indexing was live.** It described the overlay in the same present tense
+  as the three source kinds `sgt intelligence scan` actually drives,
+  without ever saying it has no trigger — the omission the brief asked
+  this closeout to find and correct (four other doc-versus-code overclaims
+  were caught in this sprint's earlier reviews; this is the fifth). Fixed:
+  the doc now says plainly that overlay indexing is built, correct, and
+  untriggered, with a new decision row (D14) pinning it.
+- **Boundary audit.** One-owner-per-database (both `x1_atlas_substrate`'s
+  and `m5_projections`'s tests) and no-client-SQL
+  (`a1a_item_13_no_client_sql_reaches_the_store`) were each personally
+  watched red, by hand, this closeout — not merely re-run green. The
+  anydoc replaceability boundary's cargo-metadata alias check
+  (`tests/y2_office_boundary.rs`) and the AGENTS.md "never fetches" scoping
+  (`tests/y5_doctrine_never_fetches_is_scoped.rs`) already carry their own
+  documented red-then-green history from the waves that built them. The
+  shared archive/mail depth-and-byte budget is proven by a real nested
+  fixture (`archive.rs`'s own `a_zip_entry_named_eml_past_the_depth_ceiling_is_admitted_but_not_parsed`)
+  rather than merely asserted, though this closeout did not itself revert
+  it to watch it fail.
 
 ### Atlas closeout (S3)
 
