@@ -365,12 +365,23 @@ pub struct LaunchOutcome {
     observed: Option<Result<Observation, BackendError>>,
 }
 
+/// The backend's own signal off an optional, possibly-failed observation —
+/// shared by [`LaunchOutcome::signal`] and [`SendOutcome::signal`] (F-SI-01),
+/// which carry an identically-shaped `Option<Result<Observation,
+/// BackendError>>` for the same reason: each may or may not have carried an
+/// observation, and that observation may have failed.
+fn signal_of_optional_observation(
+    observed: &Option<Result<Observation, BackendError>>,
+) -> Option<&BackendSignal> {
+    observed.as_ref()?.as_ref().ok().map(|o| &o.signal)
+}
+
 impl LaunchOutcome {
     /// The backend's own signal, when a launch carried an observation that
     /// actually reached it. See [`ObserveOutcome::signal`] for why this is
     /// borrowed rather than taken.
     pub fn signal(&self) -> Option<&BackendSignal> {
-        self.observed.as_ref()?.as_ref().ok().map(|o| &o.signal)
+        signal_of_optional_observation(&self.observed)
     }
 }
 
@@ -484,7 +495,7 @@ impl SendOutcome {
     /// that actually reached it. See [`ObserveOutcome::signal`] for why
     /// this is borrowed rather than taken.
     pub fn signal(&self) -> Option<&BackendSignal> {
-        self.observed.as_ref()?.as_ref().ok().map(|o| &o.signal)
+        signal_of_optional_observation(&self.observed)
     }
 }
 
