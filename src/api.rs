@@ -4972,6 +4972,19 @@ struct QueuedHook {
     /// Whether the hook this entry belongs to may be superseded
     /// ([`WorkOverlayHook::coalesces`]).
     coalescing: bool,
+    /// Flipped to `true` by the hook itself the instant it actually begins
+    /// reading the surface (F-IN-01), never by `spawn_work_overlay_hook`.
+    ///
+    /// `coalescing` alone is a static property of the hook *variant* and
+    /// stays `true` for the entry's whole life, so it cannot tell "still
+    /// waiting on the chain, hasn't started scanning yet" (safe to drop a
+    /// newer refresh — the survivor will read the surface no earlier than
+    /// the dropped one would have) from "already mid-scan" (NOT safe: the
+    /// survivor may already be reading the tree when the newer turn's edit
+    /// lands, and dropping the newer refresh loses the only scan that would
+    /// have caught it). The coalescing guard below checks this flag, not
+    /// just `coalescing`.
+    started: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run the hook detached, never on the crank's own thread of control.
@@ -4991,11 +5004,20 @@ fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayH
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     chain.retain(|_, queued| !queued.handle.is_finished());
     let coalescing = hook.coalesces();
-    if coalescing && chain.get(&work_id).is_some_and(|queued| queued.coalescing) {
-        // Superseded before it started: the refresh already in flight or
-        // queued will read the surface no earlier than this one would have,
-        // and the next turn boundary schedules another. Dropped, never
-        // appended — see [`WORK_OVERLAY_HOOKS`].
+    // F-IN-01: only a survivor that has **not yet started reading the
+    // surface** makes dropping this one safe — see `QueuedHook::started`'s
+    // doc for why `coalescing` alone cannot tell the two cases apart.
+    if coalescing
+        && chain
+            .get(&work_id)
+            .is_some_and(|queued| {
+                queued.coalescing && !queued.started.load(std::sync::atomic::Ordering::Relaxed)
+            })
+    {
+        // Superseded before it started: the refresh already queued (and
+        // confirmed not yet mid-scan) will read the surface no earlier than
+        // this one would have, and the next turn boundary schedules
+        // another. Dropped, never appended — see [`WORK_OVERLAY_HOOKS`].
         tracing::debug!(
             work_id = %work_id,
             "an overlay refresh is already queued for this Work; coalescing this one into it"
@@ -5004,6 +5026,8 @@ fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayH
     }
     let previous = chain.remove(&work_id).map(|queued| queued.handle);
     let key = work_id.clone();
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_started = started.clone();
     let handle = tokio::spawn(async move {
         if let Some(previous) = previous {
             // A panicked predecessor is still a completed predecessor for
@@ -5011,9 +5035,16 @@ fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayH
             // happened, not swallowed here.
             let _ = previous.await;
         }
-        run_work_overlay_hook(state, work_id, hook).await;
+        run_work_overlay_hook(state, work_id, hook, hook_started).await;
     });
-    chain.insert(key, QueuedHook { handle, coalescing });
+    chain.insert(
+        key,
+        QueuedHook {
+            handle,
+            coalescing,
+            started,
+        },
+    );
 }
 
 /// **The production trigger for Work-overlay evidence** (S5 W1b, closing
@@ -5082,7 +5113,12 @@ fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayH
 /// [`WorkScope::BaseOnly`](crate::runtime::atlas::db::WorkScope::BaseOnly)
 /// until then — which is exactly true, and is the whole point of carrying
 /// the scope on the answer.
-async fn run_work_overlay_hook(state: ApiState, work_id: String, hook: WorkOverlayHook) {
+async fn run_work_overlay_hook(
+    state: ApiState,
+    work_id: String,
+    hook: WorkOverlayHook,
+    started: Arc<std::sync::atomic::AtomicBool>,
+) {
     let surface = match hook {
         WorkOverlayHook::Evict => {
             match with_existing_atlas_write(&state, |atlas| atlas.evict_work_overlays(&work_id))
@@ -5121,6 +5157,12 @@ async fn run_work_overlay_hook(state: ApiState, work_id: String, hook: WorkOverl
             return;
         }
     }
+
+    // F-IN-01: from here on this task is actually reading the surface (a
+    // git tree listing, diff, and blob read per binding, next), so a newer
+    // coalescing hook queued for this Work must no longer be dropped on the
+    // assumption that this scan hasn't started yet.
+    started.store(true, std::sync::atomic::Ordering::Relaxed);
 
     for binding in &surface.bindings {
         let overlay = WorkOverlay {
