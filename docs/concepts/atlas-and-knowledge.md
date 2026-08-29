@@ -87,7 +87,7 @@ The daemon is Atlas's writer. Clients ask it questions over the API; they do not
 | ID | Decision |
 |---|---|
 | D1 | Atlas is derived evidence. The journal, Git, and the operator's original bytes remain the authority, and Atlas never becomes the only copy of anything. |
-| D2 | Two databases, two rebuild disciplines: the operations projection is deleted and re-folded from the journal on every daemon start; Atlas persists across restarts and is re-derivable only by re-scanning. |
+| D2 | One store, two rebuild disciplines: the `ops` schema is dropped and re-folded from the journal on every daemon start; the source schemas persist across restarts and are re-derivable only by re-scanning. |
 | D3 | One compact `source.scanned` event per completed scan keeps the journal authoritative without a per-file event stream. Rows are provisional until that summary is journaled and confirmed; a crash leaves both or neither, never half. |
 | D4 | A knowledge source is read-only evidence and never a mount: nothing is cloned, no worktree is cut, nothing is written back, and a path inside the estate's own mutable territory is refused by name. |
 | D5 | Repositories are indexed from the object store at the admission-pinned commit; a `HEAD` that moves mid-scan is reported as drift, never blended into the result. |
