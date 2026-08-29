@@ -181,6 +181,7 @@ pub mod deny;
 pub mod external_git;
 pub mod git;
 pub mod lane;
+pub mod lexical;
 pub mod locator;
 pub mod mail;
 pub mod office;

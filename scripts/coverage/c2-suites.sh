@@ -295,3 +295,16 @@ cov_stage_end 1 "the w1d_overlay_freshness test binary must write its own profil
 cov_stage_begin c2-f258_nextest_thread_budget
 cov_run cargo llvm-cov --no-report --test f258_nextest_thread_budget --locked || cov_fail "f258_nextest_thread_budget failed under instrumentation"
 cov_stage_end 1 "the f258_nextest_thread_budget test binary must write its own profile"
+# S5 W2, wired at birth (the #231 lesson, same as x5/y2/y5/y6/w1/w1b/w1c/w1d
+# above): A2 §5's lexical retrieval — the BM25 index over A1's existing
+# evidence units, its four unit families with A1 provenance (§17 item 2), and
+# the negative A2 §8 turns on (an inadmissible unit with a perfect lexical
+# match is never returned). Builds Atlas stores in tempdirs, runs one real
+# `scan_local_knowledge` walk for the code/document/row-text families, and
+# records the mail fixture through the ordinary `record_scan` path. No daemon,
+# no estate, no subprocess of any kind — the `.eml` worker is deliberately not
+# spawned (that is y4_mail_adapter's job), which is why this sits here rather
+# than with the spawning suites. Floor 1.
+cov_stage_begin c2-w2_lexical_retrieval
+cov_run cargo llvm-cov --no-report --test w2_lexical_retrieval --locked || cov_fail "w2_lexical_retrieval failed under instrumentation"
+cov_stage_end 1 "the w2_lexical_retrieval test binary must write its own profile"
