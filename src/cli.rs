@@ -6110,9 +6110,9 @@ pub(crate) mod doctor {
                 "the operations tables are disposable: restart the daemon — it drops the \
                  `ops` schema and re-folds it from the journal on every start. Do NOT delete \
                  the Atlas database under `atlas/` in the data dir to force this: since S5 W1c \
-                 persisted source facts, which no replay reproduces and which a delete would \
-                 cost you a full re-scan. The journal is the source of truth and nothing it \
-                 carries has been lost",
+                 it also holds persisted source facts that no replay reproduces, and deleting \
+                 it would cost you a full re-scan. The journal is the source of truth and \
+                 nothing it carries has been lost",
             ),
         }
     }
