@@ -41,17 +41,34 @@
 //! overlay and a plain estate-git scan of the same base agree on every
 //! unchanged path by construction rather than by coincidence.
 //!
-//! # Not yet reachable from a real installation (review panel finding, S4 Y6)
+//! # The production trigger, and what "as of" means (S5 W1b)
 //!
-//! [`scan_work_overlay`] is correct and proven at the unit level
-//! (`tests/x3a_git_plumbing.rs`), but nothing in `src/api.rs` or
-//! `src/cli.rs` calls it, [`super::lane::scan_work_overlay_on_lane`], or
-//! [`super::record::scan_and_record_overlay`] — no HTTP route, no `sgt`
-//! verb, no Work-lifecycle hook. A real Work's overlay evidence cannot
-//! actually be produced today outside a test. See §17 item 2's register row
-//! in `tests/x5_a1a_acceptance.rs` (verdict `met-with-deviation`) and its
-//! tripwire `a1a_item_2_gap_work_overlay_scan_has_no_production_trigger`
-//! for the honest accounting of this gap and what closes it.
+//! Through S4 this module was correct at the unit level
+//! (`tests/x3a_git_plumbing.rs`) and had **no production caller at all** —
+//! no HTTP route, no `sgt` verb, no Work-lifecycle hook — which is what
+//! §17 item 2's register row recorded as a deviation and what its tripwire
+//! `a1a_item_2_gap_work_overlay_scan_has_no_production_trigger` guarded.
+//!
+//! S5 W1b wired H13.2's chosen mechanism, the **daemon-side surface
+//! lifecycle hook** (`api::run_work_overlay_hook`):
+//!
+//! ```text
+//! surface bound (materialize / rematerialize)
+//!     -> super::lane::scan_work_overlay_on_lane   one intelligence-lane permit (F6)
+//!        -> super::record::record_scan            staged, journaled, confirmed
+//! surface torn down
+//!     -> AtlasDb::evict_work_overlays             the lifetime rule above, enforced
+//! ```
+//!
+//! Query-time scanning was rejected: a read verb that writes fights the
+//! daemon-is-sole-writer boundary, so `sgt search` never reaches this
+//! module. It reads what the hook already recorded.
+//!
+//! That makes an overlay generation a **snapshot of the surface at its last
+//! bind**, not a live view of a surface the Work is still mutating. The
+//! semantic is carried on the answer rather than left to be assumed — see
+//! [`crate::runtime::atlas::db::WorkScope::BaseAndOverlaySnapshot`], which
+//! is the type `--work` returns it in.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

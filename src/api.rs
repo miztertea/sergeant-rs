@@ -62,13 +62,15 @@ use crate::runtime::atlas::external_git::ExternalGitSource;
 use crate::runtime::atlas::git::EstateGitSource;
 use crate::runtime::atlas::lane::{
     acquire_external_git_on_lane, scan_estate_git_on_lane, scan_local_knowledge_on_lane,
+    scan_work_overlay_on_lane,
 };
 use crate::runtime::atlas::locator;
+use crate::runtime::atlas::overlay::{WorkOverlay, overlay_source_name};
 use crate::runtime::atlas::record::{ScanRecord, record_external_git_scan, record_scan};
 use crate::runtime::atlas::scan::KnowledgeSource;
 use crate::runtime::engine::{
     Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
-    Next as EngineNext, Step, SubmitContext,
+    Next as EngineNext, Step, SubmitContext, SurfaceOutcome,
 };
 use crate::runtime::graph::{
     KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
@@ -83,7 +85,7 @@ use crate::runtime::projection::{
 use crate::runtime::startup::{FloorCommandClass, FloorCommandRow};
 use crate::runtime::surface::{
     BindingDisposition, KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING,
-    KIND_SURFACE_TORN_DOWN, reap, retained_bindings,
+    KIND_SURFACE_TORN_DOWN, WorkSurface, reap, retained_bindings,
 };
 use crate::runtime::sweep::{self, SweepTarget};
 
@@ -261,6 +263,36 @@ impl Core {
         for event in group {
             // No live subscriber is not an error.
             let _ = self.events_tx.send(event);
+        }
+        Ok(())
+    }
+
+    /// Fold events this hold appended through a writer that owns the
+    /// journal **directly**, so the registry cannot fall behind it.
+    ///
+    /// [`Self::commit`] is the only mutation path that appends *and* folds.
+    /// Atlas's [`crate::runtime::atlas::record::record_scan`] cannot use it:
+    /// F1's crash-window coupling puts the `source.scanned` append strictly
+    /// between staging and confirming a generation, so it takes
+    /// `&mut Journal`. That leaves [`Self::registry`] one or more seqs
+    /// behind the journal, and the NEXT `commit` fails
+    /// [`Projection::apply`]'s contiguity check — surfacing as
+    /// `projection seq mismatch: expected N, got N+1` on whatever Work
+    /// command happened to come next.
+    ///
+    /// This is the catch-up that closes that: everything past the
+    /// registry's own seq, folded in order, and pushed onto the open group
+    /// so the hold's [`Self::flush`] publishes it exactly like any other
+    /// event. Idempotent and free when nothing was appended behind the
+    /// registry's back ([`Self::events_after`]'s first branch does no I/O).
+    ///
+    /// Every direct-journal writer must call this before releasing the
+    /// hold. In this file that is the Atlas scan trigger and S5 W1b's
+    /// Work-overlay lifecycle hook.
+    pub fn absorb_journaled(&mut self) -> Result<(), CoreError> {
+        for event in self.events_after(self.registry.last_seq())? {
+            self.registry.apply(&event)?;
+            self.open_group.push(event);
         }
         Ok(())
     }
@@ -767,12 +799,24 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
             EngineNext::Surface(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
+                // S5 W1b: H13.2's Work-overlay lifecycle hook. Read off the
+                // outcome BEFORE `settle_surface` consumes it — this arm is
+                // the one funnel every surface lifecycle moment passes
+                // through (materialize, rematerialize, teardown), which is
+                // why the hook lives here and not in three call sites.
+                let overlay_hook = work_overlay_hook_for(&outcome);
                 let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_surface(&mut core, pending, outcome),
-                    core,
-                )
+                let settled = state.engine.settle_surface(&mut core, pending, outcome);
+                // Only once the daemon has actually journaled the lifecycle
+                // transition: an overlay generation for a surface whose
+                // materialization the engine refused would be evidence about
+                // a Work that never bound one.
+                if settled.is_ok()
+                    && let Some(hook) = overlay_hook
+                {
+                    spawn_work_overlay_hook(state, work_id.clone(), hook);
+                }
+                (work_id, settled, core)
             }
             EngineNext::Observe(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
@@ -4668,6 +4712,266 @@ async fn with_atlas_write<T>(
     Ok(f(guard.as_mut().expect("opened above")))
 }
 
+/// [`with_atlas_write`] that **never creates** the store — `Ok(None)` when
+/// this installation has no Atlas store file yet (`atlas_db_path`).
+///
+/// The read-only [`with_atlas`] already has this posture and for the same
+/// reason (R1): a daemon-side hook that fires on every Work must not give a
+/// fresh install an Atlas database as a side effect of running a Work.
+async fn with_existing_atlas_write<T>(
+    state: &ApiState,
+    f: impl FnOnce(&mut AtlasDb) -> T,
+) -> Result<Option<T>, AtlasError> {
+    let mut guard = state.atlas.lock().await;
+    if guard.is_none() {
+        if !crate::runtime::atlas::db::atlas_db_path(&state.data_dir).exists() {
+            return Ok(None);
+        }
+        *guard = Some(AtlasDb::open(&state.data_dir)?);
+    }
+    Ok(Some(f(guard.as_mut().expect("opened above"))))
+}
+
+/// S5 W1b — which Work-overlay lifecycle action one settled surface
+/// operation implies (H13.2's chosen mechanism).
+///
+/// The two moments are the two ends of the lifetime
+/// [`crate::runtime::atlas::overlay`]'s module doc already claims for an
+/// overlay ("scoped to one Work, and evicted with it") and which was, until
+/// this wave, prose with nothing enforcing it.
+#[derive(Debug)]
+enum WorkOverlayHook {
+    /// The surface exists and is bound — materialized for the first time,
+    /// or re-materialized for a retry. Scan it as an overlay over its
+    /// admission-pinned base.
+    Bind(Box<WorkSurface>),
+    /// The surface is gone. Evict this Work's overlay generations with it.
+    Evict,
+}
+
+/// Read the lifecycle action off a settled [`SurfaceOutcome`].
+///
+/// A *failed* materialization is deliberately no action: there is no bound
+/// surface to scan, and nothing was written that needs evicting. A
+/// re-materialization that found every worktree already on disk
+/// (`Rematerialized(Ok(None))`) is also no action — the surface was never
+/// unbound, so the overlay standing from its last bind is still the answer
+/// this Work's own lifecycle produced, and inventing a rescan here would be
+/// the rescan loop the wave's scope explicitly excludes.
+fn work_overlay_hook_for(outcome: &SurfaceOutcome) -> Option<WorkOverlayHook> {
+    match outcome {
+        SurfaceOutcome::Materialized(Ok(surface)) => {
+            Some(WorkOverlayHook::Bind(Box::new(surface.clone())))
+        }
+        SurfaceOutcome::Rematerialized(Ok(Some(surface))) => {
+            Some(WorkOverlayHook::Bind(Box::new(surface.clone())))
+        }
+        SurfaceOutcome::TornDown(..) => Some(WorkOverlayHook::Evict),
+        _ => None,
+    }
+}
+
+/// The most recent overlay hook task per Work, so the next one can wait for
+/// it (S5 W1b).
+///
+/// **This is an ordering invariant, not an optimization.** A Work's bind
+/// hook runs a whole repository extraction; its teardown hook evicts. Both
+/// are detached, so without this chain a short-lived Work could tear down
+/// while its bind scan was still walking — the eviction would find nothing,
+/// the scan would then write an overlay generation for a surface that no
+/// longer exists, and `--work` would answer about it forever. Registration
+/// is synchronous at spawn time, so the chain is in true lifecycle order
+/// rather than in whatever order the runtime happens to poll two tasks.
+///
+/// Bounded rather than unbounded: every spawn drops the handles that have
+/// already finished, so the map holds at most one entry per Work with a
+/// hook still in flight, plus recently-finished ones until the next spawn
+/// sweeps them.
+static WORK_OVERLAY_HOOKS: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+/// Run the hook detached, never on the crank's own thread of control.
+///
+/// The crank holds the core lock when it calls this, and an overlay scan is
+/// a full extraction of a repository tree. Doing it inline would put a
+/// repository walk under the daemon's core guard — the exact hazard
+/// [`crate::runtime::engine::PendingSurface`]'s own doc exists about — so
+/// the hook is spawned and the crank returns. The Work's own progress never
+/// waits on its overlay.
+///
+/// Detached, but **ordered per Work**: see [`WORK_OVERLAY_HOOKS`].
+fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayHook) {
+    let state = state.clone();
+    let mut chain = WORK_OVERLAY_HOOKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    chain.retain(|_, handle| !handle.is_finished());
+    let previous = chain.remove(&work_id);
+    let key = work_id.clone();
+    let handle = tokio::spawn(async move {
+        if let Some(previous) = previous {
+            // A panicked predecessor is still a completed predecessor for
+            // ordering purposes; its own failure is reported where it
+            // happened, not swallowed here.
+            let _ = previous.await;
+        }
+        run_work_overlay_hook(state, work_id, hook).await;
+    });
+    chain.insert(key, handle);
+}
+
+/// **The production trigger for Work-overlay evidence** (S5 W1b, closing
+/// §17 item 2's `met-with-deviation` gap and its tripwire).
+///
+/// H13.2 chose the daemon-side lifecycle hook over query-time scanning
+/// precisely so that `sgt search` stays a pure reader: the daemon remains
+/// the sole writer, and nothing on any query path touches a Work surface.
+/// This is that hook.
+///
+/// ```text
+/// surface bound (materialize / rematerialize)
+///     -> scan_work_overlay_on_lane      one intelligence-lane permit, blocking pool (F6)
+///        -> record_scan                 the ordinary staged/journaled/confirmed write
+/// surface torn down
+///     -> AtlasDb::evict_work_overlays   a `generation_evicted` coverage row per generation
+/// ```
+///
+/// # Freshness: this is where the snapshot semantic comes from
+///
+/// A Work mutates its surface continuously; this fires at bind and at
+/// teardown and at no other moment. So a `--work` answer's overlay half is
+/// *as of the last bind*, which is why
+/// [`crate::runtime::atlas::db::WorkScope::BaseAndOverlaySnapshot`] carries
+/// that instant on the answer instead of leaving a reader to assume
+/// "current". A periodic rescan is a named destination, not this wave's
+/// (W1b brief, "NOT in scope").
+///
+/// # Nothing is created for an installation that indexes nothing
+///
+/// Both halves go through [`with_existing_atlas_write`]: no Atlas store file,
+/// no scan and no store (R1). An estate that has never run `sgt
+/// intelligence scan` holds no base generation for `--work` to compose an
+/// overlay against, and gains neither a database nor a repository walk from
+/// running a Work. **Stated, not silent**: the consequence is that an
+/// estate which starts indexing *after* a Work is already bound sees that
+/// Work's overlay only at its next bind, and `--work` reports
+/// [`WorkScope::BaseOnly`](crate::runtime::atlas::db::WorkScope::BaseOnly)
+/// until then — which is exactly true, and is the whole point of carrying
+/// the scope on the answer.
+async fn run_work_overlay_hook(state: ApiState, work_id: String, hook: WorkOverlayHook) {
+    let surface = match hook {
+        WorkOverlayHook::Evict => {
+            match with_existing_atlas_write(&state, |atlas| atlas.evict_work_overlays(&work_id))
+                .await
+            {
+                Ok(Some(Ok(evicted))) if !evicted.is_empty() => {
+                    tracing::info!(
+                        work_id = %work_id,
+                        generations = evicted.len(),
+                        "evicted this Work's overlay generations with its surface"
+                    );
+                }
+                Ok(Some(Err(e))) => tracing::error!(
+                    work_id = %work_id, error = %e,
+                    "evicting this Work's overlay generations failed"
+                ),
+                Err(e) => tracing::error!(
+                    work_id = %work_id, error = %e,
+                    "opening atlas to evict this Work's overlay generations failed"
+                ),
+                Ok(None) | Ok(Some(Ok(_))) => {}
+            }
+            return;
+        }
+        WorkOverlayHook::Bind(surface) => surface,
+    };
+
+    // Read, not create: an installation with no Atlas store indexes nothing,
+    // so a Work binding a surface must not conjure one (see this function's
+    // own doc).
+    match with_existing_atlas_write(&state, |_| ()).await {
+        Ok(Some(())) => {}
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(work_id = %work_id, error = %e, "opening atlas for the Work-overlay hook failed");
+            return;
+        }
+    }
+
+    for binding in &surface.bindings {
+        let overlay = WorkOverlay {
+            work_id: work_id.clone(),
+            repository: binding.repository.clone(),
+            surface: binding.worktree_path.clone(),
+            base_sha: binding.base_sha.clone(),
+            // Per-source ignore globs are an estate-git source's own
+            // declaration; the estate-scoped scan trigger above passes none
+            // either, and inventing a different deny set for the overlay
+            // half would make an overlay and a base scan of the same tree
+            // disagree about what was acquired.
+            ignore: Vec::new(),
+        };
+        let scanned = match scan_work_overlay_on_lane(&state.engine, overlay).await {
+            Ok(scanned) => scanned,
+            Err(e) => {
+                // Degrade to base-only, reported — never a failed query and
+                // never a silent full result. The coverage row lands on the
+                // overlay generation that survived the attempt; when there
+                // is none, there is no generation to attach one to and
+                // `--work` correctly reports `BaseOnly` (see
+                // `AtlasDb::record_overlay_unavailable`).
+                let source_name = overlay_source_name(&work_id, &binding.repository);
+                let detail = format!("the Work surface could not be read as an overlay: {e}");
+                tracing::error!(
+                    work_id = %work_id, repository = %binding.repository, error = %e,
+                    "scanning this Work's surface as an overlay failed; --work stays base-only \
+                     for this repository"
+                );
+                let recorded = with_existing_atlas_write(&state, |atlas| {
+                    atlas.record_overlay_unavailable(&source_name, &detail)
+                })
+                .await;
+                if let Err(e) | Ok(Some(Err(e))) = recorded {
+                    tracing::error!(
+                        work_id = %work_id, error = %e,
+                        "recording the overlay scan failure as coverage also failed"
+                    );
+                }
+                continue;
+            }
+        };
+        let mut core = CoreGuard::acquire(&state.core).await;
+        let recorded = with_existing_atlas_write(&state, |atlas| {
+            record_scan(atlas, &mut core.journal, &scanned.scan, None)
+        })
+        .await;
+        // The scan appended `source.scanned` straight to the journal;
+        // the registry has to be caught up before this hold ends or the
+        // next `Core::commit` fails on contiguity.
+        if let Err(e) = core.absorb_journaled() {
+            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+        }
+        drop(core);
+        match recorded {
+            Ok(Some(Ok(record))) => tracing::info!(
+                work_id = %work_id, repository = %binding.repository,
+                changed = scanned.changed.len(), record = ?record,
+                "recorded this Work's surface as an overlay over its admission-pinned base"
+            ),
+            Ok(Some(Err(e))) => tracing::error!(
+                work_id = %work_id, repository = %binding.repository, error = %e,
+                "recording this Work's overlay scan failed"
+            ),
+            Err(e) => tracing::error!(
+                work_id = %work_id, error = %e,
+                "opening atlas to record this Work's overlay scan failed"
+            ),
+            Ok(None) => {}
+        }
+    }
+}
+
 /// `POST /v1/intelligence/scan` — **estate-scoped** (S4 Y6, G8 correction of
 /// S4 Y5's own G8): a full scan of everything the addressed estate
 /// declares, across all three A1 §2 source kinds, on the intelligence lane,
@@ -4826,6 +5130,12 @@ async fn intelligence_scan(
             record_scan(atlas, &mut core.journal, &scanned.scan, None)
         })
         .await;
+        // The scan appended `source.scanned` straight to the journal;
+        // the registry has to be caught up before this hold ends or the
+        // next `Core::commit` fails on contiguity.
+        if let Err(e) = core.absorb_journaled() {
+            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+        }
         drop(core);
         match outcome {
             Ok(Ok(record)) => report.push(scan_record_json(
@@ -4892,6 +5202,12 @@ async fn intelligence_scan(
             record_scan(atlas, &mut core.journal, &scan, None)
         })
         .await;
+        // The scan appended `source.scanned` straight to the journal;
+        // the registry has to be caught up before this hold ends or the
+        // next `Core::commit` fails on contiguity.
+        if let Err(e) = core.absorb_journaled() {
+            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+        }
         drop(core);
         match outcome {
             Ok(Ok(record)) => report.push(scan_record_json(
@@ -4983,6 +5299,12 @@ async fn intelligence_scan(
             record_external_git_scan(atlas, &mut core.journal, &acquired, None)
         })
         .await;
+        // The scan appended `source.scanned` straight to the journal;
+        // the registry has to be caught up before this hold ends or the
+        // next `Core::commit` fails on contiguity.
+        if let Err(e) = core.absorb_journaled() {
+            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+        }
         drop(core);
         match outcome {
             Ok(Ok(record)) => report.push(scan_record_json(

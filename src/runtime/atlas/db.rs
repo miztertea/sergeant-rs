@@ -1197,6 +1197,147 @@ impl AtlasDb {
         Ok(targets.into_iter().map(|(id, _)| id).collect())
     }
 
+    /// What a `--work` answer actually covers, read from the store rather
+    /// than derived from the selector alone (S5 W1b).
+    ///
+    /// [`WorkScope`]'s whole job is to be TRUE about the answer beside it,
+    /// and whether an overlay stands for a Work is a fact about the store,
+    /// not about the filter a caller typed: the Work may not have bound a
+    /// surface yet, its overlay scan may have failed, or the Work may have
+    /// retired and had its overlay evicted with it
+    /// ([`Self::evict_work_overlays`]). So this asks. One extra bounded
+    /// read per admissibility call, on the same connection.
+    ///
+    /// **Also true about the store, and just as load-bearing: whether the
+    /// TABLE this particular call reads can carry an overlay-authored row at
+    /// all.** An overlay generation stands for exactly one repository
+    /// (S5 W1b's own fix — see [`SourceSelector::overlay_admit_source_name`]),
+    /// is always stamped `SourceKind::EstateGit` / `AuthorityClass::
+    /// EstateMutable` ([`crate::runtime::atlas::overlay::scan_work_overlay`]),
+    /// and never writes a `source.datasets` row at all — an overlay's
+    /// unchanged bytes come from the base tree's objects, so its own scan
+    /// records `datasets: Vec::new()` unconditionally. So an overlay
+    /// standing is not, by itself, enough to say an answer includes it:
+    ///
+    /// - `carries_overlay_rows: false` — this table (`source.datasets`) is
+    ///   one an overlay scan structurally never populates. `BaseOnly`
+    ///   always, regardless of whether an overlay stands.
+    /// - `filter.kind` narrowed to anything but [`SourceKind::EstateGit`],
+    ///   or `filter.authority` narrowed to anything but
+    ///   [`AuthorityClass::EstateMutable`] — the caller's own stage-2/4
+    ///   filter structurally excludes every row an overlay could ever have
+    ///   written. `BaseOnly` for the same reason.
+    ///
+    /// Asserting `BaseAndOverlaySnapshot` in either case would claim the
+    /// answer reflects overlay evidence as of a given instant when no row it
+    /// could contain was ever capable of coming from the overlay — the same
+    /// class of false claim [`WorkScope`]'s own doc names for "current"
+    /// dressed up as a snapshot.
+    fn work_scope(
+        &self,
+        filter: &Admissibility,
+        carries_overlay_rows: bool,
+    ) -> Result<WorkScope, AtlasError> {
+        let SourceSelector::WorkBase {
+            work_id,
+            repository,
+        } = &filter.source
+        else {
+            return Ok(WorkScope::NotWorkScoped);
+        };
+        if !carries_overlay_rows
+            || filter
+                .kind
+                .is_some_and(|kind| kind != SourceKind::EstateGit)
+            || filter
+                .authority
+                .is_some_and(|authority| authority != AuthorityClass::EstateMutable)
+        {
+            return Ok(WorkScope::BaseOnly);
+        }
+        Ok(
+            match self.newest_overlay_observed_at(work_id, repository)? {
+                Some(overlay_observed_at) => WorkScope::BaseAndOverlaySnapshot {
+                    overlay_observed_at,
+                },
+                None => WorkScope::BaseOnly,
+            },
+        )
+    }
+
+    /// When this Work's overlay half — over the one `repository` a
+    /// [`SourceSelector::WorkBase`] names — was last read off its surface:
+    /// the matching CONFIRMED `work:<id>/<repo>` generation's `observed_at`,
+    /// or `None` when no such generation stands.
+    ///
+    /// An exact lookup on the one source name
+    /// [`overlay_source_name`](crate::runtime::atlas::overlay::overlay_source_name)
+    /// can ever produce for this `(work_id, repository)` pair, not a
+    /// `work_id`-only prefix scan — the earlier prefix form answered about
+    /// *any* repository under this Work id, over-claiming past the
+    /// repository the caller actually asked about, the sibling of the
+    /// admission bug [`SourceSelector::overlay_admit_source_name`] fixes.
+    fn newest_overlay_observed_at(
+        &self,
+        work_id: &str,
+        repository: &str,
+    ) -> Result<Option<String>, AtlasError> {
+        let source_name = crate::runtime::atlas::overlay::overlay_source_name(work_id, repository);
+        let mut statement = self.conn.prepare(
+            "SELECT observed_at FROM source.generations \
+             WHERE state = ? AND source_name = ? \
+             ORDER BY observed_at DESC, generation_id DESC LIMIT 1",
+        )?;
+        let mut rows = statement.query(duckdb::params![STATE_CONFIRMED, source_name])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record that a Work overlay could **not** be read off its surface at
+    /// all, as a coverage row against the overlay generation that survived
+    /// the attempt (S5 W1b).
+    ///
+    /// The same posture [`Self::stage_scan`] already takes for an
+    /// unreachable source root, for the same reason: a surface that could
+    /// not be read changed no recorded bytes, so ruling §4 gives it no
+    /// eviction, and the standing generation keeps its evidence. The
+    /// failure becomes queryable coverage rather than an absence a reader
+    /// has to infer.
+    ///
+    /// Returns the generation the row landed on, or `None` when **no**
+    /// overlay generation stands for this source. That case deliberately
+    /// writes nothing: there is no generation for a coverage row to attach
+    /// to, and staging an empty one would make `Self::work_scope` report
+    /// [`WorkScope::BaseAndOverlaySnapshot`] for a surface that was never
+    /// read — a false claim about the answer, which is the one thing this
+    /// wave's whole freshness semantic exists to prevent. The caller
+    /// reports it (the daemon's own log) and `--work` degrades to
+    /// [`WorkScope::BaseOnly`], which is exactly true.
+    pub fn record_overlay_unavailable(
+        &mut self,
+        source_name: &str,
+        detail: &str,
+    ) -> Result<Option<String>, AtlasError> {
+        let Some(current) = self.confirmed_generation(source_name)? else {
+            return Ok(None);
+        };
+        insert_coverage(
+            &self.conn,
+            &current.id,
+            source_name,
+            &CoverageRow {
+                path: None,
+                status: Coverage::Unavailable,
+                detail: Some(detail.to_string()),
+                bytes: None,
+            },
+            &crate::domain::event::rfc3339_utc_now(),
+        )?;
+        Ok(Some(current.id))
+    }
+
     /// The newest **confirmed** generation for one source, if there is one.
     ///
     /// Every read below goes through the same filter. A provisional or
@@ -1858,14 +1999,15 @@ impl AtlasDb {
     // ------------------------------------------------------------------
 
     /// The fixed, code-owned `NOT LIKE` bound every admissibility query
-    /// below applies to `source_name`, excluding every Work-overlay
-    /// generation ([`crate::runtime::atlas::overlay::OVERLAY_PREFIX`],
-    /// `work:<id>/<repo>`) regardless of [`SourceSelector`] variant — see
-    /// [`Self::admissible_generations`]'s own doc for why the exclusion is
-    /// unconditional. Derived from the overlay module's own prefix constant
-    /// rather than a second hardcoded literal, so the two can never drift
-    /// apart; still never a client-supplied pattern (F12), the same
-    /// precedent as [`CODE_EXTRACTOR_LIKE`].
+    /// below applies to `source_name`, excluding the whole Work-overlay
+    /// family ([`crate::runtime::atlas::overlay::OVERLAY_PREFIX`],
+    /// `work:<id>/<repo>`) — see [`Self::admissible_generations`]'s own doc
+    /// for what re-admits exactly one Work's own overlay on top of it
+    /// ([`SourceSelector::overlay_admit_source_name`], S5 W1b) and why the
+    /// default-deny stays the default. Derived from the overlay module's
+    /// own prefix constant rather than a second hardcoded literal, so the
+    /// two can never drift apart; still never a client-supplied pattern
+    /// (F12), the same precedent as [`CODE_EXTRACTOR_LIKE`].
     fn overlay_exclude_like() -> String {
         format!("{}%", crate::runtime::atlas::overlay::OVERLAY_PREFIX)
     }
@@ -1885,22 +2027,46 @@ impl AtlasDb {
     /// approximate, never partial. Bounded by `limit` (capped at
     /// [`MAX_ROWS`], F12).
     ///
-    /// **Every Work-overlay generation is excluded, unconditionally.** A
-    /// generation whose `source_name` carries
+    /// **The Work-overlay family is denied by default, and exactly one
+    /// Work's own overlay is re-admitted on top of that — never by name.**
+    /// A generation whose `source_name` carries
     /// [`crate::runtime::atlas::overlay::OVERLAY_PREFIX`]
     /// (`work:<id>/<repo>`) describes a world only one Work's surface can
-    /// see (H13.2). No [`SourceSelector`] variant reaches it — not even
-    /// [`SourceSelector::Named`]/[`SourceSelector::Exact`] naming the exact
-    /// coordinate, because a caller who merely learns another Work's id
-    /// (e.g. from `sgt work list`) could otherwise type it straight into
-    /// `--source` and read that Work's surface. [`SourceSelector::WorkBase`]
-    /// does not strictly need the exclusion — it already binds the plain
-    /// repository name, never the overlay coordinate — but it applies
-    /// uniformly rather than special-casing one variant as "trusted."
-    /// Overlay visibility belongs to W1b's daemon-side lifecycle hook alone
-    /// ([`Self::evict_work_overlays`], which reads the coordinate directly,
-    /// never through this admissibility filter); search stays a pure
-    /// reader (H13.2) and does not get there yet.
+    /// see (H13.2). The composed predicate is
+    ///
+    /// ```text
+    /// (source_name NOT LIKE 'work:%' AND (?src IS NULL OR source_name = ?src))
+    ///   OR (?admit IS NOT NULL AND source_name = ?admit)
+    /// ```
+    ///
+    /// where `?admit` is `Some("work:<id>/<repository>")` — the *exact*
+    /// overlay source name, never a pattern — **only** for
+    /// [`SourceSelector::WorkBase`], built from that variant's own
+    /// `work_id` **and** `repository`
+    /// (`SourceSelector::overlay_admit_source_name`). So:
+    ///
+    /// - [`SourceSelector::Named`]/[`SourceSelector::Exact`] can never
+    ///   reach an overlay, not even naming the exact coordinate — a caller
+    ///   who merely learns another Work's id (e.g. from `sgt work list`)
+    ///   must not be able to type it into `--source` and read that Work's
+    ///   surface. `?admit` is `None` for those variants, so the left
+    ///   branch is the only one available and it denies the whole family.
+    /// - `--work <mine>` admits `mine`'s base generation and `mine`'s
+    ///   overlay over exactly the repository `WorkBase` names. It does
+    ///   **not** admit another Work's overlay over the same repository
+    ///   (`work:<other>/repo-a` fails both branches), and — because `?admit`
+    ///   is an exact name rather than a `work:<id>/%` prefix — it does
+    ///   **not** admit `mine`'s own overlay over a *different* repository
+    ///   either: `WorkBase { work_id: "mine", repository: "repo-a" }`
+    ///   admits only `work:mine/repo-a`, never `work:mine/repo-b`, matching
+    ///   the base half's own restriction to one named repository
+    ///   ([`SourceSelector::bindings`]).
+    ///
+    /// S5 W1b is what made the right branch worth having: until its
+    /// daemon-side lifecycle hook landed, no overlay generation was ever
+    /// written outside a test. `sgt search` remains a pure reader either
+    /// way — this is a `SELECT` predicate, and nothing on any query path
+    /// writes (H13.2).
     pub fn admissible_generations(
         &self,
         filter: &Admissibility,
@@ -1911,13 +2077,15 @@ impl AtlasDb {
         let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
         let overlay_exclude = Self::overlay_exclude_like();
+        let overlay_admit = filter.source.overlay_admit_source_name();
         let mut statement = self.conn.prepare(
             "SELECT generation_id, source_name, source_kind, authority_class, content_key, \
                     observed_at \
              FROM source.generations \
              WHERE state = ? \
-               AND source_name NOT LIKE ? \
-               AND (? IS NULL OR source_name = ?) \
+               AND ( (source_name NOT LIKE ? \
+                      AND (? IS NULL OR source_name = ?)) \
+                     OR (? IS NOT NULL AND source_name = ?) ) \
                AND (? IS NULL OR content_key = ?) \
                AND (? IS NULL OR source_kind = ?) \
                AND (? IS NULL OR authority_class = ?) \
@@ -1928,6 +2096,8 @@ impl AtlasDb {
             overlay_exclude,
             source_name,
             source_name,
+            &overlay_admit,
+            &overlay_admit,
             content_key,
             content_key,
             source_kind,
@@ -1959,7 +2129,7 @@ impl AtlasDb {
         }
         Ok(Admitted {
             hits: out,
-            scope: filter.source.work_scope(),
+            scope: self.work_scope(filter, true)?,
         })
     }
 
@@ -2000,6 +2170,7 @@ impl AtlasDb {
         let authority = filter.authority.map(AuthorityClass::as_str);
         let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;
         let overlay_exclude = Self::overlay_exclude_like();
+        let overlay_admit = filter.source.overlay_admit_source_name();
         let mut statement = self.conn.prepare(
             "SELECT g.source_name, u.relative_path, u.local_key, u.ordinal, u.unit_kind, \
                     u.heading_level, u.title, u.byte_start, u.byte_end, u.body \
@@ -2009,8 +2180,9 @@ impl AtlasDb {
                                  AND f.relative_path = u.relative_path \
              WHERE g.state = ? \
                AND f.extractor IN (?, ?, ?, ?) \
-               AND g.source_name NOT LIKE ? \
-               AND (? IS NULL OR g.source_name = ?) \
+               AND ( (g.source_name NOT LIKE ? \
+                      AND (? IS NULL OR g.source_name = ?)) \
+                     OR (? IS NOT NULL AND g.source_name = ?) ) \
                AND (? IS NULL OR g.content_key = ?) \
                AND (? IS NULL OR g.source_kind = ?) \
                AND (? IS NULL OR g.authority_class = ?) \
@@ -2025,6 +2197,8 @@ impl AtlasDb {
             overlay_exclude,
             source_name,
             source_name,
+            &overlay_admit,
+            &overlay_admit,
             content_key,
             content_key,
             source_kind,
@@ -2056,7 +2230,7 @@ impl AtlasDb {
         }
         Ok(Admitted {
             hits: out,
-            scope: filter.source.work_scope(),
+            scope: self.work_scope(filter, true)?,
         })
     }
 
@@ -2098,14 +2272,16 @@ impl AtlasDb {
         let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
         let overlay_exclude = Self::overlay_exclude_like();
+        let overlay_admit = filter.source.overlay_admit_source_name();
         let mut statement = self.conn.prepare(
             "SELECT g.source_name, o.relative_path, o.syntax_key, o.extractor, o.language, \
                     o.ordinal, o.label, o.name, o.byte_start, o.byte_end \
              FROM source.occurrences o JOIN source.generations g USING (generation_id) \
              WHERE g.state = ? \
                AND o.extractor LIKE ? \
-               AND g.source_name NOT LIKE ? \
-               AND (? IS NULL OR g.source_name = ?) \
+               AND ( (g.source_name NOT LIKE ? \
+                      AND (? IS NULL OR g.source_name = ?)) \
+                     OR (? IS NOT NULL AND g.source_name = ?) ) \
                AND (? IS NULL OR g.content_key = ?) \
                AND (? IS NULL OR g.source_kind = ?) \
                AND (? IS NULL OR g.authority_class = ?) \
@@ -2117,6 +2293,8 @@ impl AtlasDb {
             overlay_exclude,
             source_name,
             source_name,
+            &overlay_admit,
+            &overlay_admit,
             content_key,
             content_key,
             source_kind,
@@ -2144,7 +2322,7 @@ impl AtlasDb {
         }
         Ok(Admitted {
             hits: out,
-            scope: filter.source.work_scope(),
+            scope: self.work_scope(filter, true)?,
         })
     }
 
@@ -2169,13 +2347,15 @@ impl AtlasDb {
         let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
         let overlay_exclude = Self::overlay_exclude_like();
+        let overlay_admit = filter.source.overlay_admit_source_name();
         let mut statement = self.conn.prepare(
             "SELECT g.source_name, d.relative_path, d.format, d.content_hash, d.reader, \
                     d.dataset_key, d.byte_len, d.columns, d.row_count, d.truncated, d.row_units \
              FROM source.datasets d JOIN source.generations g USING (generation_id) \
              WHERE g.state = ? \
-               AND g.source_name NOT LIKE ? \
-               AND (? IS NULL OR g.source_name = ?) \
+               AND ( (g.source_name NOT LIKE ? \
+                      AND (? IS NULL OR g.source_name = ?)) \
+                     OR (? IS NOT NULL AND g.source_name = ?) ) \
                AND (? IS NULL OR g.content_key = ?) \
                AND (? IS NULL OR g.source_kind = ?) \
                AND (? IS NULL OR g.authority_class = ?) \
@@ -2186,6 +2366,8 @@ impl AtlasDb {
             overlay_exclude,
             source_name,
             source_name,
+            &overlay_admit,
+            &overlay_admit,
             content_key,
             content_key,
             source_kind,
@@ -2220,7 +2402,7 @@ impl AtlasDb {
         }
         Ok(Admitted {
             hits: out,
-            scope: filter.source.work_scope(),
+            scope: self.work_scope(filter, false)?,
         })
     }
 
@@ -3352,19 +3534,36 @@ pub enum SourceSelector {
         /// The exact generation's content identity.
         content_key: String,
     },
-    /// A2 §2's `--work <id>` filter, **W1's scope only** (H13.2): the
-    /// named repository's BASE generation — never the overlay half, which
-    /// is W1b's daemon-side lifecycle hook
-    /// ([`crate::runtime::atlas::overlay::overlay_source_name`]/
-    /// [`AtlasDb::evict_work_overlays`]). `repository` is the plain,
-    /// non-overlay source name this Work's surface is bound to; Atlas
-    /// holds no Work↔repository binding of its own (that lives in
-    /// [`crate::runtime::surface::WorkSurface`]) so the caller resolves it
-    /// and hands it in. [`Self::work_scope`] is what a caller MUST
-    /// render/assert alongside any answer built from this variant —
-    /// A2 §2's own text promises "including overlay", so silently
-    /// presenting a base-only answer as complete would be a false claim
-    /// about a named acceptance dimension (H13.2).
+    /// A2 §2's `--work <id>` filter: the named repository's BASE
+    /// generation **and** this Work's own overlay generations
+    /// (`work:<id>/<repo>`,
+    /// [`overlay_source_name`](crate::runtime::atlas::overlay::overlay_source_name))
+    /// — S5 W1b, which wired the daemon-side
+    /// lifecycle hook H13.2 chose and so made the overlay half real.
+    /// `repository` is the plain, non-overlay source name this Work's
+    /// surface is bound to; Atlas holds no Work↔repository binding of its
+    /// own (that lives in [`crate::runtime::surface::WorkSurface`]) so the
+    /// caller resolves it and hands it in.
+    ///
+    /// **Exactly one Work's overlay, over exactly this variant's own
+    /// `repository`, never another Work's and never a sibling repository
+    /// this same Work also binds.** The admitted overlay coordinate is the
+    /// exact source name derived from *this variant's own* `work_id` **and**
+    /// `repository` (`Self::overlay_admit_source_name`) — never a `work:
+    /// <id>/%` prefix, which would admit every repository under that Work
+    /// id and over-claim past what `repository` names. So a second Work
+    /// bound to the same repository stays outside the filter by
+    /// construction — the leak W1's review panel found reachable through
+    /// `--source`, and the one `tests/w1_deterministic_filter.rs::
+    /// a_work_filter_excludes_a_different_works_generation` pins — and this
+    /// Work's own overlay over a *different* repository stays outside it
+    /// too.
+    ///
+    /// `AtlasDb::work_scope` is what a caller MUST render/assert
+    /// alongside any answer built from this variant: the overlay half is a
+    /// SNAPSHOT taken at a lifecycle moment, not a live read of the
+    /// surface, and an answer that did not say so would imply "current"
+    /// when it means "as of the last surface bind" (W1b item 3).
     WorkBase {
         /// The Work this admission is scoped to, carried for the caller's
         /// own attribution — not read by the query itself.
@@ -3395,36 +3594,90 @@ impl SourceSelector {
         }
     }
 
-    /// A2 §2's `--work` completeness fact (H8, H13.2) — see
-    /// [`Self::WorkBase`]'s own doc for why this must be rendered, not
-    /// merely computed.
-    pub fn work_scope(&self) -> WorkScope {
+    /// The exact overlay source name this selector *additionally* admits —
+    /// `Some("work:<id>/<repository>")` for [`Self::WorkBase`], `None` for
+    /// every other variant (S5 W1b).
+    ///
+    /// **Exact, not a prefix.** An earlier revision built a `LIKE
+    /// "work:<id>/%"` pattern here, which admitted every repository under
+    /// that Work id, not just [`Self::WorkBase`]'s own `repository` field —
+    /// a `WorkBase { work_id, repository: "repo-a" }` filter's overlay
+    /// branch admitted `work:<id>/repo-a` *and* `work:<id>/repo-b`
+    /// identically, over-claiming exactly the sibling repository the base
+    /// half (`Self::bindings`) is restricted to. It also bound `work_id`
+    /// unescaped into a `LIKE` pattern, so a `work_id` containing `%`/`_`
+    /// would have widened admission past even that Work — `%` alone
+    /// produces `work:%/%`, matching any Work's overlay. Composing the
+    /// exact name via
+    /// [`overlay_source_name`](crate::runtime::atlas::overlay::overlay_source_name)
+    /// and comparing with `=` (see [`Self::admissible_generations`]'s SQL)
+    /// removes both hazards at once: there is exactly one overlay source
+    /// name a `WorkBase` selector can ever mean, so there is nothing left
+    /// for a wildcard to widen. A caller cannot widen it further: there is
+    /// no code path that puts a client-supplied string into this value
+    /// (F12).
+    fn overlay_admit_source_name(&self) -> Option<String> {
         match self {
-            Self::WorkBase { .. } => WorkScope::BaseOnly,
-            _ => WorkScope::NotWorkScoped,
+            Self::WorkBase {
+                work_id,
+                repository,
+            } => Some(crate::runtime::atlas::overlay::overlay_source_name(
+                work_id, repository,
+            )),
+            _ => None,
         }
     }
 }
 
-/// Whether an [`Admissibility`] answer built from
-/// [`SourceSelector::WorkBase`] covers A2 §2's `--work` promise in full —
-/// *"current Work's world, **including overlay**"* — or only its base
-/// half.
+/// What an [`Admissibility`] answer built from
+/// [`SourceSelector::WorkBase`] actually covers of A2 §2's `--work`
+/// promise — *"current Work's world, **including overlay**"* — **and, when
+/// the overlay half is there, exactly what instant of that world it is.**
 ///
-/// H13.2 assigns the overlay half to a daemon-side lifecycle hook (W1b);
-/// every [`SourceSelector::WorkBase`] answer is [`Self::BaseOnly`] until
-/// that lands. **If W1b escalates or slips, this stays [`Self::BaseOnly`]
-/// with the limitation stated — never a silent partial** (H13.2's own
-/// words: a filter that quietly omits the overlay is a partial
-/// implementation of a named acceptance dimension).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// # The freshness semantic is in this type, not in a comment (W1b item 3)
+///
+/// A Work's surface is mutated continuously while the Work runs. The
+/// overlay is produced by a daemon-side lifecycle hook (H13.2's chosen
+/// mechanism, wired in S5 W1b: [`crate::api`]'s surface-lifecycle arm),
+/// which fires when the surface is **bound** — materialized, or
+/// re-materialized for a retry — and is evicted when the surface is torn
+/// down. It is therefore a **snapshot**, never a live read: nothing
+/// rescans between two lifecycle events, and `sgt search` stays a pure
+/// reader that never touches the surface at all (H13.2 rejected
+/// query-time scanning precisely so it could not).
+///
+/// So [`Self::BaseAndOverlaySnapshot`] carries the snapshot's own
+/// `observed_at`. A caller renders it. An answer that said "including
+/// overlay" without saying *as of when* would imply "current" while
+/// meaning "as of the last surface bind" — the same class of false claim
+/// as the silent partial W1 refused to ship.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkScope {
     /// [`SourceSelector::WorkBase`] was not the selector in play — the
     /// concept does not apply to this answer.
     NotWorkScoped,
-    /// `--work` admitted only the repository's plain base generation —
-    /// W1's whole scope. A caller MUST state this rather than presenting
-    /// the answer as A2 §2's full "including overlay" promise.
+    /// A2 §2's promise in full: the repository's base generation **and**
+    /// this Work's overlay generation over that *same* repository —
+    /// [`SourceSelector::WorkBase`] names exactly one, so there is exactly
+    /// one overlay generation this can ever mean.
+    BaseAndOverlaySnapshot {
+        /// When the overlay half was actually read off the surface — that
+        /// one overlay generation's own `observed_at`. **Not** "now", and
+        /// not the query's own time.
+        overlay_observed_at: String,
+    },
+    /// `--work` admitted only the repository's plain base generation,
+    /// because **no overlay generation stands for this Work**: it has not
+    /// been bound yet, this installation records no Atlas evidence at all,
+    /// the overlay scan failed (its coverage row says so where there was a
+    /// generation to attach one to — [`AtlasDb::record_overlay_unavailable`]),
+    /// or the Work retired and [`AtlasDb::evict_work_overlays`] took its
+    /// overlay with it.
+    ///
+    /// A caller MUST state this rather than presenting the answer as A2
+    /// §2's full "including overlay" promise. The store cannot tell those
+    /// causes apart and this variant does not pretend to: it says what is
+    /// true — there is no overlay behind this answer.
     BaseOnly,
 }
 

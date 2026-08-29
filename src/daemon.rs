@@ -601,6 +601,31 @@ fn refuse_if_unreliable(data_dir: &Path, reliability: Reliability) -> Result<(),
     }
 }
 
+/// S5 W1b: retry one Work's overlay eviction as an idempotent startup
+/// catch-up, logging the outcome. Shared by both halves of the sweep — the
+/// terminal-cache pass right after Atlas opens, and the
+/// `surfaces_retired`-keyed pass right after `recovery::reconcile` finishes
+/// a crash-interrupted teardown — so there is exactly one place that decides
+/// what "swept" and "failed to sweep" mean.
+fn sweep_one_overlay_eviction(atlas: &mut crate::runtime::atlas::db::AtlasDb, work_id: &str) {
+    match atlas.evict_work_overlays(work_id) {
+        Ok(evicted) if !evicted.is_empty() => tracing::info!(
+            target: "sergeant::atlas",
+            work_id,
+            generations = evicted.len(),
+            "startup swept an overlay eviction a prior process's crash left unfinished"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            target: "sergeant::atlas",
+            work_id,
+            error = %e,
+            "could not sweep this Work's overlay eviction at startup; it stays queryable \
+             until a later restart retries"
+        ),
+    }
+}
+
 /// Start the daemon on `data_dir`. Returns once startup is complete: serving,
 /// runtime descriptor published, and the backend probe walk finished.
 ///
@@ -807,6 +832,35 @@ pub async fn start_with(
                         "atlas could not be reconciled at startup; a crash-window \
                          generation may remain unresolved (it stays unreadable)"
                     ),
+                }
+                // S5 W1b: the Work-overlay eviction reconciliation sweep,
+                // first half — a terminal Work whose surface was ALREADY
+                // torn down before this restart.
+                //
+                // Ordinary eviction runs as a detached task off the crank
+                // (`api::run_work_overlay_hook`'s `Evict` arm), racing a
+                // Work's teardown against nothing — a daemon killed between
+                // `surface.torn_down` landing and that task finishing loses
+                // the eviction permanently under that mechanism alone. This
+                // closes it the same way `record::reconcile_sources` above
+                // closes the analogous scan-side gap: one pass, right here,
+                // before anything is served. See
+                // `recovery::terminal_work_ids_with_a_torn_down_surface`'s
+                // own doc for exactly which Works this selects (and why the
+                // crash-before-teardown case is deliberately NOT this list —
+                // it is closed below instead, once `recovery::reconcile` has
+                // actually finished that teardown).
+                //
+                // `evict_work_overlays` is naturally idempotent (it only
+                // ever touches generations not already `evicted`), so
+                // retrying it for the overwhelming majority already cleanly
+                // evicted is a safe no-op; only the rare one a crash caught
+                // mid-flight changes. One-time pass at this restart, not a
+                // periodic loop (out of this wave's scope).
+                for work_id in crate::runtime::recovery::terminal_work_ids_with_a_torn_down_surface(
+                    registry.state(),
+                ) {
+                    sweep_one_overlay_eviction(&mut atlas, &work_id);
                 }
             }
             // Never fatal. Atlas is derived evidence; a daemon that refused
@@ -1122,6 +1176,39 @@ pub async fn start_with(
             reservations_retired = ?reconciled.reservations_retired,
             "reconciled in-flight work after restart"
         );
+    }
+
+    // S5 W1b: the Work-overlay eviction sweep's second half — a terminal
+    // Work whose surface teardown itself never finished before the crash
+    // (`recovery::reconcile_terminal_surface` bypassed the ordinary
+    // lifecycle hook entirely, because it runs the crash-recovery path
+    // directly rather than through the crank arm that hook is wired to).
+    // `reconciled.surfaces_retired` names exactly the Works whose teardown
+    // `reconcile` just finished above — this is that teardown's own overlay
+    // eviction, run once it is actually true that a torn-down surface
+    // stands to evict.
+    //
+    // Read again rather than held from the block above: that block runs
+    // before `reconcile`, and Atlas is deliberately opened-and-dropped
+    // rather than kept for the process lifetime (see this module's Atlas
+    // startup-reconciliation doc). A store worth reconciling teardowns
+    // against necessarily already exists by now if it ever will.
+    if !reconciled.surfaces_retired.is_empty()
+        && crate::runtime::atlas::db::atlas_db_path(data_dir).exists()
+    {
+        match crate::runtime::atlas::db::AtlasDb::open(data_dir) {
+            Ok(mut atlas) => {
+                for work_id in &reconciled.surfaces_retired {
+                    sweep_one_overlay_eviction(&mut atlas, work_id);
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "sergeant::atlas",
+                error = %e,
+                "atlas could not be opened to sweep a crash-recovered teardown's overlay \
+                 eviction; it stays queryable until a later restart retries"
+            ),
+        }
     }
 
     // 4c-ii. Clear a stale admission pause (L6, `KIND_ADMISSION_RESUMED`'s

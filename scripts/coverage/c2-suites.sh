@@ -252,3 +252,14 @@ cov_stage_end 1 "the y5_doctrine_never_fetches_is_scoped test binary must write 
 cov_stage_begin c2-w1_deterministic_filter
 cov_run cargo llvm-cov --no-report --test w1_deterministic_filter --locked || cov_fail "w1_deterministic_filter failed under instrumentation"
 cov_stage_end 1 "the w1_deterministic_filter test binary must write its own profile"
+
+# S5 W1b, wired at birth (the #231 lesson, same as x5/y2/y5/y6/w1 above):
+# the Work-overlay lifecycle trigger — the daemon-side hook that finally
+# gives `scan_work_overlay_on_lane`/`evict_work_overlays` a production
+# caller. Starts an IN-PROCESS daemon (the y6a shape) and drives it over
+# loopback, plus real read-only `git` invocations to build a mount and a
+# linked worktree; it spawns no `sgt` client and no detached daemon, so its
+# profile is the test binary's own. Floor 1.
+cov_stage_begin c2-w1b_overlay_lifecycle_trigger
+cov_run cargo llvm-cov --no-report --test w1b_overlay_lifecycle_trigger --locked || cov_fail "w1b_overlay_lifecycle_trigger failed under instrumentation"
+cov_stage_end 1 "the w1b_overlay_lifecycle_trigger test binary must write its own profile"
