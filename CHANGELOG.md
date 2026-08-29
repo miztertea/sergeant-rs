@@ -1148,6 +1148,35 @@ them were dead code in every real installation.
   reverting it (the binary returns byte-for-byte) measures what they will cost
   when something does: a further 5.27 MiB, for a dev-binary total of 17.7 MiB.
 
+### Test contract (S5)
+
+- **The submit-throughput guard asserts a ratio, not a rate (#278).**
+  `t12_submission_throughput_has_an_automated_floor` asserted an absolute
+  floor of 8.0 works/s, which is a bound about the host it was tuned on: on
+  one unchanged commit it measured 6.5 works/s and failed (GH run
+  33250519400) and passed forty minutes later (run 33251738966) on runner
+  load alone — and 6.5 was below the 10.2 works/s regression-path simulation
+  its own derivation recorded, so where it ran it could no longer tell a
+  healthy path from a regressed one. This is a contract-shaped change: the
+  guard now asserts the **per-submission cost of the guarded section in units
+  of one `git worktree add` measured on the same host in the same run**
+  (ceiling 12.0 units, best of three attempts) — healthy 2.4–8.8 units across
+  idle / CPU-hogged / fsync-hogged / 2-core / 2-core-plus-hogs conditions,
+  17.5–64.9 with 86 ms serialized under `runtime::surface::with_repository`
+  (N3R2-04's own number), so a slower target moves the numerator and the unit
+  together instead of failing the build. The #128 macOS special case is
+  retired with it: a ratio in git-spawn units does not need a per-platform
+  constant. The burst is still driven to a terminal state and asserted
+  `completed`, which is what keeps the measurement on the whole submit path
+  rather than the HTTP surface. `scripts/coverage/README.md` gains the general
+  rule an asserted performance bound is judged against (headroom on the
+  slowest supported target — `docs/reference/glossary-and-support.md:18` — or
+  convert it to a ratio, or delete it) and the class table it belongs to.
+  (R2/R7, J5: the coverage README's own risk-class rule; the serialized-burst
+  control the wave brief proposed was implemented, measured — healthy speedup
+  0.48×–3.78× vs 1.29× regressed — and rejected as indistinguishable from the
+  regression on two cores.)
+
 ### One Atlas database (S5)
 
 - **`sergeant.duckdb` is gone.** A1 §5 declares one physical file,
