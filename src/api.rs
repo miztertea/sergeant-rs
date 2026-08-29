@@ -769,15 +769,15 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
                         let outcome = blocking(|| pending.perform()).await;
                         let work_id = pending.work_id().to_string();
                         let ended_a_turn = is_turn_boundary(outcome.signal());
-                        let mut core = CoreGuard::acquire(&bg_state.core).await;
-                        match bg_state.engine.settle_launch(&mut core, pending, outcome) {
+                        let (work_id, settled, core) = settle_turn(
+                            &bg_state,
+                            work_id,
+                            ended_a_turn,
+                            |core| bg_state.engine.settle_launch(core, pending, outcome),
+                        )
+                        .await;
+                        match settled {
                             Ok(next_step) => {
-                                refresh_overlay_after_turn(
-                                    &bg_state,
-                                    &core,
-                                    &work_id,
-                                    ended_a_turn,
-                                );
                                 drop(core);
                                 crank(&bg_state, next_step).await;
                             }
@@ -797,10 +797,10 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
                 // S5 W1d: a launch observes the turn it just started, the
                 // same way SEND-settle below does.
                 let ended_a_turn = is_turn_boundary(outcome.signal());
-                let mut core = CoreGuard::acquire(&state.core).await;
-                let settled = state.engine.settle_launch(&mut core, pending, outcome);
-                refresh_overlay_after_turn(state, &core, &work_id, ended_a_turn && settled.is_ok());
-                (work_id, settled, core)
+                settle_turn(state, work_id, ended_a_turn, |core| {
+                    state.engine.settle_launch(core, pending, outcome)
+                })
+                .await
             }
             EngineNext::Send(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
@@ -809,10 +809,10 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
                 // SEND-settle is one of the three places a turn boundary is
                 // adjudicated. Read before the settle consumes the outcome.
                 let ended_a_turn = is_turn_boundary(outcome.signal());
-                let mut core = CoreGuard::acquire(&state.core).await;
-                let settled = state.engine.settle_send(&mut core, pending, outcome);
-                refresh_overlay_after_turn(state, &core, &work_id, ended_a_turn && settled.is_ok());
-                (work_id, settled, core)
+                settle_turn(state, work_id, ended_a_turn, |core| {
+                    state.engine.settle_send(core, pending, outcome)
+                })
+                .await
             }
             EngineNext::Surface(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
@@ -844,10 +844,10 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
                 // arm above reads a `SurfaceOutcome` in. A turn boundary is
                 // W1d's overlay-refresh moment; see `is_turn_boundary`.
                 let ended_a_turn = is_turn_boundary(outcome.signal());
-                let mut core = CoreGuard::acquire(&state.core).await;
-                let settled = state.engine.settle_observe(&mut core, pending, outcome);
-                refresh_overlay_after_turn(state, &core, &work_id, ended_a_turn && settled.is_ok());
-                (work_id, settled, core)
+                settle_turn(state, work_id, ended_a_turn, |core| {
+                    state.engine.settle_observe(core, pending, outcome)
+                })
+                .await
             }
             EngineNext::Interrupt(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
@@ -4867,6 +4867,27 @@ fn is_turn_boundary(signal: Option<&BackendSignal>) -> bool {
 /// [`WorkSurface`] the bind hook was handed, never a path reconstructed
 /// here. A run with no materialized surface has nothing to scan and is
 /// skipped, exactly as a failed materialization is.
+/// Acquire the core, settle one performed effect against it, and refresh the
+/// Work-overlay if that settle both ended a turn and actually landed
+/// (F-SI-02): the shape shared by Launch-settle, SEND-settle, OBSERVE-settle,
+/// and the execution-lane background launch, which otherwise repeated this
+/// acquire/settle/refresh/return sequence almost verbatim, differing only in
+/// which `settle_*` method the caller closes over.
+async fn settle_turn<'a, F>(
+    state: &'a ApiState,
+    work_id: String,
+    ended_a_turn: bool,
+    settle: F,
+) -> (String, Result<Step, EngineError>, CoreGuard<'a>)
+where
+    F: FnOnce(&mut Core) -> Result<Step, EngineError>,
+{
+    let mut core = CoreGuard::acquire(&state.core).await;
+    let settled = settle(&mut core);
+    refresh_overlay_after_turn(state, &core, &work_id, ended_a_turn && settled.is_ok());
+    (work_id, settled, core)
+}
+
 fn refresh_overlay_after_turn(
     state: &ApiState,
     core: &CoreGuard<'_>,
