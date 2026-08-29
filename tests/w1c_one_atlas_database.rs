@@ -24,6 +24,14 @@
 //! `tests/x1_atlas_substrate.rs`'s `atlas_database_has_exactly_one_owner`,
 //! which this wave widened to the whole of `src/`; the note where M5's `t2`
 //! used to stand says why there is now one test rather than two.
+//!
+//! This merge also introduced a cross-mutex lock-ordering invariant that
+//! did not exist before it: `ApiState::atlas`'s doc comment requires the
+//! `atlas` mutex to be acquired before the `analytics` mutex, never the
+//! reverse, because a call site holding `analytics` and then reaching for
+//! `atlas` is the deadlock shape `Analytics::atlas`'s single-instance
+//! contract depends on staying absent. [`lock_order_is_atlas_then_analytics`]
+//! pins that structurally rather than leaving it prose-only.
 
 use std::collections::BTreeSet;
 
@@ -311,4 +319,90 @@ fn deleting_atlas_duckdb_rebuilds_ops_and_loses_source_facts() {
         sources_before[0].source_name, "repo-a",
         "and the before-state must be the thing that went missing, not something else"
     );
+}
+
+// ---------------------------------------------------------------------------
+// F-IN-01 — the atlas-then-analytics lock order, pinned structurally.
+// ---------------------------------------------------------------------------
+
+/// `ApiState::atlas`'s doc comment ("Lock order is therefore this mutex,
+/// then the analytics mutex, and only in that direction") is a real
+/// invariant introduced by this merge, not decoration: `Analytics::atlas`
+/// hands out a second view onto the one `atlas.duckdb` connection, so a
+/// call site that acquired `analytics` first and then reached for `atlas`
+/// while holding it is the exact nested-lock shape that can deadlock
+/// against a site using the declared order. Nothing enforced this before
+/// now — this scans every top-level function body in `src/api.rs` and
+/// fails if any of them takes the `analytics` lock before the `atlas`
+/// lock.
+#[test]
+fn lock_order_is_atlas_then_analytics() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api.rs"),
+    )
+    .expect("read src/api.rs");
+
+    let mut violations = Vec::new();
+    for (name, body) in top_level_function_bodies(&source) {
+        let atlas_at = body.find(".atlas.lock(");
+        let analytics_at = body.find(".analytics.lock(");
+        if let (Some(atlas_at), Some(analytics_at)) = (atlas_at, analytics_at) {
+            if analytics_at < atlas_at {
+                violations.push(name);
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "these functions in src/api.rs take the analytics lock before the atlas \
+         lock, violating ApiState::atlas's declared order (atlas, then analytics): \
+         {violations:?}"
+    );
+}
+
+/// Every top-level (column-0) `fn`/`async fn`/`pub fn`/`pub async fn` in
+/// `source`, paired with the source text from its signature up to (but not
+/// including) the next column-0 `fn` signature or end of file.
+///
+/// Deliberately not brace-matched: rustfmt never indents a function body's
+/// content back to column 0, so no statement, string, or nested item inside
+/// one top-level function can itself start a line at column 0 — the next
+/// column-0 `fn` line is always the true end of the current one. A
+/// brace-counting version has to skip string/char literals and comments to
+/// stay correct (raw strings, byte strings, and lifetimes all break a naive
+/// counter), which is more machine than this one invariant needs; splitting
+/// on column-0 `fn` lines sidesteps that class of bug entirely.
+fn top_level_function_bodies(source: &str) -> Vec<(String, String)> {
+    let starts: Vec<usize> = source
+        .lines()
+        .scan(0usize, |offset, line| {
+            let this = *offset;
+            *offset += line.len() + 1;
+            Some((this, line))
+        })
+        .filter(|(_, line)| {
+            line.starts_with("fn ")
+                || line.starts_with("async fn ")
+                || line.starts_with("pub fn ")
+                || line.starts_with("pub async fn ")
+                || line.starts_with("pub(crate) fn ")
+                || line.starts_with("pub(crate) async fn ")
+        })
+        .map(|(offset, _)| offset)
+        .collect();
+
+    let mut out = Vec::new();
+    for (i, &start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(source.len());
+        let chunk = &source[start..end];
+        let name_start = chunk.find("fn ").expect("matched on fn keyword") + 3;
+        let name_end = chunk[name_start..]
+            .find(['(', '<'])
+            .map(|i| name_start + i)
+            .unwrap_or(chunk.len());
+        let name = chunk[name_start..name_end].trim().to_string();
+        out.push((name, chunk.to_string()));
+    }
+    out
 }
