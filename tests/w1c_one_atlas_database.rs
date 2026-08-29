@@ -346,10 +346,10 @@ fn lock_order_is_atlas_then_analytics() {
     for (name, body) in top_level_function_bodies(&source) {
         let atlas_at = body.find(".atlas.lock(");
         let analytics_at = body.find(".analytics.lock(");
-        if let (Some(atlas_at), Some(analytics_at)) = (atlas_at, analytics_at) {
-            if analytics_at < atlas_at {
-                violations.push(name);
-            }
+        if let (Some(atlas_at), Some(analytics_at)) = (atlas_at, analytics_at)
+            && analytics_at < atlas_at
+        {
+            violations.push(name);
         }
     }
 
