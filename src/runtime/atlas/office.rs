@@ -178,9 +178,13 @@ pub const DOCX_EXTENSIONS: &[&str] = &["docx"];
 /// unions this with [`super::archive::extractor_for`]/
 /// [`super::mail::extractor_for`], and [`super::scan::Walk::file`]/
 /// [`super::git::extract_blobs`] dispatch a path this claims to the real
-/// supervised worker (`super::worker::run_worker`) rather than reporting it
-/// unsupported — daemon-scheduling work this module's own G2/G3 adoption did
-/// not ship (`lane::run_worker_on_lane` had no production caller until Y8).
+/// supervised worker (`super::worker::run_worker`, called directly from
+/// [`super::scan::dispatch_worker_resource`] under the whole-scan
+/// intelligence-lane permit [`super::lane::scan_local_knowledge_on_lane`]/
+/// [`super::lane::scan_estate_git_on_lane`] already hold — not through
+/// `lane::run_worker_on_lane`, which remains test-only, see its own doc)
+/// rather than reporting it unsupported — daemon-scheduling work this
+/// module's own G2/G3 adoption did not ship.
 pub fn extractor_for(relative: &str) -> Option<&'static str> {
     let extension = std::path::Path::new(relative)
         .extension()

@@ -381,13 +381,19 @@ pub fn validate_batch(
 ///
 /// `program` is a plain `PathBuf` rather than [`std::env::current_exe`]
 /// baked in here, because the two callers need two different answers: the
-/// daemon's own binary IS the worker binary's addressable path at runtime
-/// (`std::env::current_exe()`, [`crate::cli`]'s `spawn_daemon` sets the same
-/// precedent for re-exec'ing the running binary with a different verb), while
-/// an integration test spawns the worker binary Cargo built for it
-/// (`env!("CARGO_BIN_EXE_sgt-atlas-worker")`) — `current_exe()` inside a test
-/// binary answers with the *test binary's own* path, which is not runnable
-/// as a worker at all.
+/// daemon's own binary directory is where the real `sgt-atlas-worker`
+/// binary's addressable path lives at runtime — resolved from
+/// [`std::env::current_exe`]'s own parent directory
+/// (`super::lane::worker_runtime`'s S4 Y8 fix; NOT `current_exe()` itself,
+/// which is the *daemon's* binary — `sgt`'s own CLI has no bare-flag
+/// surface, so re-execing it with `--generation`/`--extractor` is a clap
+/// parse error, never a worker run, unlike [`crate::cli`]'s `spawn_daemon`
+/// re-exec, which passes a real `sgt` subcommand `sgt`'s own parser
+/// accepts) — while an integration test spawns the worker binary Cargo
+/// built for it directly (`env!("CARGO_BIN_EXE_sgt-atlas-worker")`) —
+/// `current_exe()` inside a test binary answers with the *test binary's
+/// own* path, which is not runnable as a worker at all, sibling directory
+/// or not.
 #[derive(Debug, Clone)]
 pub struct WorkerSpawn {
     /// The worker binary to run.
@@ -544,12 +550,17 @@ impl WorkerFault {
 /// or signal short of it), parse its stdout, and — only for a worker that
 /// actually produced a batch — run it through [`validate_batch`].
 ///
-/// The intelligence-lane permit is not acquired here: [`super::lane`]'s
-/// [`super::lane::run_worker_on_lane`] is what a daemon caller actually
-/// calls, and it wraps this function in [`crate::runtime::engine::Engine::run_intelligence`]
-/// the same way [`super::lane::scan_estate_git_on_lane`] wraps
-/// [`super::git::scan_estate_git`] — this function stays engine-agnostic so
-/// it is independently testable without a daemon.
+/// The intelligence-lane permit is not acquired here: a real scan dispatch
+/// ([`super::scan::dispatch_worker_resource`], called from
+/// [`super::lane::scan_local_knowledge_on_lane`]/
+/// [`super::lane::scan_estate_git_on_lane`]) calls this function directly,
+/// already inside the ONE whole-scan permit those two entry points acquire
+/// (S4 Y8); [`super::lane::run_worker_on_lane`] wraps this function in its
+/// own per-call [`crate::runtime::engine::Engine::run_intelligence`] permit
+/// instead, the same way [`super::lane::scan_estate_git_on_lane`] wraps
+/// [`super::git::scan_estate_git`], but stays test-only — see its own doc.
+/// Either shape leaves this function itself engine-agnostic, independently
+/// testable without a daemon.
 pub fn run_worker(
     spawn: WorkerSpawn,
     identity: &WorkerIdentity,

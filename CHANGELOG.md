@@ -1041,20 +1041,42 @@ them were dead code in every real installation.
   in-process text/Markdown/syntax/tabular paths are untouched: pure Rust
   over local bytes was never the worker's business, and stays that way.
   `scan_local_knowledge_on_lane`/`scan_estate_git_on_lane` (the production
-  entry points) resolve a real `WorkerRuntime` — this host's own binary
-  path, `std::env::current_exe()` — and thread it down; every existing
-  caller of the plain, worker-free `scan_local_knowledge`/`scan_estate_git`
-  keeps working exactly as before, unchanged.
+  entry points) resolve a real `WorkerRuntime` and thread it down; every
+  existing caller of the plain, worker-free
+  `scan_local_knowledge`/`scan_estate_git` keeps working exactly as before,
+  unchanged.
+  **Fix-agent correction:** the originally landed `WorkerRuntime` resolution
+  returned this host's own binary path (`std::env::current_exe()`)
+  unchanged — the *daemon's* own binary, which `sgt`'s own subcommand-only
+  CLI cannot be re-exec'd as a worker with (`--generation`/`--extractor`
+  fails to parse), so every real, non-test installation would have hit a
+  clap error on the very first claimed `.docx`/`.zip`/`.eml`, never an
+  extraction. `tests/y8_adapter_dispatch.rs`'s original acceptance test
+  stayed green throughout because it drives `scan_local_knowledge_with_worker`
+  directly with a hand-built `WorkerRuntime`, never the real
+  `scan_local_knowledge_on_lane` entry point or its resolution. Fixed to
+  resolve the real sibling `sgt-atlas-worker` binary Cargo builds beside
+  `sgt` (same `target/<profile>/` / install directory), and proven by a
+  new `scan_local_knowledge_on_lane_resolves_and_dispatches_the_real_worker_binary`
+  test that plants the real worker binary beside the test binary's own
+  `current_exe()` and drives the actual lane entry point end to end —
+  confirmed to fail red (a clap "Unrecognized option: 'generation'" error)
+  against the original, unfixed resolution before this correction landed.
 - **Proven against real bytes, not a synthetic fixture.**
   `tests/y8_adapter_dispatch.rs` scans a directory holding one real
   `.docx`, one real `.zip` and one real `.eml` (this repo's own
-  hand-verified corpora) through the production worker-enabled walk, then
-  records the result through `record_scan`'s real three-step discipline,
-  and asserts the RECORDED generation's own extractor set names all three
-  adapter identities and that document units carry real, non-empty text —
-  exactly the shape an isolated adapter unit test cannot prove, which is
-  what let this defect stand through four prior waves' own acceptance
-  batteries. `tests/x3a_git_plumbing.rs` carries the estate-git-side twin.
+  hand-verified corpora) through the worker-enabled scan/dispatch logic
+  (`scan_local_knowledge_with_worker`), then records the result through
+  `record_scan`'s real three-step discipline, and asserts the RECORDED
+  generation's own extractor set names all three adapter identities and
+  that document units carry real, non-empty text — exactly the shape an
+  isolated adapter unit test cannot prove, which is what let this defect
+  stand through four prior waves' own acceptance batteries.
+  `tests/x3a_git_plumbing.rs` carries the estate-git-side twin. A second
+  test, added by the fix-agent panel pass below, additionally drives the
+  real production entry point (`scan_local_knowledge_on_lane`) end to end
+  so the worker-binary RESOLUTION this dispatch depends on is exercised
+  too, not only the pure dispatch logic.
 - **Children, honestly.** A worker-declared child (an archive entry, a mail
   attachment) is validated daemon-side by the same `validate_batch`
   AUTHORITY (path safety, F10 deny-set membership) and its name lands,
@@ -1073,6 +1095,23 @@ them were dead code in every real installation.
   intelligence scan`, independently of this wave's own dispatch fix. Fixed
   to state the actual, current gap: the surfaces answer empty only until an
   operator runs the shipped trigger, not because none exists.
+- **Fix-agent panel pass.** `run_worker_on_lane` — the permit-acquiring
+  wrapper this same wave's `lane.rs` heavily edits — turned out to be a
+  FOURTH orphaned production path: the dispatch this wave wired calls
+  `run_worker` directly from `dispatch_worker_resource`, already inside the
+  whole-scan permit `scan_local_knowledge_on_lane`/`scan_estate_git_on_lane`
+  hold, never through `run_worker_on_lane` itself, which remains reachable
+  only from `tests/y1_worker_transport.rs` and its Y2-Y4 siblings. Its own
+  doc comment now says so explicitly, and a recursive `src/`-wide tripwire
+  (`lane::tests::run_worker_on_lane_has_no_production_caller_yet`, the same
+  shape as `domain::package`'s) pins it — matching this wave's own
+  package-identity precedent rather than leaving a fifth silent instance.
+  Two doc comments (`office::extractor_for`, `worker::run_worker`) that
+  described this wave's own dispatch as running through
+  `run_worker_on_lane` are corrected to name the real path
+  (`dispatch_worker_resource` -> `run_worker`, directly). The
+  `WorkerRuntime` resolution bug this same pass found and fixed is its own
+  entry above ("The scan walk now dispatches", fix-agent correction).
 
 ### Atlas closeout (S3)
 

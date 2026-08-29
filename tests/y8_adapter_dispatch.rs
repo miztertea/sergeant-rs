@@ -15,14 +15,17 @@
 //! [`scan_local_knowledge_on_lane`]: sergeant_rs::runtime::atlas::lane::scan_local_knowledge_on_lane
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
 
+use sergeant_rs::backend::BackendRegistry;
 use sergeant_rs::domain::event::Event;
 use sergeant_rs::domain::source::{Coverage, CoverageRow, KIND_SOURCE_SCANNED};
 use sergeant_rs::runtime::atlas::archive::ZIP_EXTRACTOR;
 use sergeant_rs::runtime::atlas::db::AtlasDb;
+use sergeant_rs::runtime::atlas::lane::scan_local_knowledge_on_lane;
 use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
 use sergeant_rs::runtime::atlas::office::DOCX_EXTRACTOR;
 use sergeant_rs::runtime::atlas::record::record_scan;
@@ -31,6 +34,7 @@ use sergeant_rs::runtime::atlas::scan::{
 };
 use sergeant_rs::runtime::atlas::tabular::ContextFields;
 use sergeant_rs::runtime::atlas::worker::WorkerRuntime;
+use sergeant_rs::runtime::engine::Engine;
 use sergeant_rs::runtime::journal::Journal;
 
 /// The real worker binary Cargo built alongside this test binary — same
@@ -267,4 +271,96 @@ fn a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_g
         summaries[0].payload["files"], 3,
         "all three resources landed as source.files rows"
     );
+}
+
+/// **S4 Y8 fix-agent panel finding.** The test above proves the DISPATCH
+/// logic — worker routing, daemon-side `validate_batch`, recording — by
+/// driving [`scan_local_knowledge_with_worker`] with a hand-built
+/// [`WorkerRuntime`] that already points straight at
+/// `CARGO_BIN_EXE_sgt-atlas-worker`. It never exercises
+/// [`scan_local_knowledge_on_lane`] — the actual production entry point —
+/// so it never exercised `lane::worker_runtime`'s own RESOLUTION of that
+/// binary's path, and that resolution was the actual bug: the originally
+/// landed `worker_runtime` returned `current_exe()` unchanged (this
+/// process's own daemon binary, not the worker), which would have made
+/// every real installation's dispatch fail with a clap parse error before
+/// a single resource was ever extracted, while this suite's own tests
+/// stayed green throughout, because none of them called the real entry
+/// point either.
+///
+/// This test closes that gap: it plants the real `sgt-atlas-worker`
+/// binary directly beside `std::env::current_exe()` — the exact location
+/// `lane::worker_binary_path`'s own fix resolves against — then drives
+/// [`scan_local_knowledge_on_lane`] itself, through a real [`Engine`],
+/// exactly the call `sgt intelligence scan` makes daemon-side. If
+/// `worker_runtime` regresses back to returning `current_exe()` unchanged,
+/// this test fails (every resource comes back `Coverage::Error` from a
+/// clap parse error) even though the hand-wired test above keeps passing.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_local_knowledge_on_lane_resolves_and_dispatches_the_real_worker_binary() {
+    let sibling = plant_worker_binary_beside_current_exe();
+
+    let source_root = TempDir::new().expect("source root");
+    std::fs::write(
+        source_root.path().join("report.docx"),
+        fixture("anydoc_corpus/docx_fixtures/01-plain-headings-paragraphs.docx"),
+    )
+    .expect("write docx");
+    let source = KnowledgeSource {
+        name: "lane".to_string(),
+        root: source_root.path().to_path_buf(),
+        ignore: Vec::new(),
+        context_fields: ContextFields::none(),
+    };
+
+    let data = TempDir::new().expect("data dir");
+    let engine = Engine::new(Arc::new(BackendRegistry::new()), None, data.path())
+        .with_intelligence_lane_cap(1);
+
+    let scan = scan_local_knowledge_on_lane(&engine, source)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "scan_local_knowledge_on_lane must resolve and dispatch the real worker \
+                 planted at {}: {e}",
+                sibling.display()
+            )
+        });
+
+    let row = coverage_row(&scan, "report.docx");
+    assert_eq!(
+        row.status,
+        Coverage::Indexed,
+        "the real worker binary, resolved by lane::worker_runtime and spawned by \
+         scan_local_knowledge_on_lane, must actually extract the docx: {row:?}"
+    );
+    assert!(
+        scan.extractors.contains(DOCX_EXTRACTOR),
+        "docx extractor missing from {:?}",
+        scan.extractors
+    );
+}
+
+/// Symlink the real `sgt-atlas-worker` Cargo built (`SGT_ATLAS_WORKER`)
+/// into the same directory as this test binary's own `current_exe()` —
+/// exactly where `lane::worker_binary_path` looks. Idempotent (a shared
+/// `deps/` directory across every test in this binary, possibly across a
+/// prior run's leftovers) rather than a bare create-or-panic, because
+/// nothing here owns exclusive rights to that directory.
+fn plant_worker_binary_beside_current_exe() -> PathBuf {
+    let exe = std::env::current_exe().expect("current_exe");
+    let dir = exe.parent().expect("current_exe has a parent dir");
+    let sibling = dir.join("sgt-atlas-worker");
+    let real = PathBuf::from(SGT_ATLAS_WORKER);
+    if let Ok(existing_target) = std::fs::read_link(&sibling) {
+        if existing_target == real {
+            return sibling;
+        }
+        std::fs::remove_file(&sibling)
+            .unwrap_or_else(|e| panic!("remove stale symlink at {}: {e}", sibling.display()));
+    }
+    std::os::unix::fs::symlink(&real, &sibling)
+        .unwrap_or_else(|e| panic!("symlink {} -> {}: {e}", sibling.display(), real.display()));
+    sibling
 }
