@@ -769,13 +769,11 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
                         let outcome = blocking(|| pending.perform()).await;
                         let work_id = pending.work_id().to_string();
                         let ended_a_turn = is_turn_boundary(outcome.signal());
-                        let (work_id, settled, core) = settle_turn(
-                            &bg_state,
-                            work_id,
-                            ended_a_turn,
-                            |core| bg_state.engine.settle_launch(core, pending, outcome),
-                        )
-                        .await;
+                        let (work_id, settled, core) =
+                            settle_turn(&bg_state, work_id, ended_a_turn, |core| {
+                                bg_state.engine.settle_launch(core, pending, outcome)
+                            })
+                            .await;
                         match settled {
                             Ok(next_step) => {
                                 drop(core);
@@ -5008,11 +5006,9 @@ fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayH
     // surface** makes dropping this one safe — see `QueuedHook::started`'s
     // doc for why `coalescing` alone cannot tell the two cases apart.
     if coalescing
-        && chain
-            .get(&work_id)
-            .is_some_and(|queued| {
-                queued.coalescing && !queued.started.load(std::sync::atomic::Ordering::Relaxed)
-            })
+        && chain.get(&work_id).is_some_and(|queued| {
+            queued.coalescing && !queued.started.load(std::sync::atomic::Ordering::Relaxed)
+        })
     {
         // Superseded before it started: the refresh already queued (and
         // confirmed not yet mid-scan) will read the surface no earlier than
