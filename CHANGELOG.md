@@ -1316,6 +1316,52 @@ them were dead code in every real installation.
   still said overlay indexing had no trigger at all, now say what the code
   does.
 
+### Lexical retrieval (S5)
+
+- **Atlas can now be searched by text.** A small local BM25 index over the
+  evidence units A1 already writes (A2 §5, decision A2-05 — no search server,
+  no new chunker), living in the one Atlas database as `context.lexical_units`
+  and `context.lexical_postings`. It is derived evidence, keyed by
+  SourceGeneration: a superseded generation's postings are evicted with it in
+  the same transaction as every other derived row, and the whole index is
+  rebuildable from the A1 rows alone (`AtlasDb::reindex_lexical`).
+- **The filter runs first and ranking never widens it.** Every lexical query
+  joins postings to `source.generations` through the same admissibility
+  predicate the W1 filter family applies, so a unit outside the caller's world
+  is unreachable rather than merely unranked — A2 §8's "the reranker must
+  never silently cross an authority/source filter merely because a candidate
+  scores well", enforced structurally. A planted document that is the best
+  lexical match in the store for every query the suite runs is proven to rank
+  first with no filter and to be absent under the authority, source and kind
+  filters
+  (`w2_lexical_retrieval::an_inadmissible_unit_with_a_perfect_lexical_match_is_never_returned`),
+  and one Work's overlay never surfaces through another's `--work`
+  (`::another_works_overlay_unit_never_surfaces_through_a_lexical_query`).
+- **All four unit families answer, with A1's own coordinates.** Code,
+  document, mail and selected-row-text (A2 §17 item 2), each with a test that
+  finds a unit of that kind and resolves its provenance — source, generation,
+  unit, and the byte range for the three families whose evidence is a
+  resource's bytes. Selected-row text carries A2 §3's structured-text
+  coordinate instead (`dataset/row-id/field-set`): a row is read in place and
+  never copied into Atlas, so there is no byte range to cite and none is
+  invented.
+- **Tokenization keeps the whole identifier as well as its parts.** A2 §5's
+  six named forms — `PaymentRetryPolicy`, `payment_retry_policy`,
+  `payment-retry-policy`, `Foo::bar`, `POST /payments`, `INC0012345` — are
+  six test cases, and searching `PaymentRetryPolicy` and searching `payment`
+  both find the unit that spells it. The code family indexes the identifiers a
+  grammar claimed; the document, mail and row families index the unit's own
+  prose, which is A2 §5's "document/mail retrieval additionally retains
+  ordinary natural-language tokens".
+- **Deterministic, including its ties.** Same query and same generations give
+  the same ordered result: score descending by total order, then the stated
+  key `(source_name, relative_path, ordinal, unit_key)` ascending, accumulated
+  through a `BTreeMap` rather than a hash map. A capped posting scan says so
+  on the answer rather than quietly returning different scores.
+- No CLI surface yet (that is a later wave), no semantic retrieval, no
+  fusion, and no ANN/vector index — A2 §16 lists that last one as an explicit
+  non-goal until measurements prove exact scanning inadequate.
+
 
 ## [0.2.4] - 2026-08-25
 

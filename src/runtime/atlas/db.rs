@@ -136,6 +136,10 @@ use crate::domain::workflow::{
     KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
 };
 use crate::runtime::atlas::external_git::ExternalGitProvenance;
+use crate::runtime::atlas::lexical::{
+    Bm25Corpus, LexicalFamily, LexicalHit, UnitCoordinate, bm25_contribution, query_terms,
+    rank_order, term_frequencies,
+};
 use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
 use crate::runtime::atlas::tabular::{
     DatasetFormat, RowKeyBasis, RowUnit, ScannedDataset, row_units,
@@ -368,6 +372,29 @@ SET lock_configuration = true;\n";
 ///   that source, and that is the refusal, not an oversight. `key_basis` says
 ///   whether `row_key` is content-derived or had to fold in the ordinal — see
 ///   [`crate::runtime::atlas::tabular`] for why an S5 consumer needs to know.
+///
+/// S5 W2's two, and why the lexical index is a table here rather than a
+/// service (A2 §5, decision A2-05):
+///
+/// * **`context.lexical_units` is one indexable unit's identity and length.**
+///   It lives in `context` for `context.row_units`'s own reason — it is
+///   retrieval-facing text assembled from a source — and it is **derived
+///   evidence over A1's existing units, not a second chunk universe** (A2
+///   §3/A2-02: "A2 does not invent an independent chunk universe"). Every row
+///   is derived from a `source.occurrences`, `source.units` or
+///   `context.row_units` row that already exists; W2 adds no chunker (R2).
+///   The coordinate columns are nullable by family, because A2 §3 gives each
+///   family a different coordinate and only three of the four are byte spans
+///   — see
+///   [`crate::runtime::atlas::lexical::UnitCoordinate`], which is the type
+///   this table is read back into.
+/// * **`context.lexical_postings` is the inverted index**: one row per
+///   (unit, term), with the term's frequency in that unit. Both tables are
+///   keyed by `generation_id` and both are deleted by [`evict`] with every
+///   other derived row, which is what makes "a superseded generation's
+///   postings are evicted with it" a property of the schema rather than a
+///   promise — and keeps the reported-never-silent eviction discipline
+///   identical to every other table's.
 const TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS source.generations (\n\
   generation_id    TEXT NOT NULL,\n\
@@ -494,6 +521,30 @@ CREATE TABLE IF NOT EXISTS context.row_units (\n\
   key_basis     TEXT NOT NULL,\n\
   fields        TEXT NOT NULL,\n\
   body          TEXT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS context.lexical_units (\n\
+  generation_id TEXT NOT NULL,\n\
+  source_name   TEXT NOT NULL,\n\
+  family        TEXT NOT NULL,\n\
+  unit_key      TEXT NOT NULL,\n\
+  relative_path TEXT NOT NULL,\n\
+  ordinal       BIGINT NOT NULL,\n\
+  title         TEXT,\n\
+  symbol        TEXT,\n\
+  language      TEXT,\n\
+  label         TEXT,\n\
+  dataset_key   TEXT,\n\
+  row_key       TEXT,\n\
+  fields        TEXT,\n\
+  byte_start    BIGINT,\n\
+  byte_end      BIGINT,\n\
+  token_count   BIGINT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS context.lexical_postings (\n\
+  generation_id  TEXT NOT NULL,\n\
+  unit_key       TEXT NOT NULL,\n\
+  term           TEXT NOT NULL,\n\
+  term_frequency BIGINT NOT NULL\n\
 );\n";
 
 /// A generation whose rows are written but whose summary is not yet journaled
@@ -508,6 +559,82 @@ const STATE_CONFIRMED: &str = "confirmed";
 /// after a crash. Kept as a row (with its coverage row) rather than deleted,
 /// because "this world was observed and is no longer indexed" is evidence.
 const STATE_EVICTED: &str = "evicted";
+
+/// A2 §2's composed stage-1/2/4 admissibility predicate over the `g` alias,
+/// as a **compile-time literal** the three W2 statements below splice in with
+/// `concat!`.
+///
+/// A macro rather than a `const &str` because `concat!` takes literals, and a
+/// literal is the point: `tests/x5_a1a_acceptance.rs::
+/// a1a_item_13_no_client_sql_reaches_the_store` pins every interpolation in
+/// every SQL literal in this file, and lexical retrieval adds none. The
+/// clause order and shape are identical to the one
+/// [`AtlasDb::admissible_generations`] and its three content-kind siblings
+/// spell inline; the bind values are
+/// [`AtlasDb::admissibility_binds`], in this order:
+///
+/// ```text
+/// state, overlay-exclude LIKE, source_name x2, overlay-admit x2,
+/// content_key x2, source_kind x2, authority_class x2
+/// ```
+macro_rules! admissible_generations_where {
+    () => {
+        "g.state = ? \
+         AND ( (g.source_name NOT LIKE ? \
+                AND (? IS NULL OR g.source_name = ?)) \
+               OR (? IS NOT NULL AND g.source_name = ?) ) \
+         AND (? IS NULL OR g.content_key = ?) \
+         AND (? IS NULL OR g.source_kind = ?) \
+         AND (? IS NULL OR g.authority_class = ?)"
+    };
+}
+
+/// The join every W2 statement makes: postings to their unit, unit to its
+/// generation. A posting whose generation the admissibility predicate
+/// excludes is unreachable through it — which is what makes A2 §8's "never
+/// silently crossing an authority/source filter" structural here rather than
+/// procedural.
+macro_rules! lexical_posting_join {
+    () => {
+        "FROM context.lexical_postings p \
+         JOIN context.lexical_units l ON l.generation_id = p.generation_id \
+                                      AND l.unit_key = p.unit_key \
+         JOIN source.generations g ON g.generation_id = l.generation_id \
+         WHERE "
+    };
+}
+
+/// BM25's corpus statistics — `N` and the mean document length — measured
+/// over the admissible, family-filtered set and nothing wider.
+const LEXICAL_CORPUS_SQL: &str = concat!(
+    "SELECT count(*), coalesce(sum(l.token_count), 0) \
+     FROM context.lexical_units l \
+     JOIN source.generations g USING (generation_id) \
+     WHERE ",
+    admissible_generations_where!(),
+    " AND (? IS NULL OR l.family = ?)"
+);
+
+/// One term's document frequency over that same set.
+const LEXICAL_DOCUMENT_FREQUENCY_SQL: &str = concat!(
+    "SELECT count(*) ",
+    lexical_posting_join!(),
+    admissible_generations_where!(),
+    " AND (? IS NULL OR l.family = ?) AND p.term = ?"
+);
+
+/// One term's postings, with every coordinate column a hit has to cite.
+const LEXICAL_POSTINGS_SQL: &str = concat!(
+    "SELECT l.generation_id, l.source_name, g.content_key, l.family, l.unit_key, \
+            l.relative_path, l.ordinal, l.title, l.symbol, l.language, l.label, \
+            l.dataset_key, l.row_key, l.fields, l.byte_start, l.byte_end, \
+            l.token_count, p.term_frequency ",
+    lexical_posting_join!(),
+    admissible_generations_where!(),
+    " AND (? IS NULL OR l.family = ?) AND p.term = ? \
+      ORDER BY l.source_name, l.relative_path, l.ordinal, l.unit_key \
+      LIMIT ?"
+);
 
 /// The default row ceiling on a read from this store (F12).
 ///
@@ -1078,6 +1205,13 @@ impl AtlasDb {
                 ],
             )?;
         }
+        // S5 W2: the lexical index, derived inside the same transaction from
+        // the rows just written. Not from `scan` in memory — from the stored
+        // rows themselves, so the postings are an index over exactly the
+        // evidence a hit will cite, and there is no second derivation path
+        // that could disagree with the first (A2-02: no independent chunk
+        // universe). All-or-nothing with everything else the scan staged.
+        index_generation(&tx, &generation_id)?;
         tx.commit()?;
         Ok(ScanCommit::Staged { generation_id })
     }
@@ -2481,6 +2615,257 @@ impl AtlasDb {
         })
     }
 
+    // ------------------------------------------------------------------
+    // S5 W2 — A2 §5's lexical retrieval (decision A2-05).
+    //
+    // The filter runs FIRST and decides the world; BM25 ranks INSIDE it.
+    // That ordering is A2 §2's ("only then retrieve/rank") and A2 §8's
+    // prohibition — "the reranker must never silently cross an
+    // authority/source filter merely because a candidate scores well" — and
+    // here it is structural rather than procedural: every query below joins
+    // `context.lexical_units` to `source.generations` through the SAME
+    // composed admissibility predicate the `admissible_*` family applies, so
+    // an inadmissible generation's postings are unreachable from a search.
+    // There is no code path that scores a row first and filters it after,
+    // because there is no code path that can see the row at all.
+    // ------------------------------------------------------------------
+
+    /// A2 §2's composed stage-1/2/4 predicate's **bind values**, in the order
+    /// [`ADMISSIBLE_GENERATION_PREDICATE`] consumes them.
+    ///
+    /// The predicate text itself is a macro rather than a runtime `format!`,
+    /// and that is not a style choice: `tests/x5_a1a_acceptance.rs::
+    /// a1a_item_13_no_client_sql_reaches_the_store` pins the exhaustive list
+    /// of interpolations in every SQL literal in this file, and W2 adds none
+    /// — every statement below is a compile-time literal assembled by
+    /// `concat!`. Item 13 forbids handing the store a query; the cheapest way
+    /// to keep that true is to have no runtime string-building in the query
+    /// path at all.
+    ///
+    /// Required to agree with the W1 family's own inline predicate, and
+    /// pinned by `tests/w2_lexical_retrieval.rs::
+    /// every_generation_a_lexical_hit_cites_is_one_the_admissibility_filter_
+    /// admits`, which compares the two answers rather than the two strings (a
+    /// string comparison would pass on two queries that are identically
+    /// wrong).
+    fn admissibility_binds(filter: &Admissibility) -> Vec<Duck> {
+        let (source_name, content_key) = filter.source.bindings();
+        let source_kind = filter.kind.map(SourceKind::as_str);
+        let authority = filter.authority.map(AuthorityClass::as_str);
+        let overlay_admit = filter.source.overlay_admit_source_name();
+        vec![
+            Duck::Text(STATE_CONFIRMED.to_string()),
+            Duck::Text(Self::overlay_exclude_like()),
+            optional_text(source_name),
+            optional_text(source_name),
+            overlay_admit.clone().map_or(Duck::Null, Duck::Text),
+            overlay_admit.map_or(Duck::Null, Duck::Text),
+            optional_text(content_key),
+            optional_text(content_key),
+            optional_text(source_kind),
+            optional_text(source_kind),
+            optional_text(authority),
+            optional_text(authority),
+        ]
+    }
+
+    /// A2 §5's lexical retrieval: BM25 over the admissible set, deterministic
+    /// in its ties, every hit carrying A1's own coordinate.
+    ///
+    /// # What this does, in order
+    ///
+    /// 1. Tokenizes the query
+    ///    ([`crate::runtime::atlas::lexical::query_terms`]) — distinct terms,
+    ///    sorted, so the query itself contributes nothing order-dependent.
+    /// 2. Measures the corpus **inside the admissible set**: how many units it
+    ///    holds and their mean token count. A unit the caller may not see does
+    ///    not merely fail to appear in the results — it does not influence the
+    ///    IDF or the length normalization of the ones that do.
+    /// 3. Per term, reads that term's document frequency and then its
+    ///    postings, both over that same admissible set, and accumulates each
+    ///    unit's score
+    ///    ([`crate::runtime::atlas::lexical::bm25_contribution`]).
+    /// 4. Orders by [`crate::runtime::atlas::lexical::rank_order`].
+    ///
+    /// **Two statements per term rather than one `IN (...)` list**, because an
+    /// `IN` list's placeholders have to be built at runtime and item 13's
+    /// no-client-SQL pin (see [`Self::admissibility_binds`]) is worth more
+    /// than the round trips: a query's distinct-term count is small, and the
+    /// document frequency has to be its own exact count anyway — deriving it
+    /// from the (capped) posting scan would make a unit's IDF depend on how
+    /// many *other* units happened to fit under the cap.
+    ///
+    /// # Determinism
+    ///
+    /// Same query + same generations ⇒ same ordered result. Terms are visited
+    /// in sorted order, each statement carries its own `ORDER BY`, and
+    /// accumulation is a [`BTreeMap`] keyed by `(generation_id, unit_key)` —
+    /// never a hash map. The final order is score descending by
+    /// `f64::total_cmp`, then the stated tie-break key `(source_name,
+    /// relative_path, ordinal, unit_key)` ascending. Nothing in that chain
+    /// reads row arrival order.
+    ///
+    /// # Bounds, and saying so
+    ///
+    /// The posting scan is capped at [`MAX_ROWS`] postings across all terms
+    /// (F12). Because a cap on *postings* silently changes *scores* rather
+    /// than merely shortening a list, [`LexicalAnswer::truncated`] says when
+    /// it bit, and it is a field on the answer rather than a log line for the
+    /// same reason [`WorkScope`] is: a caller must be able to state what its
+    /// answer covers.
+    pub fn lexical_search(&self, query: &LexicalQuery<'_>) -> Result<LexicalAnswer, AtlasError> {
+        let scope = self.work_scope(query.filter, true)?;
+        let terms = query_terms(query.text);
+        let limit = query.limit.min(MAX_ROWS);
+        let empty = LexicalAnswer {
+            hits: Vec::new(),
+            scope: scope.clone(),
+            truncated: false,
+        };
+        if terms.is_empty() || limit == 0 {
+            return Ok(empty);
+        }
+        let family = query.family.map(LexicalFamily::as_str);
+        let admissibility = Self::admissibility_binds(query.filter);
+
+        // (2) the corpus, measured over the admissible, family-filtered set.
+        let mut binds = admissibility.clone();
+        binds.push(optional_text(family));
+        binds.push(optional_text(family));
+        let mut statement = self.conn.prepare(LEXICAL_CORPUS_SQL)?;
+        let mut rows = statement.query(duckdb::params_from_iter(binds))?;
+        let (units, tokens) = match rows.next()? {
+            Some(row) => (
+                row.get::<usize, i64>(0)? as u64,
+                row.get::<usize, i64>(1)? as u64,
+            ),
+            None => (0, 0),
+        };
+        drop(rows);
+        drop(statement);
+        if units == 0 {
+            return Ok(empty);
+        }
+        let corpus = Bm25Corpus {
+            units,
+            average_length: tokens as f64 / units as f64,
+        };
+
+        let mut scored: BTreeMap<(String, String), Scored> = BTreeMap::new();
+        let mut seen = 0usize;
+        let mut truncated = false;
+        'terms: for term in &terms {
+            // (3a) this term's document frequency, exact, over the admissible
+            // set — never counted off the capped scan below.
+            let mut binds = admissibility.clone();
+            binds.push(optional_text(family));
+            binds.push(optional_text(family));
+            binds.push(Duck::Text(term.clone()));
+            let mut statement = self.conn.prepare(LEXICAL_DOCUMENT_FREQUENCY_SQL)?;
+            let mut rows = statement.query(duckdb::params_from_iter(binds))?;
+            let document_frequency = match rows.next()? {
+                Some(row) => row.get::<usize, i64>(0)? as u64,
+                None => 0,
+            };
+            drop(rows);
+            drop(statement);
+            if document_frequency == 0 {
+                continue;
+            }
+
+            // (3b) this term's postings, bounded by what is left of the cap.
+            let remaining = MAX_ROWS.saturating_sub(seen);
+            let mut binds = admissibility.clone();
+            binds.push(optional_text(family));
+            binds.push(optional_text(family));
+            binds.push(Duck::Text(term.clone()));
+            binds.push(Duck::BigInt(remaining as i64 + 1));
+            let mut statement = self.conn.prepare(LEXICAL_POSTINGS_SQL)?;
+            let mut rows = statement.query(duckdb::params_from_iter(binds))?;
+            while let Some(row) = rows.next()? {
+                if seen >= MAX_ROWS {
+                    truncated = true;
+                    break 'terms;
+                }
+                seen += 1;
+                let generation_id: String = row.get(0)?;
+                let unit_key: String = row.get(4)?;
+                let token_count = row.get::<usize, i64>(16)? as u64;
+                let term_frequency = row.get::<usize, i64>(17)? as u64;
+                let entry = match scored.entry((generation_id.clone(), unit_key.clone())) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(slot) => slot.insert(Scored {
+                        hit: LexicalHit {
+                            score: 0.0,
+                            source_name: row.get(1)?,
+                            generation_id,
+                            content_key: row.get(2)?,
+                            unit_key,
+                            coordinate: coordinate_of(row)?,
+                        },
+                        token_count,
+                    }),
+                };
+                entry.hit.score += bm25_contribution(
+                    corpus,
+                    document_frequency,
+                    term_frequency,
+                    entry.token_count,
+                );
+            }
+        }
+
+        let mut hits: Vec<LexicalHit> = scored.into_values().map(|s| s.hit).collect();
+        hits.sort_by(rank_order);
+        hits.truncate(limit);
+        Ok(LexicalAnswer {
+            hits,
+            scope,
+            truncated,
+        })
+    }
+
+    /// Rebuild the whole lexical index from the A1 rows it is derived from.
+    ///
+    /// The index is **derived evidence**: the journal, Git and the original
+    /// bytes remain authority (A1-01), so losing it costs nothing that cannot
+    /// be recomputed. This is what makes that claim checkable rather than
+    /// asserted — and it is the upgrade path for a store written before S5
+    /// W2, whose generations have rows but no postings.
+    ///
+    /// Every non-evicted generation is re-derived through the same
+    /// [`index_generation`] the staging transaction uses, in one transaction,
+    /// after its existing rows are cleared. Returns how many units were
+    /// indexed.
+    pub fn reindex_lexical(&mut self) -> Result<u64, AtlasError> {
+        let mut statement = self.conn.prepare(
+            "SELECT generation_id FROM source.generations WHERE state != ? \
+             ORDER BY observed_at, generation_id LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![STATE_EVICTED, MAX_ROWS as i64])?;
+        let mut targets: Vec<String> = Vec::new();
+        while let Some(row) = rows.next()? {
+            targets.push(row.get(0)?);
+        }
+        drop(rows);
+        drop(statement);
+        let tx = self.conn.transaction()?;
+        let mut indexed = 0u64;
+        for generation_id in &targets {
+            tx.execute(
+                "DELETE FROM context.lexical_postings WHERE generation_id = ?",
+                duckdb::params![generation_id],
+            )?;
+            tx.execute(
+                "DELETE FROM context.lexical_units WHERE generation_id = ?",
+                duckdb::params![generation_id],
+            )?;
+            indexed += index_generation(&tx, generation_id)?;
+        }
+        tx.commit()?;
+        Ok(indexed)
+    }
+
     /// Every generation's state, keyed by id — a diagnostic read, and what a
     /// crash-window test inspects.
     pub fn generation_states(&self) -> Result<BTreeMap<String, String>, AtlasError> {
@@ -3125,6 +3510,291 @@ fn insert_row_unit(
     Ok(())
 }
 
+/// S5 W2 — derive one generation's lexical index from the rows it just
+/// staged (A2 §5, decision A2-05).
+///
+/// **Derived from the stored rows, not from the in-memory scan.** A hit cites
+/// a `source.occurrences`/`source.units`/`context.row_units` row; deriving
+/// the postings from those same rows is what makes the citation checkable
+/// rather than parallel. It also means [`AtlasDb::reindex_lexical`] and this
+/// call are the same derivation, so a rebuilt index cannot disagree with a
+/// freshly built one.
+///
+/// **The three families, and where each one's text comes from** (A2 §17 item
+/// 2's four, less the document/mail split that one query makes):
+///
+/// * [`LexicalFamily::Document`] / [`LexicalFamily::Mail`] — `source.units`,
+///   joined to `source.files` for the extractor identity that decides which
+///   of the two it is ([`DOCUMENT_EXTRACTOR_IDENTITIES`], with
+///   [`crate::runtime::atlas::mail::MAIL_EXTRACTOR`] the mail half). Indexed
+///   text is the unit's title and body — so these families carry every
+///   ordinary word of the prose, which is A2 §5's *"Document/mail retrieval
+///   additionally retains ordinary natural-language tokens"*.
+/// * [`LexicalFamily::Code`] — `source.occurrences`, the grammar-claimed
+///   definition sites, matched on [`CODE_EXTRACTOR_LIKE`] exactly as
+///   [`AtlasDb::admissible_occurrences`] matches them. Indexed text is the
+///   symbol name and nothing else: A2 §5's BM25 is *"tuned for
+///   identifier/document tokens"*, and [EXT-SEMBLE] validates it
+///   *"particularly for identifiers/API names"*. A code file's prose is not
+///   lost by that choice — `claims_for` gives every grammar-claimed file a
+///   plain-text fallback unit, which is indexed by the document family above.
+/// * [`LexicalFamily::RowText`] — `context.row_units`, A1's F10a-gated
+///   selected-row text. Indexed text is the assembled body.
+///
+/// **Unbounded on purpose, and this is the one read in this module that is.**
+/// [`MAX_ROWS`] is a refusal to build an unbounded result set for a *caller*;
+/// these three reads run inside the staging transaction over rows the same
+/// transaction just wrote from a scan whose units were already all in memory,
+/// so a cap here would add no new bound — it would only drop units out of the
+/// index silently, which is exactly the reported-never-silent discipline this
+/// wave is required to keep.
+fn index_generation(conn: &Connection, generation_id: &str) -> Result<u64, AtlasError> {
+    let mut units: Vec<IndexableUnit> = Vec::new();
+
+    let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;
+    let mut statement = conn.prepare(
+        "SELECT u.source_name, u.relative_path, u.ordinal, u.title, u.byte_start, u.byte_end, \
+                u.body, f.extractor \
+         FROM source.units u \
+         JOIN source.files f ON f.generation_id = u.generation_id \
+                             AND f.relative_path = u.relative_path \
+         WHERE u.generation_id = ? AND f.extractor IN (?, ?, ?, ?) \
+         ORDER BY u.relative_path, u.ordinal",
+    )?;
+    let mut rows = statement.query(duckdb::params![generation_id, doc_a, doc_b, doc_c, doc_d])?;
+    while let Some(row) = rows.next()? {
+        let extractor: String = row.get(7)?;
+        let family = if extractor == crate::runtime::atlas::mail::MAIL_EXTRACTOR {
+            LexicalFamily::Mail
+        } else {
+            LexicalFamily::Document
+        };
+        let relative_path: String = row.get(1)?;
+        let ordinal = row.get::<usize, i64>(2)? as u64;
+        let title: Option<String> = row.get(3)?;
+        let body: String = row.get(6)?;
+        let text = match &title {
+            Some(title) => format!("{title}\n{body}"),
+            None => body,
+        };
+        units.push(IndexableUnit {
+            source_name: row.get(0)?,
+            family,
+            unit_key: unit_key(family, &relative_path, ordinal),
+            relative_path,
+            ordinal,
+            title,
+            symbol: None,
+            language: None,
+            label: None,
+            dataset_key: None,
+            row_key: None,
+            fields: None,
+            byte_start: Some(row.get::<usize, i64>(4)? as u64),
+            byte_end: Some(row.get::<usize, i64>(5)? as u64),
+            text,
+        });
+    }
+    drop(rows);
+    drop(statement);
+
+    let mut statement = conn.prepare(
+        "SELECT source_name, relative_path, ordinal, language, label, name, byte_start, byte_end \
+         FROM source.occurrences \
+         WHERE generation_id = ? AND extractor LIKE ? \
+         ORDER BY relative_path, ordinal",
+    )?;
+    let mut rows = statement.query(duckdb::params![generation_id, CODE_EXTRACTOR_LIKE])?;
+    while let Some(row) = rows.next()? {
+        let relative_path: String = row.get(1)?;
+        let ordinal = row.get::<usize, i64>(2)? as u64;
+        let name: String = row.get(5)?;
+        units.push(IndexableUnit {
+            source_name: row.get(0)?,
+            family: LexicalFamily::Code,
+            unit_key: unit_key(LexicalFamily::Code, &relative_path, ordinal),
+            relative_path,
+            ordinal,
+            title: None,
+            symbol: Some(name.clone()),
+            language: Some(row.get(3)?),
+            label: Some(row.get(4)?),
+            dataset_key: None,
+            row_key: None,
+            fields: None,
+            byte_start: Some(row.get::<usize, i64>(6)? as u64),
+            byte_end: Some(row.get::<usize, i64>(7)? as u64),
+            text: name,
+        });
+    }
+    drop(rows);
+    drop(statement);
+
+    let mut statement = conn.prepare(
+        "SELECT source_name, relative_path, dataset_key, ordinal, row_key, fields, body \
+         FROM context.row_units WHERE generation_id = ? ORDER BY relative_path, ordinal",
+    )?;
+    let mut rows = statement.query(duckdb::params![generation_id])?;
+    while let Some(row) = rows.next()? {
+        let relative_path: String = row.get(1)?;
+        let ordinal = row.get::<usize, i64>(3)? as u64;
+        units.push(IndexableUnit {
+            source_name: row.get(0)?,
+            family: LexicalFamily::RowText,
+            unit_key: unit_key(LexicalFamily::RowText, &relative_path, ordinal),
+            relative_path,
+            ordinal,
+            title: None,
+            symbol: None,
+            language: None,
+            label: None,
+            dataset_key: Some(row.get(2)?),
+            row_key: Some(row.get(4)?),
+            fields: Some(row.get(5)?),
+            byte_start: None,
+            byte_end: None,
+            text: row.get(6)?,
+        });
+    }
+    drop(rows);
+    drop(statement);
+
+    // The two batches, appended rather than inserted row by row. This file
+    // already carries the measurement that decides it (see [`Analytics`]'s
+    // own doc): on this container a single-row DuckDB `INSERT` costs ~1-2 ms
+    // and an appended row ~4 us. A real repository scan produces tens of
+    // thousands of postings, so row-at-a-time `INSERT` here turned an 11 s
+    // estate scan into one that blew a 100 s client timeout
+    // (`tests/y6a_estate_scoped_scan.rs`) before this was measured and fixed;
+    // the appender is R2 — the mechanism this file already owns, reused.
+    let mut unit_rows: Vec<Vec<Duck>> = Vec::with_capacity(units.len());
+    let mut posting_rows: Vec<Vec<Duck>> = Vec::new();
+    for unit in &units {
+        let (frequencies, token_count) = term_frequencies(&unit.text);
+        unit_rows.push(vec![
+            Duck::Text(generation_id.to_string()),
+            Duck::Text(unit.source_name.clone()),
+            Duck::Text(unit.family.as_str().to_string()),
+            Duck::Text(unit.unit_key.clone()),
+            Duck::Text(unit.relative_path.clone()),
+            Duck::BigInt(unit.ordinal as i64),
+            optional_text(unit.title.as_deref()),
+            optional_text(unit.symbol.as_deref()),
+            optional_text(unit.language.as_deref()),
+            optional_text(unit.label.as_deref()),
+            optional_text(unit.dataset_key.as_deref()),
+            optional_text(unit.row_key.as_deref()),
+            optional_text(unit.fields.as_deref()),
+            unit.byte_start
+                .map_or(Duck::Null, |v| Duck::BigInt(v as i64)),
+            unit.byte_end.map_or(Duck::Null, |v| Duck::BigInt(v as i64)),
+            Duck::BigInt(token_count as i64),
+        ]);
+        for (term, frequency) in &frequencies {
+            posting_rows.push(vec![
+                Duck::Text(generation_id.to_string()),
+                Duck::Text(unit.unit_key.clone()),
+                Duck::Text(term.clone()),
+                Duck::BigInt(*frequency as i64),
+            ]);
+        }
+    }
+    let indexed = unit_rows.len() as u64;
+    append_rows(conn, CONTEXT_SCHEMA, "lexical_units", unit_rows)?;
+    append_rows(conn, CONTEXT_SCHEMA, "lexical_postings", posting_rows)?;
+    Ok(indexed)
+}
+
+/// A2 §3's family-shaped coordinate, read off one
+/// [`LEXICAL_POSTINGS_SQL`] row.
+///
+/// The column set is one row shape for four coordinate shapes, because the
+/// families share a table; `family` decides which columns are meaningful, and
+/// the ones that are not are `NULL` by construction (see
+/// [`index_generation`], the only writer). A missing value defaults rather
+/// than failing: a coordinate is evidence about where a hit came from, and a
+/// row whose `language` is somehow absent should still cite its path and span
+/// rather than take the whole answer down.
+fn coordinate_of(row: &duckdb::Row<'_>) -> Result<UnitCoordinate, AtlasError> {
+    let family_name: String = row.get(3)?;
+    let family = LexicalFamily::parse(&family_name).ok_or_else(|| AtlasError::UnknownValue {
+        column: "family".to_string(),
+        value: family_name.clone(),
+    })?;
+    let relative_path: String = row.get(5)?;
+    let ordinal = row.get::<usize, i64>(6)? as u64;
+    let title: Option<String> = row.get(7)?;
+    let byte_start = row.get::<usize, Option<i64>>(14)?.unwrap_or(0) as u64;
+    let byte_end = row.get::<usize, Option<i64>>(15)?.unwrap_or(0) as u64;
+    Ok(match family {
+        LexicalFamily::Code => UnitCoordinate::Code {
+            relative_path,
+            language: row.get::<usize, Option<String>>(9)?.unwrap_or_default(),
+            label: row.get::<usize, Option<String>>(10)?.unwrap_or_default(),
+            symbol: row.get::<usize, Option<String>>(8)?.unwrap_or_default(),
+            ordinal,
+            byte_start,
+            byte_end,
+        },
+        LexicalFamily::Document => UnitCoordinate::Document {
+            relative_path,
+            ordinal,
+            title,
+            byte_start,
+            byte_end,
+        },
+        LexicalFamily::Mail => UnitCoordinate::Mail {
+            relative_path,
+            ordinal,
+            title,
+            byte_start,
+            byte_end,
+        },
+        LexicalFamily::RowText => UnitCoordinate::RowText {
+            relative_path,
+            dataset_key: row.get::<usize, Option<String>>(11)?.unwrap_or_default(),
+            ordinal,
+            row_key: row.get::<usize, Option<String>>(12)?.unwrap_or_default(),
+            fields: row
+                .get::<usize, Option<String>>(13)?
+                .as_deref()
+                .map(split_names)
+                .unwrap_or_default(),
+        },
+    })
+}
+
+/// The index's own per-generation unit identity: `<family>:<path>#<ordinal>`.
+///
+/// The family prefix is load-bearing rather than decorative — one `.rs` file
+/// produces both a `source.occurrences` row at ordinal 0 and (through
+/// `claims_for`'s plain-text fallback) a `source.units` row at ordinal 0, and
+/// without the prefix those two distinct pieces of evidence would collide on
+/// one key and one would silently overwrite the other's postings.
+fn unit_key(family: LexicalFamily, relative_path: &str, ordinal: u64) -> String {
+    format!("{}:{relative_path}#{ordinal}", family.as_str())
+}
+
+/// One unit on its way into the index — the stored row plus the text that
+/// row contributes.
+struct IndexableUnit {
+    source_name: String,
+    family: LexicalFamily,
+    unit_key: String,
+    relative_path: String,
+    ordinal: u64,
+    title: Option<String>,
+    symbol: Option<String>,
+    language: Option<String>,
+    label: Option<String>,
+    dataset_key: Option<String>,
+    row_key: Option<String>,
+    fields: Option<String>,
+    byte_start: Option<u64>,
+    byte_end: Option<u64>,
+    text: String,
+}
+
 /// Column/field names as one stored value: JSON, so a name containing a comma
 /// survives the round trip.
 fn join_names(names: &[String]) -> String {
@@ -3222,6 +3892,20 @@ fn evict(
     // the wider allowlist exposed.
     conn.execute(
         "DELETE FROM context.row_units WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    // S5 W2: the lexical index is derived evidence over the rows deleted
+    // above, so it goes with them. This is the whole of "keyed by
+    // SourceGeneration, so a superseded generation's postings are evicted
+    // with it" — postings first, because a posting whose unit row is already
+    // gone is an orphan, and there is no window in which one exists (this
+    // runs inside the caller's transaction).
+    conn.execute(
+        "DELETE FROM context.lexical_postings WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM context.lexical_units WHERE generation_id = ?",
         duckdb::params![generation_id],
     )?;
     // A no-op DELETE for every non-`external_git` generation (the table has
@@ -3776,6 +4460,59 @@ pub struct Admitted<T> {
     pub scope: WorkScope,
 }
 
+/// One lexical query: A2 §5's text, inside A2 §2's world.
+///
+/// The filter is a **borrowed** [`Admissibility`] rather than an owned copy
+/// so a caller cannot end up ranking against a filter that differs from the
+/// one it already used to decide the world — there is one filter value, and
+/// both stages read it.
+#[derive(Debug, Clone)]
+pub struct LexicalQuery<'a> {
+    /// The raw query text, tokenized by
+    /// [`crate::runtime::atlas::lexical::query_terms`].
+    pub text: &'a str,
+    /// A2 §2's deterministic admissibility filter — applied FIRST, in SQL,
+    /// so ranking happens inside the admissible set and can never widen it
+    /// (A2 §8).
+    pub filter: &'a Admissibility,
+    /// Optionally narrow to one of A2 §17 item 2's four families. `None`
+    /// searches all four, which is the default a caller who asked for no
+    /// narrowing should get.
+    pub family: Option<LexicalFamily>,
+    /// How many hits to return, capped at [`MAX_ROWS`] (F12).
+    pub limit: usize,
+}
+
+/// What one [`AtlasDb::lexical_search`] answered, with everything a caller
+/// must be able to state about it.
+///
+/// Three fields, none decorative: the ranked hits, the [`WorkScope`] every
+/// `--work`-filtered answer has to render (see that type's own doc), and
+/// whether the posting scan hit its cap. A capped scan is not a shorter list
+/// — it is a list whose *scores* were computed over fewer postings than
+/// exist, so it is a different answer and says so.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LexicalAnswer {
+    /// The ranked hits, best first, ties broken by
+    /// [`crate::runtime::atlas::lexical::LexicalHit::tie_break_key`].
+    pub hits: Vec<LexicalHit>,
+    /// What this answer covers — see [`WorkScope`].
+    pub scope: WorkScope,
+    /// Whether the posting scan reached [`MAX_ROWS`] and stopped.
+    pub truncated: bool,
+}
+
+/// One unit's accumulating score, with the length BM25 normalizes it by.
+struct Scored {
+    hit: LexicalHit,
+    token_count: u64,
+}
+
+/// A bind value for a `(? IS NULL OR column = ?)` clause.
+fn optional_text(value: Option<&str>) -> Duck {
+    value.map_or(Duck::Null, |text| Duck::Text(text.to_string()))
+}
+
 /// H13.1's content-kind filter, document family: the exhaustive, code-owned
 /// list of extractor identities [`AtlasDb::admissible_units`] matches
 /// against — never a client-supplied pattern (F12). Every identity a
@@ -3911,6 +4648,10 @@ pub enum AnalyticsError {
 /// Physical qualification only — nothing this module reports changes name
 /// because of it. See the module doc.
 const OPS_SCHEMA: &str = "ops";
+
+/// The schema S5 W2's lexical index lives in — retrieval-facing derived
+/// text, `context.row_units`'s own namespace.
+const CONTEXT_SCHEMA: &str = "context";
 
 /// One operations table, qualified and quoted for SQL.
 ///
@@ -5344,10 +6085,24 @@ const TABLES: &[&str] = &[
 /// this container, a single-row `INSERT` costs ~1 ms and an appended row
 /// ~4 µs. An empty batch is a no-op rather than an open-and-close.
 fn append_all(conn: &Connection, table: &str, rows: Vec<Vec<Duck>>) -> Result<(), AnalyticsError> {
+    append_rows(conn, OPS_SCHEMA, table, rows)?;
+    Ok(())
+}
+
+/// [`append_all`] over any schema — the same appender, reused by S5 W2's
+/// lexical index in `context` (R2). Kept as one function rather than two
+/// because the measurement that justifies the appender is a property of
+/// DuckDB, not of the `ops` schema.
+fn append_rows(
+    conn: &Connection,
+    schema: &str,
+    table: &str,
+    rows: Vec<Vec<Duck>>,
+) -> Result<(), duckdb::Error> {
     if rows.is_empty() {
         return Ok(());
     }
-    let mut appender = conn.appender_to_db(table, OPS_SCHEMA)?;
+    let mut appender = conn.appender_to_db(table, schema)?;
     for values in rows {
         appender.append_row(duckdb::appender_params_from_iter(values))?;
     }
