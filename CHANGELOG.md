@@ -1177,6 +1177,36 @@ them were dead code in every real installation.
   0.48×–3.78× vs 1.29× regressed — and rejected as indistinguishable from the
   regression on two cores.)
 
+- **The one heavy test in the suite is now scheduled alone (#258).** This
+  repository gains its first `.config/nextest.toml`. Its single override gives
+  `m7_docker_executor::large_captured_output_does_not_grow_this_process_proportionally`
+  — the 256 MiB-capture test, one test accounting for essentially all of
+  `m7_docker_executor`'s runtime — `threads-required = "num-test-threads"`, so
+  nextest reserves the whole thread budget for it and runs it with no
+  siblings. This is a **test-harness contract change**: it is the first
+  checked-in nextest configuration, it applies to the `default` profile
+  (which is what CI's bare `cargo nextest run --locked` and a developer's
+  bare `cargo nextest run` both use), and it changes how every test in the
+  suite is scheduled around that one test. Measured on 2026-08-29, 20-core
+  container, `cargo-nextest 0.9.99` (the version CI pins): under deliberate
+  load the CI victim
+  `y6a_estate_scoped_scan::a_registered_repository_is_scanned_through_the_git_path_and_map_symbol_resolves_a_real_function`
+  failed **3/3** attempts before and passed **3/3** after, with the same
+  `reqwest … /v1/intelligence/scan … TimedOut` signature CI reported; the
+  heavy test's own runtime fell from 142.7–147.6 s to 97.9–102.8 s (−31 %),
+  confirming it was being starved as well as starving. The cost is stated
+  rather than buried: **total suite wall time gets slightly worse** — ~+5 %
+  on the mean of three full runs per arm at 20 cores, and 1025.4 s → 1095.5 s
+  (+6.9 %, two runs per arm) in a 4-CPU CI-shaped run — because isolation
+  gives up parallelism during that ~100 s. Deliberately **not** a
+  `[test-groups]` entry: a group's `max-threads` caps concurrency *within*
+  the group, and this test's problem is contention with everything *outside*
+  any group it could join. Every number and the full method are in
+  sergeant-rs-workspace's `knowledge/evidence/perf/m7-thread-budget-2026-08-29.md`.
+  (R3/R7: the test runner's own documented feature, no new script or wrapper;
+  J4: the wave brief scopes exactly this one test, and the wall-time cost is
+  reported for Captain's ship decision rather than absorbed silently.)
+
 ### One Atlas database (S5)
 
 - **`sergeant.duckdb` is gone.** A1 §5 declares one physical file,

@@ -284,3 +284,14 @@ cov_stage_end 1 "the w1c_one_atlas_database test binary must write its own profi
 cov_stage_begin c2-w1d_overlay_freshness
 cov_run cargo llvm-cov --no-report --test w1d_overlay_freshness --locked || cov_fail "w1d_overlay_freshness failed under instrumentation"
 cov_stage_end 1 "the w1d_overlay_freshness test binary must write its own profile"
+
+# #258 thread-budget contract, wired at birth (the #231 lesson, same as the
+# suites above): the structural pin for `.config/nextest.toml`'s
+# `threads-required` override on m7's heavy test. It reads the config file and
+# the test tree and asserts the override still exists in the form the config's
+# own comment describes — no daemon, no subprocess, so its profile is the test
+# binary's own. NOT allowlisted: the allowlist is for `#[ignore]`d measurement
+# suites that need a developer's own corpus, and this one runs normally. Floor 1.
+cov_stage_begin c2-f258_nextest_thread_budget
+cov_run cargo llvm-cov --no-report --test f258_nextest_thread_budget --locked || cov_fail "f258_nextest_thread_budget failed under instrumentation"
+cov_stage_end 1 "the f258_nextest_thread_budget test binary must write its own profile"
