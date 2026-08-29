@@ -1857,13 +1857,26 @@ impl AtlasDb {
     // (H1), never a new table or a new column (H13.1).
     // ------------------------------------------------------------------
 
+    /// The fixed, code-owned `NOT LIKE` bound every admissibility query
+    /// below applies to `source_name`, excluding every Work-overlay
+    /// generation ([`crate::runtime::atlas::overlay::OVERLAY_PREFIX`],
+    /// `work:<id>/<repo>`) regardless of [`SourceSelector`] variant — see
+    /// [`Self::admissible_generations`]'s own doc for why the exclusion is
+    /// unconditional. Derived from the overlay module's own prefix constant
+    /// rather than a second hardcoded literal, so the two can never drift
+    /// apart; still never a client-supplied pattern (F12), the same
+    /// precedent as [`CODE_EXTRACTOR_LIKE`].
+    fn overlay_exclude_like() -> String {
+        format!("{}%", crate::runtime::atlas::overlay::OVERLAY_PREFIX)
+    }
+
     /// A2 §2 stages 1(+4) and 2 in one canned query: the source/estate/
     /// Work-generation filter, the optional repo/knowledge/external
-    /// selector (the same [`SourceKind`] axis — [`SourceSelector::Kind`]),
-    /// and the authority filter — composed once here and reused, in
-    /// identical shape, by every content-kind method below, so a
-    /// generation excluded at this stage can never resurface through a
-    /// different table.
+    /// selector ([`Admissibility::kind`], composable with any
+    /// [`SourceSelector`]), and the authority filter — composed once here
+    /// and reused, in identical shape, by every content-kind method below,
+    /// so a generation excluded at this stage can never resurface through
+    /// a different table.
     ///
     /// Every clause is `(? IS NULL OR column = ?)`: an unset filter field
     /// admits every value of that column rather than narrowing it, so
@@ -1871,19 +1884,39 @@ impl AtlasDb {
     /// authority) is "every confirmed generation this store holds" — never
     /// approximate, never partial. Bounded by `limit` (capped at
     /// [`MAX_ROWS`], F12).
+    ///
+    /// **Every Work-overlay generation is excluded, unconditionally.** A
+    /// generation whose `source_name` carries
+    /// [`crate::runtime::atlas::overlay::OVERLAY_PREFIX`]
+    /// (`work:<id>/<repo>`) describes a world only one Work's surface can
+    /// see (H13.2). No [`SourceSelector`] variant reaches it — not even
+    /// [`SourceSelector::Named`]/[`SourceSelector::Exact`] naming the exact
+    /// coordinate, because a caller who merely learns another Work's id
+    /// (e.g. from `sgt work list`) could otherwise type it straight into
+    /// `--source` and read that Work's surface. [`SourceSelector::WorkBase`]
+    /// does not strictly need the exclusion — it already binds the plain
+    /// repository name, never the overlay coordinate — but it applies
+    /// uniformly rather than special-casing one variant as "trusted."
+    /// Overlay visibility belongs to W1b's daemon-side lifecycle hook alone
+    /// ([`Self::evict_work_overlays`], which reads the coordinate directly,
+    /// never through this admissibility filter); search stays a pure
+    /// reader (H13.2) and does not get there yet.
     pub fn admissible_generations(
         &self,
         filter: &Admissibility,
         limit: usize,
-    ) -> Result<Vec<SourceGeneration>, AtlasError> {
+    ) -> Result<Admitted<SourceGeneration>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let (source_name, content_key, source_kind) = filter.source.bindings();
+        let (source_name, content_key) = filter.source.bindings();
+        let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
+        let overlay_exclude = Self::overlay_exclude_like();
         let mut statement = self.conn.prepare(
             "SELECT generation_id, source_name, source_kind, authority_class, content_key, \
                     observed_at \
              FROM source.generations \
              WHERE state = ? \
+               AND source_name NOT LIKE ? \
                AND (? IS NULL OR source_name = ?) \
                AND (? IS NULL OR content_key = ?) \
                AND (? IS NULL OR source_kind = ?) \
@@ -1892,6 +1925,7 @@ impl AtlasDb {
         )?;
         let mut rows = statement.query(duckdb::params![
             STATE_CONFIRMED,
+            overlay_exclude,
             source_name,
             source_name,
             content_key,
@@ -1923,7 +1957,10 @@ impl AtlasDb {
                 observed_at: row.get(5)?,
             });
         }
-        Ok(out)
+        Ok(Admitted {
+            hits: out,
+            scope: filter.source.work_scope(),
+        })
     }
 
     /// A2 §2's content-kind filter, **document family** — H13.1's decided
@@ -1956,11 +1993,13 @@ impl AtlasDb {
         &self,
         filter: &Admissibility,
         limit: usize,
-    ) -> Result<Vec<StoredUnitHit>, AtlasError> {
+    ) -> Result<Admitted<StoredUnitHit>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let (source_name, content_key, source_kind) = filter.source.bindings();
+        let (source_name, content_key) = filter.source.bindings();
+        let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
         let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;
+        let overlay_exclude = Self::overlay_exclude_like();
         let mut statement = self.conn.prepare(
             "SELECT g.source_name, u.relative_path, u.local_key, u.ordinal, u.unit_kind, \
                     u.heading_level, u.title, u.byte_start, u.byte_end, u.body \
@@ -1970,6 +2009,7 @@ impl AtlasDb {
                                  AND f.relative_path = u.relative_path \
              WHERE g.state = ? \
                AND f.extractor IN (?, ?, ?, ?) \
+               AND g.source_name NOT LIKE ? \
                AND (? IS NULL OR g.source_name = ?) \
                AND (? IS NULL OR g.content_key = ?) \
                AND (? IS NULL OR g.source_kind = ?) \
@@ -1982,6 +2022,7 @@ impl AtlasDb {
             doc_b,
             doc_c,
             doc_d,
+            overlay_exclude,
             source_name,
             source_name,
             content_key,
@@ -2013,7 +2054,10 @@ impl AtlasDb {
                 },
             });
         }
-        Ok(out)
+        Ok(Admitted {
+            hits: out,
+            scope: filter.source.work_scope(),
+        })
     }
 
     /// A2 §2's content-kind filter, **code family** — `source.symbols` +
@@ -2048,16 +2092,19 @@ impl AtlasDb {
         &self,
         filter: &Admissibility,
         limit: usize,
-    ) -> Result<Vec<StoredOccurrenceHit>, AtlasError> {
+    ) -> Result<Admitted<StoredOccurrenceHit>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let (source_name, content_key, source_kind) = filter.source.bindings();
+        let (source_name, content_key) = filter.source.bindings();
+        let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
+        let overlay_exclude = Self::overlay_exclude_like();
         let mut statement = self.conn.prepare(
             "SELECT g.source_name, o.relative_path, o.syntax_key, o.extractor, o.language, \
                     o.ordinal, o.label, o.name, o.byte_start, o.byte_end \
              FROM source.occurrences o JOIN source.generations g USING (generation_id) \
              WHERE g.state = ? \
                AND o.extractor LIKE ? \
+               AND g.source_name NOT LIKE ? \
                AND (? IS NULL OR g.source_name = ?) \
                AND (? IS NULL OR g.content_key = ?) \
                AND (? IS NULL OR g.source_kind = ?) \
@@ -2067,6 +2114,7 @@ impl AtlasDb {
         let mut rows = statement.query(duckdb::params![
             STATE_CONFIRMED,
             CODE_EXTRACTOR_LIKE,
+            overlay_exclude,
             source_name,
             source_name,
             content_key,
@@ -2094,7 +2142,10 @@ impl AtlasDb {
                 },
             });
         }
-        Ok(out)
+        Ok(Admitted {
+            hits: out,
+            scope: filter.source.work_scope(),
+        })
     }
 
     /// A2 §2's content-kind filter, **tabular family** — `source.datasets`
@@ -2112,15 +2163,18 @@ impl AtlasDb {
         &self,
         filter: &Admissibility,
         limit: usize,
-    ) -> Result<Vec<StoredDatasetHit>, AtlasError> {
+    ) -> Result<Admitted<StoredDatasetHit>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let (source_name, content_key, source_kind) = filter.source.bindings();
+        let (source_name, content_key) = filter.source.bindings();
+        let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
+        let overlay_exclude = Self::overlay_exclude_like();
         let mut statement = self.conn.prepare(
             "SELECT g.source_name, d.relative_path, d.format, d.content_hash, d.reader, \
                     d.dataset_key, d.byte_len, d.columns, d.row_count, d.truncated, d.row_units \
              FROM source.datasets d JOIN source.generations g USING (generation_id) \
              WHERE g.state = ? \
+               AND g.source_name NOT LIKE ? \
                AND (? IS NULL OR g.source_name = ?) \
                AND (? IS NULL OR g.content_key = ?) \
                AND (? IS NULL OR g.source_kind = ?) \
@@ -2129,6 +2183,7 @@ impl AtlasDb {
         )?;
         let mut rows = statement.query(duckdb::params![
             STATE_CONFIRMED,
+            overlay_exclude,
             source_name,
             source_name,
             content_key,
@@ -2163,7 +2218,10 @@ impl AtlasDb {
                 },
             });
         }
-        Ok(out)
+        Ok(Admitted {
+            hits: out,
+            scope: filter.source.work_scope(),
+        })
     }
 
     /// Every generation's state, keyed by id — a diagnostic read, and what a
@@ -3245,23 +3303,36 @@ pub struct StoredReference {
 /// retrieve/rank).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Admissibility {
-    /// Stage 1 (+4): which source(s) may be seen at all.
+    /// Stage 1: which source(s) may be seen at all — `--source`/
+    /// `--source@sha`/`--work`, or none of those (every source).
     pub source: SourceSelector,
+    /// Stage 4: the optional repo/knowledge/external grouping
+    /// (`--type repo|knowledge|external`), the same [`SourceKind`] axis
+    /// [`Self::source`] can also narrow by name. A genuinely **independent**
+    /// field rather than a [`SourceSelector`] variant — A2 §2 lists stage 4
+    /// as an optional selector *layered on* stage 1 (`--work --type
+    /// document`, `--source repo-a --type repo`), and a caller must be able
+    /// to compose the two; folding it into [`SourceSelector`] as one more
+    /// mutually-exclusive variant (as an earlier revision of this type did)
+    /// made that composition inexpressible by construction. `None` admits
+    /// every kind — narrows only what a caller explicitly asked to narrow,
+    /// same as [`Self::authority`].
+    pub kind: Option<SourceKind>,
     /// Stage 2: which authority class may be seen. `None` admits every
     /// class — this filter only ever narrows what a caller explicitly
     /// asked to narrow; there is no implicit default-deny beyond what
-    /// `source` already selects.
+    /// `source`/`kind` already select.
     pub authority: Option<AuthorityClass>,
 }
 
-/// A2 §2's stage-1 source/estate/Work-generation selector, plus stage 4's
-/// optional repo/knowledge/external grouping — the same [`SourceKind`]
-/// axis, so it is one variant here ([`Self::Kind`]) rather than a second
-/// field a caller could set inconsistently with [`Self::Named`].
+/// A2 §2's stage-1 source/estate/Work-generation selector. Stage 4's
+/// repo/knowledge/external grouping is [`Admissibility::kind`], a separate
+/// field composable with any variant here — see that field's own doc for
+/// why it does not live as a variant of this enum.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SourceSelector {
-    /// No source-name/kind constraint: every confirmed generation, subject
-    /// only to [`Admissibility::authority`].
+    /// No source-name constraint: every confirmed generation, subject
+    /// only to [`Admissibility::kind`]/[`Admissibility::authority`].
     #[default]
     Any,
     /// A2 §2's `--source <name>`: exactly one declared source's newest
@@ -3281,8 +3352,6 @@ pub enum SourceSelector {
         /// The exact generation's content identity.
         content_key: String,
     },
-    /// A2 §2's `--type repo|knowledge|external` selector.
-    Kind(SourceKind),
     /// A2 §2's `--work <id>` filter, **W1's scope only** (H13.2): the
     /// named repository's BASE generation — never the overlay half, which
     /// is W1b's daemon-side lifecycle hook
@@ -3306,22 +3375,23 @@ pub enum SourceSelector {
 }
 
 impl SourceSelector {
-    /// The `(source_name, content_key, source_kind)` bind values every
-    /// admissibility query composes identically — [`Self::Named`] and
-    /// [`Self::WorkBase`] bind the same shape on purpose: **W1's whole
-    /// point is that a Work's base generation reads exactly like any other
-    /// named source's**, and only [`Self::work_scope`] marks the
-    /// difference the caller must state.
-    fn bindings(&self) -> (Option<&str>, Option<&str>, Option<&'static str>) {
+    /// The `(source_name, content_key)` bind values every admissibility
+    /// query composes identically — [`Self::Named`] and [`Self::WorkBase`]
+    /// bind the same shape on purpose: **W1's whole point is that a Work's
+    /// base generation reads exactly like any other named source's**, and
+    /// only [`Self::work_scope`] marks the difference the caller must
+    /// state. Stage 4's `source_kind` bind is
+    /// [`Admissibility::kind`]'s alone now, not this selector's — see that
+    /// field's own doc.
+    fn bindings(&self) -> (Option<&str>, Option<&str>) {
         match self {
-            Self::Any => (None, None, None),
-            Self::Named(name) => (Some(name.as_str()), None, None),
+            Self::Any => (None, None),
+            Self::Named(name) => (Some(name.as_str()), None),
             Self::Exact {
                 source_name,
                 content_key,
-            } => (Some(source_name.as_str()), Some(content_key.as_str()), None),
-            Self::Kind(kind) => (None, None, Some(kind.as_str())),
-            Self::WorkBase { repository, .. } => (Some(repository.as_str()), None, None),
+            } => (Some(source_name.as_str()), Some(content_key.as_str())),
+            Self::WorkBase { repository, .. } => (Some(repository.as_str()), None),
         }
     }
 
@@ -3356,6 +3426,23 @@ pub enum WorkScope {
     /// W1's whole scope. A caller MUST state this rather than presenting
     /// the answer as A2 §2's full "including overlay" promise.
     BaseOnly,
+}
+
+/// What one `admissible_*` call answered, **with its own completeness
+/// marker attached to the value** — every `admissible_*` method returns
+/// this rather than a bare `Vec`, so [`WorkScope`]'s "a caller MUST
+/// render/assert" (see [`SourceSelector::WorkBase`]'s own doc) is something
+/// the type forces rather than a fact only recoverable by re-deriving it
+/// from the original `filter` a caller may no longer have in scope. A
+/// caller that forwards `hits` onward without `scope` has to do so
+/// explicitly (`.hits`, dropping `.scope` on the floor) rather than by
+/// construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Admitted<T> {
+    /// The admissible rows themselves.
+    pub hits: Vec<T>,
+    /// What this answer covers — see [`WorkScope`].
+    pub scope: WorkScope,
 }
 
 /// H13.1's content-kind filter, document family: the exhaustive, code-owned

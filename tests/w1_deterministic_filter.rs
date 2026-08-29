@@ -40,7 +40,7 @@ use sergeant_rs::runtime::atlas::db::{
 };
 use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
 use sergeant_rs::runtime::atlas::office::DOCX_EXTRACTOR;
-use sergeant_rs::runtime::atlas::record::record_scan;
+use sergeant_rs::runtime::atlas::record::{ScanRecord, record_scan};
 use sergeant_rs::runtime::atlas::scan::{
     KnowledgeSource, ScannedFile, ScannedSymbol, ScannedSyntax, ScannedUnit, SourceScan,
     scan_local_knowledge,
@@ -162,6 +162,10 @@ fn scan(
 ///   `widget_vendor`) — proves authority exclusion.
 struct Estate {
     _data: TempDir,
+    /// Kept open (not dropped after setup) so a test can record a further
+    /// scan through the real [`record_scan`] path — the supersession test
+    /// below needs to drive `confirm_scan`'s own eviction, not fabricate it.
+    journal: Journal,
     db: AtlasDb,
 }
 
@@ -247,12 +251,17 @@ fn estate() -> Estate {
     );
     record_scan(&mut db, &mut journal, &vendor, None).expect("record vendor-lib");
 
-    Estate { _data: data, db }
+    Estate {
+        _data: data,
+        journal,
+        db,
+    }
 }
 
 fn named(source_name: &str) -> Admissibility {
     Admissibility {
         source: SourceSelector::Named(source_name.to_string()),
+        kind: None,
         authority: None,
     }
 }
@@ -262,6 +271,7 @@ fn occurrence_names(estate: &Estate, filter: &Admissibility) -> Vec<String> {
         .db
         .admissible_occurrences(filter, 500)
         .expect("admissible occurrences")
+        .hits
         .into_iter()
         .map(|hit| hit.occurrence.name)
         .collect()
@@ -293,8 +303,17 @@ fn a_named_source_filter_admits_only_that_sources_generation() {
         .db
         .admissible_generations(&named("repo-a"), 500)
         .expect("admissible generations");
-    let names: Vec<&str> = generations.iter().map(|g| g.source_name.as_str()).collect();
+    let names: Vec<&str> = generations
+        .hits
+        .iter()
+        .map(|g| g.source_name.as_str())
+        .collect();
     assert_eq!(names, vec!["repo-a"], "{names:?}");
+    assert_eq!(
+        generations.scope,
+        WorkScope::NotWorkScoped,
+        "a plain --source filter's answer is not Work-scoped at all"
+    );
 }
 
 /// An exact `--source repo-a@<sha>` pin answers for the CURRENT confirmed
@@ -309,20 +328,22 @@ fn an_exact_generation_pin_matches_its_own_key_and_returns_nothing_for_a_stale_o
             source_name: "repo-a".to_string(),
             content_key: REPO_A_KEY.to_string(),
         },
+        kind: None,
         authority: None,
     };
     let hit = estate
         .db
         .admissible_generations(&exact, 500)
         .expect("admissible generations");
-    assert_eq!(hit.len(), 1, "{hit:?}");
-    assert_eq!(hit[0].source_name, "repo-a");
+    assert_eq!(hit.hits.len(), 1, "{hit:?}");
+    assert_eq!(hit.hits[0].source_name, "repo-a");
 
     let stale = Admissibility {
         source: SourceSelector::Exact {
             source_name: "repo-a".to_string(),
             content_key: "repo-a@a-key-nothing-was-ever-confirmed-under".to_string(),
         },
+        kind: None,
         authority: None,
     };
     let miss = estate
@@ -330,14 +351,131 @@ fn an_exact_generation_pin_matches_its_own_key_and_returns_nothing_for_a_stale_o
         .admissible_generations(&stale, 500)
         .expect("admissible generations");
     assert!(
-        miss.is_empty(),
+        miss.hits.is_empty(),
         "a stale content key must match nothing, got {miss:?}"
+    );
+}
+
+/// NEGATIVE — the review brief's own scenario: an evicted/superseded
+/// generation must not leak. Unlike the test above (a content key that was
+/// *never confirmed*), this drives the real live-eviction path: `repo-a` is
+/// rescanned with genuinely changed bytes, so `confirm_scan` (via
+/// `record_scan`) confirms the new generation and evicts the standing one in
+/// the same transaction (`ruling §4`) — physically deleting its rows and
+/// flipping its `source.generations.state` off `confirmed`. Every
+/// admissibility method, and the exact-pin path at the now-stale key, must
+/// come back empty for it.
+#[test]
+fn a_superseded_generation_does_not_leak_through_any_admissible_method() {
+    let mut estate = estate();
+
+    let original = estate
+        .db
+        .admissible_generations(&named("repo-a"), 500)
+        .expect("admissible generations");
+    assert_eq!(original.hits.len(), 1, "{original:?}");
+    let original_generation_id = original.hits[0].id.clone();
+    assert_eq!(original.hits[0].content_key, REPO_A_KEY);
+
+    // Re-scan `repo-a` under the SAME source_name with genuinely different
+    // bytes (a new symbol, a new content key, and — the point — no
+    // `README.md`/`mystery.xyz` at all) so `confirm_scan` supersedes and
+    // evicts the standing generation rather than reporting `Unchanged`.
+    let repo_a_v2 = scan(
+        "repo-a",
+        SourceKind::EstateGit,
+        AuthorityClass::EstateMutable,
+        "repo-a@key-2",
+        vec![file(
+            "src/main.rs",
+            TEXT_EXTRACTOR,
+            vec![document("fn widget_a_v2() {}\n")],
+            Some(syntax("rust", "syntax-rust/v1", "function", "widget_a_v2")),
+        )],
+    );
+    let recorded = record_scan(&mut estate.db, &mut estate.journal, &repo_a_v2, None)
+        .expect("record repo-a v2");
+    let evicted = match recorded {
+        ScanRecord::Recorded { evicted, .. } => evicted,
+        other => panic!("expected a recorded, superseding scan of repo-a, got {other:?}"),
+    };
+    assert_eq!(
+        evicted.as_deref(),
+        Some(original_generation_id.as_str()),
+        "the rescan must genuinely supersede repo-a's original generation, or nothing below \
+         proves the LIVE eviction path rather than an empty database"
+    );
+
+    // Stage 1 (source/generation filter): exactly one confirmed generation
+    // for `repo-a`, and it is the NEW one — the evicted generation must not
+    // still be reported as admissible.
+    let after = estate
+        .db
+        .admissible_generations(&named("repo-a"), 500)
+        .expect("admissible generations");
+    assert_eq!(
+        after.hits.len(),
+        1,
+        "the evicted generation leaked through admissible_generations: {after:?}"
+    );
+    assert_eq!(after.hits[0].content_key, "repo-a@key-2");
+    assert_ne!(
+        after.hits[0].id, original_generation_id,
+        "admissible_generations still reports the evicted generation's own id"
+    );
+
+    // Content-kind filter, code family: the evicted generation's occurrence
+    // (`widget_a`) must not leak through admissible_occurrences — only the
+    // surviving generation's `widget_a_v2` is admissible now.
+    let names = occurrence_names(&estate, &named("repo-a"));
+    assert!(
+        !names.contains(&"widget_a".to_string()),
+        "the evicted generation's occurrence leaked through admissible_occurrences: {names:?}"
+    );
+    assert!(names.contains(&"widget_a_v2".to_string()), "{names:?}");
+
+    // Content-kind filter, document family: the evicted generation's
+    // `README.md` unit must not leak through admissible_units — the
+    // surviving generation never had a README.md at all.
+    let paths: Vec<String> = estate
+        .db
+        .admissible_units(&named("repo-a"), 500)
+        .expect("admissible units")
+        .hits
+        .into_iter()
+        .map(|hit| hit.unit.relative_path)
+        .collect();
+    assert!(
+        !paths.contains(&"README.md".to_string()),
+        "the evicted generation's unit leaked through admissible_units: {paths:?}"
+    );
+
+    // The exact-pin path: pinning at the OLD, now-superseded content key
+    // must match nothing — it names a world that no longer stands, exactly
+    // like the never-confirmed stale key above, but this key WAS once the
+    // real confirmed generation's own.
+    let stale_exact = Admissibility {
+        source: SourceSelector::Exact {
+            source_name: "repo-a".to_string(),
+            content_key: REPO_A_KEY.to_string(),
+        },
+        kind: None,
+        authority: None,
+    };
+    let miss = estate
+        .db
+        .admissible_generations(&stale_exact, 500)
+        .expect("admissible generations");
+    assert!(
+        miss.hits.is_empty(),
+        "an exact pin at the evicted generation's own former content key must match nothing, \
+         got {miss:?}"
     );
 }
 
 // ------------------------------------------- stage 4: repo/knowledge/external
 
-/// POSITIVE: `--type knowledge` (`SourceSelector::Kind(LocalKnowledge)`)
+/// POSITIVE: `--type knowledge` (`Admissibility::kind = Some(LocalKnowledge)`)
 /// admits `notes`. NEGATIVE: it excludes `repo-a`/`repo-b` (estate-git) and
 /// `vendor-lib` (external-git) — the estate's own repositories and a
 /// fetched external one are both a different KIND, not merely a different
@@ -346,15 +484,88 @@ fn an_exact_generation_pin_matches_its_own_key_and_returns_nothing_for_a_stale_o
 fn a_knowledge_kind_selector_admits_only_local_knowledge_sources() {
     let estate = estate();
     let filter = Admissibility {
-        source: SourceSelector::Kind(SourceKind::LocalKnowledge),
+        source: SourceSelector::Any,
+        kind: Some(SourceKind::LocalKnowledge),
         authority: None,
     };
     let generations = estate
         .db
         .admissible_generations(&filter, 500)
         .expect("admissible generations");
-    let names: Vec<&str> = generations.iter().map(|g| g.source_name.as_str()).collect();
+    let names: Vec<&str> = generations
+        .hits
+        .iter()
+        .map(|g| g.source_name.as_str())
+        .collect();
     assert_eq!(names, vec!["notes"], "{names:?}");
+}
+
+/// **Stage 4 composes with stage 1** — A2 §2's own listing ("the optional
+/// repo/knowledge/external selector") makes `--type` layered ON TOP OF
+/// `--source`/`--work`, not an alternative to them. `Admissibility::kind`
+/// is a field independent of `SourceSelector` for exactly this reason (see
+/// its own doc): the two are checked together here, over both a `--source`
+/// selector and a `--work` (`WorkBase`) selector, proving the composition
+/// the type system now allows is also correct at the SQL level, not merely
+/// expressible.
+#[test]
+fn stage_4_composes_with_a_named_source_and_with_a_work_base_selector() {
+    let estate = estate();
+
+    // `--source repo-a --type repo`: repo-a genuinely IS estate-git, so
+    // both halves of the composed filter agree — the generation is
+    // admitted.
+    let matching = Admissibility {
+        source: SourceSelector::Named("repo-a".to_string()),
+        kind: Some(SourceKind::EstateGit),
+        authority: None,
+    };
+    let hits = estate
+        .db
+        .admissible_generations(&matching, 500)
+        .expect("admissible generations");
+    let names: Vec<&str> = hits.hits.iter().map(|g| g.source_name.as_str()).collect();
+    assert_eq!(names, vec!["repo-a"], "{names:?}");
+
+    // `--source repo-a --type knowledge`: repo-a is named correctly but is
+    // NOT local-knowledge, so the composed (AND) filter admits nothing —
+    // proving `kind` genuinely narrows a `Named` selector's own answer
+    // rather than being ignored once a source name is given.
+    let disagreeing = Admissibility {
+        source: SourceSelector::Named("repo-a".to_string()),
+        kind: Some(SourceKind::LocalKnowledge),
+        authority: None,
+    };
+    let miss = estate
+        .db
+        .admissible_generations(&disagreeing, 500)
+        .expect("admissible generations");
+    assert!(
+        miss.hits.is_empty(),
+        "a --source filter naming an estate-git source, composed with --type knowledge, must          admit nothing: {miss:?}"
+    );
+
+    // The same composition over `--work` (`SourceSelector::WorkBase`), the
+    // selector this finding named specifically as inexpressible before this
+    // fix: `--work <id> --type repo` still reads repo-a's base generation.
+    let work_and_kind = Admissibility {
+        source: SourceSelector::WorkBase {
+            work_id: "01WORKID000000000000000000".to_string(),
+            repository: "repo-a".to_string(),
+        },
+        kind: Some(SourceKind::EstateGit),
+        authority: None,
+    };
+    let work_hits = estate
+        .db
+        .admissible_generations(&work_and_kind, 500)
+        .expect("admissible generations");
+    let work_names: Vec<&str> = work_hits
+        .hits
+        .iter()
+        .map(|g| g.source_name.as_str())
+        .collect();
+    assert_eq!(work_names, vec!["repo-a"], "{work_names:?}");
 }
 
 // -------------------------------------------------- stage 2: authority filter
@@ -368,6 +579,7 @@ fn an_authority_filter_excludes_external_content_when_not_requested() {
     let estate = estate();
     let filter = Admissibility {
         source: SourceSelector::Any,
+        kind: None,
         authority: Some(AuthorityClass::EstateMutable),
     };
     let names = occurrence_names(&estate, &filter);
@@ -387,6 +599,7 @@ fn an_authority_filter_for_external_admits_only_the_external_source() {
     let estate = estate();
     let filter = Admissibility {
         source: SourceSelector::Any,
+        kind: None,
         authority: Some(AuthorityClass::External),
     };
     let names = occurrence_names(&estate, &filter);
@@ -405,7 +618,11 @@ fn an_unfiltered_admissibility_admits_every_confirmed_source() {
         .db
         .admissible_generations(&Admissibility::default(), 500)
         .expect("admissible generations");
-    let mut names: Vec<&str> = generations.iter().map(|g| g.source_name.as_str()).collect();
+    let mut names: Vec<&str> = generations
+        .hits
+        .iter()
+        .map(|g| g.source_name.as_str())
+        .collect();
     names.sort_unstable();
     assert_eq!(names, vec!["notes", "repo-a", "repo-b", "vendor-lib"]);
 }
@@ -441,7 +658,11 @@ fn a_content_kind_mismatch_is_excluded_from_the_document_family() {
         .db
         .admissible_units(&named("repo-a"), 500)
         .expect("admissible units");
-    let paths: Vec<&str> = hits.iter().map(|h| h.unit.relative_path.as_str()).collect();
+    let paths: Vec<&str> = hits
+        .hits
+        .iter()
+        .map(|h| h.unit.relative_path.as_str())
+        .collect();
     assert!(
         !paths.contains(&"mystery.xyz"),
         "a unit under an unrecognized structure extractor leaked through the document-family \
@@ -561,9 +782,21 @@ fn a_work_base_selector_reads_like_its_named_repository_and_states_base_only_sco
             work_id: "01WORKID000000000000000000".to_string(),
             repository: "repo-a".to_string(),
         },
+        kind: None,
         authority: None,
     };
     assert_eq!(filter.source.work_scope(), WorkScope::BaseOnly);
+
+    // The completeness marker is carried on the ANSWER itself, not only
+    // recoverable by re-deriving it from `filter` -- `Admitted::scope`,
+    // checked directly on a real `admissible_generations` return, not on
+    // the input filter a caller forwarding just the hits may no longer
+    // have in scope.
+    let generations = estate
+        .db
+        .admissible_generations(&filter, 500)
+        .expect("admissible generations");
+    assert_eq!(generations.scope, WorkScope::BaseOnly);
 
     let names = occurrence_names(&estate, &filter);
     assert!(names.contains(&"widget_a".to_string()), "{names:?}");
@@ -638,6 +871,7 @@ fn a_toml_files_config_content_lives_in_the_code_lane_and_also_leaves_a_document
         .expect("admissible occurrences");
     assert!(
         occurrences
+            .hits
             .iter()
             .any(|hit| hit.occurrence.extractor == "syntax-toml/v1"
                 && hit.occurrence.label == "table"
@@ -649,12 +883,12 @@ fn a_toml_files_config_content_lives_in_the_code_lane_and_also_leaves_a_document
     // "zero source.units rows" the plan's own text asserted.
     let units = db.admissible_units(&filter, 500).expect("admissible units");
     assert_eq!(
-        units.len(),
+        units.hits.len(),
         1,
         "Cargo.toml must leave exactly one fallback document unit, got {units:#?}"
     );
-    assert_eq!(units[0].unit.relative_path, "Cargo.toml");
-    assert_eq!(units[0].unit.kind, UnitKind::Document);
+    assert_eq!(units.hits[0].unit.relative_path, "Cargo.toml");
+    assert_eq!(units.hits[0].unit.kind, UnitKind::Document);
 }
 
 // -------------------------------------------------- tabular family, datasets
@@ -695,9 +929,9 @@ fn a_source_filter_excludes_another_sources_dataset() {
     let hits = db
         .admissible_datasets(&named("data-a"), 500)
         .expect("admissible datasets");
-    let sources: Vec<&str> = hits.iter().map(|h| h.source_name.as_str()).collect();
+    let sources: Vec<&str> = hits.hits.iter().map(|h| h.source_name.as_str()).collect();
     assert_eq!(sources, vec!["data-a"], "{hits:#?}");
-    assert_eq!(hits[0].dataset.relative_path, "rows.csv");
+    assert_eq!(hits.hits[0].dataset.relative_path, "rows.csv");
 }
 
 // ------------------------------- --work, the fourth required negative (W1)
@@ -718,16 +952,25 @@ fn a_source_filter_excludes_another_sources_dataset() {
 /// [`AtlasDb::evict_work_overlays`](sergeant_rs::runtime::atlas::db::AtlasDb::evict_work_overlays)
 /// already reads today.
 ///
-/// Two exclusions are required and both are checked:
+/// Three exclusions are required and all three are checked:
 ///
-/// 1. **Another Work's overlay over the same repository is not admissible.**
-///    `work:01OTHER…/repo-a` describes a world only that Work can see. A
-///    filter that matched the `work:` prefix, or that reached for "anything
-///    mentioning repo-a", would admit it — and admissibility decides what
-///    may be SEEN, so that is a leak between two Works' surfaces, not a
-///    ranking imprecision (A2 §8).
-/// 2. **This Work's OWN overlay is not admissible either** — the honest
-///    half. W1's `--work` is
+/// 1. **Neither overlay coordinate is admissible through `SourceSelector::
+///    Named` either** — not just through the `--work`/`--type`/`--source`
+///    selectors `a_work_base_selector_...` already covers for a *different
+///    repository*. `work:<id>/repo-a` describes a world only that Work can
+///    see; a caller who merely learns another Work's id (visible via `sgt
+///    work list`) must not be able to type it straight into `--source` and
+///    read that Work's surface. Every `admissible_*` method excludes the
+///    `work:` prefix unconditionally, so this holds even for the coordinate
+///    typed exactly.
+/// 2. **Another Work's overlay over the same repository is not admissible
+///    through `--work` either.** `work:01OTHER…/repo-a` describes a world
+///    only that Work can see. A filter that matched the `work:` prefix, or
+///    that reached for "anything mentioning repo-a", would admit it — and
+///    admissibility decides what may be SEEN, so that is a leak between two
+///    Works' surfaces, not a ranking imprecision (A2 §8).
+/// 3. **This Work's OWN overlay is not admissible through `--work` either**
+///    — the honest half. W1's `--work` is
 ///    [`WorkScope::BaseOnly`](sergeant_rs::runtime::atlas::db::WorkScope)
 ///    (H13.2), so the overlay is absent by design rather than by accident,
 ///    and the answer says so. When W1b lands, THIS assertion is the one
@@ -760,6 +1003,14 @@ fn a_work_filter_excludes_a_different_works_generation() {
 
     // Two overlay generations over that same base, one per Work, each under
     // its own `work:<id>/<repo>` source coordinate.
+    //
+    // The write is proved directly through `record_scan`'s own return value
+    // (`ScanRecord::Recorded` — journaled and confirmed) rather than by
+    // reading the row back through an admissibility query: every
+    // admissibility method now excludes the `work:` prefix unconditionally
+    // (the blocker this test exists to pin), so a round trip through
+    // `SourceSelector::Named` can no longer serve as proof the fixture
+    // landed — that round trip succeeding was the very leak being fixed.
     for (work_id, symbol) in [(MINE, "widget_mine"), (OTHER, "widget_theirs")] {
         let overlay = scan(
             &sergeant_rs::runtime::atlas::overlay::overlay_source_name(work_id, "repo-a"),
@@ -773,7 +1024,12 @@ fn a_work_filter_excludes_a_different_works_generation() {
                 Some(syntax("rust", "syntax-rust/v1", "function", symbol)),
             )],
         );
-        record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+        let recorded = record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+        assert!(
+            matches!(recorded, ScanRecord::Recorded { .. }),
+            "the fixture must actually be journaled and confirmed, or the exclusions below \
+             prove nothing: {recorded:?}"
+        );
     }
 
     let filter = Admissibility {
@@ -781,25 +1037,32 @@ fn a_work_filter_excludes_a_different_works_generation() {
             work_id: MINE.to_string(),
             repository: "repo-a".to_string(),
         },
+        kind: None,
         authority: None,
     };
 
-    // Both overlay generations genuinely exist in the store, so the two
-    // exclusions below are the filter's doing rather than an empty database's.
+    // Neither overlay coordinate is admissible through ANY selector — not
+    // just `WorkBase` (W1's `--work`, checked below), but also `Named`/
+    // `Exact` addressing the coordinate directly, since a caller who learns
+    // another Work's id could otherwise type it straight into `--source`.
     for work_id in [MINE, OTHER] {
         let coordinate =
             sergeant_rs::runtime::atlas::overlay::overlay_source_name(work_id, "repo-a");
         assert!(
-            !db.admissible_units(&named(&coordinate), 500)
+            db.admissible_units(&named(&coordinate), 500)
                 .expect("admissible units")
+                .hits
                 .is_empty(),
-            "the fixture must actually hold {coordinate}'s rows, or the exclusions prove nothing"
+            "SourceSelector::Named must never surface an overlay coordinate, {coordinate} \
+             included: a caller who learns a Work id must not be able to read that Work's \
+             surface via --source"
         );
     }
 
     let sources: BTreeSet<String> = db
         .admissible_generations(&filter, 500)
         .expect("admissible generations")
+        .hits
         .into_iter()
         .map(|generation| generation.source_name)
         .collect();
@@ -816,6 +1079,7 @@ fn a_work_filter_excludes_a_different_works_generation() {
     let names: Vec<String> = db
         .admissible_occurrences(&filter, 500)
         .expect("admissible occurrences")
+        .hits
         .into_iter()
         .map(|hit| hit.occurrence.name)
         .collect();
