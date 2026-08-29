@@ -37,7 +37,7 @@ use sergeant_rs::domain::workflow::{
     KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_OUTPUT_MISSING,
     REASON_STAGE_OUTPUT_MISSING,
 };
-use sergeant_rs::runtime::analytics::Analytics;
+use sergeant_rs::runtime::atlas::db::Analytics;
 use sergeant_rs::runtime::journal::Journal;
 
 mod support;

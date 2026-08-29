@@ -56,8 +56,8 @@ use crate::domain::workflow::{
     KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
     WorkflowDefinition,
 };
-use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::atlas::db::{self as atlas_db, AtlasDb, AtlasError, SourceStatus};
+use crate::runtime::atlas::db::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::atlas::external_git::ExternalGitSource;
 use crate::runtime::atlas::git::EstateGitSource;
 use crate::runtime::atlas::lane::{
@@ -502,13 +502,21 @@ pub struct ApiState {
     /// up from the journal at query time (see [`with_analytics`]), so a
     /// failure anywhere in here costs an answer, never a fact.
     pub analytics: Arc<tokio::sync::Mutex<Analytics>>,
-    /// S3 X4: Atlas's durable store, opened lazily and kept for the process.
+    /// S3 X4: Atlas's durable store, derived lazily and kept for the process.
     ///
-    /// `None` until something asks — and it stays `None` on a host that has
-    /// never scanned a source, because opening the file *creates* it and a
-    /// host with no knowledge sources should not pay a database creation for a
-    /// feature it has never used (the same argument `daemon::start_with`
-    /// already makes for startup reconciliation, R1).
+    /// `None` until something asks. The read-side helpers still refuse to
+    /// bring a store into existence for a mere read — but since S5 W1c the
+    /// file is A1 §5's one database and the projection's own start created
+    /// it, so that refusal now protects the *answer* ("this host has indexed
+    /// nothing", said from zero confirmed generations) rather than the file.
+    ///
+    /// **Derived from [`Self::analytics`], never `AtlasDb::open`.** One file
+    /// is one DuckDB instance: a second `open` against the same path is a
+    /// second instance that neither sees nor is seen by the projection's, and
+    /// whose close silently overwrites it (`Analytics::atlas`). Lock order is
+    /// therefore this mutex, then the analytics mutex, and only in that
+    /// direction — nothing takes the analytics lock and then reaches for this
+    /// one.
     ///
     /// Behind its own lock, not the core's, for the same reason
     /// [`Self::analytics`] is: a `map` query is a read of derived evidence and
@@ -4408,8 +4416,9 @@ async fn doctor_report(
 ///   structural rather than promised;
 /// - an answer is always as fresh as the journal, because the catch-up runs
 ///   *before* the query, not on a timer;
-/// - rebuild and catch-up run the identical fold, so "delete the file and
-///   restart" and "keep it current" cannot produce different tables.
+/// - rebuild and catch-up run the identical fold, so a start-of-day rebuild
+///   (which drops the `ops` schema and re-folds it) and "keep it current"
+///   cannot produce different tables.
 ///
 /// A catch-up failure is answered as a 503 against the projection, never as a
 /// failure of the work it describes: the journal is untouched and a restart
@@ -4520,10 +4529,17 @@ async fn work_graph(State(state): State<ApiState>, Path(id): Path<String>) -> Re
 /// no journal replay reproduces them (F1). A read here answers with what the
 /// scanner wrote, or says honestly that nothing has been scanned.
 ///
-/// A host that has never scanned a source has no Atlas file, and creating one
-/// to answer a read would mean every `sgt intelligence status` on a fresh
-/// install left a database behind. So the absent file is an *answer*, handed
-/// to the caller as `None`, not a failure and not a reason to create anything.
+/// "This host has indexed nothing" is an *answer*, handed to the caller as
+/// `None` ([`atlas_absent`]), never a failure.
+///
+/// **What that answer is read off changed in S5 W1c, and the answer did
+/// not.** It used to be the absence of the Atlas file: a host that had never
+/// scanned had none, and creating one to answer a read would have left a
+/// database behind on every `sgt intelligence status`. A1 §5 puts `ops` in
+/// that same file, so the daemon's own start now creates it on every host —
+/// the file stopped being able to carry the distinction, and the evidence
+/// took over. `None` now means "no source has a confirmed generation," which
+/// is the question the response's own `detail` was always answering.
 async fn with_atlas<T>(
     state: &ApiState,
     f: impl FnOnce(&AtlasDb) -> Result<T, AtlasError>,
@@ -4533,7 +4549,7 @@ async fn with_atlas<T>(
         if !crate::runtime::atlas::db::atlas_db_path(&state.data_dir).exists() {
             return Ok(None);
         }
-        match AtlasDb::open(&state.data_dir) {
+        match state.analytics.lock().await.atlas() {
             Ok(atlas) => *guard = Some(atlas),
             Err(e) => {
                 return Err(Box::new(error_response(
@@ -4545,6 +4561,18 @@ async fn with_atlas<T>(
         }
     }
     let atlas = guard.as_ref().expect("opened above");
+    // The evidence check the file's existence used to stand in for.
+    match atlas.indexed_sources() {
+        Ok(sources) if sources.is_empty() => return Ok(None),
+        Ok(_) => {}
+        Err(e) => {
+            return Err(Box::new(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "atlas_unavailable",
+                format!("atlas read failed: {e}"),
+            )));
+        }
+    }
     match f(atlas) {
         Ok(value) => Ok(Some(value)),
         Err(e) => Err(Box::new(error_response(
@@ -4620,6 +4648,12 @@ impl MapQuery {
 /// indexed on this host" and "this source has nothing in it" are different
 /// answers and a client that could not tell them apart would report the wrong
 /// one.
+///
+/// `present: false` says this host holds no Atlas evidence. Since S5 W1c that
+/// is no longer the same sentence as "the file does not exist" — A1 §5's one
+/// database also carries `ops`, so it exists wherever a daemon has started —
+/// and [`with_atlas`] reads the claim off confirmed generations instead. The
+/// wording did not change because the question did not.
 fn atlas_absent() -> Response {
     Json(json!({
         "atlas": {"present": false},
@@ -4707,17 +4741,24 @@ async fn with_atlas_write<T>(
 ) -> Result<T, AtlasError> {
     let mut guard = state.atlas.lock().await;
     if guard.is_none() {
-        *guard = Some(AtlasDb::open(&state.data_dir)?);
+        *guard = Some(state.analytics.lock().await.atlas()?);
     }
     Ok(f(guard.as_mut().expect("opened above")))
 }
 
-/// [`with_atlas_write`] that **never creates** the store — `Ok(None)` when
-/// this installation has no Atlas store file yet (`atlas_db_path`).
+/// [`with_atlas_write`] for a hook that must stay invisible on an
+/// installation that indexes nothing — `Ok(None)` there, having written
+/// nothing.
 ///
-/// The read-only [`with_atlas`] already has this posture and for the same
-/// reason (R1): a daemon-side hook that fires on every Work must not give a
-/// fresh install an Atlas database as a side effect of running a Work.
+/// Same posture as the read-only [`with_atlas`], and the same S5 W1c
+/// restatement of what it is read off: the guard used to be the absence of
+/// the Atlas file (R1 — a daemon-side hook that fires on every Work must not
+/// give a fresh install a database as a side effect), and A1 §5's one
+/// database exists on every host from the daemon's first start. So the guard
+/// became the evidence: a hook fires only where some source already has a
+/// confirmed generation. An estate that has indexed nothing gets no overlay
+/// generation, exactly as before — what it no longer gets is a *file* that
+/// was never really the subject of the promise.
 async fn with_existing_atlas_write<T>(
     state: &ApiState,
     f: impl FnOnce(&mut AtlasDb) -> T,
@@ -4727,9 +4768,13 @@ async fn with_existing_atlas_write<T>(
         if !crate::runtime::atlas::db::atlas_db_path(&state.data_dir).exists() {
             return Ok(None);
         }
-        *guard = Some(AtlasDb::open(&state.data_dir)?);
+        *guard = Some(state.analytics.lock().await.atlas()?);
     }
-    Ok(Some(f(guard.as_mut().expect("opened above"))))
+    let atlas = guard.as_mut().expect("opened above");
+    if atlas.indexed_sources()?.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(f(atlas)))
 }
 
 /// S5 W1b — which Work-overlay lifecycle action one settled surface
@@ -7404,13 +7449,20 @@ mod tests {
         assert_eq!(body["error"]["code"], "name_required");
     }
 
-    /// A host that has never scanned anything answers, and **creates no
-    /// database to do it**.
+    /// A host that has never scanned anything answers "nothing indexed", and
+    /// **writes no evidence to do it**.
     ///
-    /// Opening Atlas creates its file, so a status read on a fresh install
-    /// would otherwise leave a store behind for a feature nobody used (R1).
+    /// The R1 limit this pins is that a read must not manufacture the thing
+    /// it reports on. Until S5 W1c that was measurable as file absence:
+    /// opening Atlas created its file, so a status read on a fresh install
+    /// would have left a store behind for a feature nobody used. A1 §5
+    /// declares ONE database and puts the journal-derived `ops` schema in it,
+    /// so the projection's own start creates that file on every host — the
+    /// file stopped being able to carry the claim, and the claim moved to
+    /// what it was always about: after the read, no source has a confirmed
+    /// generation, and the answer says so.
     #[tokio::test]
-    async fn an_unscanned_host_answers_without_creating_a_store() {
+    async fn an_unscanned_host_answers_without_writing_evidence() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let state = test_state(dir.path()).await;
 
@@ -7424,9 +7476,19 @@ mod tests {
                 .contains("no source has been indexed"),
             "the absent answer must say what is absent: {body}"
         );
+        // The store the answer reports on: still holding nothing, having been
+        // read. `test_state` folded `ops` into it, which is what created the
+        // file; a read that had scanned something to answer would show up
+        // here as a confirmed generation.
+        let atlas = state
+            .analytics
+            .lock()
+            .await
+            .atlas()
+            .expect("the one database the projection opened");
         assert!(
-            !crate::runtime::atlas::db::atlas_db_path(dir.path()).exists(),
-            "a read must not create the store it reports on"
+            atlas.indexed_sources().expect("indexed sources").is_empty(),
+            "a read must not manufacture the evidence it reports on"
         );
     }
 

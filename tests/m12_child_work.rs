@@ -32,7 +32,7 @@ use sergeant_rs::backend::BackendRegistry;
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::Event;
-use sergeant_rs::runtime::analytics::Analytics;
+use sergeant_rs::runtime::atlas::db::Analytics;
 use sergeant_rs::runtime::journal::Journal;
 
 mod support;

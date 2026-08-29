@@ -1,50 +1,73 @@
-//! The one owner of Atlas's database file (F2).
+//! The one owner of the estate's database (F2, A1 §5).
 //!
 //! ```text
 //! <data-dir>/atlas/atlas.duckdb
 //! ```
 //!
-//! This file is the only place under `runtime/atlas/` that names the `duckdb`
-//! crate, and the [`Connection`] it holds is a private field with no
-//! accessor — exactly the shape [`crate::runtime::analytics`] holds for the
-//! operations projection, held independently for this database.
-//! `tests/x1_atlas_substrate.rs` pins it structurally; that test is a
-//! separate assertion from M5's, over a separate tree, because two databases
-//! with one owner each is a different (and stronger) property than two files
-//! sharing permission to open any database.
+//! One physical file, five logical schemas — `meta`, `ops`, `source`, `git`,
+//! `context` — exactly as A1 §5 declares and for the reason A1-02 gives:
+//! "schemas provide separation without more databases". A second file
+//! (`projections/sergeant.duckdb`, carrying `ops`) shipped in S3 and was
+//! removed in S5 W1c after the owner correction of 2026-08-29; the
+//! capability §5 cites as the reason for one database — a cross-domain join
+//! with no `ATTACH` — is what A2's `--work` filter needs, and it is pinned by
+//! `tests/w1c_one_atlas_database.rs`.
 //!
-//! # This file is not a projection (F1)
+//! This file is the only place **in the crate** that names the `duckdb`
+//! crate, and the [`Connection`]s it holds are private fields with no
+//! accessor. `tests/x1_atlas_substrate.rs`'s
+//! `atlas_database_has_exactly_one_owner` pins that structurally over the
+//! whole of `src/`. It is one assertion because there is one database: two
+//! tests naming two owners would be the union rule ("either of these files
+//! may open a database") that both suites forbade while there really were
+//! two files.
 //!
-//! [`crate::runtime::analytics`] opens its file by deleting it: the
-//! operations tables are a pure fold of the journal, so the rebuild path and
-//! the startup path are the same path, and losing the file loses nothing.
+//! # One file, two rebuild disciplines (F1)
 //!
-//! **None of that is true here.** [`AtlasDb::open`] opens the existing file
-//! and keeps it, because `source.*`, `git.*` and `meta.coverage` PERSIST
-//! across restarts. They are derived from source bytes plus extractor
-//! identity, keyed by SourceGeneration; no
-//! journal replay reproduces them. A generation is evicted only when the
-//! source bytes it was derived from changed, and the eviction is reported as
-//! a coverage row rather than a silent gap (ruling §4). The journal carries
-//! one compact `source.scanned` summary per completed scan so the
-//! authoritative trail stays journal-side while the unit-level detail stays
-//! here.
+//! **`ops.*` is disposable, and only `ops.*`.** It is a pure fold of the
+//! journal, so [`Analytics::begin_rebuild`] drops the whole `ops` schema and
+//! re-folds it on every daemon start. `DROP SCHEMA ops CASCADE` has exactly
+//! the scope that deleting the old separate file had, which is the point: the
+//! discipline survived the merge, the file deletion did not.
+//!
+//! **Nothing else in this file is disposable.** [`AtlasDb::open`] opens the
+//! existing file and keeps it, because `source.*`, `git.*` and
+//! `meta.coverage` PERSIST across restarts. They are derived from source
+//! bytes plus extractor identity, keyed by SourceGeneration; no journal
+//! replay reproduces them. A generation is evicted only when the source bytes
+//! it was derived from changed, and the eviction is reported as a coverage
+//! row rather than a silent gap (ruling §4). The journal carries one compact
+//! `source.scanned` summary per completed scan so the authoritative trail
+//! stays journal-side while the unit-level detail stays here.
 //!
 //! Two consequences bind any later wave:
 //!
-//! * Nothing may delete this file to "fix" it the way a projection may be
-//!   deleted, and no cleanup path may treat it as disposable state.
-//! * The DDL below is `IF NOT EXISTS` because reopening an existing file is
-//!   the normal path, not a recovery path.
+//! * Nothing may delete this file to "fix" the operations tables. The
+//!   supported operation for those is a restart, and no cleanup path may
+//!   treat this file as disposable state.
+//! * Atlas's DDL is `IF NOT EXISTS` because reopening an existing file is the
+//!   normal path, not a recovery path. Only [`OPS_DDL`] drops anything.
+//!
+//! # What deleting the file costs
+//!
+//! Stated here because the old sentence — "deleting it loses nothing" — was
+//! true of `sergeant.duckdb` and is **not** true of this file. Deleting
+//! `atlas.duckdb` and restarting rebuilds every `ops` row exactly from the
+//! journal, and discards every persisted source generation, which must be
+//! re-scanned. That is acceptable under ruling §4 only because it is reported
+//! rather than silent: a store with no confirmed generation says so, and a
+//! re-scan writes fresh coverage. `tests/w1c_one_atlas_database.rs`'s
+//! `deleting_atlas_duckdb_rebuilds_ops_and_loses_source_facts` measures both
+//! halves of that sentence.
 //!
 //! # Why the file is not under `projections/`
 //!
-//! The operations projection lives in `<data-dir>/projections/`, whose whole
-//! documented contract is that deleting the directory loses nothing — an
-//! acceptance test deletes it wholesale and asserts exactly that. A database
-//! that must survive restarts cannot live inside a directory that is
-//! advertised as disposable, so Atlas gets its own directory beside the
-//! journal and the blobs, at the same level as `projections/`.
+//! `<data-dir>/projections/` is documented as disposable — an acceptance test
+//! deletes it wholesale and asserts nothing was lost — and since W1c it holds
+//! only the FloorState startup cache
+//! ([`crate::runtime::startup::PROJECTIONS_DIR`]). A database that must
+//! survive restarts cannot live inside a directory advertised as disposable,
+//! so it sits in its own directory beside the journal and the blobs.
 //!
 //! # Scope today
 //!
@@ -96,10 +119,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use duckdb::types::Value as Duck;
 use duckdb::{Connection, Statement};
+use serde_json::{Map, Value, json};
 
+use crate::domain::event::{Event, unix_millis};
+use crate::domain::execution::{
+    KIND_EXECUTION_RECONCILED, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
+};
 use crate::domain::source::{
     AuthorityClass, Coverage, CoverageRow, SourceGeneration, SourceKind, UnitKind,
+};
+use crate::domain::work::{KIND_WORK_SUBMITTED, WorkState};
+use crate::domain::workflow::{
+    KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
+    KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
 };
 use crate::runtime::atlas::external_git::ExternalGitProvenance;
 use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
@@ -107,24 +141,41 @@ use crate::runtime::atlas::tabular::{
     DatasetFormat, RowKeyBasis, RowUnit, ScannedDataset, row_units,
 };
 use crate::runtime::fsutil::create_dir_all_durable;
+use crate::runtime::graph::{
+    GraphContext, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_USER,
+    KIND_TOOL_COMPLETED, KIND_TOOL_REQUESTED, KIND_USAGE_UPDATED,
+};
+use crate::runtime::journal::JournalError;
+use crate::runtime::surface::{KIND_SURFACE_MATERIALIZED, KIND_SURFACE_TORN_DOWN};
 
 /// Directory under the data dir holding Atlas's durable store.
 ///
-/// Deliberately not [`crate::runtime::analytics::PROJECTIONS_DIR`]: that
-/// directory is disposable by contract and this one is not.
+/// Deliberately not
+/// [`crate::runtime::startup::PROJECTIONS_DIR`](crate::runtime::startup::PROJECTIONS_DIR):
+/// that directory is disposable by contract and this one is not. It is where
+/// the FloorState cache still lives, and nothing else — the database that
+/// used to sit beside it is this one.
 pub const ATLAS_DIR: &str = "atlas";
 
 /// Atlas's database file name inside [`ATLAS_DIR`].
 pub const ATLAS_DB_FILE: &str = "atlas.duckdb";
 
-/// The schema namespaces Atlas declares (A1 §5, F3).
+/// The schema namespaces Atlas declares — A1 §5's five, in full.
 ///
-/// `meta` holds Atlas's own bookkeeping (coverage above all); `source` holds
-/// what was derived from source bytes; `git` holds what was derived from Git
-/// objects; `context` holds the retrieval-facing units assembled from the
-/// other two. Sorted, because [`AtlasDb::schema_names`] answers sorted and
-/// the two are compared directly.
-pub const SCHEMAS: &[&str] = &["context", "git", "meta", "source"];
+/// `meta` holds Atlas's own bookkeeping (coverage above all); `ops` holds the
+/// journal-derived Work/Stage/Execution/message/tool/usage projection;
+/// `source` holds what was derived from source bytes; `git` holds what was
+/// derived from Git objects; `context` holds the retrieval-facing units
+/// assembled from the others. Sorted, because [`AtlasDb::schema_names`]
+/// answers sorted and the two are compared directly.
+///
+/// `ops` is here because A1 §5 lists it here (S5 W1c, owner correction
+/// 2026-08-29). It arrives as a *namespace* on every open even when this
+/// process never folds the journal: the contract's claim is that one file
+/// carries all five, and a namespace that only exists after the daemon has
+/// rebuilt is a file that answers the contract's question differently
+/// depending on who opened it last.
+pub const SCHEMAS: &[&str] = &["context", "git", "meta", "ops", "source"];
 
 /// Prepared statements the connection keeps planned.
 const STATEMENT_CACHE: usize = 64;
@@ -194,6 +245,7 @@ pub enum AtlasError {
 /// idempotent rather than run exactly once against a fresh file.
 const SCHEMA_DDL: &str = "\
 CREATE SCHEMA IF NOT EXISTS meta;\n\
+CREATE SCHEMA IF NOT EXISTS ops;\n\
 CREATE SCHEMA IF NOT EXISTS source;\n\
 CREATE SCHEMA IF NOT EXISTS git;\n\
 CREATE SCHEMA IF NOT EXISTS context;\n";
@@ -469,7 +521,7 @@ pub const MAX_ROWS: usize = 10_000;
 /// (F11's "canned/parameterized only — never string-built SQL").
 ///
 /// A fixed catalogue, for the same reason
-/// [`crate::runtime::analytics::CANNED_QUERIES`] is one: an endpoint that runs
+/// [`CANNED_QUERIES`] is one: an endpoint that runs
 /// a client's SQL hands back the one-owner property the whole architecture is
 /// built on. Here it does worse than that — the SQL names a *file path*, so
 /// arbitrary SQL against a dataset reader is arbitrary file access with the
@@ -688,6 +740,14 @@ impl AtlasDb {
     /// Existing contents are kept. That is the F1 contract, not an
     /// optimization: what this file holds cannot be re-folded from the
     /// journal.
+    /// **One live read-write handle per file, per process.** DuckDB gives
+    /// each `Connection::open` its own database instance, so a second one
+    /// against the same path neither sees nor is seen by the first, and the
+    /// last close overwrites the other's work with no error anywhere. A
+    /// process that already has the operations projection open must derive
+    /// its Atlas handle from it — [`Analytics::atlas`] — rather than call
+    /// this. This constructor is for a process that has no other handle:
+    /// tests, and any tool that owns the file outright.
     pub fn open(data_dir: &Path) -> Result<Self, AtlasError> {
         create_dir_all_durable(&atlas_dir(data_dir))?;
         let path = atlas_db_path(data_dir);
@@ -3764,6 +3824,1708 @@ pub struct StoredDatasetHit {
     pub dataset: StoredDataset,
 }
 
+// ===================================================================
+// The operations projection (`ops.*`) — A1 §5, S5 W1c
+// ===================================================================
+//
+// Everything below this line was `src/runtime/analytics.rs`, which owned a
+// second physical database (`<data-dir>/projections/sergeant.duckdb`). A1 §5
+// declares ONE physical file, `atlas.duckdb`, carrying five logical schemas —
+// `meta`, `ops`, `source`, `git`, `context` — and decision A1-02's rationale
+// is literally "schemas provide separation without more databases". The
+// second file was a wave-ratified deviation that no owner ruling ever
+// ratified; the owner correction of 2026-08-29 settled that the code
+// converges to the contract, not the other way round.
+//
+// It lives in *this* file rather than a sibling because the one-owner
+// invariant is the reason the split was tolerable at all: one database, one
+// owning module. Two files each holding a `Connection` to `atlas.duckdb`
+// would be a union rule ("either of these may open the database"), which
+// passes just as happily once one owner has grown into the other's
+// territory. `tests/x1_atlas_substrate.rs`'s
+// `atlas_database_has_exactly_one_owner` now scans the whole of `src/`.
+//
+// What did NOT merge is the rebuild discipline. `ops` is still a pure fold
+// of the journal and is still dropped and refolded on every daemon start —
+// but by `DROP SCHEMA ops CASCADE`, never by deleting the file, because
+// `meta/source/git/context` in the same file must survive (F1). See
+// [`Analytics::begin_rebuild`].
+
+/// Failures of the analytical projection.
+///
+/// Every one of these is survivable by definition: the journal is untouched
+/// and a rebuild is always available. Callers must never translate one into a
+/// failure of the operation that produced the event.
+#[derive(Debug, thiserror::Error)]
+pub enum AnalyticsError {
+    /// DuckDB refused a statement or could not open the database.
+    #[error("duckdb error: {0}")]
+    Duck(#[from] duckdb::Error),
+    /// The journal failed while replaying for a rebuild.
+    #[error(transparent)]
+    Journal(#[from] JournalError),
+    /// Filesystem failure around the projections directory.
+    #[error("projection io error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A canned query was asked for by a name that does not exist.
+    #[error("no such analytics query {name:?}")]
+    UnknownQuery {
+        /// The name that was asked for.
+        name: String,
+    },
+    /// A raw table dump was asked for by a name that is not a §22 table.
+    #[error("no such analytics table {name:?}")]
+    UnknownTable {
+        /// The name that was asked for.
+        name: String,
+    },
+    /// A write failed part-way through a fold, so the tables no longer match
+    /// the fold state. The projection refuses to answer until a `catch_up`
+    /// from the journal has rebuilt it — see [`Analytics::catch_up`].
+    #[error("the analytical projection dropped rows on a failed write and must be rebuilt")]
+    NeedsRebuild,
+}
+
+/// Prepared statements the fold keeps planned. Comfortably above the number
+/// of distinct statements it issues, so no statement is ever evicted and
+/// The schema every operations table lives in (S3 F3, A1 §5).
+///
+/// Physical qualification only — nothing this module reports changes name
+/// because of it. See the module doc.
+const OPS_SCHEMA: &str = "ops";
+
+/// One operations table, qualified and quoted for SQL.
+///
+/// The quoting is what keeps `usage` (a reserved word) addressable; the
+/// qualification is what stops a bare name from resolving against DuckDB's
+/// default `main` schema, which this database deliberately leaves empty.
+fn ops(table: &str) -> String {
+    format!("{OPS_SCHEMA}.\"{table}\"")
+}
+
+/// The §22 schema, in the [`OPS_SCHEMA`] namespace. Written on every rebuild;
+/// there is no migration path and there does not need to be one — these
+/// tables are derived.
+///
+/// The leading `DROP SCHEMA ... CASCADE` is what replaced deleting the file
+/// (S5 W1c). `CASCADE` takes the tables in the namespace with it and nothing
+/// outside it, which is exactly the scope the old `std::fs::remove_file` had
+/// back when `ops` was the only thing in its own database. `IF EXISTS`
+/// because a first-ever start has no `ops` to drop, and the namespace-level
+/// `CREATE SCHEMA IF NOT EXISTS ops` in [`SCHEMA_DDL`] may or may not have
+/// run against this file first.
+const OPS_DDL: &str = r#"
+DROP SCHEMA IF EXISTS ops CASCADE;
+CREATE SCHEMA ops;
+CREATE TABLE ops.events (
+    seq            BIGINT PRIMARY KEY,
+    event_id       VARCHAR NOT NULL,
+    timestamp      VARCHAR NOT NULL,
+    ts_ms          BIGINT,
+    source_type    VARCHAR NOT NULL,
+    source_name    VARCHAR NOT NULL,
+    workspace_id   VARCHAR,
+    work_id        VARCHAR,
+    execution_id   VARCHAR,
+    correlation_id VARCHAR,
+    causation_id   VARCHAR,
+    kind           VARCHAR NOT NULL,
+    payload        VARCHAR NOT NULL
+);
+CREATE INDEX idx_events_kind_work ON ops.events(kind, work_id);
+CREATE TABLE ops.work (
+    work_id       VARCHAR PRIMARY KEY,
+    intent        VARCHAR,
+    estate        VARCHAR,
+    estate_root   VARCHAR,
+    parent_work_id      VARCHAR,
+    parent_execution_id VARCHAR,
+    causation_unverified VARCHAR,
+    workflow      VARCHAR,
+    backend       VARCHAR,
+    route_source  VARCHAR,
+    profile       VARCHAR,
+    origin_client VARCHAR,
+    created_by    VARCHAR,
+    created_at    VARCHAR,
+    state         VARCHAR,
+    submitted_seq BIGINT,
+    submitted_ms  BIGINT
+);
+CREATE TABLE ops.stages (
+    work_id     VARCHAR,
+    stage_id    VARCHAR,
+    attempt     BIGINT,
+    idx         BIGINT,
+    status      VARCHAR,
+    detail      VARCHAR,
+    entered_seq BIGINT,
+    entered_ms  BIGINT,
+    ended_seq   BIGINT,
+    ended_ms    BIGINT,
+    PRIMARY KEY (work_id, stage_id, attempt)
+);
+CREATE TABLE ops.executions (
+    execution_id          VARCHAR PRIMARY KEY,
+    work_id               VARCHAR,
+    backend               VARCHAR,
+    native_id             VARCHAR,
+    stage_id              VARCHAR,
+    attempt               BIGINT,
+    started_seq           BIGINT,
+    started_ms            BIGINT,
+    stopped_seq           BIGINT,
+    stopped_ms            BIGINT,
+    stop_requested        BOOLEAN,
+    reconcile_disposition VARCHAR
+);
+CREATE TABLE ops.messages (
+    seq          BIGINT PRIMARY KEY,
+    work_id      VARCHAR,
+    execution_id VARCHAR,
+    role         VARCHAR,
+    text         VARCHAR,
+    ts_ms        BIGINT
+);
+CREATE TABLE ops.tool_calls (
+    execution_id  VARCHAR,
+    tool_use_id   VARCHAR,
+    work_id       VARCHAR,
+    name          VARCHAR,
+    requested_seq BIGINT,
+    requested_ms  BIGINT,
+    completed_seq BIGINT,
+    completed_ms  BIGINT,
+    is_error      BOOLEAN,
+    PRIMARY KEY (execution_id, tool_use_id)
+);
+CREATE TABLE ops."usage" (
+    seq                   BIGINT PRIMARY KEY,
+    work_id               VARCHAR,
+    execution_id          VARCHAR,
+    ts_ms                 BIGINT,
+    model                 VARCHAR,
+    input_tokens          BIGINT,
+    output_tokens         BIGINT,
+    cache_read_tokens     BIGINT,
+    cache_creation_tokens BIGINT,
+    total_cost_usd        DOUBLE,
+    model_pin             VARCHAR,
+    is_error              BOOLEAN
+);
+CREATE TABLE ops.repositories (
+    work_id          VARCHAR,
+    repository       VARCHAR,
+    source_path      VARCHAR,
+    base_branch      VARCHAR,
+    base_sha         VARCHAR,
+    worktree_path    VARCHAR,
+    work_branch      VARCHAR,
+    head_sha         VARCHAR,
+    materialized_seq BIGINT,
+    torn_down_seq    BIGINT,
+    disposition      VARCHAR,
+    PRIMARY KEY (work_id, repository)
+);
+CREATE TABLE ops.graph_nodes (
+    node_id    VARCHAR PRIMARY KEY,
+    kind       VARCHAR NOT NULL,
+    label      VARCHAR,
+    work_id    VARCHAR,
+    source_seq BIGINT NOT NULL
+);
+CREATE TABLE ops.graph_edges (
+    edge_id    VARCHAR PRIMARY KEY,
+    relation   VARCHAR NOT NULL,
+    from_node  VARCHAR NOT NULL,
+    to_node    VARCHAR NOT NULL,
+    work_id    VARCHAR,
+    source_seq BIGINT NOT NULL
+);
+"#;
+
+/// One of §22's example questions, as a query the daemon can actually answer.
+#[derive(Debug, Clone, Copy)]
+pub struct CannedQuery {
+    /// Stable name (the API path segment and CLI argument).
+    pub name: &'static str,
+    /// The §22 question this answers, verbatim where §22 phrased one.
+    pub question: &'static str,
+    /// The SQL, exposed so an answer can be checked rather than trusted.
+    pub sql: &'static str,
+}
+
+/// The canned queries this build answers.
+///
+/// Deliberately a fixed list rather than arbitrary client SQL: §22's "clients
+/// do not access DuckDB directly" is about the *one-owner* property, and an
+/// endpoint that executes a client's SQL against the daemon's database hands
+/// the ownership back. M6 owns presentation; this is the data behind it.
+pub const CANNED_QUERIES: &[CannedQuery] = &[
+    CannedQuery {
+        name: "blocked_time_per_work",
+        question: "How long does work remain blocked?",
+        // Every `work.*` event opens an interval that the next one closes;
+        // the still-open tail of a work that is blocked *right now* is left
+        // out rather than measured against a wall clock the journal does not
+        // contain (a projection must not invent a fact about the present).
+        sql: "\
+            WITH spans AS (\
+                SELECT work_id, kind, ts_ms, \
+                       lead(ts_ms) OVER (PARTITION BY work_id ORDER BY seq) AS next_ms \
+                FROM ops.events \
+                WHERE work_id IS NOT NULL AND kind LIKE 'work.%' \
+            ) \
+            SELECT w.work_id, w.state, \
+                   COALESCE(SUM(CASE WHEN spans.kind = 'work.blocked' AND spans.next_ms IS NOT NULL \
+                                     THEN spans.next_ms - spans.ts_ms END), 0) AS blocked_ms, \
+                   COUNT(CASE WHEN spans.kind = 'work.blocked' THEN 1 END) AS blocked_episodes \
+            FROM ops.work w LEFT JOIN spans ON spans.work_id = w.work_id \
+            GROUP BY w.work_id, w.state ORDER BY blocked_ms DESC, w.work_id",
+    },
+    CannedQuery {
+        name: "backend_retries",
+        question: "Which backend produces the most retries?",
+        // A retry is a stage entered for a second or later attempt — the
+        // §12 verb's observable trace, attributed to the backend the run
+        // routed to.
+        sql: "\
+            SELECT COALESCE(w.backend, '(unrouted)') AS backend, \
+                   COUNT(*) FILTER (WHERE s.attempt > 1) AS retries, \
+                   COUNT(*) AS stage_attempts, \
+                   COUNT(DISTINCT s.work_id) AS works \
+            FROM ops.stages s JOIN ops.work w ON w.work_id = s.work_id \
+            GROUP BY 1 ORDER BY retries DESC, backend",
+    },
+    CannedQuery {
+        name: "execution_touched",
+        question: "What did this execution touch?",
+        sql: "\
+            SELECT e.execution_id, e.work_id, e.backend, e.stage_id, \
+                   COALESCE(r.repositories, 0) AS repositories, \
+                   COALESCE(t.tool_calls, 0) AS tool_calls, \
+                   COALESCE(m.messages, 0) AS messages \
+            FROM ops.executions e \
+            LEFT JOIN (SELECT work_id, COUNT(*) AS repositories FROM ops.repositories GROUP BY 1) r \
+                   ON r.work_id = e.work_id \
+            LEFT JOIN (SELECT execution_id, COUNT(*) AS tool_calls FROM ops.tool_calls GROUP BY 1) t \
+                   ON t.execution_id = e.execution_id \
+            LEFT JOIN (SELECT execution_id, COUNT(*) AS messages FROM ops.messages GROUP BY 1) m \
+                   ON m.execution_id = e.execution_id \
+            ORDER BY e.started_seq",
+    },
+    CannedQuery {
+        name: "tool_calls_before_failure",
+        question: "How frequently does a tool call precede a failure?",
+        // Failure-class events are the journal's own: a stage or work that
+        // failed, and a block (§25's fail-closed landing state). Tool calls
+        // are counted up to the *first* such event per work, which is the
+        // only unambiguous reading of "precede".
+        sql: "\
+            WITH failure AS (\
+                SELECT work_id, MIN(seq) AS failed_seq \
+                FROM ops.events \
+                WHERE work_id IS NOT NULL \
+                  AND kind IN ('work.failed', 'work.blocked', 'stage.failed', 'stage.blocked') \
+                GROUP BY work_id \
+            ) \
+            SELECT f.work_id, f.failed_seq, \
+                   (SELECT kind FROM ops.events WHERE seq = f.failed_seq) AS failure_kind, \
+                   COUNT(t.tool_use_id) AS tool_calls_before \
+            FROM failure f \
+            LEFT JOIN ops.tool_calls t \
+                   ON t.work_id = f.work_id AND t.requested_seq < f.failed_seq \
+            GROUP BY f.work_id, f.failed_seq ORDER BY tool_calls_before DESC, f.work_id",
+    },
+    CannedQuery {
+        name: "token_totals_per_work",
+        question: "How many tokens (and how much cost) has each work consumed?",
+        sql: "\
+            SELECT work_id, \
+                   COUNT(*) AS turns, \
+                   COALESCE(SUM(input_tokens), 0) AS input_tokens, \
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens, \
+                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens, \
+                   COALESCE(SUM(total_cost_usd), 0) AS total_cost_usd \
+            FROM ops.\"usage\" GROUP BY work_id ORDER BY work_id",
+    },
+];
+
+/// The result of one canned query: columns and rows as plain JSON.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryResult {
+    /// Query name.
+    pub name: String,
+    /// The §22 question.
+    pub question: String,
+    /// The SQL that produced these rows.
+    pub sql: String,
+    /// Column names, in order.
+    pub columns: Vec<String>,
+    /// Rows, each aligned with `columns`.
+    pub rows: Vec<Vec<Value>>,
+}
+
+impl QueryResult {
+    /// JSON rendering for the API and the CLI.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "query": self.name,
+            "question": self.question,
+            "sql": self.sql,
+            "columns": self.columns,
+            "rows": self.rows,
+        })
+    }
+}
+
+/// A work's graph neighborhood (§8's `GET /v1/graph/work/{id}`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GraphView {
+    /// Nodes in the neighborhood.
+    pub nodes: Vec<Value>,
+    /// Edges in the neighborhood, each with its `source_seq`.
+    pub edges: Vec<Value>,
+}
+/// The DuckDB analytical projection over one data dir.
+///
+/// Owns its connection privately; nothing hands a [`Connection`] out.
+///
+/// **The database is a materialization of a pure fold, not a place state is
+/// edited.** Journal events are folded into plain Rust rows ([`Rows`], no
+/// I/O, deterministic iteration order) and the tables are written from those
+/// rows in bulk. That shape was chosen on a measurement, not a preference:
+/// DuckDB is a columnar store where a single-row `INSERT`/`UPDATE` costs
+/// ~1–2 ms, so folding straight into SQL rebuilt a 1 600-event journal in
+/// 65 s (≈24 events/s) on this container. The same fold through the bulk
+/// appender is ~4 µs a row. Two further properties fall out of it, and both
+/// are the milestone's point: the file is provably a function of the
+/// journal, and the incremental path and the rebuild path are the *same*
+/// fold rather than two implementations that have to be kept in agreement.
+pub struct Analytics {
+    conn: Connection,
+    path: PathBuf,
+    /// The mutable §22 tables, folded in memory.
+    rows: Rows,
+    /// §23 derivation state (see [`GraphContext`]).
+    graph: GraphContext,
+    /// Seq of the last event folded in.
+    last_seq: u64,
+    /// Seq the mutable tables were last written at. The append-only tables
+    /// (`events`, `messages`, `usage`) are written as they are folded, so
+    /// only the mutable ones can fall behind — and only until the next read.
+    materialized_seq: u64,
+    /// Set while a fold is in flight and left set if it fails, because a
+    /// failed fold can have advanced [`Analytics::last_seq`] past rows that
+    /// never reached the tables. While set, every read fails closed and the
+    /// next [`Analytics::catch_up`] rebuilds from seq 0. See that method.
+    needs_reset: bool,
+}
+
+impl std::fmt::Debug for Analytics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Analytics")
+            .field("path", &self.path)
+            .field("last_seq", &self.last_seq)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How many append-only rows are buffered before being flushed to DuckDB.
+///
+/// Bounds the memory a rebuild holds: event payloads are the bulk of a
+/// journal, and a rebuild must not need the whole journal resident to write
+/// it out.
+const APPEND_CHUNK: usize = 4096;
+
+/// The mutable §22 tables, keyed so a later event can revise a row.
+///
+/// `events`, `messages` and `usage` are absent: nothing ever revises them, so
+/// they stream straight to the database and are never held here.
+#[derive(Debug, Default)]
+struct Rows {
+    work: BTreeMap<String, WorkRow>,
+    stages: BTreeMap<(String, String, i64), StageRow>,
+    executions: BTreeMap<String, ExecutionRow>,
+    tool_calls: BTreeMap<(String, String), ToolCallRow>,
+    repositories: BTreeMap<(String, String), RepositoryRow>,
+    nodes: BTreeMap<String, NodeRow>,
+    edges: BTreeMap<String, EdgeRow>,
+}
+
+/// Rows buffered for the append-only tables during one fold.
+#[derive(Debug, Default)]
+struct Appended {
+    events: Vec<Vec<Duck>>,
+    messages: Vec<Vec<Duck>>,
+    usage: Vec<Vec<Duck>>,
+}
+
+impl Appended {
+    fn len(&self) -> usize {
+        self.events.len() + self.messages.len() + self.usage.len()
+    }
+}
+
+#[derive(Debug, Default)]
+struct WorkRow {
+    work_id: String,
+    intent: Option<String>,
+    /// estate-root Phase C, §7.4: seeded from `work.submitted`'s
+    /// (pre-Phase-C-only, now always absent for a new Work) `estate`
+    /// field, then overwritten by `workflow.bound`'s plan-time estate name
+    /// once that fires — see the two folds below. `None` for a `pending`
+    /// Work that never reached `workflow.bound` is an honest "not yet
+    /// resolved to an estate", not a lost fact.
+    estate: Option<String>,
+    /// H1 touch point #6: the canonical estate root, folded once from the
+    /// envelope's `workspace_id` at `work.submitted` — unlike `estate`
+    /// above, never overwritten at `workflow.bound`, since the coordinate
+    /// is already known (and immutable for a Work's life) at submission.
+    /// `None` for a pre-Phase-C-shaped legacy line, whose envelope never
+    /// carried the field at all — an honest "not recorded", not an error.
+    estate_root: Option<String>,
+    /// W1-09 (S2 E8 as amended): the **validated** parent Work/execution,
+    /// folded from `work.submitted`'s own payload — W1's explicit
+    /// instruction to extend the existing envelope for durable query rather
+    /// than build a second agent-tree store. `None` for an ordinary
+    /// top-level submission and for every Work journaled before S2.
+    parent_work_id: Option<String>,
+    parent_execution_id: Option<String>,
+    /// The `causation_unverified` marker's `reason`, when a claim failed
+    /// validation — queryable beside the relation it is the absence of, so
+    /// "which submissions claimed a parent that did not check out" is one
+    /// question of one table rather than a journal scan.
+    causation_unverified: Option<String>,
+    workflow: Option<String>,
+    backend: Option<String>,
+    route_source: Option<String>,
+    profile: Option<String>,
+    origin_client: Option<String>,
+    created_by: Option<String>,
+    created_at: Option<String>,
+    state: Option<String>,
+    submitted_seq: i64,
+    submitted_ms: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct StageRow {
+    work_id: String,
+    stage_id: String,
+    attempt: i64,
+    idx: i64,
+    status: String,
+    detail: Option<String>,
+    entered_seq: i64,
+    entered_ms: Option<i64>,
+    ended_seq: Option<i64>,
+    ended_ms: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+struct ExecutionRow {
+    execution_id: String,
+    work_id: Option<String>,
+    backend: Option<String>,
+    native_id: Option<String>,
+    stage_id: Option<String>,
+    attempt: i64,
+    started_seq: i64,
+    started_ms: Option<i64>,
+    stopped_seq: Option<i64>,
+    stopped_ms: Option<i64>,
+    stop_requested: bool,
+    reconcile_disposition: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ToolCallRow {
+    execution_id: String,
+    tool_use_id: String,
+    work_id: Option<String>,
+    name: Option<String>,
+    requested_seq: i64,
+    requested_ms: Option<i64>,
+    completed_seq: Option<i64>,
+    completed_ms: Option<i64>,
+    is_error: Option<bool>,
+}
+
+#[derive(Debug, Default)]
+struct RepositoryRow {
+    work_id: String,
+    repository: String,
+    source_path: Option<String>,
+    base_branch: Option<String>,
+    base_sha: Option<String>,
+    worktree_path: Option<String>,
+    work_branch: Option<String>,
+    head_sha: Option<String>,
+    materialized_seq: i64,
+    torn_down_seq: Option<i64>,
+    disposition: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct NodeRow {
+    node_id: String,
+    kind: String,
+    label: String,
+    work_id: Option<String>,
+    source_seq: i64,
+}
+
+#[derive(Debug, Default)]
+struct EdgeRow {
+    edge_id: String,
+    relation: String,
+    from_node: String,
+    to_node: String,
+    work_id: Option<String>,
+    source_seq: i64,
+}
+
+/// A DuckDB value from an optional string.
+fn text(value: Option<&str>) -> Duck {
+    value.map_or(Duck::Null, |s| Duck::Text(s.to_string()))
+}
+
+/// A JSON string field as an owned `Option<String>`; anything that is not a
+/// string (absent, null, a number a future writer put there) is `None`.
+fn string(value: &Value) -> Option<String> {
+    value.as_str().map(str::to_string)
+}
+
+/// A DuckDB value from an optional integer.
+fn bigint(value: Option<i64>) -> Duck {
+    value.map_or(Duck::Null, Duck::BigInt)
+}
+
+impl WorkRow {
+    fn row(&self) -> Vec<Duck> {
+        vec![
+            Duck::Text(self.work_id.clone()),
+            text(self.intent.as_deref()),
+            text(self.estate.as_deref()),
+            text(self.estate_root.as_deref()),
+            text(self.parent_work_id.as_deref()),
+            text(self.parent_execution_id.as_deref()),
+            text(self.causation_unverified.as_deref()),
+            text(self.workflow.as_deref()),
+            text(self.backend.as_deref()),
+            text(self.route_source.as_deref()),
+            text(self.profile.as_deref()),
+            text(self.origin_client.as_deref()),
+            text(self.created_by.as_deref()),
+            text(self.created_at.as_deref()),
+            text(self.state.as_deref()),
+            Duck::BigInt(self.submitted_seq),
+            bigint(self.submitted_ms),
+        ]
+    }
+}
+
+impl StageRow {
+    fn row(&self) -> Vec<Duck> {
+        vec![
+            Duck::Text(self.work_id.clone()),
+            Duck::Text(self.stage_id.clone()),
+            Duck::BigInt(self.attempt),
+            Duck::BigInt(self.idx),
+            Duck::Text(self.status.clone()),
+            text(self.detail.as_deref()),
+            Duck::BigInt(self.entered_seq),
+            bigint(self.entered_ms),
+            bigint(self.ended_seq),
+            bigint(self.ended_ms),
+        ]
+    }
+}
+
+impl ExecutionRow {
+    fn row(&self) -> Vec<Duck> {
+        vec![
+            Duck::Text(self.execution_id.clone()),
+            text(self.work_id.as_deref()),
+            text(self.backend.as_deref()),
+            text(self.native_id.as_deref()),
+            text(self.stage_id.as_deref()),
+            Duck::BigInt(self.attempt),
+            Duck::BigInt(self.started_seq),
+            bigint(self.started_ms),
+            bigint(self.stopped_seq),
+            bigint(self.stopped_ms),
+            Duck::Boolean(self.stop_requested),
+            text(self.reconcile_disposition.as_deref()),
+        ]
+    }
+}
+
+impl ToolCallRow {
+    fn row(&self) -> Vec<Duck> {
+        vec![
+            Duck::Text(self.execution_id.clone()),
+            Duck::Text(self.tool_use_id.clone()),
+            text(self.work_id.as_deref()),
+            text(self.name.as_deref()),
+            Duck::BigInt(self.requested_seq),
+            bigint(self.requested_ms),
+            bigint(self.completed_seq),
+            bigint(self.completed_ms),
+            self.is_error.map_or(Duck::Null, Duck::Boolean),
+        ]
+    }
+}
+
+impl RepositoryRow {
+    fn row(&self) -> Vec<Duck> {
+        vec![
+            Duck::Text(self.work_id.clone()),
+            Duck::Text(self.repository.clone()),
+            text(self.source_path.as_deref()),
+            text(self.base_branch.as_deref()),
+            text(self.base_sha.as_deref()),
+            text(self.worktree_path.as_deref()),
+            text(self.work_branch.as_deref()),
+            text(self.head_sha.as_deref()),
+            Duck::BigInt(self.materialized_seq),
+            bigint(self.torn_down_seq),
+            text(self.disposition.as_deref()),
+        ]
+    }
+}
+
+impl NodeRow {
+    fn row(&self) -> Vec<Duck> {
+        vec![
+            Duck::Text(self.node_id.clone()),
+            Duck::Text(self.kind.clone()),
+            Duck::Text(self.label.clone()),
+            text(self.work_id.as_deref()),
+            Duck::BigInt(self.source_seq),
+        ]
+    }
+}
+
+impl EdgeRow {
+    fn row(&self) -> Vec<Duck> {
+        vec![
+            Duck::Text(self.edge_id.clone()),
+            Duck::Text(self.relation.clone()),
+            Duck::Text(self.from_node.clone()),
+            Duck::Text(self.to_node.clone()),
+            text(self.work_id.as_deref()),
+            Duck::BigInt(self.source_seq),
+        ]
+    }
+}
+
+/// Tables written from [`Rows`] on every materialization, in dependency-free
+/// order. The append-only tables are deliberately not here.
+const MUTABLE_TABLES: &[&str] = &[
+    "work",
+    "stages",
+    "executions",
+    "tool_calls",
+    "repositories",
+    "graph_nodes",
+    "graph_edges",
+];
+
+impl Analytics {
+    /// Rebuild the projection for `data_dir` from scratch, folding `events`.
+    ///
+    /// The `ops` namespace is dropped and recreated first, so this is still
+    /// the daemon's startup path and the whole population story: there is no
+    /// "open the existing `ops` tables and continue", and nothing can quietly
+    /// accumulate state that the journal cannot reproduce. What it no longer
+    /// does is delete a file — see [`Analytics::begin_rebuild`].
+    pub fn rebuild<I>(data_dir: &Path, events: I) -> Result<Self, AnalyticsError>
+    where
+        I: IntoIterator<Item = Result<Event, JournalError>>,
+    {
+        let mut analytics = Self::begin_rebuild(data_dir)?;
+        analytics.catch_up(events)?;
+        Ok(analytics)
+    }
+
+    /// [`Analytics::rebuild`] minus the fold: open `atlas.duckdb`, drop the
+    /// `ops` namespace and recreate it empty. W2's `start_with` uses this
+    /// then [`Analytics::fold`] so the shared startup pass can feed this
+    /// projection one event at a time, the same call that feeds every other
+    /// sink.
+    ///
+    /// **This no longer deletes a file, and it must not** (S5 W1c). `ops`
+    /// shares `atlas.duckdb` with `meta`, `source`, `git` and `context`, and
+    /// those persist across restarts: they are derived from source bytes plus
+    /// extractor identity and no journal replay reproduces them (F1). Deleting
+    /// the file to rebuild `ops` would silently discard every persisted
+    /// source generation. `DROP SCHEMA ops CASCADE` has the scope the old
+    /// `remove_file` had — every `ops` table and nothing else.
+    ///
+    /// It applies [`SCHEMA_DDL`] and [`TABLE_DDL`] on the way past, exactly
+    /// as [`AtlasDb::open`] does, so a host whose daemon starts before any
+    /// source has ever been scanned still gets a file that declares all five
+    /// of A1 §5's namespaces rather than only `ops`.
+    pub fn begin_rebuild(data_dir: &Path) -> Result<Self, AnalyticsError> {
+        create_dir_all_durable(&atlas_dir(data_dir))?;
+        let path = atlas_db_path(data_dir);
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(HARDENING_DDL)?;
+        conn.execute_batch(SCHEMA_DDL)?;
+        conn.execute_batch(TABLE_DDL)?;
+        Self::over(conn, path)
+    }
+
+    /// An in-memory projection over `events`, for callers that want the
+    /// tables without a file (tests, and any read-only rendering).
+    pub fn in_memory<I>(events: I) -> Result<Self, AnalyticsError>
+    where
+        I: IntoIterator<Item = Result<Event, JournalError>>,
+    {
+        let conn = Connection::open_in_memory()?;
+        let mut analytics = Self::over(conn, PathBuf::from(":memory:"))?;
+        analytics.catch_up(events)?;
+        Ok(analytics)
+    }
+
+    fn over(conn: Connection, path: PathBuf) -> Result<Self, AnalyticsError> {
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+        conn.execute_batch(OPS_DDL)?;
+        Ok(Self {
+            conn,
+            path,
+            rows: Rows::default(),
+            graph: GraphContext::default(),
+            last_seq: 0,
+            materialized_seq: 0,
+            needs_reset: false,
+        })
+    }
+
+    /// Seq of the last event folded in — `0` when the projection is holding
+    /// a failed fold and needs rebuilding, because then it has folded
+    /// nothing a caller may rely on.
+    ///
+    /// The daemon reads this to decide which journal tail to hand back to
+    /// [`Analytics::catch_up`], so reporting `0` here is what turns a failed
+    /// fold into a full re-fold rather than a permanent hole.
+    pub fn last_seq(&self) -> u64 {
+        if self.needs_reset { 0 } else { self.last_seq }
+    }
+
+    /// Fold every event in `events` with a seq past [`Analytics::last_seq`].
+    ///
+    /// The rebuild path and the incremental path are this one method, so
+    /// "rebuilt from scratch" and "kept current" cannot drift apart. Events
+    /// at or below the current seq are skipped, so handing this the whole
+    /// journal is always safe.
+    pub fn catch_up<I>(&mut self, events: I) -> Result<u64, AnalyticsError>
+    where
+        I: IntoIterator<Item = Result<Event, JournalError>>,
+    {
+        let mut fold = self.fold()?;
+        for event in events {
+            fold.push(&event?)?;
+        }
+        fold.finish()
+    }
+
+    /// Begin a fold session. Resets if a previous fold failed, then arms
+    /// `needs_reset` — exactly [`Analytics::catch_up`]'s prologue, split out
+    /// so W2's shared startup pass can drive this fold one event at a time
+    /// alongside every other sink, instead of handing it a whole iterator of
+    /// its own.
+    ///
+    /// A fold is not atomic: rows are buffered as events are applied and
+    /// written in chunks, and `last_seq` advances per event so the skip in
+    /// [`AnalyticsFold::push`] stays right. If a write then fails, those
+    /// buffered rows are gone while `last_seq` says they landed — and because
+    /// the skip is permanent, `events`/`messages`/`usage` would answer 200
+    /// with rows missing forever after (the mutable tables self-heal via
+    /// `materialize`, the append-only ones cannot). That is precisely the
+    /// "kept current == rebuilt from scratch" invariant this method exists to
+    /// hold, so the failure is made structural instead: the flag is set
+    /// before the attempt and cleared only on [`AnalyticsFold::finish`]'s
+    /// success, so no `?` anywhere in between can escape it, and the next
+    /// fold re-folds from zero. Cost of a transient write failure is one 503
+    /// and one rebuild; it is never a silently short table.
+    pub fn fold(&mut self) -> Result<AnalyticsFold<'_>, AnalyticsError> {
+        if self.needs_reset {
+            self.reset()?;
+        }
+        self.needs_reset = true;
+        Ok(AnalyticsFold {
+            analytics: self,
+            appended: Appended::default(),
+            applied: 0,
+        })
+    }
+
+    /// Empty every table and the in-memory fold, so the next catch-up is a
+    /// rebuild from seq 0.
+    ///
+    /// The in-memory state is reset only once the SQL has succeeded, so a
+    /// reset that itself fails (the disk is still full) leaves the instance
+    /// marked and is simply retried by the next call.
+    fn reset(&mut self) -> Result<(), AnalyticsError> {
+        for table in TABLES {
+            self.conn
+                .execute_batch(&format!("DELETE FROM {}", ops(table)))?;
+        }
+        self.rows = Rows::default();
+        self.graph = GraphContext::default();
+        self.last_seq = 0;
+        self.materialized_seq = 0;
+        self.needs_reset = false;
+        Ok(())
+    }
+
+    /// Write the buffered append-only rows.
+    fn flush(&self, appended: &mut Appended) -> Result<(), AnalyticsError> {
+        append_all(&self.conn, "events", std::mem::take(&mut appended.events))?;
+        append_all(
+            &self.conn,
+            "messages",
+            std::mem::take(&mut appended.messages),
+        )?;
+        append_all(&self.conn, "usage", std::mem::take(&mut appended.usage))?;
+        Ok(())
+    }
+
+    /// Write the mutable tables from the folded rows, if they have moved.
+    ///
+    /// Truncate-and-load rather than row-wise update: it is the same
+    /// measurement as above, and it makes each materialization a total
+    /// function of the fold state — a stale row cannot survive one.
+    fn materialize(&mut self) -> Result<(), AnalyticsError> {
+        // Every read goes through here, which makes it the one place that
+        // has to refuse to answer out of a projection whose tables no longer
+        // match its fold state (see `catch_up`). Answering anyway would be
+        // the one thing the projection must never do: quietly wrong rows.
+        if self.needs_reset {
+            return Err(AnalyticsError::NeedsRebuild);
+        }
+        if self.materialized_seq == self.last_seq {
+            return Ok(());
+        }
+        for table in MUTABLE_TABLES {
+            self.conn
+                .execute_batch(&format!("DELETE FROM {}", ops(table)))?;
+        }
+        append_all(
+            &self.conn,
+            "work",
+            self.rows.work.values().map(WorkRow::row).collect(),
+        )?;
+        append_all(
+            &self.conn,
+            "stages",
+            self.rows.stages.values().map(StageRow::row).collect(),
+        )?;
+        append_all(
+            &self.conn,
+            "executions",
+            self.rows
+                .executions
+                .values()
+                .map(ExecutionRow::row)
+                .collect(),
+        )?;
+        append_all(
+            &self.conn,
+            "tool_calls",
+            self.rows
+                .tool_calls
+                .values()
+                .map(ToolCallRow::row)
+                .collect(),
+        )?;
+        append_all(
+            &self.conn,
+            "repositories",
+            self.rows
+                .repositories
+                .values()
+                .map(RepositoryRow::row)
+                .collect(),
+        )?;
+        append_all(
+            &self.conn,
+            "graph_nodes",
+            self.rows.nodes.values().map(NodeRow::row).collect(),
+        )?;
+        append_all(
+            &self.conn,
+            "graph_edges",
+            self.rows.edges.values().map(EdgeRow::row).collect(),
+        )?;
+        self.materialized_seq = self.last_seq;
+        Ok(())
+    }
+
+    /// Fold one event into every table it touches. Pure with respect to the
+    /// database: it only ever touches in-memory state and the append buffer.
+    ///
+    /// Kinds and payload shapes this fold does not understand are ignored,
+    /// never an error — a newer writer's events must not brick an older
+    /// reader's rebuild (§20, the same stance the registry reducer takes).
+    fn apply(&mut self, event: &Event, appended: &mut Appended) {
+        let seq = event.seq as i64;
+        let ts = unix_millis(&event.timestamp);
+        appended.events.push(vec![
+            Duck::BigInt(seq),
+            Duck::Text(event.id.clone()),
+            Duck::Text(event.timestamp.clone()),
+            bigint(ts),
+            Duck::Text(event.source.source_type.clone()),
+            Duck::Text(event.source.name.clone()),
+            text(event.workspace_id.as_deref()),
+            text(event.work_id.as_deref()),
+            text(event.execution_id.as_deref()),
+            text(event.correlation_id.as_deref()),
+            text(event.causation_id.as_deref()),
+            Duck::Text(event.kind.clone()),
+            Duck::Text(event.payload.to_string()),
+        ]);
+
+        let delta = self.graph.derive(event);
+        for node in delta.nodes {
+            // First sighting wins: a node's `source_seq` is where it entered
+            // the history, not the last time something mentioned it.
+            self.rows.nodes.entry(node.id.clone()).or_insert(NodeRow {
+                node_id: node.id,
+                kind: node.kind.to_string(),
+                label: node.label,
+                work_id: node.work_id,
+                source_seq: node.source_seq as i64,
+            });
+        }
+        for edge in delta.edges {
+            self.rows.edges.entry(edge.id.clone()).or_insert(EdgeRow {
+                edge_id: edge.id,
+                relation: edge.relation.to_string(),
+                from_node: edge.from,
+                to_node: edge.to,
+                work_id: edge.work_id,
+                source_seq: edge.source_seq as i64,
+            });
+        }
+
+        // A §10 transition is the only thing that rewrites `work.state`.
+        if let (Some(work_id), Some(state)) = (
+            event.work_id.as_deref(),
+            WorkState::for_event_kind(&event.kind),
+        ) && let Some(work) = self.rows.work.get_mut(work_id)
+        {
+            work.state = Some(state.as_str().to_string());
+        }
+
+        match event.kind.as_str() {
+            KIND_WORK_SUBMITTED => {
+                let work = &event.payload["work"];
+                if let Some(work_id) = work["id"].as_str() {
+                    self.rows.work.insert(
+                        work_id.to_string(),
+                        WorkRow {
+                            work_id: work_id.to_string(),
+                            intent: string(&work["intent"]),
+                            estate: string(&work["workspace"]),
+                            // H1 touch point #6: the envelope's own field,
+                            // not a payload key — real for every new Work
+                            // from `work.submitted` onward, `None` for a
+                            // legacy line whose envelope never carried it.
+                            estate_root: event.workspace_id.clone(),
+                            // W1-09: the validated relation and the
+                            // unverified marker both come out of the one
+                            // compound `work.submitted` payload (L6), so
+                            // this fold cannot see one without the other.
+                            parent_work_id: string(&work["parent_work_id"]),
+                            parent_execution_id: string(&work["parent_execution_id"]),
+                            causation_unverified: string(&work["causation_unverified"]["reason"]),
+                            workflow: string(&work["workflow"]),
+                            backend: string(&work["backend"]),
+                            route_source: None,
+                            profile: string(&work["profile"]),
+                            origin_client: string(&work["origin_client"]),
+                            created_by: string(&work["created_by"]),
+                            created_at: string(&work["created_at"]),
+                            state: string(&work["state"]),
+                            submitted_seq: seq,
+                            submitted_ms: ts,
+                        },
+                    );
+                }
+            }
+            KIND_WORKFLOW_BOUND => {
+                // The *routed* backend and the pinned workflow supersede what
+                // the submission asked for: §13's precedence is decided here,
+                // and "which backend produces the most retries" means the one
+                // that ran, not the one that was requested.
+                if let Some(work) = event
+                    .work_id
+                    .as_deref()
+                    .and_then(|id| self.rows.work.get_mut(id))
+                {
+                    work.workflow = string(&event.payload["workflow"]["name"]);
+                    work.backend = string(&event.payload["backend"]);
+                    work.route_source = string(&event.payload["route_source"]);
+                    work.profile = string(&event.payload["profile"]["name"]);
+                    if let Some(estate) = string(&event.payload["workspace"]) {
+                        work.estate = Some(estate);
+                    }
+                }
+            }
+            KIND_SURFACE_MATERIALIZED => {
+                let Some(work_id) = event.work_id.as_deref() else {
+                    return;
+                };
+                let bindings = event.payload["surface"]["bindings"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                for binding in &bindings {
+                    let Some(repository) = binding["repository"].as_str() else {
+                        continue;
+                    };
+                    self.rows.repositories.insert(
+                        (work_id.to_string(), repository.to_string()),
+                        RepositoryRow {
+                            work_id: work_id.to_string(),
+                            repository: repository.to_string(),
+                            source_path: string(&binding["source_path"]),
+                            base_branch: string(&binding["base_branch"]),
+                            base_sha: string(&binding["base_sha"]),
+                            worktree_path: string(&binding["worktree_path"]),
+                            work_branch: string(&binding["work_branch"]),
+                            head_sha: string(&binding["head_sha"]),
+                            materialized_seq: seq,
+                            torn_down_seq: None,
+                            disposition: None,
+                        },
+                    );
+                }
+            }
+            KIND_SURFACE_TORN_DOWN => {
+                let Some(work_id) = event.work_id.as_deref() else {
+                    return;
+                };
+                let bindings = event.payload["report"]["bindings"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                for binding in &bindings {
+                    let Some(repository) = binding["repository"].as_str() else {
+                        continue;
+                    };
+                    if let Some(row) = self
+                        .rows
+                        .repositories
+                        .get_mut(&(work_id.to_string(), repository.to_string()))
+                    {
+                        row.torn_down_seq = Some(seq);
+                        row.disposition = string(&binding["disposition"]);
+                    }
+                }
+            }
+            KIND_STAGE_ENTERED => {
+                let (Some(work_id), Some(stage_id)) =
+                    (event.work_id.as_deref(), event.payload["stage_id"].as_str())
+                else {
+                    return;
+                };
+                let attempt = event.payload["attempt"].as_u64().unwrap_or(1) as i64;
+                self.rows.stages.insert(
+                    (work_id.to_string(), stage_id.to_string(), attempt),
+                    StageRow {
+                        work_id: work_id.to_string(),
+                        stage_id: stage_id.to_string(),
+                        attempt,
+                        idx: event.payload["index"].as_u64().unwrap_or(0) as i64,
+                        status: "active".to_string(),
+                        detail: None,
+                        entered_seq: seq,
+                        entered_ms: ts,
+                        ended_seq: None,
+                        ended_ms: None,
+                    },
+                );
+            }
+            KIND_STAGE_COMPLETED
+            | KIND_STAGE_WAITING
+            | KIND_STAGE_NEEDS_INPUT
+            | KIND_STAGE_BLOCKED
+            | KIND_STAGE_FAILED
+            | KIND_STAGE_CANCELED => {
+                let (Some(work_id), Some(stage_id)) =
+                    (event.work_id.as_deref(), event.payload["stage_id"].as_str())
+                else {
+                    return;
+                };
+                // The latest attempt of that stage is what this outcome is
+                // about, mirroring the registry reducer's `last_stage_mut`.
+                let latest = self
+                    .rows
+                    .stages
+                    .keys()
+                    .filter(|(w, s, _)| w == work_id && s == stage_id)
+                    .map(|(_, _, attempt)| *attempt)
+                    .max();
+                let Some(attempt) = latest else { return };
+                if let Some(row) =
+                    self.rows
+                        .stages
+                        .get_mut(&(work_id.to_string(), stage_id.to_string(), attempt))
+                {
+                    row.status = event
+                        .kind
+                        .strip_prefix("stage.")
+                        .unwrap_or(&event.kind)
+                        .to_string();
+                    row.detail = string(&event.payload["detail"]);
+                    row.ended_seq = Some(seq);
+                    row.ended_ms = ts;
+                }
+            }
+            KIND_EXECUTION_STARTED => {
+                let execution = &event.payload["execution"];
+                let Some(execution_id) = execution["execution_id"].as_str() else {
+                    return;
+                };
+                self.rows.executions.insert(
+                    execution_id.to_string(),
+                    ExecutionRow {
+                        execution_id: execution_id.to_string(),
+                        work_id: event.work_id.clone(),
+                        backend: string(&execution["backend"]),
+                        native_id: string(&execution["native_id"]),
+                        stage_id: string(&execution["stage_id"]),
+                        attempt: execution["attempt"].as_u64().unwrap_or(1) as i64,
+                        started_seq: seq,
+                        started_ms: ts,
+                        stopped_seq: None,
+                        stopped_ms: None,
+                        stop_requested: execution["stop_requested"].as_bool().unwrap_or(false),
+                        reconcile_disposition: None,
+                    },
+                );
+            }
+            KIND_EXECUTION_STOPPED => {
+                let Some(execution_id) = event.payload["execution_id"].as_str() else {
+                    return;
+                };
+                // `stop_requested` latches only when the backend was asked
+                // *and did not refuse* — the same condition the registry
+                // reducer applies, so the analytic and the daemon's own state
+                // cannot disagree about whether a stop was ever delivered.
+                let acknowledged = event.payload["outcome"]["requested"] == Value::Bool(true)
+                    && event.payload["outcome"]["error"].is_null();
+                if let Some(row) = self.rows.executions.get_mut(execution_id) {
+                    row.stopped_seq = Some(seq);
+                    row.stopped_ms = ts;
+                    row.stop_requested = row.stop_requested || acknowledged;
+                }
+            }
+            KIND_EXECUTION_RECONCILED => {
+                if let Some(row) = event.payload["execution_id"]
+                    .as_str()
+                    .and_then(|id| self.rows.executions.get_mut(id))
+                {
+                    row.reconcile_disposition = string(&event.payload["disposition"]);
+                }
+            }
+            KIND_CONVERSATION_USER | KIND_CONVERSATION_ASSISTANT_COMPLETED => {
+                let role = if event.kind == KIND_CONVERSATION_USER {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                appended.messages.push(vec![
+                    Duck::BigInt(seq),
+                    text(event.work_id.as_deref()),
+                    text(event.execution_id.as_deref()),
+                    Duck::Text(role.to_string()),
+                    text(event.payload["text"].as_str()),
+                    bigint(ts),
+                ]);
+            }
+            KIND_TOOL_REQUESTED => {
+                let Some(execution_id) = event.execution_id.as_deref() else {
+                    return;
+                };
+                let tool_use_id = event.payload["id"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("seq{seq}"));
+                self.rows.tool_calls.insert(
+                    (execution_id.to_string(), tool_use_id.clone()),
+                    ToolCallRow {
+                        execution_id: execution_id.to_string(),
+                        tool_use_id,
+                        work_id: event.work_id.clone(),
+                        name: string(&event.payload["name"]),
+                        requested_seq: seq,
+                        requested_ms: ts,
+                        completed_seq: None,
+                        completed_ms: None,
+                        is_error: None,
+                    },
+                );
+            }
+            KIND_TOOL_COMPLETED => {
+                let (Some(execution_id), Some(tool_use_id)) = (
+                    event.execution_id.as_deref(),
+                    event.payload["tool_use_id"].as_str(),
+                ) else {
+                    return;
+                };
+                if let Some(row) = self
+                    .rows
+                    .tool_calls
+                    .get_mut(&(execution_id.to_string(), tool_use_id.to_string()))
+                {
+                    row.completed_seq = Some(seq);
+                    row.completed_ms = ts;
+                    row.is_error = event.payload["is_error"].as_bool();
+                }
+            }
+            KIND_USAGE_UPDATED => {
+                let usage = &event.payload["usage"];
+                // §28's token counters read from here, so the cache fields
+                // stay apart from `input_tokens`: a cache read is not an
+                // input token, and summing them would inflate every token
+                // metric this milestone exports.
+                let model = event.payload["model_usage"]
+                    .as_object()
+                    .and_then(|m| m.keys().next().cloned());
+                appended.usage.push(vec![
+                    Duck::BigInt(seq),
+                    text(event.work_id.as_deref()),
+                    text(event.execution_id.as_deref()),
+                    bigint(ts),
+                    text(model.as_deref()),
+                    bigint(usage["input_tokens"].as_i64()),
+                    bigint(usage["output_tokens"].as_i64()),
+                    bigint(usage["cache_read_input_tokens"].as_i64()),
+                    bigint(usage["cache_creation_input_tokens"].as_i64()),
+                    event.payload["total_cost_usd"]
+                        .as_f64()
+                        .map_or(Duck::Null, Duck::Double),
+                    text(event.payload["model_pin"]["verdict"].as_str()),
+                    event.payload["is_error"]
+                        .as_bool()
+                        .map_or(Duck::Null, Duck::Boolean),
+                ]);
+            }
+            _ => {}
+        }
+    }
+
+    /// Run one canned query by name.
+    ///
+    /// Takes `&mut self` because a read materializes the fold first: the
+    /// tables are always exactly as current as the events folded in, and no
+    /// caller can observe a half-written projection.
+    pub fn query(&mut self, name: &str) -> Result<QueryResult, AnalyticsError> {
+        self.materialize()?;
+        let canned = CANNED_QUERIES
+            .iter()
+            .find(|q| q.name == name)
+            .ok_or_else(|| AnalyticsError::UnknownQuery {
+                name: name.to_string(),
+            })?;
+        let (columns, rows) = self.select(canned.sql, duckdb::params![])?;
+        Ok(QueryResult {
+            name: canned.name.to_string(),
+            question: canned.question.to_string(),
+            sql: canned.sql.to_string(),
+            columns,
+            rows,
+        })
+    }
+
+    /// Row counts per table — the cheapest honest answer to "is this
+    /// projection actually populated", and what the disposability tests
+    /// compare across a rebuild.
+    pub fn table_counts(&mut self) -> Result<Vec<(String, i64)>, AnalyticsError> {
+        self.materialize()?;
+        let mut counts = Vec::new();
+        for table in TABLES {
+            let mut statement = self
+                .conn
+                .prepare(&format!("SELECT COUNT(*) FROM {}", ops(table)))?;
+            let count: i64 = statement.query_row(duckdb::params![], |row| row.get(0))?;
+            counts.push(((*table).to_string(), count));
+        }
+        Ok(counts)
+    }
+
+    /// Every row of one §22 table.
+    ///
+    /// **No production caller, and deliberately so.** No route reaches this
+    /// and no CLI verb exposes it: the daemon's analytics surface is the
+    /// canned §22 questions plus the graph neighborhood, and a raw table
+    /// dump is not in M5's contract. It is public because it is the
+    /// instrument acceptance 1 needs — "delete `atlas.duckdb`, rebuild,
+    /// identical `ops` results **row for row**" is a claim `table_counts`
+    /// cannot check, and
+    /// the M5 suite is a separate crate that cannot see `pub(crate)`. If a
+    /// future milestone wants a table dump on the API, this is the function
+    /// to route to; until then it answers only to the tests that justify it.
+    ///
+    /// The name is checked against the table list rather than interpolated — the
+    /// projection answers questions it knows, never SQL it was handed, which
+    /// is the same rule that keeps [`CANNED_QUERIES`] a fixed list.
+    pub fn table_rows(&mut self, table: &str) -> Result<QueryResult, AnalyticsError> {
+        let table = TABLES
+            .iter()
+            .find(|known| **known == table)
+            .ok_or_else(|| AnalyticsError::UnknownTable {
+                name: table.to_string(),
+            })?;
+        self.materialize()?;
+        let sql = format!("SELECT * FROM {}", ops(table));
+        let (columns, rows) = self.select(&sql, duckdb::params![])?;
+        Ok(QueryResult {
+            name: (*table).to_string(),
+            question: format!("every row of the {table} table"),
+            sql,
+            columns,
+            rows,
+        })
+    }
+
+    /// The graph neighborhood of one work (§8's `GET /v1/graph/work/{id}`).
+    ///
+    /// "Neighborhood" is every edge the work owns plus every node those edges
+    /// reach — so the shared nodes a work is connected to (its backend, its
+    /// workflow, the model it ran on) come back with it, while the rest of
+    /// the fleet does not.
+    pub fn graph_neighborhood(&mut self, work_id: &str) -> Result<GraphView, AnalyticsError> {
+        self.materialize()?;
+        let (node_columns, node_rows) = self.select(
+            "SELECT node_id, kind, label, work_id, source_seq FROM ops.graph_nodes \
+             WHERE work_id = ?1 \
+                OR node_id IN (SELECT from_node FROM ops.graph_edges WHERE work_id = ?1) \
+                OR node_id IN (SELECT to_node FROM ops.graph_edges WHERE work_id = ?1) \
+             ORDER BY source_seq, node_id",
+            duckdb::params![work_id],
+        )?;
+        let (edge_columns, edge_rows) = self.select(
+            "SELECT edge_id, relation, from_node, to_node, source_seq FROM ops.graph_edges \
+             WHERE work_id = ?1 ORDER BY source_seq, edge_id",
+            duckdb::params![work_id],
+        )?;
+        Ok(GraphView {
+            nodes: objects(&node_columns, node_rows),
+            edges: objects(&edge_columns, edge_rows),
+        })
+    }
+
+    /// Run one SELECT, returning column names and JSON rows.
+    fn select<P: duckdb::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<(Vec<String>, Vec<Vec<Value>>), AnalyticsError> {
+        let mut statement = self.conn.prepare(sql)?;
+        let mut rows = statement.query(params)?;
+        let mut out: Vec<Vec<Value>> = Vec::new();
+        let mut columns: Vec<String> = Vec::new();
+        while let Some(row) = rows.next()? {
+            if columns.is_empty() {
+                columns = row
+                    .as_ref()
+                    .column_names()
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect();
+            }
+            let mut values = Vec::with_capacity(columns.len());
+            for index in 0..columns.len() {
+                values.push(to_json(row.get::<usize, duckdb::types::Value>(index)?));
+            }
+            out.push(values);
+        }
+        if columns.is_empty() {
+            columns = statement
+                .column_names()
+                .iter()
+                .map(|c| c.to_string())
+                .collect();
+        }
+        Ok((columns, out))
+    }
+}
+
+/// A fold session opened by [`Analytics::fold`] — one iteration of what used
+/// to be `catch_up_folding`'s loop body, exposed so W2's shared startup pass
+/// can feed this projection one event at a time from the same drive that
+/// feeds every other sink.
+///
+/// The rebuild path and the incremental path are still this one method
+/// (`push`), so "rebuilt from scratch" and "kept current" cannot drift apart
+/// — [`Analytics::catch_up`] is now just a loop over `push` plus `finish`.
+pub struct AnalyticsFold<'a> {
+    analytics: &'a mut Analytics,
+    appended: Appended,
+    applied: u64,
+}
+
+impl AnalyticsFold<'_> {
+    /// Fold one event, skipping it if its seq is at or below what this
+    /// projection already has (so handing this every event a wider replay
+    /// yields, unfiltered, is always safe).
+    pub fn push(&mut self, event: &Event) -> Result<(), AnalyticsError> {
+        if event.seq <= self.analytics.last_seq {
+            return Ok(());
+        }
+        self.analytics.apply(event, &mut self.appended);
+        self.analytics.last_seq = event.seq;
+        self.applied += 1;
+        if self.appended.len() >= APPEND_CHUNK {
+            self.analytics.flush(&mut self.appended)?;
+        }
+        Ok(())
+    }
+
+    /// Today's `catch_up_folding` epilogue plus clearing `needs_reset` — the
+    /// only place that happens, so a fold whose `push` ever returned an error
+    /// (and was therefore abandoned rather than driven to `finish`) leaves
+    /// the flag armed for the next fold to see.
+    pub fn finish(self) -> Result<u64, AnalyticsError> {
+        let AnalyticsFold {
+            analytics,
+            mut appended,
+            applied,
+        } = self;
+        analytics.flush(&mut appended)?;
+        analytics.needs_reset = false;
+        Ok(applied)
+    }
+}
+
+/// Tables this projection creates, in a stable order. Crate-internal: the
+/// table list is an implementation detail of the projection, and callers get
+/// it as data from [`Analytics::table_counts`].
+const TABLES: &[&str] = &[
+    "events",
+    "work",
+    "stages",
+    "executions",
+    "messages",
+    "tool_calls",
+    "usage",
+    "repositories",
+    "graph_nodes",
+    "graph_edges",
+];
+
+/// Bulk-load `rows` into `table` through DuckDB's appender.
+///
+/// The appender is the reason this projection is usable at all: measured on
+/// this container, a single-row `INSERT` costs ~1 ms and an appended row
+/// ~4 µs. An empty batch is a no-op rather than an open-and-close.
+fn append_all(conn: &Connection, table: &str, rows: Vec<Vec<Duck>>) -> Result<(), AnalyticsError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut appender = conn.appender_to_db(table, OPS_SCHEMA)?;
+    for values in rows {
+        appender.append_row(duckdb::appender_params_from_iter(values))?;
+    }
+    appender.flush()?;
+    Ok(())
+}
+
+/// Zip columns and rows into JSON objects.
+fn objects(columns: &[String], rows: Vec<Vec<Value>>) -> Vec<Value> {
+    rows.into_iter()
+        .map(|row| {
+            let mut object = Map::new();
+            for (column, value) in columns.iter().zip(row) {
+                object.insert(column.clone(), value);
+            }
+            Value::Object(object)
+        })
+        .collect()
+}
+
+/// Convert a DuckDB value into JSON, keeping numbers numeric.
+fn to_json(value: duckdb::types::Value) -> Value {
+    use duckdb::types::Value as D;
+    match value {
+        D::Null => Value::Null,
+        D::Boolean(b) => Value::Bool(b),
+        D::TinyInt(v) => json!(v),
+        D::SmallInt(v) => json!(v),
+        D::Int(v) => json!(v),
+        D::BigInt(v) => json!(v),
+        D::UTinyInt(v) => json!(v),
+        D::USmallInt(v) => json!(v),
+        D::UInt(v) => json!(v),
+        D::UBigInt(v) => json!(v),
+        D::Float(v) => json!(v),
+        D::Double(v) => json!(v),
+        D::Text(v) => Value::String(v),
+        // DuckDB widens SUM over BIGINT to HUGEINT, so an ordinary
+        // "milliseconds blocked" total arrives as an i128. Narrow it when it
+        // fits — which every real total does — and render the impossible
+        // remainder as text rather than silently truncating it.
+        D::HugeInt(v) => i64::try_from(v).map_or_else(|_| json!(v.to_string()), |v| json!(v)),
+        D::UHugeInt(v) => u64::try_from(v).map_or_else(|_| json!(v.to_string()), |v| json!(v)),
+        // Everything else — decimals, blobs, containers — is rendered as its
+        // debug text rather than silently coerced. No column in this schema
+        // produces one; a future one that does will be visibly ugly instead
+        // of invisibly wrong.
+        other => Value::String(format!("{other:?}")),
+    }
+}
+
+// ----------------------------------------------------- the cross-schema join
+//
+// The capability A1 §5 gives as its whole reason for one database: "DuckDB
+// supports named schemas within one database, enabling cross-domain joins
+// without attaching/federating a fleet of databases." [EXT-DUCKDB-SCHEMA]
+//
+// Proven, not assumed to follow from colocation — the owner ruling of
+// 2026-08-29, decision 4.
+
+/// One row of [`AtlasDb::work_overlay_generations`]: a Work's identity from
+/// `ops`, joined to a source generation from `source`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkGeneration {
+    /// `ops.work.work_id` — the Work identity half of the join.
+    pub work_id: String,
+    /// `ops.work.state` as the journal fold last wrote it.
+    pub work_state: String,
+    /// `source.generations.source_name` — the `work:<id>/<repo>` overlay
+    /// coordinate that matched.
+    pub source_name: String,
+    /// That generation's content identity.
+    pub content_key: String,
+    /// When the overlay was read off the surface.
+    pub observed_at: String,
+}
+
+/// The join, as one SQL statement over two schemas of one database.
+///
+/// Public so a test can assert what it is as well as what it returns: no
+/// `ATTACH`, no second database name, one `FROM`/`JOIN` pair across `ops` and
+/// `source`. A statement that had to federate two stores could not be written
+/// this way at all — which is the property A1 §5 bought, and the one two
+/// files could not deliver, because each store's one-owner invariant forbids
+/// the other's token.
+pub const WORK_GENERATION_JOIN_SQL: &str = "\
+SELECT w.work_id, w.state, g.source_name, g.content_key, g.observed_at \
+  FROM ops.work AS w \
+  JOIN source.generations AS g \
+    ON g.source_name = 'work:' || w.work_id || '/' || ? \
+ WHERE g.state = 'confirmed' \
+ ORDER BY w.work_id, g.source_name";
+
+impl Analytics {
+    /// A second handle on **this same open database**, for the Atlas half of
+    /// it.
+    ///
+    /// **This is how a process gets an [`AtlasDb`] while the projection is
+    /// open, and `AtlasDb::open` is not.** One file means one DuckDB
+    /// *database instance*: two `Connection::open` calls against the same
+    /// path produce two independent instances that do not see each other's
+    /// writes and whose last close silently wins. That was harmless while
+    /// `ops` had a file to itself; with A1 §5's one database it would mean a
+    /// scan's `source.*` rows and the daemon's `ops.*` fold overwriting one
+    /// another. `Connection::try_clone` shares the instance instead, which is
+    /// what every other handle in the daemon is derived from.
+    ///
+    /// This hands out an `AtlasDb`, never a [`Connection`]: the one-owner
+    /// invariant is about which *module* may reach the driver, and both
+    /// halves of that module's public surface are still plain data.
+    pub fn atlas(&self) -> Result<AtlasDb, AtlasError> {
+        let conn = self.conn.try_clone()?;
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+        // No [`HARDENING_DDL`] here, and its absence is stronger than its
+        // presence would be. Those four settings are database-wide and
+        // `lock_configuration = true` makes them permanent, so re-issuing
+        // them on a second connection to the same instance is refused by
+        // DuckDB itself ("the configuration has been locked"). The
+        // projection's own open ran them before its first query, and F4's
+        // posture is verified rather than assumed: a clone that somehow
+        // reached an unhardened instance is refused here, not left to reach
+        // the network later.
+        conn.execute_batch(SCHEMA_DDL)?;
+        conn.execute_batch(TABLE_DDL)?;
+        let db = AtlasDb {
+            conn,
+            path: self.path.clone(),
+        };
+        let posture = db.hardening()?;
+        if !posture.locked
+            || posture.autoinstall_known_extensions
+            || posture.autoload_known_extensions
+            || posture.allow_community_extensions
+        {
+            return Err(AtlasError::UnknownValue {
+                column: "hardening".to_string(),
+                value: format!("{posture:?}"),
+            });
+        }
+        Ok(db)
+    }
+}
+
+impl Analytics {
+    /// Every confirmed Work-overlay generation over `repository`, keyed back
+    /// to the Work identity `ops` holds for it — in one statement.
+    ///
+    /// **No production caller, and deliberately so**, exactly as
+    /// [`Analytics::table_rows`] has none. A2's retrieval path is not this
+    /// wave's scope; what is this wave's scope is proving that the capability
+    /// A1 §5 cites as the reason for one database actually exists now that
+    /// there is one. [`SourceSelector::WorkBase`] is how the filter itself
+    /// reaches an overlay, and it takes the repository binding from its
+    /// caller precisely because Atlas holds no Work↔repository binding of its
+    /// own; this method is the demonstration that the *other* direction — ops
+    /// identity to source evidence — is now an ordinary join rather than a
+    /// federation.
+    ///
+    /// It lives on the projection rather than on [`AtlasDb`] because the ops
+    /// half of the join has a freshness rule the source half does not: see
+    /// [`Analytics::materialize`]'s call below. Either handle can *see* both
+    /// schemas — that is the whole point of one database — but only this one
+    /// can promise the `ops` rows are current.
+    ///
+    /// The repository is bound as a parameter, never interpolated: the
+    /// coordinate is built from a Work id that came out of the database and a
+    /// repository name that came from the caller, and only one of those is
+    /// already trusted.
+    pub fn work_overlay_generations(
+        &mut self,
+        repository: &str,
+    ) -> Result<Vec<WorkGeneration>, AnalyticsError> {
+        // The `ops` half is a *mutable* table: the fold accumulates rows in
+        // memory and writes them at read time, so a join issued without this
+        // would read whatever the last materialization left behind — from
+        // this connection or any other. Every other read on this type goes
+        // through the same call for the same reason.
+        self.materialize()?;
+        let mut statement = self.conn.prepare(WORK_GENERATION_JOIN_SQL)?;
+        let mut rows = statement.query([repository])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(WorkGeneration {
+                work_id: row.get(0)?,
+                work_state: row.get(1)?,
+                source_name: row.get(2)?,
+                content_key: row.get(3)?,
+                observed_at: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3859,7 +5621,7 @@ mod tests {
         let data = Path::new("/data");
         let path = atlas_db_path(data);
         assert!(
-            !path.starts_with(crate::runtime::analytics::projections_dir(data)),
+            !path.starts_with(crate::runtime::startup::projections_dir(data)),
             "{} must not live under the disposable projections directory",
             path.display()
         );
@@ -4234,5 +5996,354 @@ mod tests {
         let debug = format!("{atlas:?}");
         assert!(debug.contains(":memory:"), "{debug}");
         assert!(!debug.contains("Connection"), "{debug}");
+    }
+}
+
+#[cfg(test)]
+mod ops_tests {
+    use super::*;
+    use crate::domain::event::{EventDraft, EventSource};
+
+    fn events(list: Vec<Event>) -> Vec<Result<Event, JournalError>> {
+        list.into_iter().map(Ok).collect()
+    }
+
+    fn event(seq: u64, work_id: &str, kind: &str, payload: Value) -> Event {
+        EventDraft::new(EventSource::new("daemon", "test"), kind, payload)
+            .with_work_id(work_id)
+            .into_event(seq)
+    }
+
+    fn submitted(seq: u64, work_id: &str) -> Event {
+        event(
+            seq,
+            work_id,
+            KIND_WORK_SUBMITTED,
+            json!({"work": {
+                "id": work_id, "intent": "do it", "state": "pending",
+                "created_by": "test", "created_at": "2026-01-01T00:00:00.000Z",
+                "origin_client": "cli", "repositories": [],
+            }}),
+        )
+    }
+
+    #[test]
+    fn every_canned_query_runs_against_an_empty_projection() {
+        // A query that only parses against populated tables is a query that
+        // breaks the first time someone asks it on a quiet daemon.
+        let mut analytics = Analytics::in_memory(Vec::new()).expect("projection");
+        for canned in CANNED_QUERIES {
+            let result = analytics.query(canned.name).expect(canned.name);
+            assert!(
+                !result.columns.is_empty(),
+                "{} produced no column names",
+                canned.name
+            );
+            assert!(result.rows.is_empty(), "{} invented rows", canned.name);
+        }
+        assert!(matches!(
+            analytics.query("no-such-query"),
+            Err(AnalyticsError::UnknownQuery { .. })
+        ));
+    }
+
+    #[test]
+    fn the_schema_declares_exactly_the_tables_it_advertises() {
+        let mut analytics = Analytics::in_memory(Vec::new()).expect("projection");
+        let counts = analytics.table_counts().expect("counts");
+        let names: Vec<&str> = counts.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, TABLES);
+        assert!(counts.iter().all(|(_, count)| *count == 0));
+    }
+
+    /// S3 F3. The requalification is physical, not cosmetic: every table this
+    /// module creates lives in the `ops` namespace and DuckDB's default
+    /// `main` schema holds nothing at all. Read back out of the catalog, so a
+    /// table added later without a namespace fails here rather than quietly
+    /// landing in `main` and still answering queries.
+    #[test]
+    fn every_table_lives_in_the_ops_schema_and_main_holds_nothing() {
+        let analytics = Analytics::in_memory(Vec::new()).expect("projection");
+        let (columns, rows) = analytics
+            .select(
+                "SELECT schema_name, table_name FROM duckdb_tables() \
+                 WHERE database_name = current_database() ORDER BY table_name",
+                duckdb::params![],
+            )
+            .expect("select");
+        assert_eq!(columns, vec!["schema_name", "table_name"]);
+        let mut expected: Vec<&str> = TABLES.to_vec();
+        expected.sort_unstable();
+        let found: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                assert_eq!(
+                    row[0],
+                    json!(OPS_SCHEMA),
+                    "{:?} is not in the ops namespace",
+                    row[1]
+                );
+                row[1].as_str().expect("table name").to_string()
+            })
+            .collect();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn folding_is_idempotent_over_a_replayed_prefix() {
+        // `catch_up` skipping the covered prefix is what lets the daemon hand
+        // it the whole journal at any time. If the skip were wrong, replaying
+        // a prefix would double-count the events table.
+        let journal = vec![submitted(1, "w1"), submitted(2, "w2")];
+        let mut analytics = Analytics::in_memory(events(journal.clone())).expect("projection");
+        assert_eq!(analytics.last_seq(), 2);
+        assert_eq!(analytics.catch_up(events(journal)).expect("catch up"), 0);
+        let counts = analytics.table_counts().expect("counts");
+        assert_eq!(counts[0], ("events".to_string(), 2));
+        assert_eq!(counts[1], ("work".to_string(), 2));
+    }
+
+    /// H1 touch point #6: `estate_root` folds from the envelope at
+    /// `work.submitted` for a Work that never reaches `workflow.bound`
+    /// (today's documented `estate: None`-forever gap, now answered), and
+    /// stays `NULL` — never an error — for a pre-Phase-C-shaped legacy line
+    /// whose envelope never carried `workspace_id` at all (`Compatibility`
+    /// deliverable: old journal lines replay unchanged).
+    #[test]
+    fn work_estate_root_folds_from_the_submitted_envelope_and_stays_null_for_a_legacy_line() {
+        let root = "/estates/payments";
+        let mut current = submitted(1, "current");
+        current.workspace_id = Some(root.to_string());
+        // No `workspace_id` at all — exactly what a stored pre-Phase-C
+        // journal line deserializes to (`Event`'s `#[serde(default)]`).
+        let legacy = submitted(2, "legacy");
+
+        let mut analytics =
+            Analytics::in_memory(events(vec![current, legacy])).expect("projection");
+        analytics.materialize().expect("materialize");
+        let (columns, rows) = analytics
+            .select(
+                "SELECT work_id, estate_root FROM ops.work ORDER BY work_id",
+                duckdb::params![],
+            )
+            .expect("select");
+        assert_eq!(columns, vec!["work_id", "estate_root"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![json!("current"), json!(root)],
+                vec![json!("legacy"), Value::Null],
+            ]
+        );
+    }
+
+    /// W2 §9.1 step 3: a failed `push` (surfaced through `finish`, since the
+    /// append-only tables only flush at chunk boundaries or at `finish`)
+    /// leaves `needs_reset` armed — the invariant `catch_up`'s doc comment
+    /// protects, now split across `fold`/`push`/`finish`.
+    ///
+    /// Injection: drop the `events` table out from under a live connection,
+    /// so the buffered append at `finish` fails at the DB layer while
+    /// `last_seq` has already advanced past it.
+    #[test]
+    fn a_failed_push_leaves_needs_reset_armed() {
+        let mut analytics = Analytics::in_memory(Vec::new()).expect("projection");
+        analytics
+            .conn
+            .execute_batch("DROP TABLE ops.events")
+            .expect("drop the events table to force the next append to fail");
+
+        let mut fold = analytics.fold().expect("fold");
+        fold.push(&submitted(1, "w1"))
+            .expect("push buffers, does not write yet");
+        let err = fold
+            .finish()
+            .expect_err("finish must surface the failed append");
+        assert!(matches!(err, AnalyticsError::Duck(_)));
+
+        // `last_seq()` reads 0 while `needs_reset` is armed — the one public
+        // proxy for the private flag, per its own doc comment.
+        assert_eq!(
+            analytics.last_seq(),
+            0,
+            "a failed fold must leave needs_reset armed, reported as last_seq() == 0"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_leaves_a_null_cell_and_never_fails_the_fold() {
+        let mut odd = submitted(1, "w1");
+        odd.timestamp = "whenever".to_string();
+        let mut analytics = Analytics::in_memory(events(vec![odd])).expect("projection");
+        analytics.materialize().expect("materialize");
+        let (_, rows) = analytics
+            .select("SELECT ts_ms FROM ops.events", duckdb::params![])
+            .expect("select");
+        assert_eq!(rows, vec![vec![Value::Null]]);
+    }
+
+    /// An event with no work scope at all (as opposed to `event()`, which
+    /// always sets one) — the shape several §33 guards actually fire on.
+    fn event_no_work(seq: u64, kind: &str, payload: Value) -> Event {
+        EventDraft::new(EventSource::new("daemon", "test"), kind, payload).into_event(seq)
+    }
+
+    /// Issue #33 item 1: `Analytics::apply`'s malformed/incomplete-event
+    /// guards, never fired in the baseline, across every kind that has one.
+    /// Each of these is missing exactly the field its handler reads back out
+    /// — `catch_up` (§20's forward-compatibility contract) must skip the row
+    /// rather than panic or write a partial one.
+    #[test]
+    fn malformed_events_across_kinds_are_skipped_not_panicked() {
+        let mut malformed = vec![
+            // KIND_WORK_SUBMITTED: no "work.id" in the payload.
+            event_no_work(
+                1,
+                KIND_WORK_SUBMITTED,
+                json!({"work": {"intent": "orphan"}}),
+            ),
+            // KIND_WORKFLOW_BOUND: work_id names a work never submitted, so
+            // it is absent from `rows.work` (the issue's own example).
+            event(
+                2,
+                "ghost-work",
+                KIND_WORKFLOW_BOUND,
+                json!({"backend": "fake"}),
+            ),
+            // KIND_SURFACE_MATERIALIZED / TORN_DOWN: no work_id on the
+            // envelope at all. The bindings are deliberately non-empty and
+            // name a real repository: both handlers only write from inside
+            // the loop over them, so with `"bindings": []` the arm would
+            // write nothing whether or not the work_id guard is there and
+            // the repositories assertion below could not tell the two apart.
+            event_no_work(
+                3,
+                KIND_SURFACE_MATERIALIZED,
+                json!({"surface": {"bindings": [
+                    {"repository": "repo", "source_path": "/src/repo", "work_branch": "sgt/w1"},
+                ]}}),
+            ),
+            event_no_work(
+                4,
+                KIND_SURFACE_TORN_DOWN,
+                json!({"report": {"bindings": [
+                    {"repository": "repo", "disposition": "kept"},
+                ]}}),
+            ),
+            // KIND_STAGE_ENTERED: work_id present, stage_id missing.
+            event(5, "w1", KIND_STAGE_ENTERED, json!({"index": 0})),
+            // KIND_STAGE_COMPLETED: stage_id names a stage never entered, so
+            // no attempt can be found for it.
+            event(
+                6,
+                "w1",
+                KIND_STAGE_COMPLETED,
+                json!({"stage_id": "never-entered"}),
+            ),
+            // KIND_EXECUTION_STARTED: no execution_id in the payload.
+            event(
+                7,
+                "w1",
+                KIND_EXECUTION_STARTED,
+                json!({"execution": {"backend": "fake"}}),
+            ),
+            // KIND_EXECUTION_STOPPED: no execution_id, and an unknown one.
+            event(8, "w1", KIND_EXECUTION_STOPPED, json!({})),
+            event(
+                9,
+                "w1",
+                KIND_EXECUTION_STOPPED,
+                json!({"execution_id": "ghost-exec"}),
+            ),
+            // KIND_EXECUTION_RECONCILED: no execution_id, and an unknown one.
+            event(
+                10,
+                "w1",
+                KIND_EXECUTION_RECONCILED,
+                json!({"disposition": "resumed"}),
+            ),
+            event(
+                11,
+                "w1",
+                KIND_EXECUTION_RECONCILED,
+                json!({"execution_id": "ghost-exec", "disposition": "resumed"}),
+            ),
+            // KIND_TOOL_REQUESTED: no execution scope on the envelope.
+            event(
+                12,
+                "w1",
+                KIND_TOOL_REQUESTED,
+                json!({"id": "t1", "name": "Bash"}),
+            ),
+        ];
+        // KIND_TOOL_COMPLETED: execution scope present, tool_use_id absent.
+        let mut tool_completed = event(13, "w1", KIND_TOOL_COMPLETED, json!({}));
+        tool_completed.execution_id = Some("e1".to_string());
+        malformed.push(tool_completed);
+
+        let total = malformed.len() as i64;
+        let mut analytics = Analytics::in_memory(events(malformed)).expect("projection");
+        let counts: BTreeMap<String, i64> = analytics
+            .table_counts()
+            .expect("counts")
+            .into_iter()
+            .collect();
+        for table in ["work", "stages", "executions", "tool_calls", "repositories"] {
+            assert_eq!(
+                counts[table], 0,
+                "{table} should be untouched by malformed events: {counts:?}"
+            );
+        }
+        assert_eq!(
+            counts["events"], total,
+            "every malformed event is still appended to the raw log, never dropped"
+        );
+    }
+
+    /// Issue #33 item 1: `KIND_EXECUTION_RECONCILED`'s handler — the whole
+    /// arm never ran in the baseline — actually updates the matching row's
+    /// disposition on a real reconcile.
+    #[test]
+    fn execution_reconciled_records_the_disposition_on_the_matching_row() {
+        let started = event(
+            1,
+            "w1",
+            KIND_EXECUTION_STARTED,
+            json!({"execution": {
+                "execution_id": "e1", "backend": "fake", "native_id": "n1",
+                "stage_id": "00-first", "attempt": 1, "stop_requested": false,
+            }}),
+        );
+        let reconciled = event(
+            2,
+            "w1",
+            KIND_EXECUTION_RECONCILED,
+            json!({"execution_id": "e1", "disposition": "resumed"}),
+        );
+        let mut analytics =
+            Analytics::in_memory(events(vec![started, reconciled])).expect("projection");
+        analytics.materialize().expect("materialize");
+        let (_, rows) = analytics
+            .select(
+                "SELECT reconcile_disposition FROM ops.executions WHERE execution_id = 'e1'",
+                duckdb::params![],
+            )
+            .expect("select");
+        assert_eq!(rows, vec![vec![Value::String("resumed".to_string())]]);
+    }
+
+    /// Issue #33's dead-code note: `Analytics`'s manual `Debug` impl is
+    /// decided keep-with-caller rather than dropped, which means it needs an
+    /// actual caller so it is not an unmeasured claim — this is it.
+    #[test]
+    fn the_debug_impl_names_the_projection_by_path_and_last_seq() {
+        let analytics = Analytics::in_memory(events(vec![submitted(1, "w1")])).expect("projection");
+        let debug = format!("{analytics:?}");
+        assert!(debug.starts_with("Analytics {"), "{debug}");
+        // Both halves the name promises: the path is the whole reason the
+        // manual impl exists, so asserting only `last_seq` would leave the
+        // interesting field unmeasured.
+        assert!(debug.contains("path: \":memory:\""), "{debug}");
+        assert!(debug.contains("last_seq: 1"), "{debug}");
     }
 }

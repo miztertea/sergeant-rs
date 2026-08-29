@@ -42,7 +42,7 @@ use sergeant_rs::domain::work::{
 use sergeant_rs::domain::workflow::{
     KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_WORKFLOW_BOUND,
 };
-use sergeant_rs::runtime::analytics::Analytics;
+use sergeant_rs::runtime::atlas::db::Analytics;
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::projection::{
     Projection, WorkRegistry, work_registry_projection, work_registry_reducer,

@@ -35,7 +35,7 @@
 //!
 //! | # | Contract claim (§17) | Verdict | Decisive check |
 //! |---|---|---|---|
-//! | 1 | one daemon-owned `atlas.duckdb` holds independently rebuildable `ops/source/git/context/meta` families | met-with-deviation | `x1_atlas_substrate::opening_atlas_declares_the_four_schema_namespaces` |
+//! | 1 | one daemon-owned `atlas.duckdb` holds independently rebuildable `ops/source/git/context/meta` families | met | `x1_atlas_substrate::opening_atlas_declares_the_five_schema_namespaces` |
 //! | 2 | estate Git indexing pins exact repo/base generations and Work overlays without changing Work authority | met | `x3a_git_plumbing::a_scan_stays_on_its_pinned_sha_while_head_advances` |
 //! | 3 | a declared read-only local knowledge Source indexes a cloud-synced ordinary directory without becoming `[[repo]]` or receiving a worktree | met | `x5_a1a_acceptance::a1a_item_3_a_knowledge_source_is_indexed_without_becoming_a_repo_or_getting_a_worktree` |
 //! | 4 | online-only/unreadable local resources are reported as coverage gaps, not silently indexed as empty | met | `y6b_online_only::an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_trigger` |
@@ -190,33 +190,38 @@ struct Item {
 const WALK: &[Item] = &[
     Item {
         number: 1,
-        verdict: Verdict::MetWithDeviation,
+        verdict: Verdict::Met,
         checks: &[
             at(
                 "tests/x1_atlas_substrate.rs",
-                "opening_atlas_declares_the_four_schema_namespaces",
+                "opening_atlas_declares_the_five_schema_namespaces",
             ),
             at(
                 "tests/x1_atlas_substrate.rs",
                 "atlas_database_has_exactly_one_owner",
             ),
             at(
-                "tests/m5_projections.rs",
-                "t2_the_duckdb_file_has_exactly_one_owner",
+                "tests/w1c_one_atlas_database.rs",
+                "one_statement_joins_ops_work_identity_to_source_generations",
             ),
             at(
                 "tests/x2_knowledge_sources.rs",
                 "source_facts_survive_a_real_daemon_restart",
             ),
         ],
-        note: "DEVIATION, ratified: the families live in TWO daemon-owned databases, not one \
-               file. `atlas.duckdb` declares meta/source/git/context; `ops.*` is a schema inside \
-               the operations projection (`sergeant.duckdb`), because F2/F3 kept two databases \
-               with two independent one-owner invariants rather than collapsing them. \
-               `git.*` carries no table of its own: repository-derived facts land in `source.*` \
-               with the source kind as a column (see `runtime/atlas/mod.rs`). 'Independently \
-               rebuildable' is proven as the two rebuild disciplines F1 names — ops refolds from \
-               the journal on every start while source facts persist — by the restart test.",
+        note: "ONE daemon-owned database, A1 §5's five schemas: meta/ops/source/git/context in \
+               one file, declared on every open and read back out of DuckDB's own catalog. S3 \
+               shipped two files and this row recorded that as a ratified deviation; no owner \
+               ruling ever ratified it, and the owner correction of 2026-08-29 converged the \
+               code (S5 W1c) — the second file and its path constant are deleted, and the pair \
+               of one-owner tests became the single assertion one database implies. The join \
+               A1 §5 gives as its reason for one database is proven, not inferred from \
+               colocation. `git.*` carries no table of its own: repository-derived facts land \
+               in `source.*` with the source kind as a column (see `runtime/atlas/mod.rs`) — a \
+               separate register question, untouched by W1c. 'Independently rebuildable' is \
+               proven as the two rebuild disciplines F1 names, which survived the merge as \
+               scope rather than as separate files: `DROP SCHEMA ops CASCADE` + refold on every \
+               start while source facts persist, by the restart test.",
     },
     Item {
         number: 2,
@@ -1591,6 +1596,17 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
     //    keyword of its own. Every hole in every SQL literal is collected
     //    wherever it sits, and the resulting list is pinned exhaustively — the
     //    same discipline item 12 applies to the CLI's `AtlasDb::` call list.
+    //
+    //    **S5 W1c added four holes to this list, and none of them widens the
+    //    surface.** The operations projection moved into this file when A1
+    //    §5's one database absorbed `ops`, and it addresses its own tables by
+    //    name through `ops(table)`. The four fillers are `MUTABLE_TABLES` and
+    //    `TABLES` — `&'static [&'static str]` constants in this same file —
+    //    never a caller's string: `Analytics::table_rows` is the only one of
+    //    them that takes a name from outside, and it looks that name up in
+    //    `TABLES` and returns `UnknownTable` before any formatting happens.
+    //    Item 13 forbids handing the store a query; a fixed set of table
+    //    names chosen by the module that declared them is not one.
     let holes = sql_literal_holes(&db, &lines);
     assert_eq!(
         holes.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -1598,6 +1614,13 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
             "rows_sql: {} <- reader_call(format)",
             "row_count_sql: {} <- reader_call(format)",
             "column_profile_sql: {} <- reader_call(format)",
+            "reset: {} <- }",
+            "materialize: {} <- }",
+            concat!(
+                "table_counts: {} <- let count: i64 = ",
+                "statement.query_row(duckdb::params![], |row| row.get(0))?;"
+            ),
+            "table_rows: {} <- let (columns, rows) = self.select(&sql, duckdb::params![])?;",
         ],
         "the exhaustive list of (function, hole, filler) triples for every interpolation in \
          every SQL literal in db.rs. A new hole — positional or named, on any line — is a \

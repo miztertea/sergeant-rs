@@ -57,13 +57,35 @@ use crate::domain::event::Event;
 use crate::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_SUBMITTED, WorkState,
 };
-use crate::runtime::analytics::{self, AnalyticsError, AnalyticsFold};
+use crate::runtime::atlas::db::{AnalyticsError, AnalyticsFold};
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::integrity::IntegrityDisposition;
 use crate::runtime::journal::{Journal, JournalError, Replay, SegmentBound};
 use crate::runtime::projection::{
     Projection, ProjectionError, WorkIndexRow, WorkRegistry, work_registry_reducer,
 };
+
+/// Directory under the data dir holding disposable projections (§21).
+///
+/// Since S5 W1c this directory holds exactly one thing — the FloorState
+/// cache below. The DuckDB projection that used to sit beside it
+/// (the old `sergeant` projection file) is gone: `ops` is a schema inside
+/// Atlas's own database, which A1 §5 names as the estate's one physical
+/// database. The
+/// constant lives here rather than in a deleted module because the cache is
+/// now its only reason to exist, and moving the cache itself was explicitly
+/// out of W1c's scope (R1).
+///
+/// The disposability contract is unchanged *for this directory*: deleting
+/// `projections/` still loses nothing, because a missing FloorState cache is
+/// a full replay. It is Atlas's database file whose deletion is no longer free —
+/// see [`crate::runtime::atlas::db`].
+pub const PROJECTIONS_DIR: &str = "projections";
+
+/// The projections directory for a data dir.
+pub fn projections_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(PROJECTIONS_DIR)
+}
 
 /// File name of the startup cache inside `projections/`.
 pub const FLOOR_STATE_FILE: &str = "floor-state.json";
@@ -192,8 +214,8 @@ impl ReplaySink for RegistrySink<'_> {
 /// start. DuckDB's contents are therefore a pure function of `(W_seq, tail]`
 /// whether this start hit the cache or did a full replay — a cache-miss
 /// start must not populate more history than a cache-hit start, or
-/// `tests/m5_projections.rs`'s "delete the file, restart, identical
-/// results" acceptance would be flaky-by-design.
+/// `tests/m5_projections.rs`'s "delete the Atlas database file, restart, identical
+/// `ops` results" acceptance would be flaky-by-design.
 pub struct AnalyticsSink<'a> {
     fold: Option<AnalyticsFold<'a>>,
     from_seq: u64,
@@ -1048,7 +1070,7 @@ impl Plan {
 
 /// The projections directory's `floor-state.json` path for `data_dir`.
 fn floor_state_path(data_dir: &Path) -> PathBuf {
-    analytics::projections_dir(data_dir).join(FLOOR_STATE_FILE)
+    projections_dir(data_dir).join(FLOOR_STATE_FILE)
 }
 
 /// Stream a file through BLAKE3 in [`HASH_CHUNK`]-sized pieces — never
@@ -1528,7 +1550,7 @@ mod tests {
     }
 
     fn write_cache(data_dir: &Path, cache: &FloorState) {
-        std::fs::create_dir_all(analytics::projections_dir(data_dir)).expect("mkdir");
+        std::fs::create_dir_all(projections_dir(data_dir)).expect("mkdir");
         std::fs::write(
             floor_state_path(data_dir),
             serde_json::to_vec_pretty(cache).expect("serialize"),
@@ -1584,7 +1606,7 @@ mod tests {
     fn resolve_reports_malformed_on_garbage_json() {
         let dir = TempDir::new().expect("tempdir");
         let (journal, _cache) = build_journal_and_cache(dir.path());
-        std::fs::create_dir_all(analytics::projections_dir(dir.path())).expect("mkdir");
+        std::fs::create_dir_all(projections_dir(dir.path())).expect("mkdir");
         std::fs::write(floor_state_path(dir.path()), b"not json").expect("write garbage");
 
         let plan = Plan::resolve(dir.path(), &journal, false).expect("resolve");

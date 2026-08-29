@@ -1,20 +1,30 @@
-//! S3 X1 — Atlas substrate: the second one-owner invariant, and the schema
+//! S3 X1 — Atlas substrate: the one-owner invariant, and the schema
 //! namespaces Atlas declares.
 //!
-//! This suite is deliberately independent of `tests/m5_projections.rs`'s
-//! `t2_the_duckdb_file_has_exactly_one_owner`. There are two databases, and
-//! each has exactly one owning file: M5 owns the assertion about the
-//! operations projection's file, this suite owns the assertion about Atlas's.
-//! Neither is a union rule ("either of these two files may open a database"),
-//! because a union rule passes just as happily when one owner has quietly
-//! grown into the other's territory. Two databases, two invariants, two
-//! tests.
+//! **S5 W1c collapsed a pair of tests into this one.** This suite used to be
+//! deliberately independent of `tests/m5_projections.rs`'s
+//! `t2_the_duckdb_file_has_exactly_one_owner` because there were two
+//! databases, each with one owning file, and a *union* rule ("either of these
+//! two files may open a database") passes just as happily once one owner has
+//! grown into the other's territory. A1 §5 declares one physical database
+//! with five logical schemas and A1-02's rationale is "schemas provide
+//! separation without more databases"; the owner correction of 2026-08-29
+//! settled that the code converges to the contract. `sergeant.duckdb` is
+//! gone, `ops` is a schema in `atlas.duckdb`, and one database has one owner
+//! and one test. The scan below therefore covers the whole of `src/` with no
+//! skipped tree and no allowed-owners list — the strongest form of the rule,
+//! not a merged weaker one.
 //!
 //! Non-spawning and filesystem-light: no daemon, no estate, no backend.
 
 use std::path::{Path, PathBuf};
 
 use sergeant_rs::runtime::atlas::db::{ATLAS_DB_FILE, ATLAS_DIR, AtlasDb, SCHEMAS, atlas_db_path};
+
+/// The whole crate source tree.
+fn crate_src() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
+}
 
 /// The Atlas module tree.
 fn atlas_src() -> PathBuf {
@@ -45,19 +55,39 @@ fn names_the_crate(text: &str) -> bool {
         .any(|token| token == "duckdb")
 }
 
-/// F2. Inside the Atlas tree, `db.rs` is the only file that may reach the
-/// database driver, and it hands no connection back out.
+/// F2, in the form A1 §5 implies: **one database, one owning file, one
+/// assertion.** `src/runtime/atlas/db.rs` is the only file in the entire
+/// crate that may reach the database driver, and it hands no connection back
+/// out.
+///
+/// The scan covers all of `src/` — every tree, no exemptions. Before S5 W1c
+/// it covered only `src/runtime/atlas/`, and `tests/m5_projections.rs`'s
+/// `t2_the_duckdb_file_has_exactly_one_owner` covered everything else against
+/// `src/runtime/analytics.rs`, because those were two databases. There is now
+/// one, so a second test naming a second owner would be the union rule both
+/// suites forbade.
 #[test]
 fn atlas_database_has_exactly_one_owner() {
-    let src = atlas_src();
-    let owner = src.join("db.rs");
+    let src = crate_src();
+    let owner = atlas_src().join("db.rs");
     let files = rust_sources(&src);
     assert!(
         files.len() > 1,
         "the scan must actually cover a tree, not just its owner: {files:?}"
     );
+    assert!(
+        !src.join("runtime").join("analytics.rs").exists(),
+        "src/runtime/analytics.rs owned the second database; A1 §5 declares one,          so its return would mean the second database returned with it"
+    );
 
-    // The negative half: every sibling is plain Rust.
+    // The negative half: every other file in the crate is plain Rust.
+    //
+    // The scan is a bare-token match, so it also catches *prose* that spells
+    // the database's file name in lowercase. That is not a false positive to
+    // be excused with an exception list: an exception list is how a scan
+    // stops seeing the thing it was written to see. Documentation outside the
+    // owner refers to "Atlas's database file" or `ATLAS_DB_FILE`, and the
+    // owner's own module doc is where the literal name belongs.
     for file in &files {
         if *file == owner {
             continue;
@@ -66,9 +96,7 @@ fn atlas_database_has_exactly_one_owner() {
         assert!(
             !names_the_crate(&text),
             "{} names the duckdb crate; only runtime/atlas/db.rs may",
-            file.strip_prefix(&src)
-                .expect("under the atlas tree")
-                .display()
+            file.strip_prefix(&src).expect("under src").display()
         );
     }
 
@@ -93,6 +121,17 @@ fn atlas_database_has_exactly_one_owner() {
     assert!(
         !db.contains("pub fn conn") && !db.contains("-> &Connection"),
         "no accessor may hand a live connection outside the Atlas owner"
+    );
+
+    // Inherited from the deleted `t2`: the CLI reaches the operations tables
+    // through the daemon's HTTP surface and nowhere else. The loop above
+    // already proves `cli.rs` names no driver; this pins the positive half,
+    // so a CLI that stopped asking the daemon could not pass by simply
+    // answering nothing.
+    let cli = std::fs::read_to_string(src.join("cli.rs")).expect("read cli");
+    assert!(
+        cli.contains("/v1/analytics"),
+        "clients ask the daemon; they do not open the file"
     );
 }
 
@@ -125,7 +164,7 @@ fn the_atlas_module_docs_carry_the_persistence_contract() {
 /// F3. The namespaces are created in the database, read back out of its own
 /// catalog rather than echoed from the constant.
 #[test]
-fn opening_atlas_declares_the_four_schema_namespaces() {
+fn opening_atlas_declares_the_five_schema_namespaces() {
     let dir = tempfile::tempdir().expect("tempdir");
     let atlas = AtlasDb::open(dir.path()).expect("open atlas");
     assert_eq!(
@@ -135,8 +174,8 @@ fn opening_atlas_declares_the_four_schema_namespaces() {
     );
     assert_eq!(
         SCHEMAS,
-        ["context", "git", "meta", "source"],
-        "A1 §5 names exactly these four Atlas namespaces"
+        ["context", "git", "meta", "ops", "source"],
+        "A1 §5 names exactly these five schemas in the one atlas.duckdb"
     );
 }
 

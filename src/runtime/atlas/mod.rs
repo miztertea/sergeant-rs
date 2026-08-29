@@ -1,21 +1,32 @@
 //! Atlas — the daemon-owned world-intelligence store (A1 §1–§8).
 //!
-//! A second analytical database, in its own file, sitting beside the
-//! journal-derived operations projection ([`crate::runtime::analytics`]) and
-//! deliberately **not** inside it. This module tree is the whole of Atlas;
-//! [`db`] is the whole of its database access.
+//! The estate's **one** analytical database, in its own file, carrying A1
+//! §5's five logical schemas. This module tree is the whole of Atlas; [`db`]
+//! is the whole of its database access — and, since S5 W1c, the whole of the
+//! crate's database access.
 //!
-//! # One owner, per database — two invariants, never one (F2)
+//! # One database, one owner, one invariant (F2, A1 §5)
 //!
-//! The operations projection has exactly one owning file
-//! ([`crate::runtime::analytics`]) and Atlas has exactly one owning file
-//! ([`db`]). Those are two separate invariants over two separate database
-//! files, and they are enforced by two separate structural tests
-//! (`tests/m5_projections.rs`'s `t2_the_duckdb_file_has_exactly_one_owner`
-//! and `tests/x1_atlas_substrate.rs`'s `atlas_database_has_exactly_one_owner`).
-//! They are never collapsed into one "these two files may both touch a
-//! database driver" union rule: a union rule would let either owner drift
-//! into the other's file and still pass.
+//! Until S5 W1c there were two physical files: the operations projection's
+//! own file under `projections/` (`ops.*`) and Atlas's file under `atlas/`
+//! (`meta`/`source`/`git`/`context`). Each had one
+//! owning file and each was pinned by its own structural test, and those two
+//! tests were deliberately never collapsed into a "these two files may both
+//! touch a database driver" union rule, because a union rule lets either
+//! owner drift into the other's file and still pass.
+//!
+//! A1 §5 declares one physical file — Atlas's, named by [`db::ATLAS_DB_FILE`]
+//! — with schemas `meta`,
+//! `ops`, `source`, `git`, `context`, and decision A1-02's rationale is
+//! "schemas provide separation without more databases". The second database
+//! was a deviation the implementing wave ratified for itself; the owner
+//! correction of 2026-08-29 settled that the code converges to the contract.
+//! So the second file is gone, `ops` is a schema in this database, and the
+//! pair of one-owner tests has become the single assertion the contract
+//! implies: `tests/x1_atlas_substrate.rs`'s
+//! `atlas_database_has_exactly_one_owner`, scanning the whole of `src/` with
+//! no exempted tree. That is the *stronger* rule, not a merged weaker one —
+//! the union rule remains forbidden and is now unrepresentable.
 //!
 //! Every sibling module under `runtime/atlas/` is therefore plain Rust —
 //! structs, parsing, pure functions over bytes and rows — and hands [`db`]
@@ -24,34 +35,49 @@
 //!
 //! # The two rebuild disciplines (F1) — read this before adding a table
 //!
-//! Atlas and the operations projection do **not** share a rebuild story, and
-//! the most likely way to break Atlas is to assume they do.
+//! One file, two disciplines. They did not merge when the files did, and the
+//! most likely way to break Atlas is to assume they did.
 //!
-//! * **Operations tables (`ops.*`, in the other file)** are disposable.
-//!   The daemon deletes that file and re-folds it from the journal on every
-//!   start; "delete the file and restart" and "restart" are the same
-//!   operation. Nothing may come to depend on state that only lives there.
+//! * **Operations tables (`ops.*`) are disposable.** The daemon drops the
+//!   `ops` schema and re-folds it from the journal on every start
+//!   ([`db::Analytics::begin_rebuild`]), so "restart" is still the only
+//!   population path and nothing may come to depend on state that only lives
+//!   there. It drops a *schema*, never the file.
 //!
-//! * **Atlas's `source.*`, `git.*` and `meta.coverage` tables PERSIST
-//!   across restarts.** They are not a function of the journal — no replay
-//!   reproduces them. They are derived from source bytes plus the identity
-//!   of the extractor that read those bytes, keyed by SourceGeneration. A
-//!   generation is evicted only when the underlying source bytes changed,
-//!   and an eviction is reported: it leaves an explicit "generation evicted"
-//!   coverage row rather than a silent gap (ruling §4, contract §15–§16).
-//!   The journal still carries the authoritative trail as one compact
-//!   `source.scanned` summary per completed scan; the unit-level detail
-//!   lives here.
+//! * **`source.*`, `git.*` and `meta.coverage` PERSIST across restarts.**
+//!   They are not a function of the journal — no replay reproduces them. They
+//!   are derived from source bytes plus the identity of the extractor that
+//!   read those bytes, keyed by SourceGeneration. A generation is evicted only
+//!   when the underlying source bytes changed, and an eviction is reported: it
+//!   leaves an explicit "generation evicted" coverage row rather than a silent
+//!   gap (ruling §4, contract §15–§16). The journal still carries the
+//!   authoritative trail as one compact `source.scanned` summary per completed
+//!   scan; the unit-level detail lives here.
 //!
-//! So: deleting Atlas's file is not free and is not a no-op. It is
-//! re-derivable by re-scanning every declared source, which costs what the
-//! sources cost, and coverage will say the derived evidence was lost. Do not
-//! write code — or a test, or a cleanup path — that treats this file the way
-//! the operations projection's file may be treated.
+//! # What deleting Atlas's database file costs now
+//!
+//! It used to be true, of the operations projection's own file, that
+//! deleting it lost
+//! nothing. That sentence does not transfer, and this is the one place it is
+//! stated rather than assumed.
+//!
+//! Deleting Atlas's database file and restarting **rebuilds `ops` exactly** —
+//! every
+//! row of it comes back from the journal — and **discards every persisted
+//! source generation**, which must be re-scanned at whatever the sources
+//! cost. That is acceptable under ruling §4 only because it is reported and
+//! not silent: a store with no confirmed generation says so
+//! (`sgt doctor`'s atlas row, `sgt intelligence status`), and re-scanning
+//! writes fresh coverage. It is not a maintenance step, it is data loss with
+//! a recovery path. Do not write code — or a test, or a cleanup path — that
+//! deletes this file to "fix" the operations tables; the supported operation
+//! for those is a restart.
 //!
 //! # Scope of what exists here today
 //!
-//! The four namespaces, and the seven tables three walks now write:
+//! Of A1 §5's five namespaces, `ops` is folded from the journal (see [`db`])
+//! and `context` is still empty. Atlas's own derived tables are the seven
+//! three walks now write:
 //! `source.generations`, `source.files`, `source.units`, `source.symbols`,
 //! `source.occurrences`, `source.edges` and `meta.coverage`. Local knowledge,
 //! an estate repository at an admission-pinned commit, and a Work surface
