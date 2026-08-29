@@ -50,6 +50,7 @@ use crate::domain::execution::ReconcileDisposition;
 use crate::domain::work::WorkState;
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::estates::EstateRegistry;
+use crate::runtime::projection::WorkRegistry;
 
 /// What one restart's reconciliation did.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +67,54 @@ pub struct ReconcileReport {
     /// this restart (§22.5's cancel-during-launch window).
     #[serde(default)]
     pub reservations_retired: Vec<String>,
+}
+
+/// S5 W1b: the terminal Work ids whose overlay eviction a startup sweep
+/// should retry — the crash-window gap the detached eviction task
+/// (`api::run_work_overlay_hook`'s `Evict` arm, spawned off the crank)
+/// cannot close by itself, because nothing durable marks eviction as owed:
+/// a daemon killed between `surface.torn_down` landing and that task
+/// finishing loses the eviction permanently under that mechanism alone.
+///
+/// **Reads `terminal_works`/`terminal_runs`, not `works`/`runs`.** A Work
+/// whose surface has been torn down is exactly the one [`maybe_evict`]
+/// (`runtime::projection`) already moved out of the live maps and into the
+/// terminal caches, on the very same fold that recorded the teardown — by
+/// the time this reads the registry (after journal replay, before serving),
+/// a Work whose teardown crashed *before* it landed is still in `works`
+/// (that is `stranded_surfaces`' own population, above, and this function
+/// is not for it: its surface is not yet torn down, so there is nothing
+/// standing to evict yet — [`Engine::reconcile_terminal_surface`] finishing
+/// that teardown is what makes it this function's business, on the *next*
+/// restart if that also crashes, or immediately after via
+/// [`ReconcileReport::surfaces_retired`]), while a Work whose teardown
+/// *did* land before the crash is already in `terminal_works`. Filtering
+/// `run.surface.is_some()` is enough on its own to select exactly that
+/// second population: [`crate::runtime::projection::run_is_retired`]
+/// (the gate `maybe_evict` applies before moving anything into these
+/// caches) guarantees every entry here has either no surface at all or a
+/// recorded teardown, so a present surface already implies the teardown
+/// happened.
+///
+/// Bounded, not a full-history walk: `terminal_works`/`terminal_runs` are
+/// themselves capacity-bounded caches of the *most recent* settled Works
+/// ([`crate::runtime::projection::TERMINAL_WORK_CACHE_CAPACITY`]-shaped),
+/// which is exactly the right scope for a crash-window sweep — a Work
+/// terminal long enough ago to have aged out already had every ordinary
+/// restart's worth of opportunity for its (idempotent) eviction to
+/// complete undisturbed.
+pub fn terminal_work_ids_with_a_torn_down_surface(state: &WorkRegistry) -> Vec<String> {
+    state
+        .terminal_works
+        .keys()
+        .filter(|work_id| {
+            state
+                .terminal_runs
+                .get(*work_id)
+                .is_some_and(|run| run.surface.is_some())
+        })
+        .cloned()
+        .collect()
 }
 
 /// Reconcile every in-flight work against its backend (§25).
@@ -852,6 +901,151 @@ mod tests {
             core.registry.state().terminal_works[work_id].state,
             WorkState::Completed,
             "integrity never moves Work state (§11.5)"
+        );
+    }
+
+    /// S5 W1b's overlay-eviction startup sweep reads `terminal_works`/
+    /// `terminal_runs`, not `works`/`runs`, precisely because a torn-down
+    /// surface's Work has already moved there by the time anything past
+    /// journal replay looks. This drives a Work through exactly that move —
+    /// `reconcile`'s own crash-recovered teardown, proven above to land it
+    /// in the terminal cache — and checks the sweep's own selection function
+    /// finds it there.
+    #[test]
+    fn terminal_work_ids_with_a_torn_down_surface_finds_a_work_whose_teardown_already_landed() {
+        use crate::domain::work::KIND_WORK_COMPLETED;
+        use crate::runtime::surface::{KIND_SURFACE_MATERIALIZED, materialize};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(data.path());
+        let engine = Engine::new(Arc::new(BackendRegistry::new()), None, data.path());
+
+        let work_id = "01TERMINALSURFACESWEPT0000";
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            work_id,
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+
+        testing::submit(&mut core, work_id, "will finish teardown via recovery");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            json!({"surface": surface}),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_COMPLETED, json!({}));
+
+        // Crash landed before teardown; recovery finishes it — the same
+        // move `a_crash_recovered_teardown_records_the_same_integrity_
+        // assessment` above pins into `terminal_works`.
+        let report = reconcile(&engine, &EstateRegistry::new(), &mut core).expect("recovery");
+        assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
+        assert!(
+            core.registry.state().terminal_works.contains_key(work_id),
+            "sanity: the teardown above must have moved this Work into the terminal cache, \
+             or this test proves nothing about the sweep reading the right maps"
+        );
+
+        let swept = terminal_work_ids_with_a_torn_down_surface(core.registry.state());
+        assert_eq!(
+            swept,
+            vec![work_id.to_string()],
+            "a terminal Work whose surface was torn down must be named for the overlay- \
+             eviction sweep: {swept:?}"
+        );
+    }
+
+    /// The negative half: a Work still in flight — active, its surface
+    /// materialized, nowhere near terminal — must not be swept. It is
+    /// nowhere near `terminal_works` at all, but the point is worth pinning
+    /// directly rather than only by the positive case's absence.
+    #[test]
+    fn terminal_work_ids_with_a_torn_down_surface_excludes_a_work_still_in_flight() {
+        use crate::runtime::surface::{KIND_SURFACE_MATERIALIZED, materialize};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(data.path());
+
+        let work_id = "01STILLACTIVESURFACE00000";
+        let spec = repo(&dir.path().join("solo"));
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            work_id,
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+
+        testing::submit(&mut core, work_id, "still running");
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_SURFACE_MATERIALIZED,
+            json!({"surface": surface}),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+
+        assert!(
+            core.registry.state().works.contains_key(work_id),
+            "sanity: an active Work stays in the live map, not the terminal cache"
+        );
+        assert!(
+            terminal_work_ids_with_a_torn_down_surface(core.registry.state()).is_empty(),
+            "a Work still active must never be named for the overlay-eviction sweep, \
+             regardless of whether it has a surface"
+        );
+    }
+
+    /// The other negative half: a terminal Work that never bound a surface
+    /// at all (no repositories to materialize) reaches `terminal_works`
+    /// exactly as readily as one that did — `run_is_retired`'s
+    /// `surface.is_none()` branch — and must still be excluded, since there
+    /// is nothing for `evict_work_overlays` to usefully be called for.
+    #[test]
+    fn terminal_work_ids_with_a_torn_down_surface_excludes_a_work_that_never_had_one() {
+        use crate::domain::work::KIND_WORK_COMPLETED;
+
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(data.path());
+
+        let work_id = "01NEVERHADASURFACE000000";
+        testing::submit(
+            &mut core,
+            work_id,
+            "no repositories, nothing to materialize",
+        );
+        // A run entry only exists once a workflow is bound (the reducer's
+        // `runs.entry(...).or_default()` arm) — this Work's own binding
+        // never sets `surface_plan` at all, exactly the "no repositories to
+        // materialize" case `run_is_settled`'s own doc names.
+        testing::commit(
+            &mut core,
+            work_id,
+            KIND_WORKFLOW_BOUND,
+            json!({
+                "workflow": {"name": "tiny", "version": "1", "source": "test",
+                             "stages": [{"id": "00-first", "context": "c"}]},
+                "backend": "fake",
+            }),
+        );
+        testing::commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
+        testing::commit(&mut core, work_id, KIND_WORK_COMPLETED, json!({}));
+
+        assert!(
+            core.registry.state().terminal_works.contains_key(work_id),
+            "sanity: a surface-less run is retired the moment the Work goes absorbing, so it \
+             is already in the terminal cache"
+        );
+        assert!(
+            terminal_work_ids_with_a_torn_down_surface(core.registry.state()).is_empty(),
+            "a terminal Work with no surface at all has nothing to evict and must not be \
+             named for the sweep"
         );
     }
 

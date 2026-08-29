@@ -1137,3 +1137,218 @@ fn a_work_filter_admits_its_own_overlay_and_no_other_works() {
         "the snapshot instant is the whole point of the variant"
     );
 }
+
+/// The panel-confirmed sibling of the test above: **the SAME Work's own
+/// overlay over a DIFFERENT repository must not leak either.**
+///
+/// The bug this pins built the admitted overlay coordinate from a `LIKE
+/// "work:<id>/%"` *prefix*, keyed only on `work_id` — so a
+/// `WorkBase { work_id: "mine", repository: "repo-a" }` filter's overlay
+/// branch admitted `work:mine/repo-a` AND `work:mine/repo-b` identically,
+/// even though the base half (`SourceSelector::bindings`) is restricted to
+/// `repo-a` alone. That is the same class of leak
+/// `a_work_filter_admits_its_own_overlay_and_no_other_works` pins for a
+/// *different* Work; this is the *same* Work's own overlay reaching past the
+/// one repository it named. The fix is an exact overlay source name
+/// (`SourceSelector::overlay_admit_source_name`), never a prefix.
+#[test]
+fn a_work_filter_does_not_admit_its_own_overlay_over_a_different_repository() {
+    let data = tempfile::tempdir().expect("data dir");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+
+    const MINE: &str = "01MINE0000000000000000000A";
+
+    for repo in ["repo-a", "repo-b"] {
+        let base = scan(
+            repo,
+            SourceKind::EstateGit,
+            AuthorityClass::EstateMutable,
+            &format!("{repo}@key-1"),
+            vec![file(
+                "src/main.rs",
+                TEXT_EXTRACTOR,
+                vec![document("fn base() {}\n")],
+                Some(syntax("rust", "syntax-rust/v1", "function", "base")),
+            )],
+        );
+        record_scan(&mut db, &mut journal, &base, None).expect("record base");
+
+        let overlay = scan(
+            &sergeant_rs::runtime::atlas::overlay::overlay_source_name(MINE, repo),
+            SourceKind::EstateGit,
+            AuthorityClass::EstateMutable,
+            &format!("{repo}@base+{MINE}"),
+            vec![file(
+                "src/main.rs",
+                TEXT_EXTRACTOR,
+                vec![document("fn overlaid() {}\n")],
+                Some(syntax(
+                    "rust",
+                    "syntax-rust/v1",
+                    "function",
+                    &format!("overlaid_{repo}"),
+                )),
+            )],
+        );
+        let recorded = record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+        assert!(
+            matches!(recorded, ScanRecord::Recorded { .. }),
+            "the fixture must actually land, or the exclusion below proves nothing: {recorded:?}"
+        );
+    }
+
+    // `--work mine` scoped to `repo-a`: must admit repo-a's base and MINE's
+    // own repo-a overlay, and must NOT admit repo-b's base or MINE's own
+    // repo-b overlay — the repository name is a real filter, not decoration.
+    let filter = Admissibility {
+        source: SourceSelector::WorkBase {
+            work_id: MINE.to_string(),
+            repository: "repo-a".to_string(),
+        },
+        kind: None,
+        authority: None,
+    };
+    let sources: BTreeSet<String> = db
+        .admissible_generations(&filter, 500)
+        .expect("admissible generations")
+        .hits
+        .into_iter()
+        .map(|generation| generation.source_name)
+        .collect();
+    assert_eq!(
+        sources,
+        BTreeSet::from([
+            "repo-a".to_string(),
+            sergeant_rs::runtime::atlas::overlay::overlay_source_name(MINE, "repo-a"),
+        ]),
+        "--work scoped to repo-a must not admit repo-b's base, and must not admit MINE's own \
+         overlay over repo-b either: {sources:?}"
+    );
+
+    let names: Vec<String> = db
+        .admissible_occurrences(&filter, 500)
+        .expect("admissible occurrences")
+        .hits
+        .into_iter()
+        .map(|hit| hit.occurrence.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["base".to_string(), "overlaid_repo-a".to_string()],
+        "content-kind admission must match the generation-level exclusion exactly: {names:?}"
+    );
+}
+
+/// The panel-confirmed WorkScope-side gap: `--work`'s scope marker must not
+/// claim `BaseAndOverlaySnapshot` for an answer whose overlay half is
+/// structurally incapable of containing overlay-authored rows.
+///
+/// `source.datasets` is one such table (an overlay scan's own
+/// `datasets: Vec::new()`, `overlay::scan_work_overlay`'s doc), and a
+/// `--type`/authority narrowing to anything but the fixed kind/authority
+/// every overlay generation is stamped with
+/// (`SourceKind::EstateGit`/`AuthorityClass::EstateMutable`) is another:
+/// both structurally exclude every row an overlay could ever have written,
+/// so asserting a snapshot instant for either would claim freshness for
+/// evidence that can never be there.
+#[test]
+fn work_scope_declares_base_only_when_the_answer_cannot_structurally_carry_overlay_rows() {
+    let data = tempfile::tempdir().expect("data dir");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+
+    const MINE: &str = "01MINE0000000000000000000A";
+
+    let base = scan(
+        "repo-a",
+        SourceKind::EstateGit,
+        AuthorityClass::EstateMutable,
+        REPO_A_KEY,
+        vec![file(
+            "src/main.rs",
+            TEXT_EXTRACTOR,
+            vec![document("fn base() {}\n")],
+            Some(syntax("rust", "syntax-rust/v1", "function", "base")),
+        )],
+    );
+    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+
+    let overlay = scan(
+        &sergeant_rs::runtime::atlas::overlay::overlay_source_name(MINE, "repo-a"),
+        SourceKind::EstateGit,
+        AuthorityClass::EstateMutable,
+        &format!("repo-a@base+{MINE}"),
+        vec![file(
+            "src/main.rs",
+            TEXT_EXTRACTOR,
+            vec![document("fn overlaid() {}\n")],
+            Some(syntax("rust", "syntax-rust/v1", "function", "overlaid")),
+        )],
+    );
+    let recorded = record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+    assert!(matches!(recorded, ScanRecord::Recorded { .. }));
+
+    let work_base = SourceSelector::WorkBase {
+        work_id: MINE.to_string(),
+        repository: "repo-a".to_string(),
+    };
+
+    // The overlay genuinely stands, and an unnarrowed --work answer says so.
+    let unnarrowed = Admissibility {
+        source: work_base.clone(),
+        kind: None,
+        authority: None,
+    };
+    assert!(
+        matches!(
+            db.admissible_generations(&unnarrowed, 500)
+                .expect("admissible generations")
+                .scope,
+            WorkScope::BaseAndOverlaySnapshot { .. }
+        ),
+        "sanity: the overlay stands, so the unnarrowed answer must say so"
+    );
+
+    // `source.datasets` never carries an overlay row at all — BaseOnly
+    // regardless of whether the overlay stands.
+    assert_eq!(
+        db.admissible_datasets(&unnarrowed, 500)
+            .expect("admissible datasets")
+            .scope,
+        WorkScope::BaseOnly,
+        "datasets can never come from an overlay scan (it always records datasets: Vec::new()), \
+         so the scope must say BaseOnly even though an overlay generation stands"
+    );
+
+    // A kind narrowing to anything but EstateGit excludes every row an
+    // overlay could ever have written.
+    let knowledge_narrowed = Admissibility {
+        source: work_base.clone(),
+        kind: Some(SourceKind::LocalKnowledge),
+        authority: None,
+    };
+    assert_eq!(
+        db.admissible_generations(&knowledge_narrowed, 500)
+            .expect("admissible generations")
+            .scope,
+        WorkScope::BaseOnly,
+        "an overlay generation is always SourceKind::EstateGit, so a --type knowledge/external \
+         narrowing must report BaseOnly even though an overlay stands"
+    );
+
+    // An authority narrowing to anything but EstateMutable does the same.
+    let authority_narrowed = Admissibility {
+        source: work_base,
+        kind: None,
+        authority: Some(AuthorityClass::External),
+    };
+    assert_eq!(
+        db.admissible_generations(&authority_narrowed, 500)
+            .expect("admissible generations")
+            .scope,
+        WorkScope::BaseOnly,
+        "an overlay generation is always AuthorityClass::EstateMutable, so an authority \
+         narrowing to anything else must report BaseOnly even though an overlay stands"
+    );
+}
