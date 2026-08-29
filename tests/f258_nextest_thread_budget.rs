@@ -45,8 +45,12 @@ const EXPECTED_FILTER: &str = "binary_id(=sergeant-rs::m7_docker_executor) and t
 fn m7_heavy_test_is_still_scheduled_alone_via_threads_required() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let config_path = repo_root.join(".config/nextest.toml");
-    let raw = std::fs::read_to_string(&config_path)
-        .unwrap_or_else(|e| panic!("expected {} to exist and be readable: {e}", config_path.display()));
+    let raw = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        panic!(
+            "expected {} to exist and be readable: {e}",
+            config_path.display()
+        )
+    });
 
     let config: NextestConfig =
         toml::from_str(&raw).expect(".config/nextest.toml must parse as valid nextest config");
@@ -66,7 +70,10 @@ fn m7_heavy_test_is_still_scheduled_alone_via_threads_required() {
         });
 
     assert_eq!(
-        heavy.threads_required.as_ref().and_then(toml::Value::as_str),
+        heavy
+            .threads_required
+            .as_ref()
+            .and_then(toml::Value::as_str),
         Some("num-test-threads"),
         "the #258 override must keep `threads-required = \"num-test-threads\"` \
          (reserving the whole thread budget so the heavy test runs with no \
@@ -79,7 +86,8 @@ fn m7_heavy_test_is_still_scheduled_alone_via_threads_required() {
     // Deliberately not a test-groups conversion: assert no [test-groups]
     // table exists in the raw document at all, since that would be exactly
     // the "simplification" the checked-in comment forbids.
-    let doc: toml::Value = toml::from_str(&raw).expect("re-parsing as a generic Value must also succeed");
+    let doc: toml::Value =
+        toml::from_str(&raw).expect("re-parsing as a generic Value must also succeed");
     assert!(
         doc.get("test-groups").is_none(),
         "found a [test-groups] table in .config/nextest.toml — the #258 \
