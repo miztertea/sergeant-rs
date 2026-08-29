@@ -715,6 +715,23 @@ pub struct DatasetFact {
     pub output_hash: String,
 }
 
+/// The bootstrap DDL every fresh read-write connection onto `atlas.duckdb`
+/// needs before its first query: F4's hardening settings, then A1 §5's five
+/// schema namespaces, then Atlas's own tables — in that order, and always
+/// together.
+///
+/// [`AtlasDb::over`] and [`Analytics::begin_rebuild`] both open a new
+/// connection onto the one physical file and must apply exactly this
+/// sequence; this is the one place it is spelled out, so a future DDL
+/// addition to one caller cannot silently miss the other and leave the
+/// file's shape depend on which struct opened it first.
+fn bootstrap_atlas_ddl(conn: &Connection) -> Result<(), duckdb::Error> {
+    conn.execute_batch(HARDENING_DDL)?;
+    conn.execute_batch(SCHEMA_DDL)?;
+    conn.execute_batch(TABLE_DDL)?;
+    Ok(())
+}
+
 /// Atlas's database over one data dir.
 ///
 /// Owns its connection privately; nothing hands a [`Connection`] out. Values
@@ -811,9 +828,7 @@ impl AtlasDb {
         // autoinstalling are off, and locked off (F4). A connection that ran
         // one query before this ran is a connection that could have reached
         // the network once.
-        conn.execute_batch(HARDENING_DDL)?;
-        conn.execute_batch(SCHEMA_DDL)?;
-        conn.execute_batch(TABLE_DDL)?;
+        bootstrap_atlas_ddl(&conn)?;
         // No reconciliation here. A provisional generation is already
         // unreadable — every read below filters on `state` — so nothing is
         // exposed by leaving one standing until the journal can be consulted,
@@ -4564,17 +4579,15 @@ impl Analytics {
     /// source generation. `DROP SCHEMA ops CASCADE` has the scope the old
     /// `remove_file` had — every `ops` table and nothing else.
     ///
-    /// It applies [`SCHEMA_DDL`] and [`TABLE_DDL`] on the way past, exactly
-    /// as [`AtlasDb::open`] does, so a host whose daemon starts before any
+    /// It applies [`bootstrap_atlas_ddl`] on the way past — the same helper
+    /// [`AtlasDb::over`] uses — so a host whose daemon starts before any
     /// source has ever been scanned still gets a file that declares all five
     /// of A1 §5's namespaces rather than only `ops`.
     pub fn begin_rebuild(data_dir: &Path) -> Result<Self, AnalyticsError> {
         create_dir_all_durable(&atlas_dir(data_dir))?;
         let path = atlas_db_path(data_dir);
         let conn = Connection::open(&path)?;
-        conn.execute_batch(HARDENING_DDL)?;
-        conn.execute_batch(SCHEMA_DDL)?;
-        conn.execute_batch(TABLE_DDL)?;
+        bootstrap_atlas_ddl(&conn)?;
         Self::over(conn, path)
     }
 
