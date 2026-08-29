@@ -473,7 +473,13 @@ fn code_extractor_like_covers_every_syntax_language_and_rejects_an_unknown_ident
         );
     }
     assert!(!"mystery/v1".starts_with(prefix));
-    assert!(!"anydoc/0.2.4+docx/v1".starts_with(prefix));
+    // A real document-family identity, not merely a fabricated one — proves
+    // the pattern rejects an adapter identity that genuinely exists in this
+    // build, not only a string nothing would ever produce. Referenced by
+    // constant rather than spelled out: office.rs's own boundary test
+    // (`tests/y2_office_boundary.rs`) forbids the vendor name it wraps from
+    // appearing in any other file as a literal.
+    assert!(!DOCX_EXTRACTOR.starts_with(prefix));
 }
 
 /// H13.1's structural pin, document family — the same shape
