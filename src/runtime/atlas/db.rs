@@ -2835,20 +2835,25 @@ impl AtlasDb {
     ///
     /// Every non-evicted generation is re-derived through the same
     /// [`index_generation`] the staging transaction uses, in one transaction,
-    /// after its existing rows are cleared. Returns how many units were
-    /// indexed.
-    pub fn reindex_lexical(&mut self) -> Result<u64, AtlasError> {
+    /// after its existing rows are cleared — up to [`MAX_ROWS`] generations;
+    /// beyond that the generation list is capped and
+    /// [`ReindexOutcome::truncated`] says so, the same bound and the same
+    /// disclosure `lexical_search` uses for its posting scan.
+    pub fn reindex_lexical(&mut self) -> Result<ReindexOutcome, AtlasError> {
         let mut statement = self.conn.prepare(
             "SELECT generation_id FROM source.generations WHERE state != ? \
              ORDER BY observed_at, generation_id LIMIT ?",
         )?;
-        let mut rows = statement.query(duckdb::params![STATE_EVICTED, MAX_ROWS as i64])?;
+        let mut rows =
+            statement.query(duckdb::params![STATE_EVICTED, MAX_ROWS as i64 + 1])?;
         let mut targets: Vec<String> = Vec::new();
         while let Some(row) = rows.next()? {
             targets.push(row.get(0)?);
         }
         drop(rows);
         drop(statement);
+        let truncated = targets.len() > MAX_ROWS;
+        targets.truncate(MAX_ROWS);
         let tx = self.conn.transaction()?;
         let mut indexed = 0u64;
         for generation_id in &targets {
@@ -2863,7 +2868,7 @@ impl AtlasDb {
             indexed += index_generation(&tx, generation_id)?;
         }
         tx.commit()?;
-        Ok(indexed)
+        Ok(ReindexOutcome { indexed, truncated })
     }
 
     /// Every generation's state, keyed by id — a diagnostic read, and what a
@@ -4499,6 +4504,22 @@ pub struct LexicalAnswer {
     /// What this answer covers — see [`WorkScope`].
     pub scope: WorkScope,
     /// Whether the posting scan reached [`MAX_ROWS`] and stopped.
+    pub truncated: bool,
+}
+
+/// Outcome of [`AtlasDb::reindex_lexical`]: how many units were indexed,
+/// and whether the *generation list itself* was capped at [`MAX_ROWS`]
+/// (F-IN-01) — mirroring [`LexicalAnswer::truncated`] for the same reason
+/// that field exists: a cap that silently changes what a rebuild covers is
+/// not merely a shorter list, and a caller must be able to state what its
+/// rebuild covers rather than assume the completeness the doc promises but
+/// the cap quietly withdraws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReindexOutcome {
+    /// How many units were (re)indexed across the rebuilt generations.
+    pub indexed: u64,
+    /// Whether the generation list itself hit [`MAX_ROWS`] and was capped —
+    /// not every non-evicted generation may have been rebuilt.
     pub truncated: bool,
 }
 

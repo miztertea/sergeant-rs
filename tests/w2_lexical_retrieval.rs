@@ -933,8 +933,12 @@ fn the_lexical_index_rebuilds_from_the_a1_rows_it_derives_from() {
     let mut estate = estate();
     let filter = Admissibility::default();
     let before = estate.search("PaymentRetryPolicy INC0012345", &filter, None);
-    let indexed = estate.db.reindex_lexical().expect("reindex");
-    assert!(indexed > 0, "the rebuild must actually index units");
+    let outcome = estate.db.reindex_lexical().expect("reindex");
+    assert!(outcome.indexed > 0, "the rebuild must actually index units");
+    assert!(
+        !outcome.truncated,
+        "this fixture is far under MAX_ROWS generations; a true flag here means the cap logic is wrong"
+    );
     let after = estate.search("PaymentRetryPolicy INC0012345", &filter, None);
     assert_eq!(
         before, after,
