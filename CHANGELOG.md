@@ -1148,6 +1148,67 @@ them were dead code in every real installation.
   reverting it (the binary returns byte-for-byte) measures what they will cost
   when something does: a further 5.27 MiB, for a dev-binary total of 17.7 MiB.
 
+### One Atlas database (S5)
+
+- **`sergeant.duckdb` is gone.** A1 §5 declares one physical file,
+  `atlas.duckdb`, carrying five logical schemas — `meta`, `ops`, `source`,
+  `git`, `context` — and decision A1-02's stated rationale is "schemas provide
+  separation without more databases". S3 shipped two files and recorded that
+  in the A1a register as a *ratified* deviation; no owner ruling ever ratified
+  it. The owner correction of 2026-08-29 settled that the code converges to
+  the contract, so the operations projection's `ops.*` tables now live in
+  `atlas.duckdb`, and `sergeant.duckdb`, `DUCKDB_FILE` and `duckdb_path` are
+  deleted. Register item 1 is `met`, and the word "ratified" is struck from
+  its note.
+- **The rebuild discipline survived the merge as scope, not as separate
+  files.** `ops` is still a pure fold of the journal and is still rebuilt on
+  every daemon start — by `DROP SCHEMA ops CASCADE` + recreate + refold, which
+  has exactly the reach the old `remove_file` had. `meta`, `source`, `git` and
+  `context` persist, untouched by a refold.
+- **What deleting the file costs changed, and is now stated wherever it was
+  promised.** Deleting the projection file used to be lossless. Deleting
+  `atlas.duckdb` still rebuilds every `ops` row from the journal — and
+  discards every persisted source generation, which must be re-scanned.
+  `docs/concepts/atlas-and-knowledge.md`, both module docs and `sgt doctor`'s
+  projection remedy say so; the remedy now names a *restart* as the supported
+  way to rebuild the operations tables and warns against deleting the file to
+  force one. Both halves of the new sentence are measured, not just written
+  (`w1c_one_atlas_database::deleting_atlas_duckdb_rebuilds_ops_and_loses_source_facts`).
+- **The cross-schema join A1 §5 cites as its reason for one database is
+  proven.** A single statement joins a Work's identity in `ops.work` to its
+  overlay generations in `source.generations` — no `ATTACH`, no second
+  database name — and a Work without an overlay is not returned
+  (`w1c_one_atlas_database::one_statement_joins_ops_work_identity_to_source_generations`).
+  This is the capability A2 §2's `--work` filter is built on.
+- **The two one-owner structural tests collapsed into one, because their
+  premise did.** `m5_projections::t2_the_duckdb_file_has_exactly_one_owner`
+  and `x1_atlas_substrate::atlas_database_has_exactly_one_owner` existed as a
+  pair only because there were two databases, each with one owning file, and
+  both suites forbade merging them into a union rule. With one database there
+  is one owner: `x1`'s test now scans the whole of `src/` with no exempted
+  tree, and `src/runtime/atlas/db.rs` is the only file in the crate that may
+  name the database driver. A note where `t2` stood records why it was
+  removed.
+- **One file is one DuckDB instance.** Two `Connection::open` calls against
+  the same path produce two independent instances that neither see each
+  other's writes nor error — the last close silently wins. Harmless while
+  `ops` had a file to itself; not harmless now. The daemon and the API derive
+  their Atlas handle from the open projection (`Analytics::atlas`), and
+  `AtlasDb::open` documents that it is for a process holding no other handle.
+- **"This host has indexed nothing" is now read off the evidence, not off the
+  file.** `/v1/intelligence/*` and the `map` reads answered
+  `atlas.present: false` when the Atlas file did not exist; the file now
+  exists on every host from the daemon's first start, because `ops` lives in
+  it. The same answer, with the same wording, is now given when no source has
+  a confirmed generation — which is the question its `detail` string was
+  always answering. A Work on an estate that indexes nothing still gains no
+  Atlas evidence and no repository walk
+  (`w1b_overlay_lifecycle_trigger::a_work_on_an_unindexed_estate_gains_no_atlas_evidence`).
+- `floor-state.json` did not move: `projections/` still holds the FloorState
+  startup cache, and deleting that directory still loses nothing. Only the
+  database left it.
+
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain

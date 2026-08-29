@@ -1,11 +1,29 @@
 //! M5 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M5.md).
 //!
 //! 1. Rebuild determinism: real work through the daemon → DuckDB populated →
-//!    delete the `.duckdb` file → restart → the §22 canned queries return
+//!    delete `atlas.duckdb` → restart → the §22 canned queries return
 //!    identical results, row for row.
-//! 2. One owner: nothing outside `daemon`/`runtime` opens the DuckDB file —
-//!    the `duckdb` crate is reachable from exactly one module, no `Connection`
-//!    escapes it, and clients have only the API.
+//!
+//!    **What deleting that file costs changed in S5 W1c, and this suite no
+//!    longer claims otherwise.** `ops.*` used to be the only thing in its own
+//!    file, so deleting it was free by construction. A1 §5 declares one
+//!    physical database, so `ops` is now a schema inside `atlas.duckdb`
+//!    beside `meta`, `source`, `git` and `context` — and *those* persist
+//!    across restarts, because they are derived from source bytes plus
+//!    extractor identity and no journal replay reproduces them (F1).
+//!    Deleting the file therefore still rebuilds `ops` exactly, which is what
+//!    acceptance 1 measures and all it ever measured; it also discards every
+//!    confirmed source generation, which must be rescanned. That loss is
+//!    proven, not merely documented, by
+//!    `tests/w1c_one_atlas_database.rs`'s
+//!    `deleting_atlas_duckdb_rebuilds_ops_and_loses_source_facts`. The
+//!    daemon's own rebuild path never deletes the file — it drops and refolds
+//!    the `ops` schema.
+//! 2. One owner: nothing outside `daemon`/`runtime` opens the DuckDB file.
+//!    Since S5 W1c there is one database, so there is one assertion, and it
+//!    lives in `tests/x1_atlas_substrate.rs`'s
+//!    `atlas_database_has_exactly_one_owner` — see the note where `t2` used
+//!    to be.
 //! 3. Graph provenance: every edge of `/v1/graph/work/{id}` carries a
 //!    `source_seq` resolving to a real journal event whose *content* justifies
 //!    that edge.
@@ -43,11 +61,10 @@ use sergeant_rs::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeConfig};
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::Event;
-use sergeant_rs::runtime::analytics::{
-    Analytics, AnalyticsError, CANNED_QUERIES, DUCKDB_FILE, PROJECTIONS_DIR, duckdb_path,
-};
+use sergeant_rs::runtime::atlas::db::{Analytics, AnalyticsError, CANNED_QUERIES, atlas_db_path};
 use sergeant_rs::runtime::graph::{GraphContext, GraphEdge};
 use sergeant_rs::runtime::journal::{Journal, JournalError};
+use sergeant_rs::runtime::startup::PROJECTIONS_DIR;
 use sergeant_rs::telemetry::{DEFAULT_OTLP_ENDPOINT, Telemetry, TelemetryConfig};
 
 mod support;
@@ -348,10 +365,14 @@ async fn t1_rebuild_from_scratch_reproduces_every_canned_answer() {
     }
     handle.shutdown().await;
 
-    // §21's diagram, literally: delete the file, restart, rebuild.
-    let db = duckdb_path(data.path());
+    // §21's diagram, literally: delete the file, restart, rebuild. What the
+    // file is has changed (S5 W1c: `ops` is a schema in `atlas.duckdb`), what
+    // this measures has not — every `ops` row comes back identical from the
+    // journal. See the module doc for what deleting it now *also* costs.
+    let db = atlas_db_path(data.path());
     assert!(db.exists(), "the daemon must have created {}", db.display());
     std::fs::remove_file(&db).expect("delete the projection");
+    let _ = std::fs::remove_file(db.with_extension("duckdb.wal"));
 
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     assert!(db.exists(), "restart must rebuild {}", db.display());
@@ -388,7 +409,11 @@ async fn t1_rebuild_from_scratch_reproduces_every_canned_answer() {
 #[tokio::test]
 async fn a_fresh_daemon_answers_from_the_journal_alone() {
     let (data, estate, work_id) = completed_run().await;
-    std::fs::remove_dir_all(data.path().join(PROJECTIONS_DIR)).expect("delete projections");
+    let _ = std::fs::remove_dir_all(data.path().join(PROJECTIONS_DIR));
+    // And the database itself: since W1c the two are separate deletions, and
+    // "from the journal alone" is only true if neither survives.
+    let _ = std::fs::remove_file(atlas_db_path(data.path()));
+    let _ = std::fs::remove_file(atlas_db_path(data.path()).with_extension("duckdb.wal"));
 
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let answer = get(&handle, "/v1/analytics/execution_touched").await;
@@ -417,7 +442,7 @@ async fn a_fresh_daemon_answers_from_the_journal_alone() {
 async fn a_restart_over_the_existing_projection_file_rebuilds_it() {
     let (data, estate, work_id) = completed_run().await;
     assert!(
-        duckdb_path(data.path()).exists(),
+        atlas_db_path(data.path()).exists(),
         "the first daemon left its projection behind"
     );
 
@@ -644,95 +669,29 @@ fn journal_segment(data_dir: &Path) -> PathBuf {
 }
 
 // ------------------------------------------------------ 2. one owner
-
-/// Acceptance 2. Only the daemon's own projection module opens
-/// `sergeant.duckdb`.
-///
-/// Enforced structurally and checked mechanically: the `duckdb` crate is
-/// named in exactly one source file, that file hands out no connection, and
-/// the dependency is a normal one (a client binary that wanted its own copy
-/// would have to change this test first).
-///
-/// **Scope (S3 X1).** This assertion is about the operations projection's
-/// database and stays that. Atlas (`src/runtime/atlas/`) is a *second,
-/// separate* database with its own single owning file, pinned by its own
-/// test — `tests/x1_atlas_substrate.rs`'s
-/// `atlas_database_has_exactly_one_owner`. The scan below therefore skips
-/// that tree rather than growing an allowed-owners list: a union rule
-/// ("either of these files may open a database") would pass just as happily
-/// once one owner had grown into the other's database, which is exactly the
-/// drift a one-owner acceptance exists to catch. Every `.rs` file outside
-/// those two trees is still scanned here, so the two tests together leave no
-/// source unscanned.
-#[test]
-fn t2_the_duckdb_file_has_exactly_one_owner() {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    // A token scan, not a fixed-pattern grep: however the import is spelled
-    // (`use duckdb::...`, `duckdb::Connection`, `extern crate duckdb`, a
-    // re-export), the crate's own lowercase name has to appear somewhere in
-    // the file. Prose that mentions the product ("DuckDB") is capitalized
-    // and does not collide with the identifier.
-    let names_the_crate = |text: &str| {
-        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .any(|token| token == "duckdb")
-    };
-    // Atlas's own tree is out of this test's scope, not exempt from having an
-    // owner: `tests/x1_atlas_substrate.rs` scans it, with the same token scan
-    // and the same positive half, against `runtime/atlas/db.rs`.
-    let atlas_tree = src.join("runtime").join("atlas");
-    for file in rust_sources(&src) {
-        if file.ends_with("runtime/analytics.rs") || file.starts_with(&atlas_tree) {
-            continue;
-        }
-        let text = std::fs::read_to_string(&file).expect("read source");
-        assert!(
-            !names_the_crate(&text),
-            "{} names the duckdb crate; it must be reachable from one module only",
-            file.strip_prefix(&src).expect("under src").display()
-        );
-    }
-    assert!(
-        atlas_tree.join("db.rs").is_file(),
-        "the skip above is only honest while {} exists to carry the second \
-         one-owner assertion",
-        atlas_tree.join("db.rs").display()
-    );
-
-    // The positive half of "exactly one owner". Without it the loop above is
-    // satisfied by a build that stopped using the crate altogether — and R5
-    // named the embedded Rust client specifically, so a silent swap for some
-    // other store is exactly the drift this acceptance test exists to catch.
-    let analytics = std::fs::read_to_string(src.join("runtime/analytics.rs")).expect("read");
-    assert!(
-        names_the_crate(&analytics),
-        "runtime/analytics.rs must be the one module that uses the duckdb crate"
-    );
-
-    // And that module must not leak the connection: everything crossing its
-    // boundary is plain data (`QueryResult`, `GraphView`, counts).
-    //
-    // Private-by-default does not cover this on its own. `Analytics` is a
-    // public struct in a public module, so `pub conn: Connection` compiles
-    // and is reachable from anywhere in the estate — and a consumer
-    // written against it (`analytics.conn.execute(..)`) names the lowercase
-    // crate token nowhere, so the scan above would not see it either. The
-    // field declaration is therefore pinned directly.
-    assert!(
-        analytics.contains("\n    conn: Connection,"),
-        "the connection must stay a private field"
-    );
-    assert!(
-        !analytics.contains("pub fn conn") && !analytics.contains("-> &Connection"),
-        "no accessor may hand a live DuckDB connection outside the projection"
-    );
-
-    // The CLI reaches analytics only through the daemon's HTTP surface.
-    let cli = std::fs::read_to_string(src.join("cli.rs")).expect("read cli");
-    assert!(
-        cli.contains("/v1/analytics") && !names_the_crate(&cli),
-        "clients ask the daemon; they do not open the file"
-    );
-}
+//
+// `t2_the_duckdb_file_has_exactly_one_owner` was deleted in S5 W1c, and this
+// note is what replaced it. Deleting a boundary test is normally forbidden;
+// this is the case where the test's *premise* stopped existing.
+//
+// The premise was two databases. `t2` asserted that exactly one file
+// (`src/runtime/analytics.rs`) may open `sergeant.duckdb`, and skipped
+// `src/runtime/atlas/` because that tree held a second, independent database
+// with its own single owner, pinned by its own test. Both suites said in
+// terms that the pair must never be merged into a union rule — "either of
+// these two files may open a database" passes just as happily once one owner
+// has quietly grown into the other's territory.
+//
+// A1 §5 declares ONE physical database (`atlas.duckdb`, five logical schemas)
+// and A1-02's rationale is "schemas provide separation without more
+// databases". The owner correction of 2026-08-29 settled that the code
+// converges to that, so `sergeant.duckdb` no longer exists and `ops` is a
+// schema in `atlas.duckdb`. One database has one owner and therefore one
+// assertion: `tests/x1_atlas_substrate.rs`'s
+// `atlas_database_has_exactly_one_owner`, which now scans the whole of
+// `src/` — no skipped tree, no allowed-owners list — plus the CLI half `t2`
+// used to carry. Keeping a second test here would have re-created exactly
+// the union rule both suites forbade, this time over one file.
 
 fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -1330,9 +1289,20 @@ async fn t4_deleting_the_projections_directory_loses_nothing() {
     let graph_before = get(&handle, &format!("/v1/graph/work/{work_id}")).await;
     handle.shutdown().await;
 
+    // Both disposable stores, in one go. Since S5 W1c `projections/` holds
+    // only the FloorState startup cache — which a start may legitimately not
+    // have written — and the operations tables live in the Atlas database,
+    // which is disposable *for `ops`* and nothing else.
     let projections = data.path().join(PROJECTIONS_DIR);
-    assert!(projections.join(DUCKDB_FILE).exists());
-    std::fs::remove_dir_all(&projections).expect("delete the whole projections dir");
+    let _ = std::fs::remove_dir_all(&projections);
+    assert!(
+        !projections.exists(),
+        "the projections directory must be gone before the restart below"
+    );
+    let db = atlas_db_path(data.path());
+    assert!(db.is_file(), "the daemon left its projection behind");
+    std::fs::remove_file(&db).expect("delete the atlas database");
+    let _ = std::fs::remove_file(db.with_extension("duckdb.wal"));
 
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let work_after = get(&handle, &format!("/v1/work/{work_id}")).await;

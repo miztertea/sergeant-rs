@@ -3930,7 +3930,7 @@ pub(crate) mod doctor {
     use crate::daemon;
     use crate::domain::estate::{DEFAULT_RETENTION, Estate, MANIFEST_FILE};
     use crate::domain::event::Event;
-    use crate::runtime::analytics::Analytics;
+    use crate::runtime::atlas::db::Analytics;
     use crate::runtime::journal::Journal;
     use crate::runtime::projection::{Projection, WorkRegistry, work_registry_reducer};
     use crate::runtime::prune::{FirstSeqIndex, PolicySource, PrunePolicy};
@@ -6074,8 +6074,11 @@ pub(crate) mod doctor {
     /// §31: the disposable projection can be rebuilt from the journal.
     ///
     /// Built into a scratch directory, not the data dir: a live daemon owns
-    /// the real DuckDB file, and a diagnostic must not touch state it does
-    /// not own. What this proves is the property that matters — the fold from
+    /// the real database, and a diagnostic must not touch state it does not
+    /// own. Since S5 W1c that matters more, not less — the real file also
+    /// holds persisted source facts, so a diagnostic that rebuilt in place
+    /// would be dropping a schema in the operator's live store to answer a
+    /// question about whether a fold completes. What this proves is the property that matters — the fold from
     /// journal to projection completes — which is exactly what the daemon
     /// does on every start (§40: projections are disposable).
     fn projection_check(journal_ok: bool, events: Option<&[Event]>) -> Check {
@@ -6104,9 +6107,12 @@ pub(crate) mod doctor {
             Err(e) => Check::fail(
                 "projection",
                 format!("rebuild failed: {e}"),
-                "the analytical projection is disposable: stop the daemon, delete \
-                 `projections/` in the data dir, and start it again. If it still fails, the \
-                 journal is the source of truth and nothing has been lost",
+                "the operations tables are disposable: restart the daemon — it drops the \
+                 `ops` schema and re-folds it from the journal on every start. Do NOT delete \
+                 the Atlas database under `atlas/` in the data dir to force this: since S5 W1c \
+                 it also holds persisted source facts that no replay reproduces, and deleting \
+                 it would cost you a full re-scan. The journal is the source of truth and \
+                 nothing it carries has been lost",
             ),
         }
     }

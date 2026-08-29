@@ -213,8 +213,9 @@ async fn a_bound_work_surface_is_scanned_as_an_overlay_and_evicted_when_it_retir
     let handle = start(&data).await;
     let http = client();
 
-    // 1. The estate indexes something. The hook never CREATES an Atlas store
-    //    (see `a_work_on_an_unindexed_estate_creates_no_atlas_store` below),
+    // 1. The estate indexes something. The hook never writes Atlas evidence
+    //    on an installation that has none
+    //    (see `a_work_on_an_unindexed_estate_gains_no_atlas_evidence` below),
     //    so this is the step that makes an installation one that indexes.
     let (status, body) = post(
         &http,
@@ -345,10 +346,11 @@ async fn a_bound_work_surface_is_scanned_as_an_overlay_and_evicted_when_it_retir
 }
 
 /// The named limit, checked rather than merely written down: a Work on an
-/// estate that indexes nothing gains neither an Atlas database nor a
-/// repository walk (R1). `--work` there is honestly base-only.
+/// estate that indexes nothing gains neither Atlas evidence nor a repository
+/// walk (R1). `--work` there is honestly base-only. See the note at the end
+/// of the body for what S5 W1c changed about how that is measured.
 #[tokio::test]
-async fn a_work_on_an_unindexed_estate_creates_no_atlas_store() {
+async fn a_work_on_an_unindexed_estate_gains_no_atlas_evidence() {
     let estate = TempDir::new().expect("estate");
     scaffold(estate.path());
     let data = DataDir::new();
@@ -396,13 +398,26 @@ async fn a_work_on_an_unindexed_estate_creates_no_atlas_store() {
     assert_eq!(
         status["atlas"]["present"],
         Value::Bool(false),
-        "running a Work must not conjure an Atlas store on an installation that indexes \
-         nothing: {status}"
+        "running a Work must not give an installation that indexes nothing any Atlas \
+         evidence: {status}"
     );
     handle.shutdown().await;
+
+    // **What this no longer asserts, and why.** Until S5 W1c it also asserted
+    // that no Atlas database file existed on disk, because the hook creating
+    // one would have been the R1 violation the limit names. A1 §5 declares
+    // ONE database and puts the journal-derived `ops` schema in it, so the
+    // daemon's own start creates that file on every host whether or not
+    // anything is ever indexed — the file stopped being able to carry the
+    // claim. The claim itself is unchanged and is asserted one line up, off
+    // the evidence: no source has a confirmed generation, so `--work` here is
+    // honestly base-only and the hook wrote nothing. Asserting file absence
+    // now would be asserting that `ops` had nowhere to live.
+    let path = sergeant_rs::runtime::atlas::db::atlas_db_path(data.path());
     assert!(
-        !sergeant_rs::runtime::atlas::db::atlas_db_path(data.path()).exists(),
-        "no atlas.duckdb may exist on disk either"
+        path.exists(),
+        "A1 §5's one database carries `ops`, which every daemon start folds: {}",
+        path.display()
     );
 }
 

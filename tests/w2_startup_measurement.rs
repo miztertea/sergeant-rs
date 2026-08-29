@@ -28,7 +28,7 @@ use std::time::Instant;
 use tempfile::TempDir;
 
 use sergeant_rs::backend::claude::{AskWithdrawal, note_ask_withdrawal};
-use sergeant_rs::runtime::analytics::Analytics;
+use sergeant_rs::runtime::atlas::db::Analytics;
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::projection::work_registry_projection;
 

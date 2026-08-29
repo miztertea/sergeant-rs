@@ -99,7 +99,7 @@ use crate::backend::opencode::{OPENCODE_BACKEND_NAME, OpencodeBackend, OpencodeC
 use crate::backend::{BackendRegistry, EventSink, ProbeGate};
 use crate::domain::event::{EventDraft, EventSource};
 use crate::platform::fs_locking::{self, Reliability};
-use crate::runtime::analytics::{Analytics, AnalyticsError};
+use crate::runtime::atlas::db::{Analytics, AnalyticsError};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic_secret};
 use crate::runtime::journal::{DEFAULT_SEGMENT_MAX_BYTES, Journal, JournalError};
@@ -718,6 +718,13 @@ pub async fn start_with(
     // The disposable analytical projection (§21–§23, §40): rebuilt from the
     // journal on every start (windowed exactly like every other sink), so
     // deleting it and restarting is indistinguishable from restarting.
+    //
+    // Since S5 W1c this opens Atlas's database file under `atlas/` and drops its `ops`
+    // schema; it no longer deletes a file, because four other schemas in that
+    // file must survive (A1 §5, F1). One consequence is visible three
+    // paragraphs down: this call *creates* the Atlas database if it is
+    // absent, so by the time the reconciliation below runs, the file always
+    // exists.
     let mut analytics = Analytics::begin_rebuild(data_dir)?;
     let mut capability_sink = startup::CapabilitySink::seeded(plan.capability_seed());
     // Loaded once, never mutated by the pass (§26 Q8's below-window ledger) —
@@ -786,10 +793,11 @@ pub async fn start_with(
 
     // 2e (S3 X2, F1): Atlas's startup reconciliation.
     //
-    // The two rebuild disciplines meet here, a few lines apart, and the
-    // difference between them is the whole of F1. `Analytics::begin_rebuild`
-    // above *deleted* its file and refolded it from the journal, because the
-    // operations tables are a pure fold of it. Atlas is opened and **kept**:
+    // The two rebuild disciplines meet here, a few lines apart, over the same
+    // file, and the difference between them is the whole of F1.
+    // `Analytics::begin_rebuild` above dropped the `ops` *schema* and refolded
+    // it from the journal, because the operations tables are a pure fold of
+    // it. Everything else in that file is opened and **kept**:
     // its `source.*` and `meta.coverage` rows are derived from source bytes
     // plus extractor identity, and no journal replay reproduces them.
     // `record::reconcile_sources` is what closes the crash window, and it
@@ -807,14 +815,19 @@ pub async fn start_with(
     // process lifetime would buy nothing. What must happen at startup is the
     // reconciliation, and that is what this does.
     //
-    // And only when the file is already there. Opening creates it, and
-    // creating it here would mean every host that has never declared a
-    // knowledge source pays a database creation on every start for a feature
-    // it has never used (R1) — while a file that does not exist has, by
-    // definition, no crash-window generation to reconcile. The scanner
-    // creates the store the first time it actually writes to it.
+    // The existence check is kept, and is now a cheap guard rather than the
+    // cost-avoidance it was. It used to be load-bearing: opening creates the
+    // file, and creating it here would have meant every host that never
+    // declared a knowledge source paying a database creation on every start
+    // for a feature it never used (R1). `Analytics::begin_rebuild` above now
+    // creates that same file unconditionally, because `ops` lives in it — so
+    // the cost is paid either way and the branch is no longer avoiding it.
+    // What it still buys is honesty about the one case that could ever reach
+    // it: a file that does not exist has, by definition, no crash-window
+    // generation to reconcile, and a reconciliation that had to create its
+    // own store to find nothing in it would be reporting on state it made up.
     if crate::runtime::atlas::db::atlas_db_path(data_dir).exists() {
-        match crate::runtime::atlas::db::AtlasDb::open(data_dir) {
+        match analytics.atlas() {
             Ok(mut atlas) => {
                 match crate::runtime::atlas::record::reconcile_sources(&mut atlas, &journal) {
                     Ok(resolved) => tracing::debug!(
@@ -1188,15 +1201,17 @@ pub async fn start_with(
     // eviction, run once it is actually true that a torn-down surface
     // stands to evict.
     //
-    // Read again rather than held from the block above: that block runs
-    // before `reconcile`, and Atlas is deliberately opened-and-dropped
-    // rather than kept for the process lifetime (see this module's Atlas
-    // startup-reconciliation doc). A store worth reconciling teardowns
-    // against necessarily already exists by now if it ever will.
+    // Derived again rather than held from the block above: that block runs
+    // before `reconcile`, and an Atlas handle is deliberately taken and
+    // dropped rather than kept for the process lifetime (see this module's
+    // Atlas startup-reconciliation doc). Derived from `analytics`, never
+    // `AtlasDb::open` — one file is one DuckDB instance, and a second
+    // `open` would be a second instance whose writes and the projection's
+    // silently overwrite each other (`Analytics::atlas`).
     if !reconciled.surfaces_retired.is_empty()
         && crate::runtime::atlas::db::atlas_db_path(data_dir).exists()
     {
-        match crate::runtime::atlas::db::AtlasDb::open(data_dir) {
+        match analytics.atlas() {
             Ok(mut atlas) => {
                 for work_id in &reconciled.surfaces_retired {
                     sweep_one_overlay_eviction(&mut atlas, work_id);

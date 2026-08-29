@@ -263,3 +263,13 @@ cov_stage_end 1 "the w1_deterministic_filter test binary must write its own prof
 cov_stage_begin c2-w1b_overlay_lifecycle_trigger
 cov_run cargo llvm-cov --no-report --test w1b_overlay_lifecycle_trigger --locked || cov_fail "w1b_overlay_lifecycle_trigger failed under instrumentation"
 cov_stage_end 1 "the w1b_overlay_lifecycle_trigger test binary must write its own profile"
+
+# S5 W1c, wired at birth (the #231 lesson, same as x5/y2/y5/y6/w1/w1b above):
+# A1 §5's one Atlas database — the cross-schema ops<->source join the
+# contract cites as its reason for one file, and the honest restatement of
+# what deleting that file now costs. Non-spawning: it folds `ops` in-process
+# and records scans through the ordinary `record_scan` path. No daemon, no
+# estate, no subprocess. Floor 1.
+cov_stage_begin c2-w1c_one_atlas_database
+cov_run cargo llvm-cov --no-report --test w1c_one_atlas_database --locked || cov_fail "w1c_one_atlas_database failed under instrumentation"
+cov_stage_end 1 "the w1c_one_atlas_database test binary must write its own profile"

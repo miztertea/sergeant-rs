@@ -6,7 +6,7 @@
 //!
 //! This module owns only the derivation: `fn(&mut GraphContext, &Event) ->
 //! GraphDelta`, a pure fold with no I/O. Where the rows are *stored* is the
-//! analytical projection's business ([`crate::runtime::analytics`] materializes
+//! analytical projection's business ([`crate::runtime::atlas::db`] materializes
 //! them into §22's `graph_nodes` / `graph_edges` tables), so there is one
 //! storage owner and one rebuild path rather than two.
 //!

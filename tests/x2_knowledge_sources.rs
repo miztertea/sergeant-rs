@@ -32,7 +32,7 @@ use tempfile::TempDir;
 use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::event::Event;
 use sergeant_rs::domain::source::{Coverage, KIND_SOURCE_SCANNED, UnitKind};
-use sergeant_rs::runtime::analytics::Analytics;
+use sergeant_rs::runtime::atlas::db::Analytics;
 use sergeant_rs::runtime::atlas::db::AtlasDb;
 use sergeant_rs::runtime::atlas::record::{ScanRecord, scan_and_record, scan_summary};
 use sergeant_rs::runtime::atlas::scan::{KnowledgeSource, scan_local_knowledge};
@@ -545,20 +545,28 @@ async fn source_facts_survive_a_real_daemon_restart() {
     );
 
     // The contrast, in the same test so the two disciplines cannot silently
-    // converge: the operations projection was rebuilt from the journal, and
-    // deleting its whole directory loses nothing.
-    let projections = sergeant_rs::runtime::analytics::projections_dir(data.path());
-    assert!(projections.exists(), "the projection rebuilt on start");
-    std::fs::remove_dir_all(&projections).expect("the projection is disposable");
+    // converge: the operations projection is rebuilt from the journal on
+    // every start and losing it loses nothing.
+    //
+    // **S5 W1c moved where that contrast is visible, and this is the only
+    // change this test took.** `ops` used to be a second database file inside
+    // `projections/`, so deleting that directory was the demonstration. A1 §5
+    // declares one database, so `ops` is a schema inside the same file whose
+    // `source.*` rows the assertions above and below prove survive — the two
+    // disciplines now share a file and are told apart by scope, not by path.
+    // Deleting the file would take both, so what is exercised here is what
+    // the daemon itself does: a plain restart drops the `ops` schema and
+    // refolds it, and the source facts are still there afterwards.
+    let projections = sergeant_rs::runtime::startup::projections_dir(data.path());
+    let _ = std::fs::remove_dir_all(&projections);
     start_and_stop(data.path()).await;
-    assert!(projections.exists(), "and rebuilt again from the journal");
     assert_eq!(
         AtlasDb::open(data.path())
             .expect("atlas")
             .units("notes", 100)
             .expect("units"),
         before,
-        "deleting the disposable projection must not touch Atlas"
+        "an ops refold on restart must not touch Atlas"
     );
     let _ = Analytics::begin_rebuild(data.path()).expect("the projection still opens");
     data.reap();
@@ -946,9 +954,7 @@ fn the_atlas_store_is_not_inside_the_disposable_projection_directory() {
     let path: PathBuf = db.path().to_path_buf();
     assert!(path.starts_with(data.path()));
     assert!(
-        !path.starts_with(sergeant_rs::runtime::analytics::projections_dir(
-            data.path()
-        )),
+        !path.starts_with(sergeant_rs::runtime::startup::projections_dir(data.path())),
         "{} must not live under the disposable projections directory",
         path.display()
     );

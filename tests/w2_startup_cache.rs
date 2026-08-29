@@ -12,8 +12,8 @@ use tempfile::TempDir;
 
 use sergeant_rs::daemon::{self, DaemonConfig};
 use sergeant_rs::domain::event::Event;
-use sergeant_rs::runtime::analytics;
 use sergeant_rs::runtime::journal::Journal;
+use sergeant_rs::runtime::startup;
 use sergeant_rs::runtime::startup::FLOOR_STATE_FILE;
 
 use support::DataDir;
@@ -65,7 +65,7 @@ async fn a_second_start_on_the_same_data_dir_hits_the_cache() {
     assert_eq!(first["startup_cache"], "miss:absent", "{first}");
 
     assert!(
-        analytics::projections_dir(data.path())
+        startup::projections_dir(data.path())
             .join(FLOOR_STATE_FILE)
             .exists()
             || first["replay_from_seq"].as_u64() == Some(1),
@@ -137,7 +137,7 @@ async fn a_wide_journal_writes_a_cache_and_the_next_start_hits_it() {
     let first = daemon_started_payload(data.path());
     assert_eq!(first["startup_cache"], "miss:absent", "{first}");
 
-    let cache_path = analytics::projections_dir(data.path()).join(FLOOR_STATE_FILE);
+    let cache_path = startup::projections_dir(data.path()).join(FLOOR_STATE_FILE);
     assert!(
         cache_path.exists(),
         "a journal this wide must leave a cache behind (H > 0 expected)"
@@ -190,7 +190,7 @@ async fn rebuild_cache_forces_a_full_replay_even_with_a_valid_cache_present() {
     let first = daemon_started_payload(data.path());
     assert_eq!(first["startup_cache"], "miss:absent");
     assert!(
-        analytics::projections_dir(data.path())
+        startup::projections_dir(data.path())
             .join(FLOOR_STATE_FILE)
             .exists(),
         "a cache must exist for --rebuild-cache to have something to ignore"
