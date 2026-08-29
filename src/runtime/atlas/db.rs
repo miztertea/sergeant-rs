@@ -1841,6 +1841,331 @@ impl AtlasDb {
         Ok(out)
     }
 
+    // ------------------------------------------------------------------
+    // S5 W1 — A2 §2's deterministic admissibility filter (H1, H13.1).
+    //
+    // "The first operation is deterministic admissibility, not embeddings":
+    // source/estate/Work-generation filter, then authority filter, then
+    // content-kind filter, then the optional repo/knowledge/external
+    // selector — every stage a database predicate that decides what may be
+    // SEEN, never a ranking hint (A2 §8: a reranker must never cross this
+    // boundary because a candidate scores well). No scoring, no ranking, no
+    // BM25, no embeddings live here or anywhere in this wave — those are
+    // W2-W4. Every method below answers with a COMPLETE, EXACT admissible
+    // set: additive SQL on the cross-source join precedent
+    // [`Self::symbol_lookup`]/[`Self::references`] already established
+    // (H1), never a new table or a new column (H13.1).
+    // ------------------------------------------------------------------
+
+    /// A2 §2 stages 1(+4) and 2 in one canned query: the source/estate/
+    /// Work-generation filter, the optional repo/knowledge/external
+    /// selector (the same [`SourceKind`] axis — [`SourceSelector::Kind`]),
+    /// and the authority filter — composed once here and reused, in
+    /// identical shape, by every content-kind method below, so a
+    /// generation excluded at this stage can never resurface through a
+    /// different table.
+    ///
+    /// Every clause is `(? IS NULL OR column = ?)`: an unset filter field
+    /// admits every value of that column rather than narrowing it, so
+    /// `Admissibility::default()` (bare [`SourceSelector::Any`], no
+    /// authority) is "every confirmed generation this store holds" — never
+    /// approximate, never partial. Bounded by `limit` (capped at
+    /// [`MAX_ROWS`], F12).
+    pub fn admissible_generations(
+        &self,
+        filter: &Admissibility,
+        limit: usize,
+    ) -> Result<Vec<SourceGeneration>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let (source_name, content_key, source_kind) = filter.source.bindings();
+        let authority = filter.authority.map(AuthorityClass::as_str);
+        let mut statement = self.conn.prepare(
+            "SELECT generation_id, source_name, source_kind, authority_class, content_key, \
+                    observed_at \
+             FROM source.generations \
+             WHERE state = ? \
+               AND (? IS NULL OR source_name = ?) \
+               AND (? IS NULL OR content_key = ?) \
+               AND (? IS NULL OR source_kind = ?) \
+               AND (? IS NULL OR authority_class = ?) \
+             ORDER BY source_name, observed_at DESC, generation_id DESC LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![
+            STATE_CONFIRMED,
+            source_name,
+            source_name,
+            content_key,
+            content_key,
+            source_kind,
+            source_kind,
+            authority,
+            authority,
+            limit
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind: String = row.get(2)?;
+            let auth: String = row.get(3)?;
+            out.push(SourceGeneration {
+                id: row.get(0)?,
+                source_name: row.get(1)?,
+                kind: SourceKind::parse(&kind).ok_or_else(|| AtlasError::UnknownValue {
+                    column: "source_kind".to_string(),
+                    value: kind.clone(),
+                })?,
+                authority: AuthorityClass::parse(&auth).ok_or_else(|| {
+                    AtlasError::UnknownValue {
+                        column: "authority_class".to_string(),
+                        value: auth.clone(),
+                    }
+                })?,
+                content_key: row.get(4)?,
+                observed_at: row.get(5)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// A2 §2's content-kind filter, **document family** — H13.1's decided
+    /// mechanism: table-routing (`source.units` is physically separate from
+    /// the code and tabular families, so the coarse split needs no new
+    /// column) plus an extractor-identity allowlist joined off
+    /// `source.files`, pinned by [`DOCUMENT_EXTRACTOR_IDENTITIES`] and its
+    /// own structural test (`tests/w1_deterministic_filter.rs`).
+    ///
+    /// **The allowlist is a safety net, not a clean split — verified live,
+    /// correcting a premise H13.1's own text carried.** `claims_for`
+    /// (`src/runtime/atlas/scan.rs`) gives every grammar-claimed-but-
+    /// document-unclaimed file (`main.rs`, `Cargo.toml`) a plain-text
+    /// fallback unit under [`crate::runtime::atlas::text::TEXT_EXTRACTOR`]
+    /// so "every acquired resource still has units" — checked directly in
+    /// this worktree: a `Cargo.toml` fixture produces exactly one
+    /// `Document` unit (extractor `"text/v1"`, body = the whole file) in
+    /// *addition* to its `source.occurrences` rows under `"syntax-toml/v1"`.
+    /// That is the *same* extractor identity a genuine `.txt` document
+    /// carries, so this filter cannot separate "real prose" from a
+    /// code/config file's catch-all body — no `extractor` value
+    /// distinguishes them — and it does not try to. H13.1's "no new
+    /// column" holds regardless: the gap is named here, not engineered
+    /// around with state this wave was told not to add.
+    ///
+    /// Stages 1/2/4 come from `filter`, identically to
+    /// [`Self::admissible_generations`]. Bounded by `limit` (capped at
+    /// [`MAX_ROWS`], F12).
+    pub fn admissible_units(
+        &self,
+        filter: &Admissibility,
+        limit: usize,
+    ) -> Result<Vec<StoredUnitHit>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let (source_name, content_key, source_kind) = filter.source.bindings();
+        let authority = filter.authority.map(AuthorityClass::as_str);
+        let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;
+        let mut statement = self.conn.prepare(
+            "SELECT g.source_name, u.relative_path, u.local_key, u.ordinal, u.unit_kind, \
+                    u.heading_level, u.title, u.byte_start, u.byte_end, u.body \
+             FROM source.units u \
+             JOIN source.generations g USING (generation_id) \
+             JOIN source.files f ON f.generation_id = u.generation_id \
+                                 AND f.relative_path = u.relative_path \
+             WHERE g.state = ? \
+               AND f.extractor IN (?, ?, ?, ?) \
+               AND (? IS NULL OR g.source_name = ?) \
+               AND (? IS NULL OR g.content_key = ?) \
+               AND (? IS NULL OR g.source_kind = ?) \
+               AND (? IS NULL OR g.authority_class = ?) \
+             ORDER BY g.source_name, u.relative_path, u.ordinal LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![
+            STATE_CONFIRMED,
+            doc_a,
+            doc_b,
+            doc_c,
+            doc_d,
+            source_name,
+            source_name,
+            content_key,
+            content_key,
+            source_kind,
+            source_kind,
+            authority,
+            authority,
+            limit
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let kind: String = row.get(4)?;
+            out.push(StoredUnitHit {
+                source_name: row.get(0)?,
+                unit: StoredUnit {
+                    relative_path: row.get(1)?,
+                    local_key: row.get(2)?,
+                    ordinal: row.get::<usize, i64>(3)? as u64,
+                    kind: UnitKind::parse(&kind).ok_or_else(|| AtlasError::UnknownValue {
+                        column: "unit_kind".to_string(),
+                        value: kind.clone(),
+                    })?,
+                    heading_level: row.get::<usize, Option<i64>>(5)?.map(|v| v as u8),
+                    title: row.get(6)?,
+                    byte_start: row.get::<usize, i64>(7)? as u64,
+                    byte_end: row.get::<usize, i64>(8)? as u64,
+                    body: row.get(9)?,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// A2 §2's content-kind filter, **code family** — `source.symbols` +
+    /// `source.occurrences` + `source.edges`, physically separate from the
+    /// document and tabular families (H13.1, no new column). This method
+    /// reads `source.occurrences`; `symbols`/`edges` follow the identical
+    /// shape and are not duplicated here (R1 — nothing in this wave's
+    /// negative-admission proof needs them; each is a mechanical variant of
+    /// this one for a later wave to add on demand).
+    ///
+    /// The extractor match is `extractor LIKE ?` bound to
+    /// [`CODE_EXTRACTOR_LIKE`] (`"syntax-%"`) — a fixed, code-owned pattern
+    /// (F12: never a client-supplied pattern), pinned by a structural test
+    /// against every
+    /// [`crate::runtime::atlas::syntax::SyntaxLanguage::ALL`] identity.
+    /// **This is also where a `.toml` config file's occurrences live**
+    /// (H13.1's decided exception): a config file's key/table structure is
+    /// claimed by
+    /// [`crate::runtime::atlas::syntax::SyntaxLanguage::Toml`] the same way
+    /// Rust is claimed by
+    /// [`crate::runtime::atlas::syntax::SyntaxLanguage::Rust`], under
+    /// extractor identity `"syntax-toml/v1"` — matched by this same `LIKE`
+    /// pattern. `--content config` has no document-side backing (see
+    /// [`Self::admissible_units`]'s own doc) and is not offered as a
+    /// distinct value; a caller wanting config content calls this method,
+    /// exactly as for code.
+    ///
+    /// Stages 1/2/4 come from `filter`, identically to
+    /// [`Self::admissible_generations`]. Bounded by `limit` (capped at
+    /// [`MAX_ROWS`], F12).
+    pub fn admissible_occurrences(
+        &self,
+        filter: &Admissibility,
+        limit: usize,
+    ) -> Result<Vec<StoredOccurrenceHit>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let (source_name, content_key, source_kind) = filter.source.bindings();
+        let authority = filter.authority.map(AuthorityClass::as_str);
+        let mut statement = self.conn.prepare(
+            "SELECT g.source_name, o.relative_path, o.syntax_key, o.extractor, o.language, \
+                    o.ordinal, o.label, o.name, o.byte_start, o.byte_end \
+             FROM source.occurrences o JOIN source.generations g USING (generation_id) \
+             WHERE g.state = ? \
+               AND o.extractor LIKE ? \
+               AND (? IS NULL OR g.source_name = ?) \
+               AND (? IS NULL OR g.content_key = ?) \
+               AND (? IS NULL OR g.source_kind = ?) \
+               AND (? IS NULL OR g.authority_class = ?) \
+             ORDER BY g.source_name, o.relative_path, o.ordinal LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![
+            STATE_CONFIRMED,
+            CODE_EXTRACTOR_LIKE,
+            source_name,
+            source_name,
+            content_key,
+            content_key,
+            source_kind,
+            source_kind,
+            authority,
+            authority,
+            limit
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredOccurrenceHit {
+                source_name: row.get(0)?,
+                occurrence: StoredOccurrence {
+                    relative_path: row.get(1)?,
+                    syntax_key: row.get(2)?,
+                    extractor: row.get(3)?,
+                    language: row.get(4)?,
+                    ordinal: row.get::<usize, i64>(5)? as u64,
+                    label: row.get(6)?,
+                    name: row.get(7)?,
+                    byte_start: row.get::<usize, i64>(8)? as u64,
+                    byte_end: row.get::<usize, i64>(9)? as u64,
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    /// A2 §2's content-kind filter, **tabular family** — `source.datasets`
+    /// (+ `context.row_units`, not read here — see
+    /// [`Self::admissible_occurrences`]'s note on why the whole family is
+    /// not duplicated). No extractor ambiguity here: `source.datasets`
+    /// carries no `extractor` column at all (`format`/`reader` are a
+    /// different axis), so table-routing alone is exact for this family
+    /// (H13.1).
+    ///
+    /// Stages 1/2/4 come from `filter`, identically to
+    /// [`Self::admissible_generations`]. Bounded by `limit` (capped at
+    /// [`MAX_ROWS`], F12).
+    pub fn admissible_datasets(
+        &self,
+        filter: &Admissibility,
+        limit: usize,
+    ) -> Result<Vec<StoredDatasetHit>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let (source_name, content_key, source_kind) = filter.source.bindings();
+        let authority = filter.authority.map(AuthorityClass::as_str);
+        let mut statement = self.conn.prepare(
+            "SELECT g.source_name, d.relative_path, d.format, d.content_hash, d.reader, \
+                    d.dataset_key, d.byte_len, d.columns, d.row_count, d.truncated, d.row_units \
+             FROM source.datasets d JOIN source.generations g USING (generation_id) \
+             WHERE g.state = ? \
+               AND (? IS NULL OR g.source_name = ?) \
+               AND (? IS NULL OR g.content_key = ?) \
+               AND (? IS NULL OR g.source_kind = ?) \
+               AND (? IS NULL OR g.authority_class = ?) \
+             ORDER BY g.source_name, d.relative_path LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![
+            STATE_CONFIRMED,
+            source_name,
+            source_name,
+            content_key,
+            content_key,
+            source_kind,
+            source_kind,
+            authority,
+            authority,
+            limit
+        ])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let format: String = row.get(2)?;
+            out.push(StoredDatasetHit {
+                source_name: row.get(0)?,
+                dataset: StoredDataset {
+                    relative_path: row.get(1)?,
+                    format: DatasetFormat::parse(&format).ok_or_else(|| {
+                        AtlasError::UnknownValue {
+                            column: "format".to_string(),
+                            value: format.clone(),
+                        }
+                    })?,
+                    content_hash: row.get(3)?,
+                    reader: row.get(4)?,
+                    dataset_key: row.get(5)?,
+                    byte_len: row.get::<usize, i64>(6)? as u64,
+                    columns: split_names(&row.get::<usize, String>(7)?),
+                    row_count: row.get::<usize, i64>(8)? as u64,
+                    truncated: row.get(9)?,
+                    row_units: row.get::<usize, i64>(10)? as u64,
+                },
+            });
+        }
+        Ok(out)
+    }
+
     /// Every generation's state, keyed by id — a diagnostic read, and what a
     /// crash-window test inspects.
     pub fn generation_states(&self) -> Result<BTreeMap<String, String>, AtlasError> {
@@ -2900,6 +3225,203 @@ pub struct StoredReference {
     pub byte_start: u64,
     /// End offset into the original file bytes, exclusive.
     pub byte_end: u64,
+}
+
+// ---------------------------------------------------------------------
+// S5 W1 — A2 §2's admissibility filter vocabulary (H1, H13.1).
+// ---------------------------------------------------------------------
+
+/// A2 §2's stage-1(+4) and stage-2 world selection, composed once and
+/// reused by every content-kind method
+/// ([`AtlasDb::admissible_units`]/[`AtlasDb::admissible_occurrences`]/
+/// [`AtlasDb::admissible_datasets`]) and by
+/// [`AtlasDb::admissible_generations`] itself.
+///
+/// **Admissibility only, never a ranking hint** (A2 §8): every field here
+/// either admits a row or it does not. There is no score, no weight,
+/// nothing a downstream reranker (W2-W4, not built yet) could read as a
+/// preference — this wave ships before any of that exists, and this type
+/// is why it can (A2 §2's own ordering: filter the world, only THEN
+/// retrieve/rank).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Admissibility {
+    /// Stage 1 (+4): which source(s) may be seen at all.
+    pub source: SourceSelector,
+    /// Stage 2: which authority class may be seen. `None` admits every
+    /// class — this filter only ever narrows what a caller explicitly
+    /// asked to narrow; there is no implicit default-deny beyond what
+    /// `source` already selects.
+    pub authority: Option<AuthorityClass>,
+}
+
+/// A2 §2's stage-1 source/estate/Work-generation selector, plus stage 4's
+/// optional repo/knowledge/external grouping — the same [`SourceKind`]
+/// axis, so it is one variant here ([`Self::Kind`]) rather than a second
+/// field a caller could set inconsistently with [`Self::Named`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SourceSelector {
+    /// No source-name/kind constraint: every confirmed generation, subject
+    /// only to [`Admissibility::authority`].
+    #[default]
+    Any,
+    /// A2 §2's `--source <name>`: exactly one declared source's newest
+    /// CONFIRMED generation.
+    Named(String),
+    /// A2 §2's `--source <name>@<sha>`: one exact generation. Because a
+    /// superseded generation's content rows are deleted at eviction time
+    /// (ruling §4 — [`AtlasDb::confirm_scan`]'s own promotion, and
+    /// [`AtlasDb::evict_work_overlays`]), this can only ever answer for a
+    /// `content_key` that is *still* the source's current confirmed
+    /// generation; a genuinely stale key correctly returns nothing rather
+    /// than approximating — "never approximate" (A2 §2) applies to an
+    /// admissibility miss exactly as it applies to a hit.
+    Exact {
+        /// The declared source.
+        source_name: String,
+        /// The exact generation's content identity.
+        content_key: String,
+    },
+    /// A2 §2's `--type repo|knowledge|external` selector.
+    Kind(SourceKind),
+    /// A2 §2's `--work <id>` filter, **W1's scope only** (H13.2): the
+    /// named repository's BASE generation — never the overlay half, which
+    /// is W1b's daemon-side lifecycle hook
+    /// ([`crate::runtime::atlas::overlay::overlay_source_name`]/
+    /// [`AtlasDb::evict_work_overlays`]). `repository` is the plain,
+    /// non-overlay source name this Work's surface is bound to; Atlas
+    /// holds no Work↔repository binding of its own (that lives in
+    /// [`crate::runtime::surface::WorkSurface`]) so the caller resolves it
+    /// and hands it in. [`Self::work_scope`] is what a caller MUST
+    /// render/assert alongside any answer built from this variant —
+    /// A2 §2's own text promises "including overlay", so silently
+    /// presenting a base-only answer as complete would be a false claim
+    /// about a named acceptance dimension (H13.2).
+    WorkBase {
+        /// The Work this admission is scoped to, carried for the caller's
+        /// own attribution — not read by the query itself.
+        work_id: String,
+        /// The base repository source name.
+        repository: String,
+    },
+}
+
+impl SourceSelector {
+    /// The `(source_name, content_key, source_kind)` bind values every
+    /// admissibility query composes identically — [`Self::Named`] and
+    /// [`Self::WorkBase`] bind the same shape on purpose: **W1's whole
+    /// point is that a Work's base generation reads exactly like any other
+    /// named source's**, and only [`Self::work_scope`] marks the
+    /// difference the caller must state.
+    fn bindings(&self) -> (Option<&str>, Option<&str>, Option<&'static str>) {
+        match self {
+            Self::Any => (None, None, None),
+            Self::Named(name) => (Some(name.as_str()), None, None),
+            Self::Exact {
+                source_name,
+                content_key,
+            } => (Some(source_name.as_str()), Some(content_key.as_str()), None),
+            Self::Kind(kind) => (None, None, Some(kind.as_str())),
+            Self::WorkBase { repository, .. } => (Some(repository.as_str()), None, None),
+        }
+    }
+
+    /// A2 §2's `--work` completeness fact (H8, H13.2) — see
+    /// [`Self::WorkBase`]'s own doc for why this must be rendered, not
+    /// merely computed.
+    pub fn work_scope(&self) -> WorkScope {
+        match self {
+            Self::WorkBase { .. } => WorkScope::BaseOnly,
+            _ => WorkScope::NotWorkScoped,
+        }
+    }
+}
+
+/// Whether an [`Admissibility`] answer built from
+/// [`SourceSelector::WorkBase`] covers A2 §2's `--work` promise in full —
+/// *"current Work's world, **including overlay**"* — or only its base
+/// half.
+///
+/// H13.2 assigns the overlay half to a daemon-side lifecycle hook (W1b);
+/// every [`SourceSelector::WorkBase`] answer is [`Self::BaseOnly`] until
+/// that lands. **If W1b escalates or slips, this stays [`Self::BaseOnly`]
+/// with the limitation stated — never a silent partial** (H13.2's own
+/// words: a filter that quietly omits the overlay is a partial
+/// implementation of a named acceptance dimension).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkScope {
+    /// [`SourceSelector::WorkBase`] was not the selector in play — the
+    /// concept does not apply to this answer.
+    NotWorkScoped,
+    /// `--work` admitted only the repository's plain base generation —
+    /// W1's whole scope. A caller MUST state this rather than presenting
+    /// the answer as A2 §2's full "including overlay" promise.
+    BaseOnly,
+}
+
+/// H13.1's content-kind filter, document family: the exhaustive, code-owned
+/// list of extractor identities [`AtlasDb::admissible_units`] matches
+/// against — never a client-supplied pattern (F12). Every identity a
+/// document-shaped adapter in this build can write to `source.files`:
+/// Markdown, plain text, Office (`.docx`), and mail (`.eml`). **Not**
+/// [`crate::runtime::atlas::archive::ZIP_EXTRACTOR`]: a ZIP archive is a
+/// container — its own top-level resource carries no prose, only its
+/// unpacked children do, each under its own (already-listed) extractor
+/// identity.
+///
+/// Pinned by `tests/w1_deterministic_filter.rs`'s structural test, in the
+/// shape of `tests/x1_atlas_substrate.rs`'s one-owner test: it walks
+/// `text.rs`/`office.rs`/`mail.rs`'s own `pub const ..._EXTRACTOR`
+/// declarations and asserts this list is exactly that set, so a new
+/// document adapter that lands a new identity without updating this list
+/// fails that test rather than silently falling out of (or into)
+/// `--content document`.
+pub const DOCUMENT_EXTRACTOR_IDENTITIES: [&str; 4] = [
+    crate::runtime::atlas::text::MARKDOWN_EXTRACTOR,
+    crate::runtime::atlas::text::TEXT_EXTRACTOR,
+    crate::runtime::atlas::office::DOCX_EXTRACTOR,
+    crate::runtime::atlas::mail::MAIL_EXTRACTOR,
+];
+
+/// H13.1's content-kind filter, code family: the fixed, code-owned `LIKE`
+/// pattern [`AtlasDb::admissible_occurrences`] matches `extractor` against
+/// — never a client-supplied pattern (F12). Every `source.occurrences`
+/// (and `source.symbols`/`source.edges`) row is written from
+/// [`crate::runtime::atlas::syntax::SyntaxLanguage::extractor_identity`],
+/// whose own format (`"syntax-{name}/{SYNTAX_EXTRACTOR_VERSION}"`) makes
+/// this prefix exhaustive by construction — pinned by a structural test
+/// that asserts every
+/// [`crate::runtime::atlas::syntax::SyntaxLanguage::ALL`] identity matches
+/// it, and that a synthetic unknown identity does not.
+pub const CODE_EXTRACTOR_LIKE: &str = "syntax-%";
+
+/// One structure unit read back out of the store, with the source it
+/// belongs to — [`AtlasDb::admissible_units`]'s cross-source answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredUnitHit {
+    /// The declared source.
+    pub source_name: String,
+    /// The unit itself.
+    pub unit: StoredUnit,
+}
+
+/// One occurrence read back out of the store, with the source it belongs
+/// to — [`AtlasDb::admissible_occurrences`]'s cross-source answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredOccurrenceHit {
+    /// The declared source.
+    pub source_name: String,
+    /// The occurrence itself.
+    pub occurrence: StoredOccurrence,
+}
+
+/// One registered dataset read back out of the store, with the source it
+/// belongs to — [`AtlasDb::admissible_datasets`]'s cross-source answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredDatasetHit {
+    /// The declared source.
+    pub source_name: String,
+    /// The dataset itself.
+    pub dataset: StoredDataset,
 }
 
 #[cfg(test)]

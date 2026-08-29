@@ -240,3 +240,15 @@ cov_stage_end 1 "the y6b_online_only test binary must write its own profile"
 cov_stage_begin c2-y5_doctrine_never_fetches_is_scoped
 cov_run cargo llvm-cov --no-report --test y5_doctrine_never_fetches_is_scoped --locked || cov_fail "y5_doctrine_never_fetches_is_scoped failed under instrumentation"
 cov_stage_end 1 "the y5_doctrine_never_fetches_is_scoped test binary must write its own profile"
+
+# S5 W1, wired at birth (the #231 lesson, same as x5/y2/y5/y6 above): A2 §2's
+# deterministic admissibility filter — the four bounded canned queries and
+# their negative-admission proofs, plus the structural pins on H13.1's
+# extractor vocabulary. Builds Atlas stores in tempdirs and records scans
+# through the ordinary `record_scan` path, and runs one real
+# `scan_local_knowledge` walk for the `--content config` live check. No
+# daemon, no estate, no subprocess of any kind — which is why it is here
+# rather than with the spawning suites. Floor 1.
+cov_stage_begin c2-w1_deterministic_filter
+cov_run cargo llvm-cov --no-report --test w1_deterministic_filter --locked || cov_fail "w1_deterministic_filter failed under instrumentation"
+cov_stage_end 1 "the w1_deterministic_filter test binary must write its own profile"
