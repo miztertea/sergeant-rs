@@ -265,7 +265,11 @@ pub fn acquire_and_scan(source: &ExternalGitSource) -> Result<ExternalGitScan, E
     let mut out = Extracted::default();
     let paths: BTreeSet<String> = tree.entries.iter().map(|e| e.path.clone()).collect();
     let denied_dirs = directory_coverage(&paths, &filter, &mut out.coverage);
-    extract_blobs(&mount, &filter, &tree.entries, &denied_dirs, &mut out)?;
+    // Out of this wave's scope (brief-y8-adapter-dispatch.md names only
+    // `scan.rs`'s and `git.rs`'s own walks): an external-Git acquisition
+    // stays worker-free, matching `extract_tree`'s own no-worker default
+    // rather than gaining one this wave never asked for.
+    extract_blobs(&mount, &filter, &tree.entries, &denied_dirs, None, &mut out)?;
     out.files
         .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     out.coverage.sort_by(|a, b| a.path.cmp(&b.path));
@@ -381,7 +385,11 @@ mod tests {
         let mut out = Extracted::default();
         let paths: BTreeSet<String> = tree.entries.iter().map(|e| e.path.clone()).collect();
         let denied_dirs = directory_coverage(&paths, &filter, &mut out.coverage);
-        extract_blobs(&mount, &filter, &tree.entries, &denied_dirs, &mut out)?;
+        // Out of this wave's scope (brief-y8-adapter-dispatch.md names only
+        // `scan.rs`'s and `git.rs`'s own walks): an external-Git acquisition
+        // stays worker-free, matching `extract_tree`'s own no-worker default
+        // rather than gaining one this wave never asked for.
+        extract_blobs(&mount, &filter, &tree.entries, &denied_dirs, None, &mut out)?;
         out.files
             .sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         out.coverage.sort_by(|a, b| a.path.cmp(&b.path));

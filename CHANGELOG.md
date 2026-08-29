@@ -400,9 +400,26 @@ release.
   community extensions are turned off and locked off on every connection, so
   reading a dataset can never become a network fetch.
 
-### Supervised parse workers (S4)
+### Atlas adapters, indexing, and the scan trigger (S4)
 
-- Third-party document parsing moves out of the daemon and into supervised
+Atlas goes from a daemon-owned substrate with two demonstrated source kinds
+and no operator-reachable trigger (S3) to an estate-wide indexing surface
+with a real scan behind it: a supervised worker transport carries three real
+content adapters (Office, ZIP, mail) out of the daemon's own process; a
+fourth source kind (`external Git`) and a package-identity derivation join
+`estate_git`/`local_knowledge`; `sgt intelligence scan` finally gives an
+operator something to run — across all three source kinds, not only the one
+S4 Y5 first wired — with a cloud-sync placeholder finally reported honestly
+instead of silently as empty; and, closing this sprint's own signature
+defect a third time (Y8, below), that scan actually **dispatches** a claimed
+`.docx`/`.zip`/`.eml` to the worker rather than reporting it unsupported —
+the adapters and the transport were built and proven through the real
+subprocess from Y1 through Y4, but nothing in `scan.rs`'s or `git.rs`'s own
+routing table claimed those three extensions until Y8 wired them, so no
+installation before this release could actually reach any of the three from
+an ordinary scan. What follows is the one arc, in the order it was built.
+
+**Supervised parse workers.** Third-party document parsing moves out of the daemon and into supervised
   child processes: a worker takes bytes and returns a normalized batch, and
   the daemon remains the only writer Atlas has. The adapters themselves did
   not change shape — they were already pure functions over bytes — so this
@@ -448,9 +465,7 @@ release.
   behaviour is otherwise unchanged — it still checks for the file first, and
   still defers to the daemon when a running daemon holds the store.
 
-### Office document adoption (S4)
-
-- `.docx` documents now normalize into document units, running the `anydoc`
+**Office document adoption.** `.docx` documents now normalize into document units, running the `anydoc`
   crate behind a narrow adapter — bytes in, our own vocabulary out — inside
   the supervised worker transport the previous entry shipped. The owner
   ruled to adopt anydoc past a RUSTSEC advisory reached through one of its
@@ -494,9 +509,7 @@ release.
   one above), with expected counts written down and independently
   cross-checked before any extractor existed, backs every claim above.
 
-### Bounded ZIP containers (S4)
-
-- ZIP archives now expand into child resources — bytes in, admitted
+**Bounded ZIP containers.** ZIP archives now expand into child resources — bytes in, admitted
   entries out — running the `zip` crate (the maintained `zip2` fork) behind
   a pure-function adapter inside the same supervised worker transport the
   Office adapter uses. `enclosed_name` (already cited for path safety) is a
@@ -580,9 +593,7 @@ release.
   bytes end to end is left, explicitly, to the wave that wires real
   daemon-side persistence for archive children.
 
-### Mail (`.eml`) adoption (S4)
-
-- `.eml` messages now normalize into message shape (A1 §6.5) — from/to/cc,
+**Mail (`.eml`) adoption.** `.eml` messages now normalize into message shape (A1 §6.5) — from/to/cc,
   sent timestamp (RFC3339), subject, text AND html bodies, message id, and
   thread identifiers (References plus any In-Reply-To id not already
   present) — running the `mail-parser` crate (0.11.8, `full_encoding`
@@ -661,9 +672,7 @@ release.
   citing the real subprocess acceptance proof the same way rows 5 and 7
   already do.
 
-### External Git, package identity, and the scan trigger (S4 Y5)
-
-Atlas stops being writers-and-readers with nothing between them: a scan
+**External Git, package identity, and the scan trigger.** Atlas stops being writers-and-readers with nothing between them: a scan
 trigger, and a second source kind (`external_git`) alongside
 `estate_git`/`local_knowledge`.
 
@@ -755,7 +764,16 @@ trigger, and a second source kind (`external_git`) alongside
   (`domain::package`); no CLI verb or table wires it yet, because no
   register item or consumer commissions one this wave and an unused
   surface is the same false promise an empty table is (R1) — the
-  derivation itself is what §10 actually asks A1 to be able to do.
+  derivation itself is what §10 actually asks A1 to be able to do. **S4 Y7
+  closeout correction**: this was itself an unpinned instance of the
+  sprint's own signature defect (built, tested, zero production caller —
+  no `git.package_dependencies` table, no CLI verb, no API route ever
+  calls `domain::package`) and had no tripwire holding it to that fact,
+  unlike row 2's Work-overlay gap. A tripwire now does
+  (`domain::package::the_derivation_has_no_production_caller_yet`,
+  `src/domain/package.rs`); the destination is unbuilt scope, named rather
+  than guessed at — whichever wave first commissions a `git.*` consumer
+  for lockfile-derived package identity.
 - **G2's revisit trigger, answered rather than left to pass silently.**
   G2 kept the tree-sitter syntax extractor in-process on the stated
   predicate "inputs are local/estate-owned rather than attacker-chosen",
@@ -812,9 +830,7 @@ trigger, and a second source kind (`external_git`) alongside
   the ruling cited. Both are documentation corrections to where an item
   already lived, not scope changes.
 
-### The scan trigger becomes estate-scoped, and online-only detection ships (S4 Y6)
-
-The owner correction **"estate intelligence is the feature. Not index a
+**The scan trigger becomes estate-scoped, and online-only detection ships.** The owner correction **"estate intelligence is the feature. Not index a
 knowledge repo"**
 (`knowledge/rulings/owner-rulings/estate-intelligence-is-the-feature-2026-08-28.md`
 in the workspace estate) named a gap S4 Y5's own scan trigger left open: it
@@ -921,9 +937,7 @@ the wave's other named item alongside it.
     (`a1a_item_4_the_coverage_vocabulary_now_names_online_only`), the same
     pattern the cross-cutting-gap tripwire already set at S4 Y5.
 
-### Review-panel fixes (S4 Y6)
-
-Three findings from this wave's own review, fixed against the commit above
+**Review-panel fixes.** Three findings from this wave's own review, fixed against the commit above
 rather than folded silently into it:
 
 - **Register row 2 corrected: honest about the Work-overlay half.** The
@@ -963,6 +977,141 @@ rather than folded silently into it:
   `online_only`/`error`/`unavailable` count now warns
   (`generation_evicted` stays reported-but-not-warned: an eviction is
   ordinary lifecycle, not a fault).
+
+**S4 Y7 closeout — the contract walk, not the wave ledger.** This sprint
+shipped its own signature defect twice before this closeout (Y5's
+`estate_git` scan built with no production caller, closed by Y6; Y6's own
+review then caught Work-overlay scanning in the identical shape). The
+closeout's own brief: don't check work against its own brief again — walk
+`A1-ATLAS-WORLD-INTELLIGENCE.md` directly and deliberately search for a
+third instance. There was one.
+
+- **Package identity (§10, A1-26) was the third instance, unpinned.**
+  `domain::package`'s derivation — tested at the unit level since S4 Y5 —
+  has zero production callers: no `git.package_dependencies` table, no CLI
+  verb, no API route. This CHANGELOG already said so honestly at Y5; what
+  it lacked was a tripwire holding it to that fact the way row 2's
+  Work-overlay gap has one. `domain::package::the_derivation_has_no_production_caller_yet`
+  is that tripwire now, watched red by hand (a temporary reference from
+  `src/api.rs`, reverted) before landing.
+- **"A worker never opens the store" was asserted only in a comment.**
+  `src/bin/atlas_worker.rs`'s own module doc claimed this structurally; no
+  test checked it. `runtime::atlas::worker::tests::a_worker_never_names_the_atlas_store`
+  now does, watched red against both the worker binary and its own module
+  before landing, the same discipline the one-owner `duckdb` tests already
+  set.
+- **`docs/concepts/atlas-and-knowledge.md` silently implied Work-overlay
+  indexing was live.** It described the overlay in the same present tense
+  as the three source kinds `sgt intelligence scan` actually drives,
+  without ever saying it has no trigger — the omission the brief asked
+  this closeout to find and correct (four other doc-versus-code overclaims
+  were caught in this sprint's earlier reviews; this is the fifth). Fixed:
+  the doc now says plainly that overlay indexing is built, correct, and
+  untriggered, with a new decision row (D14) pinning it.
+- **Boundary audit.** One-owner-per-database (both `x1_atlas_substrate`'s
+  and `m5_projections`'s tests) and no-client-SQL
+  (`a1a_item_13_no_client_sql_reaches_the_store`) were each personally
+  watched red, by hand, this closeout — not merely re-run green. The
+  anydoc replaceability boundary's cargo-metadata alias check
+  (`tests/y2_office_boundary.rs`) and the AGENTS.md "never fetches" scoping
+  (`tests/y5_doctrine_never_fetches_is_scoped.rs`) already carry their own
+  documented red-then-green history from the waves that built them. The
+  shared archive/mail depth-and-byte budget is proven by a real nested
+  fixture (`archive.rs`'s own `a_zip_entry_named_eml_past_the_depth_ceiling_is_admitted_but_not_parsed`)
+  rather than merely asserted, though this closeout did not itself revert
+  it to watch it fail.
+
+**S4 Y8 — dispatch, not just adapters.** The Y7 closeout's own sweep
+reported finding exactly one remaining unreachable-code instance (package
+identity) and called the sweep complete. That claim was false: the largest
+instance of the sprint's own signature defect was still standing. `sgt
+intelligence scan` walked a folder, saw a `.docx`, and did not extract it —
+`scan.rs`'s routing table (`claims_for`) never claimed `.docx`/`.zip`/`.eml`,
+so the resource fell straight through to `unsupported`, and neither
+`scan.rs` nor `record.rs` ever called `run_worker_on_lane` or `worker::`
+anything. The three content adapters and the worker transport that carries
+them were dead code in every real installation.
+
+- **The scan walk now dispatches.** `scan.rs`'s `Walk::file` and `git.rs`'s
+  `extract_blobs` both route a resource their own new `worker_extractor_for`
+  table claims through the real `run_worker` transport and the daemon-side
+  `validate_batch` AUTHORITY — the identical path Y1 designed and Y2/Y3/Y4
+  built the three adapters to run inside, exercised for the first time from
+  a real walk rather than only from each adapter's own test suite. The
+  in-process text/Markdown/syntax/tabular paths are untouched: pure Rust
+  over local bytes was never the worker's business, and stays that way.
+  `scan_local_knowledge_on_lane`/`scan_estate_git_on_lane` (the production
+  entry points) resolve a real `WorkerRuntime` and thread it down; every
+  existing caller of the plain, worker-free
+  `scan_local_knowledge`/`scan_estate_git` keeps working exactly as before,
+  unchanged.
+  **Fix-agent correction:** the originally landed `WorkerRuntime` resolution
+  returned this host's own binary path (`std::env::current_exe()`)
+  unchanged — the *daemon's* own binary, which `sgt`'s own subcommand-only
+  CLI cannot be re-exec'd as a worker with (`--generation`/`--extractor`
+  fails to parse), so every real, non-test installation would have hit a
+  clap error on the very first claimed `.docx`/`.zip`/`.eml`, never an
+  extraction. `tests/y8_adapter_dispatch.rs`'s original acceptance test
+  stayed green throughout because it drives `scan_local_knowledge_with_worker`
+  directly with a hand-built `WorkerRuntime`, never the real
+  `scan_local_knowledge_on_lane` entry point or its resolution. Fixed to
+  resolve the real sibling `sgt-atlas-worker` binary Cargo builds beside
+  `sgt` (same `target/<profile>/` / install directory), and proven by a
+  new `scan_local_knowledge_on_lane_resolves_and_dispatches_the_real_worker_binary`
+  test that plants the real worker binary beside the test binary's own
+  `current_exe()` and drives the actual lane entry point end to end —
+  confirmed to fail red (a clap "Unrecognized option: 'generation'" error)
+  against the original, unfixed resolution before this correction landed.
+- **Proven against real bytes, not a synthetic fixture.**
+  `tests/y8_adapter_dispatch.rs` scans a directory holding one real
+  `.docx`, one real `.zip` and one real `.eml` (this repo's own
+  hand-verified corpora) through the worker-enabled scan/dispatch logic
+  (`scan_local_knowledge_with_worker`), then records the result through
+  `record_scan`'s real three-step discipline, and asserts the RECORDED
+  generation's own extractor set names all three adapter identities and
+  that document units carry real, non-empty text — exactly the shape an
+  isolated adapter unit test cannot prove, which is what let this defect
+  stand through four prior waves' own acceptance batteries.
+  `tests/x3a_git_plumbing.rs` carries the estate-git-side twin. A second
+  test, added by the fix-agent panel pass below, additionally drives the
+  real production entry point (`scan_local_knowledge_on_lane`) end to end
+  so the worker-binary RESOLUTION this dispatch depends on is exercised
+  too, not only the pure dispatch logic.
+- **Children, honestly.** A worker-declared child (an archive entry, a mail
+  attachment) is validated daemon-side by the same `validate_batch`
+  AUTHORITY (path safety, F10 deny-set membership) and its name lands,
+  visibly, in its parent's own coverage detail — but its CONTENT does not
+  yet reach the store as its own `source.files` row. `WorkerBatch`'s
+  `DeclaredChild` still carries only a name and a path on the wire, exactly
+  the "named seam" `archive.rs`'s own module doc has flagged since Y3;
+  widening that shared wire type to carry a child's bytes, hash, or
+  composed key is a security/footprint decision this wave's brief does not
+  settle and this wave does not decide unilaterally. Register rows 7 and 8
+  (`tests/x5_a1a_acceptance.rs`) are corrected to `met-with-deviation`
+  naming exactly this gap and its destination, rather than continuing to
+  read `met` on the strength of the adapter alone.
+- **The register's own stale claim, corrected.** Item 13's note still read
+  "nothing shipped triggers a scan" — false since S4 Y5/Y6 shipped `sgt
+  intelligence scan`, independently of this wave's own dispatch fix. Fixed
+  to state the actual, current gap: the surfaces answer empty only until an
+  operator runs the shipped trigger, not because none exists.
+- **Fix-agent panel pass.** `run_worker_on_lane` — the permit-acquiring
+  wrapper this same wave's `lane.rs` heavily edits — turned out to be a
+  FOURTH orphaned production path: the dispatch this wave wired calls
+  `run_worker` directly from `dispatch_worker_resource`, already inside the
+  whole-scan permit `scan_local_knowledge_on_lane`/`scan_estate_git_on_lane`
+  hold, never through `run_worker_on_lane` itself, which remains reachable
+  only from `tests/y1_worker_transport.rs` and its Y2-Y4 siblings. Its own
+  doc comment now says so explicitly, and a recursive `src/`-wide tripwire
+  (`lane::tests::run_worker_on_lane_has_no_production_caller_yet`, the same
+  shape as `domain::package`'s) pins it — matching this wave's own
+  package-identity precedent rather than leaving a fifth silent instance.
+  Two doc comments (`office::extractor_for`, `worker::run_worker`) that
+  described this wave's own dispatch as running through
+  `run_worker_on_lane` are corrected to name the real path
+  (`dispatch_worker_resource` -> `run_worker`, directly). The
+  `WorkerRuntime` resolution bug this same pass found and fixed is its own
+  entry above ("The scan walk now dispatches", fix-agent correction).
 
 ### Atlas closeout (S3)
 

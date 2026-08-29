@@ -174,14 +174,17 @@ pub const DOCX_EXTENSIONS: &[&str] = &["docx"];
 /// shape (extension-driven, never content-sniffed, for the same reason: an
 /// unclaimed extension is honestly `unsupported`, not guessed at).
 ///
-/// Nothing calls this in production yet: wiring the local-knowledge walk to
-/// dispatch a claimed path to the supervised worker is daemon-scheduling
-/// work Y1 did not ship either (`lane::run_worker_on_lane` has no production
-/// caller as of this wave) and is not this wave's own deliverable list — the
-/// adapter, the worker route, and the real-parser supervision proof are.
-/// Named now so a later wave's routing table has one place to look, exactly
-/// as [`crate::domain::source::SourceKind::ExternalGit`]'s own doc names a
-/// seam ahead of the wave that fills it.
+/// Called from a real scan since S4 Y8: [`super::scan::worker_extractor_for`]
+/// unions this with [`super::archive::extractor_for`]/
+/// [`super::mail::extractor_for`], and [`super::scan::Walk::file`]/
+/// [`super::git::extract_blobs`] dispatch a path this claims to the real
+/// supervised worker (`super::worker::run_worker`, called directly from
+/// [`super::scan::dispatch_worker_resource`] under the whole-scan
+/// intelligence-lane permit [`super::lane::scan_local_knowledge_on_lane`]/
+/// [`super::lane::scan_estate_git_on_lane`] already hold — not through
+/// `lane::run_worker_on_lane`, which remains test-only, see its own doc)
+/// rather than reporting it unsupported — daemon-scheduling work this
+/// module's own G2/G3 adoption did not ship.
 pub fn extractor_for(relative: &str) -> Option<&'static str> {
     let extension = std::path::Path::new(relative)
         .extension()

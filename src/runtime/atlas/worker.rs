@@ -381,13 +381,19 @@ pub fn validate_batch(
 ///
 /// `program` is a plain `PathBuf` rather than [`std::env::current_exe`]
 /// baked in here, because the two callers need two different answers: the
-/// daemon's own binary IS the worker binary's addressable path at runtime
-/// (`std::env::current_exe()`, [`crate::cli`]'s `spawn_daemon` sets the same
-/// precedent for re-exec'ing the running binary with a different verb), while
-/// an integration test spawns the worker binary Cargo built for it
-/// (`env!("CARGO_BIN_EXE_sgt-atlas-worker")`) — `current_exe()` inside a test
-/// binary answers with the *test binary's own* path, which is not runnable
-/// as a worker at all.
+/// daemon's own binary directory is where the real `sgt-atlas-worker`
+/// binary's addressable path lives at runtime — resolved from
+/// [`std::env::current_exe`]'s own parent directory
+/// (`super::lane::worker_runtime`'s S4 Y8 fix; NOT `current_exe()` itself,
+/// which is the *daemon's* binary — `sgt`'s own CLI has no bare-flag
+/// surface, so re-execing it with `--generation`/`--extractor` is a clap
+/// parse error, never a worker run, unlike [`crate::cli`]'s `spawn_daemon`
+/// re-exec, which passes a real `sgt` subcommand `sgt`'s own parser
+/// accepts) — while an integration test spawns the worker binary Cargo
+/// built for it directly (`env!("CARGO_BIN_EXE_sgt-atlas-worker")`) —
+/// `current_exe()` inside a test binary answers with the *test binary's
+/// own* path, which is not runnable as a worker at all, sibling directory
+/// or not.
 #[derive(Debug, Clone)]
 pub struct WorkerSpawn {
     /// The worker binary to run.
@@ -400,6 +406,39 @@ pub struct WorkerSpawn {
     /// process group and reaps it.
     pub deadline: Duration,
 }
+
+/// The two invariants one whole scan's worth of worker dispatch shares —
+/// where the binary lives, and how long a single call may run — threaded
+/// down to whichever walk ([`super::scan::Walk`], [`super::git::extract_blobs`])
+/// actually claims a resource for a supervised adapter (S4 Y8).
+///
+/// A scan claims Office/ZIP/mail resources one at a time, deep inside a
+/// pure, engine-agnostic walk that (by design, module doc) knows nothing
+/// about an [`crate::runtime::engine::Engine`] or a daemon's own binary
+/// path — so this is resolved once, by whichever caller *does* know it
+/// ([`super::lane::scan_local_knowledge_on_lane`]/
+/// [`super::lane::scan_estate_git_on_lane`] in production; a test spawning
+/// the real `sgt-atlas-worker` Cargo built), and passed down as one small
+/// value rather than re-derived per resource.
+#[derive(Debug, Clone)]
+pub struct WorkerRuntime {
+    /// The worker binary every claimed resource in this scan dispatches to
+    /// — see [`WorkerSpawn::program`]'s own doc for why this is a plain
+    /// `PathBuf` rather than [`std::env::current_exe`] baked in here.
+    pub program: PathBuf,
+    /// [`WorkerSpawn::deadline`] for every call this scan makes.
+    pub deadline: Duration,
+}
+
+/// **PROVISIONAL — declared, not measured**, the same honesty
+/// [`WORKER_ADDRESS_SPACE_LIMIT_BYTES`]'s own doc states for its number: S4
+/// Y8 is this transport's first production caller, so there is no real
+/// scanned corpus to time it against yet. Generous enough that an ordinary
+/// `.docx`/`.zip`/`.eml` well under [`super::scan::MAX_RESOURCE_BYTES`]
+/// finishes with room to spare; must be re-derived against a real corpus
+/// once one exists, and this comment updated to cite that measurement when
+/// it does.
+pub const WORKER_RUNTIME_DEADLINE: Duration = Duration::from_secs(30);
 
 /// What one supervised call produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -511,12 +550,17 @@ impl WorkerFault {
 /// or signal short of it), parse its stdout, and — only for a worker that
 /// actually produced a batch — run it through [`validate_batch`].
 ///
-/// The intelligence-lane permit is not acquired here: [`super::lane`]'s
-/// [`super::lane::run_worker_on_lane`] is what a daemon caller actually
-/// calls, and it wraps this function in [`crate::runtime::engine::Engine::run_intelligence`]
-/// the same way [`super::lane::scan_estate_git_on_lane`] wraps
-/// [`super::git::scan_estate_git`] — this function stays engine-agnostic so
-/// it is independently testable without a daemon.
+/// The intelligence-lane permit is not acquired here: a real scan dispatch
+/// ([`super::scan::dispatch_worker_resource`], called from
+/// [`super::lane::scan_local_knowledge_on_lane`]/
+/// [`super::lane::scan_estate_git_on_lane`]) calls this function directly,
+/// already inside the ONE whole-scan permit those two entry points acquire
+/// (S4 Y8); [`super::lane::run_worker_on_lane`] wraps this function in its
+/// own per-call [`crate::runtime::engine::Engine::run_intelligence`] permit
+/// instead, the same way [`super::lane::scan_estate_git_on_lane`] wraps
+/// [`super::git::scan_estate_git`], but stays test-only — see its own doc.
+/// Either shape leaves this function itself engine-agnostic, independently
+/// testable without a daemon.
 pub fn run_worker(
     spawn: WorkerSpawn,
     identity: &WorkerIdentity,
@@ -1179,5 +1223,102 @@ mod tests {
             "an unrelated signal must not be named the memory cap: {detail:?}"
         );
         assert!(detail.contains("terminated by signal"), "{detail:?}");
+    }
+
+    /// **S4 Y7 closeout, boundary audit.** "A worker never opens the store"
+    /// was asserted only in `src/bin/atlas_worker.rs`'s own module doc
+    /// ("Never opens Atlas's store ... which is what makes ... true
+    /// structurally rather than by convention") — a comment claiming a
+    /// structural fact, not a test proving one. Item 12's own check
+    /// (`x5_a1a_acceptance::a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli`)
+    /// pins the CLI-never-writes half of the daemon-sole-writer boundary;
+    /// nothing pinned this sibling claim about the worker process. This is
+    /// that pin, in the same token-scan style the one-owner DuckDB-crate
+    /// tests use (`x1_atlas_substrate::atlas_database_has_exactly_one_owner`,
+    /// `m5_projections::t2_the_duckdb_file_has_exactly_one_owner`) — watched
+    /// red by hand before landing (a temporary `AtlasDb` token inserted into
+    /// each file in turn failed this assertion, then was reverted) rather
+    /// than assumed to work from the shape alone.
+    #[test]
+    fn a_worker_never_names_the_atlas_store() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // Needle spelled from parts so this test's own source does not trip
+        // its own check the way scanning `worker.rs` in full — the file
+        // this very test lives in — would (the same self-reference problem
+        // `x5_a1a_acceptance.rs`'s production-caller check solves by cutting
+        // its scan off at `\nmod tests {`).
+        let needles = ["Atlas", "Db"].concat();
+
+        // S4 Y8 panel fix (a): `src/bin/` is walked recursively rather than
+        // one hardcoded `atlas_worker.rs` path, the same "one owner, checked
+        // against everything in the tree" shape
+        // `x1_atlas_substrate::atlas_database_has_exactly_one_owner` already
+        // uses — a second worker binary, or `atlas_worker.rs` splitting into
+        // a directory, stays covered without this test needing a second
+        // edit. The `any(...)` assertion is the coverage guard: a typo'd
+        // root that silently matched zero files would make the loop below
+        // vacuously pass.
+        let bin_files = rust_sources(&root.join("src/bin"));
+        assert!(
+            bin_files
+                .iter()
+                .any(|f| f.file_name().is_some_and(|n| n == "atlas_worker.rs")),
+            "the recursive walk of src/bin/ must actually find atlas_worker.rs, or this check \
+             proves nothing: {bin_files:?}"
+        );
+        let mut scanned: Vec<(String, String)> = bin_files
+            .into_iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                (
+                    path.strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                    text,
+                )
+            })
+            .collect();
+        scanned.push((
+            "src/runtime/atlas/worker.rs (production code only)".to_string(),
+            std::fs::read_to_string(root.join("src/runtime/atlas/worker.rs"))
+                .map(|whole| {
+                    let cut = whole
+                        .find("\n#[cfg(test)]\nmod tests {")
+                        .unwrap_or(whole.len());
+                    whole[..cut].to_string()
+                })
+                .unwrap_or_else(|e| panic!("read src/runtime/atlas/worker.rs: {e}")),
+        ));
+
+        for (relative, text) in scanned {
+            assert!(
+                !text.contains(&needles),
+                "{relative} names the Atlas store type — a worker process must have no path to \
+                 Atlas's store at all; the daemon is the sole writer AND the sole opener"
+            );
+            assert!(
+                !text.contains("atlas::db::"),
+                "{relative} names the store module path directly"
+            );
+        }
+    }
+
+    /// Every `.rs` file under `dir`, recursively — the same shape
+    /// `tests/x1_atlas_substrate.rs`'s own `rust_sources` helper uses (R2),
+    /// duplicated rather than shared because that one lives in a separate
+    /// integration-test binary this `src/`-embedded unit test cannot import.
+    fn rust_sources(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                out.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
     }
 }

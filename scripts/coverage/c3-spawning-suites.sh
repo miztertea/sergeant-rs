@@ -165,3 +165,16 @@ cov_stage_end 2 "y4_mail_adapter spawns real sgt-atlas-worker subprocesses in ev
 happy path, the genuine-vs-synthesized-HTML case, and every honest-refusal case all exit \
 normally, none are signalled); more than the test binary's own profile must arrive, or no \
 subprocess flushed"
+
+# S4 Y8, wired at birth (the #231 lesson, same as y1-y4 above): the dispatch
+# wiring itself, through the real sgt-atlas-worker subprocess spawned three
+# times over from one real scan (one docx, one zip, one eml, all in the one
+# end-to-end test this suite runs) — every case exits normally, none are
+# signalled, so every case is expected to flush a subprocess profile. Floor
+# 2, not higher, for the same reason y1-y4's is: the test binary's own
+# profile plus at least one flushed worker.
+cov_stage_begin c3-y8_adapter_dispatch
+cov_run cargo llvm-cov --no-report --test y8_adapter_dispatch --locked || cov_fail "y8_adapter_dispatch failed under instrumentation"
+cov_stage_end 2 "y8_adapter_dispatch dispatches real sgt-atlas-worker subprocesses for a real \
+docx, zip and eml from one real scan; more than the test binary's own profile must arrive, or \
+no subprocess flushed"

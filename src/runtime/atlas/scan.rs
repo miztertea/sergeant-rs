@@ -60,12 +60,23 @@
 //!
 //! Three walks acquire bytes by three different routes — this module's
 //! filesystem walk, [`super::git`]'s object-store read, and
-//! [`super::overlay`]'s Work surface. They all extract through exactly two
+//! [`super::overlay`]'s Work surface. They all extract through the same two
 //! functions here: [`claims_for`], which decides from a path alone what claims
 //! it, and [`extract_resource`], which runs every claiming extractor over the
 //! bytes. Three copies of that would be three ways for F7's premise —
 //! identical bytes plus an identical extractor identity are one extraction —
 //! to stop being true.
+//!
+//! **A second, disjoint pair does the same job for a supervised-worker
+//! adapter (S4 Y8).** [`worker_extractor_for`] is [`claims_for`]'s own
+//! sibling for Office/ZIP/mail — extensions that are never valid UTF-8 text,
+//! so they were never reaching `claims_for`'s pipeline — and
+//! [`dispatch_worker_resource`] is [`extract_resource`]'s sibling, shared by
+//! this module's own walk and [`super::git`]'s. [`super::overlay`] uses
+//! neither half of this second pair: a Work surface's own edited files stay
+//! worker-free this wave (brief-y8-adapter-dispatch.md names only this
+//! module's and `super::git`'s walks), the same default
+//! [`scan_local_knowledge`]'s own doc states for its own callers.
 //!
 //! # F1's crash window
 //!
@@ -88,6 +99,9 @@ use crate::runtime::atlas::syntax::{SyntaxLanguage, language_for};
 use crate::runtime::atlas::tabular::{ContextFields, ScannedDataset, format_for, reader_identity};
 use crate::runtime::atlas::text::{
     MARKDOWN_EXTRACTOR, TEXT_EXTRACTOR, as_text, extractor_for, markdown_units, plain_units,
+};
+use crate::runtime::atlas::worker::{
+    WorkerIdentity, WorkerOutcome, WorkerRuntime, WorkerSpawn, run_worker,
 };
 
 /// The largest resource this build reads into memory to extract.
@@ -450,10 +464,35 @@ impl SourceScan {
 /// that refuses to finish when one file is unreadable reports nothing about
 /// the thousand that were.
 pub fn scan_local_knowledge(source: &KnowledgeSource) -> Result<SourceScan, BadPattern> {
+    scan_local_knowledge_impl(source, None)
+}
+
+/// [`scan_local_knowledge`], with Office/ZIP/mail resources routed through a
+/// real supervised worker (S4 Y8) instead of being reported `unsupported`
+/// for lack of one — the shape [`super::lane::scan_local_knowledge_on_lane`]
+/// actually drives in production.
+///
+/// [`scan_local_knowledge`] itself stays worker-free (R1): every existing
+/// caller — this module's own tests, [`super::record`]'s convenience
+/// wrapper, and the suites that construct a [`KnowledgeSource`] directly —
+/// proves what it proves without ever needing a real subprocess, and none of
+/// their fixtures claim a worker-routed extension anyway.
+pub fn scan_local_knowledge_with_worker(
+    source: &KnowledgeSource,
+    worker: &WorkerRuntime,
+) -> Result<SourceScan, BadPattern> {
+    scan_local_knowledge_impl(source, Some(worker))
+}
+
+fn scan_local_knowledge_impl(
+    source: &KnowledgeSource,
+    worker: Option<&WorkerRuntime>,
+) -> Result<SourceScan, BadPattern> {
     let filter = AcquisitionFilter::new(&source.ignore)?;
     let mut walk = Walk {
         filter: &filter,
         context_fields: &source.context_fields,
+        worker,
         files: Vec::new(),
         datasets: Vec::new(),
         coverage: Vec::new(),
@@ -515,6 +554,11 @@ pub fn scan_local_knowledge(source: &KnowledgeSource) -> Result<SourceScan, BadP
 struct Walk<'a> {
     filter: &'a AcquisitionFilter,
     context_fields: &'a ContextFields,
+    /// `None` for a worker-free walk ([`scan_local_knowledge`]'s own
+    /// callers): a resource [`worker_extractor_for`] claims is then reported
+    /// `unsupported`, honestly naming the missing worker, rather than
+    /// dispatched to nothing.
+    worker: Option<&'a WorkerRuntime>,
     files: Vec<ScannedFile>,
     datasets: Vec<ScannedDataset>,
     coverage: Vec<CoverageRow>,
@@ -641,6 +685,16 @@ impl Walk<'_> {
             self.dataset(path, relative, meta, format);
             return;
         }
+        // X3b's union, widened (S4 Y8): a third, disjoint routing table for
+        // the three extensions that are never valid UTF-8 text and were
+        // never going into `extract_resource`'s in-process pipeline —
+        // checked before `claims_for` so a `.docx`/`.zip`/`.eml` never falls
+        // through to the text branch's UTF-8 gate on its way to being
+        // reported unsupported.
+        if let Some(extractor) = worker_extractor_for(&relative) {
+            self.worker_resource(path, relative, meta, extractor);
+            return;
+        }
         let Some(claims) = claims_for(&relative) else {
             self.coverage.push(CoverageRow {
                 path: Some(relative),
@@ -713,6 +767,83 @@ impl Walk<'_> {
             units: extracted.units,
             syntax: extracted.syntax,
         });
+    }
+
+    /// Acquire and dispatch one resource a supervised-worker adapter claims
+    /// (S4 Y8) — [`worker_extractor_for`]'s own routing. The same online-only
+    /// and size-ceiling gates [`Self::file`] applies to the in-process path
+    /// apply here first, over the same already-fetched metadata, before a
+    /// single byte is read; what differs from there on is where the bytes
+    /// go — [`run_worker`], never `extract_resource`'s UTF-8 text pipeline,
+    /// because the parser behind this extractor is third-party code over
+    /// attacker-influenced bytes (G2's own boundary), not because this walk
+    /// stopped trusting the filesystem.
+    fn worker_resource(
+        &mut self,
+        path: &Path,
+        relative: String,
+        meta: std::fs::Metadata,
+        extractor: &'static str,
+    ) {
+        if suspected_online_only(&meta) {
+            self.coverage.push(CoverageRow {
+                path: Some(relative),
+                status: Coverage::OnlineOnly,
+                detail: Some(ONLINE_ONLY_DETAIL.to_string()),
+                bytes: Some(meta.len()),
+            });
+            return;
+        }
+        if meta.len() > MAX_RESOURCE_BYTES {
+            self.coverage.push(CoverageRow {
+                path: Some(relative),
+                status: Coverage::Unsupported,
+                detail: Some(format!(
+                    "larger than the {MAX_RESOURCE_BYTES}-byte resource ceiling"
+                )),
+                bytes: Some(meta.len()),
+            });
+            return;
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.coverage.push(CoverageRow {
+                    path: Some(relative),
+                    status: Coverage::Unavailable,
+                    detail: Some(format!("cannot be read: {e}")),
+                    bytes: Some(meta.len()),
+                });
+                return;
+            }
+        };
+        let hash = content_hash(&bytes);
+        let Some(worker) = self.worker else {
+            self.coverage.push(CoverageRow {
+                path: Some(relative),
+                status: Coverage::Unsupported,
+                detail: Some(format!(
+                    "{extractor} claims this resource, but no supervised worker is configured \
+                     for this scan"
+                )),
+                bytes: Some(bytes.len() as u64),
+            });
+            return;
+        };
+        let mtime = mtime_millis(&meta);
+        dispatch_worker_resource(
+            worker,
+            self.filter,
+            relative,
+            &hash,
+            KeySpace::Local,
+            bytes,
+            extractor,
+            mtime,
+            &mut self.files,
+            &mut self.coverage,
+            &mut self.extractors,
+        );
     }
 
     /// Register one tabular dataset (X4).
@@ -889,6 +1020,163 @@ pub fn claims_for(relative: &str) -> Option<Claims> {
         structure,
         language,
     })
+}
+
+/// What claims `relative` for a supervised-worker adapter (Office/ZIP/mail),
+/// or `None` for a path none of them claims (S4 Y8).
+///
+/// A second, disjoint routing table from [`claims_for`]'s own union of
+/// [`extractor_for`]/[`language_for`]: `.docx`/`.zip`/`.eml` are never valid
+/// UTF-8 text, so they were never reaching [`extract_resource`]'s in-process
+/// pipeline — they route instead through [`run_worker`], because the parser
+/// behind each is third-party code over attacker-influenced bytes (G2's own
+/// boundary), and a crash in one belongs to a worker's own process group,
+/// never the daemon's. [`office::extractor_for`], [`archive::extractor_for`]
+/// and [`mail::extractor_for`] are unioned exactly the way [`claims_for`]
+/// unions its own two tables — one place, so a fourth worker-routed adapter
+/// only ever widens this one `.or_else` chain.
+///
+/// [`office::extractor_for`]: crate::runtime::atlas::office::extractor_for
+/// [`archive::extractor_for`]: crate::runtime::atlas::archive::extractor_for
+/// [`mail::extractor_for`]: crate::runtime::atlas::mail::extractor_for
+pub fn worker_extractor_for(relative: &str) -> Option<&'static str> {
+    crate::runtime::atlas::office::extractor_for(relative)
+        .or_else(|| crate::runtime::atlas::archive::extractor_for(relative))
+        .or_else(|| crate::runtime::atlas::mail::extractor_for(relative))
+}
+
+/// The sentinel [`WorkerIdentity::generation_id`] a per-resource worker
+/// dispatch uses mid-walk (S4 Y8) — before Atlas has assigned a real
+/// generation for the scan this resource belongs to.
+///
+/// A generation is assigned only once a whole scan is staged
+/// ([`super::db::AtlasDb::stage_scan`]), which happens after every resource
+/// has already been walked and extracted; dispatching one resource to a
+/// worker happens *during* that walk, before any such id exists. This value
+/// correlates one dispatched call to its own [`super::worker::validate_batch`]
+/// check — the worker echoes it back untouched, and a mismatch would mean
+/// the batch answered a different call — and is never written to the store
+/// or confused with a persisted `source.generations.id`.
+pub(crate) const PRE_STAGE_GENERATION: &str = "pending";
+
+/// Dispatch one resource a supervised-worker adapter claims to the real
+/// worker, and fold the outcome into a walk's accumulating rows (S4 Y8) —
+/// the one place this happens for every walk that routes through a worker,
+/// mirroring [`extract_resource`]'s own "one place a resource is extracted"
+/// rule for the in-process pipeline (module doc, "The shared extraction").
+///
+/// `content_id`/`keys` compose the *stored* F7 key exactly as
+/// [`extract_resource`] does for its own callers — a filesystem resource's
+/// BLAKE3 hash for [`KeySpace::Local`], Git's own blob OID for
+/// [`KeySpace::EstateGit`], never a second hash of bytes Git already hashed.
+/// That is independent of, and may differ from, the hash the wire protocol
+/// itself always uses: [`WorkerIdentity::resource_hash`] is specifically
+/// "BLAKE3 hex of the exact bytes handed to the worker" (its own doc)
+/// because `sgt-atlas-worker` always computes it that way regardless of
+/// which key space the caller's own F7 identity lives in
+/// (`src/bin/atlas_worker.rs`'s `normal_batch`) — so this function hashes
+/// `bytes` itself for the wire identity, and composes the stored key from
+/// `content_id` separately. For an estate-git resource the two differ (a
+/// SHA-1 blob OID is not a BLAKE3 digest); for a local one they happen to be
+/// the same bytes hashed the same way, computed twice rather than threaded
+/// through as one more parameter, because keeping the wire hash's
+/// computation in one place (here) is worth more than saving one BLAKE3
+/// pass over an already-small, already-ceiling-bounded resource.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_worker_resource(
+    worker: &WorkerRuntime,
+    filter: &AcquisitionFilter,
+    relative_path: String,
+    content_id: &str,
+    keys: KeySpace,
+    bytes: Vec<u8>,
+    extractor: &'static str,
+    mtime_millis: Option<i64>,
+    files: &mut Vec<ScannedFile>,
+    coverage: &mut Vec<CoverageRow>,
+    extractors: &mut BTreeSet<String>,
+) {
+    let identity = WorkerIdentity {
+        generation_id: PRE_STAGE_GENERATION.to_string(),
+        resource_hash: content_hash(&bytes),
+        extractor: extractor.to_string(),
+    };
+    let spawn = WorkerSpawn {
+        program: worker.program.clone(),
+        args: vec![
+            "--generation".to_string(),
+            identity.generation_id.clone(),
+            "--extractor".to_string(),
+            identity.extractor.clone(),
+        ],
+        input: bytes.clone(),
+        deadline: worker.deadline,
+    };
+    match run_worker(spawn, &identity, filter) {
+        WorkerOutcome::Accepted(batch) => {
+            extractors.insert(batch.extractor.clone());
+            // Children (archive entries, mail attachments) are validated
+            // daemon-side (`validate_batch`'s own AUTHORITY, already proven)
+            // but do not yet carry content on the wire — `WorkerBatch`'s own
+            // `declared_children` is `name`/`relative_path` only
+            // (`archive.rs`'s module doc, "A named seam"). Recording their
+            // names here, in the parent's own coverage detail, is what makes
+            // a validated declaration a visible, persisted fact rather than
+            // one silently dropped on the floor — the honest amount of
+            // "landed" the wire contract can carry today (J0: widening that
+            // contract is not this function's call to make).
+            let mut detail = batch.extractor.clone();
+            if !batch.declared_children.is_empty() {
+                let names: Vec<String> = batch
+                    .declared_children
+                    .iter()
+                    .map(|c| c.relative_path.clone())
+                    .collect();
+                detail = format!(
+                    "{detail}; declared children (validated daemon-side, not yet \
+                     content-persisted — see archive.rs's own module doc, \"A named seam\"): {}",
+                    names.join(", ")
+                );
+            }
+            coverage.push(CoverageRow {
+                path: Some(relative_path.clone()),
+                status: Coverage::Indexed,
+                detail: Some(detail),
+                bytes: Some(bytes.len() as u64),
+            });
+            let units = batch
+                .units
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, unit)| ScannedUnit {
+                    ordinal: ordinal as u64,
+                    kind: unit.kind,
+                    heading_level: None,
+                    title: None,
+                    byte_start: unit.byte_start,
+                    byte_end: unit.byte_end,
+                    text: unit.text,
+                })
+                .collect();
+            files.push(ScannedFile {
+                relative_path,
+                local_key: keys.key(content_id, &batch.extractor),
+                content_hash: content_id.to_string(),
+                extractor: batch.extractor,
+                byte_len: bytes.len() as u64,
+                mtime_millis,
+                units,
+                syntax: None,
+            });
+        }
+        WorkerOutcome::Refused(row) => {
+            coverage.push(CoverageRow {
+                path: Some(relative_path),
+                bytes: Some(bytes.len() as u64),
+                ..row
+            });
+        }
+    }
 }
 
 /// Everything one resource's bytes yielded, for every extractor that claimed

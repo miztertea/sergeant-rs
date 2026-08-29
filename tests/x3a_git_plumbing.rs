@@ -29,13 +29,16 @@ use sergeant_rs::domain::source::{Coverage, KIND_SOURCE_SCANNED, estate_git_key}
 use sergeant_rs::runtime::atlas::db::AtlasDb;
 use sergeant_rs::runtime::atlas::git::{
     EstateGitSource, extract_tree, list_tree, observe_drift, scan_estate_git,
+    scan_estate_git_with_worker,
 };
 use sergeant_rs::runtime::atlas::lane::scan_estate_git_on_lane;
+use sergeant_rs::runtime::atlas::office::DOCX_EXTRACTOR;
 use sergeant_rs::runtime::atlas::overlay::{WorkOverlay, scan_work_overlay};
 use sergeant_rs::runtime::atlas::record::{
     ScanRecord, scan_and_record_estate_git, scan_and_record_overlay,
 };
 use sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR;
+use sergeant_rs::runtime::atlas::worker::WorkerRuntime;
 use sergeant_rs::runtime::engine::Engine;
 use sergeant_rs::runtime::git::git;
 use sergeant_rs::runtime::journal::Journal;
@@ -489,4 +492,64 @@ async fn a_panicking_intelligence_job_is_reported_and_frees_its_permit() {
     );
     let ok: usize = engine.run_intelligence(|| 7).await.expect("still usable");
     assert_eq!(ok, 7);
+}
+
+// ------------------------------------------------- S4 Y8: worker dispatch
+
+/// S4 Y8: a repository-resident `.docx` routes through the real supervised
+/// worker exactly the way a filesystem one does
+/// (`tests/y8_adapter_dispatch.rs`'s own end-to-end proof) — the estate-git
+/// half of the wave's own dispatch requirement, over real bytes committed to
+/// a real repository rather than a synthetic fixture.
+#[test]
+fn a_committed_docx_blob_routes_through_the_worker_via_estate_git() {
+    let docx = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/anydoc_corpus/docx_fixtures/01-plain-headings-paragraphs.docx"),
+    )
+    .expect("read fixture");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mount = dir.path().join("mount");
+    std::fs::create_dir_all(&mount).expect("mkdir");
+    git(&mount, &["init", "--initial-branch=main"]).expect("init");
+    git(&mount, &["config", "user.email", "t@example.com"]).expect("email");
+    git(&mount, &["config", "user.name", "T"]).expect("name");
+    std::fs::write(mount.join("report.docx"), &docx).expect("write docx");
+    git(&mount, &["add", "-A"]).expect("add");
+    git(&mount, &["commit", "-m", "one"]).expect("commit");
+    let sha = git(&mount, &["rev-parse", "HEAD"]).expect("rev-parse");
+
+    let worker = WorkerRuntime {
+        program: PathBuf::from(env!("CARGO_BIN_EXE_sgt-atlas-worker")),
+        deadline: std::time::Duration::from_secs(20),
+    };
+    let scan = scan_estate_git_with_worker(&source(&mount, &sha), &worker)
+        .expect("scan")
+        .scan;
+    let row = scan
+        .coverage
+        .iter()
+        .find(|r| r.path.as_deref() == Some("report.docx"))
+        .expect("coverage row for report.docx");
+    assert_eq!(row.status, Coverage::Indexed, "{:?}", scan.coverage);
+    assert!(
+        scan.extractors.contains(DOCX_EXTRACTOR),
+        "{:?}",
+        scan.extractors
+    );
+    let file = scan
+        .files
+        .iter()
+        .find(|f| f.relative_path == "report.docx")
+        .expect("docx landed in source.files");
+    assert!(!file.units.is_empty(), "docx must produce document units");
+
+    // F7's estate-git half still holds for a worker-routed resource: the
+    // stored content identity is Git's own blob OID, never a second BLAKE3
+    // hash of bytes Git already hashed — even though the WIRE protocol to
+    // the worker always uses BLAKE3 (`dispatch_worker_resource`'s own doc
+    // explains why those are allowed to differ).
+    let oid = git(&mount, &["rev-parse", &format!("{sha}:report.docx")]).expect("rev-parse");
+    assert_eq!(file.content_hash, oid);
+    assert_eq!(file.local_key, estate_git_key(&oid, DOCX_EXTRACTOR));
 }
