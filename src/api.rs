@@ -852,12 +852,19 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
             EngineNext::Interrupt(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
+                // S5 W1d (F-SF-01 fix): an interrupt always ends the turn it
+                // cuts short — `settle_interrupt` unconditionally commits
+                // KIND_TURN_CEILING_INTERRUPTED and, when the Work is still
+                // Active, blocks it — so this is a fourth turn-boundary site,
+                // not a signal-conditioned one like Launch/Send/Observe: there
+                // is no `BackendSignal` on `InterruptOutcome` to read.
+                // Without this, a Work interrupted for a live ceiling
+                // crossing sits Blocked — often for a long time — with the
+                // overlay left stale from before the interrupted turn.
                 let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_interrupt(&mut core, *pending, outcome),
-                    core,
-                )
+                let settled = state.engine.settle_interrupt(&mut core, *pending, outcome);
+                refresh_overlay_after_turn(state, &core, &work_id, settled.is_ok());
+                (work_id, settled, core)
             }
         };
         let (work_id, outcome, core) = settled;
