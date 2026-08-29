@@ -178,3 +178,18 @@ cov_run cargo llvm-cov --no-report --test y8_adapter_dispatch --locked || cov_fa
 cov_stage_end 2 "y8_adapter_dispatch dispatches real sgt-atlas-worker subprocesses for a real \
 docx, zip and eml from one real scan; more than the test binary's own profile must arrive, or \
 no subprocess flushed"
+
+# S5 W7, wired at birth (the #231 lesson, same as y1-y4/y8 above): container
+# children as real resources, through the real sgt-atlas-worker subprocess.
+# Four of this suite's ten tests drive a real scan (a zip, a zip-in-mail
+# chain, an unclaimed-extension child, a four-level nested archive) and every
+# one of them spawns at least one worker that exits normally; the remaining
+# six call `validate_batch`/`decode_bounded` in-process, which is the point of
+# them — the daemon-side AUTHORITY is provable without a subprocess. Floor 2,
+# not higher, for the same reason y1-y4/y8's is: the test binary's own profile
+# plus at least one flushed worker.
+cov_stage_begin c3-w7_container_children
+cov_run cargo llvm-cov --no-report --test w7_container_children --locked || cov_fail "w7_container_children failed under instrumentation"
+cov_stage_end 2 "w7_container_children dispatches real sgt-atlas-worker subprocesses from four \
+real scans (a zip, a zip-inside-a-mail chain, an unclaimed-extension child, and a four-level \
+nested archive); more than the test binary's own profile must arrive, or no subprocess flushed"

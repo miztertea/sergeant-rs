@@ -110,6 +110,7 @@ fn file(
         mtime_millis: None,
         units,
         syntax: syntax_extraction,
+        parent: None,
     }
 }
 

@@ -91,8 +91,8 @@ use std::time::UNIX_EPOCH;
 use crate::domain::estate::KnowledgeSpec;
 use crate::domain::event::rfc3339_utc_now;
 use crate::domain::source::{
-    AuthorityClass, Coverage, CoverageRow, SourceKind, UnitKind, content_hash, estate_git_key,
-    generation_key, local_key,
+    AuthorityClass, Coverage, CoverageRow, SourceKind, UnitKind, child_key, content_hash,
+    estate_git_key, generation_key, local_key,
 };
 use crate::runtime::atlas::deny::{AcquisitionFilter, BadPattern, Verdict};
 use crate::runtime::atlas::syntax::{SyntaxLanguage, language_for};
@@ -335,6 +335,12 @@ pub struct ScannedFile {
     /// ([`Coverage::Error`]) rather than a shorter list nothing can
     /// distinguish from a complete one.
     pub syntax: Option<ScannedSyntax>,
+    /// `Some` when this resource is a container CHILD — an archive entry, a
+    /// mail attachment, or a descendant of either (S5 W7) — naming the parent
+    /// coordinate A1 §6.6 requires an expanded entry to preserve. `None` for
+    /// every resource acquired directly from a source root, a Git tree or a
+    /// Work overlay.
+    pub parent: Option<ChildProvenance>,
 }
 
 /// Everything one completed walk observed. Plain data — no handle, no
@@ -766,6 +772,7 @@ impl Walk<'_> {
             mtime_millis: mtime_millis(&meta),
             units: extracted.units,
             syntax: extracted.syntax,
+            parent: None,
         });
     }
 
@@ -967,26 +974,66 @@ pub const UNCLAIMED: &str = "no extractor or grammar in this build claims this e
 /// The two halves of F7's cache-key rule, as a value the three walks can pass
 /// to one shared extractor instead of each spelling their own composition. The
 /// spaces are domain-separated by
-/// [`estate_git_key`]/[`local_key`] themselves — this enum only chooses
-/// between them, and cannot blur them.
+/// [`estate_git_key`]/[`local_key`]/[`child_key`] themselves — this enum only
+/// chooses between them, and cannot blur them. S5 W7 added the third arm for
+/// container children; the domain separation argument is unchanged, because
+/// it lives in those three functions' own hash transcripts, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeySpace {
+pub enum KeySpace<'a> {
     /// BLAKE3 of the bytes plus extractor identity — a filesystem resource,
     /// which no object store has already named.
     Local,
     /// Git blob OID plus extractor identity — **never a second hash of bytes
     /// Git already hashed**.
     EstateGit,
+    /// A container child (S5 W7): [`child_key`] of its IMMEDIATE parent's own
+    /// key, its entry path, its content hash and its extractor — chained, so
+    /// a grandchild's key already encodes its whole ancestry (`child_key`'s
+    /// own doc for why a flattened "always key off the root" scheme would
+    /// collide two nested archives sharing a leaf path).
+    ///
+    /// Not a third *hashing* rule so much as a third *composition* rule: the
+    /// content identity handed to [`Self::key`] is still the daemon's own
+    /// BLAKE3 of the bytes it received, exactly as [`Self::Local`]'s is.
+    Child {
+        /// The immediate parent resource's own composed key.
+        parent_key: &'a str,
+        /// The child's entry path inside that parent.
+        entry_path: &'a str,
+    },
 }
 
-impl KeySpace {
+impl KeySpace<'_> {
     /// Compose a content identity with an extractor identity in this space.
     pub fn key(self, content_id: &str, extractor: &str) -> String {
         match self {
             Self::Local => local_key(content_id, extractor),
             Self::EstateGit => estate_git_key(content_id, extractor),
+            Self::Child {
+                parent_key,
+                entry_path,
+            } => child_key(parent_key, entry_path, content_id, extractor),
         }
     }
+}
+
+/// Where a landed child resource came from — A1 §6.6's first two preserved
+/// fields (`parent archive source/resource`, `entry path`), carried beside
+/// the child's own row (S5 W7).
+///
+/// The other two of §6.6's four are already columns every resource row has:
+/// the entry content hash is [`ScannedFile::content_hash`] (the daemon's own
+/// hash of the bytes it received) and the entry adapter is
+/// [`ScannedFile::extractor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildProvenance {
+    /// The parent container resource's own path, as that resource was
+    /// addressed in this scan.
+    pub parent_relative_path: String,
+    /// The parent container resource's own composed F7 key.
+    pub parent_key: String,
+    /// This child's entry path inside that parent.
+    pub entry_path: String,
 }
 
 /// What claims one path, decided from the path alone (X3b).
@@ -1045,6 +1092,58 @@ pub fn worker_extractor_for(relative: &str) -> Option<&'static str> {
         .or_else(|| crate::runtime::atlas::mail::extractor_for(relative))
 }
 
+/// What claims a container CHILD's path — A1 §6.6's `entry adapter` field
+/// (S5 W7).
+///
+/// Deliberately not a fourth routing table: it is exactly
+/// [`worker_extractor_for`] unioned with [`claims_for`]'s own structure
+/// extractor, in that order — the same two tables, consulted in the same
+/// order, that `Walk::file` already consults for a loose file on disk. A
+/// `.docx` inside a `.zip` inside an `.eml` therefore reaches the Office
+/// adapter by the same route a loose `.docx` does (A1-17, "recursively route
+/// child bytes through normal adapters"), and a child nothing claims answers
+/// `None`, which is a named coverage gap daemon-side rather than silence
+/// (F8).
+///
+/// What it deliberately does NOT consult is [`format_for`]'s dataset table: a
+/// `.csv`/`.parquet` child is registered from a filesystem PATH DuckDB reads
+/// itself, and a child's bytes exist only in memory. Such a child answers
+/// `None` here and lands as a named gap saying so — the honest answer, rather
+/// than a dataset row pointing at a path that does not exist.
+pub fn child_extractor_for(relative: &str) -> Option<&'static str> {
+    worker_extractor_for(relative).or_else(|| claims_for(relative).map(|claims| claims.structure))
+}
+
+/// Whether a child path routes to a CONTAINER adapter — an archive or a mail
+/// message (S5 W7).
+///
+/// A container child is landed as its own resource but never dispatched to a
+/// worker a second time: the worker that produced it already expanded it,
+/// under the one shared depth counter and the one shared whole-tree byte
+/// budget, and that expansion's own members arrive flattened in the SAME
+/// batch (see [`validate_batch`]'s own doc). Re-dispatching it daemon-side
+/// would be a second recursion under a second budget.
+///
+/// [`validate_batch`]: crate::runtime::atlas::worker::validate_batch
+pub fn child_is_container(relative: &str) -> bool {
+    crate::runtime::atlas::archive::extractor_for(relative).is_some()
+        || crate::runtime::atlas::mail::extractor_for(relative).is_some()
+}
+
+/// The separator between a container resource's own path and an entry path
+/// inside it, in a landed child's [`ScannedFile::relative_path`] (S5 W7).
+///
+/// `!/` is the long-established archive-coordinate convention (JAR URLs, and
+/// every tool that reads them), taken for the reason it was chosen there: it
+/// reads as "inside", and it is not what an ordinary directory separator
+/// looks like. The authoritative, unambiguous decomposition is not this
+/// string, though — it is [`ChildProvenance`], persisted per child in
+/// `source.child_resources`, which carries the parent path, the parent key
+/// and the entry path as their own columns (A1 §6.6's first two preserved
+/// fields). This separator is what makes a child addressable in the same
+/// column every other resource is addressable in.
+pub const CHILD_PATH_SEPARATOR: &str = "!/";
+
 /// The sentinel [`WorkerIdentity::generation_id`] a per-resource worker
 /// dispatch uses mid-walk (S4 Y8) — before Atlas has assigned a real
 /// generation for the scan this resource belongs to.
@@ -1096,6 +1195,55 @@ pub(crate) fn dispatch_worker_resource(
     coverage: &mut Vec<CoverageRow>,
     extractors: &mut BTreeSet<String>,
 ) {
+    dispatch_worker_resource_at_depth(
+        worker,
+        filter,
+        relative_path,
+        content_id,
+        keys,
+        bytes,
+        extractor,
+        mtime_millis,
+        None,
+        0,
+        files,
+        coverage,
+        extractors,
+    );
+}
+
+/// [`dispatch_worker_resource`] plus the two things only a CHILD dispatch
+/// needs (S5 W7): the parent coordinate the landed row must carry, and the
+/// nesting depth this dispatch already sits at.
+///
+/// `depth` is measured in the SAME counter mail and archive already share —
+/// [`archive::MAX_NESTING_DEPTH`], never a second one. In practice a worker
+/// flattens its whole expansion tree into one batch, so this recursion only
+/// ever goes one level deep (a container's child dispatched to a non-container
+/// adapter, e.g. a `.docx` entry to the Office adapter). The guard is what
+/// makes that a structural fact rather than an assumption about a
+/// well-behaved worker: a buggy or hostile worker that answers a `.docx`
+/// dispatch with another `.docx` child cannot walk the daemon down an
+/// unbounded recursion, because the same ceiling that bounds a container tree
+/// bounds this.
+///
+/// [`archive::MAX_NESTING_DEPTH`]: crate::runtime::atlas::archive::MAX_NESTING_DEPTH
+#[allow(clippy::too_many_arguments)]
+fn dispatch_worker_resource_at_depth(
+    worker: &WorkerRuntime,
+    filter: &AcquisitionFilter,
+    relative_path: String,
+    content_id: &str,
+    keys: KeySpace,
+    bytes: Vec<u8>,
+    extractor: &'static str,
+    mtime_millis: Option<i64>,
+    parent: Option<ChildProvenance>,
+    depth: u32,
+    files: &mut Vec<ScannedFile>,
+    coverage: &mut Vec<CoverageRow>,
+    extractors: &mut BTreeSet<String>,
+) {
     let identity = WorkerIdentity {
         generation_id: PRE_STAGE_GENERATION.to_string(),
         resource_hash: content_hash(&bytes),
@@ -1115,16 +1263,12 @@ pub(crate) fn dispatch_worker_resource(
     match run_worker(spawn, &identity, filter) {
         WorkerOutcome::Accepted(batch) => {
             extractors.insert(batch.extractor.clone());
-            // Children (archive entries, mail attachments) are validated
-            // daemon-side (`validate_batch`'s own AUTHORITY, already proven)
-            // but do not yet carry content on the wire — `WorkerBatch`'s own
-            // `declared_children` is `name`/`relative_path` only
-            // (`archive.rs`'s module doc, "A named seam"). Recording their
-            // names here, in the parent's own coverage detail, is what makes
-            // a validated declaration a visible, persisted fact rather than
-            // one silently dropped on the floor — the honest amount of
-            // "landed" the wire contract can carry today (J0: widening that
-            // contract is not this function's call to make).
+            // Every child in this batch has already passed `validate_batch`'s
+            // whole AUTHORITY — path safety, F10's deny set on name and path,
+            // the per-child ceiling, the content hash, the adapter claim —
+            // before a byte of it reaches here (S5 W7). What is left is to
+            // land it: a child is a RESOURCE, not a name in its container's
+            // coverage detail.
             let mut detail = batch.extractor.clone();
             if !batch.declared_children.is_empty() {
                 let names: Vec<String> = batch
@@ -1133,8 +1277,8 @@ pub(crate) fn dispatch_worker_resource(
                     .map(|c| c.relative_path.clone())
                     .collect();
                 detail = format!(
-                    "{detail}; declared children (validated daemon-side, not yet \
-                     content-persisted — see archive.rs's own module doc, \"A named seam\"): {}",
+                    "{detail}; children landed as their own resources (A1 §6.6, each with its \
+                     parent coordinate and the daemon's own hash of the bytes it received): {}",
                     names.join(", ")
                 );
             }
@@ -1158,16 +1302,31 @@ pub(crate) fn dispatch_worker_resource(
                     text: unit.text,
                 })
                 .collect();
+            let parent_key = keys.key(content_id, &batch.extractor);
             files.push(ScannedFile {
-                relative_path,
-                local_key: keys.key(content_id, &batch.extractor),
+                relative_path: relative_path.clone(),
+                local_key: parent_key.clone(),
                 content_hash: content_id.to_string(),
                 extractor: batch.extractor,
                 byte_len: bytes.len() as u64,
                 mtime_millis,
                 units,
                 syntax: None,
+                parent,
             });
+            for child in batch.declared_children {
+                land_child(
+                    worker,
+                    filter,
+                    &relative_path,
+                    &parent_key,
+                    child,
+                    depth,
+                    files,
+                    coverage,
+                    extractors,
+                );
+            }
         }
         WorkerOutcome::Refused(row) => {
             coverage.push(CoverageRow {
@@ -1177,6 +1336,181 @@ pub(crate) fn dispatch_worker_resource(
             });
         }
     }
+}
+
+/// Land one validated container child as its own resource (S5 W7) — A1
+/// §6.6's "entries expand into child resources", and A1-17's "recursively
+/// route child bytes through normal adapters".
+///
+/// The routing is [`child_extractor_for`]'s, which is
+/// [`worker_extractor_for`] ∪ [`claims_for`] — the same two tables, in the
+/// same order, a loose file of that name goes through — so there is exactly
+/// one dispatcher in this build, not a second one for children (R2). Three
+/// destinations follow from it:
+///
+/// - **a container child** (a nested `.zip`/`.eml`) lands as its own resource
+///   and is NOT re-dispatched: the worker already expanded it under the one
+///   shared depth counter and the one shared whole-tree byte budget, and its
+///   own members arrive flattened in the same batch;
+/// - **a worker-adapter child** (a `.docx`) is dispatched to the real worker
+///   through [`dispatch_worker_resource_at_depth`] — the identical path a
+///   loose `.docx` takes;
+/// - **an in-process child** (`.md`, `.txt`, a grammar-claimed source file)
+///   goes through [`extract_resource`], the identical path a loose one takes.
+///
+/// A child nothing claims is a NAMED COVERAGE GAP, not silence (F8): a
+/// [`Coverage::Unsupported`] row at the child's own composed path saying so.
+///
+/// The daemon's own [`content_hash`] of the bytes that arrived is the child's
+/// stored identity — see [`DeclaredChild`]'s own doc for what that does and
+/// does not vouch for.
+///
+/// [`DeclaredChild`]: crate::runtime::atlas::worker::DeclaredChild
+#[allow(clippy::too_many_arguments)]
+fn land_child(
+    worker: &WorkerRuntime,
+    filter: &AcquisitionFilter,
+    parent_relative_path: &str,
+    parent_key: &str,
+    child: crate::runtime::atlas::worker::DeclaredChild,
+    depth: u32,
+    files: &mut Vec<ScannedFile>,
+    coverage: &mut Vec<CoverageRow>,
+    extractors: &mut BTreeSet<String>,
+) {
+    let entry_path = child.relative_path;
+    let composed = format!("{parent_relative_path}{CHILD_PATH_SEPARATOR}{entry_path}");
+    let byte_len = child.content.len() as u64;
+    if depth >= crate::runtime::atlas::archive::MAX_NESTING_DEPTH {
+        coverage.push(CoverageRow {
+            path: Some(composed),
+            status: Coverage::Unsupported,
+            detail: Some(format!(
+                "container child at nesting depth {depth}, at or past the shared \
+                 {}-level ceiling (archive::MAX_NESTING_DEPTH — the same counter archive and \
+                 mail nesting share); not landed",
+                crate::runtime::atlas::archive::MAX_NESTING_DEPTH
+            )),
+            bytes: Some(byte_len),
+        });
+        return;
+    }
+    let Some(extractor) = child_extractor_for(&entry_path) else {
+        coverage.push(CoverageRow {
+            path: Some(composed),
+            status: Coverage::Unsupported,
+            detail: Some(format!(
+                "{UNCLAIMED} (container child of {parent_relative_path:?}; admitted and \
+                 validated, but nothing in this build claims its extension)"
+            )),
+            bytes: Some(byte_len),
+        });
+        return;
+    };
+    // The daemon's own hash of the bytes it received, computed on receipt —
+    // not the worker's declared value, which `validate_batch` has already
+    // cross-checked against exactly this computation.
+    let hash = content_hash(&child.content);
+    let provenance = ChildProvenance {
+        parent_relative_path: parent_relative_path.to_string(),
+        parent_key: parent_key.to_string(),
+        entry_path: entry_path.clone(),
+    };
+    let keys = KeySpace::Child {
+        parent_key,
+        entry_path: &entry_path,
+    };
+    if child_is_container(&entry_path) {
+        extractors.insert(extractor.to_string());
+        coverage.push(CoverageRow {
+            path: Some(composed.clone()),
+            status: Coverage::Indexed,
+            detail: Some(format!(
+                "{extractor}; container child — whatever the worker that produced it admitted \
+                 out of it, under the shared depth counter and whole-tree byte budget, is landed \
+                 from the SAME batch; this daemon never re-enters a container. Whether that \
+                 worker opened this one at all, or stopped at the depth ceiling, is a per-entry \
+                 coverage fact `WorkerBatch` still has no field to carry (the pre-existing named \
+                 gap in `src/bin/atlas_worker.rs`'s own module doc), so it is not claimed here"
+            )),
+            bytes: Some(byte_len),
+        });
+        files.push(ScannedFile {
+            relative_path: composed,
+            local_key: keys.key(&hash, extractor),
+            content_hash: hash,
+            extractor: extractor.to_string(),
+            byte_len,
+            mtime_millis: None,
+            units: Vec::new(),
+            syntax: None,
+            parent: Some(provenance),
+        });
+        return;
+    }
+    if worker_extractor_for(&entry_path).is_some() {
+        dispatch_worker_resource_at_depth(
+            worker,
+            filter,
+            composed,
+            &hash,
+            keys,
+            child.content,
+            extractor,
+            None,
+            Some(provenance),
+            depth + 1,
+            files,
+            coverage,
+            extractors,
+        );
+        return;
+    }
+    let Some(claims) = claims_for(&entry_path) else {
+        // Unreachable in practice: `child_extractor_for` answered `Some`, and
+        // its only other arm is `worker_extractor_for`, already taken above.
+        // Named rather than unwrapped — a routing table that grew a third arm
+        // should produce an honest coverage row here, never a panic in the
+        // daemon.
+        coverage.push(CoverageRow {
+            path: Some(composed),
+            status: Coverage::Unsupported,
+            detail: Some(format!(
+                "{UNCLAIMED} (container child claimed {extractor} by routing but no in-process \
+                 claim backs it)"
+            )),
+            bytes: Some(byte_len),
+        });
+        return;
+    };
+    let Some(text) = as_text(&child.content) else {
+        coverage.push(CoverageRow {
+            path: Some(composed),
+            status: Coverage::Unsupported,
+            detail: Some("not valid UTF-8 text".to_string()),
+            bytes: Some(byte_len),
+        });
+        return;
+    };
+    let extracted = extract_resource(claims, text, &hash, keys);
+    extractors.extend(extracted.identities.iter().cloned());
+    coverage.push(CoverageRow {
+        path: Some(composed.clone()),
+        status: extracted.status(),
+        detail: Some(extracted.detail()),
+        bytes: Some(byte_len),
+    });
+    files.push(ScannedFile {
+        relative_path: composed,
+        local_key: extracted.key,
+        content_hash: hash,
+        extractor: extracted.extractor.to_string(),
+        byte_len,
+        mtime_millis: None,
+        units: extracted.units,
+        syntax: extracted.syntax,
+        parent: Some(provenance),
+    });
 }
 
 /// Everything one resource's bytes yielded, for every extractor that claimed

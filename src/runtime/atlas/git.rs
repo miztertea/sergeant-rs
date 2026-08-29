@@ -541,6 +541,9 @@ pub(crate) fn extract_blobs(
                 mtime_millis: None,
                 units: extracted.units,
                 syntax: extracted.syntax,
+                // A Git tree entry is acquired directly, never expanded out
+                // of a container (S5 W7).
+                parent: None,
             });
         }
     }

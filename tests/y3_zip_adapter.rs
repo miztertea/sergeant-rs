@@ -154,12 +154,20 @@ fn a_zip_worker_declares_admitted_children_through_the_real_subprocess() {
     assert_eq!(dup_batch.declared_children[0].relative_path, "dup.txt");
 }
 
-/// A well-formed nested archive (`06-nested-outer.zip`, depth 1) is declared
-/// as ONE child (`inner.zip`) on today's wire — grandchildren stay internal
-/// to `archive::expand`'s own return value (the named seam, `archive.rs`'s
-/// own module doc: `DeclaredChild` carries no nested structure yet).
+/// A well-formed nested archive (`06-nested-outer.zip`, depth 1) declares
+/// BOTH levels on the wire (S5 W7): the entry that is itself an archive, and
+/// — beneath it, at its own `/`-joined path — the members `archive::expand`
+/// already extracted from it under the shared depth counter and whole-tree
+/// byte budget.
+///
+/// This is what makes ONE depth counter enough: the worker flattens the tree
+/// it already walked, so the daemon lands what this list says and never
+/// re-enters a container looking for more (`validate_batch`'s own doc, "Why
+/// the daemon never re-enters a container to find a grandchild"). Before W7
+/// this test asserted the opposite — one child, grandchildren unreachable —
+/// which was the named seam register items 7 and 8 carried as a deviation.
 #[test]
-fn a_nested_archive_entry_is_declared_once_not_recursed_onto_the_wire() {
+fn a_nested_archive_declares_both_levels_flattened_onto_one_wire_batch() {
     let input = fixture("06-nested-outer.zip");
     let identity = identity_for(&input);
     let outcome = run_worker(
@@ -170,9 +178,33 @@ fn a_nested_archive_entry_is_declared_once_not_recursed_onto_the_wire() {
     let WorkerOutcome::Accepted(batch) = outcome else {
         panic!("a nested archive within the depth ceiling must still be accepted: {outcome:?}");
     };
-    assert_eq!(batch.declared_children.len(), 1);
-    assert_eq!(batch.declared_children[0].relative_path, "inner.zip");
+    let paths: Vec<&str> = batch
+        .declared_children
+        .iter()
+        .map(|c| c.relative_path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["inner.zip", "inner.zip/leaf.md"],
+        "the nested archive and its own member both reach the wire"
+    );
     assert_eq!(batch.declared_children[0].name, "inner.zip");
+    assert_eq!(batch.declared_children[1].name, "leaf.md");
+    // The grandchild carries REAL BYTES, not just a name — the whole point of
+    // W7 — and the adapter claim is the child's own downstream extractor
+    // (`markdown/v1`), never the container adapter that unpacked it (A1 §6.6,
+    // and `child_key`'s own warning against `adapter=zip`).
+    let leaf = &batch.declared_children[1];
+    assert_eq!(
+        String::from_utf8(leaf.content.clone()).expect("leaf.md is UTF-8"),
+        "# leaf\n\ninner content\n"
+    );
+    assert_eq!(leaf.entry_adapter.as_deref(), Some("markdown/v1"));
+    assert_eq!(
+        leaf.content_hash,
+        sergeant_rs::domain::source::content_hash(&leaf.content),
+        "the worker's declared hash is its own BLAKE3 of the bytes it sent"
+    );
 }
 
 // ------------------------------------------------- the archive-level refusal proof

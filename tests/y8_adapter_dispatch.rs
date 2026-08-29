@@ -202,33 +202,43 @@ fn a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_g
     );
 
     // ------------------------------------------------------------ children
-    // Declared children (validated daemon-side by the real `validate_batch`
-    // AUTHORITY — path safety, F10 deny-set membership) actually landed as
-    // visible, persisted evidence: the recorded coverage detail for each
-    // container names every admitted child. This is the honest amount the
-    // wire contract can carry today — see `archive.rs`'s own module doc,
-    // "A named seam": `WorkerBatch`/`DeclaredChild` do not yet carry a
-    // child's content bytes, only its name and path, so a child does not
-    // yet land as its own `source.files` row. Register row 7's own note
-    // states this as `met-with-deviation`, not a silent gap.
-    let zip_detail = coverage_row(&scan, "bundle.zip")
-        .detail
-        .clone()
-        .unwrap_or_default();
-    for child in ["readme.txt", "notes/a.md", "notes/b.txt"] {
+    // S5 W7: a declared child is a RESOURCE, not a name in its container's
+    // coverage detail. Each one lands as its own `source.files` row, at its
+    // own composed path, carrying the parent coordinate A1 §6.6 requires an
+    // expanded entry to preserve.
+    for (parent, entry) in [
+        ("bundle.zip", "readme.txt"),
+        ("bundle.zip", "notes/a.md"),
+        ("bundle.zip", "notes/b.txt"),
+        ("message.eml", "report.txt"),
+    ] {
+        let composed = format!("{parent}!/{entry}");
+        let child = scan
+            .files
+            .iter()
+            .find(|f| f.relative_path == composed)
+            .unwrap_or_else(|| panic!("{composed} must land as its own source.files row"));
+        let provenance = child
+            .parent
+            .as_ref()
+            .unwrap_or_else(|| panic!("{composed} must carry its parent coordinate"));
+        assert_eq!(provenance.parent_relative_path, parent);
+        assert_eq!(provenance.entry_path, entry);
+        let parent_row = scan
+            .files
+            .iter()
+            .find(|f| f.relative_path == parent)
+            .expect("the container itself landed");
+        assert_eq!(
+            provenance.parent_key, parent_row.local_key,
+            "the child's parent coordinate names the parent's OWN key, chained"
+        );
         assert!(
-            zip_detail.contains(child),
-            "the zip's own coverage row must name declared child {child:?}: {zip_detail:?}"
+            !child.units.is_empty(),
+            "{composed} routed through the same adapter a loose file of that name uses, so it \
+             has real units"
         );
     }
-    let eml_detail = coverage_row(&scan, "message.eml")
-        .detail
-        .clone()
-        .unwrap_or_default();
-    assert!(
-        eml_detail.contains("report.txt"),
-        "the mail's own coverage row must name its declared attachment: {eml_detail:?}"
-    );
 
     // --------------------------------------- the recorded generation itself
     // Not just the in-memory `SourceScan` — the real three-step
@@ -268,8 +278,8 @@ fn a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_g
         "the RECORDED generation's own extractor set must name the mail adapter: {extractors:?}"
     );
     assert_eq!(
-        summaries[0].payload["files"], 3,
-        "all three resources landed as source.files rows"
+        summaries[0].payload["files"], 7,
+        "three container resources plus their four landed children (S5 W7)"
     );
 }
 

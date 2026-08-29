@@ -304,33 +304,48 @@
 //! child as `adapter=zip` erases exactly the information F7's key exists to
 //! carry).
 //!
-//! # A named seam: not yet wired onto the wire batch
+//! # The seam that WAS here is closed (S5 W7)
 //!
 //! [`expand`] is proven directly, in-process, against every admission and
-//! bounds claim above (mirroring `office.rs`'s own `#[cfg(test)]` block), and
-//! — since S4 Y8 wired `scan.rs`'s and `git.rs`'s own routing tables to
-//! dispatch a claimed `.zip` to the real worker from a real scan
-//! (`tests/y8_adapter_dispatch.rs`) — a real container's admitted children
-//! really do reach [`super::worker::validate_batch`]'s daemon-side authority
-//! (path safety, F10 deny-set membership) from production code, not only
-//! from this file's own tests and `tests/y3_zip_adapter.rs`'s subprocess
-//! proof. What STILL does not reach the daemon is a child's own CONTENT:
-//! [`super::worker::DeclaredChild`] does not yet carry a child's content
-//! bytes, content hash, or composed key on the wire — it still ships exactly
-//! the `name`/`relative_path` pair Y1 defined for its own synthetic
-//! `--declare-child` test fixture, and Y8's own dispatch fix records a
-//! validated child's name in its container's own coverage detail rather than
-//! inventing a `source.files` row this wire shape cannot honestly back.
-//! Widening that shared wire type to carry a child's real bytes is a
-//! decision with its own security/footprint shape (JSON-embedding
-//! potentially-large binary content on every worker round trip) that no
-//! wave's brief through Y8 has settled and this module does not decide
-//! unilaterally (J0: no rung above resolves it, and it changes a contract
-//! every later wave depends on) — recorded here, not silently deferred, so
-//! the wave that IS given that authority has one place to look. §17 item 7's
-//! register row (`tests/x5_a1a_acceptance.rs`) states this exact split as
-//! `met-with-deviation`: dispatch met, content-on-the-wire the named
-//! deviation.
+//! bounds claim above (mirroring `office.rs`'s own `#[cfg(test)]` block).
+//! S4 Y8 wired `scan.rs`'s and `git.rs`'s own routing tables to dispatch a
+//! claimed `.zip` to the real worker from a real scan
+//! (`tests/y8_adapter_dispatch.rs`), so a real container's admitted children
+//! reached [`super::worker::validate_batch`]'s daemon-side authority — but a
+//! child's own CONTENT still did not: [`super::worker::DeclaredChild`] was
+//! `name`/`relative_path` only, and a validated child landed as a name in its
+//! container's coverage detail rather than as a resource. That was the named
+//! seam register items 7 and 8 carried as `met-with-deviation`.
+//!
+//! S5 W7 closed it, and this is the shape of the answer, because it changes
+//! what THIS module's output means downstream:
+//!
+//! * `DeclaredChild` now carries the child's bytes, the worker's own hash of
+//!   them and the child's downstream adapter claim, and
+//!   `src/bin/atlas_worker.rs` FLATTENS the whole tree [`expand`] returns
+//!   (a nested archive's own members, a nested message's own attachments) into
+//!   one `declared_children` list at `/`-joined paths. Nothing about this
+//!   file's own bounds changes: the flattening walks a recursion
+//!   `expand_at_depth` already performed under [`MAX_NESTING_DEPTH`] and the
+//!   whole-tree cumulative-byte accumulator, and admits no byte those bounds
+//!   did not already admit.
+//! * Because the tree arrives flat, the daemon LANDS children and never
+//!   re-enters a container to find more — which is what keeps ONE depth
+//!   counter and ONE budget rather than a second, daemon-side pair
+//!   (`tests/w7_container_children.rs`'s
+//!   `container_children_share_one_depth_counter_and_one_budget_not_a_second_pair`
+//!   fails if a second is ever introduced).
+//! * The daemon hashes what it RECEIVES, on receipt, and stores that value
+//!   (H15 option (b); [`super::worker::DeclaredChild`]'s own doc states, at
+//!   length, what that hash does and does not vouch for — it identifies the
+//!   bytes that reached the store, not "what is really inside the archive").
+//!
+//! One narrower gap this module named is NOT closed and is not claimed to be:
+//! a per-entry [`CoverageRow`] still has no field on `WorkerBatch` to travel
+//! in, so an entry-level refusal here (a symlink, a duplicate name, the depth
+//! ceiling) is proven in this file's own tests but does not reach the daemon
+//! — `src/bin/atlas_worker.rs`'s own module doc, "A named gap", states it from
+//! the wire's side, unchanged by W7.
 //!
 //! # Reused by Y4's mail adapter (R2) — and the reverse direction wired here
 //!

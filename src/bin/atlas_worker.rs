@@ -38,8 +38,25 @@
 //! admitted children are declared, and the per-entry refusal detail
 //! `archive::expand`'s own return value carries (proven exhaustively in
 //! `archive.rs`'s own tests) does not reach this wire at all. Named here
-//! rather than silently dropped — see `archive.rs`'s own module doc, "A
-//! named seam", for the same gap stated from the adapter's side.
+//! rather than silently dropped — see `archive.rs`'s own module doc for the
+//! same gap stated from the adapter's side. S5 W7 closed a DIFFERENT seam
+//! (a child's content, hash and adapter, below) and deliberately did not
+//! widen this one: `WorkerBatch` still has no `CoverageRow` field, so the
+//! depth-ceiling refusal that stops a deeply nested archive from being opened
+//! is visible as a not-opened container child, never as a row saying why.
+//!
+//! # Children carry their own bytes, and the whole tree is flattened (S5 W7)
+//!
+//! [`DeclaredChild`] carries the child's content, the worker's own BLAKE3 of
+//! it, and the adapter [`scan::child_extractor_for`] derives for its path —
+//! the same function the daemon re-derives with, so a fixture child and a
+//! real one are composed identically ([`declared_child`]). The whole
+//! expansion tree is flattened into ONE list at `/`-joined paths
+//! ([`flatten_zip`]/[`flatten_mail`]), because that is what lets the daemon
+//! land children without re-entering a container — one depth counter, one
+//! whole-tree byte budget, both already spent by the adapter that walked the
+//! tree. The daemon hashes what it receives and stores THAT
+//! ([`DeclaredChild`]'s own doc for what that does and does not vouch for).
 //!
 //! # A failed extraction exits non-zero — it never emits an empty batch
 //!
@@ -76,6 +93,7 @@ use sergeant_rs::domain::source::UnitKind;
 use sergeant_rs::runtime::atlas::archive;
 use sergeant_rs::runtime::atlas::mail;
 use sergeant_rs::runtime::atlas::office;
+use sergeant_rs::runtime::atlas::scan;
 use sergeant_rs::runtime::atlas::worker::{DeclaredChild, WorkerBatch, WorkerUnit};
 
 /// One process-level misbehavior this binary can perform on command, in
@@ -112,11 +130,14 @@ struct Args {
     /// the batch's identity untouched.
     #[arg(long)]
     extractor: String,
-    /// Declare a child resource in the returned batch, `NAME=RELATIVE/PATH`.
-    /// Repeatable. Test-only: Y1 has no real container adapter that would
-    /// populate this on its own, so the acceptance suite uses it to hand the
-    /// daemon-side validator both safe and deliberately unsafe/denied
-    /// declarations.
+    /// Declare a child resource in the returned batch,
+    /// `NAME=RELATIVE/PATH[=CONTENT]` (CONTENT is UTF-8 text, empty when
+    /// omitted). Repeatable. Test-only: it exists so the acceptance suite can
+    /// hand the daemon-side validator both safe and deliberately
+    /// unsafe/denied declarations without needing a container fixture that
+    /// produces them. The hash and adapter fields are composed by
+    /// [`declared_child`], never taken from the flag, so a fixture child is
+    /// always self-consistent with what the daemon re-derives.
     #[arg(long = "declare-child", value_parser = parse_declared_child)]
     declared_children: Vec<DeclaredChild>,
     /// Misbehave instead of producing a batch (test-only fixture mode).
@@ -125,13 +146,88 @@ struct Args {
 }
 
 fn parse_declared_child(raw: &str) -> Result<DeclaredChild, String> {
-    let (name, path) = raw
-        .split_once('=')
-        .ok_or_else(|| format!("{raw:?} is not NAME=PATH"))?;
-    Ok(DeclaredChild {
-        name: name.to_string(),
-        relative_path: path.to_string(),
-    })
+    let mut parts = raw.splitn(3, '=');
+    let name = parts
+        .next()
+        .ok_or_else(|| format!("{raw:?} is not NAME=PATH[=CONTENT]"))?;
+    let path = parts
+        .next()
+        .ok_or_else(|| format!("{raw:?} is not NAME=PATH[=CONTENT]"))?;
+    let content = parts.next().unwrap_or("").as_bytes().to_vec();
+    Ok(declared_child(name.to_string(), path.to_string(), content))
+}
+
+/// One [`DeclaredChild`], with the two fields the daemon cross-checks rather
+/// than trusts filled in the only way that can ever pass: the worker's own
+/// BLAKE3 of the bytes it is sending, and the adapter THIS BUILD'S OWN
+/// routing table derives for the child's path
+/// ([`scan::child_extractor_for`], the same function
+/// [`sergeant_rs::runtime::atlas::worker::validate_batch`] re-derives with).
+///
+/// Composed in one place so no branch below can drift: a child whose hash or
+/// adapter disagrees with the daemon's own derivation is a REFUSED BATCH, not
+/// a warning, and that refusal should mean "this worker is wrong", never
+/// "this worker filled the field differently over here".
+fn declared_child(name: String, relative_path: String, content: Vec<u8>) -> DeclaredChild {
+    let content_hash = blake3::hash(&content).to_hex().to_string();
+    let entry_adapter = scan::child_extractor_for(&relative_path).map(str::to_string);
+    DeclaredChild {
+        name,
+        relative_path,
+        content,
+        content_hash,
+        entry_adapter,
+    }
+}
+
+/// Flatten one whole ZIP expansion into declared children (S5 W7).
+///
+/// Every admitted entry at this level, then — for an entry that is itself a
+/// container the adapter ALREADY opened — that container's own members, at
+/// their `/`-joined path beneath it. The recursion this walks is one
+/// `archive::expand` already performed under
+/// [`archive::MAX_NESTING_DEPTH`] and its whole-tree cumulative byte budget;
+/// flattening it adds no depth and admits no byte those bounds did not
+/// already admit. That is what keeps ONE depth counter and ONE budget: the
+/// daemon lands what this list says and never re-enters a container to look
+/// for more.
+fn flatten_zip(expansion: &archive::ZipExpansion, prefix: &str, out: &mut Vec<DeclaredChild>) {
+    for child in &expansion.children {
+        let path = format!("{prefix}{}", child.relative_path);
+        out.push(declared_child(
+            entry_basename(&child.relative_path),
+            path.clone(),
+            child.content.clone(),
+        ));
+        if let Some(nested) = &child.nested {
+            flatten_zip(nested, &format!("{path}/"), out);
+        }
+        if let Some(nested) = &child.nested_mail {
+            flatten_mail(nested, &format!("{path}/"), out);
+        }
+    }
+}
+
+/// Flatten one whole parsed message's attachments into declared children (S5
+/// W7) — the mail half of [`flatten_zip`], sharing its reasoning exactly:
+/// `mail::parse_message` already walked this tree under the SAME shared
+/// depth counter and whole-tree budget (`mail.rs`'s own module doc,
+/// "Container recursion is one shared budget").
+fn flatten_mail(message: &mail::MailMessage, prefix: &str, out: &mut Vec<DeclaredChild>) {
+    for attachment in &message.attachments {
+        let path = format!("{prefix}{}", attachment.filename);
+        out.push(declared_child(
+            attachment.filename.clone(),
+            path.clone(),
+            attachment.content.clone(),
+        ));
+        if let Some(nested) = &attachment.nested_message {
+            flatten_mail(nested, &format!("{path}/"), out);
+        }
+        if let Some(nested) = &attachment.nested_archive {
+            flatten_zip(nested, &format!("{path}/"), out);
+        }
+    }
 }
 
 fn main() -> std::process::ExitCode {
@@ -214,13 +310,12 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
             })
             .collect()
     } else if args.extractor == archive::ZIP_EXTRACTOR {
-        // `parent_key` composes every declared child's F7 key
-        // (`archive.rs`'s own module doc), but no field on `DeclaredChild`
-        // carries a composed key onto today's wire (the named seam, this
-        // file's own module doc) — `resource_hash` is used here only so
-        // `archive::expand`'s pure signature is satisfiable and its
-        // internally-computed keys stay self-consistent; nothing this
-        // process emits depends on its exact value.
+        // `parent_key` composes every child's F7 key inside
+        // `archive::expand` (`archive.rs`'s own module doc). The DAEMON
+        // composes the key it actually stores, from its own hash of the
+        // bytes it receives (S5 W7, `scan::land_child`), so the value passed
+        // here only has to keep this expansion's internally-computed keys
+        // self-consistent; nothing this process emits depends on it.
         let expansion = archive::expand(input, &resource_hash);
         if let Some(refusal) = expansion.coverage.iter().find(|row| row.path.is_none()) {
             // An archive-level refusal (malformed open, the entry-count
@@ -232,10 +327,7 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
                 .clone()
                 .unwrap_or_else(|| "archive refused".to_string()));
         }
-        declared_children.extend(expansion.children.iter().map(|child| DeclaredChild {
-            name: entry_basename(&child.relative_path),
-            relative_path: child.relative_path.clone(),
-        }));
+        flatten_zip(&expansion, "", &mut declared_children);
         // A container's own body carries no text unit of its own — its
         // whole content is in its declared children. An empty `units` here
         // is the honest answer for a ZIP resource, not a placeholder this
@@ -243,10 +335,10 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
         // doctrine, restated for the opposite field).
         Vec::new()
     } else if args.extractor == mail::MAIL_EXTRACTOR {
-        // `parent_key` composes every declared attachment's F7 key
-        // (`mail.rs`'s own module doc) exactly as the ZIP branch above does
-        // for `archive::expand` — same reasoning, same named seam: no field
-        // on `DeclaredChild` carries a composed key onto today's wire yet.
+        // `parent_key` composes every attachment's F7 key inside
+        // `mail::parse_message` (`mail.rs`'s own module doc) exactly as the
+        // ZIP branch above does for `archive::expand` — same reasoning, and
+        // the same S5 W7 answer: the daemon composes the key it stores.
         let message = mail::parse_message(input, &resource_hash).map_err(|e| e.to_string())?;
         // Two Document-kind units, not one — the wave's own schema decision
         // (mirrors office.rs's own "no new UnitKind variant" call, `mail.rs`'s
@@ -276,17 +368,11 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
                 text: html,
             });
         }
-        // Named seam, identical shape to the ZIP branch above: only this
-        // message's own TOP-LEVEL attachments are declared onto today's
-        // wire; a grandchild nested inside an attachment's own
-        // `nested_message`/`nested_archive` stays internal to
-        // `mail::parse_message`'s own return value, proven in-process
-        // (`mail.rs`'s own tests), not yet reachable daemon-side — the same
-        // gap `archive.rs`'s module doc names for a nested ZIP entry.
-        declared_children.extend(message.attachments.iter().map(|attachment| DeclaredChild {
-            name: attachment.filename.clone(),
-            relative_path: attachment.filename.clone(),
-        }));
+        // The WHOLE tree, flattened (S5 W7) — a grandchild nested inside an
+        // attachment's own `nested_message`/`nested_archive` is declared too,
+        // at its own `/`-joined path, exactly as the ZIP branch above
+        // declares a nested entry's own members.
+        flatten_mail(&message, "", &mut declared_children);
         mail_units
     } else {
         // Y1's trivial, honestly-labeled fallback body: one
