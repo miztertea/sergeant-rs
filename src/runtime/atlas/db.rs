@@ -2844,8 +2844,7 @@ impl AtlasDb {
             "SELECT generation_id FROM source.generations WHERE state != ? \
              ORDER BY observed_at, generation_id LIMIT ?",
         )?;
-        let mut rows =
-            statement.query(duckdb::params![STATE_EVICTED, MAX_ROWS as i64 + 1])?;
+        let mut rows = statement.query(duckdb::params![STATE_EVICTED, MAX_ROWS as i64 + 1])?;
         let mut targets: Vec<String> = Vec::new();
         while let Some(row) = rows.next()? {
             targets.push(row.get(0)?);
