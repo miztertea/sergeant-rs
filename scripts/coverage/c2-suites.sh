@@ -273,3 +273,14 @@ cov_stage_end 1 "the w1b_overlay_lifecycle_trigger test binary must write its ow
 cov_stage_begin c2-w1c_one_atlas_database
 cov_run cargo llvm-cov --no-report --test w1c_one_atlas_database --locked || cov_fail "w1c_one_atlas_database failed under instrumentation"
 cov_stage_end 1 "the w1c_one_atlas_database test binary must write its own profile"
+
+# S5 W1d, wired at birth (the #231 lesson, same as x5/y2/y5/y6/w1/w1b/w1c
+# above): `--work` reflects what the Work has CHANGED — the turn-boundary
+# overlay refresh, without which the only overlay a bind can record is one
+# describing a worktree still byte-identical to its base. Same shape as
+# w1b's suite: an IN-PROCESS daemon driven over loopback plus real
+# read-only `git` invocations; no `sgt` client, no detached daemon, so its
+# profile is the test binary's own. Floor 1.
+cov_stage_begin c2-w1d_overlay_freshness
+cov_run cargo llvm-cov --no-report --test w1d_overlay_freshness --locked || cov_fail "w1d_overlay_freshness failed under instrumentation"
+cov_stage_end 1 "the w1d_overlay_freshness test binary must write its own profile"

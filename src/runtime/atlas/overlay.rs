@@ -49,14 +49,16 @@
 //! §17 item 2's register row recorded as a deviation and what its tripwire
 //! `a1a_item_2_gap_work_overlay_scan_has_no_production_trigger` guarded.
 //!
-//! S5 W1b wired H13.2's chosen mechanism, the **daemon-side surface
-//! lifecycle hook** (`api::run_work_overlay_hook`):
+//! S5 W1b wired H13.2's chosen mechanism, the **daemon-side hook**
+//! (`api::run_work_overlay_hook`); S5 W1d added its middle row:
 //!
 //! ```text
-//! surface bound (materialize / rematerialize)
+//! surface bound (materialize / rematerialize)     [W1b]
 //!     -> super::lane::scan_work_overlay_on_lane   one intelligence-lane permit (F6)
 //!        -> super::record::record_scan            staged, journaled, confirmed
-//! surface torn down
+//! a turn ended, surface still bound               [W1d]
+//!     -> the same two steps again                 coalescing, per Work
+//! surface torn down                               [W1b]
 //!     -> AtlasDb::evict_work_overlays             the lifetime rule above, enforced
 //! ```
 //!
@@ -64,9 +66,19 @@
 //! daemon-is-sole-writer boundary, so `sgt search` never reaches this
 //! module. It reads what the hook already recorded.
 //!
-//! That makes an overlay generation a **snapshot of the surface at its last
-//! bind**, not a live view of a surface the Work is still mutating. The
-//! semantic is carried on the answer rather than left to be assumed — see
+//! W1b's bind-and-teardown pair alone could only ever record an **empty**
+//! overlay: a linked worktree is cut byte-identical to its base, so there
+//! is nothing to describe until the Work has actually changed something.
+//! W1d's turn-boundary refresh is what makes A2 §2's "current Work's world,
+//! **including overlay**" true of the code rather than of the machinery
+//! alone.
+//!
+//! An overlay generation is therefore a **snapshot of the surface as of the
+//! end of the Work's last completed turn**, not a live view of a surface
+//! the Work is still mutating — a turn in flight is a tree being written,
+//! and indexing it at an arbitrary instant would describe a world that
+//! never settled. The semantic is carried on the answer rather than left to
+//! be assumed — see
 //! [`crate::runtime::atlas::db::WorkScope::BaseAndOverlaySnapshot`], which
 //! is the type `--work` returns it in.
 
