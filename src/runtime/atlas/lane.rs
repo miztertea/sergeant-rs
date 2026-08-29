@@ -9,11 +9,20 @@
 //!
 //! ```text
 //! Engine::run_intelligence   permit, then the blocking pool
-//!    -> scan_estate_git         one pinned commit's objects, extracted
-//!    -> scan_work_overlay       one Work surface, over its base
-//!    -> scan_local_knowledge    one declared knowledge source, walked (S4 Y5, G8)
-//!    -> acquire_and_scan        one external Git source, fetched then extracted (S4 Y5, G6)
+//!    -> scan_estate_git_with_worker       one pinned commit's objects, extracted (S4 Y8 dispatch)
+//!    -> scan_work_overlay                 one Work surface, over its base
+//!    -> scan_local_knowledge_with_worker  one declared knowledge source, walked (S4 Y5 G8; Y8)
+//!    -> acquire_and_scan                  one external Git source, fetched then extracted (S4 Y5, G6)
 //! ```
+//!
+//! `_with_worker` (S4 Y8): [`worker_runtime`] resolves this host's own
+//! binary path once per call and threads it down as a real
+//! [`super::worker::WorkerRuntime`], so a claimed Office/ZIP/mail resource
+//! actually reaches [`super::worker::run_worker`] from these two production
+//! entry points — the plain, worker-free [`super::scan::scan_local_knowledge`]/
+//! [`super::git::scan_estate_git`] stay every other caller's default.
+//! `scan_work_overlay`/`acquire_and_scan` are untouched: worker dispatch is
+//! scoped to these two walks this wave (brief-y8-adapter-dispatch.md).
 //!
 //! # Why these two functions exist rather than a call site inlining them
 //!
@@ -39,10 +48,14 @@ use crate::runtime::atlas::deny::{AcquisitionFilter, BadPattern};
 use crate::runtime::atlas::external_git::{
     ExternalGitError, ExternalGitScan, ExternalGitSource, acquire_and_scan,
 };
-use crate::runtime::atlas::git::{EstateGitScan, EstateGitSource, GitScanError, scan_estate_git};
+use crate::runtime::atlas::git::{
+    EstateGitScan, EstateGitSource, GitScanError, scan_estate_git_with_worker,
+};
 use crate::runtime::atlas::overlay::{OverlayScan, WorkOverlay, scan_work_overlay};
-use crate::runtime::atlas::scan::{KnowledgeSource, SourceScan, scan_local_knowledge};
-use crate::runtime::atlas::worker::{WorkerIdentity, WorkerOutcome, WorkerSpawn, run_worker};
+use crate::runtime::atlas::scan::{KnowledgeSource, SourceScan, scan_local_knowledge_with_worker};
+use crate::runtime::atlas::worker::{
+    WORKER_RUNTIME_DEADLINE, WorkerIdentity, WorkerOutcome, WorkerRuntime, WorkerSpawn, run_worker,
+};
 use crate::runtime::engine::{Engine, IntelligenceError};
 
 /// Why an extraction on the lane did not produce an answer.
@@ -57,6 +70,13 @@ pub enum LaneError {
     /// A declared `[[knowledge]] ignore` glob does not compile.
     #[error(transparent)]
     Pattern(#[from] BadPattern),
+    /// This host's own binary path could not be resolved (S4 Y8) —
+    /// [`WorkerRuntime::program`] needs it before a single resource can be
+    /// dispatched, and [`std::env::current_exe`] is the one call that can
+    /// fail to produce it (an unlinked/deleted binary, a permission
+    /// problem reading `/proc/self/exe` on Linux).
+    #[error("cannot resolve this host's own binary path for the supervised worker: {0}")]
+    WorkerProgram(#[from] std::io::Error),
 }
 
 /// Why an external-git acquisition on the lane did not produce an answer —
@@ -81,9 +101,28 @@ pub async fn scan_estate_git_on_lane(
     engine: &Engine,
     source: EstateGitSource,
 ) -> Result<EstateGitScan, LaneError> {
+    let worker = worker_runtime()?;
     Ok(engine
-        .run_intelligence(move || scan_estate_git(&source))
+        .run_intelligence(move || scan_estate_git_with_worker(&source, &worker))
         .await??)
+}
+
+/// This host's own binary — the same one running right now — as the
+/// supervised worker every Office/ZIP/mail resource this scan claims
+/// dispatches to (S4 Y8), with [`WORKER_RUNTIME_DEADLINE`]'s provisional
+/// bound.
+///
+/// [`std::env::current_exe`] is a plain, cheap syscall (`/proc/self/exe` on
+/// Linux, `_NSGetExecutablePath`/`sysctl` on macOS) — no daemon state, no
+/// database, nothing this lane-glue file doesn't already own the right to
+/// call — resolved here rather than inside [`super::scan`]/[`super::git`]'s
+/// own pure walks, which by design (their own module docs) know nothing
+/// about a running process's own path.
+fn worker_runtime() -> Result<WorkerRuntime, LaneError> {
+    Ok(WorkerRuntime {
+        program: std::env::current_exe()?,
+        deadline: WORKER_RUNTIME_DEADLINE,
+    })
 }
 
 /// Scan one Work surface as an overlay under an intelligence-lane permit, on
@@ -128,8 +167,9 @@ pub async fn scan_local_knowledge_on_lane(
     engine: &Engine,
     source: KnowledgeSource,
 ) -> Result<SourceScan, LaneError> {
+    let worker = worker_runtime()?;
     Ok(engine
-        .run_intelligence(move || scan_local_knowledge(&source))
+        .run_intelligence(move || scan_local_knowledge_with_worker(&source, &worker))
         .await??)
 }
 

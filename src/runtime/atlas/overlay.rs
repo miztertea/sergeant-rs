@@ -205,6 +205,11 @@ pub fn extract_overlay(
         &filter,
         &unchanged,
         &denied_dirs,
+        // Out of this wave's scope (brief-y8-adapter-dispatch.md names only
+        // `scan.rs`'s and `git.rs`'s own walks): a Work overlay's unchanged
+        // half stays worker-free, matching `extract_tree`'s own no-worker
+        // default rather than gaining one this wave never asked for.
+        None,
         &mut out,
     )?;
 

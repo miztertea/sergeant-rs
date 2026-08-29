@@ -407,11 +407,17 @@ and no operator-reachable trigger (S3) to an estate-wide indexing surface
 with a real scan behind it: a supervised worker transport carries three real
 content adapters (Office, ZIP, mail) out of the daemon's own process; a
 fourth source kind (`external Git`) and a package-identity derivation join
-`estate_git`/`local_knowledge`; and `sgt intelligence scan` finally gives an
+`estate_git`/`local_knowledge`; `sgt intelligence scan` finally gives an
 operator something to run — across all three source kinds, not only the one
 S4 Y5 first wired — with a cloud-sync placeholder finally reported honestly
-instead of silently as empty. What follows is the one arc, in the order it
-was built.
+instead of silently as empty; and, closing this sprint's own signature
+defect a third time (Y8, below), that scan actually **dispatches** a claimed
+`.docx`/`.zip`/`.eml` to the worker rather than reporting it unsupported —
+the adapters and the transport were built and proven through the real
+subprocess from Y1 through Y4, but nothing in `scan.rs`'s or `git.rs`'s own
+routing table claimed those three extensions until Y8 wired them, so no
+installation before this release could actually reach any of the three from
+an ordinary scan. What follows is the one arc, in the order it was built.
 
 **Supervised parse workers.** Third-party document parsing moves out of the daemon and into supervised
   child processes: a worker takes bytes and returns a normalized batch, and
@@ -1014,6 +1020,59 @@ third instance. There was one.
   fixture (`archive.rs`'s own `a_zip_entry_named_eml_past_the_depth_ceiling_is_admitted_but_not_parsed`)
   rather than merely asserted, though this closeout did not itself revert
   it to watch it fail.
+
+**S4 Y8 — dispatch, not just adapters.** The Y7 closeout's own sweep
+reported finding exactly one remaining unreachable-code instance (package
+identity) and called the sweep complete. That claim was false: the largest
+instance of the sprint's own signature defect was still standing. `sgt
+intelligence scan` walked a folder, saw a `.docx`, and did not extract it —
+`scan.rs`'s routing table (`claims_for`) never claimed `.docx`/`.zip`/`.eml`,
+so the resource fell straight through to `unsupported`, and neither
+`scan.rs` nor `record.rs` ever called `run_worker_on_lane` or `worker::`
+anything. The three content adapters and the worker transport that carries
+them were dead code in every real installation.
+
+- **The scan walk now dispatches.** `scan.rs`'s `Walk::file` and `git.rs`'s
+  `extract_blobs` both route a resource their own new `worker_extractor_for`
+  table claims through the real `run_worker` transport and the daemon-side
+  `validate_batch` AUTHORITY — the identical path Y1 designed and Y2/Y3/Y4
+  built the three adapters to run inside, exercised for the first time from
+  a real walk rather than only from each adapter's own test suite. The
+  in-process text/Markdown/syntax/tabular paths are untouched: pure Rust
+  over local bytes was never the worker's business, and stays that way.
+  `scan_local_knowledge_on_lane`/`scan_estate_git_on_lane` (the production
+  entry points) resolve a real `WorkerRuntime` — this host's own binary
+  path, `std::env::current_exe()` — and thread it down; every existing
+  caller of the plain, worker-free `scan_local_knowledge`/`scan_estate_git`
+  keeps working exactly as before, unchanged.
+- **Proven against real bytes, not a synthetic fixture.**
+  `tests/y8_adapter_dispatch.rs` scans a directory holding one real
+  `.docx`, one real `.zip` and one real `.eml` (this repo's own
+  hand-verified corpora) through the production worker-enabled walk, then
+  records the result through `record_scan`'s real three-step discipline,
+  and asserts the RECORDED generation's own extractor set names all three
+  adapter identities and that document units carry real, non-empty text —
+  exactly the shape an isolated adapter unit test cannot prove, which is
+  what let this defect stand through four prior waves' own acceptance
+  batteries. `tests/x3a_git_plumbing.rs` carries the estate-git-side twin.
+- **Children, honestly.** A worker-declared child (an archive entry, a mail
+  attachment) is validated daemon-side by the same `validate_batch`
+  AUTHORITY (path safety, F10 deny-set membership) and its name lands,
+  visibly, in its parent's own coverage detail — but its CONTENT does not
+  yet reach the store as its own `source.files` row. `WorkerBatch`'s
+  `DeclaredChild` still carries only a name and a path on the wire, exactly
+  the "named seam" `archive.rs`'s own module doc has flagged since Y3;
+  widening that shared wire type to carry a child's bytes, hash, or
+  composed key is a security/footprint decision this wave's brief does not
+  settle and this wave does not decide unilaterally. Register rows 7 and 8
+  (`tests/x5_a1a_acceptance.rs`) are corrected to `met-with-deviation`
+  naming exactly this gap and its destination, rather than continuing to
+  read `met` on the strength of the adapter alone.
+- **The register's own stale claim, corrected.** Item 13's note still read
+  "nothing shipped triggers a scan" — false since S4 Y5/Y6 shipped `sgt
+  intelligence scan`, independently of this wave's own dispatch fix. Fixed
+  to state the actual, current gap: the surfaces answer empty only until an
+  operator runs the shipped trigger, not because none exists.
 
 ### Atlas closeout (S3)
 

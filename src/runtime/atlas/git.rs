@@ -57,10 +57,11 @@ use crate::domain::source::{AuthorityClass, Coverage, CoverageRow, SourceKind};
 use crate::runtime::atlas::deny::{AcquisitionFilter, BadPattern, Verdict};
 use crate::runtime::atlas::scan::{
     DATASET_NO_ROOT, KeySpace, MAX_RESOURCE_BYTES, ScannedFile, SourceScan, UNCLAIMED, claims_for,
-    extract_resource,
+    dispatch_worker_resource, extract_resource, worker_extractor_for,
 };
 use crate::runtime::atlas::tabular::{ContextFields, format_for};
 use crate::runtime::atlas::text::as_text;
+use crate::runtime::atlas::worker::WorkerRuntime;
 use crate::runtime::git::{GitError, git, git_bytes, git_cat_file_batch};
 use crate::runtime::integrity::{DriftAttribution, EstateDriftObservation};
 
@@ -289,6 +290,28 @@ fn parse_tree_record(
 /// honest shape — the two phases really are two Git conversations, and
 /// pretending otherwise would hide the only window that exists.
 pub fn extract_tree(source: &EstateGitSource, tree: &GitTree) -> Result<SourceScan, GitScanError> {
+    extract_tree_impl(source, tree, None)
+}
+
+/// [`extract_tree`], with Office/ZIP/mail blobs routed through a real
+/// supervised worker (S4 Y8) instead of being reported `unsupported` for
+/// lack of one — the shape [`super::lane::scan_estate_git_on_lane`] actually
+/// drives in production. [`extract_tree`] itself stays worker-free (R1),
+/// exactly the reasoning [`super::scan::scan_local_knowledge`]'s own doc
+/// gives for its sibling.
+pub fn extract_tree_with_worker(
+    source: &EstateGitSource,
+    tree: &GitTree,
+    worker: &WorkerRuntime,
+) -> Result<SourceScan, GitScanError> {
+    extract_tree_impl(source, tree, Some(worker))
+}
+
+fn extract_tree_impl(
+    source: &EstateGitSource,
+    tree: &GitTree,
+    worker: Option<&WorkerRuntime>,
+) -> Result<SourceScan, GitScanError> {
     let filter = AcquisitionFilter::new(&source.ignore)?;
     let mut out = Extracted::default();
     let paths: BTreeSet<String> = tree.entries.iter().map(|e| e.path.clone()).collect();
@@ -298,6 +321,7 @@ pub fn extract_tree(source: &EstateGitSource, tree: &GitTree) -> Result<SourceSc
         &filter,
         &tree.entries,
         &denied_dirs,
+        worker,
         &mut out,
     )?;
     out.files
@@ -346,6 +370,7 @@ pub(crate) fn extract_blobs(
     filter: &AcquisitionFilter,
     entries: &[TreeEntry],
     denied_dirs: &[String],
+    worker: Option<&WorkerRuntime>,
     out: &mut Extracted,
 ) -> Result<(), GitScanError> {
     // Decide every path from metadata alone, before one byte is requested.
@@ -407,7 +432,11 @@ pub(crate) fn extract_blobs(
             });
             continue;
         }
-        if claims_for(&entry.path).is_none() {
+        // S4 Y8: a path claimed by a supervised-worker adapter is wanted
+        // too — it is never valid UTF-8 text, so `claims_for` alone would
+        // wrongly report it `UNCLAIMED` rather than routing it to the
+        // worker below.
+        if claims_for(&entry.path).is_none() && worker_extractor_for(&entry.path).is_none() {
             out.coverage.push(CoverageRow {
                 path: Some(entry.path.clone()),
                 status: Coverage::Unsupported,
@@ -434,7 +463,6 @@ pub(crate) fn extract_blobs(
         let oids: Vec<String> = batch.iter().map(|e| e.oid.clone()).collect();
         let objects = git_cat_file_batch(mount, &oids)?;
         for (entry, object) in batch.iter().zip(objects) {
-            let claims = claims_for(&entry.path).expect("filtered above");
             let Some(object) = object else {
                 out.coverage.push(CoverageRow {
                     path: Some(entry.path.clone()),
@@ -448,6 +476,36 @@ pub(crate) fn extract_blobs(
                 });
                 continue;
             };
+            if let Some(extractor) = worker_extractor_for(&entry.path) {
+                match worker {
+                    Some(worker) => dispatch_worker_resource(
+                        worker,
+                        filter,
+                        entry.path.clone(),
+                        &entry.oid,
+                        KeySpace::EstateGit,
+                        object.bytes,
+                        extractor,
+                        // Not a fact a Git object has — see `extract_blobs`'s
+                        // own in-process branch below, same reasoning.
+                        None,
+                        &mut out.files,
+                        &mut out.coverage,
+                        &mut out.extractors,
+                    ),
+                    None => out.coverage.push(CoverageRow {
+                        path: Some(entry.path.clone()),
+                        status: Coverage::Unsupported,
+                        detail: Some(format!(
+                            "{extractor} claims this resource, but no supervised worker is \
+                             configured for this scan"
+                        )),
+                        bytes: Some(object.bytes.len() as u64),
+                    }),
+                }
+                continue;
+            }
+            let claims = claims_for(&entry.path).expect("filtered above");
             let Some(text) = as_text(&object.bytes) else {
                 out.coverage.push(CoverageRow {
                     path: Some(entry.path.clone()),
@@ -569,8 +627,24 @@ pub(crate) fn batches<'a>(wanted: &[&'a TreeEntry]) -> Vec<Vec<&'a TreeEntry>> {
 
 /// List and extract in one call — the ordinary path.
 pub fn scan_estate_git(source: &EstateGitSource) -> Result<EstateGitScan, GitScanError> {
+    scan_estate_git_impl(source, None)
+}
+
+/// [`scan_estate_git`], with Office/ZIP/mail blobs routed through a real
+/// supervised worker (S4 Y8) — see [`extract_tree_with_worker`]'s own doc.
+pub fn scan_estate_git_with_worker(
+    source: &EstateGitSource,
+    worker: &WorkerRuntime,
+) -> Result<EstateGitScan, GitScanError> {
+    scan_estate_git_impl(source, Some(worker))
+}
+
+fn scan_estate_git_impl(
+    source: &EstateGitSource,
+    worker: Option<&WorkerRuntime>,
+) -> Result<EstateGitScan, GitScanError> {
     let tree = list_tree(source)?;
-    let scan = extract_tree(source, &tree)?;
+    let scan = extract_tree_impl(source, &tree, worker)?;
     let drift = observe_drift(source, &tree);
     Ok(EstateGitScan {
         scan,

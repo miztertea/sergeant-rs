@@ -307,25 +307,30 @@
 //! # A named seam: not yet wired onto the wire batch
 //!
 //! [`expand`] is proven directly, in-process, against every admission and
-//! bounds claim above (mirroring `office.rs`'s own `#[cfg(test)]` block) —
-//! but, like `office::extractor_for` before it ("Nothing calls this in
-//! production yet", that module's own doc), [`super::worker::DeclaredChild`] does
-//! not yet carry a child's content bytes, content hash, or composed key on
-//! the wire: it still ships exactly the `name`/`relative_path` pair Y1
-//! defined for its own synthetic `--declare-child` test fixture. Widening
-//! that shared wire type to carry a child's real bytes is a decision with
-//! its own security/footprint shape (JSON-embedding potentially-large binary
-//! content on every worker round trip) that this wave's brief does not
-//! settle and this module does not decide unilaterally (J0: no rung above
-//! resolves it, and it changes a contract every later wave depends on) —
-//! recorded here, not silently deferred, so the wave that wires real
-//! daemon-side persistence for archive children (riding G8's own scan
-//! trigger, Y5) has one place to look. What IS wired today: `sgt-atlas-worker`
-//! dispatches [`ZIP_EXTRACTOR`] to the real [`expand`] adapter and reports
-//! its admitted children through the EXISTING `name`/`relative_path` wire
-//! shape, so [`super::worker::validate_batch`]'s daemon-side authority (path
-//! safety, F10 deny-set membership) already runs, for real, against a real
-//! container adapter's real output — see `tests/y3_zip_adapter.rs`.
+//! bounds claim above (mirroring `office.rs`'s own `#[cfg(test)]` block), and
+//! — since S4 Y8 wired `scan.rs`'s and `git.rs`'s own routing tables to
+//! dispatch a claimed `.zip` to the real worker from a real scan
+//! (`tests/y8_adapter_dispatch.rs`) — a real container's admitted children
+//! really do reach [`super::worker::validate_batch`]'s daemon-side authority
+//! (path safety, F10 deny-set membership) from production code, not only
+//! from this file's own tests and `tests/y3_zip_adapter.rs`'s subprocess
+//! proof. What STILL does not reach the daemon is a child's own CONTENT:
+//! [`super::worker::DeclaredChild`] does not yet carry a child's content
+//! bytes, content hash, or composed key on the wire — it still ships exactly
+//! the `name`/`relative_path` pair Y1 defined for its own synthetic
+//! `--declare-child` test fixture, and Y8's own dispatch fix records a
+//! validated child's name in its container's own coverage detail rather than
+//! inventing a `source.files` row this wire shape cannot honestly back.
+//! Widening that shared wire type to carry a child's real bytes is a
+//! decision with its own security/footprint shape (JSON-embedding
+//! potentially-large binary content on every worker round trip) that no
+//! wave's brief through Y8 has settled and this module does not decide
+//! unilaterally (J0: no rung above resolves it, and it changes a contract
+//! every later wave depends on) — recorded here, not silently deferred, so
+//! the wave that IS given that authority has one place to look. §17 item 7's
+//! register row (`tests/x5_a1a_acceptance.rs`) states this exact split as
+//! `met-with-deviation`: dispatch met, content-on-the-wire the named
+//! deviation.
 //!
 //! # Reused by Y4's mail adapter (R2) — and the reverse direction wired here
 //!

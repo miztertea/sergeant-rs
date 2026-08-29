@@ -41,8 +41,8 @@
 //! | 4 | online-only/unreadable local resources are reported as coverage gaps, not silently indexed as empty | met | `y6b_online_only::an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_trigger` |
 //! | 5 | Markdown/text and at least one Office format normalize into document units with provenance | met | `y2_office_adapter::a_docx_worker_returns_document_and_section_units_with_provenance` |
 //! | 6 | CSV/JSON/Parquet stay relational, with a deterministic aggregate and selected text-field context units sharing row identity | met | `x4_tabular_map::datasets_are_registered_and_read_in_place_as_derived_evidence` |
-//! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | met | `y3_zip_adapter::a_zip_worker_declares_admitted_children_through_the_real_subprocess` |
-//! | 8 | `.eml` or the chosen first mail format produces structured message evidence | met | `y4_mail_adapter::a_mail_worker_returns_message_shape_and_attachment_with_provenance` |
+//! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | met-with-deviation | `y3_zip_adapter::a_zip_worker_declares_admitted_children_through_the_real_subprocess` |
+//! | 8 | `.eml` or the chosen first mail format produces structured message evidence | met-with-deviation | `y4_mail_adapter::a_mail_worker_returns_message_shape_and_attachment_with_provenance` |
 //! | 9 | image/scanned evidence enters the OCR fallback with page/region/engine provenance | deferred-post-s4 | — |
 //! | 10 | external Git acquisition resolves an exact commit in a no-Work-checkout cache | met | `src/runtime/atlas/external_git::a_refresh_resolves_the_origins_new_tip_over_the_same_cache` |
 //! | 11 | source parsing uses content/extractor identity so unchanged resources reuse cached facts | met | `x2_knowledge_sources::a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one` |
@@ -89,6 +89,19 @@
 //! [`the_intelligence_verb_set_now_includes_the_trigger_and_the_acquisition_surface`]'s
 //! own update); `sgt knowledge scan` still runs the same widened scan
 //! rather than being narrowed to match its own name.
+//!
+//! **S4 Y8 closed a second, sibling gap this trigger did not by itself
+//! touch.** The trigger existing (Y5/Y6) is not the same claim as every
+//! adapter it walks past actually running — `scan.rs`'s and `git.rs`'s own
+//! routing tables never claimed `.docx`/`.zip`/`.eml` until Y8 wired
+//! [`worker_extractor_for`](../src/runtime/atlas/scan.rs) into both walks,
+//! so a real `sgt intelligence scan` on a real installation reported all
+//! three `unsupported` through every wave from Y2 to Y7 despite the
+//! adapters existing and the trigger existing simultaneously. Items 5/7/8
+//! below now cite `tests/y8_adapter_dispatch.rs` as part of their own
+//! decisive check for exactly this reason — this file's item-4 lesson
+//! ("no silent pass") applies to the DISPATCH half of a capability just as
+//! much as to the capability's own existence.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -370,6 +383,10 @@ const WALK: &[Item] = &[
                 "tests/y2_office_boundary.rs",
                 "anydoc_is_named_nowhere_but_the_office_adapter",
             ),
+            at(
+                "tests/y8_adapter_dispatch.rs",
+                "a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_generation_carries_the_proof",
+            ),
         ],
         note: "S4 Y2, closing the deferral the S3 sprint plan's panel adjudication finding 1 \
                recorded here. The Markdown/text half shipped in S3 (see item 3's checks). The \
@@ -386,10 +403,14 @@ const WALK: &[Item] = &[
                derived, never canonical (A1-12). NARROWING, not a deviation from what §17 asks: \
                `.docx` is this wave's one adopted format (G3's gate order), so `office::extractor_for` \
                claims nothing else yet — a second Office format is explicitly out of this \
-               sprint's scope. CROSS-CUTTING GAP applies, same as items 3/6/13: the adapter is \
-               invoked here through its own writer (the worker binary) and by tests, not yet by \
-               a shipped scan trigger — that daemon-side scheduling is Y5's (G8), same as it was \
-               for Y1's own worker transport.",
+               sprint's scope. CROSS-CUTTING GAP, CLOSED (S4 Y8): this note used to read 'the \
+               adapter is invoked here through its own writer (the worker binary) and by tests, \
+               not yet by a shipped scan trigger' — true through Y2-Y7, and corrected here. \
+               `scan.rs`'s `Walk::file` and `git.rs`'s `extract_blobs` now dispatch a claimed \
+               `.docx` through the real worker from a real scan; the newly-added check above \
+               proves it against real bytes end to end, through `record_scan`'s own three-step \
+               discipline, not only against the worker binary in isolation. Unlike items 7/8, \
+               Office has no container-child concept, so this item carries no residual deviation.",
     },
     Item {
         number: 6,
@@ -422,7 +443,7 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 7,
-        verdict: Verdict::Met,
+        verdict: Verdict::MetWithDeviation,
         checks: &[
             at(
                 "tests/y3_zip_adapter.rs",
@@ -439,6 +460,10 @@ const WALK: &[Item] = &[
             at(
                 "src/domain/source.rs",
                 "a_grandchild_key_chains_through_its_own_parent_not_the_root",
+            ),
+            at(
+                "tests/y8_adapter_dispatch.rs",
+                "a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_generation_carries_the_proof",
             ),
         ],
         note: "S4 Y3 (G5 as AMENDED 2026-08-28). `enclosed_name` is a path-STRING validator only \
@@ -486,14 +511,25 @@ const WALK: &[Item] = &[
                Y1's own original shape — so per-entry coverage rows and F7 provenance are proven \
                exhaustively against `archive::expand`'s own return value (in-process) but do not \
                yet reach the daemon; widening that shared wire type is left to the wave that \
-               wires real daemon-side persistence (rides G8's trigger, Y5), stated explicitly in \
-               `archive.rs`'s own module doc rather than silently deferred. CROSS-CUTTING GAP \
-               applies, same as items 3/5/6/13: the adapter is invoked here through the real \
-               worker binary and by tests, not yet by a shipped scan trigger.",
+               wires real daemon-side persistence, stated explicitly in `archive.rs`'s own \
+               module doc rather than silently deferred. DISPATCH CLOSED, NAMED SEAM STANDS (S4 \
+               Y8): a claimed `.zip` now reaches the worker from a real scan — `scan.rs`'s \
+               `Walk::file` and `git.rs`'s `extract_blobs` route it through `run_worker` and \
+               daemon-side `validate_batch`, proven end to end by the newly-added check above, \
+               closing the 'not yet by a shipped scan trigger' half of what this note used to \
+               say. What did NOT close, and is why this row is `met-with-deviation` rather than \
+               `met`: the named seam two paragraphs up. `WorkerBatch`'s declared children still \
+               carry only a name and a path, so an admitted ZIP entry does not land as its own \
+               `source.files` row with real content — only as a name recorded, validated and \
+               visible, in its container's own coverage detail. DESTINATION: widening \
+               `WorkerBatch`/`DeclaredChild` to carry a child's content bytes, hash, or composed \
+               key is a security/footprint decision (J0 — no rung above this wave's own brief \
+               resolves it, and it changes a contract every later wave depends on); it is left to \
+               whichever wave is given that authority explicitly, not assumed here.",
     },
     Item {
         number: 8,
-        verdict: Verdict::Met,
+        verdict: Verdict::MetWithDeviation,
         checks: &[
             at(
                 "tests/y4_mail_adapter.rs",
@@ -510,6 +546,10 @@ const WALK: &[Item] = &[
             at(
                 "src/domain/source.rs",
                 "a_grandchild_key_chains_through_its_own_parent_not_the_root",
+            ),
+            at(
+                "tests/y8_adapter_dispatch.rs",
+                "a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_generation_carries_the_proof",
             ),
         ],
         note: "S4 Y4 (G4 — ADOPT, tests/fixtures/mail_corpus/SPIKE-G4.md). `mail-parser` 0.11.8 \
@@ -578,9 +618,18 @@ const WALK: &[Item] = &[
                exists to discharge a specific owner ruling over a RUSTSEC advisory G4's own deny \
                gate did not find; Y3's `archive.rs` (a second real container adapter) already set \
                the precedent of no dedicated one-owner test, which this wave follows rather than \
-               diverging from unprompted. CROSS-CUTTING GAP applies, same as items 3/5/6/7/13: \
-               the adapter is invoked here through the real worker binary and by tests, not yet \
-               by a shipped scan trigger.",
+               diverging from unprompted. DISPATCH CLOSED, NAMED SEAM STANDS (S4 Y8), same \
+               correction as item 7's own: a claimed `.eml` now reaches the worker from a real \
+               scan (the newly-added check above proves it end to end), closing the 'not yet by \
+               a shipped scan trigger' half of what this note used to say. Mail's own message \
+               body (text/html) is a real `WorkerUnit` and lands as real content — no deviation \
+               there. What does not land is an attachment's own bytes: `WorkerBatch`'s declared \
+               children carry only a name and a path, the identical wire-shape gap item 7's note \
+               states in full (`archive.rs`'s own module doc, 'A named seam' — mail reuses \
+               `archive.rs`'s container machinery, so it inherits the identical wire limit). An \
+               attachment is validated daemon-side and its name lands, visibly, in the message's \
+               own coverage detail — never as its own `source.files` row with real content. Same \
+               destination as item 7: a J0 decision this wave's brief does not settle.",
     },
     Item {
         number: 9,
@@ -735,9 +784,14 @@ const WALK: &[Item] = &[
         note: "X4 pinned the verbs and the wire shape. What had no check was the negative claim \
                — that no surface accepts SQL and the store exposes no way to run any — so this \
                wave wrote one. `map neighbors`/`changed` are absent by declared deferral (F11), \
-               which the verb-set check holds them to. CROSS-CUTTING GAP applies from the other \
-               side: these surfaces expose exactly what a scan wrote, and nothing shipped \
-               triggers a scan, so on a fresh installation they honestly answer empty.",
+               which the verb-set check holds them to. CORRECTED (S4 Y8 panel fix (c)): this note \
+               used to read '...and nothing shipped triggers a scan, so on a fresh installation \
+               they honestly answer empty' — false since S4 Y5/Y6 shipped `sgt intelligence \
+               scan` (see 'One cross-cutting gap, closed', this file's own module doc), and \
+               unnoticed here through two more waves. The true, current gap is narrower: these \
+               surfaces expose exactly what the most recent scan wrote, so a fresh installation \
+               answers empty only until an operator actually RUNS the shipped trigger, not \
+               because no trigger exists.",
     },
     Item {
         number: 14,

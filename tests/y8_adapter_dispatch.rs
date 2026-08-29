@@ -1,0 +1,270 @@
+//! S4 Y8 acceptance: dispatch, not just adapters (brief-y8-adapter-dispatch.md).
+//!
+//! S4 built three content adapters (Office, ZIP/archive, mail/eml)
+//! and a supervised worker transport to run them in — and wired none of it
+//! to a real scan. `sgt intelligence scan` walked a folder, saw a `.docx`,
+//! and did not extract it: `scan.rs`'s routing table never claimed the
+//! extension, so it never reached [`run_worker`]. This is the wave that
+//! fixes it, and this is the proof: a scan of a directory holding one real
+//! `.docx`, one real `.zip` and one real `.eml`, through the PRODUCTION
+//! worker-enabled walk (the shape [`scan_local_knowledge_on_lane`] actually
+//! drives), not an isolated adapter unit test — exactly what the Y7
+//! closeout's own sweep already warned an adapter-only proof would miss.
+//!
+//! [`run_worker`]: sergeant_rs::runtime::atlas::worker::run_worker
+//! [`scan_local_knowledge_on_lane`]: sergeant_rs::runtime::atlas::lane::scan_local_knowledge_on_lane
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use tempfile::TempDir;
+
+use sergeant_rs::domain::event::Event;
+use sergeant_rs::domain::source::{Coverage, CoverageRow, KIND_SOURCE_SCANNED};
+use sergeant_rs::runtime::atlas::archive::ZIP_EXTRACTOR;
+use sergeant_rs::runtime::atlas::db::AtlasDb;
+use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
+use sergeant_rs::runtime::atlas::office::DOCX_EXTRACTOR;
+use sergeant_rs::runtime::atlas::record::record_scan;
+use sergeant_rs::runtime::atlas::scan::{
+    KnowledgeSource, SourceScan, scan_local_knowledge_with_worker,
+};
+use sergeant_rs::runtime::atlas::tabular::ContextFields;
+use sergeant_rs::runtime::atlas::worker::WorkerRuntime;
+use sergeant_rs::runtime::journal::Journal;
+
+/// The real worker binary Cargo built alongside this test binary — same
+/// spelling `tests/y1_worker_transport.rs` and its siblings already use.
+const SGT_ATLAS_WORKER: &str = env!("CARGO_BIN_EXE_sgt-atlas-worker");
+
+fn worker() -> WorkerRuntime {
+    WorkerRuntime {
+        program: PathBuf::from(SGT_ATLAS_WORKER),
+        deadline: Duration::from_secs(20),
+    }
+}
+
+/// One of this repo's own hand-verified fixtures — never a fixture authored
+/// for this test, which is exactly the substitution the brief warns an
+/// isolated adapter test could get away with.
+fn fixture(relative: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(relative);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()))
+}
+
+fn coverage_row<'a>(scan: &'a SourceScan, relative_path: &str) -> &'a CoverageRow {
+    scan.coverage
+        .iter()
+        .find(|r| r.path.as_deref() == Some(relative_path))
+        .unwrap_or_else(|| panic!("no coverage row for {relative_path:?}: {:?}", scan.coverage))
+}
+
+/// The one `source.scanned` journal summary a completed scan writes —
+/// `tests/x2_knowledge_sources.rs`'s own helper, same shape (R2).
+fn scan_summaries(data_dir: &Path) -> Vec<Event> {
+    if !data_dir.join("journal").exists() {
+        return Vec::new();
+    }
+    Journal::replay_data_dir(data_dir)
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == KIND_SOURCE_SCANNED)
+        .collect()
+}
+
+/// **The defect, proven live, and its fix.**
+///
+/// Before S4 Y8: `scan.rs`'s `claims_for` never claimed `.docx`/`.zip`/
+/// `.eml`, so this scan reported all three `unsupported` — no worker ever
+/// ran, `run_worker_on_lane`/`run_worker` had zero callers from a real walk,
+/// and the recorded generation's extractor set never named
+/// the Office, ZIP and mail extractor identities. Watched
+/// red against that code before this wave's dispatch wiring landed.
+///
+/// After: the walk routes each resource through the real supervised worker
+/// ([`run_worker`]) and daemon-side [`validate_batch`] AUTHORITY, exactly as
+/// Y1 designed and Y2/Y3/Y4 built the three adapters to be run — and the
+/// recorded generation (through [`record_scan`]'s real three-step
+/// stage/journal/confirm discipline, not a shortcut) carries the proof.
+///
+/// [`run_worker`]: sergeant_rs::runtime::atlas::worker::run_worker
+/// [`validate_batch`]: sergeant_rs::runtime::atlas::worker::validate_batch
+#[test]
+fn a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_generation_carries_the_proof()
+ {
+    let source_root = TempDir::new().expect("source root");
+    std::fs::write(
+        source_root.path().join("report.docx"),
+        fixture("anydoc_corpus/docx_fixtures/01-plain-headings-paragraphs.docx"),
+    )
+    .expect("write docx");
+    std::fs::write(
+        source_root.path().join("bundle.zip"),
+        fixture("zip_corpus/zip_fixtures/01-plain-and-directory.zip"),
+    )
+    .expect("write zip");
+    std::fs::write(
+        source_root.path().join("message.eml"),
+        fixture("mail_corpus/03-with-attachment.eml"),
+    )
+    .expect("write eml");
+
+    let source = KnowledgeSource {
+        name: "mixed".to_string(),
+        root: source_root.path().to_path_buf(),
+        ignore: Vec::new(),
+        context_fields: ContextFields::none(),
+    };
+    let scan = scan_local_knowledge_with_worker(&source, &worker()).expect("scan");
+
+    // -------------------------------------------------- the extractor set
+    // All three adapter identities actually ran — through the worker, not
+    // merely present in a routing table nothing calls.
+    assert!(
+        scan.extractors.contains(DOCX_EXTRACTOR),
+        "docx extractor missing from {:?}",
+        scan.extractors
+    );
+    assert!(
+        scan.extractors.contains(ZIP_EXTRACTOR),
+        "zip extractor missing from {:?}",
+        scan.extractors
+    );
+    assert!(
+        scan.extractors.contains(MAIL_EXTRACTOR),
+        "mail extractor missing from {:?}",
+        scan.extractors
+    );
+
+    // No adapter is silently unsupported — the very failure mode this scan
+    // exhibited before this wave.
+    for name in ["report.docx", "bundle.zip", "message.eml"] {
+        let row = coverage_row(&scan, name);
+        assert_eq!(
+            row.status,
+            Coverage::Indexed,
+            "{name} must be Indexed through the real worker, not {row:?}"
+        );
+    }
+
+    // ----------------------------------------------------- document units
+    // The docx produced real, non-empty document/section units — not a
+    // placeholder and not zero units silently reported as success.
+    let docx = scan
+        .files
+        .iter()
+        .find(|f| f.relative_path == "report.docx")
+        .expect("docx file landed in source.files");
+    assert!(
+        !docx.units.is_empty(),
+        "a real .docx must produce document units"
+    );
+    assert!(
+        docx.units.iter().any(|u| !u.text.trim().is_empty()),
+        "docx units must carry real text: {:?}",
+        docx.units
+    );
+
+    // The mail message's own body is a document unit too — mail lands both
+    // units (its own body) and children (its attachment) in one message.
+    let eml = scan
+        .files
+        .iter()
+        .find(|f| f.relative_path == "message.eml")
+        .expect("eml file landed in source.files");
+    assert!(
+        !eml.units.is_empty(),
+        "a real .eml must produce at least its text-body unit"
+    );
+    assert!(
+        eml.units.iter().any(|u| u.text.contains("attached report")),
+        "the eml's real text body must reach a unit: {:?}",
+        eml.units
+    );
+
+    // A ZIP's own body carries no text unit of its own (its content is its
+    // children) — the honest empty [`atlas_worker.rs`]'s own doc states,
+    // not a bug.
+    let zip = scan
+        .files
+        .iter()
+        .find(|f| f.relative_path == "bundle.zip")
+        .expect("zip file landed in source.files");
+    assert!(
+        zip.units.is_empty(),
+        "a ZIP container has no body unit of its own"
+    );
+
+    // ------------------------------------------------------------ children
+    // Declared children (validated daemon-side by the real `validate_batch`
+    // AUTHORITY — path safety, F10 deny-set membership) actually landed as
+    // visible, persisted evidence: the recorded coverage detail for each
+    // container names every admitted child. This is the honest amount the
+    // wire contract can carry today — see `archive.rs`'s own module doc,
+    // "A named seam": `WorkerBatch`/`DeclaredChild` do not yet carry a
+    // child's content bytes, only its name and path, so a child does not
+    // yet land as its own `source.files` row. Register row 7's own note
+    // states this as `met-with-deviation`, not a silent gap.
+    let zip_detail = coverage_row(&scan, "bundle.zip")
+        .detail
+        .clone()
+        .unwrap_or_default();
+    for child in ["readme.txt", "notes/a.md", "notes/b.txt"] {
+        assert!(
+            zip_detail.contains(child),
+            "the zip's own coverage row must name declared child {child:?}: {zip_detail:?}"
+        );
+    }
+    let eml_detail = coverage_row(&scan, "message.eml")
+        .detail
+        .clone()
+        .unwrap_or_default();
+    assert!(
+        eml_detail.contains("report.txt"),
+        "the mail's own coverage row must name its declared attachment: {eml_detail:?}"
+    );
+
+    // --------------------------------------- the recorded generation itself
+    // Not just the in-memory `SourceScan` — the real three-step
+    // stage/journal/confirm discipline `record_scan` implements, exactly the
+    // coupling `record.rs`'s own module doc states, over the SAME scan a
+    // production `sgt intelligence scan` would have produced.
+    let data_dir = TempDir::new().expect("data dir");
+    let mut db = AtlasDb::open(data_dir.path()).expect("open atlas");
+    let mut journal = Journal::open(data_dir.path()).expect("open journal");
+    let record = record_scan(&mut db, &mut journal, &scan, None).expect("record");
+    assert!(
+        matches!(
+            record,
+            sergeant_rs::runtime::atlas::record::ScanRecord::Recorded { .. }
+        ),
+        "a fresh scan must record a new generation: {record:?}"
+    );
+
+    let summaries = scan_summaries(data_dir.path());
+    assert_eq!(summaries.len(), 1, "exactly one scan was recorded");
+    let extractors: Vec<&str> = summaries[0].payload["extractors"]
+        .as_array()
+        .expect("extractors array")
+        .iter()
+        .map(|v| v.as_str().expect("str"))
+        .collect();
+    assert!(
+        extractors.contains(&DOCX_EXTRACTOR),
+        "the RECORDED generation's own extractor set must name the docx adapter: {extractors:?}"
+    );
+    assert!(
+        extractors.contains(&ZIP_EXTRACTOR),
+        "the RECORDED generation's own extractor set must name the zip adapter: {extractors:?}"
+    );
+    assert!(
+        extractors.contains(&MAIL_EXTRACTOR),
+        "the RECORDED generation's own extractor set must name the mail adapter: {extractors:?}"
+    );
+    assert_eq!(
+        summaries[0].payload["files"], 3,
+        "all three resources landed as source.files rows"
+    );
+}

@@ -312,12 +312,40 @@ version = "0.0.1"
     /// first commissions a `git.*` consumer for lockfile-derived package
     /// identity", and delete or repoint this tripwire rather than leaving
     /// it stale.
+    ///
+    /// **S4 Y8 panel fix (b).** The original landed form of this tripwire
+    /// scanned three hardcoded files (`src/api.rs`, `src/cli.rs`,
+    /// `src/runtime/atlas/db.rs`) while roughly seventy other files under
+    /// `src/` — `record.rs` among them, the documented DB-glue layer a
+    /// production caller would actually be reached through — went unscanned.
+    /// A caller wired through any of those seventy would have passed this
+    /// tripwire silently. This sweeps every `.rs` file under `src/`
+    /// recursively instead, the same shape
+    /// `x1_atlas_substrate::atlas_database_has_exactly_one_owner` already
+    /// uses for its own "one owner, checked against everything else"
+    /// argument — [`rust_sources`] is that walker, and the `files.len()`
+    /// guard is its coverage check: a typo'd root that silently matched zero
+    /// files would make every assertion below vacuously true.
     #[test]
     fn the_derivation_has_no_production_caller_yet() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        for relative in ["src/api.rs", "src/cli.rs", "src/runtime/atlas/db.rs"] {
-            let path = root.join(relative);
-            let text = std::fs::read_to_string(&path)
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        // The owner itself is exempt (R2, same reasoning
+        // `atlas_database_has_exactly_one_owner` gives for skipping `db.rs`):
+        // this very file defines `parse_cargo_lock`/`LockedPackage`/etc., so
+        // scanning it would trip on its own definitions rather than on a
+        // caller.
+        let owner = root.join("domain/package.rs");
+        let files = rust_sources(&root);
+        assert!(
+            files.len() > 50,
+            "the scan must actually cover the whole src/ tree, not a handful of files: {} found",
+            files.len()
+        );
+        for path in &files {
+            if *path == owner {
+                continue;
+            }
+            let text = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             for needle in [
                 "domain::package",
@@ -328,10 +356,28 @@ version = "0.0.1"
             ] {
                 assert!(
                     !text.contains(needle),
-                    "{relative} now names `{needle}` — package identity appears to have a \
-                     production caller. See this test's own doc comment for what to do."
+                    "{} now names `{needle}` — package identity appears to have a production \
+                     caller. See this test's own doc comment for what to do.",
+                    path.strip_prefix(&root).unwrap_or(path).display()
                 );
             }
         }
+    }
+
+    /// Every `.rs` file under `dir`, recursively — the same shape
+    /// `tests/x1_atlas_substrate.rs`'s own `rust_sources` helper uses (R2),
+    /// duplicated rather than shared because that one lives in a separate
+    /// integration-test binary this `src/`-embedded unit test cannot import.
+    fn rust_sources(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                out.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
     }
 }

@@ -401,6 +401,39 @@ pub struct WorkerSpawn {
     pub deadline: Duration,
 }
 
+/// The two invariants one whole scan's worth of worker dispatch shares —
+/// where the binary lives, and how long a single call may run — threaded
+/// down to whichever walk ([`super::scan::Walk`], [`super::git::extract_blobs`])
+/// actually claims a resource for a supervised adapter (S4 Y8).
+///
+/// A scan claims Office/ZIP/mail resources one at a time, deep inside a
+/// pure, engine-agnostic walk that (by design, module doc) knows nothing
+/// about an [`crate::runtime::engine::Engine`] or a daemon's own binary
+/// path — so this is resolved once, by whichever caller *does* know it
+/// ([`super::lane::scan_local_knowledge_on_lane`]/
+/// [`super::lane::scan_estate_git_on_lane`] in production; a test spawning
+/// the real `sgt-atlas-worker` Cargo built), and passed down as one small
+/// value rather than re-derived per resource.
+#[derive(Debug, Clone)]
+pub struct WorkerRuntime {
+    /// The worker binary every claimed resource in this scan dispatches to
+    /// — see [`WorkerSpawn::program`]'s own doc for why this is a plain
+    /// `PathBuf` rather than [`std::env::current_exe`] baked in here.
+    pub program: PathBuf,
+    /// [`WorkerSpawn::deadline`] for every call this scan makes.
+    pub deadline: Duration,
+}
+
+/// **PROVISIONAL — declared, not measured**, the same honesty
+/// [`WORKER_ADDRESS_SPACE_LIMIT_BYTES`]'s own doc states for its number: S4
+/// Y8 is this transport's first production caller, so there is no real
+/// scanned corpus to time it against yet. Generous enough that an ordinary
+/// `.docx`/`.zip`/`.eml` well under [`super::scan::MAX_RESOURCE_BYTES`]
+/// finishes with room to spare; must be re-derived against a real corpus
+/// once one exists, and this comment updated to cite that measurement when
+/// it does.
+pub const WORKER_RUNTIME_DEADLINE: Duration = Duration::from_secs(30);
+
 /// What one supervised call produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerOutcome {
@@ -1204,22 +1237,51 @@ mod tests {
         // `x5_a1a_acceptance.rs`'s production-caller check solves by cutting
         // its scan off at `\nmod tests {`).
         let needles = ["Atlas", "Db"].concat();
-        for (relative, text) in [
-            (
-                "src/bin/atlas_worker.rs",
-                std::fs::read_to_string(root.join("src/bin/atlas_worker.rs")),
-            ),
-            (
-                "src/runtime/atlas/worker.rs (production code only)",
-                std::fs::read_to_string(root.join("src/runtime/atlas/worker.rs")).map(|whole| {
+
+        // S4 Y8 panel fix (a): `src/bin/` is walked recursively rather than
+        // one hardcoded `atlas_worker.rs` path, the same "one owner, checked
+        // against everything in the tree" shape
+        // `x1_atlas_substrate::atlas_database_has_exactly_one_owner` already
+        // uses — a second worker binary, or `atlas_worker.rs` splitting into
+        // a directory, stays covered without this test needing a second
+        // edit. The `any(...)` assertion is the coverage guard: a typo'd
+        // root that silently matched zero files would make the loop below
+        // vacuously pass.
+        let bin_files = rust_sources(&root.join("src/bin"));
+        assert!(
+            bin_files
+                .iter()
+                .any(|f| f.file_name().is_some_and(|n| n == "atlas_worker.rs")),
+            "the recursive walk of src/bin/ must actually find atlas_worker.rs, or this check \
+             proves nothing: {bin_files:?}"
+        );
+        let mut scanned: Vec<(String, String)> = bin_files
+            .into_iter()
+            .map(|path| {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+                (
+                    path.strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                    text,
+                )
+            })
+            .collect();
+        scanned.push((
+            "src/runtime/atlas/worker.rs (production code only)".to_string(),
+            std::fs::read_to_string(root.join("src/runtime/atlas/worker.rs"))
+                .map(|whole| {
                     let cut = whole
                         .find("\n#[cfg(test)]\nmod tests {")
                         .unwrap_or(whole.len());
                     whole[..cut].to_string()
-                }),
-            ),
-        ] {
-            let text = text.unwrap_or_else(|e| panic!("read {relative}: {e}"));
+                })
+                .unwrap_or_else(|e| panic!("read src/runtime/atlas/worker.rs: {e}")),
+        ));
+
+        for (relative, text) in scanned {
             assert!(
                 !text.contains(&needles),
                 "{relative} names the Atlas store type — a worker process must have no path to \
@@ -1230,5 +1292,22 @@ mod tests {
                 "{relative} names the store module path directly"
             );
         }
+    }
+
+    /// Every `.rs` file under `dir`, recursively — the same shape
+    /// `tests/x1_atlas_substrate.rs`'s own `rust_sources` helper uses (R2),
+    /// duplicated rather than shared because that one lives in a separate
+    /// integration-test binary this `src/`-embedded unit test cannot import.
+    fn rust_sources(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                out.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
     }
 }
