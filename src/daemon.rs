@@ -846,6 +846,39 @@ pub async fn start_with(
                          generation may remain unresolved (it stays unreadable)"
                     ),
                 }
+                // S5 W2 (F-SF-01): the lexical-index upgrade path. A store
+                // written before W2 has confirmed generations with rows but
+                // no postings — `reindex_lexical`'s own doc names this exact
+                // condition, but nothing invoked it. `lexical_index_needs_rebuild`
+                // is a cheap anti-join, so it is safe to check every startup
+                // rather than only once at a version boundary this crate has
+                // no other way to detect; the rebuild itself runs only when
+                // that check finds something to do.
+                match atlas.lexical_index_needs_rebuild() {
+                    Ok(true) => match atlas.reindex_lexical() {
+                        Ok(outcome) => tracing::debug!(
+                            target: "sergeant::atlas",
+                            indexed = outcome.indexed,
+                            truncated = outcome.truncated,
+                            "lexical index rebuilt at startup (S5 W2 upgrade path)"
+                        ),
+                        // Same reasoning as an unopenable store above:
+                        // derived evidence never costs the estate its daemon.
+                        Err(e) => tracing::warn!(
+                            target: "sergeant::atlas",
+                            error = %e,
+                            "lexical index could not be rebuilt at startup; \
+                             lexical_search may return empty for pre-existing \
+                             generations this run"
+                        ),
+                    },
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        target: "sergeant::atlas",
+                        error = %e,
+                        "could not check whether the lexical index needs a rebuild"
+                    ),
+                }
                 // S5 W1b: the Work-overlay eviction reconciliation sweep,
                 // first half — a terminal Work whose surface was ALREADY
                 // torn down before this restart.

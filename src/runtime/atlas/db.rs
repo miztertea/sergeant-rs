@@ -2871,6 +2871,29 @@ impl AtlasDb {
         Ok(ReindexOutcome { indexed, truncated })
     }
 
+    /// Whether the lexical index is missing postings for a non-evicted
+    /// generation that has rows — the exact condition
+    /// [`Self::reindex_lexical`]'s doc names as "a store written before S5
+    /// W2". Cheap: an anti-join over generation ids, not a rebuild, so it is
+    /// safe to call every startup rather than only once at a version
+    /// boundary this crate has no other way to detect (F-SF-01).
+    pub fn lexical_index_needs_rebuild(&self) -> Result<bool, AtlasError> {
+        let mut statement = self.conn.prepare(
+            "SELECT COUNT(*) FROM source.generations g \
+             WHERE g.state != ? \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM context.lexical_units l \
+                 WHERE l.generation_id = g.generation_id \
+               )",
+        )?;
+        let mut rows = statement.query(duckdb::params![STATE_EVICTED])?;
+        let count: i64 = match rows.next()? {
+            Some(row) => row.get(0)?,
+            None => 0,
+        };
+        Ok(count > 0)
+    }
+
     /// Every generation's state, keyed by id — a diagnostic read, and what a
     /// crash-window test inspects.
     pub fn generation_states(&self) -> Result<BTreeMap<String, String>, AtlasError> {
@@ -6788,6 +6811,77 @@ mod tests {
         let debug = format!("{atlas:?}");
         assert!(debug.contains(":memory:"), "{debug}");
         assert!(!debug.contains("Connection"), "{debug}");
+    }
+
+    /// F-SF-01: `reindex_lexical`'s own doc names its upgrade condition as
+    /// "a store written before S5 W2, whose generations have rows but no
+    /// postings" — but nothing detected that condition. Reproduce it
+    /// directly (strip a confirmed generation's own postings, the same rows
+    /// `reindex_lexical` itself deletes before rebuilding) rather than via a
+    /// second `Connection::open` on the file, which `tests/x1_atlas_substrate.rs`'s
+    /// one-owner assertion forbids: `db.conn` here is the *same* connection
+    /// `record` staged and confirmed through, just used to remove rows the
+    /// same way an old on-disk store would already be missing them.
+    #[test]
+    fn a_confirmed_generation_missing_postings_is_detected_and_backfilled() {
+        let mut db = AtlasDb::open_in_memory().expect("atlas");
+        let generation_id = record(
+            &mut db,
+            &scan_of("notes", "PaymentRetryPolicy lives here"),
+            "evt-1",
+        );
+
+        // A generation confirmed through the normal path already has
+        // postings (index_generation runs at staging) — strip them to
+        // reproduce the exact shape a pre-W2 store would have.
+        db.conn
+            .execute(
+                "DELETE FROM context.lexical_postings WHERE generation_id = ?",
+                duckdb::params![generation_id],
+            )
+            .expect("strip postings");
+        db.conn
+            .execute(
+                "DELETE FROM context.lexical_units WHERE generation_id = ?",
+                duckdb::params![generation_id],
+            )
+            .expect("strip units");
+
+        assert!(
+            db.lexical_index_needs_rebuild().expect("check"),
+            "a confirmed generation with rows but no lexical_units must be flagged stale"
+        );
+        let before = db
+            .lexical_search(&LexicalQuery {
+                text: "PaymentRetryPolicy",
+                filter: &Admissibility::default(),
+                family: None,
+                limit: 10,
+            })
+            .expect("search");
+        assert!(
+            before.hits.is_empty(),
+            "with postings stripped, the unit must be silently unreachable — F-SF-01's gap"
+        );
+
+        let outcome = db.reindex_lexical().expect("reindex");
+        assert!(outcome.indexed > 0, "the rebuild must actually index units");
+        assert!(
+            !db.lexical_index_needs_rebuild().expect("recheck"),
+            "after reindex_lexical the store must no longer look stale"
+        );
+        let after = db
+            .lexical_search(&LexicalQuery {
+                text: "PaymentRetryPolicy",
+                filter: &Admissibility::default(),
+                family: None,
+                limit: 10,
+            })
+            .expect("search");
+        assert!(
+            !after.hits.is_empty(),
+            "reindex_lexical must backfill the generation's postings"
+        );
     }
 }
 
