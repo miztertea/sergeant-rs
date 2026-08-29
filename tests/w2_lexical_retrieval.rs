@@ -40,7 +40,7 @@ use tempfile::TempDir;
 use sergeant_rs::domain::event::rfc3339_utc_now;
 use sergeant_rs::domain::source::{AuthorityClass, SourceKind, UnitKind};
 use sergeant_rs::runtime::atlas::db::{
-    Admissibility, AtlasDb, LexicalAnswer, LexicalQuery, SourceSelector,
+    Admissibility, AtlasDb, LexicalAnswer, LexicalQuery, MAX_ROWS, SourceSelector,
 };
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, LexicalHit, UnitCoordinate};
 use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
@@ -956,5 +956,51 @@ fn a_bounded_answer_states_whether_the_posting_scan_was_capped() {
     assert!(
         !answer.truncated,
         "this corpus is far under the cap; a true flag here means the cap logic is wrong"
+    );
+}
+
+/// F-TH-01: the sibling of the test above, exercising the branch that one
+/// never reaches — `MAX_ROWS + 1` postings for a single term, all admissible,
+/// so the posting scan (`db.rs`'s `'terms` loop) must hit the cap and report
+/// it. Without this test, `truncated = true;` could be deleted or made a
+/// permanent no-op and nothing in the suite would notice.
+#[test]
+fn a_bounded_answer_reports_true_when_the_posting_scan_is_actually_capped() {
+    let mut db = AtlasDb::open_in_memory().expect("atlas");
+    let data = tempfile::tempdir().expect("data dir");
+    let mut journal = Journal::open(data.path()).expect("journal");
+
+    let unit_count = MAX_ROWS + 1;
+    let units: Vec<ScannedUnit> = (0..unit_count as u64)
+        .map(|ordinal| ScannedUnit {
+            ordinal,
+            kind: UnitKind::Document,
+            heading_level: None,
+            title: None,
+            byte_start: 0,
+            byte_end: 8,
+            text: "needleterm".to_string(),
+        })
+        .collect();
+    let bulk = hand_built_scan(
+        "bulk",
+        SourceKind::LocalKnowledge,
+        AuthorityClass::EstateReadonly,
+        "bulk@key-1",
+        vec![scanned_file("bulk.md", MARKDOWN_EXTRACTOR, units)],
+    );
+    record_scan(&mut db, &mut journal, &bulk, None).expect("record bulk");
+
+    let answer = db
+        .lexical_search(&LexicalQuery {
+            text: "needleterm",
+            filter: &Admissibility::default(),
+            family: None,
+            limit: MAX_ROWS,
+        })
+        .expect("lexical search");
+    assert!(
+        answer.truncated,
+        "{unit_count} admissible postings for one term must trip the {MAX_ROWS}-row cap"
     );
 }
