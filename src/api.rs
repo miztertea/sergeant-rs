@@ -29,8 +29,8 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::backend::Deferred;
 use crate::backend::codex::KIND_TURN_HARNESS_ERROR;
+use crate::backend::{BackendSignal, Deferred};
 use crate::cli::doctor;
 use crate::daemon::{
     KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED, KIND_BACKEND_PROBED, KIND_DAEMON_STARTED,
@@ -768,8 +768,13 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
                         }
                         let outcome = blocking(|| pending.perform()).await;
                         let work_id = pending.work_id().to_string();
-                        let mut core = CoreGuard::acquire(&bg_state.core).await;
-                        match bg_state.engine.settle_launch(&mut core, pending, outcome) {
+                        let ended_a_turn = is_turn_boundary(outcome.signal());
+                        let (work_id, settled, core) =
+                            settle_turn(&bg_state, work_id, ended_a_turn, |core| {
+                                bg_state.engine.settle_launch(core, pending, outcome)
+                            })
+                            .await;
+                        match settled {
                             Ok(next_step) => {
                                 drop(core);
                                 crank(&bg_state, next_step).await;
@@ -787,22 +792,25 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
                 }
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_launch(&mut core, pending, outcome),
-                    core,
-                )
+                // S5 W1d: a launch observes the turn it just started, the
+                // same way SEND-settle below does.
+                let ended_a_turn = is_turn_boundary(outcome.signal());
+                settle_turn(state, work_id, ended_a_turn, |core| {
+                    state.engine.settle_launch(core, pending, outcome)
+                })
+                .await
             }
             EngineNext::Send(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_send(&mut core, pending, outcome),
-                    core,
-                )
+                // S5 W1d: a delivery observes the turn it just started, so
+                // SEND-settle is one of the three places a turn boundary is
+                // adjudicated. Read before the settle consumes the outcome.
+                let ended_a_turn = is_turn_boundary(outcome.signal());
+                settle_turn(state, work_id, ended_a_turn, |core| {
+                    state.engine.settle_send(core, pending, outcome)
+                })
+                .await
             }
             EngineNext::Surface(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
@@ -829,22 +837,32 @@ async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
             EngineNext::Observe(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_observe(&mut core, pending, outcome),
-                    core,
-                )
+                // S5 W1d: read the backend's signal off the outcome BEFORE
+                // `settle_observe` consumes it — the same order the surface
+                // arm above reads a `SurfaceOutcome` in. A turn boundary is
+                // W1d's overlay-refresh moment; see `is_turn_boundary`.
+                let ended_a_turn = is_turn_boundary(outcome.signal());
+                settle_turn(state, work_id, ended_a_turn, |core| {
+                    state.engine.settle_observe(core, pending, outcome)
+                })
+                .await
             }
             EngineNext::Interrupt(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
+                // S5 W1d (F-SF-01 fix): an interrupt always ends the turn it
+                // cuts short — `settle_interrupt` unconditionally commits
+                // KIND_TURN_CEILING_INTERRUPTED and, when the Work is still
+                // Active, blocks it — so this is a fourth turn-boundary site,
+                // not a signal-conditioned one like Launch/Send/Observe: there
+                // is no `BackendSignal` on `InterruptOutcome` to read.
+                // Without this, a Work interrupted for a live ceiling
+                // crossing sits Blocked — often for a long time — with the
+                // overlay left stale from before the interrupted turn.
                 let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_interrupt(&mut core, *pending, outcome),
-                    core,
-                )
+                let settled = state.engine.settle_interrupt(&mut core, *pending, outcome);
+                refresh_overlay_after_turn(state, &core, &work_id, settled.is_ok());
+                (work_id, settled, core)
             }
         };
         let (work_id, outcome, core) = settled;
@@ -4777,21 +4795,120 @@ async fn with_existing_atlas_write<T>(
     Ok(Some(f(atlas)))
 }
 
-/// S5 W1b — which Work-overlay lifecycle action one settled surface
-/// operation implies (H13.2's chosen mechanism).
+/// S5 W1b/W1d — which Work-overlay action one settled engine step implies.
 ///
-/// The two moments are the two ends of the lifetime
+/// [`Self::Bind`] and [`Self::Evict`] are the two ends of the lifetime
 /// [`crate::runtime::atlas::overlay`]'s module doc already claims for an
 /// overlay ("scoped to one Work, and evicted with it") and which was, until
-/// this wave, prose with nothing enforcing it.
+/// W1b, prose with nothing enforcing it. [`Self::Refresh`] is W1d's
+/// addition and is the only one of the three that fires **while the Work is
+/// still running** — which is what A2 §2's "current Work's world, including
+/// overlay" actually asks for: a freshly cut worktree is byte-identical to
+/// its base, so a bind-only trigger records an empty overlay and `--work`
+/// never reflects anything the Work did.
 #[derive(Debug)]
 enum WorkOverlayHook {
     /// The surface exists and is bound — materialized for the first time,
     /// or re-materialized for a retry. Scan it as an overlay over its
     /// admission-pinned base.
     Bind(Box<WorkSurface>),
+    /// A **turn boundary** passed and the surface is still bound: the actor
+    /// stopped producing, so whatever it changed is now on disk and settled.
+    /// Scan it again, exactly as [`Self::Bind`] does.
+    ///
+    /// Distinguished from `Bind` only so that
+    /// [`spawn_work_overlay_hook`] can **coalesce** it: a refresh is by
+    /// construction superseded by the next one, whereas a bind and an
+    /// eviction are lifecycle facts that must each be applied.
+    Refresh(Box<WorkSurface>),
     /// The surface is gone. Evict this Work's overlay generations with it.
     Evict,
+}
+
+impl WorkOverlayHook {
+    /// Whether a hook of this kind may be dropped when one is already
+    /// queued for the same Work — see [`WorkOverlayHook::Refresh`].
+    fn coalesces(&self) -> bool {
+        matches!(self, Self::Refresh(_))
+    }
+}
+
+/// Whether a settled observation ended a **turn**.
+///
+/// [`BackendSignal::Running`] is the poll that found the actor still
+/// producing: its surface is mid-write and scanning it would index a
+/// half-written tree at an arbitrary instant. Every other signal is the
+/// actor having stopped — completed the stage, asked a question, parked on
+/// a wait, blocked, or failed — which is the moment the surface is as
+/// settled as it will get without the Work ending.
+///
+/// **This is why W1d needed no scan interval.** A rescan *loop* would need
+/// a period, and a period is a number with no measurement behind it; a turn
+/// boundary is the actor's own rhythm, self-limiting at exactly one scan
+/// per turn, and it is the moment at which the thing being described has
+/// stopped moving.
+fn is_turn_boundary(signal: Option<&BackendSignal>) -> bool {
+    !matches!(signal, None | Some(BackendSignal::Running))
+}
+
+/// S5 W1d's refresh moment, applied to one settled step.
+///
+/// A turn boundary is adjudicated in three places, not one — the engine's
+/// own doc on [`crate::runtime::engine::PendingObserve`] lists them:
+/// launch-settle and SEND-settle each carry the observation of the turn
+/// they themselves started, and the completion driver's OBSERVE covers the
+/// turn nothing else was watching. All three route here so that a Work
+/// which never goes through the poller (a scripted, fast-answering actor)
+/// is refreshed exactly as one that does.
+///
+/// The surface is read from the journal-backed registry — the same
+/// [`WorkSurface`] the bind hook was handed, never a path reconstructed
+/// here. A run with no materialized surface has nothing to scan and is
+/// skipped, exactly as a failed materialization is.
+/// Acquire the core, settle one performed effect against it, and refresh the
+/// Work-overlay if that settle both ended a turn and actually landed
+/// (F-SI-02): the shape shared by Launch-settle, SEND-settle, OBSERVE-settle,
+/// and the execution-lane background launch, which otherwise repeated this
+/// acquire/settle/refresh/return sequence almost verbatim, differing only in
+/// which `settle_*` method the caller closes over.
+async fn settle_turn<'a, F>(
+    state: &'a ApiState,
+    work_id: String,
+    ended_a_turn: bool,
+    settle: F,
+) -> (String, Result<Step, EngineError>, CoreGuard<'a>)
+where
+    F: FnOnce(&mut Core) -> Result<Step, EngineError>,
+{
+    let mut core = CoreGuard::acquire(&state.core).await;
+    let settled = settle(&mut core);
+    refresh_overlay_after_turn(state, &core, &work_id, ended_a_turn && settled.is_ok());
+    (work_id, settled, core)
+}
+
+fn refresh_overlay_after_turn(
+    state: &ApiState,
+    core: &CoreGuard<'_>,
+    work_id: &str,
+    ended_a_turn: bool,
+) {
+    if !ended_a_turn {
+        return;
+    }
+    let Some(surface) = core
+        .registry
+        .state()
+        .runs
+        .get(work_id)
+        .and_then(|run| run.surface.clone())
+    else {
+        return;
+    };
+    spawn_work_overlay_hook(
+        state,
+        work_id.to_string(),
+        WorkOverlayHook::Refresh(Box::new(surface)),
+    );
 }
 
 /// Read the lifecycle action off a settled [`SurfaceOutcome`].
@@ -4800,9 +4917,10 @@ enum WorkOverlayHook {
 /// surface to scan, and nothing was written that needs evicting. A
 /// re-materialization that found every worktree already on disk
 /// (`Rematerialized(Ok(None))`) is also no action — the surface was never
-/// unbound, so the overlay standing from its last bind is still the answer
-/// this Work's own lifecycle produced, and inventing a rescan here would be
-/// the rescan loop the wave's scope explicitly excludes.
+/// unbound, so the overlay standing from its last scan is still the answer
+/// this Work's own lifecycle produced, and the next turn boundary
+/// ([`is_turn_boundary`], S5 W1d) refreshes it without a second bind hook
+/// here.
 fn work_overlay_hook_for(outcome: &SurfaceOutcome) -> Option<WorkOverlayHook> {
     match outcome {
         SurfaceOutcome::Materialized(Ok(surface)) => {
@@ -4832,9 +4950,40 @@ fn work_overlay_hook_for(outcome: &SurfaceOutcome) -> Option<WorkOverlayHook> {
 /// already finished, so the map holds at most one entry per Work with a
 /// hook still in flight, plus recently-finished ones until the next spawn
 /// sweeps them.
-static WORK_OVERLAY_HOOKS: std::sync::LazyLock<
-    std::sync::Mutex<BTreeMap<String, tokio::task::JoinHandle<()>>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+///
+/// The bool beside each handle is "the hook this entry belongs to is a
+/// coalescing one" ([`WorkOverlayHook::coalesces`]) — W1d's bound on the
+/// chain's own length. Without it a Work whose turns end faster than its
+/// overlay scans complete would grow the chain without limit, and, worse,
+/// would queue its own teardown eviction behind every stale scan ahead of
+/// it. A refresh that is already waiting is by construction superseded by
+/// the one that would follow it, so the newer one is dropped rather than
+/// appended; a bind and an eviction never are.
+static WORK_OVERLAY_HOOKS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, QueuedHook>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+/// One Work's most recently spawned overlay hook — see [`WORK_OVERLAY_HOOKS`].
+struct QueuedHook {
+    /// The task itself; the next hook for this Work awaits it before
+    /// running, which is the ordering invariant the chain exists for.
+    handle: tokio::task::JoinHandle<()>,
+    /// Whether the hook this entry belongs to may be superseded
+    /// ([`WorkOverlayHook::coalesces`]).
+    coalescing: bool,
+    /// Flipped to `true` by the hook itself the instant it actually begins
+    /// reading the surface (F-IN-01), never by `spawn_work_overlay_hook`.
+    ///
+    /// `coalescing` alone is a static property of the hook *variant* and
+    /// stays `true` for the entry's whole life, so it cannot tell "still
+    /// waiting on the chain, hasn't started scanning yet" (safe to drop a
+    /// newer refresh — the survivor will read the surface no earlier than
+    /// the dropped one would have) from "already mid-scan" (NOT safe: the
+    /// survivor may already be reading the tree when the newer turn's edit
+    /// lands, and dropping the newer refresh loses the only scan that would
+    /// have caught it). The coalescing guard below checks this flag, not
+    /// just `coalescing`.
+    started: Arc<std::sync::atomic::AtomicBool>,
+}
 
 /// Run the hook detached, never on the crank's own thread of control.
 ///
@@ -4851,9 +5000,30 @@ fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayH
     let mut chain = WORK_OVERLAY_HOOKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    chain.retain(|_, handle| !handle.is_finished());
-    let previous = chain.remove(&work_id);
+    chain.retain(|_, queued| !queued.handle.is_finished());
+    let coalescing = hook.coalesces();
+    // F-IN-01: only a survivor that has **not yet started reading the
+    // surface** makes dropping this one safe — see `QueuedHook::started`'s
+    // doc for why `coalescing` alone cannot tell the two cases apart.
+    if coalescing
+        && chain.get(&work_id).is_some_and(|queued| {
+            queued.coalescing && !queued.started.load(std::sync::atomic::Ordering::Relaxed)
+        })
+    {
+        // Superseded before it started: the refresh already queued (and
+        // confirmed not yet mid-scan) will read the surface no earlier than
+        // this one would have, and the next turn boundary schedules
+        // another. Dropped, never appended — see [`WORK_OVERLAY_HOOKS`].
+        tracing::debug!(
+            work_id = %work_id,
+            "an overlay refresh is already queued for this Work; coalescing this one into it"
+        );
+        return;
+    }
+    let previous = chain.remove(&work_id).map(|queued| queued.handle);
     let key = work_id.clone();
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_started = started.clone();
     let handle = tokio::spawn(async move {
         if let Some(previous) = previous {
             // A panicked predecessor is still a completed predecessor for
@@ -4861,9 +5031,16 @@ fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayH
             // happened, not swallowed here.
             let _ = previous.await;
         }
-        run_work_overlay_hook(state, work_id, hook).await;
+        run_work_overlay_hook(state, work_id, hook, hook_started).await;
     });
-    chain.insert(key, handle);
+    chain.insert(
+        key,
+        QueuedHook {
+            handle,
+            coalescing,
+            started,
+        },
+    );
 }
 
 /// **The production trigger for Work-overlay evidence** (S5 W1b, closing
@@ -4875,22 +5052,50 @@ fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayH
 /// This is that hook.
 ///
 /// ```text
-/// surface bound (materialize / rematerialize)
+/// surface bound (materialize / rematerialize)   [W1b]
 ///     -> scan_work_overlay_on_lane      one intelligence-lane permit, blocking pool (F6)
 ///        -> record_scan                 the ordinary staged/journaled/confirmed write
-/// surface torn down
+/// a turn ended and the surface is still bound   [W1d]
+///     -> the same two steps again       coalescing (see `WORK_OVERLAY_HOOKS`)
+/// surface torn down                             [W1b]
 ///     -> AtlasDb::evict_work_overlays   a `generation_evicted` coverage row per generation
 /// ```
 ///
 /// # Freshness: this is where the snapshot semantic comes from
 ///
-/// A Work mutates its surface continuously; this fires at bind and at
-/// teardown and at no other moment. So a `--work` answer's overlay half is
-/// *as of the last bind*, which is why
-/// [`crate::runtime::atlas::db::WorkScope::BaseAndOverlaySnapshot`] carries
-/// that instant on the answer instead of leaving a reader to assume
-/// "current". A periodic rescan is a named destination, not this wave's
-/// (W1b brief, "NOT in scope").
+/// **W1b bound this to the surface lifecycle alone, and that was not
+/// enough.** A worktree is cut byte-identical to its base, so the only
+/// overlay a bind can ever record is an *empty* one: `--work` answered with
+/// the base generation and an honestly-labelled snapshot of nothing, while
+/// A2 §2 names `--work` as the "current Work's world, **including
+/// overlay**". W1d added the [`WorkOverlayHook::Refresh`] moment above so
+/// the sentence is true of the code.
+///
+/// The overlay half is therefore *as of the end of the Work's last
+/// completed turn* — not "live". A Work is mutating its surface throughout
+/// a turn, and scanning mid-turn would index a half-written tree; the
+/// boundary is where the actor has stopped. That instant is still carried
+/// on the answer by
+/// [`crate::runtime::atlas::db::WorkScope::BaseAndOverlaySnapshot`] rather
+/// than left for a reader to assume, exactly as W1b left it — a fresher
+/// moment moves the instant, it does not turn the marker into a claim of
+/// currency.
+///
+/// # Cost, measured rather than asserted
+///
+/// One scan is a repository extraction (base tree listing, one `git diff`,
+/// a batched blob read of the unchanged half). Measured 2026-08-29 against
+/// this estate's own `sergeant-rs` mount — 400 tracked files, 178 indexed —
+/// at **~0.72 s release / ~1.93 s debug per scan, flat in the number of
+/// changed paths** (`tests/w1d_overlay_scan_measurement.rs`, figures in the
+/// estate's `knowledge/evidence/perf/`). A turn boundary is minutes apart,
+/// the scan is detached from the crank and bounded by the intelligence
+/// lane's own permit, and the chain coalesces refreshes — so per-turn was
+/// affordable at that corpus and no narrower incremental scan was built
+/// (R1). The measurement is of one corpus on one host and says nothing
+/// about a repository two orders of magnitude larger; the coalescing bound
+/// is what keeps *that* case from queueing scans behind a teardown rather
+/// than an unmeasured interval knob.
 ///
 /// # Nothing is created for an installation that indexes nothing
 ///
@@ -4900,11 +5105,16 @@ fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayH
 /// overlay against, and gains neither a database nor a repository walk from
 /// running a Work. **Stated, not silent**: the consequence is that an
 /// estate which starts indexing *after* a Work is already bound sees that
-/// Work's overlay only at its next bind, and `--work` reports
+/// Work's overlay only at its next turn boundary or bind, and `--work` reports
 /// [`WorkScope::BaseOnly`](crate::runtime::atlas::db::WorkScope::BaseOnly)
 /// until then — which is exactly true, and is the whole point of carrying
 /// the scope on the answer.
-async fn run_work_overlay_hook(state: ApiState, work_id: String, hook: WorkOverlayHook) {
+async fn run_work_overlay_hook(
+    state: ApiState,
+    work_id: String,
+    hook: WorkOverlayHook,
+    started: Arc<std::sync::atomic::AtomicBool>,
+) {
     let surface = match hook {
         WorkOverlayHook::Evict => {
             match with_existing_atlas_write(&state, |atlas| atlas.evict_work_overlays(&work_id))
@@ -4929,7 +5139,7 @@ async fn run_work_overlay_hook(state: ApiState, work_id: String, hook: WorkOverl
             }
             return;
         }
-        WorkOverlayHook::Bind(surface) => surface,
+        WorkOverlayHook::Bind(surface) | WorkOverlayHook::Refresh(surface) => surface,
     };
 
     // Read, not create: an installation with no Atlas store indexes nothing,
@@ -4943,6 +5153,12 @@ async fn run_work_overlay_hook(state: ApiState, work_id: String, hook: WorkOverl
             return;
         }
     }
+
+    // F-IN-01: from here on this task is actually reading the surface (a
+    // git tree listing, diff, and blob read per binding, next), so a newer
+    // coalescing hook queued for this Work must no longer be dropped on the
+    // assumption that this scan hasn't started yet.
+    started.store(true, std::sync::atomic::Ordering::Relaxed);
 
     for binding in &surface.bindings {
         let overlay = WorkOverlay {
@@ -9319,6 +9535,85 @@ mod tests {
             view["work"]["state"], "completed_dirty",
             "a dirty completion reports the §11.5 compact label even without \
              ADR 0007(b)'s stranded inference"
+        );
+    }
+
+    /// S5 W1d, structural: **`Running` is the only signal that is not a
+    /// refresh moment**, and the match is exhaustive so a new
+    /// [`BackendSignal`] variant cannot be added without deciding whether
+    /// the Work's surface has settled at it.
+    ///
+    /// The distinction is the whole cost argument. A poll that finds the
+    /// actor still producing has found a tree mid-write; scanning it would
+    /// index a world that never settled, and would do so at whatever rate
+    /// the completion driver happens to poll — which is exactly the
+    /// unmeasured rescan interval W1d did not introduce.
+    #[test]
+    fn only_a_still_running_turn_is_not_an_overlay_refresh_moment() {
+        assert!(
+            !is_turn_boundary(None),
+            "a poll that never reached the backend says nothing about the turn"
+        );
+        for signal in [
+            BackendSignal::Running,
+            BackendSignal::StageCompleted { summary: None },
+            BackendSignal::NeedsInput {
+                prompt: "q".to_string(),
+                asked_by: Default::default(),
+            },
+            BackendSignal::Waiting {
+                reason: "w".to_string(),
+            },
+            BackendSignal::Blocked {
+                reason: "b".to_string(),
+            },
+            BackendSignal::Failed {
+                reason: "f".to_string(),
+            },
+        ] {
+            // Exhaustive on purpose: adding a variant breaks this match,
+            // not this test's assertion.
+            let settled = match signal {
+                BackendSignal::Running => false,
+                BackendSignal::StageCompleted { .. }
+                | BackendSignal::NeedsInput { .. }
+                | BackendSignal::Waiting { .. }
+                | BackendSignal::Blocked { .. }
+                | BackendSignal::Failed { .. } => true,
+            };
+            assert_eq!(
+                is_turn_boundary(Some(&signal)),
+                settled,
+                "{signal:?} is {} a moment at which the Work's surface has stopped moving",
+                if settled { "" } else { "not" }
+            );
+        }
+    }
+
+    /// S5 W1d, structural: **only a refresh may be dropped.** The chain in
+    /// [`WORK_OVERLAY_HOOKS`] coalesces on this predicate, and a bind or an
+    /// eviction silently coalesced away would be a lost lifecycle fact —
+    /// an overlay never recorded, or worse, one never evicted from a Work
+    /// that has retired.
+    #[test]
+    fn a_bind_or_an_eviction_is_never_coalesced_away() {
+        let surface = WorkSurface {
+            work_id: "01W1D".to_string(),
+            root: std::path::PathBuf::from("/nowhere"),
+            bindings: Vec::new(),
+        };
+        assert!(
+            WorkOverlayHook::Refresh(Box::new(surface.clone())).coalesces(),
+            "a refresh is superseded by the next turn boundary and may be dropped"
+        );
+        assert!(
+            !WorkOverlayHook::Bind(Box::new(surface)).coalesces(),
+            "a bind records the overlay a Work's whole lifetime hangs on"
+        );
+        assert!(
+            !WorkOverlayHook::Evict.coalesces(),
+            "an eviction is the lifetime rule itself; dropping one leaves evidence about a \
+             surface that no longer exists"
         );
     }
 }

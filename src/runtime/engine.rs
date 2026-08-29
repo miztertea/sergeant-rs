@@ -365,6 +365,26 @@ pub struct LaunchOutcome {
     observed: Option<Result<Observation, BackendError>>,
 }
 
+/// The backend's own signal off an optional, possibly-failed observation —
+/// shared by [`LaunchOutcome::signal`] and [`SendOutcome::signal`] (F-SI-01),
+/// which carry an identically-shaped `Option<Result<Observation,
+/// BackendError>>` for the same reason: each may or may not have carried an
+/// observation, and that observation may have failed.
+fn signal_of_optional_observation(
+    observed: &Option<Result<Observation, BackendError>>,
+) -> Option<&BackendSignal> {
+    observed.as_ref()?.as_ref().ok().map(|o| &o.signal)
+}
+
+impl LaunchOutcome {
+    /// The backend's own signal, when a launch carried an observation that
+    /// actually reached it. See [`ObserveOutcome::signal`] for why this is
+    /// borrowed rather than taken.
+    pub fn signal(&self) -> Option<&BackendSignal> {
+        signal_of_optional_observation(&self.observed)
+    }
+}
+
 impl From<Result<ExecutionHandle, BackendError>> for LaunchOutcome {
     /// A launch result with no observation attached, for a caller that drove
     /// [`PendingLaunch::launch`] by hand. `settle_launch` records the start
@@ -470,6 +490,15 @@ pub struct SendOutcome {
     observed: Option<Result<Observation, BackendError>>,
 }
 
+impl SendOutcome {
+    /// The backend's own signal, when the delivery carried an observation
+    /// that actually reached it. See [`ObserveOutcome::signal`] for why
+    /// this is borrowed rather than taken.
+    pub fn signal(&self) -> Option<&BackendSignal> {
+        signal_of_optional_observation(&self.observed)
+    }
+}
+
 /// An observation of a live execution the engine has decided to take **with
 /// the core lock released** (§14.2's middle phase, applied to OBSERVE alone).
 ///
@@ -531,6 +560,24 @@ impl PendingObserve {
 #[derive(Debug)]
 pub struct ObserveOutcome {
     observed: Result<Observation, BackendError>,
+}
+
+impl ObserveOutcome {
+    /// The backend's own signal, when the poll actually reached it.
+    ///
+    /// Read-only, and deliberately borrowed rather than taken: S5 W1d's
+    /// Work-overlay refresh reads the signal off the outcome *before*
+    /// [`Engine::settle_observe`] consumes it — the same order
+    /// `api::crank`'s surface arm already reads a [`SurfaceOutcome`] in
+    /// (S5 W1b) — so that a **turn boundary** (any signal other than
+    /// [`BackendSignal::Running`]) can be recognized without the API layer
+    /// re-deriving it from the journal afterwards.
+    ///
+    /// `None` for a poll that failed: a backend error is not a statement
+    /// about the turn, and [`Engine::drive`] is what adjudicates it.
+    pub fn signal(&self) -> Option<&BackendSignal> {
+        self.observed.as_ref().ok().map(|o| &o.signal)
+    }
 }
 
 /// A turn's INTERRUPT the engine has decided to issue (R-MVP1-7's per-turn

@@ -1208,6 +1208,55 @@ them were dead code in every real installation.
   startup cache, and deleting that directory still loses nothing. Only the
   database left it.
 
+### `--work` reflects what the Work has changed (S5)
+
+- **A Work's overlay is now rescanned at every turn boundary, not only at
+  surface bind.** The lifecycle hook shipped earlier in S5 fired at
+  materialize, rematerialize and teardown — and a linked worktree is cut
+  byte-identical to its base, so the only overlay a bind could ever record
+  was one describing nothing the Work had done. A2 §2 names `--work` as the
+  "current Work's world, **including overlay**"; that sentence was not true
+  of the code. It is now: a settled observation whose backend signal is
+  anything but `Running` — the actor has stopped producing — triggers the
+  same scan, from all three places a turn boundary is adjudicated
+  (launch-settle, SEND-settle, and the completion driver's OBSERVE).
+  Proven end to end on a real daemon against a real worktree, with the
+  Work still running when the answer is read
+  (`w1d_overlay_freshness::a_running_works_modified_file_is_findable_through_work_scope`).
+- **A turn boundary, not an interval.** A rescan *loop* would need a period,
+  and a period is a number with nothing behind it. A turn boundary is the
+  actor's own rhythm, self-limiting at one scan per turn, and it is the
+  moment the surface has stopped moving — scanning mid-turn would index a
+  tree still being written. `Running` is the only signal that is not a
+  refresh moment, pinned exhaustively so a new signal cannot be added
+  without deciding
+  (`api::tests::only_a_still_running_turn_is_not_an_overlay_refresh_moment`).
+- **Per-turn was affordable, measured rather than assumed.** One overlay
+  scan against this estate's own `sergeant-rs` mount (400 tracked files,
+  178 indexed) costs ~0.72 s release / ~1.93 s debug, and is flat in the
+  number of changed paths — the cost is the unchanged half. Turn boundaries
+  are minutes apart, the scan is detached from the daemon's crank and
+  bounded by the intelligence lane's own permit, so no narrower incremental
+  scan was built. The measurement is re-runnable
+  (`tests/w1d_overlay_scan_measurement.rs`, `#[ignore]`d, read-only against
+  the estate) and says nothing about a repository two orders of magnitude
+  larger.
+- **Refreshes coalesce; binds and evictions never do.** A refresh already
+  queued for a Work is superseded by the one that would follow it, so the
+  newer one is dropped rather than appended — which bounds the per-Work hook
+  chain and, more importantly, keeps a retiring Work's overlay eviction from
+  queueing behind a backlog of stale scans. A bind or an eviction is a
+  lifecycle fact and is always applied
+  (`api::tests::a_bind_or_an_eviction_is_never_coalesced_away`).
+- **The snapshot marker still tells the truth, it just points at a fresher
+  instant.** `WorkScope::BaseAndOverlaySnapshot` carries the overlay
+  generation's own `observed_at`; an overlay is now "as of the end of the
+  Work's last completed turn" rather than "as of the last surface bind".
+  `sgt search` remains a pure reader — the refresh is daemon-side and on no
+  query path. `docs/concepts/atlas-and-knowledge.md` and its D14 row, which
+  still said overlay indexing had no trigger at all, now say what the code
+  does.
+
 
 ## [0.2.4] - 2026-08-25
 

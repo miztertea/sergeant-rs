@@ -56,6 +56,15 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "pre-existing, #231(a) audit pending",
     ),
     ("w4_read_surfaces", "pre-existing, #231(a) audit pending"),
+    (
+        "w1d_overlay_scan_measurement",
+        "S5 W1d: every test in it is `#[ignore]`d and reads a real \
+         repository corpus off the developer's own machine, so it \
+         contributes no coverage under instrumentation and cannot run on a \
+         CI host at all — the same reason w2_startup_measurement and \
+         w3_prune_measurement are here. Its figures are recorded, dated, in \
+         the estate's knowledge library instead.",
+    ),
 ];
 
 fn repo_root() -> PathBuf {

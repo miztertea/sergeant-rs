@@ -3712,20 +3712,23 @@ impl SourceSelector {
 /// # The freshness semantic is in this type, not in a comment (W1b item 3)
 ///
 /// A Work's surface is mutated continuously while the Work runs. The
-/// overlay is produced by a daemon-side lifecycle hook (H13.2's chosen
-/// mechanism, wired in S5 W1b: [`crate::api`]'s surface-lifecycle arm),
-/// which fires when the surface is **bound** — materialized, or
-/// re-materialized for a retry — and is evicted when the surface is torn
-/// down. It is therefore a **snapshot**, never a live read: nothing
-/// rescans between two lifecycle events, and `sgt search` stays a pure
-/// reader that never touches the surface at all (H13.2 rejected
-/// query-time scanning precisely so it could not).
+/// overlay is produced by a daemon-side hook (H13.2's chosen mechanism,
+/// wired in S5 W1b: [`crate::api`]'s surface-lifecycle arm) which fires
+/// when the surface is **bound** — materialized, or re-materialized for a
+/// retry — when **a turn ends** while it is still bound (S5 W1d's
+/// addition, and the only one of the three that can record an overlay
+/// describing anything: a freshly cut worktree is byte-identical to its
+/// base), and is evicted when the surface is torn down. It is therefore a
+/// **snapshot**, never a live read: nothing rescans *between* those
+/// moments, a turn still in flight is a tree still being written, and `sgt
+/// search` stays a pure reader that never touches the surface at all
+/// (H13.2 rejected query-time scanning precisely so it could not).
 ///
 /// So [`Self::BaseAndOverlaySnapshot`] carries the snapshot's own
 /// `observed_at`. A caller renders it. An answer that said "including
 /// overlay" without saying *as of when* would imply "current" while
-/// meaning "as of the last surface bind" — the same class of false claim
-/// as the silent partial W1 refused to ship.
+/// meaning "as of the end of the Work's last completed turn" — the same
+/// class of false claim as the silent partial W1 refused to ship.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkScope {
     /// [`SourceSelector::WorkBase`] was not the selector in play — the
