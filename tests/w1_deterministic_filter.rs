@@ -770,12 +770,21 @@ fn document_extractor_identities_matches_every_known_document_adapter_constant()
 // -------------------------------------------------------------- --work scope
 
 /// A `--work` filter reads a named repository exactly like `--source`
-/// does — W1's whole point — and its answer states [`WorkScope::BaseOnly`]
-/// rather than presenting itself as A2 §2's full "including overlay"
-/// promise (H13.2). It excludes a different repository's generation the
-/// identical way a plain `--source` filter would.
+/// does — W1's whole point — and, when **no overlay generation stands for
+/// the Work**, its answer states [`WorkScope::BaseOnly`] rather than
+/// presenting itself as A2 §2's full "including overlay" promise. It
+/// excludes a different repository's generation the identical way a plain
+/// `--source` filter would.
+///
+/// **Moved, not deleted, by S5 W1b.** Before W1b, `BaseOnly` was what
+/// `--work` ALWAYS answered, because no production caller ever wrote an
+/// overlay. Now it is what `--work` answers when this particular Work has
+/// none — never bound, never scanned, or evicted with its retirement —
+/// which this fixture (base generations only, no overlay recorded) is
+/// exactly. The overlay-present answer is pinned by
+/// `a_work_filter_admits_its_own_overlay_and_no_other_works` below.
 #[test]
-fn a_work_base_selector_reads_like_its_named_repository_and_states_base_only_scope() {
+fn a_work_base_selector_reads_like_its_named_repository_and_states_base_only_without_an_overlay() {
     let estate = estate();
     let filter = Admissibility {
         source: SourceSelector::WorkBase {
@@ -785,13 +794,9 @@ fn a_work_base_selector_reads_like_its_named_repository_and_states_base_only_sco
         kind: None,
         authority: None,
     };
-    assert_eq!(filter.source.work_scope(), WorkScope::BaseOnly);
-
-    // The completeness marker is carried on the ANSWER itself, not only
-    // recoverable by re-deriving it from `filter` -- `Admitted::scope`,
-    // checked directly on a real `admissible_generations` return, not on
-    // the input filter a caller forwarding just the hits may no longer
-    // have in scope.
+    // The completeness marker is carried on the ANSWER itself -- and it is
+    // read from the STORE, not derived from the filter, because whether an
+    // overlay stands for a Work is a fact about the store (W1b).
     let generations = estate
         .db
         .admissible_generations(&filter, 500)
@@ -811,11 +816,26 @@ fn a_work_base_selector_reads_like_its_named_repository_and_states_base_only_sco
 /// unstated completeness.
 #[test]
 fn a_non_work_selector_reports_not_work_scoped() {
-    assert_eq!(
-        SourceSelector::Named("repo-a".to_string()).work_scope(),
-        WorkScope::NotWorkScoped
-    );
-    assert_eq!(SourceSelector::Any.work_scope(), WorkScope::NotWorkScoped);
+    let estate = estate();
+    for selector in [
+        SourceSelector::Named("repo-a".to_string()),
+        SourceSelector::Any,
+    ] {
+        let filter = Admissibility {
+            source: selector.clone(),
+            kind: None,
+            authority: None,
+        };
+        assert_eq!(
+            estate
+                .db
+                .admissible_generations(&filter, 500)
+                .expect("admissible generations")
+                .scope,
+            WorkScope::NotWorkScoped,
+            "{selector:?}"
+        );
+    }
 }
 
 // -------------------------------------------- --content config, verified live
@@ -969,16 +989,22 @@ fn a_source_filter_excludes_another_sources_dataset() {
 ///    that reached for "anything mentioning repo-a", would admit it — and
 ///    admissibility decides what may be SEEN, so that is a leak between two
 ///    Works' surfaces, not a ranking imprecision (A2 §8).
-/// 3. **This Work's OWN overlay is not admissible through `--work` either**
-///    — the honest half. W1's `--work` is
-///    [`WorkScope::BaseOnly`](sergeant_rs::runtime::atlas::db::WorkScope)
-///    (H13.2), so the overlay is absent by design rather than by accident,
-///    and the answer says so. When W1b lands, THIS assertion is the one
-///    that must be revisited together with `work_scope()` — never one
-///    without the other, which is exactly why they are pinned in the same
-///    test.
+/// 3. **This Work's OWN overlay IS admissible through `--work`** — S5 W1b,
+///    which flipped this third assertion and the scope marker together, in
+///    this same test, exactly as W1 said they must move (never one without
+///    the other). A2 §2 promises "including overlay"; W1b's lifecycle hook
+///    is what makes an overlay generation exist to include, and the answer
+///    now says
+///    [`WorkScope::BaseAndOverlaySnapshot`](sergeant_rs::runtime::atlas::db::WorkScope)
+///    with the instant the surface was actually read.
+///
+/// Exclusions 1 and 2 are unchanged and are the reason this test's name
+/// still leads with the negative: admitting one's own overlay must not
+/// widen the filter to the overlay FAMILY. `work:<other>/repo-a` fails both
+/// branches of the composed predicate, and no `--source` can reach either
+/// coordinate.
 #[test]
-fn a_work_filter_excludes_a_different_works_generation() {
+fn a_work_filter_admits_its_own_overlay_and_no_other_works() {
     let data = tempfile::tempdir().expect("data dir");
     let mut journal = Journal::open(data.path()).expect("journal");
     let mut db = AtlasDb::open(data.path()).expect("atlas");
@@ -1068,9 +1094,12 @@ fn a_work_filter_excludes_a_different_works_generation() {
         .collect();
     assert_eq!(
         sources,
-        BTreeSet::from(["repo-a".to_string()]),
-        "--work admits exactly its repository's BASE generation: not another Work's overlay \
-         over the same repository, and not (yet, H13.2) its own"
+        BTreeSet::from([
+            "repo-a".to_string(),
+            sergeant_rs::runtime::atlas::overlay::overlay_source_name(MINE, "repo-a"),
+        ]),
+        "--work admits exactly its repository's base generation AND its own overlay — never \
+         another Work's overlay over the same repository"
     );
 
     // And at the content tables too — a content-kind method that composed
@@ -1085,10 +1114,26 @@ fn a_work_filter_excludes_a_different_works_generation() {
         .collect();
     assert_eq!(
         names,
-        vec!["widget_base".to_string()],
-        "another Work's occurrences must never cross a --work filter: {names:?}"
+        vec!["widget_base".to_string(), "widget_mine".to_string()],
+        "a --work filter admits its own base and its own overlay, and NEVER another Work's \
+         overlay over the same repository: {names:?}"
     );
 
-    // The limitation is declared, not silently applied (H13.2).
-    assert_eq!(filter.source.work_scope(), WorkScope::BaseOnly);
+    // The freshness semantic is declared on the answer, not assumed: the
+    // overlay half is a snapshot, and the scope carries the instant it was
+    // taken (W1b item 3).
+    let scope = db
+        .admissible_generations(&filter, 500)
+        .expect("admissible generations")
+        .scope;
+    let WorkScope::BaseAndOverlaySnapshot {
+        overlay_observed_at,
+    } = &scope
+    else {
+        panic!("--work must declare the overlay it admitted, and when it was taken: {scope:?}");
+    };
+    assert!(
+        !overlay_observed_at.is_empty(),
+        "the snapshot instant is the whole point of the variant"
+    );
 }

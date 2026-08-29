@@ -257,6 +257,7 @@ Two risk classes, and the second is the dangerous one:
 | `m6_surfaces.rs:2341` | 30 s | a spawned daemon publishing its descriptor | **0.74–1.85 s** (5 samples, idle box, uninstrumented) | **16–40×** — the S0 challenge's "unknown headroom" deadline, now measured |
 | `m5_projections.rs:2344` | 30 s | *asserted* rebuild time for 16,000 events — a performance bound, not a wait | **1.17 s** (13.7k events/s) | **25.6×** — the most generous bound in the suite, as S0 estimated (~27×) |
 | `m6_surfaces.rs:486` | 90 s | the TUI coming up under a pty and painting | unknown | unknown, but the largest bound in the default suite |
+| `w1b_overlay_lifecycle_trigger.rs:53` (`LIFECYCLE_DEADLINE`, 3 sites) | 120 s | S5 W1b's Work-overlay lifecycle hook: the overlay generation appearing after a surface binds, disappearing after it retires, and the surface binding at all — each a **polling** wait (50 ms `POLL_GAP`, never a sleep-then-assert) | **4.8 s / 4.2 s for the WHOLE test** including daemon boot, an estate scan, a Work submit, a cancel and a shutdown (2 samples, this container, uninstrumented) | **≥ 25×** against a conservative upper bound — the individual waits are a fraction of those totals |
 | `m4:3583/3593/3688/3793/3837`, `m4:3817` | 180 s / 30 s | real-Claude turns settling | n/a | **never run** — `#[ignore]`d, and R-S0-3 forbids `--ignored` here |
 
 Suite wall times on this container, uninstrumented, for scale: m1 1.1 s,
