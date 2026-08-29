@@ -219,6 +219,46 @@ Two risk classes, and the second is the dangerous one:
 - **Fixed sleeps** are a wait with no retry: the test sleeps, then asserts.
   Slowdown does not eat headroom here, it invalidates the premise. These are
   listed first.
+- **Asserted performance bounds** are a third class, and the rule below is
+  what they are judged against. They are not waits at all: the test measures
+  an operation and asserts the number, so a slower host does not eat headroom,
+  it changes the answer.
+
+### The rule for an asserted performance bound (#278, 2026-08-29)
+
+> An **asserted** performance bound — a test that measures an operation and
+> asserts the figure, rather than polling until something happens — is
+> admissible only with headroom measured on the **slowest supported target**,
+> not on the fastest one available. `docs/reference/glossary-and-support.md:18`
+> names those targets: x86_64 Linux, Apple Silicon macOS, and Windows through
+> WSL2 — plus shared CI runners in practice. Below that headroom, convert the
+> bound to something host-independent (a ratio between two quantities measured
+> in the same run, so a slow host moves both) or delete it. A guard that fails
+> on a supported platform is not a guard; it is a portability bug the suite
+> reports as a product defect.
+
+That rule was written against `m2_daemon_api.rs`'s
+`t12_submission_throughput_has_an_automated_floor`, which asserted **8.0
+works/s** and, on one unchanged commit, measured 6.5 works/s and failed (GH
+run 33250519400) then passed forty minutes later (run 33251738966) — only
+runner load differed, and 6.5 was *below* the 10.2 works/s regression-path
+simulation the test's own derivation recorded, so on that hardware the floor
+had no discriminating power at all. It is now a **ratio**: the per-submission
+cost of the guarded section, in units of one `git worktree add` measured on
+the same host in the same run (healthy 2.4–8.8 units across idle / CPU-hogged
+/ fsync-hogged / 2-core / 2-core-plus-hogs; 17.5–64.9 with 86 ms serialized
+under `runtime::surface::with_repository`; ceiling 12.0, best of three
+attempts). The derivation, the rejected alternative (a serialized control —
+healthy speedup 0.48×–3.78×, regressed 1.29×, so unusable), and every sample
+are in sergeant-rs-workspace's
+`knowledge/evidence/perf/t12-ratio-guard-2026-08-29.md`.
+
+### Asserted performance bounds
+
+| site | what it asserts | measured | headroom |
+| --- | --- | --- | --- |
+| `m2_daemon_api.rs`'s `t12_…automated_floor` | per-submission guarded cost ≤ 12 `git worktree add`s, best of 3 | 1.8–8.8 units across every condition measured 2026-08-29, including 1 core under 160 CPU + 16 fsync hogs | **≥1.4×**, and *host-independent by construction*: the numerator and the unit are both measured in-run, so a slower target moves both (the unit went 3.8 ms → 28.7 ms under load and the ratio went **down**) |
+| `m5_projections.rs:2602` | 16,000-event rebuild under 30 s — a performance bound, not a wait | **1.17 s** (13.7k events/s) | **25.6×** — admissible under the rule above on headroom alone, but the measurement is Cerberus's; it has never been taken on the slowest supported target (#258) |
 
 ### Fixed sleeps (no retry — a slowdown breaks the premise, not the margin)
 
@@ -255,7 +295,7 @@ Two risk classes, and the second is the dangerous one:
 | `m4_backends.rs:146`, `m4:2959` | 30 s | a stand-in child reaching `exec` (argv visible in `/proc`) | ~ms | very large |
 | `m6_surfaces.rs:511` | 30 s | the TUI exiting after its terminal hangs up | unknown | unknown |
 | `m6_surfaces.rs:2341` | 30 s | a spawned daemon publishing its descriptor | **0.74–1.85 s** (5 samples, idle box, uninstrumented) | **16–40×** — the S0 challenge's "unknown headroom" deadline, now measured |
-| `m5_projections.rs:2344` | 30 s | *asserted* rebuild time for 16,000 events — a performance bound, not a wait | **1.17 s** (13.7k events/s) | **25.6×** — the most generous bound in the suite, as S0 estimated (~27×) |
+| `m5_projections.rs:2602` | 30 s | *asserted* rebuild time for 16,000 events — a performance bound, not a wait; belongs to the "Asserted performance bounds" table above, which carries the measurement and headroom figures | see "Asserted performance bounds" above | see "Asserted performance bounds" above |
 | `m6_surfaces.rs:486` | 90 s | the TUI coming up under a pty and painting | unknown | unknown, but the largest bound in the default suite |
 | `w1b_overlay_lifecycle_trigger.rs:53` (`LIFECYCLE_DEADLINE`, 3 sites) | 120 s | S5 W1b's Work-overlay lifecycle hook: the overlay generation appearing after a surface binds, disappearing after it retires, and the surface binding at all — each a **polling** wait (50 ms `POLL_GAP`, never a sleep-then-assert) | **4.8 s / 4.2 s for the WHOLE test** including daemon boot, an estate scan, a Work submit, a cancel and a shutdown (2 samples, this container, uninstrumented — **not yet measured on the slowest supported target**, x86_64 Linux / Apple Silicon macOS / WSL2, per `docs/reference/glossary-and-support.md:18`) | **≥ 25×** against a conservative upper bound on this container — the individual waits are a fraction of those totals, and the bound is a **polling** wait (this section's own risk-class split, above), so a slower target eats headroom rather than invalidating the premise; the ≥25× margin is offered as reassurance, not as the cross-platform measurement the letter of the rule asks for, which is still open |
 | `m4:3583/3593/3688/3793/3837`, `m4:3817` | 180 s / 30 s | real-Claude turns settling | n/a | **never run** — `#[ignore]`d, and R-S0-3 forbids `--ignored` here |
