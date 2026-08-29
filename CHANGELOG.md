@@ -1196,8 +1196,8 @@ them were dead code in every real installation.
   heavy test's own runtime fell from 142.7–147.6 s to 97.9–102.8 s (−31 %),
   confirming it was being starved as well as starving. The cost is stated
   rather than buried: **total suite wall time gets slightly worse** — ~+5 %
-  on the mean of three full runs per arm at 20 cores, and 1020.7 s → 1098.8 s
-  (+7.6 %, one sample per arm) in a 4-CPU CI-shaped run — because isolation
+  on the mean of three full runs per arm at 20 cores, and 1025.4 s → 1095.5 s
+  (+6.9 %, two runs per arm) in a 4-CPU CI-shaped run — because isolation
   gives up parallelism during that ~100 s. Deliberately **not** a
   `[test-groups]` entry: a group's `max-threads` caps concurrency *within*
   the group, and this test's problem is contention with everything *outside*
