@@ -2484,12 +2484,35 @@ async fn run_intelligence_scan(
                 consecutive_failures = 0;
                 status
             }
+            // A definitive 404 is not a lost poll — the daemon answered and
+            // said it holds no record of this scan. That happens when it
+            // restarted (the spawned scan task died with the old process,
+            // so "may still be running" would be false) or the entry aged
+            // past the retained window (the scan already finished). Either
+            // way retrying will not change the answer, and claiming the
+            // scan "may still be running" here would repeat the exact
+            // defect this command was fixed for, just in the other
+            // direction: reporting uncertainty the daemon has just
+            // resolved.
+            Err(ClientError::Api {
+                status: 404,
+                ref code,
+                ref message,
+            }) if code == "unknown_scan" => {
+                return Err(CliError::new(format!(
+                    "the daemon has no record of scan {scan_id} ({message}); if it was \
+                     accepted before a daemon restart, that run ended when the daemon did \
+                     — read the journal's intelligence.scan.completed event for {scan_id} \
+                     for the outcome"
+                )));
+            }
             Err(e) => {
-                // A poll that fails is a fact about this poll, never about
-                // the scan — the daemon is running it whether or not this
-                // client is watching, and saying otherwise is the exact
-                // defect this command was fixed for. Retry a few times,
-                // then say precisely what is and is not known.
+                // A poll that fails to reach the daemon at all is a fact
+                // about this poll, never about the scan — the daemon is
+                // running it whether or not this client is watching, and
+                // saying otherwise is the exact defect this command was
+                // fixed for. Retry a few times, then say precisely what is
+                // and is not known.
                 consecutive_failures += 1;
                 if consecutive_failures > POLL_FAILURES_TOLERATED {
                     return Err(CliError::new(format!(
@@ -7488,6 +7511,93 @@ pub(crate) mod doctor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare-bones HTTP/1.1 responder for exactly the two requests
+    /// `run_intelligence_scan` makes: it does not attempt to be a real
+    /// server, only to answer a fixed script of (method, path) -> (status,
+    /// body) pairs once each, in order, which is all F-IN-02's regression
+    /// test needs and all that justifies not pulling in a mocking
+    /// dependency for one test (R2/R6: plain `std::net`, a few lines).
+    fn spawn_scripted_http_server(script: Vec<(&'static str, u16, &'static str)>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for (_method_and_path, status, body) in script {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf); // discard the request itself
+                let reason = if status == 202 {
+                    "Accepted"
+                } else {
+                    "Not Found"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// F-IN-02: a **definitive** 404 (`unknown_scan`) from the daemon is
+    /// not the same fact as losing contact with it, and the poll loop must
+    /// not say the scan "may still be running" once the daemon has just
+    /// said it holds no record of it at all — the same defect this whole
+    /// front door was built to remove, restated in the other direction.
+    ///
+    /// Reverting the dedicated `ClientError::Api { status: 404, code:
+    /// "unknown_scan", .. }` arm (collapsing it back into the generic
+    /// `Err(e)` retry arm) makes this test fail: the error message would
+    /// read "may still be running" instead of "no record of scan".
+    #[tokio::test]
+    async fn a_definitive_unknown_scan_404_is_never_reported_as_may_still_be_running() {
+        let accepted = json!({
+            "scan_id": "01FAKESCAN00000000000000",
+            "total_sources": 1,
+            "state": "in_progress",
+            "scanned": [],
+        })
+        .to_string();
+        let not_found = json!({
+            "error": {
+                "code": "unknown_scan",
+                "message": "no scan 01FAKESCAN00000000000000 is tracked by this daemon",
+            }
+        })
+        .to_string();
+        let endpoint = spawn_scripted_http_server(vec![
+            (
+                "POST /v1/intelligence/scan",
+                202,
+                Box::leak(accepted.into_boxed_str()),
+            ),
+            (
+                "GET /v1/intelligence/scan/01FAKESCAN00000000000000",
+                404,
+                Box::leak(not_found.into_boxed_str()),
+            ),
+        ]);
+        let client = ApiClient::new(&endpoint, "fake-token").expect("client");
+
+        let err = run_intelligence_scan(&client, None, false)
+            .await
+            .expect_err("a 404 unknown_scan must surface as an error, not a silent success");
+        let message = err.to_string();
+        assert!(
+            message.contains("no record of scan"),
+            "must name the definitive 404 for what it is: {message}"
+        );
+        assert!(
+            !message.contains("may still be running"),
+            "a definitive 404 must never be reported with the lost-contact retry message: \
+             {message}"
+        );
+    }
 
     /// #96: a human-rendered transcript must show *when* each turn
     /// happened, not just what it said — the exact gap that let a
