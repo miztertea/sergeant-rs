@@ -104,8 +104,7 @@ pub struct SemanticModel {
 ///
 /// Non-omittable by construction — it is a plain enum on the answer struct,
 /// not an `Option`, so there is no "unset" to forget. The three variants are
-/// A2 §15's and H4's own vocabulary, and [`Self::as_str`] is their wire
-/// spelling.
+/// A2 §15's and H4's own vocabulary, `applied | not_installed | disabled`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticStatus {
     /// A model was installed, the caller wanted it, and it contributed to
@@ -121,46 +120,6 @@ pub enum SemanticStatus {
     /// entirely different reason, and a consumer that must not confuse a
     /// host-configuration fact with a caller's choice can tell them apart.
     Disabled,
-}
-
-impl SemanticStatus {
-    /// The stable wire spelling — A2 §15's and H4's literal vocabulary,
-    /// `applied | not_installed | disabled`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Applied => "applied",
-            Self::NotInstalled => "not_installed",
-            Self::Disabled => "disabled",
-        }
-    }
-
-    /// The inverse of [`Self::as_str`].
-    pub fn parse(text: &str) -> Option<Self> {
-        match text {
-            "applied" => Some(Self::Applied),
-            "not_installed" => Some(Self::NotInstalled),
-            "disabled" => Some(Self::Disabled),
-            _ => None,
-        }
-    }
-
-    /// Whether the answer this status describes was produced **without** the
-    /// semantic half — true for both degraded reasons, false only for
-    /// [`Self::Applied`].
-    ///
-    /// The one-line predicate a consumer needs, so "is this answer complete?"
-    /// never has to be re-derived by matching on the variant set at every
-    /// call site (and never has to be re-derived *wrongly* when a fourth
-    /// variant is added).
-    pub fn is_degraded(self) -> bool {
-        !matches!(self, Self::Applied)
-    }
-}
-
-impl std::fmt::Display for SemanticStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 /// Resolve the status of one answer from the caller's request and the
@@ -214,20 +173,6 @@ mod tests {
     }
 
     #[test]
-    fn the_three_variants_round_trip_their_contract_spelling() {
-        for status in [
-            SemanticStatus::Applied,
-            SemanticStatus::NotInstalled,
-            SemanticStatus::Disabled,
-        ] {
-            assert_eq!(SemanticStatus::parse(status.as_str()), Some(status));
-        }
-        assert_eq!(SemanticStatus::Applied.as_str(), "applied");
-        assert_eq!(SemanticStatus::NotInstalled.as_str(), "not_installed");
-        assert_eq!(SemanticStatus::Disabled.as_str(), "disabled");
-    }
-
-    #[test]
     fn suppression_outranks_absence_in_both_orders_of_the_same_facts() {
         assert_eq!(
             resolve(SemanticRequest::Suppressed, None),
@@ -249,13 +194,6 @@ mod tests {
             resolve(SemanticRequest::Requested, Some(&model())),
             SemanticStatus::Applied
         );
-    }
-
-    #[test]
-    fn only_applied_is_undegraded() {
-        assert!(!SemanticStatus::Applied.is_degraded());
-        assert!(SemanticStatus::NotInstalled.is_degraded());
-        assert!(SemanticStatus::Disabled.is_degraded());
     }
 
     #[test]

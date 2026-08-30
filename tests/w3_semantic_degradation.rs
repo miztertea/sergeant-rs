@@ -168,10 +168,6 @@ fn a_run_with_no_model_still_answers_through_the_lexical_half_and_says_not_insta
         SemanticStatus::NotInstalled,
         "a host with no installed semantic assets must SAY so"
     );
-    assert!(
-        answer.semantic.is_degraded(),
-        "not_installed is a degraded answer and must report itself as one"
-    );
     assert_eq!(
         answer.semantic_model, None,
         "A2 §13's model identity is recorded 'if used'; nothing was used here"
