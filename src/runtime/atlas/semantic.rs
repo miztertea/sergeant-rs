@@ -50,10 +50,15 @@
 //!
 //! # Why `Applied` exists in a build that cannot produce it
 //!
-//! A2 §15's vocabulary — and H4's, verbatim — is `applied | not_installed |
-//! disabled`. All three are declared here because the contract declares
-//! three, and a consumer parsing this field parses the contract's set, not
-//! this commit's reachable subset. As of this commit
+//! The three-value vocabulary `applied | not_installed | disabled` is
+//! **H4's**, verbatim (sprint plan `sprint-plan-2026-08-28.md`). It is NOT
+//! A2's own words: A2 §15 states the honesty REQUIREMENT ("reports that
+//! coverage/capability honestly") and §17 item 4 the capability
+//! ("disabled/degraded cleanly"), but the strings `applied` and
+//! `not_installed` appear nowhere in A2. H4 chose the spelling; the contract
+//! chose the obligation. All three are declared here because H4 declares
+//! three, and a consumer parsing this field parses that whole set, not this
+//! commit's reachable subset. As of this commit
 //! [`installed_model`] always answers `None`, so [`SemanticStatus::Applied`]
 //! is unreachable from [`resolve`] in production — and that is the truth
 //! this build has to tell, not a stub. When a model is adopted,
@@ -104,7 +109,9 @@ pub struct SemanticModel {
 ///
 /// Non-omittable by construction — it is a plain enum on the answer struct,
 /// not an `Option`, so there is no "unset" to forget. The three variants are
-/// A2 §15's and H4's own vocabulary, `applied | not_installed | disabled`.
+/// H4's vocabulary, `applied | not_installed | disabled` — H4's spelling of
+/// A2 §15's honesty requirement and §17 item 4's "disabled/degraded", not
+/// strings A2 itself contains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticStatus {
     /// A model was installed, the caller wanted it, and it contributed to
@@ -150,9 +157,19 @@ pub fn resolve(request: SemanticRequest, model: Option<&SemanticModel>) -> Seman
 /// download. This build has no adopted embedding model to install: F5's deny
 /// gate failed on the A2-06 candidate and the decision escalated
 /// (`tests/fixtures/model2vec_corpus/SPIKE-F5.md`). So there is nothing to
-/// look for, no cache directory to define, and — importantly — **no code
-/// path here that could reach the network**, which is A2-12's requirement
-/// met by there being no fetcher at all.
+/// look for and no cache directory to define. **This file** contains no
+/// fetcher — but note precisely what that is and is not: A2-12 is met here
+/// by there being no embedding dependency in the graph at all, NOT by any
+/// structural guarantee that a future one cannot reach out. `reqwest` is
+/// already a dependency of this crate for backend transport, so the absence
+/// is of an adopted model, not of the means.
+///
+/// The dependency-level pin — `model2vec-rs` declared
+/// `default-features = false, features = ["local-only"]`, so `hf-hub`/`ureq`
+/// are never compiled and the fetcher does not exist to be called — is what
+/// actually makes this structural, and it lands with the adoption (W3b,
+/// owner ruling `model2vec-paste-advisory-2026-08-30.md`). Until then the
+/// guard below is a weak one and says so itself.
 ///
 /// This is the single function an adoption ruling changes. Everything else
 /// in this module, and every consumer of [`SemanticStatus`], is already

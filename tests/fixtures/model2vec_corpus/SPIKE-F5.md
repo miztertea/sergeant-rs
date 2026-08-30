@@ -71,9 +71,11 @@ advisories ok, bans ok, licenses ok, sources ok
 (exit 0)
 ```
 
-`grep -cE '^error\[' deny-baseline-full.txt` → **0** (full baseline output
-was captured live during this run and is not retained here — decisive fact
-above). Note this is a *stronger* baseline than S4's anydoc spike had: the
+The baseline produced **0** `error[` lines — the verbatim `cargo deny check`
+output above IS that evidence, quoted in full. (An earlier revision of this
+record cited a `deny-baseline-full.txt` beside it; that dump was dropped as
+unread, so the quoted output above is the retained record. To reproduce, run
+`cargo deny check` at the base commit named in the header.) Note this is a *stronger* baseline than S4's anydoc spike had: the
 pre-existing yanked-`chacha20` failure that spike had to exclude is gone
 from this graph, so every error below is attributable to this spike with
 no subtraction needed.
@@ -145,15 +147,19 @@ advisories FAILED, bans ok, licenses ok, sources ok
 ```
 
 The full advisory block is quoted above. Exactly **one** new `error[...]`
-line against a baseline with none — the decisive check, reproducible from
-each run's own output:
+line against a baseline with none. Both outputs are quoted verbatim in this
+record; the difference between them is exactly one line:
 
 ```
-$ diff <(grep -E '^error\[' deny-baseline-full.txt) \
-       <(grep -E '^error\[' deny-candidate-b-full.txt)
-0a1
 > error[unmaintained]: paste - no longer maintained
 ```
+
+To reproduce from scratch rather than from this record: run `cargo deny check`
+at the base commit, then again with the candidate manifest from the section
+above, and diff the `^error\[` lines. (An earlier revision printed a `diff`
+against two `.txt` dumps beside this file; those dumps were dropped as unread,
+so the command is stated rather than shown against files that no longer
+exist.)
 
 ### The crate set candidate B actually locks
 

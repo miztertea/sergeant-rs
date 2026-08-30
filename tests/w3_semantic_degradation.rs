@@ -288,14 +288,25 @@ fn the_search_answers_semantic_field_is_required_not_optional() {
 /// network to get a model.**
 ///
 /// A2 §15: *"Do not surprise-download a model in the middle of a stage."*
-/// The wave brief: *"a default that reaches the network must be UNREACHABLE
-/// and pinned by a test — not avoided by remembering a flag."* With the F5
-/// spike reverted there is no embedding crate in the graph at all, so the
-/// strongest available pin is that the semantic module itself contains no
-/// fetcher and no URL — nothing for a later "convenience fallback" to be
-/// bolted onto without this test going red.
+///
+/// **WHAT THIS TEST DOES NOT PROVE, stated because a guard whose reach is
+/// overstated is worse than none.** It is a substring scan of ONE file's
+/// non-comment lines. It does not see a fetcher in a sibling module called
+/// from here; it does not catch `std::process::Command::new("curl")`; it
+/// does not catch a URL assembled by `concat!`. And `reqwest` (blocking,
+/// rustls) is already in this crate's graph for backend transport, so the
+/// means are present even though no embedding dependency is.
+///
+/// What it DOES prove is narrow and still worth having: nobody bolted an
+/// obvious "convenience fallback" onto this module without turning it red.
+///
+/// **The real structural pin lands with adoption (W3b):** `model2vec-rs`
+/// declared `default-features = false, features = ["local-only"]`, so
+/// `hf-hub`/`ureq` are never compiled and the fetcher does not exist to be
+/// called — A2-12 met by absence of a code path rather than by a scan. That
+/// test belongs on the Cargo manifest, not on this file's text.
 #[test]
-fn the_semantic_module_has_no_path_to_the_network() {
+fn the_semantic_module_names_no_obvious_fetcher() {
     let source = std::fs::read_to_string(Path::new("src/runtime/atlas/semantic.rs"))
         .expect("read src/runtime/atlas/semantic.rs");
     // Doc comments legitimately name the crates and advisories the spike
@@ -321,7 +332,8 @@ fn the_semantic_module_has_no_path_to_the_network() {
     ] {
         assert!(
             !code.contains(forbidden),
-            "A2-12: the semantic module's code must contain no network path; found {forbidden:?}"
+            "A2-12 (weak guard, see this test's doc): the semantic module's code \
+             must name no obvious fetcher; found {forbidden:?}"
         );
     }
 }
