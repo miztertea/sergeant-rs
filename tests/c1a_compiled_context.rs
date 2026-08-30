@@ -163,7 +163,13 @@ fn fixture() -> Fixture {
                 )],
             ),
             file(
-                "docs/glossary.md",
+                // A synthetic fixture path, deliberately not any real docs/
+                // path: `f_doctrine_skew`'s removed-path guard scans test
+                // sources for citations of files split-hardening W2c deleted,
+                // and it cannot tell a fixture from a citation. Naming a live
+                // doc here would also couple this fixture to that file's
+                // location. This name belongs to no real or removed file.
+                "docs/team-vocabulary.md",
                 vec![unit(0, "Glossary", "A surface is a linked worktree.")],
             ),
         ],
