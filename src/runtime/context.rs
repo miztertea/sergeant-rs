@@ -109,19 +109,32 @@
 //! statement to that surface at all, so there is nothing here for a runtime
 //! string to get into (**R2/R3**).
 //!
+//! # §14's two budgets and the three tiers' resolution (C1b)
+//!
+//! §5 step 9 — *"pack Bound; emit useful remainder as Referenced"* — is where
+//! [`RenderBudget`] is spent ([`pack`]). Two budgets, not one, because §14
+//! says *"Referenced coordinates have a **small separate** rendering budget"*;
+//! both are **hard**, so a source bigger than the Bound budget becomes
+//! Referenced remainder rather than a truncated body; and neither is visible
+//! to [`resolve`], because §14's last sentence says the budget *"is not a ban
+//! on the actor resolving Reachable/Referenced evidence when needed"*.
+//! [`resolve`] is a keyed lookup on the coordinate's own row identity —
+//! §21 item 4's *"without broad rediscovery"* — and it is the same call
+//! packing uses to fetch what it renders, so every rendered Bound unit
+//! resolves back to the stored row it came from by construction (item 3).
+//!
 //! # What this wave does NOT do
 //!
-//! §14's budget and the three tiers' resolution are C1b (items 3, 4, 5);
-//! authority, provenance and structured query results are C1c (items 6–9);
+//! Authority, provenance and structured query results are C1c (items 6–9);
 //! attribution, nesting and audit are C1d (items 11, 12, 14). Fields §15 asks
 //! for that those waves fill are present and empty, each naming its wave —
 //! never absent, because an absent field is indistinguishable from a
 //! forgotten one.
 //!
 //! §20's non-goals this step is closest to are named and refused: **no raw
-//! corpus stuffing** ([`ContextSnapshot::render_onto`] renders *coordinates*,
-//! never resource bodies — §2's Referenced shape, applied to Bound too until
-//! C1b's budget exists to render content safely), **no automatic Work scope
+//! corpus stuffing** (a Bound body renders only inside §14's hard budget, and
+//! a resource too large for it is never truncated into the prompt — it
+//! becomes Referenced remainder), **no automatic Work scope
 //! expansion** (§4: *"The compiler does not silently add repos to Work
 //! mutation scope because a search result is relevant"* — nothing here
 //! touches [`crate::runtime::surface::WorkSurface`] or a binding), **no
@@ -135,7 +148,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::backend::BindingSummary;
-use crate::domain::source::SourceGeneration;
+use crate::domain::source::{AuthorityClass, SourceGeneration};
 use crate::domain::workflow::{StageDefinition, StageRecord};
 use crate::runtime::atlas::db::{
     Admissibility, AtlasDb, AtlasError, LexicalQuery, SourceSelector, StoredChildResource,
@@ -404,9 +417,12 @@ impl EvidenceCoordinate {
     /// make the ordering unobservable and this whole mechanism decorative.
     ///
     /// The cost is stated rather than hidden: a resource bound by an early
-    /// step absorbs every later hit inside it, so C1a binds resources, not
-    /// spans. §14's budget (C1b) is what makes span-level selection
-    /// meaningful, and that is the wave to refine this in.
+    /// step absorbs every later hit inside it, so this binds resources, not
+    /// spans. C1b kept it that way deliberately: the contest above only
+    /// exists because both entrants address the same key, and a span-keyed
+    /// identity would make §5's order unobservable again. What C1b's budget
+    /// changed is what a *bound* resource costs — a unit that does not fit
+    /// becomes Referenced remainder — not what counts as the same evidence.
     pub fn dedup_key(&self) -> String {
         match self {
             Self::Stage {
@@ -549,10 +565,28 @@ impl EvidenceCoordinate {
 pub struct EvidenceUnit {
     /// The §5 step that contributed it, first-contributor-wins.
     pub step: ResearchStep,
-    /// §2's tier it landed in.
+    /// §2's tier it landed in — as **packing** left it (§5 step 9), which is
+    /// not always the tier the contributing step asked for: Bound evidence
+    /// that did not fit §14's hard budget is *"useful remainder"* and is
+    /// emitted as Referenced.
     pub tier: Tier,
     /// Where the evidence actually is.
     pub coordinate: EvidenceCoordinate,
+    /// The unit's own source text, when §14's Bound budget had room to
+    /// render it — §2's Bound tier is *"evidence deliberately **rendered
+    /// into** the actor's initial context"*, which a coordinate alone is not.
+    ///
+    /// `None` is not "no text exists": it is *this unit is carried as a
+    /// pointer*, either because the budget was spent, because the coordinate
+    /// is a Work record rather than a stored resource, or because the
+    /// evidence is external (see [`pack`]). The text is still resolvable —
+    /// §14: the budget *"is not a ban on the actor resolving Reachable/
+    /// Referenced evidence when needed"*.
+    pub excerpt: Option<String>,
+    /// Whether the **automatic** render carried this unit at all. A unit past
+    /// both budgets stays in the snapshot (§15's *"Bound/Referenced evidence
+    /// IDs"*) and stays resolvable; it simply is not spent on the prompt.
+    pub rendered: bool,
 }
 
 impl EvidenceUnit {
@@ -564,6 +598,8 @@ impl EvidenceUnit {
             "cognition": self.step.cognition().as_str(),
             "tier": self.tier.as_str(),
             "coordinate": self.coordinate.json(),
+            "rendered": self.rendered,
+            "excerpt_bytes": self.excerpt.as_ref().map(|e| e.len()),
         })
     }
 }
@@ -724,6 +760,11 @@ impl StepWriter<'_> {
             step: self.step,
             tier,
             coordinate,
+            // Packing (§5 step 9) decides both of these, once the whole plan
+            // has run and §14's budget can be spent on the evidence that
+            // actually exists. A contributing step never renders.
+            excerpt: None,
+            rendered: false,
         });
         self.contributed += 1;
         true
@@ -867,12 +908,18 @@ pub struct ContextSnapshot {
     /// *content*, which is the only payload big enough to need decision
     /// C1-09's blob seam. What this wave renders is coordinates, inline.
     pub payload_pointer: Option<String>,
-    /// **15/16.** `budget + rendered size` — the size actually appended to the
-    /// stage's context, in bytes. The **budget** half is `None` until C1b
-    /// (item 3), which owns §14's hard automatic-render budget; the rendered
-    /// size is measured here because it is a fact this wave produces.
-    pub budget: Option<u64>,
-    /// How many bytes this snapshot appended to the stage's `CONTEXT.md`.
+    /// **15.** `budget` — §14's two hard automatic-render budgets and what
+    /// each tier actually spent ([`BudgetReport`]). `None` only for a
+    /// degraded compilation, which rendered nothing to budget.
+    pub budget: Option<BudgetReport>,
+    /// **16.** `rendered size` — how many bytes this snapshot appended to the
+    /// stage's `CONTEXT.md` in total, evidence and frame together. Always at
+    /// least [`BudgetReport::bound_spent`] + [`BudgetReport::referenced_spent`]
+    /// and never much more: the difference is the section heading, the
+    /// snapshot id and §2's Reachable descriptor, which are not evidence and
+    /// are outside both budgets — item 5 requires Reachable to survive an
+    /// exhausted budget, and a descriptor inside the budget it must survive
+    /// could not.
     pub rendered_bytes: u64,
     /// §5's executed steps, in the order the ledger let them run.
     pub plan: Vec<StepRecord>,
@@ -1034,7 +1081,7 @@ impl ContextSnapshot {
             "referenced": self.referenced.iter().map(EvidenceUnit::json).collect::<Vec<_>>(),
             "reachable": self.reachable.as_ref().map(ReachableScope::json),
             "payload_pointer": self.payload_pointer,
-            "budget": self.budget,
+            "budget": self.budget.as_ref().map(BudgetReport::json),
             "rendered_bytes": self.rendered_bytes,
             "plan": self.plan.iter().map(StepRecord::json).collect::<Vec<_>>(),
             "degradation": self.degradation.as_ref().map(|d| json!({
@@ -1052,13 +1099,22 @@ impl ContextSnapshot {
     /// part sergeant added. §12's *"procedure is data"* survives — this adds
     /// evidence beside the procedure, it does not interpret it.
     ///
-    /// **Coordinates, never bodies.** §20's first non-goal is *"raw corpus
-    /// stuffing"*, and §14's hard automatic-render budget — the thing that
-    /// would make rendering resource *content* safe — is C1b's. So Bound
-    /// renders in Referenced's own shape for now (*"exact coordinates not
-    /// rendered in full"*), which under-delivers §2's Bound tier and cannot
-    /// over-deliver §20. The under-delivery is C1b's to close and is named
-    /// there rather than left implicit.
+    /// **This function makes no budget decision.** [`pack`] already spent
+    /// §14's budgets and marked every unit `rendered` or not; this emits
+    /// exactly what packing chose, through the same [`render_chunk`] packing
+    /// measured. A budget applied here instead would be a second policy in a
+    /// second place, and the snapshot's `budget` numbers would be a claim
+    /// about a different function's output.
+    ///
+    /// §20's first non-goal is *"raw corpus stuffing"*, and the reason a body
+    /// may be rendered at all now is that §14's hard budget exists to bound
+    /// it: C1a rendered coordinates only and said so — *"the under-delivery
+    /// is C1b's to close"* — because a body with no budget is exactly the
+    /// non-goal. A source larger than the budget cannot fill Bound with body
+    /// text; it becomes Referenced remainder.
+    ///
+    /// §2's Reachable descriptor renders whenever there is one, **including
+    /// when both budgets are exhausted** (§21 item 5).
     ///
     /// A snapshot that compiled nothing returns the context **unchanged, byte
     /// for byte** — §3's *"If intelligence is disabled/unavailable and the
@@ -1076,16 +1132,12 @@ impl ContextSnapshot {
             (Tier::Bound, &self.bound),
             (Tier::Referenced, &self.referenced),
         ] {
-            if units.is_empty() {
+            if !units.iter().any(|unit| unit.rendered) {
                 continue;
             }
             out.push_str(&format!("\n{}\n", tier.as_str()));
-            for unit in units {
-                out.push_str(&format!(
-                    "  [{}] {}\n",
-                    unit.step.number(),
-                    unit.coordinate.render()
-                ));
+            for unit in units.iter().filter(|unit| unit.rendered) {
+                out.push_str(&render_chunk(unit));
             }
         }
         if let Some(reachable) = &self.reachable {
@@ -1096,6 +1148,402 @@ impl ContextSnapshot {
             ));
         }
         out
+    }
+}
+
+// ===================================================================
+// §14's budgets
+// ===================================================================
+
+/// **§14's two rendering budgets.**
+///
+/// > *"Use a **hard** automatic-render budget. Reuse backend-native/token
+/// > count if already available at the launch boundary; otherwise use a
+/// > conservative documented estimate rather than requiring a universal
+/// > tokenizer dependency."*
+/// >
+/// > *"Referenced coordinates have a **small separate** rendering budget
+/// > because a pointer is far cheaper than loading the resource."*
+/// >
+/// > *"The budget is for automatic prompt material, **not a ban on the actor
+/// > resolving Reachable/Referenced evidence when needed**."*
+///
+/// Three separate rules, and this type is shaped by all three.
+///
+/// # 1. Two budgets, because §14 says two
+///
+/// [`Self::bound_bytes`] and [`Self::referenced_bytes`] are spent
+/// independently: an exhausted Bound budget never eats into the Referenced
+/// one and an exhausted Referenced budget never eats into Bound. A single
+/// shared number would be cheaper to implement and would be a contract miss —
+/// the second sentence exists precisely because a pointer costs a line and a
+/// resource costs a body.
+///
+/// # 2. The unit is **bytes**, and why that is the *documented estimate*
+///
+/// §14's first choice is a backend-native token count *"if already available
+/// at the launch boundary"*. It is not available: the launch boundary is
+/// [`crate::backend::StartRequest`], which carries the stage's `context` as a
+/// `String` and no count of anything, and the one token-shaped capability an
+/// adapter advertises — [`crate::backend::Capabilities::usage`] — is
+/// *reporting*, read off a finished turn's result payload
+/// (`crate::telemetry`'s `input_tokens`/`output_tokens` handling), long after
+/// this compilation has to be over. So §14's second branch applies, and the
+/// estimate is UTF-8 **bytes of rendered text**.
+///
+/// It is conservative in the exact sense §14 asks for, and the reason is a
+/// property rather than a ratio somebody guessed: every tokenizer maps **at
+/// least one byte** to each token it emits, so `tokens <= bytes` for any
+/// tokenizer at all. A byte budget therefore over-states token cost and can
+/// never under-state it, without adding a tokenizer dependency to bound
+/// something a tokenizer would only bound more tightly (**R1/R3**). It is
+/// also exactly measurable, which a token estimate would not be: the number
+/// this type bounds is the number of bytes actually appended.
+///
+/// # 3. Where the two default numbers come from
+///
+/// Both are traced to one measurement of this repository's own shipped
+/// content, taken **2026-08-30** in the C1b lane, and both commands re-run:
+///
+/// ```text
+/// $ find .sergeant/workflows -name CONTEXT.md -printf '%s\n' | ...
+/// n=55  mean=3964  median=3033  p90=6041  max=15476    (bytes)
+///
+/// $ git ls-files | awk '{ print length($0) }' | ...
+/// n=573  mean=41  median=39  max=90                    (bytes per path)
+/// ```
+///
+/// The first population is the 55 authored stage `CONTEXT.md` files of the
+/// distro this binary embeds (`crate::domain::distro`'s `WORKFLOWS`) — the
+/// procedure text a compiled world is appended *beside*.
+/// [`Self::BOUND_BYTES`] is **8 KiB**: above the p90 authored stage context
+/// (6041 B) and well below the largest (15476 B), so the automatic Bound
+/// render can add at most about one typical stage's worth of material and can
+/// never dwarf the procedure it accompanies.
+///
+/// The second gives the cost of a *pointer*. A rendered Atlas coordinate is
+/// `source@content_key:path`, and a git source's `content_key` is the tree
+/// OID — 40 hex characters (`crate::runtime::atlas::git`) — so a line costs
+/// roughly `6 + 11 + 1 + 40 + 1 + 41 + 1 ≈ 100` bytes for this repository.
+/// [`Self::REFERENCED_BYTES`] is **2 KiB**: about twenty pointers, which is
+/// the same order as [`STEP_ROW_CAP`]'s 32 rows, and a quarter of Bound —
+/// *small* and *separate*, as §14 puts it.
+///
+/// Neither number is tuned by anything at runtime (§20: *"learned context
+/// policy/live self-tuning"*); both are constants a human wrote, with the
+/// measurement that produced them written down beside them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderBudget {
+    /// Hard ceiling, in bytes, on everything the Bound tier renders into the
+    /// actor's context automatically.
+    pub bound_bytes: u64,
+    /// Hard ceiling, in bytes, on everything the Referenced tier renders —
+    /// §14's *"small separate"* budget, spent independently of the Bound one.
+    pub referenced_bytes: u64,
+}
+
+impl RenderBudget {
+    /// 8 KiB — see this type's own doc for the measurement it comes from.
+    pub const BOUND_BYTES: u64 = 8 * 1024;
+    /// 2 KiB — see this type's own doc for the measurement it comes from.
+    pub const REFERENCED_BYTES: u64 = 2 * 1024;
+
+    /// The budget every production compilation runs under.
+    pub const DEFAULT: Self = Self {
+        bound_bytes: Self::BOUND_BYTES,
+        referenced_bytes: Self::REFERENCED_BYTES,
+    };
+}
+
+impl Default for RenderBudget {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// §15's *"budget + rendered size"*, per tier: what was allowed and what was
+/// actually spent.
+///
+/// Both halves are on the snapshot because *"the budget was 8 KiB"* and
+/// *"the render spent 300 bytes"* are different facts and a reader auditing a
+/// compiled world needs both — and because `spent <= allowed` is then a claim
+/// the journal itself carries, checkable after the fact rather than only at
+/// the moment of rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BudgetReport {
+    /// The budget this compilation ran under.
+    pub budget: RenderBudget,
+    /// Bytes the Bound tier actually rendered. Never above
+    /// [`RenderBudget::bound_bytes`].
+    pub bound_spent: u64,
+    /// Bytes the Referenced tier actually rendered. Never above
+    /// [`RenderBudget::referenced_bytes`].
+    pub referenced_spent: u64,
+}
+
+impl BudgetReport {
+    /// The report as JSON — §15's `budget` line.
+    pub fn json(&self) -> Value {
+        json!({
+            "unit": "bytes",
+            "bound_bytes": self.budget.bound_bytes,
+            "referenced_bytes": self.budget.referenced_bytes,
+            "bound_spent": self.bound_spent,
+            "referenced_spent": self.referenced_spent,
+        })
+    }
+}
+
+// ===================================================================
+// Resolution (§21 items 3 and 4)
+// ===================================================================
+
+/// The source evidence one [`EvidenceCoordinate`] resolves back to.
+///
+/// §21 item 3's second half — *"every unit resolves to source evidence"* — is
+/// a claim about **this** function's answer, not about a rendered line
+/// looking plausible: a rendered unit that cannot be resolved back to a real
+/// stored row is the same defect class as a register note asserting what the
+/// code does not do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceEvidence {
+    /// An exact stored unit of an exact generation, with its full text.
+    Unit {
+        /// The unit's own text, in full — not the possibly-absent excerpt the
+        /// budget allowed into the prompt.
+        text: String,
+        /// Its heading, when it has one.
+        title: Option<String>,
+        /// Byte offsets into the original resource.
+        byte_start: u64,
+        /// End offset, exclusive.
+        byte_end: u64,
+    },
+    /// An exact stored relationship of an exact generation.
+    Relationship(crate::runtime::atlas::db::ResolvedRelationship),
+    /// A record of the Work itself — a stage record or a repository binding.
+    ///
+    /// These two coordinate shapes are **not** Atlas rows: their source
+    /// evidence is the Work's own journal-folded run, and the snapshot pins
+    /// every field of it inline (`stage_id`/`index`/`attempt`/`status`,
+    /// `repository`/`work_branch`/`base_sha`). Resolution says so rather than
+    /// pretending a store lookup happened.
+    WorkRecord,
+}
+
+/// **Resolve one coordinate to its source evidence, by direct lookup.**
+///
+/// §21 item 4: *"Referenced coordinates resolve **without broad
+/// rediscovery**"* — §2's own words for the tier are *"the actor can resolve
+/// them directly **without broad search**"*. That is a property of how this
+/// is implemented, and it is why this function takes no query text, no
+/// ranker, no filter and no limit: it takes a coordinate and hands it
+/// straight to [`AtlasDb::resolve_unit`] / [`AtlasDb::resolve_relationship`],
+/// each of which is an equality lookup on the row identity the coordinate
+/// already carries. A resolver that searched for the coordinate's content
+/// would answer the same way on a small fixture while being the exact thing
+/// item 4 forbids — so the test for it resolves two identical bodies under
+/// two different generations and requires the right one back.
+///
+/// **The budget does not appear here, and that is the point.** §14's last
+/// sentence — *"the budget is for automatic prompt material, not a ban on the
+/// actor resolving Reachable/Referenced evidence when needed"* — means an
+/// exhausted budget must not make anything unresolvable. Nothing in this
+/// path can see a [`RenderBudget`] at all.
+///
+/// `Ok(None)` is an honest answer: the coordinate names no such row. It is
+/// how the item-3 test tells a real resolution from a vacuous one.
+pub fn resolve(
+    atlas: &AtlasDb,
+    coordinate: &EvidenceCoordinate,
+) -> Result<Option<SourceEvidence>, AtlasError> {
+    match coordinate {
+        EvidenceCoordinate::Stage { .. } | EvidenceCoordinate::Binding { .. } => {
+            Ok(Some(SourceEvidence::WorkRecord))
+        }
+        EvidenceCoordinate::Atlas {
+            generation_id,
+            relative_path,
+            ordinal,
+            ..
+        } => {
+            let Some(ordinal) = ordinal else {
+                return Ok(None);
+            };
+            Ok(atlas
+                .resolve_unit(generation_id, relative_path, *ordinal)?
+                .map(|unit| SourceEvidence::Unit {
+                    text: unit.body,
+                    title: unit.title,
+                    byte_start: unit.byte_start,
+                    byte_end: unit.byte_end,
+                }))
+        }
+        EvidenceCoordinate::Relationship {
+            generation_id,
+            kind,
+            from,
+            to,
+            ..
+        } => Ok(atlas
+            .resolve_relationship(generation_id, kind, from, to)?
+            .map(SourceEvidence::Relationship)),
+    }
+}
+
+// ===================================================================
+// Packing (§5 step 9) — where §14's budget is actually spent
+// ===================================================================
+
+/// What one unit costs the automatic render, formatted exactly once.
+///
+/// Both the packer (which decides what fits) and
+/// [`ContextSnapshot::render_onto`] (which emits it) call this, so *"the
+/// budget was not exceeded"* is arithmetic over the same bytes that reach the
+/// prompt rather than an estimate of them. Two formatters would make the
+/// budget a guess about the renderer's output.
+fn render_chunk(unit: &EvidenceUnit) -> String {
+    let mut chunk = format!("  [{}] {}\n", unit.step.number(), unit.coordinate.render());
+    if let Some(excerpt) = &unit.excerpt {
+        for line in excerpt.lines() {
+            chunk.push_str("      | ");
+            chunk.push_str(line);
+            chunk.push('\n');
+        }
+    }
+    chunk
+}
+
+/// The packed world: §2's two rendered tiers and what they spent.
+#[derive(Debug)]
+struct Packed {
+    bound: Vec<EvidenceUnit>,
+    referenced: Vec<EvidenceUnit>,
+    bound_spent: u64,
+    referenced_spent: u64,
+    note: String,
+}
+
+/// **§5 step 9 — *"pack Bound; emit useful remainder as Referenced"*.**
+///
+/// One pass over the ledger's units **in contribution order**, which is §5's
+/// step order: an earlier, more deterministic step spends the budget before a
+/// later, fuzzier one gets to. That is the same ordering first-contributor-
+/// wins already enforces, applied to the second scarce thing (§14's bytes)
+/// rather than to identity.
+///
+/// For each Bound unit: resolve its text (a direct lookup, the same one the
+/// actor would use), render the chunk, and take it **only if the whole chunk
+/// fits** what is left of [`RenderBudget::bound_bytes`]. A unit that does not
+/// fit is not truncated into a half-body — it is §5's *"useful remainder"*
+/// and moves to Referenced as a pointer, where it competes for the separate
+/// Referenced budget. A pointer that does not fit that either stays in the
+/// snapshot unrendered: §14 bounds the *prompt*, never the record and never
+/// the actor.
+///
+/// Two things deliberately never carry a body:
+///
+/// - **a Work record** ([`EvidenceCoordinate::Stage`]/[`Binding`]) — it has
+///   no stored text; the coordinate *is* the evidence;
+/// - **external evidence** (`authority_class = external`) — §21 item 9 wants
+///   external evidence *"visibly external and unable to alter instruction
+///   hierarchy"*, and that labeling is C1c's. Until it exists, external prose
+///   does not enter a prompt from here. It is still Referenced, still
+///   resolvable, and the step note says so. Under-delivering a tier is
+///   recoverable; shipping unlabeled external prose into an actor's context
+///   is not (**J5** — item 9 is this contract's, and it is not yet met).
+///
+/// [`Binding`]: EvidenceCoordinate::Binding
+fn pack(
+    atlas: &AtlasDb,
+    units: &[EvidenceUnit],
+    budget: &RenderBudget,
+    generations: &[GenerationPin],
+) -> Packed {
+    let external: BTreeSet<&str> = generations
+        .iter()
+        .filter(|pin| pin.authority == AuthorityClass::External.as_str())
+        .map(|pin| pin.generation_id.as_str())
+        .collect();
+    let mut bound: Vec<EvidenceUnit> = Vec::new();
+    let mut referenced: Vec<EvidenceUnit> = Vec::new();
+    let mut bound_spent = 0u64;
+    let mut referenced_spent = 0u64;
+    let mut demoted = 0usize;
+    let mut unrendered = 0usize;
+    let mut withheld_external = 0usize;
+
+    for unit in units {
+        let mut candidate = unit.clone();
+        if candidate.tier == Tier::Bound {
+            // Only resolve while the budget could still hold the answer:
+            // resolving past exhaustion would be a read whose result is
+            // thrown away.
+            if bound_spent < budget.bound_bytes
+                && let EvidenceCoordinate::Atlas { generation_id, .. } = &candidate.coordinate
+            {
+                if external.contains(generation_id.as_str()) {
+                    withheld_external += 1;
+                } else if let Ok(Some(SourceEvidence::Unit { text, .. })) =
+                    resolve(atlas, &candidate.coordinate)
+                {
+                    candidate.excerpt = Some(text);
+                }
+            }
+            let cost = render_chunk(&candidate).len() as u64;
+            if bound_spent + cost <= budget.bound_bytes {
+                candidate.rendered = true;
+                bound_spent += cost;
+                bound.push(candidate);
+                continue;
+            }
+            // §5's "useful remainder": demoted to a pointer, and it competes
+            // for the OTHER budget.
+            demoted += 1;
+            candidate.excerpt = None;
+            candidate.tier = Tier::Referenced;
+        }
+        let cost = render_chunk(&candidate).len() as u64;
+        if referenced_spent + cost <= budget.referenced_bytes {
+            candidate.rendered = true;
+            referenced_spent += cost;
+        } else {
+            unrendered += 1;
+        }
+        referenced.push(candidate);
+    }
+
+    let mut note = format!(
+        "packed {} Bound unit(s) into {bound_spent}/{} budget bytes and {} Referenced \
+         pointer(s) into {referenced_spent}/{} budget bytes",
+        bound.len(),
+        budget.bound_bytes,
+        referenced.len(),
+        budget.referenced_bytes,
+    );
+    if demoted > 0 {
+        note.push_str(&format!(
+            "; {demoted} Bound unit(s) did not fit and were emitted as Referenced remainder"
+        ));
+    }
+    if withheld_external > 0 {
+        note.push_str(&format!(
+            "; {withheld_external} external unit(s) rendered as coordinates only, pending §21 \
+             item 9's external labeling (C1c)"
+        ));
+    }
+    if unrendered > 0 {
+        note.push_str(&format!(
+            "; {unrendered} coordinate(s) are in the snapshot but past the render budget — \
+             still resolvable, not rendered"
+        ));
+    }
+    Packed {
+        bound,
+        referenced,
+        bound_spent,
+        referenced_spent,
+        note,
     }
 }
 
@@ -1129,6 +1577,11 @@ pub struct CompileRequest<'a> {
     pub prior_stages: &'a [StageRecord],
     /// The launch profile the stage was bound with, when it has one.
     pub profile: Option<&'a str>,
+    /// §14's two hard automatic-render budgets. Every production compilation
+    /// passes [`RenderBudget::DEFAULT`]; it is a request field rather than a
+    /// constant read inside [`compile`] so a test can watch the hard bound
+    /// actually bind, which a constant nobody can vary cannot show.
+    pub budget: RenderBudget,
 }
 
 /// The port [`crate::runtime::engine::Engine`] calls before an actor starts.
@@ -1191,8 +1644,10 @@ impl ContextCompiler for AtlasContextCompiler {
 ///
 /// A constant a human wrote, not a policy anything learns (§20: *"learned
 /// context policy/live self-tuning"*). It bounds the compilation's cost and
-/// its output; §14's real automatic-render budget is C1b's and will bound the
-/// rendered payload, which is a different bound over a different quantity.
+/// its output; §14's automatic-render budget ([`RenderBudget`]) bounds the
+/// rendered payload, which is a different bound over a different quantity —
+/// rows read versus bytes rendered. Both apply, and neither implies the
+/// other: a compilation can read 32 rows and render two of them.
 pub const STEP_ROW_CAP: usize = 32;
 
 /// **§5's nine steps, run in §5's order, through the gate that enforces it.**
@@ -1474,25 +1929,26 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
         }
     }
     // ---- 9. pack Bound; emit useful remainder as Referenced
+    //
+    // §14's budget is spent HERE and nowhere else. Packing is computed off
+    // the ledger's finished units first, then step 9 is entered and states
+    // what it did: the step adds no evidence, so it opens the writer only to
+    // record the outcome, and the gate's order stays total either way.
+    let packed = pack(atlas, ledger.units(), &request.budget, &source_generations);
     {
         let mut step = ledger.enter(ResearchStep::Pack).expect("step 9 is last");
-        step.note("packing adds no evidence: it partitions what steps 1-8 contributed");
+        step.note(packed.note.clone());
     }
 
-    let bound: Vec<EvidenceUnit> = ledger
-        .units()
-        .iter()
-        .filter(|u| u.tier == Tier::Bound)
-        .cloned()
-        .collect();
-    let referenced: Vec<EvidenceUnit> = ledger
-        .units()
-        .iter()
-        .filter(|u| u.tier == Tier::Referenced)
-        .cloned()
-        .collect();
     let plan = ledger.executed().to_vec();
     let selection_plan_hash = selection_plan_hash(&plan, ledger.units());
+    let Packed {
+        bound,
+        referenced,
+        bound_spent,
+        referenced_spent,
+        ..
+    } = packed;
 
     ContextSnapshot {
         snapshot_id: ulid::Ulid::generate().to_string(),
@@ -1513,7 +1969,11 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
         referenced,
         reachable: Some(reachable_scope(&filter, request.work_id)),
         payload_pointer: None,
-        budget: None,
+        budget: Some(BudgetReport {
+            budget: request.budget,
+            bound_spent,
+            referenced_spent,
+        }),
         rendered_bytes: 0,
         plan,
         degradation: None,

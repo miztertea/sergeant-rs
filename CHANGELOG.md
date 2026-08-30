@@ -1590,8 +1590,10 @@ them were dead code in every real installation.
   and the adapter being asked to PREPARE — not a second execution pipeline.
   The compiled world is *appended* to the stage's authored `CONTEXT.md` by
   the same rule the branch-status fact already used: the authored bytes are
-  untouched, and the appended section carries evidence **coordinates**,
-  never resource bodies (C1 §20's first non-goal).
+  untouched, and the appended section carries evidence **coordinates** — and,
+  once C1b's budget landed below, the body §14's hard budget allowed beside
+  them; C1a itself rendered no body at all, because C1 §20's first non-goal
+  is raw corpus stuffing and an unbudgeted body is exactly that.
 - **§5's nine research steps are enforceable runtime order, not advice.**
   `ResearchLedger::enter` refuses any step that is not §5's next one, and
   reports a fuzzy step (A2 lexical/semantic retrieval) that jumps a
@@ -1633,6 +1635,38 @@ them were dead code in every real installation.
   provenance, and attribution/nesting/audit are **not** in this change;
   they are C1b/C1c/C1d, and the places that under-deliver until then say so
   where they under-deliver.
+- **Bound evidence now renders its body, inside two hard budgets** (C1 §14,
+  C1b). §5 step 9 — *"pack Bound; emit useful remainder as Referenced"* — is
+  where the budget is spent: a Bound unit renders its coordinate *and* its
+  source text when the whole chunk fits what is left of the Bound budget,
+  and a unit that does not fit is never truncated into the prompt — it is
+  emitted as Referenced remainder, keeping the §5 step that selected it.
+  Referenced has its own **separate, smaller** budget, because a pointer is
+  far cheaper than a resource: exhausting either never spends or starves the
+  other. Both budgets are in bytes of rendered UTF-8, which is §14's
+  *"conservative documented estimate"* — no backend exposes a token count at
+  the launch boundary (`StartRequest` carries none, and `Capabilities::usage`
+  is post-turn reporting), and every tokenizer maps at least one byte per
+  token, so a byte bound can only over-state token cost. It adds no tokenizer
+  dependency. The two default numbers (8 KiB Bound, 2 KiB Referenced) are
+  traced in `RenderBudget`'s own doc to a dated measurement of this
+  repository's 55 shipped stage `CONTEXT.md` files and its own path lengths.
+- **A coordinate resolves by direct lookup, and the budget does not bound
+  the actor.** `AtlasDb::resolve_unit`/`resolve_relationship` are equality
+  lookups on the row identity a pinned coordinate already carries — C1 §21
+  item 4's *"without broad rediscovery"* — so resolving a Referenced pointer
+  never goes near retrieval, and two content-identical rows in two
+  generations resolve to their own rows. Nothing on that path can see a
+  budget: §14's *"the budget is for automatic prompt material, not a ban on
+  the actor resolving Reachable/Referenced evidence"* is a property of the
+  API rather than a promise. An exhausted budget still renders §2's
+  Reachable descriptor with all four managed verbs, and still leaves every
+  evidence id in the snapshot.
+- **External evidence renders as a coordinate only**, pending C1c's item 9
+  labeling: until external evidence can be shown as visibly external and
+  unable to alter instruction hierarchy, external prose does not enter an
+  actor's prompt from here. §15's `budget` line is no longer empty; it
+  carries both budgets and what each tier actually spent.
 
 
 ## [0.2.4] - 2026-08-25
