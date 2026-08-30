@@ -12,7 +12,7 @@
 //! |---|---|
 //! | candidate collection order | [`the_order_the_two_lists_arrive_in_cannot_change_the_fused_answer`] |
 //! | tie-breaking | [`tied_fused_scores_are_broken_by_the_stated_key_not_by_arrival_order`] |
-//! | float summation order | [`the_two_contributions_are_summed_in_a_fixed_source_order`] |
+//! | float summation order | [`the_two_contributions_sum_to_the_documented_formula`] |
 //! | `HashMap` iteration | [`no_hash_map_or_hash_set_reaches_the_fusion_module`] |
 //!
 //! Two of them were checked the way W3b checked its own — by breaking the
@@ -246,32 +246,36 @@ fn tied_fused_scores_follow_the_key_even_when_the_map_order_disagrees() {
 
 // ------------------------------------------------ hazard 3: summation order
 
-/// **Hazard 3 — float summation order.** `a + b` and `b + a` differ in f64
-/// whenever rounding differs, so the two contributions are summed in a fixed
-/// source order (lexical, then semantic) rather than in whichever order a
-/// candidate happened to be discovered.
+/// **Hazard 3 — float summation order, honestly scoped (F-TH-01).** `a + b`
+/// and `b + a` are bit-identical for any two finite `f64` operands — IEEE-754
+/// addition is exactly commutative for two terms — so no fixture can ever
+/// show `Accumulator::total`'s documented `lexical + semantic` order
+/// diverging from its reverse: verified live by swapping the order in
+/// `Accumulator::total` and rerunning the original version of this test,
+/// which still passed. A bit-identical comparison between two mirrored
+/// candidates is therefore not a test of anything the module does.
 ///
-/// Two mirrored candidates: one is lexical-rank-1/semantic-rank-2, the other
-/// lexical-rank-2/semantic-rank-1. Their totals must be **bit-identical** —
-/// which is only guaranteed because both are computed as
-/// `lexical_term + semantic_term`, in that order, and never as
-/// "the term I found first + the term I found second".
+/// What *is* real, and is checked here instead: that the total is exactly
+/// the documented **formula** — the sum of the two contributions the
+/// candidate's ranks name, and nothing else. A different `k`, an extra
+/// term, or a mean instead of a sum would all fail this, where the old
+/// pairwise-equality check would not have caught any of them either (both
+/// mirrored candidates would still tie on whatever wrong formula was used).
 #[test]
-fn the_two_contributions_are_summed_in_a_fixed_source_order() {
+fn the_two_contributions_sum_to_the_documented_formula() {
     let fused = fuse(
         &[lexical("aaa", 5.0), lexical("bbb", 4.0)],
         &[semantic("bbb", 0.9), semantic("aaa", 0.8)],
     );
     assert_eq!(fused.len(), 2);
-    assert_eq!(
-        fused[0].rrf.to_bits(),
-        fused[1].rrf.to_bits(),
-        "mirrored rank profiles must sum to identical bits, not merely to \
-         approximately equal floats"
-    );
-    // And the summation is the one the module documents, not an accident of
-    // this fixture's symmetry.
-    assert_eq!(fused[0].rrf, rrf_contribution(1) + rrf_contribution(2));
+    let expected = rrf_contribution(1) + rrf_contribution(2);
+    for hit in &fused {
+        assert_eq!(
+            hit.rrf, expected,
+            "a lexical-rank-1/semantic-rank-2 candidate (or its mirror) must \
+             total exactly rrf_contribution(1) + rrf_contribution(2): {hit:#?}"
+        );
+    }
 }
 
 // -------------------------------------------------- hazard 4: HashMap
