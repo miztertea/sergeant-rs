@@ -62,6 +62,7 @@ fn document(text: &str) -> ScannedUnit {
         title: None,
         byte_start: 0,
         byte_end: text.len() as u64,
+        coordinate: None,
         text: text.to_string(),
     }
 }

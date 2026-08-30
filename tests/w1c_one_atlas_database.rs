@@ -88,6 +88,7 @@ fn scan(source_name: &str, content_key: &str, body: &str) -> SourceScan {
             title: None,
             byte_start: 0,
             byte_end: body.len() as u64,
+            coordinate: None,
             text: body.to_string(),
         }],
         syntax: None,

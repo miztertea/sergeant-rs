@@ -188,6 +188,42 @@ fn a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_g
         eml.units
     );
 
+    // ------------------------------------ what a worker-landed unit carries
+    // S5 closeout (F-AC-02). The landing path used to build every
+    // worker-routed unit with `heading_level: None, title: None` and to drop
+    // the adapter's native `coordinate` entirely, so the two families that
+    // can only be addressed by that coordinate landed unaddressable. This is
+    // the pin at the exact place it was lost: the scan, before any store or
+    // index is involved.
+    assert!(
+        docx.units
+            .iter()
+            .any(|u| u.coordinate.is_some() && u.title.is_some()),
+        "an Office section unit is not byte-recoverable, so its native coordinate and heading \
+         title are the whole of its provenance: {:?}",
+        docx.units
+    );
+    let mut bodies: Vec<&str> = eml
+        .units
+        .iter()
+        .map(|u| {
+            assert_eq!(
+                u.title.as_deref(),
+                Some("Report attached"),
+                "A1 §6.5 keeps a message's subject; a body unit's title is where it lands: {u:?}"
+            );
+            u.coordinate
+                .as_deref()
+                .unwrap_or_else(|| panic!("a mail body unit must name which body it is: {u:?}"))
+        })
+        .collect();
+    bodies.sort();
+    assert_eq!(
+        bodies,
+        vec!["text-body"],
+        "this fixture has one body, and the native coordinate names it"
+    );
+
     // A ZIP's own body carries no text unit of its own (its content is its
     // children) — the honest empty [`atlas_worker.rs`]'s own doc states,
     // not a bug.

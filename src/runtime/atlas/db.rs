@@ -452,6 +452,14 @@ CREATE TABLE IF NOT EXISTS source.units (\n\
   byte_end      BIGINT NOT NULL,\n\
   body          TEXT NOT NULL\n\
 );\n\
+CREATE TABLE IF NOT EXISTS source.unit_coordinates (\n\
+  generation_id TEXT NOT NULL,\n\
+  source_name   TEXT NOT NULL,\n\
+  relative_path TEXT NOT NULL,\n\
+  local_key     TEXT NOT NULL,\n\
+  ordinal       BIGINT NOT NULL,\n\
+  coordinate    TEXT NOT NULL\n\
+);\n\
 CREATE TABLE IF NOT EXISTS source.symbols (\n\
   generation_id TEXT NOT NULL,\n\
   source_name   TEXT NOT NULL,\n\
@@ -617,11 +625,20 @@ macro_rules! admissible_generations_where {
 /// procedural.
 macro_rules! lexical_posting_join {
     () => {
-        "FROM context.lexical_postings p \
-         JOIN context.lexical_units l ON l.generation_id = p.generation_id \
-                                      AND l.unit_key = p.unit_key \
-         JOIN source.generations g ON g.generation_id = l.generation_id \
-         WHERE "
+        lexical_posting_join!("")
+    };
+    // `$extra` is spliced between the joins and the `WHERE`, and must be a
+    // literal for the same reason every statement in this file is one
+    // (item 13's no-client-SQL pin): `concat!` takes literals only.
+    ($extra:expr) => {
+        concat!(
+            "FROM context.lexical_postings p \
+             JOIN context.lexical_units l ON l.generation_id = p.generation_id \
+                                          AND l.unit_key = p.unit_key \
+             JOIN source.generations g ON g.generation_id = l.generation_id ",
+            $extra,
+            " WHERE "
+        )
     };
 }
 
@@ -649,8 +666,20 @@ const LEXICAL_POSTINGS_SQL: &str = concat!(
     "SELECT l.generation_id, l.source_name, g.content_key, l.family, l.unit_key, \
             l.relative_path, l.ordinal, l.title, l.symbol, l.language, l.label, \
             l.dataset_key, l.row_key, l.fields, l.byte_start, l.byte_end, \
-            l.token_count, p.term_frequency, g.source_kind, g.authority_class ",
-    lexical_posting_join!(),
+            l.token_count, p.term_frequency, g.source_kind, g.authority_class, \
+            c.coordinate ",
+    // A2 §9's native coordinate, joined rather than stored a second time:
+    // `context.lexical_units` is a landed table this module may not alter,
+    // and a derived index re-deriving a stored fact is how two copies drift.
+    // The family guard is not decoration — a code unit and a document unit
+    // can share one path and ordinal (`unit_key`'s own doc), and only the
+    // document/mail families read `source.units` rows at all.
+    lexical_posting_join!(
+        "LEFT JOIN source.unit_coordinates c ON c.generation_id = l.generation_id \
+                                            AND c.relative_path = l.relative_path \
+                                            AND c.ordinal = l.ordinal \
+                                            AND l.family IN ('document', 'mail') "
+    ),
     admissible_generations_where!(),
     " AND (? IS NULL OR l.family = ?) AND p.term = ? \
       ORDER BY l.source_name, l.relative_path, l.ordinal, l.unit_key \
@@ -3840,6 +3869,29 @@ fn insert_unit(
         unit.byte_end as i64,
         &unit.text,
     ])?;
+    // A2 §9's *native coordinate*, in its own table rather than a column on
+    // `source.units` — this module's own rule (see the module doc): a landed
+    // table is only ever added to, never altered, so a new fact arrives as a
+    // new table carrying its own copy of the coordinates that address it.
+    //
+    // A row only when there is one. `None` is every in-process text/Markdown
+    // unit, whose byte span is already its address; a row of `NULL` here
+    // would be a declared-but-empty promise for those.
+    if let Some(coordinate) = unit.coordinate.as_deref() {
+        conn.prepare_cached(
+            "INSERT INTO source.unit_coordinates \
+             (generation_id, source_name, relative_path, local_key, ordinal, coordinate) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )?
+        .execute(duckdb::params![
+            generation_id,
+            source_name,
+            &file.relative_path,
+            &file.local_key,
+            unit.ordinal as i64,
+            coordinate,
+        ])?;
+    }
     Ok(())
 }
 
@@ -4484,10 +4536,13 @@ fn indexable_units(
     let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;
     let mut statement = conn.prepare(
         "SELECT u.source_name, u.relative_path, u.ordinal, u.title, u.byte_start, u.byte_end, \
-                u.body, f.extractor \
+                u.body, f.extractor, c.coordinate \
          FROM source.units u \
          JOIN source.files f ON f.generation_id = u.generation_id \
                              AND f.relative_path = u.relative_path \
+         LEFT JOIN source.unit_coordinates c ON c.generation_id = u.generation_id \
+                                             AND c.relative_path = u.relative_path \
+                                             AND c.ordinal = u.ordinal \
          WHERE u.generation_id = ? AND f.extractor IN (?, ?, ?, ?) \
          ORDER BY u.relative_path, u.ordinal",
     )?;
@@ -4522,6 +4577,7 @@ fn indexable_units(
             fields: None,
             byte_start: Some(row.get::<usize, i64>(4)? as u64),
             byte_end: Some(row.get::<usize, i64>(5)? as u64),
+            native: row.get(8)?,
             text,
         });
     }
@@ -4554,6 +4610,7 @@ fn indexable_units(
             fields: None,
             byte_start: Some(row.get::<usize, i64>(6)? as u64),
             byte_end: Some(row.get::<usize, i64>(7)? as u64),
+            native: None,
             text: name,
         });
     }
@@ -4583,6 +4640,7 @@ fn indexable_units(
             fields: Some(row.get(5)?),
             byte_start: None,
             byte_end: None,
+            native: None,
             text: row.get(6)?,
         });
     }
@@ -4687,6 +4745,10 @@ fn coordinate_of(row: &duckdb::Row<'_>) -> Result<UnitCoordinate, AtlasError> {
     let title: Option<String> = row.get(7)?;
     let byte_start = row.get::<usize, Option<i64>>(14)?.unwrap_or(0) as u64;
     let byte_end = row.get::<usize, Option<i64>>(15)?.unwrap_or(0) as u64;
+    // A2 §9's native coordinate, `LEFT JOIN`ed on the posting row: `None`
+    // for a unit whose byte span is its address, and for every family that
+    // does not come from `source.units` at all.
+    let native: Option<String> = row.get(20)?;
     Ok(match family {
         LexicalFamily::Code => UnitCoordinate::Code {
             relative_path,
@@ -4703,6 +4765,7 @@ fn coordinate_of(row: &duckdb::Row<'_>) -> Result<UnitCoordinate, AtlasError> {
             title,
             byte_start,
             byte_end,
+            native,
         },
         LexicalFamily::Mail => UnitCoordinate::Mail {
             relative_path,
@@ -4710,6 +4773,7 @@ fn coordinate_of(row: &duckdb::Row<'_>) -> Result<UnitCoordinate, AtlasError> {
             title,
             byte_start,
             byte_end,
+            native,
         },
         LexicalFamily::RowText => UnitCoordinate::RowText {
             relative_path,
@@ -4753,6 +4817,9 @@ struct IndexableUnit {
     fields: Option<String>,
     byte_start: Option<u64>,
     byte_end: Option<u64>,
+    /// A2 §9's native coordinate for this unit, when the adapter produced
+    /// one — `source.unit_coordinates`, joined in by [`indexable_units`].
+    native: Option<String>,
     text: String,
 }
 
@@ -4783,6 +4850,7 @@ impl IndexableUnit {
                 title: self.title.clone(),
                 byte_start: self.byte_start.unwrap_or(0),
                 byte_end: self.byte_end.unwrap_or(0),
+                native: self.native.clone(),
             },
             LexicalFamily::Mail => UnitCoordinate::Mail {
                 relative_path: self.relative_path.clone(),
@@ -4790,6 +4858,7 @@ impl IndexableUnit {
                 title: self.title.clone(),
                 byte_start: self.byte_start.unwrap_or(0),
                 byte_end: self.byte_end.unwrap_or(0),
+                native: self.native.clone(),
             },
             LexicalFamily::RowText => UnitCoordinate::RowText {
                 relative_path: self.relative_path.clone(),
@@ -4866,6 +4935,10 @@ fn evict(
 ) -> Result<(), AtlasError> {
     conn.execute(
         "DELETE FROM source.units WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    conn.execute(
+        "DELETE FROM source.unit_coordinates WHERE generation_id = ?",
         duckdb::params![generation_id],
     )?;
     conn.execute(
@@ -7655,6 +7728,7 @@ mod tests {
                     title: None,
                     byte_start: 0,
                     byte_end: body.len() as u64,
+                    coordinate: None,
                     text: body.to_string(),
                 }],
                 syntax: None,

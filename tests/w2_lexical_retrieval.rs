@@ -23,17 +23,19 @@
 //! real three-step `record_scan` path — so their byte ranges are the real
 //! offsets into real files, and the tests slice the files with them.
 //!
-//! The mail family is a hand-built [`SourceScan`] carrying
-//! [`MAIL_EXTRACTOR`] units. That is deliberate and is not a gap in what is
-//! proved: `.eml` extraction routes through a supervised **worker
-//! subprocess** (`scan.rs`'s `worker_extractor_for`), which this suite
-//! deliberately does not spawn — spawning is `tests/y4_mail_adapter.rs`'s
-//! job, and it already proves the parse. What W2 owns is what happens to a
-//! stored mail unit once it exists, and a hand-built `source.units` row under
-//! the mail extractor identity is byte-for-byte the row that adapter writes.
+//! The mail family comes from a **real** `.eml` fixture walked through the
+//! real supervised worker subprocess (`scan_local_knowledge_with_worker`, the
+//! shape `scan.rs`'s `worker_extractor_for` routes `.eml` into) and recorded
+//! through the same `record_scan`. It was hand-built until the S5 closeout
+//! (F-AC-02) and that was the defect: the hand-built row set `title` and a
+//! real byte span by hand, which the worker landing path cannot produce, so
+//! the test pinned values production never emits and would have passed with
+//! the whole mail adapter deleted. A family's provenance test has to land the
+//! family the way production lands it.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -47,10 +49,12 @@ use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
 use sergeant_rs::runtime::atlas::record::{ScanRecord, record_scan, scan_and_record};
 use sergeant_rs::runtime::atlas::scan::{
     KnowledgeSource, ScannedFile, ScannedSymbol, ScannedSyntax, ScannedUnit, SourceScan,
+    scan_local_knowledge_with_worker,
 };
 use sergeant_rs::runtime::atlas::semantic::SemanticRequest;
 use sergeant_rs::runtime::atlas::tabular::ContextFields;
 use sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR;
+use sergeant_rs::runtime::atlas::worker::WorkerRuntime;
 use sergeant_rs::runtime::journal::Journal;
 
 // ---------------------------------------------------------------- fixtures
@@ -106,6 +110,7 @@ fn document_unit(title: Option<&str>, text: &str) -> ScannedUnit {
         title: title.map(str::to_string),
         byte_start: 0,
         byte_end: text.len() as u64,
+        coordinate: None,
         text: text.to_string(),
     }
 }
@@ -179,14 +184,16 @@ fn rust_symbol(name: &str) -> ScannedSyntax {
 /// * `knowledge` (local-knowledge, estate-readonly) — a REAL walk over a real
 ///   directory: `docs/forms.md`, `src/lib.rs`, `tickets.csv` with
 ///   `number`/`short_description` allowlisted (F10a).
-/// * `mailbox` (local-knowledge, estate-readonly) — one hand-built
-///   [`MAIL_EXTRACTOR`] unit (see the module doc for why it is hand-built).
+/// * `mailbox` (local-knowledge, estate-readonly) — a REAL walk over a
+///   directory holding this repo's own `02-multipart-alternative.eml`
+///   fixture, dispatched through the real supervised worker subprocess.
 /// * `vendor-lib` (external-git, external) — the decoy: a document whose body
 ///   is a *better* lexical match for the queries below than anything
 ///   admissible, planted so the negative-admission test has something real to
 ///   fail on.
 struct Estate {
     _data: TempDir,
+    _mailbox: TempDir,
     root: TempDir,
     journal: Journal,
     db: AtlasDb,
@@ -245,19 +252,37 @@ fn estate() -> Estate {
     };
     scan_and_record(&mut db, &mut journal, &knowledge, None).expect("record knowledge");
 
-    let mailbox = hand_built_scan(
-        "mailbox",
-        SourceKind::LocalKnowledge,
-        AuthorityClass::EstateReadonly,
-        "mailbox@key-1",
-        vec![scanned_file(
-            "inbox/message.eml",
-            MAIL_EXTRACTOR,
-            vec![document_unit(
-                Some("Payment retry policy failure"),
-                "The PaymentRetryPolicy raised INC0012345 during settlement.",
-            )],
-        )],
+    // The mail source is REAL: this repo's own `.eml` fixture, walked
+    // through the real supervised worker subprocess the production `.eml`
+    // route uses. See the module doc for why it is not hand-built.
+    let mailbox_root = tempfile::tempdir().expect("mailbox root");
+    std::fs::create_dir_all(mailbox_root.path().join("inbox")).expect("inbox");
+    std::fs::write(
+        mailbox_root.path().join("inbox/message.eml"),
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mail_corpus/02-multipart-alternative.eml"),
+        )
+        .expect("read the mail fixture"),
+    )
+    .expect("write the mail fixture");
+    let mailbox = scan_local_knowledge_with_worker(
+        &KnowledgeSource {
+            name: "mailbox".to_string(),
+            root: mailbox_root.path().to_path_buf(),
+            ignore: Vec::new(),
+            context_fields: ContextFields::none(),
+        },
+        &WorkerRuntime {
+            program: PathBuf::from(env!("CARGO_BIN_EXE_sgt-atlas-worker")),
+            deadline: Duration::from_secs(20),
+        },
+    )
+    .expect("scan the mailbox through the real worker");
+    assert!(
+        mailbox.extractors.contains(MAIL_EXTRACTOR),
+        "the mail fixture must have routed through the real mail adapter: {:?}",
+        mailbox.extractors
     );
     record_scan(&mut db, &mut journal, &mailbox, None).expect("record mailbox");
 
@@ -277,6 +302,7 @@ fn estate() -> Estate {
 
     Estate {
         _data: data,
+        _mailbox: mailbox_root,
         root,
         journal,
         db,
@@ -455,33 +481,75 @@ fn lexical_search_returns_a_document_unit_with_exact_a1_provenance() {
     );
 }
 
-/// Family 3 of 4 — **mail**. A2 §3's email coordinate, as far as A1's stored
-/// rows carry it: the `.eml` resource's path, the unit inside it, and the
-/// span of the message bytes.
+/// Family 3 of 4 — **mail**, landed the way production lands it: this
+/// repo's own `.eml` fixture through the real worker subprocess.
+///
+/// **What a mail hit actually carries, and why.** The message has two
+/// bodies (A1 §6.5's `text/html body`), so it lands two `Document`-kind
+/// units at one path. Neither is byte-recoverable into the original wire
+/// bytes — a decoded Content-Transfer-Encoding is a transform — so both
+/// carry `0`/`0`, the honest "not applicable" the worker's own comment
+/// names, and the *only* thing that tells them apart is the normalizer's
+/// native coordinate (`text-body`/`html-body`). The subject is the unit
+/// title. Those three facts are what A2 §17 item 2's "exact A1 provenance"
+/// and §9's "still cite the original source path/native coordinate" mean
+/// for this family; asserting a byte span here would be asserting a value
+/// production cannot produce, which is precisely what the pre-F-AC-02
+/// version of this test did.
 #[test]
-fn lexical_search_returns_a_mail_unit_with_exact_a1_provenance() {
+fn lexical_search_returns_mail_units_with_exact_a1_provenance() {
     let estate = estate();
     let filter = Admissibility {
         source: SourceSelector::Named("mailbox".to_string()),
         kind: None,
         authority: None,
     };
-    let answer = estate.search("INC0012345", &filter, Some(LexicalFamily::Mail));
-    let hit = hit_at(&answer, "inbox/message.eml");
-    assert_eq!(hit.source_name, "mailbox");
-    let UnitCoordinate::Mail {
-        title,
-        byte_start,
-        byte_end,
-        ..
-    } = &hit.coordinate
-    else {
-        panic!("expected a mail coordinate, got {:?}", hit.coordinate);
-    };
-    assert_eq!(title.as_deref(), Some("Payment retry policy failure"));
-    assert!(
-        byte_end > byte_start,
-        "a mail unit's span must be a real range: {byte_start}..{byte_end}"
+    let answer = estate.search("alternative", &filter, Some(LexicalFamily::Mail));
+
+    let mut seen: Vec<String> = Vec::new();
+    for hit in &answer.hits {
+        assert_eq!(hit.source_name, "mailbox");
+        let UnitCoordinate::Mail {
+            relative_path,
+            title,
+            byte_start,
+            byte_end,
+            native,
+            ordinal: _,
+        } = &hit.coordinate
+        else {
+            panic!("expected a mail coordinate, got {:?}", hit.coordinate);
+        };
+        assert_eq!(relative_path, "inbox/message.eml");
+        assert_eq!(
+            title.as_deref(),
+            Some("Alternative body demo"),
+            "the message subject is the unit's title (A1 §6.5), and the worker landing path \
+             must carry it: {:?}",
+            hit.coordinate
+        );
+        assert_eq!(
+            (*byte_start, *byte_end),
+            (0, 0),
+            "a mail body is not byte-recoverable into the original wire bytes; 0/0 is the \
+             honest not-applicable, and no other value is truthful: {:?}",
+            hit.coordinate
+        );
+        seen.push(native.clone().unwrap_or_else(|| {
+            panic!(
+                "a mail unit must carry its native coordinate — it is \
+                     the only thing telling the two bodies apart: {:?}",
+                hit.coordinate
+            )
+        }));
+    }
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec!["html-body".to_string(), "text-body".to_string()],
+        "the fixture has a text body and an html body; both are indexed units, and the native \
+         coordinate is what distinguishes them: {:?}",
+        answer.hits
     );
 }
 
@@ -989,6 +1057,7 @@ fn a_bounded_answer_reports_true_when_the_posting_scan_is_actually_capped() {
             title: None,
             byte_start: 0,
             byte_end: 8,
+            coordinate: None,
             text: "needleterm".to_string(),
         })
         .collect();

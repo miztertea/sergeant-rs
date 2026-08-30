@@ -328,6 +328,8 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
                     byte_start,
                     byte_end,
                     coordinate: unit.coordinate,
+                    heading_level: unit.heading_level,
+                    title: unit.title,
                     text: unit.text,
                 }
             })
@@ -379,6 +381,12 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
                 byte_start: 0,
                 byte_end: 0,
                 coordinate: Some("text-body".to_string()),
+                heading_level: None,
+                // A1 §6.5 lists `subject` among the fields a mail message
+                // must preserve rather than flatten into anonymous prose.
+                // A unit's title is where this store keeps that, so both of
+                // a message's bodies carry it.
+                title: message.subject.clone(),
                 text,
             });
         }
@@ -388,6 +396,8 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
                 byte_start: 0,
                 byte_end: 0,
                 coordinate: Some("html-body".to_string()),
+                heading_level: None,
+                title: message.subject.clone(),
                 text: html,
             });
         }
@@ -407,6 +417,8 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
                 byte_start: 0,
                 byte_end: input.len() as u64,
                 coordinate: None,
+                heading_level: None,
+                title: None,
                 text: text.to_string(),
             }],
             Err(_) => Vec::new(),

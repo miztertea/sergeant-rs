@@ -120,6 +120,7 @@ fn document_unit(title: Option<&str>, text: &str) -> ScannedUnit {
         title: title.map(str::to_string),
         byte_start: 0,
         byte_end: text.len() as u64,
+        coordinate: None,
         text: text.to_string(),
     }
 }

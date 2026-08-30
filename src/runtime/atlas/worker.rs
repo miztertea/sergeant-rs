@@ -160,6 +160,18 @@ pub struct WorkerUnit {
     /// `"text-body"`/`"html-body"` — see [`super::mail`]'s own module doc.
     #[serde(default)]
     pub coordinate: Option<String>,
+    /// Heading depth, when the extractor knows the unit sits under one.
+    ///
+    /// Present for the same reason [`Self::title`] is: the daemon-side
+    /// landing path stores exactly what arrives here, so a field an
+    /// extractor knows and this wire shape drops is a field the store can
+    /// never hold (S5 closeout, F-AC-02).
+    #[serde(default)]
+    pub heading_level: Option<u8>,
+    /// The unit's own title — an Office section's heading text, a mail
+    /// message's subject (A1 §6.5's `subject`).
+    #[serde(default)]
+    pub title: Option<String>,
     /// The unit's own text.
     pub text: String,
 }

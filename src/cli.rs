@@ -3185,12 +3185,24 @@ fn print_hit(rank: usize, hit: &Value) {
             cell_text(&unit["row_key"]),
             cell_text(&unit["fields"]),
         ),
-        _ => format!(
-            "{} bytes {}..{}",
-            unit["title"].as_str().unwrap_or("(untitled)"),
-            cell_text(&unit["byte_start"]),
-            cell_text(&unit["byte_end"]),
-        ),
+        // A2 §9: a result cites the original source path *and native
+        // coordinate*. A document or mail unit the adapter had to decode a
+        // container to reach has no byte span (`0`/`0` is its honest
+        // not-applicable), and its native coordinate — which body of the
+        // message, which block of the document — is the only thing that
+        // addresses it. Printing `bytes 0..0` there prints the absence
+        // instead of the evidence (S5 closeout, F-AC-02).
+        _ => {
+            let title = unit["title"].as_str().unwrap_or("(untitled)");
+            match unit["native"].as_str() {
+                Some(native) => format!("{title} at {native}"),
+                None => format!(
+                    "{title} bytes {}..{}",
+                    cell_text(&unit["byte_start"]),
+                    cell_text(&unit["byte_end"]),
+                ),
+            }
+        }
     };
     println!(
         "{rank}. {}  [{}/{}]",

@@ -1340,11 +1340,14 @@ them were dead code in every real installation.
 - **All four unit families answer, with A1's own coordinates.** Code,
   document, mail and selected-row-text (A2 §17 item 2), each with a test that
   finds a unit of that kind and resolves its provenance — source, generation,
-  unit, and the byte range for the three families whose evidence is a
-  resource's bytes. Selected-row text carries A2 §3's structured-text
+  unit, and the byte range for the families whose evidence really is a span of
+  a resource's bytes. Selected-row text carries A2 §3's structured-text
   coordinate instead (`dataset/row-id/field-set`): a row is read in place and
   never copied into Atlas, so there is no byte range to cite and none is
-  invented.
+  invented. A mail body and an Office section have no byte span either, and
+  carry the native coordinate described under "Worker-landed units keep their
+  provenance" below; the S5 closeout corrected this bullet, which had claimed
+  a byte range for all three non-row families.
 - **Tokenization keeps the whole identifier as well as its parts.** A2 §5's
   six named forms — `PaymentRetryPolicy`, `payment_retry_policy`,
   `payment-retry-policy`, `Foo::bar`, `POST /payments`, `INC0012345` — are
@@ -1518,6 +1521,37 @@ them were dead code in every real installation.
   coverage row still has no field on the worker batch to travel in, so an
   entry-level refusal is proven in the adapter's own tests and does not
   reach the daemon.
+
+### Worker-landed units keep their provenance (S5 closeout)
+
+- **A mail or Office unit now lands with everything its adapter knew about
+  it.** The daemon-side landing path for every worker-routed adapter built
+  each unit with `heading_level: None, title: None` and dropped the
+  normalizer's native coordinate entirely, so Markdown and text kept their
+  provenance and mail, Office and container children lost theirs: a real
+  `.eml` hit carried no title, no span and no way to tell a message's text
+  body from its html body — the one field that distinguishes them. All three
+  values travel the worker wire and land now
+  (`y8_adapter_dispatch::a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_generation_carries_the_proof`).
+- **A message's subject is the unit's title** (A1 §6.5's `subject`), on both
+  of its bodies.
+- **A2 §9's native coordinate is stored and cited.** It lives in a new
+  `source.unit_coordinates` table rather than a column added to the landed
+  `source.units` — this store's own rule is that a landed table is only ever
+  added to — and is joined onto both the lexical postings read and the shared
+  `indexable_units` derivation, so a lexical hit and a semantic hit on one
+  unit still carry the identical coordinate. `GET /v1/search` renders it as
+  `unit.native`, and `sgt search` prints `<title> at <native>` for a unit that
+  has one instead of the `bytes 0..0` it used to print, which printed the
+  absence rather than the evidence.
+- **The mail family's item-2 test now lands a real `.eml` through the real
+  worker subprocess.** It was a hand-built row that never touched the worker
+  and asserted a title and a byte span production could not produce — it would
+  have passed with the whole mail adapter deleted. It now asserts what a
+  production mail hit actually carries: the subject as title, `0`/`0` as the
+  honest not-applicable span, and `text-body`/`html-body` as the coordinate
+  that distinguishes the two bodies
+  (`w2_lexical_retrieval::lexical_search_returns_mail_units_with_exact_a1_provenance`).
 
 
 ## [0.2.4] - 2026-08-25
