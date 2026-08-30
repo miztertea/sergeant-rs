@@ -1900,6 +1900,69 @@ impl AtlasDb {
         )
     }
 
+    /// Container children of one source's confirmed generation, with A1
+    /// §6.6's four preserved fields, in path order, bounded by `limit`
+    /// (capped at [`MAX_ROWS`], F12).
+    ///
+    /// **The read side of `source.child_resources`** (S5 W7 F-SF-03). The
+    /// table's own insert comment says the entry content hash and entry
+    /// adapter "are already columns on the resource's own row ... and a
+    /// reader joins back to it on that key rather than being handed a second,
+    /// driftable copy". This is that reader, and it is the reason the
+    /// non-duplication is a design and not a hole: without it two of §6.6's
+    /// four fields were reachable only by opening the database file directly,
+    /// which A1-15 keeps off the public surface.
+    ///
+    /// Both lanes, one answer: a child that landed as a `source.files`
+    /// resource and one that landed as a `source.datasets` registration
+    /// (S5 W7 F-SF-01) are the same fact about the same generation, so they
+    /// come back in one list with `lane` saying which table holds the
+    /// resource. `content_hash`/`extractor`/`lane` are `Option` because the
+    /// join is a LEFT JOIN: a child row whose own resource row is missing
+    /// would be a real defect, and this answers with the coordinate it does
+    /// have rather than dropping the row and hiding it.
+    pub fn child_resources(
+        &self,
+        source_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredChildResource>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT c.relative_path, c.local_key, c.parent_relative_path, c.parent_key, \
+                    c.entry_path, coalesce(f.content_hash, d.content_hash), \
+                    coalesce(f.extractor, d.reader), \
+                    CASE WHEN f.relative_path IS NOT NULL THEN 'file' \
+                         WHEN d.relative_path IS NOT NULL THEN 'dataset' END \
+             FROM source.child_resources c \
+             JOIN source.generations g USING (generation_id) \
+             LEFT JOIN source.files f \
+               ON f.generation_id = c.generation_id \
+              AND f.source_name = c.source_name \
+              AND f.relative_path = c.relative_path \
+             LEFT JOIN source.datasets d \
+               ON d.generation_id = c.generation_id \
+              AND d.source_name = c.source_name \
+              AND d.relative_path = c.relative_path \
+             WHERE g.source_name = ? AND g.state = ? \
+             ORDER BY c.relative_path LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredChildResource {
+                relative_path: row.get(0)?,
+                key: row.get(1)?,
+                parent_relative_path: row.get(2)?,
+                parent_key: row.get(3)?,
+                entry_path: row.get(4)?,
+                content_hash: row.get(5)?,
+                extractor: row.get(6)?,
+                lane: row.get(7)?,
+            });
+        }
+        Ok(out)
+    }
+
     /// Registered datasets of one source's confirmed generation, in path
     /// order, bounded by `limit` (capped at [`MAX_ROWS`], F12).
     pub fn datasets(
@@ -3650,8 +3713,13 @@ fn write_dataset(
 /// are NOT duplicated here (F-SI-01): they are already columns on the
 /// resource's own row for this same
 /// `(generation_id, source_name, relative_path)`, and
-/// a reader joins back to it rather than being handed a
-/// second, driftable copy.
+/// [`AtlasDb::child_resources`] — the canned read behind
+/// `GET /v1/map/children` and `sgt map children` — joins back to it there
+/// rather than being handed a second, driftable copy. That reader is what
+/// makes the non-duplication a design instead of a hole (S5 W7 F-SF-03):
+/// before it existed these rows were written and read by nothing, and A1-15
+/// keeps arbitrary client SQL off the surface, so the coordinate was
+/// reachable only by opening the database file directly.
 fn insert_child_resource(
     conn: &Connection,
     generation_id: &str,
@@ -4313,6 +4381,32 @@ pub struct Hardening {
     /// `json` and `parquet` are here because the feature flags put them here,
     /// which is why nothing has to be fetched to read a dataset.
     pub statically_linked: Vec<String>,
+}
+
+/// One container child of a confirmed generation, as
+/// [`AtlasDb::child_resources`] answers it — A1 §6.6's four preserved
+/// fields, with the parent coordinate from `source.child_resources` and the
+/// entry content hash / entry adapter joined back from the resource's own
+/// row (S5 W7 F-SF-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredChildResource {
+    /// The child's own composed path, e.g. `bundle.zip!/notes/a.md`.
+    pub relative_path: String,
+    /// Its own F7 key — `local_key` for a file, `dataset_key` for a dataset.
+    pub key: String,
+    /// §6.6's "parent archive source/resource": the IMMEDIATE parent's own
+    /// composed path, chained rather than resolved to the root container.
+    pub parent_relative_path: String,
+    /// That parent's own F7 key.
+    pub parent_key: String,
+    /// §6.6's "entry path", relative to that immediate parent.
+    pub entry_path: String,
+    /// §6.6's "entry content hash", read back from the resource's own row.
+    pub content_hash: Option<String>,
+    /// §6.6's "entry adapter", read back from the resource's own row.
+    pub extractor: Option<String>,
+    /// Which table holds the resource this row names: `file` or `dataset`.
+    pub lane: Option<String>,
 }
 
 /// One registered tabular dataset, read back out of the store (X4).

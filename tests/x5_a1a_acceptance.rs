@@ -477,6 +477,14 @@ const WALK: &[Item] = &[
             ),
             at(
                 "tests/w7_container_children.rs",
+                "a_grandchilds_persisted_parent_is_its_immediate_container_not_the_root",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "the_parent_coordinate_is_readable_through_the_daemons_own_bounded_reader",
+            ),
+            at(
+                "tests/w7_container_children.rs",
                 "a_nested_container_cannot_escape_the_shared_depth_ceiling_by_recursing",
             ),
             at(
@@ -563,7 +571,22 @@ const WALK: &[Item] = &[
                memory, the daemon materialises those bytes into a per-read scratch directory \
                under its OWN data dir, named by its own content hash rather than the entry's \
                name, and removes it when the read ends. Nothing executes it and no container is \
-               unpacked to disk. H15, the wave's named J0-shaped question, was answered as its \
+               unpacked to disk. THE COORDINATE IS READ, NOT ONLY WRITTEN (S5 W7 F-SF-03): \
+               `AtlasDb::child_resources` is the canned read behind `GET /v1/map/children` and \
+               `sgt map children`, answering with all four §6.6 fields for both lanes in one \
+               list — the parent coordinate from `source.child_resources`, the entry content \
+               hash and entry adapter JOINED BACK from the resource's own row. That join is why \
+               those two fields are not duplicated beside the coordinate (F-SI-01), and until \
+               this reader existed the non-duplication was a hole rather than a design: every \
+               occurrence of the table in `src/` was DDL, INSERT or DELETE, and A1-15 keeps \
+               arbitrary client SQL off the public surface, so two of the four preserved fields \
+               were reachable only by opening the database file directly. AND THE PARENT IS THE \
+               IMMEDIATE ONE (S5 W7 F-SF-02): the daemon composes each child's coordinate from \
+               the container its own flattened path names, not from the dispatched resource, so \
+               a grandchild records the intermediate archive and chains its key through that \
+               archive's own key — `validate_batch` refuses a child naming a container the \
+               batch never declared (`OrphanedChildPath`), which is what makes that composition \
+               well-founded rather than a best effort. H15, the wave's named J0-shaped question, was answered as its \
                brief recommended and the code states honestly: the worker returns child bytes \
                and the DAEMON hashes what it receives, on receipt, before storing (option (b)), \
                because option (a) — the daemon re-opening the container — would have moved ZIP \
@@ -1729,9 +1752,17 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
         .collect();
     assert_eq!(
         verbs,
-        BTreeSet::from(["repos", "stats", "outline", "symbol", "references"]),
-        "`sgt map` ships F11's five verbs and no others — `neighbors` and `changed` land \
-         with the waves whose consumers need them: {text}"
+        BTreeSet::from([
+            "repos",
+            "stats",
+            "outline",
+            "children",
+            "symbol",
+            "references",
+        ]),
+        "`sgt map` ships F11's five verbs plus `children` (S5 W7 F-SF-03, the canned read \
+         `source.child_resources` had no consumer for) and no others — `neighbors` and \
+         `changed` land with the waves whose consumers need them: {text}"
     );
     for forbidden in ["--sql", "--query", "--where"] {
         assert!(

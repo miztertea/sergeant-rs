@@ -605,6 +605,85 @@ fn a_landed_childs_parent_coordinate_is_persisted_in_its_own_table() {
     assert_eq!(extractor, "markdown/v1");
 }
 
+/// **F-SF-03: `source.child_resources` has a READER.** The table was written
+/// per landed child and read by nothing in product code — every occurrence in
+/// `src/` was DDL, INSERT or DELETE — while the insert's own comment claimed
+/// "a reader joins back to it on that key". A1-15 keeps arbitrary client SQL
+/// off the public surface, so without a canned read two of A1 §6.6's four
+/// preserved fields were reachable only by opening the database file
+/// directly, which is exactly what a capability built and left unreachable
+/// looks like.
+///
+/// This test deliberately opens NO raw `duckdb::Connection`: it goes through
+/// `AtlasDb::child_resources`, the daemon's own bounded reader that
+/// `GET /v1/map/children` and `sgt map children` are the transport for.
+#[test]
+fn the_parent_coordinate_is_readable_through_the_daemons_own_bounded_reader() {
+    let (_root, scan) = scan_one(
+        "bundle.zip",
+        &zip_of(&[
+            ("notes/a.md", b"# notes\n" as &[u8]),
+            ("tickets.csv", b"id,short_description\n1,printer offline\n"),
+        ]),
+    );
+    let container_key = scan
+        .files
+        .iter()
+        .find(|f| f.relative_path == "bundle.zip")
+        .expect("the container lands")
+        .local_key
+        .clone();
+
+    let data_dir = TempDir::new().expect("data dir");
+    {
+        let mut db = AtlasDb::open(data_dir.path()).expect("open atlas");
+        let mut journal = Journal::open(data_dir.path()).expect("open journal");
+        record_scan(&mut db, &mut journal, &scan, None).expect("record");
+    }
+
+    let db = AtlasDb::open(data_dir.path()).expect("reopen atlas");
+    let children = db.child_resources("w7", 50).expect("read child resources");
+    assert_eq!(
+        children.len(),
+        2,
+        "both lanes come back from one read: {children:?}"
+    );
+
+    let document = children
+        .iter()
+        .find(|c| c.relative_path == "bundle.zip!/notes/a.md")
+        .expect("the document child is readable");
+    assert_eq!(document.parent_relative_path, "bundle.zip");
+    assert_eq!(document.parent_key, container_key);
+    assert_eq!(document.entry_path, "notes/a.md");
+    // §6.6's other two fields, JOINED BACK from the resource's own row rather
+    // than duplicated beside the coordinate (F-SI-01) — which is only a
+    // design, and not a hole, because this read performs the join.
+    assert_eq!(
+        document.content_hash.as_deref(),
+        Some(content_hash(b"# notes\n").as_str())
+    );
+    assert_eq!(document.extractor.as_deref(), Some("markdown/v1"));
+    assert_eq!(document.lane.as_deref(), Some("file"));
+
+    let dataset = children
+        .iter()
+        .find(|c| c.relative_path == "bundle.zip!/tickets.csv")
+        .expect("the dataset child is readable through the SAME reader");
+    assert_eq!(dataset.parent_relative_path, "bundle.zip");
+    assert_eq!(dataset.parent_key, container_key);
+    assert_eq!(dataset.entry_path, "tickets.csv");
+    assert_eq!(dataset.lane.as_deref(), Some("dataset"));
+    assert!(
+        dataset
+            .extractor
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("csv/"),
+        "a dataset child's entry adapter is its reader identity: {dataset:?}"
+    );
+}
+
 // -------------------------------------------------- the negative acceptance
 
 /// **Still refused (path safety).** W7 widened what a child carries; it did
