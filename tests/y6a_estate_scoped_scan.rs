@@ -134,24 +134,6 @@ fn client() -> reqwest::Client {
         .expect("client")
 }
 
-async fn post(
-    client: &reqwest::Client,
-    handle: &daemon::DaemonHandle,
-    path: &str,
-    body: &Value,
-) -> (reqwest::StatusCode, Value) {
-    let response = client
-        .post(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(body)
-        .send()
-        .await
-        .expect("request");
-    let status = response.status();
-    let body: Value = response.json().await.expect("json body");
-    (status, body)
-}
-
 async fn get(
     client: &reqwest::Client,
     handle: &daemon::DaemonHandle,
@@ -194,7 +176,8 @@ async fn a_registered_repository_is_scanned_through_the_git_path_and_map_symbol_
         "command_id": ulid::Ulid::generate().to_string(),
         "estate_root": estate_dir.path(),
     });
-    let (status, response) = post(&http, &handle, "/v1/intelligence/scan", &body).await;
+    let (status, response) =
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
     assert_eq!(status, 200, "{response}");
     let scanned = response["scanned"].as_array().expect("scanned array");
     assert_eq!(
@@ -317,7 +300,8 @@ async fn a_knowledge_source_copy_of_the_same_content_is_still_reported_local_kno
         "command_id": ulid::Ulid::generate().to_string(),
         "estate_root": estate_dir.path(),
     });
-    let (status, response) = post(&http, &handle, "/v1/intelligence/scan", &body).await;
+    let (status, response) =
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
     assert_eq!(status, 200, "{response}");
     let row = &response["scanned"][0];
     assert_eq!(

@@ -406,3 +406,15 @@ cov_stage_end 1 "the c1b_tiers_and_budget test binary must write its own profile
 cov_stage_begin c2-c1c_authority_and_provenance
 cov_run cargo llvm-cov --no-report --test c1c_authority_and_provenance --locked || cov_fail "c1c_authority_and_provenance failed under instrumentation"
 cov_stage_end 1 "the c1c_authority_and_provenance test binary must write its own profile"
+
+# S6 scan front door, wired at birth (the #231 lesson): `sgt intelligence
+# scan` must not report failure on success. Starts an IN-PROCESS daemon (the
+# y6a shape) over a three-source estate — one of them a copy of this build's
+# own `src/` tree, so the scan is genuinely minutes-shaped rather than
+# instant — drives the accept/poll pair over loopback, reads the journal's
+# two scan-lifecycle events directly, and runs the REAL `sgt` client once
+# against that daemon's published descriptor for the verb's own exit code.
+# Floor 1.
+cov_stage_begin c2-s6_scan_front_door
+cov_run cargo llvm-cov --no-report --test s6_scan_front_door --locked || cov_fail "s6_scan_front_door failed under instrumentation"
+cov_stage_end 1 "the s6_scan_front_door test binary must write its own profile"

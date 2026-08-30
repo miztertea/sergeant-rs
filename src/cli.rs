@@ -47,6 +47,16 @@ const SPAWN_POLL: Duration = Duration::from_millis(50);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for a single `/healthz` probe.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often `sgt intelligence scan` asks how the scan it started is
+/// going. Every poll is a small read, so this is a display cadence, not a
+/// bound on the work: nothing here has to be re-derived when an estate
+/// grows — the property #278 retired the class of tuned-per-estate bounds
+/// for.
+const SCAN_POLL: Duration = Duration::from_millis(500);
+/// How many consecutive failed polls are tolerated before the follow gives
+/// up and says so. A poll is a fresh HTTP request; one dropped connection
+/// must not end a scan that is still running.
+const POLL_FAILURES_TOLERATED: u32 = 5;
 
 /// `sgt` — sergeant-rs command line.
 #[derive(Parser, Debug)]
@@ -2449,13 +2459,67 @@ async fn run_intelligence_scan(
         "command_id": ulid::Ulid::generate().to_string(),
         "estate_root": estate_root,
     });
-    let result = client.post("/v1/intelligence/scan", &body).await?;
-    if json {
-        print_json(&result);
-    } else {
-        print_intelligence_scan(&result);
+    let accepted = client.post("/v1/intelligence/scan", &body).await?;
+    // The one answer that starts no scan: an estate that declares nothing
+    // to scan. It carries no `scan_id`, so there is nothing to follow —
+    // print it exactly as before.
+    let Some(scan_id) = accepted["scan_id"].as_str() else {
+        if json {
+            print_json(&accepted);
+        } else {
+            print_intelligence_scan(&accepted);
+        }
+        return Ok(());
+    };
+    let total = accepted["total_sources"].as_u64().unwrap_or(0);
+    if !json {
+        println!("scan {scan_id}: {total} source(s)");
     }
-    Ok(())
+    let path = format!("/v1/intelligence/scan/{scan_id}");
+    let mut printed = 0usize;
+    let mut consecutive_failures = 0u32;
+    loop {
+        let status = match client.get(&path).await {
+            Ok(status) => {
+                consecutive_failures = 0;
+                status
+            }
+            Err(e) => {
+                // A poll that fails is a fact about this poll, never about
+                // the scan — the daemon is running it whether or not this
+                // client is watching, and saying otherwise is the exact
+                // defect this command was fixed for. Retry a few times,
+                // then say precisely what is and is not known.
+                consecutive_failures += 1;
+                if consecutive_failures > POLL_FAILURES_TOLERATED {
+                    return Err(CliError::new(format!(
+                        "lost contact with the daemon while following scan {scan_id} ({e}); \
+                         the scan itself is the daemon's and may still be running — \
+                         `sgt intelligence scan` again once it answers, or read the \
+                         journal's intelligence.scan.completed event for {scan_id}"
+                    )));
+                }
+                tokio::time::sleep(SCAN_POLL).await;
+                continue;
+            }
+        };
+        let empty = Vec::new();
+        let rows = status["scanned"].as_array().unwrap_or(&empty);
+        while printed < rows.len() {
+            if !json {
+                print!("[{}/{total}] ", printed + 1);
+                print_scan_record_row(&rows[printed]);
+            }
+            printed += 1;
+        }
+        if status["state"] == "completed" {
+            if json {
+                print_json(&status);
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(SCAN_POLL).await;
+    }
 }
 
 /// `sgt knowledge add/list` (S3 F11): a pure manifest edit/read, same

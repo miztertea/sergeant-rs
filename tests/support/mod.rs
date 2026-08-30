@@ -780,6 +780,74 @@ impl Drop for CrossProcessLock {
     }
 }
 
+/// Drive `POST /v1/intelligence/scan` to completion and hand back the
+/// finished report (S6 scan front door).
+///
+/// The trigger accepts and returns a `scan_id`; the scan itself runs on the
+/// daemon's own task and is followed through
+/// `GET /v1/intelligence/scan/{scan_id}`. Every suite that scans goes
+/// through this one helper, so no test can quietly go back to asserting on
+/// an acceptance as if it were a report.
+///
+/// This is also what makes those suites *honest* rather than lucky. The
+/// synchronous trigger they used to call was raced against one HTTP
+/// request timeout, and `y6a`'s own repository scan had begun timing out in
+/// CI — a real scan outrunning a fixed client bound, which is the same
+/// defect the product had. Here the wait is over the scan's own reported
+/// completion, with [`SCAN_BUDGET`] as a backstop that fails loudly and
+/// says how far the scan got.
+///
+/// Returns the status and body of whatever last answered: the acceptance
+/// itself when it carries no `scan_id` (the estate declares nothing to
+/// scan — a real, immediate answer), otherwise the terminal poll, whose
+/// `scanned` array is exactly the per-source report.
+pub async fn scan_to_completion(
+    http: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    body: &serde_json::Value,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let response = http
+        .post(format!("{endpoint}/v1/intelligence/scan"))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .expect("scan request");
+    let status = response.status();
+    let accepted: serde_json::Value = response.json().await.expect("json body");
+    let Some(scan_id) = accepted["scan_id"].as_str().map(str::to_string) else {
+        return (status, accepted);
+    };
+    let deadline = Instant::now() + SCAN_BUDGET;
+    let mut last = accepted;
+    let mut last_status = status;
+    while Instant::now() < deadline {
+        let response = http
+            .get(format!("{endpoint}/v1/intelligence/scan/{scan_id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("scan status request");
+        last_status = response.status();
+        last = response.json().await.expect("json body");
+        if last["state"] == "completed" {
+            return (last_status, last);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!(
+        "scan {scan_id} did not complete within {SCAN_BUDGET:?}; last poll answered \
+         {last_status}: {last}"
+    );
+}
+
+/// How long [`scan_to_completion`] waits for a scan to finish before
+/// failing the test. Generous on purpose: it is a backstop against a hung
+/// scan, not a bound anything is tuned against — the wait itself ends on
+/// the scan's own reported completion.
+pub const SCAN_BUDGET: Duration = Duration::from_secs(600);
+
 #[cfg(test)]
 mod cross_process_lock_tests {
     use super::CrossProcessLock;
