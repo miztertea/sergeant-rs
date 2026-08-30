@@ -138,8 +138,8 @@ use crate::backend::BindingSummary;
 use crate::domain::source::SourceGeneration;
 use crate::domain::workflow::{StageDefinition, StageRecord};
 use crate::runtime::atlas::db::{
-    Admissibility, AtlasDb, LexicalQuery, SourceSelector, StoredChildResource, StoredEdge,
-    StoredUnit,
+    Admissibility, AtlasDb, AtlasError, LexicalQuery, SourceSelector, StoredChildResource,
+    StoredEdge, StoredUnit,
 };
 use crate::runtime::atlas::overlay::overlay_source_name;
 use crate::runtime::atlas::semantic::{SemanticRequest, SemanticStatus};
@@ -1326,19 +1326,14 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
         let mut step = ledger
             .enter(ResearchStep::ExactRelationships)
             .expect("step 3 follows step 2");
-        let mut found = 0usize;
-        for pin in &source_generations {
-            for child in atlas
-                .child_resources(&pin.source_name, STEP_ROW_CAP)
-                .unwrap_or_default()
-            {
-                found += 1;
-                step.contribute(Tier::Bound, child_relationship(pin, &child));
-            }
-        }
-        if found == 0 {
-            step.note("no container/document/mail parent-child relationship in this world");
-        }
+        contribute_generation_rows(
+            &mut step,
+            &source_generations,
+            Tier::Bound,
+            "no container/document/mail parent-child relationship in this world",
+            |source_name| atlas.child_resources(source_name, STEP_ROW_CAP),
+            child_relationship,
+        );
     }
     // ---- 4. deterministic dataset aggregates/joins/diffs DECLARED by the
     //         profile/workflow
@@ -1361,19 +1356,14 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
         let mut step = ledger
             .enter(ResearchStep::ReferencedNeighbors)
             .expect("step 5 follows step 4");
-        let mut found = 0usize;
-        for pin in &source_generations {
-            for edge in atlas
-                .edges(&pin.source_name, STEP_ROW_CAP)
-                .unwrap_or_default()
-            {
-                found += 1;
-                step.contribute(Tier::Referenced, edge_relationship(pin, &edge));
-            }
-        }
-        if found == 0 {
-            step.note("no stored structural edge in this world");
-        }
+        contribute_generation_rows(
+            &mut step,
+            &source_generations,
+            Tier::Referenced,
+            "no stored structural edge in this world",
+            |source_name| atlas.edges(source_name, STEP_ROW_CAP),
+            edge_relationship,
+        );
     }
     // ---- 6/7. A2 lexical retrieval, then A2 semantic retrieval if
     //           installed/needed — S5's own pipeline, consumed (R2).
@@ -1610,6 +1600,31 @@ fn coverage_states(atlas: &AtlasDb, admitted: &[SourceGeneration]) -> Vec<Covera
         }
     }
     out
+}
+
+/// Step 3 and step 5's shared shape (**R2**): for every pinned source
+/// generation, fetch its rows through `fetch`, contribute each one at `tier`
+/// via `map`, and note `empty_note` once if nothing was found across every
+/// pin. `fetch`'s own `STEP_ROW_CAP`/limit argument stays the caller's, same
+/// as before this was factored out.
+fn contribute_generation_rows<T>(
+    step: &mut StepWriter<'_>,
+    source_generations: &[GenerationPin],
+    tier: Tier,
+    empty_note: &str,
+    fetch: impl Fn(&str) -> Result<Vec<T>, AtlasError>,
+    map: impl Fn(&GenerationPin, &T) -> EvidenceCoordinate,
+) {
+    let mut found = 0usize;
+    for pin in source_generations {
+        for item in fetch(&pin.source_name).unwrap_or_default() {
+            found += 1;
+            step.contribute(tier, map(pin, &item));
+        }
+    }
+    if found == 0 {
+        step.note(empty_note);
+    }
 }
 
 /// One stored unit, as an exact Atlas coordinate under its pinned generation.
