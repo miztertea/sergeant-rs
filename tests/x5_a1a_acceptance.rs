@@ -1568,6 +1568,151 @@ fn string_literals(source: &str) -> Vec<Literal> {
     }
     out
 }
+/// The parameter names an SQL-taking entry point plausibly uses.
+///
+/// A list of spellings is a weak check on its own — that is exactly why the
+/// old one-spelling version of item 13's API check was evadable — so it is
+/// the *cheap* half here, standing beside [`statement_arguments`], which
+/// does not care what anything is called.
+const SQL_PARAMETER_SPELLINGS: [&str; 10] = [
+    "sql",
+    "stmt",
+    "statement",
+    "query",
+    "raw",
+    "expr",
+    "expression",
+    "command",
+    "ddl",
+    "dml",
+];
+
+/// Every string-typed parameter of one whole `pub fn` signature, by name.
+///
+/// String-typed is the filter that matters: `lexical_search(&self, query:
+/// &LexicalQuery)` takes a name from the list above and is not a query
+/// surface, because a typed request is not a statement.
+fn string_parameters(signature: &str) -> Vec<String> {
+    let Some(open) = signature.find('(') else {
+        return Vec::new();
+    };
+    let mut depth = 0i32;
+    let mut close = signature.len();
+    for (at, c) in signature[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = open + at;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut names = Vec::new();
+    let mut depth = 0i32;
+    for part in signature[open + 1..close].split(|c| {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        c == ',' && depth == 0
+    }) {
+        let Some((name, typing)) = part.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || name == "&self" || name == "self" {
+            continue;
+        }
+        if typing.contains("str") || typing.contains("String") {
+            names.push(name.trim_start_matches("mut ").to_string());
+        }
+    }
+    names
+}
+
+/// Whether `text` names `parameter` as an identifier rather than as part of
+/// a longer one — `sql` must not match `sql_for_table`.
+fn mentions(text: &str, parameter: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(at) = text[from..].find(parameter) {
+        let at = from + at;
+        let before = at.checked_sub(1).map(|i| bytes[i] as char);
+        let after = text[at + parameter.len()..].chars().next();
+        let boundary = |c: Option<char>| !matches!(c, Some(c) if c == '_' || c.is_alphanumeric());
+        if boundary(before) && boundary(after) {
+            return true;
+        }
+        from = at + parameter.len();
+    }
+    false
+}
+
+/// The first argument of every statement-running call in the function that
+/// starts at `index` — the SQL each one hands to duckdb.
+///
+/// The body ends at the closing brace on the function's own indentation:
+/// brace counting would trip over the `{}` in this file's many `format!`s.
+fn statement_arguments(lines: &[&str], index: usize) -> Vec<(String, String)> {
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let closing = format!("{}}}", " ".repeat(indent_of(lines[index])));
+    let mut body = String::new();
+    for line in lines.iter().skip(index + 1) {
+        if *line == closing {
+            break;
+        }
+        if !line.trim_start().starts_with("//") {
+            body.push_str(line.trim());
+            body.push(' ');
+        }
+    }
+    let mut found = Vec::new();
+    // Only the calls whose FIRST argument is the statement. A
+    // `Statement::execute`/`query`/`query_row` takes bound parameters there,
+    // and binding a caller's value is the shape item 13 wants, not the one
+    // it forbids — `conn`/`tx` name the `Connection`/`Transaction` receivers
+    // whose `execute` really does take SQL first.
+    for call in [
+        "prepare(",
+        "prepare_cached(",
+        "execute_batch(",
+        "conn.execute(",
+        "tx.execute(",
+    ] {
+        let mut from = 0;
+        while let Some(at) = body[from..].find(call) {
+            let at = from + at;
+            let start = at + call.len();
+            let mut depth = 0i32;
+            let mut end = body.len();
+            for (offset, c) in body[start..].char_indices() {
+                match c {
+                    '(' | '[' | '<' => depth += 1,
+                    ')' | ']' | '>' => {
+                        if depth == 0 {
+                            end = start + offset;
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    ',' if depth == 0 => {
+                        end = start + offset;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            found.push((call.to_string(), body[start..end].to_string()));
+            from = start;
+        }
+    }
+    found
+}
 
 /// Every interpolation hole in every SQL-carrying string literal in `source`,
 /// rendered as `<enclosing fn>: <hole> <- <filler>` in file order.
@@ -1683,10 +1828,38 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
         if signature.contains("pub fn query_identity(") {
             continue;
         }
-        assert!(
-            !signature.contains("sql:"),
-            "Atlas exposes an SQL-taking entry point, which item 13 forbids: {signature}"
-        );
+        // The predicate is what item 13 MEANS, not one parameter spelling.
+        // Until the S5 closeout this was `!signature.contains("sql:")`, so a
+        // `pub fn run(&self, stmt: &str)` — or `query:`, or `raw:` — was an
+        // SQL-taking entry point that compiled and passed. Two checks now
+        // stand in its place, and neither depends on a name being chosen
+        // honestly:
+        //
+        //   a. no public signature takes a string-typed parameter under any
+        //      of the names an SQL-taking one plausibly uses, and
+        //   b. no public function hands one of its OWN string parameters to
+        //      the store as a statement — the flow item 13 actually forbids,
+        //      whatever the parameter is called.
+        for spelling in SQL_PARAMETER_SPELLINGS {
+            for typing in [": &str", ": String", ": &String", ": Option<&str>"] {
+                assert!(
+                    !signature.contains(&format!("{spelling}{typing}")),
+                    "Atlas exposes an SQL-taking entry point, which item 13 forbids: \
+                     {signature}"
+                );
+            }
+        }
+        for (call, argument) in statement_arguments(&lines, index) {
+            for parameter in string_parameters(&signature) {
+                assert!(
+                    !mentions(&argument, &parameter),
+                    "a public Atlas function hands its own `{parameter}` parameter to \
+                     {call} as the statement to run — that is client SQL reaching the \
+                     store, which item 13 forbids, and no parameter name makes it not \
+                     one: {signature}"
+                );
+            }
+        }
     }
     assert!(
         signatures > 20,
