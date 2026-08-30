@@ -119,6 +119,10 @@ fn scanned_file(relative_path: &str, extractor: &str, units: Vec<ScannedUnit>) -
         mtime_millis: None,
         units,
         syntax: None,
+        // Not a container child: this helper hand-builds a top-level resource,
+        // which is exactly the case `ScannedFile::parent`'s own doc calls
+        // `None` — "every resource acquired directly from a source root".
+        parent: None,
     }
 }
 
