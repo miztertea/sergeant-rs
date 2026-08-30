@@ -189,6 +189,7 @@ fn compiled(atlas: Option<&AtlasDb>) -> ContextSnapshot {
             bindings: &bindings,
             prior_stages: &prior,
             profile: Some("standard"),
+            parent: None,
             budget: sergeant_rs::runtime::context::RenderBudget::DEFAULT,
         },
     )
@@ -522,11 +523,16 @@ fn the_snapshot_pins_the_retrieval_generation_and_model_it_actually_used() {
     assert_eq!(trace.query.text, "tighten the retention policy");
     assert_eq!(
         trace.attribution,
-        sergeant_rs::runtime::atlas::trace::Attribution::Work {
+        // Sharpened by C1d (§21 item 11 / §16: *"attributed to the current
+        // execution"*). C1a asserted `Attribution::Work` here, which was
+        // managed but a coordinate too coarse — it could not tell two stage
+        // launches of one Work apart.
+        sergeant_rs::runtime::atlas::trace::Attribution::Execution {
             work_id: WORK_ID.to_string(),
             repository: REPOSITORY.to_string(),
+            execution_id: "01EXECUTION".to_string(),
         },
-        "a search a Work's own execution issued is a MANAGED search (§13)"
+        "a search a Work's own execution issued is a MANAGED search (§13), attributed to that          execution (§16)"
     );
     assert!(
         !trace.retrieval_generation.generations.is_empty(),
@@ -624,6 +630,7 @@ fn the_selection_plan_hash_separates_two_plans_that_selected_the_same_evidence()
             bindings: &bindings,
             prior_stages: &[],
             profile: Some("standard"),
+            parent: None,
             budget: sergeant_rs::runtime::context::RenderBudget::DEFAULT,
         },
     );

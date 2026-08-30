@@ -137,6 +137,128 @@ pub const KIND_STAGE_OUTPUT_MISSING: &str = "stage.output_missing";
 /// compiler installed journals nothing at all, which is the other, stronger
 /// half of §21 item 13: the existing stage launch path with nothing added.
 pub const KIND_CONTEXT_COMPILED: &str = "context.compiled";
+
+// ===================================================================
+// C1 §16 — actor queries are evidence
+// ===================================================================
+//
+// §16 lists **seven** event kinds verbatim, and all seven are declared here,
+// in §16's own order, so a reader of the contract finds every line of its
+// list in one place:
+//
+// ```text
+// context.bound
+// context.referenced
+// context.query
+// context.reference_resolved
+// context.search_fallback
+// context.scope_expansion_requested
+// context.contradiction_observed
+// ```
+//
+// **Four are emitted by this build and three are declared-but-unemitted**,
+// each saying which surface would emit it and why nothing does yet. That
+// split is stated rather than hidden for the same reason
+// [`crate::runtime::context::EvidenceProvenance::ocr`] is present and null:
+// an absent kind is indistinguishable from a forgotten one, and a reader of
+// §16 checking whether Sergeant records its list needs the answer for all
+// seven, not for the subset that happened to be easy.
+//
+// **What §16 bounds.** Its own purpose clause is *"This later lets Sergeant
+// analyze where compiled worlds were insufficient **without self-tuning
+// during Sprint 3**"*, and its own instruction is *"Record raw evidence
+// rather than a magic 'sharpness score'"* — which §20 repeats as two separate
+// non-goals (*learned context policy/live self-tuning*, *universal scalar
+// sharpness score*). So every payload below is raw coordinates and raw
+// stated status. **Nothing here is scored, ranked, aggregated into a quality
+// number, or read back by the compiler.** No code in this crate consumes
+// these events at all; they are a record for a later reader, which is
+// exactly what "record, do not adapt" means.
+
+/// §16's `context.bound` — the Bound evidence one compiled world actually
+/// carried into one fresh execution, attributed to that execution.
+///
+/// One event per compilation, never one per unit: the evidence coordinates
+/// ride in the payload as a list. That is the same affordability argument
+/// [`KIND_CONTEXT_COMPILED`] and `source.scanned` already make, and it is
+/// what keeps a nine-step plan with [`crate::runtime::context::STEP_ROW_CAP`]
+/// rows per step from journaling hundreds of events per stage entry.
+pub const KIND_CONTEXT_BOUND: &str = "context.bound";
+/// §16's `context.referenced` — the Referenced coordinates the same
+/// compilation emitted, attributed to the same execution. Separate from
+/// [`KIND_CONTEXT_BOUND`] because §2's two tiers are different facts about
+/// what the actor was given: a body it was handed versus a pointer it may
+/// resolve.
+pub const KIND_CONTEXT_REFERENCED: &str = "context.referenced";
+/// §16's `context.query` — a **managed** retrieval call issued for one
+/// execution, carrying A2 §13's query identity and the execution attribution
+/// ([`crate::runtime::atlas::trace::Attribution::Execution`]).
+///
+/// This is the destination `crate::runtime::atlas::trace`'s own doc named:
+/// *"persisting the trace of a **managed** search — one a Work's own
+/// execution issued — is C1/S6's, where a managed retrieval call has a Work
+/// execution to attach the row to."* An unmanaged `sgt search` still
+/// journals nothing, so H13.2's pure-reader property is untouched.
+pub const KIND_CONTEXT_QUERY: &str = "context.query";
+/// §16's `context.reference_resolved` — **declared, and emitted by nothing
+/// in this build.**
+///
+/// The fact it would record is *the actor went and resolved a Referenced
+/// coordinate*, which is §14's *"not a ban on the actor resolving
+/// Reachable/Referenced evidence when needed"* actually being exercised. In
+/// this release there is no surface through which an execution resolves one:
+/// `crate::runtime::context::resolve` is called by the compiler's own packing
+/// step, before the actor exists, and journaling *that* under this kind would
+/// be recording the compiler's read as if it were the actor's — a false
+/// entry in exactly the record §16 exists to make trustworthy. The wave that
+/// gives an execution a managed resolve verb is the wave that emits this.
+pub const KIND_CONTEXT_REFERENCE_RESOLVED: &str = "context.reference_resolved";
+/// §16's `context.search_fallback` — the managed retrieval for one execution
+/// ran on a **narrower ladder rung than it asked for**: §18's *"A1 + lexical
+/// A2"* where *"A1 + full A2"* was requested.
+///
+/// Raw evidence, not a score: the payload states
+/// [`crate::runtime::atlas::semantic::SemanticStatus`]'s own word for why
+/// (`not_installed` | `disabled`), which is A2 §15's required honesty about
+/// the answer, carried onto the execution that got it.
+pub const KIND_CONTEXT_SEARCH_FALLBACK: &str = "context.search_fallback";
+/// §16's `context.scope_expansion_requested` — **declared, and emitted by
+/// nothing in this build.**
+///
+/// §20's third non-goal is *automatic Work scope expansion*, and §4 states
+/// the rule the compiler obeys: *"The compiler does not silently add repos to
+/// Work mutation scope because a search result is relevant."* So there is no
+/// automatic expansion for this kind to record, by design. What it is
+/// reserved for is the *asked-for* case §10 allows — *"an actor can request
+/// an additional bounded query when judgment discovers one is needed"* — and
+/// no surface accepts such a request today. Emitting it from the compiler
+/// would mean inventing an expansion request nobody made.
+pub const KIND_CONTEXT_SCOPE_EXPANSION_REQUESTED: &str = "context.scope_expansion_requested";
+/// §16's `context.contradiction_observed` — **declared, and emitted by
+/// nothing in this build.**
+///
+/// §9's contradiction is two evidence sources *disagreeing* — *"knowledge
+/// says: payments-worker owns retries / source shows: payments-api owns
+/// current implementation"* — and this build has no detector for that.
+/// Deciding that two excerpts disagree is a judgment, and §9's own answer is
+/// that *"the actor gets the conflict as a judgment problem"*; a compiler
+/// that scored disagreement would be synthesizing the consensus §9 forbids,
+/// and the scalar §16 and §20 both refuse. The kind is named so the record
+/// has a place for the fact when a wave lands a detector whose evidence is
+/// exact coordinates rather than a similarity number.
+pub const KIND_CONTEXT_CONTRADICTION_OBSERVED: &str = "context.contradiction_observed";
+
+/// Every kind §16 lists, in §16's own order — what a test compares the
+/// contract's seven lines against.
+pub const CONTEXT_AUDIT_KINDS: [&str; 7] = [
+    KIND_CONTEXT_BOUND,
+    KIND_CONTEXT_REFERENCED,
+    KIND_CONTEXT_QUERY,
+    KIND_CONTEXT_REFERENCE_RESOLVED,
+    KIND_CONTEXT_SEARCH_FALLBACK,
+    KIND_CONTEXT_SCOPE_EXPANSION_REQUESTED,
+    KIND_CONTEXT_CONTRADICTION_OBSERVED,
+];
 /// The named `needs_input` reason #260 Q3 requires when a stage's declared
 /// `output/` artifact is still missing after its one bounded re-prompt:
 /// carried in the `stage.needs_input`/`work.needs_input` payload's

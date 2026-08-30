@@ -157,6 +157,30 @@ pub enum Attribution {
         /// The repository the Work's search was scoped to.
         repository: String,
     },
+    /// **C1 §16's attribution**: a managed call issued *by an execution* —
+    /// the compiled-context step's own retrieval, run for one fresh actor
+    /// start.
+    ///
+    /// > *"Managed `map/search/related/query` calls can be attributed to the
+    /// > current execution."* (§16)
+    ///
+    /// A third variant rather than an `Option<String>` bolted onto
+    /// [`Self::Work`], for exactly the reason this enum has variants at all
+    /// (see the type's own doc): `sgt search --work <id>` is a human's
+    /// Work-scoped read and genuinely has **no** execution, so an optional
+    /// field would make *"this call had no execution"* and *"nobody filled
+    /// this in"* the same value. They are different facts, and §16's whole
+    /// point is telling which compiled world — which is to say, which
+    /// execution — a query belonged to.
+    Execution {
+        /// The Work the execution belongs to.
+        work_id: String,
+        /// The repository its world was scoped to.
+        repository: String,
+        /// **The execution itself** — the fresh actor start this query's
+        /// compiled world was built for.
+        execution_id: String,
+    },
 }
 
 /// A2 §13's field 3: *"source-generation filter"* — the A2 §2 stage-1
@@ -367,6 +391,16 @@ impl SearchTrace {
                     "managed": true,
                     "work": work_id,
                     "repository": repository,
+                    // Present and null rather than omitted: a Work-scoped
+                    // CLI search really has no execution, and an absent key
+                    // would be indistinguishable from a dropped one.
+                    "execution": serde_json::Value::Null,
+                }),
+                Attribution::Execution { work_id, repository, execution_id } => serde_json::json!({
+                    "managed": true,
+                    "work": work_id,
+                    "repository": repository,
+                    "execution": execution_id,
                 }),
             },
             "source_generation_filter": {

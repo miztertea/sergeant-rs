@@ -182,6 +182,7 @@ fn compiled(atlas: &AtlasDb, budget: RenderBudget) -> ContextSnapshot {
             bindings: &bindings,
             prior_stages: &prior,
             profile: Some("standard"),
+            parent: None,
             budget,
         },
     )
@@ -770,6 +771,7 @@ fn external_and_estate_bodies_render_differently_only_because_of_authority_class
             bindings: &[],
             prior_stages: &[],
             profile: None,
+            parent: None,
             budget: RenderBudget::DEFAULT,
         },
     );

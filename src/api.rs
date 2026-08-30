@@ -6797,6 +6797,19 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     // kind per fresh execution, never one per evidence unit — the same
     // affordability argument `source.scanned` makes below.
     KIND_CONTEXT_COMPILED,
+    // C1 §16's seven audit kinds, in §16's own order. Three of them are
+    // declared-but-unemitted in this build (see each constant's doc); they
+    // are listed here anyway, because this list is the *vocabulary* an
+    // enumerating client subscribes to, and a client that learns a frame
+    // name only once something first emits it is a client that drops the
+    // first one.
+    workflow::KIND_CONTEXT_BOUND,
+    workflow::KIND_CONTEXT_REFERENCED,
+    workflow::KIND_CONTEXT_QUERY,
+    workflow::KIND_CONTEXT_REFERENCE_RESOLVED,
+    workflow::KIND_CONTEXT_SEARCH_FALLBACK,
+    workflow::KIND_CONTEXT_SCOPE_EXPANSION_REQUESTED,
+    workflow::KIND_CONTEXT_CONTRADICTION_OBSERVED,
     KIND_EXECUTION_RESERVED,
     KIND_EXECUTION_STARTED,
     KIND_EXECUTION_STOPPED,
