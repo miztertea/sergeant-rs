@@ -621,19 +621,28 @@ impl ScanTracker {
         }
     }
 
-    /// Mark a scan finished and prune the oldest finished scans past
-    /// [`RETAINED_SCANS`]. Keys are ULIDs, so map order is start order.
+    /// Mark a scan finished and prune the oldest scans past
+    /// [`RETAINED_SCANS`], regardless of whether they ever finished. Keys
+    /// are ULIDs, so map order is start order.
+    ///
+    /// Pruning used to search only for entries with `completed.is_some()`,
+    /// which meant a task that never reached this method at all — stuck
+    /// indefinitely on a hanging source, or terminated by a panic before
+    /// this line ran — left a `completed: None` entry invisible to that
+    /// search forever: every later scan's `finish()` would find no
+    /// completed entry to remove and stop, so the map grew without bound
+    /// (F-IN-01). Evicting the oldest *entry*, completed or not, is what
+    /// actually keeps [`ApiState::scans`] the bounded map its own doc
+    /// comment claims: a scan that can never finish still ages out once
+    /// enough newer scans have started, exactly like one that finished
+    /// normally.
     fn finish(&self, scan_id: &str) {
         let mut scans = self.lock();
         if let Some(progress) = scans.get_mut(scan_id) {
             progress.completed = Some(rfc3339_utc_now());
         }
         while scans.len() > RETAINED_SCANS {
-            let Some(oldest) = scans
-                .iter()
-                .find(|(_, p)| p.completed.is_some())
-                .map(|(id, _)| id.clone())
-            else {
+            let Some(oldest) = scans.keys().next().cloned() else {
                 break;
             };
             scans.remove(&oldest);
@@ -10556,6 +10565,40 @@ mod tests {
             !WorkOverlayHook::Evict.coalesces(),
             "an eviction is the lifetime rule itself; dropping one leaves evidence about a \
              surface that no longer exists"
+        );
+    }
+
+    /// F-IN-01: a scan whose task never calls [`ScanTracker::finish`] —
+    /// stuck indefinitely on a hanging source, or terminated by a panic
+    /// before that line runs — must still age out of the map once enough
+    /// newer scans have started and finished. Before the fix, pruning only
+    /// ever searched for `completed.is_some()` entries to evict, so a
+    /// `completed: None` entry was permanently invisible to it and the map
+    /// grew without bound; reverting the eviction predicate to
+    /// `find(|(_, p)| p.completed.is_some())` makes this test fail with
+    /// the stuck scan still present.
+    #[test]
+    fn a_scan_that_never_finishes_still_ages_out_of_the_bounded_map() {
+        let tracker = ScanTracker::default();
+        // The stuck scan: begun, never finished.
+        tracker.begin("00_stuck", "/estate", Vec::new());
+        // Enough later scans start and finish normally to push the map
+        // past RETAINED_SCANS.
+        for i in 1..=RETAINED_SCANS {
+            let id = format!("{i:02}_ok");
+            tracker.begin(&id, "/estate", Vec::new());
+            tracker.finish(&id);
+        }
+        assert!(
+            tracker.snapshot("00_stuck").is_none(),
+            "a scan that never finishes must still age out once enough newer scans have \
+             finished, or ApiState::scans is unbounded exactly as F-IN-01 found"
+        );
+        assert_eq!(
+            tracker.lock().len(),
+            RETAINED_SCANS,
+            "the map stays bounded at RETAINED_SCANS even with a permanently unfinished entry \
+             among the candidates for eviction"
         );
     }
 }
