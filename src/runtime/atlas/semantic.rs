@@ -86,6 +86,7 @@ use std::path::{Path, PathBuf};
 
 use model2vec_rs::model::StaticModel;
 
+use crate::domain::source::{AuthorityClass, SourceKind};
 use crate::runtime::atlas::lexical::UnitCoordinate;
 
 /// What the **caller asked for** — the request side, distinct from what the
@@ -147,6 +148,22 @@ pub enum SemanticStatus {
     /// entirely different reason, and a consumer that must not confuse a
     /// host-configuration fact with a caller's choice can tell them apart.
     Disabled,
+}
+
+impl SemanticStatus {
+    /// H4's own three spellings — `applied` | `not_installed` | `disabled`
+    /// — as the stable wire word every surface renders.
+    ///
+    /// One function rather than a `match` at each render site: A2 §15's
+    /// honesty is only mechanical if every consumer reads the same three
+    /// words, and a second spelling of "degraded" is a second vocabulary.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::NotInstalled => "not_installed",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 /// Resolve the status of one answer from the caller's request and the
@@ -448,6 +465,16 @@ pub struct SemanticHit {
     pub score: f64,
     /// The declared source.
     pub source_name: String,
+    /// **A2 §17 item 8** — the source's kind, so an answer built from this
+    /// half stays as visibly external as one built from the lexical half.
+    /// See [`crate::runtime::atlas::lexical::LexicalHit::authority_class`]
+    /// for the whole argument; it is here for the same reason the tie-break
+    /// key is: RRF's two inputs must agree on every field the fused hit
+    /// carries, or the fused answer would depend on which half a candidate
+    /// arrived through.
+    pub source_kind: SourceKind,
+    /// **A2 §17 item 8's other half** — the source's authority class.
+    pub authority_class: AuthorityClass,
     /// The exact SourceGeneration this unit belongs to.
     pub generation_id: String,
     /// That generation's content identity.

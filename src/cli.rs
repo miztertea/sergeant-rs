@@ -301,6 +301,36 @@ enum Command {
         #[command(subcommand)]
         command: IntelligenceCommand,
     },
+    /// Search everything this estate can see (A2 §14), one query across
+    /// every admissible source.
+    ///
+    /// A **pure read**: nothing is scanned, indexed or refreshed by asking.
+    /// Run `sgt intelligence scan` to change what is searchable.
+    ///
+    /// Every hit cites source, generation, unit and an A1-owned coordinate,
+    /// and every answer states whether A2 §6's semantic half participated
+    /// (`semantic: applied | not_installed | disabled`). `--json` carries
+    /// A2 §13's full search trace.
+    Search {
+        /// What to search for. Tokenized for identifiers and document
+        /// words alike — `PaymentRetryPolicy` and `payment` both find it.
+        query: String,
+        #[command(flatten)]
+        selectors: SearchSelectors,
+    },
+    /// Find units related to one already-retrieved coordinate (A2 §14).
+    ///
+    /// The coordinate is the one `sgt search` prints —
+    /// `<source>/<family>:<path>#<ordinal>`. Neighbours are ranked by the
+    /// same pipeline `sgt search` uses, over the anchor unit's own indexed
+    /// text, inside the same deterministic filter; the anchor itself is
+    /// never returned as its own neighbour.
+    Related {
+        /// A coordinate as `sgt search` prints it.
+        coordinate: String,
+        #[command(flatten)]
+        selectors: SearchSelectors,
+    },
     /// Read the world map Atlas derived from the estate's sources (S3, F11).
     ///
     /// Canned reads over rows the daemon already holds — no client SQL, no
@@ -536,6 +566,98 @@ pub enum IntelligenceCommand {
     /// once, when invoked, and returns. A recurring scan is a later wave's,
     /// when retrieval needs one.
     Scan,
+}
+
+/// A2 §14's deterministic selectors, shared by `sgt search` and `sgt
+/// related` because §14 gives them one list and two verbs.
+///
+/// > ```text
+/// > --source <name>   --work <id>   --content code|document|email|config|all
+/// > --type knowledge  --external    --top <n>
+/// > ```
+///
+/// **Every one of these narrows the world before ranking** (A2 §2, decision
+/// A2-01) — none of them is a retrieval weight. A2 §14's *"Do not expose raw
+/// retrieval weight tuning"* is met by there being nothing here to expose:
+/// BM25's `k1`/`b` and RRF's `k` are `const`s no flag reaches.
+#[derive(Debug, clap::Args)]
+pub struct SearchSelectors {
+    /// Search one declared source only; `<name>@<content-key>` pins one
+    /// exact generation.
+    #[arg(long)]
+    pub source: Option<String>,
+    /// Search one Work's world: its repository's base generation plus that
+    /// Work's own overlay of it. The answer states which of the two it
+    /// actually covered.
+    #[arg(long, conflicts_with = "source")]
+    pub work: Option<String>,
+    /// Which repository a multi-repository `--work` addresses. Required
+    /// only when the Work targets more than one.
+    #[arg(long, requires = "work")]
+    pub repo: Option<String>,
+    /// Narrow to one content family: `code`, `document`, `email`,
+    /// `row-text`, or `all` (the default). `config` is named in A2 §14 and
+    /// is refused with its reason in this build — Atlas stores no value
+    /// that separates a config file from a text document.
+    #[arg(long)]
+    pub content: Option<String>,
+    /// Narrow to one source kind: `repo`, `knowledge` or `external`.
+    #[arg(long = "type")]
+    pub source_type: Option<String>,
+    /// Shorthand for `--type external`: evidence acquired from outside the
+    /// estate.
+    #[arg(long)]
+    pub external: bool,
+    /// How many hits to print (default 10). A display bound only — both
+    /// retrieval halves always rank the whole admissible set, so this cannot
+    /// change the order of what it returns.
+    #[arg(long)]
+    pub top: Option<usize>,
+    /// Leave A2 §6's semantic half out even where a model is installed. The
+    /// answer reports `semantic: disabled`, which is a different fact from
+    /// `not_installed` and is not reported as one.
+    #[arg(long)]
+    pub no_semantic: bool,
+}
+
+impl SearchSelectors {
+    /// The selectors as query parameters, url-encoded — never a path
+    /// segment, never spliced into anything the daemon parses as a query
+    /// language (the same rule `sgt map` follows).
+    pub fn query_string(&self) -> String {
+        let mut out = String::new();
+        let mut add = |key: &str, value: &str| {
+            out.push('&');
+            out.push_str(key);
+            out.push('=');
+            out.push_str(&crate::api::urlencode(value));
+        };
+        if let Some(source) = &self.source {
+            add("source", source);
+        }
+        if let Some(work) = &self.work {
+            add("work", work);
+        }
+        if let Some(repo) = &self.repo {
+            add("repo", repo);
+        }
+        if let Some(content) = &self.content {
+            add("content", content);
+        }
+        if let Some(kind) = &self.source_type {
+            add("type", kind);
+        }
+        if self.external {
+            add("external", "true");
+        }
+        if let Some(top) = self.top {
+            add("top", &top.to_string());
+        }
+        if self.no_semantic {
+            add("semantic", "off");
+        }
+        out
+    }
 }
 
 /// `sgt map ...` subcommands (S3 X4, F11's minimum honest set).
@@ -1711,6 +1833,44 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     run_intelligence_scan(&client, estate_root_opt(&estate), sgt.json).await
                 }
             }
+        }
+        Command::Search { query, selectors } => {
+            // A2 §14's first verb. `observe_connect`, not `ensure_daemon`:
+            // a search is a question about evidence that already exists, and
+            // spawning a daemon to answer one would make a pure read a
+            // side effect (ADR 0009's no-spawn posture, the same one
+            // `sgt map` takes).
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            let path = format!(
+                "/v1/search?q={}{}",
+                crate::api::urlencode(&query),
+                selectors.query_string()
+            );
+            let result = client.get(&path).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_search(&result);
+            }
+            Ok(())
+        }
+        Command::Related {
+            coordinate,
+            selectors,
+        } => {
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            let path = format!(
+                "/v1/related?coordinate={}{}",
+                crate::api::urlencode(&coordinate),
+                selectors.query_string()
+            );
+            let result = client.get(&path).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_related(&result);
+            }
+            Ok(())
         }
         Command::Map { command } => {
             let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
@@ -2933,6 +3093,137 @@ fn print_external_git_sources(result: &Value) {
             provenance["retrieved_at"].as_str().unwrap_or("?"),
         );
     }
+}
+
+/// A `sgt search` answer as plain text.
+///
+/// **Two things are printed unconditionally, not on a flag**: every hit's
+/// coordinate — source, generation, unit and A1 coordinate, so an answer
+/// traces to exact bytes — and the answer's disclosure line
+/// (`semantic:`/`work scope`/`truncated`). A2 §15 requires a degraded answer
+/// to report itself honestly and decision **H4** makes that a required
+/// field; a renderer that only showed it under `--json` would have made it
+/// omittable again at the surface a human actually reads.
+///
+/// A2 §17 item 8's `source_kind`/`authority_class` are on the coordinate
+/// line for the same reason: *"external evidence remains **visibly**
+/// external"* is a claim about what the answer shows.
+fn print_search(result: &Value) {
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!(
+            "{}",
+            result["detail"]
+                .as_str()
+                .unwrap_or("no source has been indexed on this host yet")
+        );
+        return;
+    }
+    let empty = Vec::new();
+    let hits = result["hits"].as_array().unwrap_or(&empty);
+    if hits.is_empty() {
+        println!("no hits");
+    }
+    for (index, hit) in hits.iter().enumerate() {
+        print_hit(index + 1, hit);
+    }
+    print_disclosure(result);
+}
+
+/// A `sgt related` answer: the anchor it actually resolved, then the
+/// neighbours, then the same disclosure line.
+///
+/// The anchor is echoed because a coordinate can parse to a unit the caller
+/// did not mean, and an answer that only listed neighbours would give a
+/// reader no way to notice.
+fn print_related(result: &Value) {
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!(
+            "{}",
+            result["detail"]
+                .as_str()
+                .unwrap_or("no source has been indexed on this host yet")
+        );
+        return;
+    }
+    let anchor = &result["anchor"];
+    println!(
+        "anchor {}  [{}/{}]",
+        anchor["coordinate"].as_str().unwrap_or("?"),
+        anchor["source_kind"].as_str().unwrap_or("?"),
+        anchor["authority_class"].as_str().unwrap_or("?"),
+    );
+    let empty = Vec::new();
+    let hits = result["hits"].as_array().unwrap_or(&empty);
+    if hits.is_empty() {
+        println!("no related units");
+    }
+    for (index, hit) in hits.iter().enumerate() {
+        print_hit(index + 1, hit);
+    }
+    print_disclosure(result);
+}
+
+/// One hit: rank, coordinate, the item-8 pair, the fused score and which of
+/// A2 §7's two lists it came from.
+fn print_hit(rank: usize, hit: &Value) {
+    let unit = &hit["unit"];
+    let detail = match unit["family"].as_str() {
+        Some("code") => format!(
+            "{} {} `{}` bytes {}..{}",
+            unit["language"].as_str().unwrap_or("?"),
+            unit["label"].as_str().unwrap_or("?"),
+            unit["symbol"].as_str().unwrap_or("?"),
+            cell_text(&unit["byte_start"]),
+            cell_text(&unit["byte_end"]),
+        ),
+        // A2 §3: structured row text has a dataset key, a row key and a
+        // field set, and NO byte span. Rendering one would be inventing
+        // evidence (W2's J5 correction).
+        Some("row-text") => format!(
+            "dataset {} row {} fields {}",
+            cell_text(&unit["dataset_key"]),
+            cell_text(&unit["row_key"]),
+            cell_text(&unit["fields"]),
+        ),
+        _ => format!(
+            "{} bytes {}..{}",
+            unit["title"].as_str().unwrap_or("(untitled)"),
+            cell_text(&unit["byte_start"]),
+            cell_text(&unit["byte_end"]),
+        ),
+    };
+    println!(
+        "{rank}. {}  [{}/{}]",
+        hit["coordinate"].as_str().unwrap_or("?"),
+        hit["source_kind"].as_str().unwrap_or("?"),
+        hit["authority_class"].as_str().unwrap_or("?"),
+    );
+    println!(
+        "   {detail}\n   generation={} rrf={} lexical={} semantic={}",
+        hit["generation_id"].as_str().unwrap_or("?"),
+        cell_text(&hit["rrf"]),
+        cell_text(&hit["ranks"]["lexical"]),
+        cell_text(&hit["ranks"]["semantic"]),
+    );
+}
+
+/// The disclosure line every retrieval answer prints — decision **H4**'s
+/// required semantic status, the `--work` scope, and whether a bound bit.
+fn print_disclosure(result: &Value) {
+    let scope = &result["work_scope"];
+    let scope_text = match scope["kind"].as_str() {
+        Some("base_and_overlay_snapshot") => format!(
+            "base+overlay as of {}",
+            scope["overlay_observed_at"].as_str().unwrap_or("?")
+        ),
+        Some("base_only") => "base only (no overlay stands for this work)".to_string(),
+        _ => "not work-scoped".to_string(),
+    };
+    println!(
+        "semantic: {}  |  scope: {scope_text}  |  truncated: {}",
+        result["semantic"].as_str().unwrap_or("?"),
+        cell_text(&result["truncated"]),
+    );
 }
 
 /// A `map` answer as plain text: one line per row, keys in the order the

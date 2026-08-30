@@ -193,4 +193,5 @@ pub mod semantic;
 pub mod syntax;
 pub mod tabular;
 pub mod text;
+pub mod trace;
 pub mod worker;

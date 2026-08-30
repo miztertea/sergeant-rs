@@ -61,6 +61,7 @@
 //! expression, summed over the query's distinct terms by [`Bm25Corpus`].
 //! Nothing is trained and nothing self-tunes (A2 §16 forbids both).
 
+use crate::domain::source::{AuthorityClass, SourceKind};
 use std::collections::BTreeMap;
 
 /// Which of A2 §17 item 2's four unit families a lexical hit belongs to —
@@ -107,9 +108,80 @@ impl LexicalFamily {
     }
 }
 
+impl LexicalFamily {
+    /// Every family, so a parser or a renderer can iterate them rather than
+    /// re-listing them and drifting when a fifth arrives.
+    pub const ALL: [Self; 4] = [Self::Code, Self::Document, Self::Mail, Self::RowText];
+}
+
 impl std::fmt::Display for LexicalFamily {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// **A2 §14's `sgt related <coordinate>` argument**, as one addressable
+/// string: `<source>/<family>:<path>#<ordinal>`.
+///
+/// # Why the address is exactly the two fields a hit already prints
+///
+/// Every hit carries `source_name` and `unit_key`, and `unit_key` is
+/// `<family>:<path>#<ordinal>` (see `db::unit_key`). So the coordinate `sgt
+/// related` accepts is the coordinate `sgt search` prints, with no third
+/// spelling in between — **R2**, and the reason A2 §3's *"the result's
+/// evidence coordinate remains A1-owned"* survives a round trip through the
+/// CLI.
+///
+/// # Parsing, and the one ambiguity it removes deliberately
+///
+/// A source name may itself contain `/` — an overlay source is
+/// `work:<id>/<repo>` — so splitting on the first `/` would mis-address
+/// every overlay unit. [`UnitAddress::parse`] instead splits at the first
+/// `/` **whose remainder begins with a known family prefix**, which is
+/// exactly the shape `db::unit_key` writes and nothing else is. A relative
+/// path that itself began with `code:`/`document:`/`mail:`/`row-text:` at a
+/// path segment boundary could in principle produce a second candidate
+/// split; the earliest is taken, stated here rather than discovered, and
+/// [`Self::render`] round-trips through [`Self::parse`] for every address
+/// this build can produce
+/// (`tests/w5_search_surface.rs::a_printed_coordinate_parses_back_to_itself`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitAddress {
+    /// The declared source (or `work:<id>/<repo>` overlay source name).
+    pub source_name: String,
+    /// Atlas's own per-generation unit identity.
+    pub unit_key: String,
+}
+
+impl UnitAddress {
+    /// The address as one string — what `sgt search` prints per hit.
+    pub fn render(source_name: &str, unit_key: &str) -> String {
+        format!("{source_name}/{unit_key}")
+    }
+
+    /// Parse `<source>/<family>:<path>#<ordinal>`, or `None` when the text
+    /// carries no family-prefixed unit key at a `/` boundary.
+    ///
+    /// `None` rather than a best guess: A2 §2's *"never approximate"* applies
+    /// to addressing exactly as it applies to admission, and a coordinate
+    /// that half-parses would send `related` at the wrong unit while looking
+    /// like it worked.
+    pub fn parse(text: &str) -> Option<Self> {
+        for (index, _) in text.match_indices('/') {
+            let rest = &text[index + 1..];
+            if LexicalFamily::ALL
+                .iter()
+                .any(|family| rest.starts_with(&format!("{}:", family.as_str())))
+                && rest.contains('#')
+                && index > 0
+            {
+                return Some(Self {
+                    source_name: text[..index].to_string(),
+                    unit_key: rest.to_string(),
+                });
+            }
+        }
+        None
     }
 }
 
@@ -497,6 +569,38 @@ pub struct LexicalHit {
     pub score: f64,
     /// The declared source.
     pub source_name: String,
+    /// **A2 §17 item 8** — *"external evidence remains **visibly**
+    /// external"*. The source's own kind, carried on the hit rather than
+    /// left for a caller to look up: see [`Self::authority_class`].
+    pub source_kind: SourceKind,
+    /// **A2 §17 item 8's other half.** The source's authority class.
+    ///
+    /// # Why these two are on the *hit*
+    ///
+    /// Visibility is a property of the **answer**, not of the store. Before
+    /// S5 W5 a hit carried `source_name` and nothing else about its world,
+    /// so a caller holding an answer could not mechanically tell an
+    /// `external_git` unit from an `estate_git` one — it had the source's
+    /// *name*, and names are not a taxonomy. Item 8 asks for external
+    /// evidence to *remain visible* as external, and an answer that
+    /// requires a second, unbounded lookup to establish that has not kept
+    /// it visible; it has merely left it discoverable.
+    ///
+    /// A2 §2's filter already knows both values — it filters on them
+    /// (`Admissibility::kind`/`Admissibility::authority`, and
+    /// `source.generations` stores both columns the admissibility predicate
+    /// binds against) — so this is the same shape as decision **H4**'s
+    /// `semantic:` field and W1b's `WorkScope`: a fact the system already
+    /// holds, which the answer must carry or a consumer cannot distinguish
+    /// two materially different answers. **R2** — reuse the stored columns
+    /// rather than introducing a second classification.
+    ///
+    /// `tests/w5_search_surface.rs::
+    /// an_external_hit_is_identifiable_as_external_from_the_answer_alone`
+    /// is the pin: it searches a corpus holding one `estate_git` and one
+    /// `external_git` source for a term both match, and identifies the
+    /// external hit from the returned answer with no second store read.
+    pub authority_class: AuthorityClass,
     /// The exact SourceGeneration this unit belongs to.
     pub generation_id: String,
     /// That generation's content identity.

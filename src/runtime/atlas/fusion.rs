@@ -72,6 +72,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::domain::source::{AuthorityClass, SourceKind};
+
 use crate::runtime::atlas::lexical::{LexicalHit, UnitCoordinate, rank_order};
 use crate::runtime::atlas::semantic::{SemanticHit, rank_semantic};
 
@@ -267,6 +269,15 @@ pub struct FusedHit {
     pub signals: RerankSignals,
     /// The declared source.
     pub source_name: String,
+    /// **A2 §17 item 8** — the source's kind, carried through the fusion
+    /// unchanged from whichever input list the candidate arrived in. Both
+    /// inputs carry it, and both agree: `fuse` joins on
+    /// `(generation_id, unit_key)`, and a generation has exactly one
+    /// `source_kind` row in `source.generations`.
+    pub source_kind: SourceKind,
+    /// **A2 §17 item 8's other half** — the source's authority class. See
+    /// [`crate::runtime::atlas::lexical::LexicalHit::authority_class`].
+    pub authority_class: AuthorityClass,
     /// The exact SourceGeneration this unit belongs to.
     pub generation_id: String,
     /// That generation's content identity.
@@ -346,6 +357,8 @@ impl Accumulator {
     /// level copy once required (F-SI-02).
     fn new(
         source_name: &str,
+        source_kind: SourceKind,
+        authority_class: AuthorityClass,
         generation_id: &str,
         content_key: &str,
         unit_key: &str,
@@ -357,6 +370,8 @@ impl Accumulator {
                 origins: RankOrigins::default(),
                 signals: RerankSignals::default(),
                 source_name: source_name.to_string(),
+                source_kind,
+                authority_class,
                 generation_id: generation_id.to_string(),
                 content_key: content_key.to_string(),
                 unit_key: unit_key.to_string(),
@@ -419,6 +434,8 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit]) -> Vec<FusedHit> {
             .or_insert_with(|| {
                 Accumulator::new(
                     &hit.source_name,
+                    hit.source_kind,
+                    hit.authority_class,
                     &hit.generation_id,
                     &hit.content_key,
                     &hit.unit_key,
@@ -435,6 +452,8 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit]) -> Vec<FusedHit> {
             .or_insert_with(|| {
                 Accumulator::new(
                     &hit.source_name,
+                    hit.source_kind,
+                    hit.authority_class,
                     &hit.generation_id,
                     &hit.content_key,
                     &hit.unit_key,

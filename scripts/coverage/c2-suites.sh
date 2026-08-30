@@ -364,3 +364,18 @@ cov_stage_end 1 "the w3b_model2vec_manifest_pin test binary must write its own p
 cov_stage_begin c2-w4_rrf_fusion
 cov_run cargo llvm-cov --no-report --test w4_rrf_fusion --locked || cov_fail "w4_rrf_fusion failed under instrumentation"
 cov_stage_end 1 "the w4_rrf_fusion test binary must write its own profile"
+
+# S5 W5, wired at birth (the #231 lesson, same as w1/w1b/w1c/w1d/w2/w3/w3b/w4
+# above): A2 §13's search trace, A2 §14's two verbs (`sgt search` AND `sgt
+# related`), and the three A2 §17 items the mid-sprint acceptance walk found
+# unassigned — item 8 (external evidence visibly external from the answer
+# alone), item 3 (a relational aggregate joined to retrieved row evidence)
+# and item 6 (one query spanning a normalized Office document and a Markdown
+# one). Builds Atlas stores in tempdirs and records scans through the
+# ordinary `record_scan` path; item 6 spawns the REAL `sgt-atlas-worker`
+# subprocess for the `.docx` half, the way y2_office_adapter and
+# w7_container_children do, because a hand-built office unit would assume the
+# half item 6 is actually about. No daemon and no estate. Floor 1.
+cov_stage_begin c2-w5_search_surface
+cov_run cargo llvm-cov --no-report --test w5_search_surface --locked || cov_fail "w5_search_surface failed under instrumentation"
+cov_stage_end 1 "the w5_search_surface test binary must write its own profile"

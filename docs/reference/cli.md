@@ -6,7 +6,7 @@ Global options are `-C <ESTATE_ROOT>`, `--data-dir <PATH>`, and `--json`. A daem
 
 - **Unscoped** — `--help`, `--version`, `init`, `doctor` — valid anywhere, touch no daemon.
 - **Host-scoped** — `tui`, `status`, `work show`/`list`/`transcript`, `watch`, and every `daemon` verb (foreground start, `stop`, `install-service`) — valid from any directory, no estate root required. `sgt watch` still consults `-C`/cwd opportunistically: inside a valid estate root it defaults to that estate's events; `--all`, or a cwd that is not one, watches every estate the daemon has admitted.
-- **Estate-scoped** — everything else (`run`, `repo`, `knowledge`, `group`, `workflow`, `respond`, `retry`, `extend`, `cancel`, `work reap`/`sweep`/`retained`, `analytics`, `intelligence`, `map`, and the harness launchers) — requires an exact estate root (`-C <ESTATE_ROOT>` or a cwd that is one); refused outside one.
+- **Estate-scoped** — everything else (`run`, `repo`, `knowledge`, `group`, `workflow`, `respond`, `retry`, `extend`, `cancel`, `work reap`/`sweep`/`retained`, `analytics`, `intelligence`, `map`, `search`, `related`, and the harness launchers) — requires an exact estate root (`-C <ESTATE_ROOT>` or a cwd that is one); refused outside one.
 
 Harness launchers exec the native harness; estate client commands use the host daemon and may auto-start it according to their help contract — the spawned daemon addresses no estate itself (H1: every estate it ever serves is admitted per-request, over the wire, once it is already running).
 
@@ -25,6 +25,8 @@ Harness launchers exec the native harness; estate client commands use the host d
 | `analytics` | query operational projections | estate |
 | `intelligence` | report what the source index holds and how completely it covers each declared source | estate |
 | `map` | read the derived world map — indexed repositories, a source's outline, a symbol, its recorded sites, and totals | estate |
+| `search` | search everything the estate can see, one query across every admissible source | estate |
+| `related` | find units related to one coordinate `search` printed | estate |
 | `claude`, `codex`, `opencode`, `goose`, `agy` | launch Captain harnesses | estate |
 
 Human errors use a nonzero exit status. Successful `--json` output is JSON; streaming surfaces use JSONL where documented. Do not assume every error shape or exit status is stable across pre-1.0 releases unless a page explicitly promises it.

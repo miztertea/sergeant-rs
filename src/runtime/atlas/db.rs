@@ -152,6 +152,10 @@ use crate::runtime::atlas::semantic::{
 use crate::runtime::atlas::tabular::{
     DatasetFormat, RowKeyBasis, RowUnit, ScannedDataset, row_units,
 };
+use crate::runtime::atlas::trace::{
+    Attribution, ContentAuthorityFilter, LexicalIdentity, PolicyIdentity, QueryIdentity,
+    RETRIEVAL_INDEX_VERSION, ResultRank, RetrievalGeneration, SearchTrace, SourceGenerationFilter,
+};
 use crate::runtime::fsutil::create_dir_all_durable;
 use crate::runtime::graph::{
     GraphContext, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_USER,
@@ -645,7 +649,7 @@ const LEXICAL_POSTINGS_SQL: &str = concat!(
     "SELECT l.generation_id, l.source_name, g.content_key, l.family, l.unit_key, \
             l.relative_path, l.ordinal, l.title, l.symbol, l.language, l.label, \
             l.dataset_key, l.row_key, l.fields, l.byte_start, l.byte_end, \
-            l.token_count, p.term_frequency ",
+            l.token_count, p.term_frequency, g.source_kind, g.authority_class ",
     lexical_posting_join!(),
     admissible_generations_where!(),
     " AND (? IS NULL OR l.family = ?) AND p.term = ? \
@@ -2953,6 +2957,12 @@ impl AtlasDb {
                         hit: LexicalHit {
                             score: 0.0,
                             source_name: row.get(1)?,
+                            // A2 §17 item 8: the two columns the
+                            // admissibility predicate already binds against,
+                            // now carried out on the hit so an answer is
+                            // visibly external without a second lookup.
+                            source_kind: source_kind_at(row, 18)?,
+                            authority_class: authority_class_at(row, 19)?,
                             generation_id,
                             content_key: row.get(2)?,
                             unit_key,
@@ -3106,6 +3116,11 @@ impl AtlasDb {
                 hits.push(SemanticHit {
                     score: cosine(&query_vector, vector),
                     source_name: unit.source_name.clone(),
+                    // A2 §17 item 8, from the admitted generation row this
+                    // unit was enumerated under — the same two values the
+                    // lexical half reads off `source.generations`.
+                    source_kind: generation.kind,
+                    authority_class: generation.authority,
                     generation_id: generation.id.clone(),
                     content_key: generation.content_key.clone(),
                     unit_key: unit.unit_key.clone(),
@@ -3199,6 +3214,177 @@ impl AtlasDb {
             semantic: lexical.semantic,
             semantic_model: lexical.semantic_model,
         })
+    }
+
+    /// **A2 §13's search trace, attached to the answer it describes.**
+    ///
+    /// [`Self::fused_search`] plus the nine fields §13 says to *"record at
+    /// minimum"* — see [`crate::runtime::atlas::trace`] for the field-by-field
+    /// account and for why the trace rides the answer rather than being
+    /// journaled (`sgt search` is a pure reader; the pin is
+    /// `tests/w1b_overlay_lifecycle_trigger.rs::
+    /// the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`).
+    ///
+    /// Not folded into `fused_search` itself (**R1**): the retrieval halves
+    /// have three in-tree callers that want the ranked list and not the
+    /// trace, and building §13's generation list costs a second read of
+    /// `source.generations`. A caller that wants the trace asks for it.
+    pub fn traced_search(
+        &self,
+        query: &LexicalQuery<'_>,
+        attribution: Attribution,
+    ) -> Result<(FusedAnswer, SearchTrace), AtlasError> {
+        let answer = self.fused_search(query)?;
+        let trace = self.trace_of(query, attribution, &answer)?;
+        Ok((answer, trace))
+    }
+
+    /// A2 §13's nine fields for one answered query.
+    fn trace_of(
+        &self,
+        query: &LexicalQuery<'_>,
+        attribution: Attribution,
+        answer: &FusedAnswer,
+    ) -> Result<SearchTrace, AtlasError> {
+        // Field 5's generation list: the exact worlds the filter admitted.
+        // The same call `semantic_search` enumerates over, at the same cap,
+        // so the trace describes the world the answer was actually computed
+        // in rather than a second, differently-bounded one.
+        let admitted = self.admissible_generations(query.filter, MAX_ROWS)?;
+        let (selector, source_name, content_key) = match &query.filter.source {
+            SourceSelector::Any => ("any", None, None),
+            SourceSelector::Named(name) => ("named", Some(name.clone()), None),
+            SourceSelector::Exact {
+                source_name,
+                content_key,
+            } => (
+                "exact",
+                Some(source_name.clone()),
+                Some(content_key.clone()),
+            ),
+            SourceSelector::WorkBase { repository, .. } => {
+                ("work_base", Some(repository.clone()), None)
+            }
+        };
+        Ok(SearchTrace {
+            query: QueryIdentity::of(query.text),
+            attribution,
+            source_generation_filter: SourceGenerationFilter {
+                selector,
+                source_name,
+                content_key,
+                work_scope: describe_work_scope(&answer.scope),
+            },
+            content_authority_filter: ContentAuthorityFilter {
+                content: query.family,
+                kind: query.filter.kind,
+                authority: query.filter.authority,
+            },
+            retrieval_generation: RetrievalGeneration {
+                index_version: RETRIEVAL_INDEX_VERSION,
+                truncated: admitted.hits.len() >= MAX_ROWS,
+                generations: admitted.hits,
+            },
+            lexical: LexicalIdentity::default(),
+            semantic: answer.semantic,
+            semantic_model: answer.semantic_model.clone(),
+            policy: PolicyIdentity::default(),
+            results: answer
+                .hits
+                .iter()
+                .enumerate()
+                .map(|(index, hit)| ResultRank::of(index, hit))
+                .collect(),
+        })
+    }
+
+    /// **A2 §14's second verb: `sgt related <coordinate>`.**
+    ///
+    /// Neighbours of one already-retrieved unit, inside the same A2 §2
+    /// admissibility filter — *"more like this"*, answered by the retrieval
+    /// pipeline that already exists rather than by a second mechanism
+    /// (**R2**): the anchor unit's own indexed text becomes the query text,
+    /// and [`Self::traced_search`] answers it. There is no new ranker, no new
+    /// index and no new score here; A2 §16's non-goals stay non-goals.
+    ///
+    /// # The anchor is resolved through the filter, never around it
+    ///
+    /// The anchor generation comes from [`Self::admissible_generations`], so
+    /// a coordinate naming a source the caller may not see resolves to
+    /// `Ok(None)` — "no such unit in this world" — exactly as A2 §2's
+    /// *"never approximate"* requires of an admissibility miss. A2 §8's
+    /// prohibition (*"never silently cross an authority/source filter"*)
+    /// would otherwise have a hole shaped like an anchor lookup.
+    ///
+    /// # The anchor is excluded from its own neighbours
+    ///
+    /// A unit is trivially its own best match under both halves, and an
+    /// answer whose first neighbour is the thing asked about is not a list of
+    /// neighbours. It is dropped by `(generation_id, unit_key)` — Atlas's own
+    /// unit identity, the same key [`crate::runtime::atlas::fusion::fuse`]
+    /// joins on — after ranking, and the search runs one wider so dropping it
+    /// does not shorten the answer.
+    ///
+    /// `Ok(None)` when the coordinate names no admissible unit. Every read
+    /// here is bounded: one admissible-generation list at [`MAX_ROWS`], one
+    /// generation's [`indexable_units`], and the search's own caps.
+    pub fn related(
+        &self,
+        request: &RelatedRequest<'_>,
+    ) -> Result<Option<RelatedAnswer>, AtlasError> {
+        let admitted = self.admissible_generations(request.filter, MAX_ROWS)?;
+        let Some(generation) = admitted
+            .hits
+            .iter()
+            .find(|generation| generation.source_name == request.source_name)
+        else {
+            return Ok(None);
+        };
+        let Some(unit) = indexable_units(&self.conn, &generation.id)?
+            .into_iter()
+            .find(|unit| unit.unit_key == request.unit_key)
+        else {
+            return Ok(None);
+        };
+        let anchor = RelatedAnchor {
+            source_name: generation.source_name.clone(),
+            source_kind: generation.kind,
+            authority_class: generation.authority,
+            generation_id: generation.id.clone(),
+            content_key: generation.content_key.clone(),
+            unit_key: unit.unit_key.clone(),
+            coordinate: unit.coordinate(),
+        };
+        let limit = request.limit.min(MAX_ROWS);
+        let query = LexicalQuery {
+            text: &unit.text,
+            filter: request.filter,
+            // Deliberately unfamily-filtered: a document that explains a
+            // function is a neighbour of it, and A2 §8's own signal 5 ("same
+            // module/package/document section") only means anything across
+            // families. `--content` still narrows it when a caller asks.
+            family: request.family,
+            // One wider, so removing the anchor below returns `limit`
+            // neighbours rather than `limit - 1`.
+            limit: limit.saturating_add(1).min(MAX_ROWS),
+            semantic: request.semantic,
+        };
+        let (mut answer, mut trace) = self.traced_search(&query, request.attribution.clone())?;
+        answer.hits.retain(|hit| {
+            hit.generation_id != anchor.generation_id || hit.unit_key != anchor.unit_key
+        });
+        answer.hits.truncate(limit);
+        trace.results = answer
+            .hits
+            .iter()
+            .enumerate()
+            .map(|(index, hit)| ResultRank::of(index, hit))
+            .collect();
+        Ok(Some(RelatedAnswer {
+            anchor,
+            answer,
+            trace,
+        }))
     }
 
     /// Fill in A2 §8's nine signals for every fused candidate, from A1's own
@@ -4455,6 +4641,31 @@ fn index_generation(conn: &Connection, generation_id: &str) -> Result<u64, Atlas
     Ok(indexed)
 }
 
+/// **A2 §17 item 8**, lexical half: the `g.source_kind` column of one
+/// [`LEXICAL_POSTINGS_SQL`] row.
+///
+/// Refuses an unrecognized spelling rather than defaulting, exactly as
+/// [`AtlasDb::admissible_generations`] does for the same column — this value
+/// is what tells a consumer that a hit is external, and a wrong default here
+/// would make external evidence *invisibly* external, which is the failure
+/// item 8 names.
+fn source_kind_at(row: &duckdb::Row<'_>, index: usize) -> Result<SourceKind, AtlasError> {
+    let text: String = row.get(index)?;
+    SourceKind::parse(&text).ok_or(AtlasError::UnknownValue {
+        column: "source_kind".to_string(),
+        value: text,
+    })
+}
+
+/// **A2 §17 item 8**, the other column — see [`source_kind_at`].
+fn authority_class_at(row: &duckdb::Row<'_>, index: usize) -> Result<AuthorityClass, AtlasError> {
+    let text: String = row.get(index)?;
+    AuthorityClass::parse(&text).ok_or(AtlasError::UnknownValue {
+        column: "authority_class".to_string(),
+        value: text,
+    })
+}
+
 /// A2 §3's family-shaped coordinate, read off one
 /// [`LEXICAL_POSTINGS_SQL`] row.
 ///
@@ -5417,6 +5628,90 @@ pub struct FusedAnswer {
     pub semantic: SemanticStatus,
     /// A2 §13's *"semantic model identity/hash **if used**"*.
     pub semantic_model: Option<SemanticModel>,
+}
+
+/// One `sgt related <coordinate>` request: which unit to find neighbours of,
+/// inside which A2 §2 world.
+///
+/// A separate type from [`LexicalQuery`] because the *query text* is not the
+/// caller's — it is the anchor unit's own indexed text, which
+/// [`AtlasDb::related`] reads out of the store. A caller cannot supply it,
+/// and a type that let one do so would be a client-supplied pattern by
+/// another name.
+#[derive(Debug, Clone)]
+pub struct RelatedRequest<'a> {
+    /// The declared source the anchor unit belongs to.
+    pub source_name: &'a str,
+    /// Atlas's own per-generation unit identity, `<family>:<path>#<ordinal>`
+    /// — the value every hit already carries as `unit_key`, so a coordinate
+    /// printed by `sgt search` is a coordinate `sgt related` accepts.
+    pub unit_key: &'a str,
+    /// A2 §2's deterministic admissibility filter, applied to the anchor
+    /// lookup **and** to the neighbours.
+    pub filter: &'a Admissibility,
+    /// Optionally narrow the neighbours to one family (`--content`).
+    pub family: Option<LexicalFamily>,
+    /// How many neighbours to return, capped at [`MAX_ROWS`].
+    pub limit: usize,
+    /// Decision **H4**: whether the caller wants A2 §6's half at all.
+    pub semantic: SemanticRequest,
+    /// A2 §13 field 2's attribution for the trace this produces.
+    pub attribution: Attribution,
+}
+
+/// The unit a [`RelatedRequest`] was anchored on, as it was actually
+/// resolved — echoed back so an answer states what it is about rather than
+/// leaving a caller to trust that its coordinate parsed the way it meant.
+///
+/// Carries A2 §17 item 8's two fields for the same reason every hit does: an
+/// anchor in an external source produces neighbours whose externality a
+/// consumer must be able to see.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelatedAnchor {
+    /// The declared source.
+    pub source_name: String,
+    /// **A2 §17 item 8** — the source's kind.
+    pub source_kind: SourceKind,
+    /// **A2 §17 item 8** — the source's authority class.
+    pub authority_class: AuthorityClass,
+    /// The exact SourceGeneration the anchor was resolved in.
+    pub generation_id: String,
+    /// That generation's content identity.
+    pub content_key: String,
+    /// Atlas's own per-generation unit identity.
+    pub unit_key: String,
+    /// A1's coordinate for the anchor unit.
+    pub coordinate: UnitCoordinate,
+}
+
+/// What one [`AtlasDb::related`] answered: the resolved anchor, the
+/// neighbours (the anchor itself removed), and A2 §13's trace.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelatedAnswer {
+    /// The unit the neighbours are neighbours *of*.
+    pub anchor: RelatedAnchor,
+    /// The neighbours, best first — the same [`FusedAnswer`] shape `sgt
+    /// search` returns, disclosure fields included.
+    pub answer: FusedAnswer,
+    /// A2 §13's trace. Its `query.text` is the **anchor's own text**, which
+    /// is what was actually retrieved on; recording the caller's coordinate
+    /// there instead would make the trace unreproducible.
+    pub trace: SearchTrace,
+}
+
+/// [`WorkScope`] as one stable word for A2 §13's field 3.
+///
+/// The snapshot variant carries its `observed_at` into the string rather than
+/// dropping it: "base and overlay" without *as of when* is exactly the
+/// implied-currency claim [`WorkScope`]'s own doc refuses.
+fn describe_work_scope(scope: &WorkScope) -> String {
+    match scope {
+        WorkScope::NotWorkScoped => "not_work_scoped".to_string(),
+        WorkScope::BaseOnly => "base_only".to_string(),
+        WorkScope::BaseAndOverlaySnapshot {
+            overlay_observed_at,
+        } => format!("base_and_overlay_snapshot@{overlay_observed_at}"),
+    }
 }
 
 /// Outcome of [`AtlasDb::reindex_lexical`]: how many units were indexed,

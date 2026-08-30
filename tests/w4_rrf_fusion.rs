@@ -84,6 +84,8 @@ fn lexical(path: &str, score: f64) -> LexicalHit {
     LexicalHit {
         score,
         source_name: "s".to_string(),
+        source_kind: SourceKind::EstateGit,
+        authority_class: AuthorityClass::EstateMutable,
         generation_id: "g".to_string(),
         content_key: "c".to_string(),
         unit_key: format!("code:{path}#0"),
@@ -95,6 +97,8 @@ fn semantic(path: &str, score: f64) -> sergeant_rs::runtime::atlas::semantic::Se
     sergeant_rs::runtime::atlas::semantic::SemanticHit {
         score,
         source_name: "s".to_string(),
+        source_kind: SourceKind::EstateGit,
+        authority_class: AuthorityClass::EstateMutable,
         generation_id: "g".to_string(),
         content_key: "c".to_string(),
         unit_key: format!("code:{path}#0"),
@@ -411,6 +415,8 @@ fn the_rerank_key_is_a2_section_8s_nine_signals_in_the_contracts_own_order() {
         origins: RankOrigins::default(),
         signals: set[0].1,
         source_name: "s".to_string(),
+        source_kind: SourceKind::EstateGit,
+        authority_class: AuthorityClass::EstateMutable,
         generation_id: "g".to_string(),
         content_key: "c".to_string(),
         unit_key: "u1".to_string(),
