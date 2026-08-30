@@ -144,6 +144,20 @@ const DATASET_HASH_CHUNK: usize = 64 * 1024;
 pub const DATASET_NO_ROOT: &str =
     "tabular datasets are read in place, and this source's bytes have no path to read in place";
 
+/// The coverage detail for a CONTAINER CHILD claimed by [`format_for`] on a
+/// walk that registers no datasets (S5 W7 F-SF-01).
+///
+/// Not [`DATASET_NO_ROOT`], which would be a false statement here: a child
+/// dataset does not need a root — it carries its own bytes
+/// ([`ScannedDataset::content`]). This says the true thing instead, which is
+/// that the walk it arrived on registers no dataset rows for a loose file of
+/// that extension either, so its child gets the same answer. That is what
+/// route-equivalence means, and it is the honest reason rather than a
+/// borrowed one.
+pub const DATASET_CHILD_NOT_REGISTERED: &str = "a container child claimed by the tabular routing table is registered as a dataset only by a \
+     filesystem source walk; this generation's own resources came from a Git object store, where \
+     a loose file of the same extension is likewise not registered";
+
 /// [`Coverage::OnlineOnly`]'s own detail text — the honesty the acceptance
 /// item's own scope names as the deliverable, not a caveat: stated as a
 /// signal, never a certainty, every time the row is written rather than only
@@ -847,9 +861,13 @@ impl Walk<'_> {
             bytes,
             extractor,
             mtime,
-            &mut self.files,
-            &mut self.coverage,
-            &mut self.extractors,
+            ChildSink {
+                files: &mut self.files,
+                coverage: &mut self.coverage,
+                extractors: &mut self.extractors,
+                datasets: Some(&mut self.datasets),
+                context_fields: self.context_fields,
+            },
         );
     }
 
@@ -938,6 +956,10 @@ impl Walk<'_> {
             reader,
             byte_len: meta.len(),
             mtime_millis: mtime_millis(&meta),
+            // A loose dataset is read IN PLACE, from the path just recorded:
+            // its bytes never enter this struct, and it has no container.
+            content: None,
+            parent: None,
         });
     }
 }
@@ -1095,23 +1117,34 @@ pub fn worker_extractor_for(relative: &str) -> Option<&'static str> {
 /// What claims a container CHILD's path — A1 §6.6's `entry adapter` field
 /// (S5 W7).
 ///
-/// Deliberately not a fourth routing table: it is exactly
-/// [`worker_extractor_for`] unioned with [`claims_for`]'s own structure
-/// extractor, in that order — the same two tables, consulted in the same
-/// order, that `Walk::file` already consults for a loose file on disk. A
-/// `.docx` inside a `.zip` inside an `.eml` therefore reaches the Office
-/// adapter by the same route a loose `.docx` does (A1-17, "recursively route
-/// child bytes through normal adapters"), and a child nothing claims answers
-/// `None`, which is a named coverage gap daemon-side rather than silence
-/// (F8).
+/// Deliberately not a fourth routing table: it is exactly the THREE tables
+/// `Walk::file` already consults for a loose file on disk, in the same
+/// order — [`format_for`]'s dataset table first, then
+/// [`worker_extractor_for`], then [`claims_for`]'s own structure extractor.
+/// A `.docx` inside a `.zip` inside an `.eml` therefore reaches the Office
+/// adapter by the same route a loose `.docx` does, and a `.csv` inside a
+/// `.zip` reaches the tabular reader by the same route a loose `.csv` does
+/// (A1-17, "recursively route child bytes through normal adapters"; A1 §1's
+/// own motivating payload is "100k ServiceNow tickets in CSV/JSON/Parquet
+/// inside an archive"). A child nothing claims answers `None`, which is a
+/// named coverage gap daemon-side rather than silence (F8).
 ///
-/// What it deliberately does NOT consult is [`format_for`]'s dataset table: a
-/// `.csv`/`.parquet` child is registered from a filesystem PATH DuckDB reads
-/// itself, and a child's bytes exist only in memory. Such a child answers
-/// `None` here and lands as a named gap saying so — the honest answer, rather
-/// than a dataset row pointing at a path that does not exist.
+/// The dataset arm answers with [`DatasetFormat::reader_version`], not the
+/// per-source [`reader_identity`] the registered row carries: this function
+/// is the cross-check both the worker and [`validate_batch`] re-derive
+/// independently (A1 §6.6's `entry adapter` field), and a worker knows
+/// nothing about the source's own F10a column allowlist. The allowlist is
+/// part of the dataset's *extraction* identity, not of which table claimed
+/// its extension.
+///
+/// [`DatasetFormat::reader_version`]: crate::runtime::atlas::tabular::DatasetFormat::reader_version
+/// [`reader_identity`]: crate::runtime::atlas::tabular::reader_identity
+/// [`validate_batch`]: crate::runtime::atlas::worker::validate_batch
 pub fn child_extractor_for(relative: &str) -> Option<&'static str> {
-    worker_extractor_for(relative).or_else(|| claims_for(relative).map(|claims| claims.structure))
+    format_for(relative)
+        .map(|format| format.reader_version())
+        .or_else(|| worker_extractor_for(relative))
+        .or_else(|| claims_for(relative).map(|claims| claims.structure))
 }
 
 /// Whether a child path routes to a CONTAINER adapter — an archive or a mail
@@ -1168,6 +1201,50 @@ pub const CHILD_PATH_SEPARATOR: &str = "!/";
 /// or confused with a persisted `source.generations.id`.
 pub(crate) const PRE_STAGE_GENERATION: &str = "pending";
 
+/// The accumulating outputs one worker dispatch folds into, plus the two
+/// source-level facts landing a CHILD needs (S5 W7 F-SF-01).
+///
+/// One struct rather than five more parameters on a `#[allow(clippy::
+/// too_many_arguments)]` function that recurses into itself: the set is
+/// exactly "everything a walk accumulates", it travels as a unit, and a
+/// caller that forgot one would otherwise silently drop rows.
+pub(crate) struct ChildSink<'a> {
+    /// Acquired resources, appended in the order they land.
+    pub files: &'a mut Vec<ScannedFile>,
+    /// One row per path seen — F8's rule holds for children exactly as it
+    /// does for loose files.
+    pub coverage: &'a mut Vec<CoverageRow>,
+    /// Distinct extractor identities that actually produced evidence.
+    pub extractors: &'a mut BTreeSet<String>,
+    /// Where a container child claimed by [`format_for`] is registered, and
+    /// `None` for a walk that registers no datasets at all.
+    ///
+    /// `None` is not a shrug: [`super::git`]'s walk answers `None` because
+    /// its own loose files claimed by that same table are not registered
+    /// either ([`DATASET_NO_ROOT`]), so a child taking that route gets the
+    /// same answer a loose file of that extension gets — which is what
+    /// route-equivalence means. [`super::overlay`] never produces a
+    /// container child at all.
+    pub datasets: Option<&'a mut Vec<ScannedDataset>>,
+    /// **F10a**: the source's declared column allowlist, needed to compose a
+    /// registered child dataset's reader identity.
+    pub context_fields: &'a ContextFields,
+}
+
+impl ChildSink<'_> {
+    /// Reborrow, so a recursive dispatch can hand the same sink down without
+    /// moving it.
+    fn reborrow(&mut self) -> ChildSink<'_> {
+        ChildSink {
+            files: self.files,
+            coverage: self.coverage,
+            extractors: self.extractors,
+            datasets: self.datasets.as_deref_mut(),
+            context_fields: self.context_fields,
+        }
+    }
+}
+
 /// Dispatch one resource a supervised-worker adapter claims to the real
 /// worker, and fold the outcome into a walk's accumulating rows (S4 Y8) —
 /// the one place this happens for every walk that routes through a worker,
@@ -1201,9 +1278,7 @@ pub(crate) fn dispatch_worker_resource(
     bytes: Vec<u8>,
     extractor: &'static str,
     mtime_millis: Option<i64>,
-    files: &mut Vec<ScannedFile>,
-    coverage: &mut Vec<CoverageRow>,
-    extractors: &mut BTreeSet<String>,
+    sink: ChildSink<'_>,
 ) {
     dispatch_worker_resource_at_depth(
         worker,
@@ -1216,9 +1291,7 @@ pub(crate) fn dispatch_worker_resource(
         mtime_millis,
         None,
         0,
-        files,
-        coverage,
-        extractors,
+        sink,
     );
 }
 
@@ -1250,9 +1323,7 @@ fn dispatch_worker_resource_at_depth(
     mtime_millis: Option<i64>,
     parent: Option<ChildProvenance>,
     depth: u32,
-    files: &mut Vec<ScannedFile>,
-    coverage: &mut Vec<CoverageRow>,
-    extractors: &mut BTreeSet<String>,
+    mut sink: ChildSink<'_>,
 ) {
     let identity = WorkerIdentity {
         generation_id: PRE_STAGE_GENERATION.to_string(),
@@ -1272,7 +1343,7 @@ fn dispatch_worker_resource_at_depth(
     };
     match run_worker(spawn, &identity, filter) {
         WorkerOutcome::Accepted(batch) => {
-            extractors.insert(batch.extractor.clone());
+            sink.extractors.insert(batch.extractor.clone());
             // Every child in this batch has already passed `validate_batch`'s
             // whole AUTHORITY — path safety, F10's deny set on name and path,
             // the per-child ceiling, the content hash, the adapter claim —
@@ -1292,7 +1363,7 @@ fn dispatch_worker_resource_at_depth(
                     names.join(", ")
                 );
             }
-            coverage.push(CoverageRow {
+            sink.coverage.push(CoverageRow {
                 path: Some(relative_path.clone()),
                 status: Coverage::Indexed,
                 detail: Some(detail),
@@ -1313,7 +1384,7 @@ fn dispatch_worker_resource_at_depth(
                 })
                 .collect();
             let parent_key = keys.key(content_id, &batch.extractor);
-            files.push(ScannedFile {
+            sink.files.push(ScannedFile {
                 relative_path: relative_path.clone(),
                 local_key: parent_key.clone(),
                 content_hash: content_id.to_string(),
@@ -1355,7 +1426,7 @@ fn dispatch_worker_resource_at_depth(
                             // every other such branch in this module is:
                             // an honest coverage row beats a panic in the
                             // sole writer.
-                            coverage.push(CoverageRow {
+                            sink.coverage.push(CoverageRow {
                                 path: Some(format!(
                                     "{relative_path}{CHILD_PATH_SEPARATOR}{full_entry_path}"
                                 )),
@@ -1380,16 +1451,14 @@ fn dispatch_worker_resource_at_depth(
                     entry_path,
                     child.content,
                     depth,
-                    files,
-                    coverage,
-                    extractors,
+                    sink.reborrow(),
                 ) {
                     containers.insert(full_entry_path, landed);
                 }
             }
         }
         WorkerOutcome::Refused(row) => {
-            coverage.push(CoverageRow {
+            sink.coverage.push(CoverageRow {
                 path: Some(relative_path),
                 bytes: Some(bytes.len() as u64),
                 ..row
@@ -1402,12 +1471,16 @@ fn dispatch_worker_resource_at_depth(
 /// §6.6's "entries expand into child resources", and A1-17's "recursively
 /// route child bytes through normal adapters".
 ///
-/// The routing is [`child_extractor_for`]'s, which is
-/// [`worker_extractor_for`] ∪ [`claims_for`] — the same two tables, in the
+/// The routing is [`child_extractor_for`]'s, which is [`format_for`] ∪
+/// [`worker_extractor_for`] ∪ [`claims_for`] — the same three tables, in the
 /// same order, a loose file of that name goes through — so there is exactly
-/// one dispatcher in this build, not a second one for children (R2). Three
+/// one dispatcher in this build, not a second one for children (R2). Four
 /// destinations follow from it:
 ///
+/// - **a dataset child** (a `.csv`/`.json`/`.parquet`) is REGISTERED, not
+///   extracted — A1-13's relational lane, the identical destination a loose
+///   one reaches, with its bytes travelling on the registration because a
+///   child has no path for DuckDB to read in place;
 /// - **a container child** (a nested `.zip`/`.eml`) lands as its own resource
 ///   and is NOT re-dispatched: the worker already expanded it under the one
 ///   shared depth counter and the one shared whole-tree byte budget, and its
@@ -1444,14 +1517,12 @@ fn land_child(
     entry_path: String,
     content: Vec<u8>,
     depth: u32,
-    files: &mut Vec<ScannedFile>,
-    coverage: &mut Vec<CoverageRow>,
-    extractors: &mut BTreeSet<String>,
+    mut sink: ChildSink<'_>,
 ) -> Option<(String, String)> {
     let composed = format!("{parent_relative_path}{CHILD_PATH_SEPARATOR}{entry_path}");
     let byte_len = content.len() as u64;
     if depth >= crate::runtime::atlas::archive::MAX_NESTING_DEPTH {
-        coverage.push(CoverageRow {
+        sink.coverage.push(CoverageRow {
             path: Some(composed),
             status: Coverage::Unsupported,
             detail: Some(format!(
@@ -1465,7 +1536,7 @@ fn land_child(
         return None;
     }
     let Some(extractor) = child_extractor_for(&entry_path) else {
-        coverage.push(CoverageRow {
+        sink.coverage.push(CoverageRow {
             path: Some(composed),
             status: Coverage::Unsupported,
             detail: Some(format!(
@@ -1489,9 +1560,53 @@ fn land_child(
         parent_key,
         entry_path: &entry_path,
     };
+    // A1-17 + A1 §1's motivating payload (S5 W7 F-SF-01): a `.csv`/`.json`/
+    // `.parquet` child takes the SAME relational lane a loose one takes —
+    // `Walk::file` consults `format_for` first, and so does
+    // `child_extractor_for`. What differs is only where the reader finds the
+    // bytes: a loose dataset is read in place from the source root, and a
+    // child's bytes exist only here, so they travel on the registration and
+    // `db::read_dataset` materialises them around its own read. Registering
+    // rather than extracting is the whole point of A1-13 — a 100k-ticket
+    // export inside an archive must not become 100k Markdown documents just
+    // because it arrived inside a container.
+    if let Some(format) = format_for(&entry_path) {
+        let Some(datasets) = sink.datasets.as_deref_mut() else {
+            sink.coverage.push(CoverageRow {
+                path: Some(composed),
+                status: Coverage::Unsupported,
+                detail: Some(DATASET_CHILD_NOT_REGISTERED.to_string()),
+                bytes: Some(byte_len),
+            });
+            return None;
+        };
+        let reader = reader_identity(format, sink.context_fields);
+        sink.extractors.insert(reader.clone());
+        // A placeholder, exactly as `Walk::dataset`'s own row is: the read
+        // happens later, in the one module that owns a connection, and
+        // `stage_scan` replaces this row with what actually happened.
+        sink.coverage.push(CoverageRow {
+            path: Some(composed.clone()),
+            status: Coverage::Indexed,
+            detail: Some(reader.clone()),
+            bytes: Some(byte_len),
+        });
+        datasets.push(ScannedDataset {
+            relative_path: composed,
+            format,
+            dataset_key: keys.key(&hash, &reader),
+            content_hash: hash,
+            reader,
+            byte_len,
+            mtime_millis: None,
+            content: Some(content),
+            parent: Some(provenance),
+        });
+        return None;
+    }
     if child_is_container(&entry_path) {
-        extractors.insert(extractor.to_string());
-        coverage.push(CoverageRow {
+        sink.extractors.insert(extractor.to_string());
+        sink.coverage.push(CoverageRow {
             path: Some(composed.clone()),
             status: Coverage::Indexed,
             detail: Some(format!(
@@ -1505,7 +1620,7 @@ fn land_child(
             bytes: Some(byte_len),
         });
         let local_key = keys.key(&hash, extractor);
-        files.push(ScannedFile {
+        sink.files.push(ScannedFile {
             relative_path: composed.clone(),
             local_key: local_key.clone(),
             content_hash: hash,
@@ -1533,9 +1648,7 @@ fn land_child(
             None,
             Some(provenance),
             depth + 1,
-            files,
-            coverage,
-            extractors,
+            sink,
         );
         return None;
     }
@@ -1545,7 +1658,7 @@ fn land_child(
         // Named rather than unwrapped — a routing table that grew a third arm
         // should produce an honest coverage row here, never a panic in the
         // daemon.
-        coverage.push(CoverageRow {
+        sink.coverage.push(CoverageRow {
             path: Some(composed),
             status: Coverage::Unsupported,
             detail: Some(format!(
@@ -1557,7 +1670,7 @@ fn land_child(
         return None;
     };
     let Some(text) = as_text(&content) else {
-        coverage.push(CoverageRow {
+        sink.coverage.push(CoverageRow {
             path: Some(composed),
             status: Coverage::Unsupported,
             detail: Some("not valid UTF-8 text".to_string()),
@@ -1566,14 +1679,14 @@ fn land_child(
         return None;
     };
     let extracted = extract_resource(claims, text, &hash, keys);
-    extractors.extend(extracted.identities.iter().cloned());
-    coverage.push(CoverageRow {
+    sink.extractors.extend(extracted.identities.iter().cloned());
+    sink.coverage.push(CoverageRow {
         path: Some(composed.clone()),
         status: extracted.status(),
         detail: Some(extracted.detail()),
         bytes: Some(byte_len),
     });
-    files.push(ScannedFile {
+    sink.files.push(ScannedFile {
         relative_path: composed,
         local_key: extracted.key,
         content_hash: hash,

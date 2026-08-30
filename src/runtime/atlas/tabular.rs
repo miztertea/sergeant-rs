@@ -241,8 +241,20 @@ pub fn reader_identity(format: DatasetFormat, fields: &ContextFields) -> String 
     )
 }
 
-/// One registered tabular dataset, as the walk found it. Plain data — the
-/// bytes were never read into this struct.
+/// One registered tabular dataset, as the walk found it. Plain data — for a
+/// dataset that lives at a path, the bytes were never read into this struct.
+///
+/// **A CONTAINER CHILD is the one exception, and it is why [`Self::content`]
+/// exists** (S5 W7 F-SF-01). A1 §1's motivating payload is "100k ServiceNow
+/// tickets in CSV/JSON/Parquet inside an archive" and A1-17 routes child
+/// bytes "through normal adapters", but the tabular lane's reader is DuckDB
+/// reading a filesystem path, and a child's bytes exist only in memory —
+/// the container is not unpacked to disk and must not be. So a child dataset
+/// carries its bytes here and [`super::db`] materialises them, under its own
+/// [`std::fs`] handle, immediately around the read it already performs (see
+/// `read_dataset`). Still plain data: a `Vec<u8>`, no handle, no borrow of
+/// anything live, and the struct stays `Clone`/`Eq` as
+/// [`super::scan::SourceScan`]'s own doc requires of everything it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScannedDataset {
     /// Path relative to the source root, `/`-separated.
@@ -262,6 +274,16 @@ pub struct ScannedDataset {
     /// Modification time in Unix milliseconds — **a change hint only**, part
     /// of no key, exactly as [`super::scan::ScannedFile::mtime_millis`] is.
     pub mtime_millis: Option<i64>,
+    /// A container child's own bytes, and `None` for every dataset that has a
+    /// path (S5 W7 F-SF-01). See this struct's own doc for why the one
+    /// exception exists at all.
+    pub content: Option<Vec<u8>>,
+    /// A1 §6.6's parent coordinate, when this dataset is a container child —
+    /// the SAME [`super::scan::ChildProvenance`] a child `ScannedFile`
+    /// carries, landed into the same `source.child_resources` table, because
+    /// "the entry expanded out of a container" is one fact and must not
+    /// become two shapes depending on which lane the entry routed to.
+    pub parent: Option<super::scan::ChildProvenance>,
 }
 
 /// How a row's identity was arrived at.

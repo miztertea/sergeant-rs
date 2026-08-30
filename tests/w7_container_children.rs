@@ -207,9 +207,9 @@ fn an_admitted_zip_entry_lands_as_its_own_resource_with_all_four_preserved_field
 
 /// **A1-17 / A1 §6.5, the whole chain.** A `.docx` inside a `.zip` inside an
 /// `.eml` reaches the Office adapter by the same route a loose `.docx` does
-/// — `scan::child_extractor_for` is `worker_extractor_for` ∪ `claims_for`,
-/// the same two tables in the same order `Walk::file` consults, so there is
-/// one dispatcher, not a second one for children (R2).
+/// — `scan::child_extractor_for` is `format_for` ∪ `worker_extractor_for` ∪
+/// `claims_for`, the same three tables in the same order `Walk::file`
+/// consults, so there is one dispatcher, not a second one for children (R2).
 ///
 /// The mail attachment also keeps its parent-message coordinate (§6.5), and
 /// the intermediate container lands as its own resource with no units of its
@@ -278,6 +278,99 @@ Content-Transfer-Encoding: base64\r\n\r\n"
         scan.extractors.contains(DOCX_EXTRACTOR),
         "the scan's own extractor set names the adapter that ran on a child: {:?}",
         scan.extractors
+    );
+}
+
+/// **F-SF-01 / A1-17 / A1 §1's motivating payload.** A `.csv` inside a
+/// `.zip` reaches the RELATIONAL lane a loose `.csv` reaches — registered as
+/// a dataset, read in place, profiled by the canned queries — rather than
+/// landing as an unsupported gap claiming "nothing in this build claims its
+/// extension" while `tabular.rs` claims exactly that extension.
+///
+/// A1 §1 names the payload verbatim ("100k ServiceNow tickets in
+/// CSV/JSON/Parquet inside an archive") and A1-17 says child bytes route
+/// "through normal adapters". The one real constraint is that DuckDB reads a
+/// dataset from a filesystem path and a child's bytes exist only in memory;
+/// that is answered by the daemon materialising the child's bytes into its
+/// OWN scratch directory around the read it already performs, not by the
+/// container being unpacked to disk and not by prose-flattening the rows
+/// (A1-13).
+#[test]
+fn a_csv_inside_a_zip_reaches_the_relational_lane_a_loose_csv_reaches() {
+    let csv = b"id,short_description\n1,printer offline\n2,vpn down\n";
+    let (_root, scan) = scan_one("bundle.zip", &zip_of(&[("tickets.csv", csv)]));
+
+    let registered = scan
+        .datasets
+        .iter()
+        .find(|d| d.relative_path == "bundle.zip!/tickets.csv")
+        .unwrap_or_else(|| {
+            panic!(
+                "a .csv child must be REGISTERED as a dataset, not reported unsupported: \
+                 datasets={:?} coverage={:?}",
+                scan.datasets, scan.coverage
+            )
+        });
+    assert_eq!(registered.content_hash, content_hash(csv));
+    assert!(
+        registered.content.is_some(),
+        "a child dataset carries its own bytes — it has no path to be read in place from"
+    );
+    // A1 §6.6's parent coordinate is preserved for the relational lane too.
+    let provenance = registered
+        .parent
+        .as_ref()
+        .expect("a child dataset carries its parent coordinate");
+    assert_eq!(provenance.parent_relative_path, "bundle.zip");
+    assert_eq!(provenance.entry_path, "tickets.csv");
+    // And it is NOT landed as a `source.files` resource: a dataset stays
+    // data (A1-13), it does not become documents.
+    assert!(
+        scan.files
+            .iter()
+            .all(|f| f.relative_path != "bundle.zip!/tickets.csv"),
+        "a dataset child must not also land as an extracted document: {:?}",
+        scan.files
+    );
+
+    let data_dir = TempDir::new().expect("data dir");
+    {
+        let mut db = AtlasDb::open(data_dir.path()).expect("open atlas");
+        let mut journal = Journal::open(data_dir.path()).expect("open journal");
+        record_scan(&mut db, &mut journal, &scan, None).expect("record");
+    }
+    let db = AtlasDb::open(data_dir.path()).expect("reopen atlas");
+    let stored = db
+        .datasets("w7", 50)
+        .expect("read datasets")
+        .into_iter()
+        .find(|d| d.relative_path == "bundle.zip!/tickets.csv")
+        .expect("the child dataset is persisted as a dataset row");
+    // The read actually happened, in place, against the materialised bytes:
+    // real columns and a real row count, not an empty registration.
+    assert_eq!(
+        stored.columns,
+        vec!["id".to_string(), "short_description".to_string()],
+        "the tabular reader saw the child's real columns"
+    );
+    assert_eq!(stored.row_count, 2, "and its real rows");
+    let facts = db.dataset_facts("w7", 50).expect("read facts");
+    assert!(
+        facts
+            .iter()
+            .any(|f| f.relative_path == "bundle.zip!/tickets.csv"),
+        "the canned queries ran against the child dataset: {facts:?}"
+    );
+
+    // The scratch the daemon gave those bytes is gone again.
+    let scratch = data_dir.path().join("atlas-child-datasets");
+    assert!(
+        !scratch.exists()
+            || std::fs::read_dir(&scratch)
+                .expect("read scratch")
+                .next()
+                .is_none(),
+        "the materialised child dataset must not outlive its own read"
     );
 }
 

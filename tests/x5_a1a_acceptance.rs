@@ -473,6 +473,10 @@ const WALK: &[Item] = &[
             ),
             at(
                 "tests/w7_container_children.rs",
+                "a_csv_inside_a_zip_reaches_the_relational_lane_a_loose_csv_reaches",
+            ),
+            at(
+                "tests/w7_container_children.rs",
                 "a_nested_container_cannot_escape_the_shared_depth_ceiling_by_recursing",
             ),
             at(
@@ -551,7 +555,15 @@ const WALK: &[Item] = &[
                carrying A1 §6.6's parent coordinate (parent resource path + parent key + entry \
                path) beside the entry content hash and entry adapter its `source.files` row \
                already holds. All four §6.6 fields are preserved, and the first check above \
-               asserts each one. H15, the wave's named J0-shaped question, was answered as its \
+               asserts each one. A child claimed by the TABULAR routing table takes the \
+               relational lane instead (S5 W7 F-SF-01): it is registered in `source.datasets` \
+               and read in place, never prose-flattened (A1-13), and writes the same \
+               `source.child_resources` parent-coordinate row keyed by its `dataset_key` — \
+               because DuckDB reads a dataset from a path and a child's bytes exist only in \
+               memory, the daemon materialises those bytes into a per-read scratch directory \
+               under its OWN data dir, named by its own content hash rather than the entry's \
+               name, and removes it when the read ends. Nothing executes it and no container is \
+               unpacked to disk. H15, the wave's named J0-shaped question, was answered as its \
                brief recommended and the code states honestly: the worker returns child bytes \
                and the DAEMON hashes what it receives, on receipt, before storing (option (b)), \
                because option (a) — the daemon re-opening the container — would have moved ZIP \
@@ -687,10 +699,21 @@ const WALK: &[Item] = &[
                that sentence are now literally true, not one of them: the first check above \
                drives a real `.docx` inside a real `.zip` inside a real `.eml` and asserts the \
                grandchild's extractor is the OFFICE adapter's own identity, reached through \
-               `scan::child_extractor_for` — which is `worker_extractor_for` unioned with \
-               `claims_for`, the same two tables in the same order a loose file on disk goes \
-               through, so there is one dispatcher in this build and not a second one for \
-               children (R2). The message's own body units are unchanged. H15's trust model, the \
+               `scan::child_extractor_for` — which is `format_for` unioned with \
+               `worker_extractor_for` unioned with `claims_for`, the same THREE tables in the \
+               same order a loose file on disk goes through, so there is one dispatcher in this \
+               build and not a second one for children (R2). That third table was missing until \
+               S5 W7's F-SF-01 fix, and its absence was exactly A1 §1's own motivating payload \
+               ('100k ServiceNow tickets in CSV/JSON/Parquet inside an archive') not working: a \
+               `.csv` child answered `None` and landed as a gap whose detail said 'nothing in \
+               this build claims its extension' while `tabular.rs` claims csv/tsv/json/jsonl/ \
+               parquet. It now takes the relational lane a loose one takes — registered, not \
+               prose-flattened (A1-13) — with the daemon materialising the child's bytes into \
+               its own scratch directory under the data dir, named by its own content hash and \
+               removed when the read ends, because DuckDB reads a dataset from a path and a \
+               child's bytes exist only in memory. A child dataset carries the same A1 §6.6 \
+               parent coordinate a child file does, into the same `source.child_resources` \
+               table. The message's own body units are unchanged. H15's trust model, the \
                per-child ceiling, the hash and adapter cross-checks, and the single shared \
                depth/byte budget are item 7's note in full and are not restated here; the one \
                narrower gap named there (no `CoverageRow` field on `WorkerBatch`) applies to \
