@@ -2353,16 +2353,38 @@ impl AtlasDb {
     /// generation was confirmed would be a description rather than a pin
     /// (§15). Nothing widens by it — a generation id only ever reaches a
     /// caller through the admissibility filter that admitted it.
+    /// # Why it answers with the resource's provenance too (C1 §21 item 8)
+    ///
+    /// *"document/mail/OCR excerpts preserve original resource/native/
+    /// extractor provenance"* is a claim about the **excerpt in the prompt**,
+    /// and the two facts a prompt excerpt needs beyond the unit's own row do
+    /// not live in `source.units`: the extractor identity that produced it is
+    /// `source.files.extractor`, and A2 §9's native coordinate is
+    /// `source.unit_coordinates.coordinate`. Both are joined here, in the one
+    /// statement, rather than fetched by a second keyed read — the same two
+    /// joins [`indexable_units`] already writes (**R2**), so a resolved unit
+    /// and an indexed one describe the same provenance by construction.
+    ///
+    /// Both joins are `LEFT`: a unit whose resource row is missing would be a
+    /// real defect, and this answers with what it does have rather than
+    /// dropping the row and hiding it (the argument [`Self::child_resources`]
+    /// already makes). A Markdown unit legitimately has no native coordinate
+    /// — its byte span *is* its address — so `None` there is ordinary.
     pub fn resolve_unit(
         &self,
         generation_id: &str,
         relative_path: &str,
         ordinal: u64,
-    ) -> Result<Option<StoredUnit>, AtlasError> {
+    ) -> Result<Option<ResolvedUnit>, AtlasError> {
         let mut statement = self.conn.prepare(sql!(
             "SELECT u.relative_path, u.local_key, u.ordinal, u.unit_kind, u.heading_level, \
-                    u.title, u.byte_start, u.byte_end, u.body \
+                    u.title, u.byte_start, u.byte_end, u.body, f.extractor, c.coordinate \
              FROM source.units u \
+             LEFT JOIN source.files f ON f.generation_id = u.generation_id \
+                                     AND f.relative_path = u.relative_path \
+             LEFT JOIN source.unit_coordinates c ON c.generation_id = u.generation_id \
+                                                AND c.relative_path = u.relative_path \
+                                                AND c.ordinal = u.ordinal \
              WHERE u.generation_id = ? AND u.relative_path = ? AND u.ordinal = ?"
         ))?;
         let mut rows = statement.query(duckdb::params![
@@ -2374,19 +2396,72 @@ impl AtlasDb {
             return Ok(None);
         };
         let kind: String = row.get(3)?;
-        Ok(Some(StoredUnit {
+        Ok(Some(ResolvedUnit {
+            unit: StoredUnit {
+                relative_path: row.get(0)?,
+                local_key: row.get(1)?,
+                ordinal: row.get::<usize, i64>(2)? as u64,
+                kind: UnitKind::parse(&kind).ok_or_else(|| AtlasError::UnknownValue {
+                    column: "unit_kind".to_string(),
+                    value: kind.clone(),
+                })?,
+                heading_level: row.get::<usize, Option<i64>>(4)?.map(|v| v as u8),
+                title: row.get(5)?,
+                byte_start: row.get::<usize, i64>(6)? as u64,
+                byte_end: row.get::<usize, i64>(7)? as u64,
+                body: row.get(8)?,
+            },
+            extractor: row.get(9)?,
+            native_coordinate: row.get(10)?,
+        }))
+    }
+
+    /// **One exact stored query result, by its pinned coordinate** — C1 §10's
+    /// *"a deterministic data result is itself derived evidence and should be
+    /// addressable/pinnable"*, resolved the same keyed way
+    /// [`Self::resolve_unit`] is.
+    ///
+    /// `(generation_id, relative_path, query_name)` is
+    /// `source.dataset_facts`' own identity: one canned query's answer about
+    /// one dataset of one generation. Every predicate is an equality; nothing
+    /// here ranks, scans a corpus, or takes a string that could become SQL —
+    /// `query_name` selects a *stored row* by the name of the canned query
+    /// that produced it, and that query's statement was an associated `const`
+    /// chosen by [`sql_for`] from the fixed [`DATASET_QUERIES`] catalogue.
+    ///
+    /// It is spelled `query_name` rather than `query` deliberately:
+    /// `tests/x5_a1a_acceptance.rs::a1a_item_13_no_client_sql_reaches_the_store`
+    /// reads Atlas's public signatures and refuses a reader that takes
+    /// `query: &str`, because that is exactly the shape an SQL-taking entry
+    /// point wears — and a guard that made an exception for this one would
+    /// stop being a guard.
+    pub fn resolve_dataset_fact(
+        &self,
+        generation_id: &str,
+        relative_path: &str,
+        query_name: &str,
+    ) -> Result<Option<DatasetFact>, AtlasError> {
+        let mut statement = self.conn.prepare(sql!(
+            "SELECT f.relative_path, f.dataset_key, f.query, f.query_identity, f.row_limit, \
+                    f.truncated, f.columns, f.rows, f.output_hash \
+             FROM source.dataset_facts f \
+             WHERE f.generation_id = ? AND f.relative_path = ? AND f.query = ?"
+        ))?;
+        let mut rows =
+            statement.query(duckdb::params![generation_id, relative_path, query_name])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(DatasetFact {
             relative_path: row.get(0)?,
-            local_key: row.get(1)?,
-            ordinal: row.get::<usize, i64>(2)? as u64,
-            kind: UnitKind::parse(&kind).ok_or_else(|| AtlasError::UnknownValue {
-                column: "unit_kind".to_string(),
-                value: kind.clone(),
-            })?,
-            heading_level: row.get::<usize, Option<i64>>(4)?.map(|v| v as u8),
-            title: row.get(5)?,
-            byte_start: row.get::<usize, i64>(6)? as u64,
-            byte_end: row.get::<usize, i64>(7)? as u64,
-            body: row.get(8)?,
+            dataset_key: row.get(1)?,
+            query: row.get(2)?,
+            query_identity: row.get(3)?,
+            row_limit: row.get::<usize, i64>(4)? as u64,
+            truncated: row.get(5)?,
+            columns: split_names(&row.get::<usize, String>(6)?),
+            rows: parse_rows(&row.get::<usize, String>(7)?),
+            output_hash: row.get(8)?,
         }))
     }
 
@@ -5470,6 +5545,29 @@ pub struct StoredUnit {
     pub byte_end: u64,
     /// The unit's text.
     pub body: String,
+}
+
+/// One stored unit **plus the provenance a prompt excerpt of it must carry**
+/// — C1 §21 item 8, and [`AtlasDb::resolve_unit`]'s answer.
+///
+/// The two extra fields are not on [`StoredUnit`] because they are not the
+/// unit's own row: they belong to the resource it came from and to A2 §9's
+/// native-coordinate table, and copying them onto every listing read
+/// ([`AtlasDb::units`], [`AtlasDb::outline`]) would make two of the three
+/// readers pay a join their callers do not use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedUnit {
+    /// The unit's own stored row.
+    pub unit: StoredUnit,
+    /// The extractor identity that produced this resource's units — §12's
+    /// *"normalizer identity"*. `None` only when the resource row is missing,
+    /// which would be a defect rather than an ordinary answer.
+    pub extractor: Option<String>,
+    /// A2 §9's native coordinate for this unit — the normalizer's own address
+    /// inside the document it was extracted from (an Office block address, a
+    /// mail body selector), when the byte span cannot be one. `None` for a
+    /// Markdown/text unit, whose span *is* its address.
+    pub native_coordinate: Option<String>,
 }
 
 /// One entry of the symbol index, read back out of the store.
