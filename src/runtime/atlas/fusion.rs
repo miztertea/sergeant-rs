@@ -329,11 +329,39 @@ pub fn rerank_order(left: &FusedHit, right: &FusedHit) -> std::cmp::Ordering {
 /// would be the beginning of the ranker framework A2-08's **R6** says not to
 /// build.
 struct Accumulator {
-    origins: RankOrigins,
     hit: FusedHit,
 }
 
 impl Accumulator {
+    /// A fresh candidate's skeleton, from the five identifying fields
+    /// [`LexicalHit`] and [`SemanticHit`] both carry (F-SI-01: the two call
+    /// sites in [`fuse`] differed only in which of `origins.lexical`/
+    /// `origins.semantic` they went on to set). `origins` starts at
+    /// [`RankOrigins::default`] and is mutated in place by the caller —
+    /// there is exactly one copy of it, so there is nothing left to
+    /// overwrite at [`fuse`]'s finalize step the way a second, accumulator-
+    /// level copy once required (F-SI-02).
+    fn new(
+        source_name: &str,
+        generation_id: &str,
+        content_key: &str,
+        unit_key: &str,
+        coordinate: &UnitCoordinate,
+    ) -> Self {
+        Accumulator {
+            hit: FusedHit {
+                rrf: 0.0,
+                origins: RankOrigins::default(),
+                signals: RerankSignals::default(),
+                source_name: source_name.to_string(),
+                generation_id: generation_id.to_string(),
+                content_key: content_key.to_string(),
+                unit_key: unit_key.to_string(),
+                coordinate: coordinate.clone(),
+            },
+        }
+    }
+
     /// Hazard 3 — **float summation order.** Two terms, added in one fixed
     /// order (lexical, then semantic), with an absent list contributing a
     /// literal `0.0` rather than being skipped. `a + b` and `b + a` differ in
@@ -341,8 +369,8 @@ impl Accumulator {
     /// instead of falling out of whichever list a candidate happened to be
     /// found in first.
     fn total(&self) -> f64 {
-        let lexical = self.origins.lexical.map_or(0.0, rrf_contribution);
-        let semantic = self.origins.semantic.map_or(0.0, rrf_contribution);
+        let lexical = self.hit.origins.lexical.map_or(0.0, rrf_contribution);
+        let semantic = self.hit.origins.semantic.map_or(0.0, rrf_contribution);
         lexical + semantic
     }
 }
@@ -385,38 +413,32 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit]) -> Vec<FusedHit> {
     for (index, hit) in lexical.iter().enumerate() {
         candidates
             .entry((hit.generation_id.clone(), hit.unit_key.clone()))
-            .or_insert_with(|| Accumulator {
-                origins: RankOrigins::default(),
-                hit: FusedHit {
-                    rrf: 0.0,
-                    origins: RankOrigins::default(),
-                    signals: RerankSignals::default(),
-                    source_name: hit.source_name.clone(),
-                    generation_id: hit.generation_id.clone(),
-                    content_key: hit.content_key.clone(),
-                    unit_key: hit.unit_key.clone(),
-                    coordinate: hit.coordinate.clone(),
-                },
+            .or_insert_with(|| {
+                Accumulator::new(
+                    &hit.source_name,
+                    &hit.generation_id,
+                    &hit.content_key,
+                    &hit.unit_key,
+                    &hit.coordinate,
+                )
             })
+            .hit
             .origins
             .lexical = Some(index + 1);
     }
     for (index, hit) in semantic.iter().enumerate() {
         candidates
             .entry((hit.generation_id.clone(), hit.unit_key.clone()))
-            .or_insert_with(|| Accumulator {
-                origins: RankOrigins::default(),
-                hit: FusedHit {
-                    rrf: 0.0,
-                    origins: RankOrigins::default(),
-                    signals: RerankSignals::default(),
-                    source_name: hit.source_name.clone(),
-                    generation_id: hit.generation_id.clone(),
-                    content_key: hit.content_key.clone(),
-                    unit_key: hit.unit_key.clone(),
-                    coordinate: hit.coordinate.clone(),
-                },
+            .or_insert_with(|| {
+                Accumulator::new(
+                    &hit.source_name,
+                    &hit.generation_id,
+                    &hit.content_key,
+                    &hit.unit_key,
+                    &hit.coordinate,
+                )
             })
+            .hit
             .origins
             .semantic = Some(index + 1);
     }
@@ -427,7 +449,6 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit]) -> Vec<FusedHit> {
             let rrf = accumulator.total();
             let mut hit = accumulator.hit;
             hit.rrf = rrf;
-            hit.origins = accumulator.origins;
             hit
         })
         .collect();
