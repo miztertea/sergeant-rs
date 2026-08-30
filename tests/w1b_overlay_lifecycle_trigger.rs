@@ -464,38 +464,62 @@ fn an_overlay_scan_failure_degrades_to_base_only_and_is_reported() {
     );
 }
 
-/// `sgt search` cannot write, structurally — and this test proves the
-/// *absence of a write*, not a Rust borrow shape.
+/// `sgt search` cannot write — **and since the S5 closeout that is enforced
+/// by the compiler, not by this scan.**
+///
+/// # What changed, and why
 ///
 /// H13.2 rejected query-time scanning because it would make a read verb a
-/// writer. That decision is worth exactly as much as what enforces it, and
-/// what enforced it until the S5 closeout was `&self` vs `&mut self` — which
-/// is **not** proof of anything about writing, because duckdb's own
-/// `Connection::execute`, `execute_batch` and `prepare` all take `&self`
-/// (verified against the vendored crate). A future `admissible_*` method
-/// could have called `self.conn.execute("UPDATE ...")` and satisfied the old
-/// assertion while performing a real write.
+/// writer. Through S5 that decision was guarded two ways, and both were
+/// weaker than they read:
 ///
-/// So both properties are checked, and the second is the load-bearing one:
+/// 1. `&self` vs `&mut self` — no proof of anything, because DuckDB's own
+///    `Connection::execute`, `execute_batch` and `prepare` all take `&self`.
+/// 2. A transitive scan of `admissible_*` bodies for write-capable
+///    spellings — which the closeout re-verify **defeated in one hop**. Its
+///    `WRITE_CAPABLE` list mixed lowercase call syntax (`.execute_batch(`)
+///    with uppercase SQL verbs (`DELETE `) and tested
+///    `body.to_uppercase().contains(verb)`, so the three call-syntax entries
+///    could never match anything: uppercasing the body turns `.execute_batch(`
+///    into `.EXECUTE_BATCH(`. Inserting
+///    `let v = format!("{}ETE FROM source.units", "DEL"); self.conn.execute_batch(&v);`
+///    into `admissible_datasets` left this test **green**.
 ///
-/// 1. every `pub fn admissible_*` still takes `&self` — it cannot reach
-///    `stage_scan`, `confirm_scan`, `evict_work_overlays` or
-///    `record_overlay_unavailable`, which need `&mut self`;
-/// 2. **no code any of them can reach inside `db.rs` writes.** The bodies are
-///    walked transitively through every `db.rs`-local function they call, and
-///    none may contain a write-capable connection call (`execute`,
-///    `execute_batch`, `appender`) or an SQL write verb. `prepare` is
-///    admissible only because a statement that reaches this closure carries
-///    no write verb to prepare.
+/// So the mechanism moved. `db.rs` now implements the whole A2 §2 filter on
+/// `Admissible`, a struct whose only field is a `ReadOnly` — a handle with no
+/// write call on it, which hands out no `Statement`, `Appender`,
+/// `Transaction` or `Connection`, and whose two query methods take a
+/// `ReadSql` that a `const` item proves begins `SELECT `. **A write inside
+/// the admissibility filter is a compile error**, verified by inserting each
+/// of these and watching the build fail:
 ///
-/// The transitive walk is what makes it unevadable by one hop: moving the
-/// write into a private helper the method calls fails exactly as loudly as
-/// writing it inline. **R2** — the mechanism is this suite's own
-/// read-the-source structural test, not new machinery; a read-only
-/// connection newtype was weighed and rejected, because duckdb hands out
-/// `Statement::execute` from a `&self` `prepare` too, so the type would
-/// carry a guarantee it could not keep while costing a refactor of all four
-/// methods and their statements.
+/// | inserted into `Admissible::datasets` | result |
+/// |---|---|
+/// | `self.conn.execute_batch(&v)` | `no field 'conn' on type &Admissible` |
+/// | `self.reader.execute_batch(&v)` | `no method named 'execute_batch'` |
+/// | `self.reader.rows(&v, …)` | `Sql: From<&String> is not satisfied` |
+/// | `self.reader.rows(read_sql!("DELETE FROM source.units"), …)` | `evaluation panicked: … must begin 'SELECT '` |
+///
+/// # What THIS test is, now
+///
+/// The compiler owns the claim. This test owns two things the compiler
+/// cannot state for a future reader: that the wiring is still in place (part
+/// 1), and a cheap second net over the shapes a type does not see (part 2).
+/// Part 1 is the one that must never be relaxed — deleting it would let
+/// someone quietly reintroduce a `Connection` field on `Admissible` and lose
+/// the guarantee with no test going red.
+///
+/// # What the second net cannot see — stated, not implied
+///
+/// The scan reads source text, so it is blind to exactly what source text is
+/// blind to. It does **not** see: a write assembled from pieces no single
+/// line spells (`concat!`, a `const` defined elsewhere in the file and named
+/// here, a byte array); a call reached through a trait object or a function
+/// pointer; anything in another file. Those are the hops that defeated its
+/// predecessor, and the reason it is no longer the load-bearing check. It is
+/// kept because it is nearly free and because it *does* catch the one shape
+/// the type system still permits: a literal SQL write verb sitting in a
+/// method the filter can reach.
 #[test]
 fn the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls() {
     let source = std::fs::read_to_string(
@@ -503,6 +527,83 @@ fn the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls() {
     )
     .expect("read db.rs");
     let lines: Vec<&str> = source.lines().collect();
+
+    // ---------------------------------------------------------------- part 1
+    // The compile-time guarantee is still wired. Each assertion below is a
+    // load-bearing piece of it; none is cosmetic.
+
+    // (a) The filter's own type holds a read-only handle and NOTHING else. A
+    //     second field of any connection-ish type would restore the hop the
+    //     closeout closed, and would not change one character of the scan
+    //     below.
+    assert!(
+        source.contains("struct Admissible<'conn> {\n    reader: ReadOnly<'conn>,\n}"),
+        "`Admissible` must hold exactly one field, a `ReadOnly` — that single field is the \
+         whole reason a write inside the admissibility filter does not compile"
+    );
+
+    // (b) The public methods are delegates onto it, so the public path cannot
+    //     do anything the filter's own type forbids.
+    for family in ["generations", "units", "occurrences", "datasets"] {
+        let delegate = format!("        self.admissible().{family}(filter, limit)\n    }}");
+        assert!(
+            source.contains(&delegate),
+            "`AtlasDb::admissible_{family}` must be a one-line delegate onto `Admissible`; \
+             any logic that stays on `AtlasDb` runs with `self.conn` in scope and is \
+             therefore outside the guarantee"
+        );
+    }
+
+    // (c) The read-only handle really is write-free: it exposes exactly two
+    //     operations, and neither hands back a value with a write on it. This
+    //     is spelled as an allowlist of `pub fn`s in the `ReadOnly` impl
+    //     rather than a denylist of forbidden method names, because a
+    //     denylist is what the old scan was.
+    let read_only_impl = block_after(&source, "    impl ReadOnly<'_> {");
+    let exposed: Vec<&str> = read_only_impl
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub fn "))
+        .filter_map(|rest| rest.split(['(', '<', ' ']).next())
+        .collect();
+    assert_eq!(
+        exposed,
+        vec!["rows", "first"],
+        "`ReadOnly` must expose only its two mapping queries; anything else — a `prepare`, a \
+         `connection`, a `Statement` accessor — is a write one dot away"
+    );
+    for handed_out in [
+        "-> Statement",
+        "-> CachedStatement",
+        "-> Appender",
+        "-> Connection",
+    ] {
+        assert!(
+            !read_only_impl.contains(handed_out),
+            "`ReadOnly` must hand out no {handed_out} — a value with a write on it defeats \
+             the whole type"
+        );
+    }
+    assert_eq!(
+        read_only_impl.matches("sql: ReadSql,").count(),
+        2,
+        "both `ReadOnly` queries must take a `ReadSql`, never a `Sql`: a `Sql` may be any \
+         statement this crate wrote, DELETE included, and DuckDB runs what it is handed"
+    );
+
+    // (d) And `ReadSql` really is checked, at compile time. `read_sql!` builds
+    //     a named `const` item rather than a `const { .. }` block on purpose:
+    //     a const block inside the lifetime-generic `impl Admissible<'_>` is a
+    //     post-monomorphization error that `cargo check` walks straight past,
+    //     which was observed during the closeout before this shape was chosen.
+    assert!(
+        source.contains("        const CHECKED: $crate::runtime::atlas::db::store::ReadSql =")
+            && source.contains("begins_with_select(sql),"),
+        "`read_sql!` must evaluate `ReadSql::new` as a `const` item, so a statement that is \
+         not a `SELECT` fails the build rather than reaching DuckDB"
+    );
+
+    // ---------------------------------------------------------------- part 2
+    // The second net. Cheap, honest, and explicitly NOT the guarantee.
 
     // Every function defined in db.rs, by name, with the body text a caller
     // of it would actually run. Bodies end at the closing brace on the
@@ -538,11 +639,24 @@ fn the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls() {
         bodies.insert(name.to_string(), body);
     }
 
-    /// A call into duckdb that can write, or an SQL verb that does.
-    const WRITE_CAPABLE: [&str; 12] = [
+    /// A call into the driver that can write. Matched **case-sensitively
+    /// against the body as written**, which is the bug the closeout found:
+    /// these were previously compared against `body.to_uppercase()`, where
+    /// `.execute_batch(` had become `.EXECUTE_BATCH(` and could never match.
+    const WRITE_CALLS: [&str; 6] = [
         ".execute(",
         ".execute_batch(",
         ".appender(",
+        ".appender_to_db(",
+        // Reaching for a connection of its own is how a read path would get
+        // around the read-only handle without ever naming a write.
+        "Connection::",
+        "Store::new(",
+    ];
+
+    /// An SQL verb that writes. Matched against the **uppercased** body, so
+    /// `delete from` in a runtime-built string is caught too.
+    const WRITE_VERBS: [&str; 9] = [
         "INSERT ",
         "UPDATE ",
         "DELETE ",
@@ -581,33 +695,36 @@ fn the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls() {
         false
     }
 
-    let mut checked = 0;
-    for (index, line) in lines.iter().enumerate() {
-        let Some(name) = line.trim().strip_prefix("pub fn admissible_") else {
-            continue;
-        };
-        let name = format!(
-            "admissible_{}",
-            name.split(['(', '<', ' ']).next().unwrap_or(name)
-        );
-        checked += 1;
+    // Seeded from the *implementation*, not from the delegates. Seeding on
+    // `pub fn admissible_` would now walk four one-line bodies and prove
+    // nothing — a vacuous net is worse than none, because it reads like one
+    // that works.
+    let admissible_impl = block_after(&source, "impl Admissible<'_> {");
+    let mut seeds: Vec<String> = admissible_impl
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("fn "))
+        .filter_map(|rest| rest.split(['(', '<', ' ']).next())
+        .map(str::to_string)
+        .collect();
+    seeds.sort();
+    assert_eq!(
+        seeds,
+        vec![
+            "datasets",
+            "generations",
+            "newest_overlay_observed_at",
+            "occurrences",
+            "units",
+            "work_scope",
+        ],
+        "the four A2 §2 content-family methods and their two helpers must all be covered; a \
+         new one must be added here"
+    );
 
-        let signature: String = lines
-            .iter()
-            .skip(index)
-            .take(6)
-            .copied()
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert!(
-            signature.contains("&self,") && !signature.contains("&mut self"),
-            "{name} must take &self — a query path that could write is exactly what H13.2 \
-             rejected when it chose the lifecycle hook over query-time scanning"
-        );
-
+    for seed in &seeds {
         // Everything this method can reach inside db.rs, transitively.
         let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut queue = vec![name.clone()];
+        let mut queue = vec![seed.clone()];
         while let Some(current) = queue.pop() {
             if !seen.insert(current.clone()) {
                 continue;
@@ -615,13 +732,17 @@ fn the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls() {
             let Some(body) = bodies.get(&current) else {
                 continue;
             };
-            for verb in WRITE_CAPABLE {
+            for call in WRITE_CALLS {
+                assert!(
+                    !body.contains(call),
+                    "{seed} reaches {current}, which contains {call:?} — the admissibility \
+                     filter is the read side of H13.2's decision"
+                );
+            }
+            for verb in WRITE_VERBS {
                 assert!(
                     !body.to_uppercase().contains(verb),
-                    "{name} reaches {current}, which contains {verb:?} — the admissibility \
-                     filter is the read side of H13.2's decision, and `&self` is no proof it \
-                     cannot write: duckdb's Connection::execute/execute_batch/prepare all take \
-                     &self"
+                    "{seed} reaches {current}, which contains the SQL verb {verb:?}"
                 );
             }
             for callee in bodies.keys() {
@@ -631,8 +752,19 @@ fn the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls() {
             }
         }
     }
-    assert_eq!(
-        checked, 4,
-        "the four A2 §2 content-family methods must all be covered; a new one must be added here"
-    );
+}
+
+/// The text of the `{ .. }` block opened by the line `header`, up to the
+/// closing brace at that line's own indentation.
+fn block_after(source: &str, header: &str) -> String {
+    let at = source
+        .find(header)
+        .unwrap_or_else(|| panic!("db.rs must still contain `{header}`"));
+    let indent = header.len() - header.trim_start().len();
+    let closing = format!("\n{}}}", " ".repeat(indent));
+    let rest = &source[at + header.len()..];
+    let end = rest
+        .find(&closing)
+        .unwrap_or_else(|| panic!("`{header}` must close at its own indentation"));
+    rest[..end].to_string()
 }
