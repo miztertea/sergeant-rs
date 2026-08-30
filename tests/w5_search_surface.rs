@@ -614,6 +614,32 @@ fn item_3s_relational_read_is_reachable_from_outside_the_process() {
 ///
 /// The `.docx` here is a real Office file read by the real adapter in a real
 /// subprocess (see [`estate`]); the Markdown is a real file on the same root.
+///
+/// # Which coordinates carry a real byte span, and which honestly do not
+///
+/// *"Coordinates intact"* is not *"every hit cites a byte range"*, and this
+/// test asserts the true version rather than the convenient one:
+///
+/// * **Markdown** is its own bytes, so every document-family unit of
+///   `notes.md` carries a real span into the original file and no native
+///   coordinate — the span **is** the address. (The same file also produces
+///   a `Code`-family hit, its tree-sitter heading; item 6 is about the
+///   document family, so the span claims below skip it.)
+/// * **A `.docx`** can promise that for exactly one unit. The whole-document
+///   unit truthfully spans the whole input, in any container format. Every
+///   **section** unit carries `0`/`0` **by design** — `sgt-atlas-worker`'s
+///   own `normal_batch` calls that "not applicable" honestly, because the
+///   original bytes are a compressed ZIP/XML container and no offset into
+///   them corresponds to a position in the normalized text
+///   (`office::OfficeUnit`'s own doc). What a section cites instead is
+///   [`UnitCoordinate::Document`]'s `native` — the normalizer's own address,
+///   `block:<n>` — and that is what this test holds an Office section to.
+///
+/// An earlier version of this test asserted `byte_end > byte_start` for "a
+/// document coordinate" of *both* files and passed only because the one hit
+/// it happened to pick per path was the whole-document one. That prose
+/// claimed a guarantee the adapter does not make; this one states the
+/// guarantee the adapter actually makes, and checks both halves of it.
 #[test]
 fn one_local_knowledge_query_spans_a_normalized_docx_and_a_markdown_file() {
     let estate = estate();
@@ -633,35 +659,107 @@ fn one_local_knowledge_query_spans_a_normalized_docx_and_a_markdown_file() {
         "and the Markdown one, from the SAME query: {paths:?}"
     );
 
-    // "without losing original path/source coordinates": both coordinates
-    // still name the original resource — the `.docx` path, not a normalized
-    // intermediate — and both cite the one source they came from.
-    for path in ["report.docx", "notes.md"] {
-        let hit = answer
+    // "without losing original path/source coordinates": every hit from
+    // either file still names the original resource — the `.docx` path, not
+    // a normalized intermediate — and cites the one source it came from.
+    let hits_for = |path: &str| {
+        answer
             .hits
             .iter()
-            .find(|hit| hit.coordinate.relative_path() == path)
-            .expect("hit for the path just asserted present");
-        assert_eq!(hit.source_name, "library");
-        assert_eq!(hit.source_kind, SourceKind::LocalKnowledge);
-        assert!(
-            matches!(hit.coordinate, UnitCoordinate::Document { .. }),
-            "both are document-family units: {:?}",
-            hit.coordinate
-        );
+            .filter(|hit| hit.coordinate.relative_path() == path)
+            .collect::<Vec<_>>()
+    };
+    for path in ["report.docx", "notes.md"] {
+        for hit in hits_for(path) {
+            assert_eq!(hit.source_name, "library");
+            assert_eq!(hit.source_kind, SourceKind::LocalKnowledge);
+        }
+    }
+
+    // The Markdown half: the span IS the address, for every document unit.
+    let mut markdown_documents = 0;
+    for hit in hits_for("notes.md") {
         let UnitCoordinate::Document {
             byte_start,
             byte_end,
+            native,
             ..
         } = &hit.coordinate
         else {
-            unreachable!("asserted above")
+            // The same file's tree-sitter heading is a `Code` coordinate;
+            // the document-family claim is what item 6 is about.
+            continue;
         };
         assert!(
-            byte_end > byte_start,
-            "a document coordinate cites a real span of the original resource"
+            native.is_none(),
+            "a Markdown unit needs no native coordinate — its span is its \
+             address: {:?}",
+            hit.coordinate
         );
+        assert!(
+            byte_end > byte_start,
+            "and that span is a real one: {:?}",
+            hit.coordinate
+        );
+        markdown_documents += 1;
     }
+    assert!(
+        markdown_documents > 0,
+        "the Markdown half of the span must not be vacuous"
+    );
+
+    // The Office half: one byte-recoverable whole-document unit, and
+    // sections that cite `block:<n>` rather than inventing a span.
+    let office = hits_for("report.docx");
+    let (mut whole_document, mut sections) = (0, 0);
+    for hit in &office {
+        let UnitCoordinate::Document {
+            byte_start,
+            byte_end,
+            native,
+            ..
+        } = &hit.coordinate
+        else {
+            panic!(
+                "an Office hit is a document-family unit: {:?}",
+                hit.coordinate
+            )
+        };
+        match native {
+            None => {
+                assert!(
+                    byte_end > byte_start,
+                    "the whole-document unit spans the whole `.docx`: {:?}",
+                    hit.coordinate
+                );
+                whole_document += 1;
+            }
+            Some(native) => {
+                assert_eq!(
+                    (*byte_start, *byte_end),
+                    (0, 0),
+                    "an Office section is not byte-recoverable and must not \
+                     claim a span: {:?}",
+                    hit.coordinate
+                );
+                assert!(
+                    !native.is_empty(),
+                    "so its native coordinate is the only address it has: {:?}",
+                    hit.coordinate
+                );
+                sections += 1;
+            }
+        }
+    }
+    assert_eq!(
+        whole_document, 1,
+        "exactly one `.docx` unit carries a real span — the whole-document \
+         one: {office:?}"
+    );
+    assert!(
+        sections >= 1,
+        "and the honest-`0`/`0` half is not vacuous either: {office:?}"
+    );
 }
 
 // ============================================================ §13 the trace
