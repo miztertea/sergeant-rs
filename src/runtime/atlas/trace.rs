@@ -41,7 +41,7 @@
 //! destination, not an oversight.** `sgt search` is a pure reader — H13.2
 //! rejected query-time scanning specifically to keep it one, and
 //! `tests/w1b_overlay_lifecycle_trigger.rs::
-//! the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`
+//! the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls`
 //! pins it structurally. Journaling a row per query would make every search a
 //! write, which is the property that pin exists to forbid (**J5** — the pin
 //! is a governing constraint, and a lower rung cannot override it). §13's

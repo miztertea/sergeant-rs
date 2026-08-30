@@ -13,7 +13,7 @@
 //! H13.2's chosen mechanism is the daemon-side surface-lifecycle hook. Not
 //! query-time scanning: that would make a read verb a writer, against the
 //! daemon-is-sole-writer boundary. `sgt search` stays a pure reader —
-//! [`the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`]
+//! [`the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls`]
 //! is the structural half of that claim, and the daemon-sole-writer /
 //! no-client-SQL suites own the rest.
 //!
@@ -464,34 +464,172 @@ fn an_overlay_scan_failure_degrades_to_base_only_and_is_reported() {
     );
 }
 
-/// `sgt search` cannot write, structurally: every admissibility method takes
-/// `&self`.
+/// `sgt search` cannot write, structurally — and this test proves the
+/// *absence of a write*, not a Rust borrow shape.
 ///
 /// H13.2 rejected query-time scanning because it would make a read verb a
 /// writer. That decision is worth exactly as much as what enforces it, and
-/// this is the cheapest thing that does: a `&self` method cannot reach
-/// `stage_scan`, `confirm_scan`, `evict_work_overlays` or
-/// `record_overlay_unavailable`, all of which need `&mut self`. Wiring the
-/// overlay into a query path would not compile without first changing a
-/// signature this test reads.
+/// what enforced it until the S5 closeout was `&self` vs `&mut self` — which
+/// is **not** proof of anything about writing, because duckdb's own
+/// `Connection::execute`, `execute_batch` and `prepare` all take `&self`
+/// (verified against the vendored crate). A future `admissible_*` method
+/// could have called `self.conn.execute("UPDATE ...")` and satisfied the old
+/// assertion while performing a real write.
+///
+/// So both properties are checked, and the second is the load-bearing one:
+///
+/// 1. every `pub fn admissible_*` still takes `&self` — it cannot reach
+///    `stage_scan`, `confirm_scan`, `evict_work_overlays` or
+///    `record_overlay_unavailable`, which need `&mut self`;
+/// 2. **no code any of them can reach inside `db.rs` writes.** The bodies are
+///    walked transitively through every `db.rs`-local function they call, and
+///    none may contain a write-capable connection call (`execute`,
+///    `execute_batch`, `appender`) or an SQL write verb. `prepare` is
+///    admissible only because a statement that reaches this closure carries
+///    no write verb to prepare.
+///
+/// The transitive walk is what makes it unevadable by one hop: moving the
+/// write into a private helper the method calls fails exactly as loudly as
+/// writing it inline. **R2** — the mechanism is this suite's own
+/// read-the-source structural test, not new machinery; a read-only
+/// connection newtype was weighed and rejected, because duckdb hands out
+/// `Statement::execute` from a `&self` `prepare` too, so the type would
+/// carry a guarantee it could not keep while costing a refactor of all four
+/// methods and their statements.
 #[test]
-fn the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self() {
-    let db = std::fs::read_to_string(
+fn the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls() {
+    let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime/atlas/db.rs"),
     )
     .expect("read db.rs");
+    let lines: Vec<&str> = source.lines().collect();
+
+    // Every function defined in db.rs, by name, with the body text a caller
+    // of it would actually run. Bodies end at the closing brace on the
+    // function's own indentation — brace counting would trip over the `{}`
+    // in a `format!`, and this file has many.
+    let mut bodies: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        let Some(rest) = trimmed
+            .strip_prefix("pub fn ")
+            .or_else(|| trimmed.strip_prefix("fn "))
+            .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+        else {
+            continue;
+        };
+        let Some(name) = rest.split(['(', '<', ' ']).next() else {
+            continue;
+        };
+        let closing = format!("{indent}}}");
+        let mut body = String::new();
+        for next in lines.iter().skip(index + 1) {
+            if *next == closing {
+                break;
+            }
+            // Prose is not code: a comment naming a `DELETE` this function
+            // does not perform must not fail the scan.
+            if !next.trim_start().starts_with("//") {
+                body.push_str(next);
+                body.push('\n');
+            }
+        }
+        bodies.insert(name.to_string(), body);
+    }
+
+    /// A call into duckdb that can write, or an SQL verb that does.
+    const WRITE_CAPABLE: [&str; 12] = [
+        ".execute(",
+        ".execute_batch(",
+        ".appender(",
+        "INSERT ",
+        "UPDATE ",
+        "DELETE ",
+        "DROP ",
+        "CREATE ",
+        "ALTER ",
+        "ATTACH ",
+        "COPY ",
+        "TRUNCATE ",
+    ];
+
+    /// Does `body` call `name` — as a free function, or on `self`?
+    ///
+    /// The receiver matters: `statement.query(...)` is duckdb's `query`, not
+    /// this file's `Analytics::query`, and following that name would walk
+    /// the closure into every unrelated method that happens to share a
+    /// spelling. `self.` and no-receiver calls are the ones that really are
+    /// this file's own code.
+    fn calls(body: &str, name: &str) -> bool {
+        let needle = format!("{name}(");
+        if body.contains(&format!("self.{needle}")) {
+            return true;
+        }
+        let bytes = body.as_bytes();
+        let mut from = 0;
+        while let Some(at) = body[from..].find(&needle) {
+            let at = from + at;
+            let before = at.checked_sub(1).map(|i| bytes[i] as char);
+            match before {
+                // A receiver, or a longer identifier ending in this name.
+                Some(c) if c == '.' || c == '_' || c.is_alphanumeric() => {}
+                _ => return true,
+            }
+            from = at + needle.len();
+        }
+        false
+    }
+
     let mut checked = 0;
-    for (index, line) in db.lines().enumerate() {
+    for (index, line) in lines.iter().enumerate() {
         let Some(name) = line.trim().strip_prefix("pub fn admissible_") else {
             continue;
         };
+        let name = format!(
+            "admissible_{}",
+            name.split(['(', '<', ' ']).next().unwrap_or(name)
+        );
         checked += 1;
-        let signature: String = db.lines().skip(index).take(6).collect::<Vec<_>>().join(" ");
+
+        let signature: String = lines
+            .iter()
+            .skip(index)
+            .take(6)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
             signature.contains("&self,") && !signature.contains("&mut self"),
-            "admissible_{name} must take &self — a query path that could write is exactly what \
-             H13.2 rejected when it chose the lifecycle hook over query-time scanning"
+            "{name} must take &self — a query path that could write is exactly what H13.2 \
+             rejected when it chose the lifecycle hook over query-time scanning"
         );
+
+        // Everything this method can reach inside db.rs, transitively.
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut queue = vec![name.clone()];
+        while let Some(current) = queue.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let Some(body) = bodies.get(&current) else {
+                continue;
+            };
+            for verb in WRITE_CAPABLE {
+                assert!(
+                    !body.to_uppercase().contains(verb),
+                    "{name} reaches {current}, which contains {verb:?} — the admissibility \
+                     filter is the read side of H13.2's decision, and `&self` is no proof it \
+                     cannot write: duckdb's Connection::execute/execute_batch/prepare all take \
+                     &self"
+                );
+            }
+            for callee in bodies.keys() {
+                if calls(body, callee) {
+                    queue.push(callee.clone());
+                }
+            }
+        }
     }
     assert_eq!(
         checked, 4,

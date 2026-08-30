@@ -956,7 +956,7 @@ fn the_search_cli_exposes_a2_section_14s_selectors_and_no_weight_knob() {
 ///
 /// H13.2 rejected query-time scanning specifically to keep it one, and
 /// `tests/w1b_overlay_lifecycle_trigger.rs::
-/// the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`
+/// the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls`
 /// pins the store side. This pins the *route* side: both handlers reach Atlas
 /// through the read-only `with_atlas`, never `with_atlas_write` or
 /// `with_existing_atlas_write`, so no index-on-demand, scan-if-stale or

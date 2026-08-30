@@ -6274,7 +6274,7 @@ fn answer_disclosure(answer: &atlas_db::FusedAnswer) -> Value {
 /// A **pure read**. Nothing here indexes, scans, warms or writes: H13.2
 /// rejected query-time scanning precisely so this verb could be one, and
 /// `tests/w1b_overlay_lifecycle_trigger.rs::
-/// the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`
+/// the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls`
 /// is the structural pin. It reaches Atlas through the read-only
 /// [`with_atlas`], which hands `&AtlasDb`, never `&mut`.
 async fn search_query(State(state): State<ApiState>, Query(query): Query<SearchQuery>) -> Response {

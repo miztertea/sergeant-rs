@@ -3252,7 +3252,7 @@ impl AtlasDb {
     /// account and for why the trace rides the answer rather than being
     /// journaled (`sgt search` is a pure reader; the pin is
     /// `tests/w1b_overlay_lifecycle_trigger.rs::
-    /// the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`).
+    /// the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls`).
     ///
     /// Not folded into `fused_search` itself (**R1**): the retrieval halves
     /// have three in-tree callers that want the ranked list and not the
