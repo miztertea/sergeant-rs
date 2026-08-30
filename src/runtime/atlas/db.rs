@@ -121,7 +121,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use duckdb::types::Value as Duck;
-use duckdb::{Connection, Statement};
+use duckdb::{Connection, Statement, Transaction};
 use serde_json::{Map, Value, json};
 
 use crate::domain::event::{Event, unix_millis};
@@ -3168,10 +3168,28 @@ impl AtlasDb {
             limit: MAX_ROWS,
             semantic: query.semantic,
         };
+        // F-IN-01: `lexical_search` and `semantic_search` are two
+        // independent reads of `source.generations`/`source.edges`; without
+        // an enclosing transaction a concurrent writer's commit landing
+        // between them (e.g. `confirm_scan` promoting a generation) could
+        // hand back a fused answer built from two different committed
+        // states of the store — undermining A2 §4's output-hash
+        // reproducibility exactly as much as any of the four named
+        // determinism hazards would. `lexical_search`/`semantic_search`/
+        // `rerank_signals` all take `&self`, so the ordinary `Connection::
+        // transaction` (which requires `&mut self` to rule out nesting) is
+        // not available without widening every one of their signatures;
+        // `Transaction::new_unchecked` (R5) is the crate's own documented
+        // escape hatch for exactly this "`&mut Connection` is unacceptable"
+        // case, and opens the same snapshot-isolated transaction from a
+        // shared `&Connection`. It is dropped (and rolled back — nothing
+        // here writes) on every exit path, `?` included.
+        let snapshot = Transaction::new_unchecked(&self.conn)?;
         let lexical = self.lexical_search(&full)?;
         let semantic = self.semantic_search(&full)?;
         let mut hits = fuse(&lexical.hits, &semantic.hits);
         self.rerank_signals(query, &mut hits)?;
+        drop(snapshot);
         rerank(&mut hits);
         hits.truncate(query.limit.min(MAX_ROWS));
         Ok(FusedAnswer {
