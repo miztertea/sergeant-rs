@@ -1725,6 +1725,54 @@ them were dead code in every real installation.
   estate's F9 containment rule already refuses a `[[knowledge]]` path that
   resolves inside a repository mount, so read-only evidence cannot alias a
   mutation surface on the way in either.
+- **Managed context queries are attributed to the execution that issued
+  them** (C1 §16, §21 item 11, C1d). The compilation's own retrieval now
+  carries a third attribution — the Work, the repository **and the fresh
+  execution** — so two stage launches of one Work are told apart, which the
+  Work-level attribution could not do. `sgt search --work <id>` is unchanged
+  and still reports no execution, because a human's Work-scoped read has
+  none; the field is present and null there rather than borrowed. §16's
+  **seven** event kinds are all declared, in §16's own order:
+  `context.bound`, `context.referenced` and `context.query` are journaled per
+  compiled world, and `context.search_fallback` records — in A2 §15's own
+  word — a retrieval that landed on a narrower §18 rung than it asked for.
+  The remaining three are declared and emitted by nothing, each saying why:
+  `context.reference_resolved` (no surface gives an *execution* a resolve
+  verb yet, and journaling the compiler's own packing read under it would be
+  a false entry), `context.scope_expansion_requested` (§20 forbids automatic
+  expansion and nothing accepts §10's asked-for one) and
+  `context.contradiction_observed` (§9's detection does not exist, and
+  scoring disagreement would synthesize the consensus §9 forbids). **Record,
+  do not adapt**: no code reads these events, and no payload carries a score,
+  a sharpness or any other scalar — §16's *"record raw evidence rather than a
+  magic 'sharpness score'"*, which §20 states twice more.
+- **Nested leaves and causal child Work receive independent worlds** (C1 §17,
+  §21 item 12, C1d). Each nested leaf actor compiles its own snapshot under
+  its own composed stage id, its own execution and its own evidence — a leaf
+  that runs fourth binds strictly more stage-input evidence than one that
+  runs first, so four leaves are four worlds rather than four copies. A
+  container gets none, and cannot: a container is not a stage, and dropping a
+  `CONTEXT.md` into a container's directory is refused by name at load time.
+  A causal child Work compiles from its own Work coordinate and its own
+  `sergeant/<child>` binding and **inherits no byte of the parent's
+  transcript or prompt** (§20's *parent-prompt inheritance for child Work*),
+  proved adversarially against markers planted in the parent's procedure and
+  intent. What the child does get is §17's one permitted channel: the parent
+  causation as a **Referenced** pointer — the validated parent Work, the
+  parent execution and the parent's state — a coordinate with no field a
+  parent's prose could travel in.
+- **Produced artifacts retain enough coordinates for claim-level audit**
+  (C1 §19, §21 item 14, C1d). §19's chain now has a walked proof rather than
+  an assumption: from a quoted evidence line in the actor's prompt, through
+  the snapshot id the prompt names, into the journaled `context.compiled`
+  payload read back as bytes, to the source, generation, resource, unit
+  coordinate, heading, the normalizer's own slide/block address, the
+  extractor identity and the query provenance — and from there to the exact
+  stored row by keyed resolution, with the same coordinate under a different
+  generation resolving to nothing. **No claim graph was built**, because §19
+  says one is not required in Sprint 3 and that preserving exact coordinates
+  is the enabling invariant. §19's `page+bbox` arm is OCR's and stays absent
+  **by owner ruling**, present and null in every unit rather than omitted.
 
 
 ### Every document format the normalizer parses is routed (S6)

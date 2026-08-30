@@ -3994,7 +3994,7 @@ impl Engine {
         // reads `StartRequest.context` for it — compiling a snapshot it
         // cannot see would be unasked-for scope doing unread work.
         // ---------------------------------------------------------------
-        let (context, snapshot) = if stage.kind == StageKind::Actor {
+        let (context, context_events) = if stage.kind == StageKind::Actor {
             self.compile_stage_context(
                 core,
                 work_id,
@@ -4009,10 +4009,10 @@ impl Engine {
                 &authored,
             )
         } else {
-            (authored.clone(), None)
+            (authored.clone(), Vec::new())
         };
-        if let Some(snapshot) = snapshot {
-            self.commit(core, work_id, KIND_CONTEXT_COMPILED, snapshot)?;
+        for (kind, payload) in context_events {
+            self.commit(core, work_id, kind, payload)?;
         }
         let request = StartRequest {
             work_id: work_id.to_string(),
@@ -5300,12 +5300,51 @@ impl Engine {
         run: &WorkRun,
         profile: Option<&str>,
         authored: &str,
-    ) -> (String, Option<Value>) {
+    ) -> (String, Vec<(&'static str, Value)>) {
         let Some(compiler) = self.context_compiler.as_ref() else {
-            return (authored.to_string(), None);
+            return (authored.to_string(), Vec::new());
         };
         let estate_root = Self::work_estate_root(core, work_id);
         let bindings = surface.binding_summary();
+        // **C1 §17's fifth rule**: *"parent causation/output may be
+        // Referenced when needed"*. Read off the journal-folded Work record
+        // — `Work::parent_work_id`/`parent_execution_id` are W1 §6's
+        // *validated* relation, so a claim the daemon refused
+        // (`causation_unverified`) can never become a coordinate. The
+        // parent's state comes from `state_view`, which answers from the
+        // slim index and is never evicted, so a child compiled after its
+        // parent went terminal still gets the real state rather than a
+        // missing one.
+        //
+        // Coordinates only. Nothing here reads the parent's intent, prompt,
+        // context or transcript — §17's fourth rule and §20's
+        // *parent-prompt inheritance for child Work* forbid it, and
+        // `ParentCausation` has no field one could travel in.
+        let parent_state = {
+            let registry = core.registry.state();
+            registry
+                .works
+                .get(work_id)
+                .and_then(|work| {
+                    work.parent_work_id
+                        .clone()
+                        .map(|parent| (parent, work.parent_execution_id.clone()))
+                })
+                .map(|(parent_work_id, parent_execution_id)| {
+                    let state = registry
+                        .state_view(&parent_work_id)
+                        .map(|state| state.as_str().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    (parent_work_id, parent_execution_id, state)
+                })
+        };
+        let parent = parent_state.as_ref().map(|(work, execution, state)| {
+            crate::runtime::context::ParentCausation {
+                work_id: work.as_str(),
+                execution_id: execution.as_deref(),
+                state: state.as_str(),
+            }
+        });
         let request = crate::runtime::context::CompileRequest {
             estate_root: estate_root.as_deref(),
             work_id,
@@ -5321,6 +5360,7 @@ impl Engine {
             bindings: &bindings,
             prior_stages: &run.stages,
             profile,
+            parent,
             // §14's hard automatic-render budget. One value, written by a
             // human and measured against this repository's own shipped stage
             // procedures — see `RenderBudget`'s own doc. Nothing tunes it at
@@ -5330,7 +5370,37 @@ impl Engine {
         let mut snapshot = compiler.compile(&request);
         let context = snapshot.render_onto(authored);
         snapshot.rendered_bytes = context.len().saturating_sub(authored.len()) as u64;
-        (context, Some(snapshot.json()))
+        // §15's snapshot first, then §16's audit record for the same
+        // compilation. Two contracts, two kinds, one ordered list the caller
+        // commits in order: `context.compiled` is *what world was presented*
+        // and C1 §16's kinds are *what the managed calls that built it did*,
+        // attributed to this execution (§21 item 11). A degraded compilation
+        // journals the snapshot and no audit events — see
+        // `ContextSnapshot::audit_events`.
+        let audit_events = snapshot.audit_events();
+        // F-IN-01: the caller below commits `context.compiled` and each
+        // audit event as separate, non-transactional journal writes — a
+        // mid-sequence commit failure can leave fewer audit rows for this
+        // `execution_id` than this compilation actually produced, and that
+        // truncation is otherwise indistinguishable from a compilation that
+        // legitimately bound/referenced/queried nothing (§16's own
+        // documented degraded case). Naming the count this compilation
+        // produced, on the one event committed first and always (degraded
+        // or not), lets a reader compare it against the audit rows actually
+        // observed for the execution and tell the two apart — a raw fact
+        // recorded alongside the rest of §15's snapshot, not a policy
+        // change to how or whether anything commits.
+        let mut compiled_payload = snapshot.json();
+        if let Value::Object(ref mut map) = compiled_payload {
+            map.insert(
+                "audit_event_count".to_string(),
+                Value::from(audit_events.len()),
+            );
+        }
+        let mut events: Vec<(&'static str, Value)> =
+            vec![(KIND_CONTEXT_COMPILED, compiled_payload)];
+        events.extend(audit_events);
+        (context, events)
     }
 }
 

@@ -6772,69 +6772,88 @@ async fn forward_events(
 /// that wants "every journaled kind" still gets exactly this list; a client
 /// that wants "everything this stream can ever frame" also has to handle
 /// the two names in [`SSE_CONTROL_FRAMES`] below.
-pub const SSE_EVENT_KINDS: &[&str] = &[
-    KIND_WORK_SUBMITTED,
-    KIND_WORK_STARTED,
-    KIND_WORK_RESUMED,
-    KIND_WORK_WAITING,
-    KIND_WORK_NEEDS_INPUT,
-    KIND_WORK_BLOCKED,
-    KIND_WORK_COMPLETED,
-    KIND_WORK_FAILED,
-    KIND_WORK_CANCELED,
-    KIND_WORKFLOW_BOUND,
-    KIND_STAGE_ENTERED,
-    KIND_STAGE_COMPLETED,
-    KIND_STAGE_WAITING,
-    KIND_STAGE_NEEDS_INPUT,
-    KIND_STAGE_INPUT_RECEIVED,
-    KIND_STAGE_RESUMED,
-    KIND_STAGE_BLOCKED,
-    KIND_STAGE_FAILED,
-    KIND_STAGE_CANCELED,
-    KIND_STAGE_OUTPUT_MISSING,
-    // C1 §15: the compiled-context snapshot, journaled at stage entry. One
-    // kind per fresh execution, never one per evidence unit — the same
-    // affordability argument `source.scanned` makes below.
-    KIND_CONTEXT_COMPILED,
-    KIND_EXECUTION_RESERVED,
-    KIND_EXECUTION_STARTED,
-    KIND_EXECUTION_STOPPED,
-    KIND_EXECUTION_ABANDONED,
-    KIND_EXECUTION_RECONCILED,
-    KIND_TURN_CEILING_INTERRUPTED,
-    KIND_TURN_ENVELOPE_EXTENDED,
-    KIND_SURFACE_MATERIALIZING,
-    KIND_SURFACE_MATERIALIZED,
-    KIND_SURFACE_TORN_DOWN,
-    KIND_CONVERSATION_USER,
-    KIND_CONVERSATION_ASSISTANT_COMPLETED,
-    KIND_CONVERSATION_ASK,
-    KIND_CONVERSATION_TURN_ENDED,
-    KIND_TOOL_REQUESTED,
-    KIND_TOOL_COMPLETED,
-    KIND_USAGE_UPDATED,
-    // W1: the codex adapter's one module-local kind (§1.2 of the spec) — a
-    // `pub const KIND_*`, unlike claude.rs's bare string-literal
-    // "conversation.turn.grammar_unmeasured", so it is journaled and must be
-    // named here for t6's bidirectional check to hold.
-    KIND_TURN_HARNESS_ERROR,
-    KIND_COMMAND_ACCEPTED,
-    KIND_COMMAND_REJECTED,
-    KIND_DAEMON_STARTED,
-    KIND_DAEMON_STOPPED,
-    KIND_BACKEND_PROBED,
-    KIND_ADMISSION_PAUSED,
-    KIND_ADMISSION_RESUMED,
-    crate::runtime::prune::KIND_PRUNE_INTENT,
-    crate::runtime::prune::KIND_PRUNE_COMPLETED,
-    // S3 X2: the one compact summary a completed source scan journals. Named
-    // here for the same reason as every kind above — a journaled kind absent
-    // from this list is a frame every enumerating client silently drops — and
-    // it is *one* kind per completed scan, never one per file, which is what
-    // makes putting it on the live stream affordable at all.
-    crate::domain::source::KIND_SOURCE_SCANNED,
-];
+pub static SSE_EVENT_KINDS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        let mut kinds: Vec<&'static str> = vec![
+            KIND_WORK_SUBMITTED,
+            KIND_WORK_STARTED,
+            KIND_WORK_RESUMED,
+            KIND_WORK_WAITING,
+            KIND_WORK_NEEDS_INPUT,
+            KIND_WORK_BLOCKED,
+            KIND_WORK_COMPLETED,
+            KIND_WORK_FAILED,
+            KIND_WORK_CANCELED,
+            KIND_WORKFLOW_BOUND,
+            KIND_STAGE_ENTERED,
+            KIND_STAGE_COMPLETED,
+            KIND_STAGE_WAITING,
+            KIND_STAGE_NEEDS_INPUT,
+            KIND_STAGE_INPUT_RECEIVED,
+            KIND_STAGE_RESUMED,
+            KIND_STAGE_BLOCKED,
+            KIND_STAGE_FAILED,
+            KIND_STAGE_CANCELED,
+            KIND_STAGE_OUTPUT_MISSING,
+            // C1 §15: the compiled-context snapshot, journaled at stage
+            // entry. One kind per fresh execution, never one per evidence
+            // unit — the same affordability argument `source.scanned` makes
+            // below.
+            KIND_CONTEXT_COMPILED,
+        ];
+        // C1 §16's seven audit kinds, in §16's own order — reused from
+        // `workflow::CONTEXT_AUDIT_KINDS` rather than retyped here, so a
+        // future reorder or addition to that array cannot silently drift
+        // from this list (R2, F-SI-01). Three of them are
+        // declared-but-unemitted in this build (see each constant's doc);
+        // they are listed here anyway, because this list is the
+        // *vocabulary* an enumerating client subscribes to, and a client
+        // that learns a frame name only once something first emits it is a
+        // client that drops the first one.
+        kinds.extend_from_slice(&workflow::CONTEXT_AUDIT_KINDS);
+        kinds.extend([
+            KIND_EXECUTION_RESERVED,
+            KIND_EXECUTION_STARTED,
+            KIND_EXECUTION_STOPPED,
+            KIND_EXECUTION_ABANDONED,
+            KIND_EXECUTION_RECONCILED,
+            KIND_TURN_CEILING_INTERRUPTED,
+            KIND_TURN_ENVELOPE_EXTENDED,
+            KIND_SURFACE_MATERIALIZING,
+            KIND_SURFACE_MATERIALIZED,
+            KIND_SURFACE_TORN_DOWN,
+            KIND_CONVERSATION_USER,
+            KIND_CONVERSATION_ASSISTANT_COMPLETED,
+            KIND_CONVERSATION_ASK,
+            KIND_CONVERSATION_TURN_ENDED,
+            KIND_TOOL_REQUESTED,
+            KIND_TOOL_COMPLETED,
+            KIND_USAGE_UPDATED,
+            // W1: the codex adapter's one module-local kind (§1.2 of the
+            // spec) — a `pub const KIND_*`, unlike claude.rs's bare
+            // string-literal "conversation.turn.grammar_unmeasured", so it
+            // is journaled and must be named here for t6's bidirectional
+            // check to hold.
+            KIND_TURN_HARNESS_ERROR,
+            KIND_COMMAND_ACCEPTED,
+            KIND_COMMAND_REJECTED,
+            KIND_DAEMON_STARTED,
+            KIND_DAEMON_STOPPED,
+            KIND_BACKEND_PROBED,
+            KIND_ADMISSION_PAUSED,
+            KIND_ADMISSION_RESUMED,
+            crate::runtime::prune::KIND_PRUNE_INTENT,
+            crate::runtime::prune::KIND_PRUNE_COMPLETED,
+            // S3 X2: the one compact summary a completed source scan
+            // journals. Named here for the same reason as every kind above
+            // — a journaled kind absent from this list is a frame every
+            // enumerating client silently drops — and it is *one* kind per
+            // completed scan, never one per file, which is what makes
+            // putting it on the live stream affordable at all.
+            crate::domain::source::KIND_SOURCE_SCANNED,
+        ]);
+        kinds
+    });
 
 /// Frame names this stream sends that are **not** journaled `KIND_*` events
 /// — deliberately outside [`SSE_EVENT_KINDS`]'s contract (see its doc

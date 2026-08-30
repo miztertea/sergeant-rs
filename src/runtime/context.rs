@@ -123,13 +123,44 @@
 //! packing uses to fetch what it renders, so every rendered Bound unit
 //! resolves back to the stored row it came from by construction (item 3).
 //!
+//! # §16's attribution and §17's nesting (C1d)
+//!
+//! §16 asks that *"managed map/search/related/query calls can be attributed
+//! to the **current execution**"*, so the compilation's own retrieval is
+//! issued under [`Attribution::Execution`] — the variant `sgt search --work`
+//! cannot use, because a human's Work-scoped read has no execution to name.
+//! §16's seven event kinds are declared in
+//! [`crate::domain::workflow`] and the four this build can honestly emit are
+//! derived by [`ContextSnapshot::audit_events`] and committed by the engine
+//! beside the snapshot. **Record, do not adapt**: nothing in this crate reads
+//! one of those events, and no payload carries a scalar — §16's own *"raw
+//! evidence rather than a magic 'sharpness score'"* and §20's two separate
+//! prohibitions.
+//!
+//! §17's five rules land as: the compilation step already runs per
+//! `StageKind::Actor` **leaf**, so a nested leaf's snapshot is separate by
+//! construction and a container — which is not a stage at all (W1-02) and
+//! cannot acquire a `CONTEXT.md`
+//! ([`crate::domain::workflow::WorkflowError::NestedPackageWithContext`]) —
+//! gets none; a causal child compiles its own world from its own Work
+//! coordinate and bindings; and the parent reaches it through exactly one
+//! channel, [`EvidenceCoordinate::ParentWork`] at §2's **Referenced** tier —
+//! a coordinate with no field for the parent's prompt, intent or transcript,
+//! because §17's fourth rule and §20's *parent-prompt inheritance for child
+//! Work* forbid one.
+//!
 //! # What this wave does NOT do
 //!
-//! Authority, provenance and structured query results are C1c (items 6–9);
-//! attribution, nesting and audit are C1d (items 11, 12, 14). Fields §15 asks
-//! for that those waves fill are present and empty, each naming its wave —
-//! never absent, because an absent field is indistinguishable from a
-//! forgotten one.
+//! **No claim graph.** §19 bounds item 14 itself: *"A full first-class claim
+//! graph is **not required** in Sprint 3; preserving exact evidence
+//! coordinates in snapshots/artifacts is the **enabling invariant**."* So the
+//! coordinates and their provenance survive verbatim into the journaled
+//! snapshot — `tests/c1d_attribution_nesting_audit.rs` walks §19's chain from
+//! a rendered fragment through that artifact to the resolved stored row — and
+//! nothing here stores, indexes or infers a claim.
+//!
+//! §19's `page+bbox` arm is OCR's and is **deferred by owner ruling**, named
+//! absent rather than omitted on [`EvidenceProvenance::ocr`].
 //!
 //! §20's non-goals this step is closest to are named and refused: **no raw
 //! corpus stuffing** (a Bound body renders only inside §14's hard budget, and
@@ -461,6 +492,46 @@ pub enum EvidenceCoordinate {
         /// answer covers.
         truncated: bool,
     },
+    /// **§17's fifth rule**: *"parent causation/output **may be Referenced**
+    /// when needed"* — the causal parent of a child Work, as a coordinate.
+    ///
+    /// This is the *permitted channel*, and it is what makes §17's fourth
+    /// rule survivable. That rule — *"child Work does **not inherit** the
+    /// parent's entire transcript/prompt"*, which §20 states again as the
+    /// non-goal *parent-prompt inheritance for child Work* — would leave a
+    /// child unable to say anything at all about why it exists if there were
+    /// no channel; §17 supplies one, and bounds it to §2's **Referenced**
+    /// tier: *"known-relevant exact coordinates **not rendered in full**"*.
+    ///
+    /// So this variant carries **coordinates and nothing else**. There is
+    /// deliberately no field here for the parent's intent, its prompt, its
+    /// stage `CONTEXT.md`, its compiled world or its transcript: a child that
+    /// needs the parent's output resolves it from these coordinates
+    /// (`sgt work show <parent>`), exactly as every other Referenced unit is
+    /// resolved. A field carrying parent prose would be the non-goal wearing
+    /// this rule's name, which is why the prohibition gets an adversarial
+    /// test rather than a comment.
+    ///
+    /// [`pack`] never gives it a body — [`resolve`] answers
+    /// [`SourceEvidence::WorkRecord`] for it, like the two other Work-record
+    /// shapes — so the bytes it costs the prompt are one pointer line.
+    ParentWork {
+        /// The **validated** parent Work (`Work::parent_work_id`) — W1 §6's
+        /// journal-checked relation, never the client's raw claim. A claim
+        /// that did not validate is journaled as
+        /// `Work::causation_unverified` and never reaches here, so this
+        /// coordinate cannot assert a lineage the daemon refused.
+        parent_work_id: String,
+        /// Which execution of the parent spent its causation env on this
+        /// submission, when the claim named one. `None` is the coarser
+        /// relation W1 §6 allows, not a dropped field.
+        parent_execution_id: Option<String>,
+        /// The parent's folded Work state at the instant this world was
+        /// compiled — the one fact about the parent's *causation* a child
+        /// cannot get from the coordinate alone, and a state word, not
+        /// output text.
+        state: String,
+    },
 }
 
 /// §10's `query_result_id`: a content hash over the six identities that make
@@ -542,6 +613,7 @@ impl EvidenceCoordinate {
                 query_identity,
                 ..
             } => format!("query/{generation_id}/{relative_path}/{query_identity}"),
+            Self::ParentWork { parent_work_id, .. } => format!("parent/{parent_work_id}"),
         }
     }
 
@@ -551,7 +623,7 @@ impl EvidenceCoordinate {
     /// is no Atlas source behind it.
     pub fn source_name(&self) -> Option<&str> {
         match self {
-            Self::Stage { .. } | Self::Binding { .. } => None,
+            Self::Stage { .. } | Self::Binding { .. } | Self::ParentWork { .. } => None,
             Self::Atlas { source_name, .. }
             | Self::Relationship { source_name, .. }
             | Self::QueryResult { source_name, .. } => Some(source_name),
@@ -562,7 +634,7 @@ impl EvidenceCoordinate {
     /// Atlas row. `None` for a Work record.
     pub fn generation_id(&self) -> Option<&str> {
         match self {
-            Self::Stage { .. } | Self::Binding { .. } => None,
+            Self::Stage { .. } | Self::Binding { .. } | Self::ParentWork { .. } => None,
             Self::Atlas { generation_id, .. }
             | Self::Relationship { generation_id, .. }
             | Self::QueryResult { generation_id, .. } => Some(generation_id),
@@ -572,7 +644,7 @@ impl EvidenceCoordinate {
     /// The pinned generation's content identity — §11's `generation: <sha>`.
     pub fn content_key(&self) -> Option<&str> {
         match self {
-            Self::Stage { .. } | Self::Binding { .. } => None,
+            Self::Stage { .. } | Self::Binding { .. } | Self::ParentWork { .. } => None,
             Self::Atlas { content_key, .. } | Self::QueryResult { content_key, .. } => {
                 Some(content_key)
             }
@@ -587,7 +659,7 @@ impl EvidenceCoordinate {
     /// this evidence is.
     pub fn path_coordinate(&self) -> Option<String> {
         match self {
-            Self::Stage { .. } | Self::Binding { .. } => None,
+            Self::Stage { .. } | Self::Binding { .. } | Self::ParentWork { .. } => None,
             Self::Atlas {
                 relative_path,
                 unit_key,
@@ -675,6 +747,18 @@ impl EvidenceCoordinate {
                 result_columns.join(", "),
                 if *truncated { ", truncated" } else { "" },
             ),
+            Self::ParentWork {
+                parent_work_id,
+                parent_execution_id,
+                state,
+            } => match parent_execution_id {
+                Some(execution) => format!(
+                    "parent work {parent_work_id} [{state}] — caused by its execution {execution}"
+                ),
+                None => format!(
+                    "parent work {parent_work_id} [{state}] — no parent execution was claimed"
+                ),
+            },
         }
     }
 
@@ -768,6 +852,18 @@ impl EvidenceCoordinate {
                 "result_rows": result_rows,
                 "row_limit": row_limit,
                 "truncated": truncated,
+            }),
+            Self::ParentWork {
+                parent_work_id,
+                parent_execution_id,
+                state,
+            } => json!({
+                "shape": "parent_work",
+                "parent_work": parent_work_id,
+                // Present and null when the claim named no execution: the
+                // coarser relation W1 §6 allows is an answer, not a gap.
+                "parent_execution": parent_execution_id,
+                "parent_state": state,
             }),
         }
     }
@@ -1480,6 +1576,134 @@ impl ContextSnapshot {
         })
     }
 
+    /// **§16's audit record for this compilation** — `(kind, payload)` pairs
+    /// the engine commits to the journal beside
+    /// [`crate::domain::workflow::KIND_CONTEXT_COMPILED`].
+    ///
+    /// > *"Managed `map/search/related/query` calls can be attributed to the
+    /// > current execution. **Record raw evidence rather than a magic
+    /// > 'sharpness score'**"* … *"This later lets Sergeant analyze where
+    /// > compiled worlds were insufficient **without self-tuning during
+    /// > Sprint 3**."* (§16)
+    ///
+    /// # Record, do not adapt
+    ///
+    /// Every payload below is raw: evidence coordinates as the plan
+    /// contributed them, the query's own text/hash identity, and
+    /// [`SemanticStatus`]'s own stated word. **Nothing is scored, weighted,
+    /// aggregated or fed back.** Nothing in this crate reads these events —
+    /// they are written for a later human or a later analysis, and the
+    /// compiler's behaviour is byte-identical whether or not anybody ever
+    /// reads them. That is the shape §16's *"without self-tuning"* and §20's
+    /// two separate prohibitions (*learned context policy/live self-tuning*,
+    /// *universal scalar sharpness score*) jointly require.
+    ///
+    /// # Which of §16's seven kinds appear here
+    ///
+    /// Four, and only when the fact each records actually happened:
+    ///
+    /// | §16 kind | emitted when |
+    /// |---|---|
+    /// | `context.bound` | this compilation bound any evidence |
+    /// | `context.referenced` | it emitted any Referenced coordinate |
+    /// | `context.query` | steps 6/7's managed retrieval ran |
+    /// | `context.search_fallback` | that retrieval landed on a narrower §18 rung than it asked for |
+    ///
+    /// The other three are declared and emitted by nothing in this build,
+    /// each for a stated reason on its own constant
+    /// ([`crate::domain::workflow::KIND_CONTEXT_REFERENCE_RESOLVED`],
+    /// [`crate::domain::workflow::KIND_CONTEXT_SCOPE_EXPANSION_REQUESTED`],
+    /// [`crate::domain::workflow::KIND_CONTEXT_CONTRADICTION_OBSERVED`]).
+    ///
+    /// A **degraded** compilation emits none of the four: it bound nothing,
+    /// referenced nothing and ran no query, and inventing an empty
+    /// `context.bound` for it would put a row in the audit record for
+    /// something that did not happen. §18's degradation is already visible —
+    /// on the `context.compiled` snapshot, which is journaled either way.
+    pub fn audit_events(&self) -> Vec<(&'static str, Value)> {
+        let mut events: Vec<(&'static str, Value)> = Vec::new();
+        // The execution attribution §16 is about, on every event, so an
+        // analysis never has to correlate through a second table to learn
+        // which fresh actor start a row belongs to.
+        let attribution = json!({
+            "managed": true,
+            "work": self.coordinate.work_id,
+            "stage": self.coordinate.stage_id,
+            "attempt": self.coordinate.attempt,
+            "execution": self.coordinate.execution_id,
+        });
+        for (kind, tier, units) in [
+            (
+                crate::domain::workflow::KIND_CONTEXT_BOUND,
+                Tier::Bound,
+                &self.bound,
+            ),
+            (
+                crate::domain::workflow::KIND_CONTEXT_REFERENCED,
+                Tier::Referenced,
+                &self.referenced,
+            ),
+        ] {
+            if units.is_empty() {
+                continue;
+            }
+            events.push((
+                kind,
+                json!({
+                    "attribution": attribution,
+                    "context_snapshot_id": self.snapshot_id,
+                    "tier": tier.as_str(),
+                    // Raw coordinates: the §5 step that contributed each one,
+                    // its dedup identity, whether the render budget carried
+                    // it, and the coordinate itself. No excerpt text — the
+                    // journal records what world was presented, and the text
+                    // is resolvable from the coordinate.
+                    "evidence": units
+                        .iter()
+                        .map(|unit| json!({
+                            "step": unit.step.number(),
+                            "evidence_id": unit.coordinate.dedup_key(),
+                            "rendered": unit.rendered,
+                            "coordinate": unit.coordinate.json(),
+                        }))
+                        .collect::<Vec<_>>(),
+                }),
+            ));
+        }
+        if let Some(trace) = &self.retrieval {
+            events.push((
+                crate::domain::workflow::KIND_CONTEXT_QUERY,
+                json!({
+                    "attribution": attribution,
+                    "context_snapshot_id": self.snapshot_id,
+                    // A2 §13's full trace, which already carries its own
+                    // `attribution` field — the `Attribution::Execution`
+                    // this compilation issued the search under. Both are
+                    // here on purpose: the outer one is §16's, uniform
+                    // across all four kinds; the inner one is A2 §13's, and
+                    // a reader comparing them is checking exactly the claim
+                    // item 11 makes.
+                    "trace": trace.json(),
+                }),
+            ));
+            if trace.semantic != SemanticStatus::Applied {
+                events.push((
+                    crate::domain::workflow::KIND_CONTEXT_SEARCH_FALLBACK,
+                    json!({
+                        "attribution": attribution,
+                        "context_snapshot_id": self.snapshot_id,
+                        // The raw stated reason, in A2 §15's own three
+                        // words — not a quality number about the answer.
+                        "requested": "lexical+semantic",
+                        "applied": "lexical",
+                        "semantic_status": trace.semantic.as_str(),
+                    }),
+                ));
+            }
+        }
+        events
+    }
+
     /// Append the compiled world to a stage's authored `CONTEXT.md`.
     ///
     /// **Appended, never substituted**, exactly as the branch-status fact is
@@ -1722,13 +1946,15 @@ pub enum SourceEvidence {
     QueryResult(DatasetFact),
     /// An exact stored relationship of an exact generation.
     Relationship(crate::runtime::atlas::db::ResolvedRelationship),
-    /// A record of the Work itself — a stage record or a repository binding.
+    /// A record of the Work itself — a stage record, a repository binding,
+    /// or (§17) the causal parent Work.
     ///
-    /// These two coordinate shapes are **not** Atlas rows: their source
+    /// These three coordinate shapes are **not** Atlas rows: their source
     /// evidence is the Work's own journal-folded run, and the snapshot pins
     /// every field of it inline (`stage_id`/`index`/`attempt`/`status`,
-    /// `repository`/`work_branch`/`base_sha`). Resolution says so rather than
-    /// pretending a store lookup happened.
+    /// `repository`/`work_branch`/`base_sha`,
+    /// `parent_work_id`/`parent_execution_id`/`state`). Resolution says so
+    /// rather than pretending a store lookup happened.
     WorkRecord,
 }
 
@@ -1759,9 +1985,9 @@ pub fn resolve(
     coordinate: &EvidenceCoordinate,
 ) -> Result<Option<SourceEvidence>, AtlasError> {
     match coordinate {
-        EvidenceCoordinate::Stage { .. } | EvidenceCoordinate::Binding { .. } => {
-            Ok(Some(SourceEvidence::WorkRecord))
-        }
+        EvidenceCoordinate::Stage { .. }
+        | EvidenceCoordinate::Binding { .. }
+        | EvidenceCoordinate::ParentWork { .. } => Ok(Some(SourceEvidence::WorkRecord)),
         EvidenceCoordinate::Atlas {
             generation_id,
             relative_path,
@@ -2190,11 +2416,36 @@ pub struct CompileRequest<'a> {
     pub prior_stages: &'a [StageRecord],
     /// The launch profile the stage was bound with, when it has one.
     pub profile: Option<&'a str>,
+    /// **§17's fifth rule** — the causal parent of this Work, when the
+    /// daemon validated one at submit. `None` for an ordinary Work, which is
+    /// most of them: a Work with no parent has no parent coordinate, and
+    /// that is the observable difference §17's tests turn on.
+    pub parent: Option<ParentCausation<'a>>,
     /// §14's two hard automatic-render budgets. Every production compilation
     /// passes [`RenderBudget::DEFAULT`]; it is a request field rather than a
     /// constant read inside [`compile`] so a test can watch the hard bound
     /// actually bind, which a constant nobody can vary cannot show.
     pub budget: RenderBudget,
+}
+
+/// **§17's causal parent, as the compiler is given it.**
+///
+/// Every field is a coordinate or a state word the engine read off the
+/// **journal-folded** Work record (`Work::parent_work_id`,
+/// `Work::parent_execution_id` — W1 §6's *validated* relation, not the
+/// client's claim). There is no field for the parent's intent, prompt,
+/// context or transcript, and that absence is the contract: §17's fourth
+/// rule and §20's *parent-prompt inheritance for child Work* both forbid one,
+/// so the type a compiler is handed cannot express it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentCausation<'a> {
+    /// The validated parent Work id.
+    pub work_id: &'a str,
+    /// The parent execution that spent its causation env, when one was
+    /// claimed and validated.
+    pub execution_id: Option<&'a str>,
+    /// The parent's folded Work state right now.
+    pub state: &'a str,
 }
 
 /// The port [`crate::runtime::engine::Engine`] calls before an actor starts.
@@ -2414,6 +2665,24 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
                 },
             );
         }
+        // **§17's fifth rule, the permitted channel.** A causal child Work
+        // gets the parent's causation as a **Referenced** coordinate — a
+        // pointer, never a body — beside its own exact bindings, because
+        // *"causal child Work gets its own Work/source/context binding"* is
+        // the rule immediately above it and this is a fact about *this*
+        // Work's binding, not about the parent's world. Nothing of the
+        // parent's prompt, intent or transcript can travel this way: the
+        // coordinate has no field for one (see [`ParentCausation`]).
+        if let Some(parent) = request.parent {
+            step.contribute(
+                Tier::Referenced,
+                EvidenceCoordinate::ParentWork {
+                    parent_work_id: parent.work_id.to_string(),
+                    parent_execution_id: parent.execution_id.map(str::to_string),
+                    state: parent.state.to_string(),
+                },
+            );
+        }
         // "changed resources" is exactly the Work's own overlay generation —
         // a worktree scanned against its base holds only what the Work
         // changed (S5 W1b/W1d). Nothing here reads the surface: the overlay
@@ -2516,10 +2785,21 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
     }
     // ---- 6/7. A2 lexical retrieval, then A2 semantic retrieval if
     //           installed/needed — S5's own pipeline, consumed (R2).
+    //
+    // **§21 item 11 / §16's attribution.** *"Managed map/search/related/query
+    // calls can be attributed to the current execution."* This retrieval is
+    // managed by construction — it is issued by the compiler for one fresh
+    // actor start — so it is attributed to that **execution**, not merely to
+    // the Work: `Attribution::Execution` is the variant `sgt search --work`
+    // cannot use, because a human's Work-scoped read has no execution to
+    // name (see the enum's own doc). Attributing to the Work alone would
+    // make two stage launches of one Work indistinguishable, which is
+    // exactly the question §16 exists to answer.
     let attribution = match &repository {
-        Some(repository) => Attribution::Work {
+        Some(repository) => Attribution::Execution {
             work_id: request.work_id.to_string(),
             repository: repository.clone(),
+            execution_id: request.execution_id.to_string(),
         },
         None => Attribution::Unmanaged,
     };

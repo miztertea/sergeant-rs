@@ -123,6 +123,7 @@ fn compiled(
             bindings: bound_to,
             prior_stages: prior,
             profile: Some("standard"),
+            parent: None,
             budget: RenderBudget::DEFAULT,
         },
     )

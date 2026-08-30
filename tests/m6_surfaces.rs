@@ -3943,7 +3943,7 @@ fn t6_the_sse_vocabulary_is_stated_once_and_stays_complete() {
         );
     }
     let names: Vec<&str> = declared.iter().map(|(kind, _)| kind.as_str()).collect();
-    for kind in sergeant_rs::api::SSE_EVENT_KINDS {
+    for kind in sergeant_rs::api::SSE_EVENT_KINDS.iter() {
         assert!(
             names.contains(kind),
             "api::SSE_EVENT_KINDS lists {kind:?}, which no KIND_* constant declares"

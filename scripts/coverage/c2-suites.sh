@@ -406,3 +406,13 @@ cov_stage_end 1 "the c1b_tiers_and_budget test binary must write its own profile
 cov_stage_begin c2-c1c_authority_and_provenance
 cov_run cargo llvm-cov --no-report --test c1c_authority_and_provenance --locked || cov_fail "c1c_authority_and_provenance failed under instrumentation"
 cov_stage_end 1 "the c1c_authority_and_provenance test binary must write its own profile"
+
+# S6 C1d, wired at birth (the #231 lesson): C1 §21 items 11, 12 and 14 —
+# attribution, nesting and audit. Ten in-process tests over a real Atlas built
+# by the ordinary `record_scan` path (§16's seven event kinds, §17's parent
+# pointer, §19's chain walked from a rendered fragment to a resolved row),
+# plus two live-daemon tests over a real estate for §17's nested-leaf and
+# child-Work rules. No Docker, no subprocess. Floor 1.
+cov_stage_begin c2-c1d_attribution_nesting_audit
+cov_run cargo llvm-cov --no-report --test c1d_attribution_nesting_audit --locked || cov_fail "c1d_attribution_nesting_audit failed under instrumentation"
+cov_stage_end 1 "the c1d_attribution_nesting_audit test binary must write its own profile"
