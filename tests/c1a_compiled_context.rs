@@ -321,15 +321,17 @@ fn the_plan_enters_all_nine_steps_in_section_5s_order_over_a_real_atlas() {
             "a step that contributed nothing must say why: {record:?}"
         );
     }
-    // §21 item 2's own qualifier — *"where the profile declares such
-    // operations"* — is answered honestly rather than silently skipped.
+    // §5 step 4 is entered and states what it did rather than being skipped.
+    // This fixture registers no tabular dataset, so C1c's §10 query results
+    // (§21 item 7) have nothing to bind and the step says so — the same
+    // visible-degradation discipline every other empty step follows.
     let step_4 = &snapshot.plan[3];
     assert_eq!(step_4.contributed, 0);
     assert!(
         step_4
             .note
             .as_deref()
-            .is_some_and(|n| n.contains("declared")),
+            .is_some_and(|n| n.contains("deterministic dataset answer")),
         "{step_4:?}"
     );
 }

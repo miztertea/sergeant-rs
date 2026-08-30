@@ -396,3 +396,13 @@ cov_stage_end 1 "the c1a_compiled_context test binary must write its own profile
 cov_stage_begin c2-c1b_tiers_and_budget
 cov_run cargo llvm-cov --no-report --test c1b_tiers_and_budget --locked || cov_fail "c1b_tiers_and_budget failed under instrumentation"
 cov_stage_end 1 "the c1b_tiers_and_budget test binary must write its own profile"
+
+# S6 C1c, wired at birth (the #231 lesson): C1 §21 items 6, 7, 8 and 9 —
+# authority, provenance and structured data. Ten in-process tests over a real
+# Atlas built by the ordinary scan/record paths, including the prompt-
+# injection pair item 9 rests on and a 20,000-row CSV item 7 must keep out of
+# a prompt. No daemon, no subprocess beyond one `git init` for F9's manifest
+# refusal. Floor 1.
+cov_stage_begin c2-c1c_authority_and_provenance
+cov_run cargo llvm-cov --no-report --test c1c_authority_and_provenance --locked || cov_fail "c1c_authority_and_provenance failed under instrumentation"
+cov_stage_end 1 "the c1c_authority_and_provenance test binary must write its own profile"
