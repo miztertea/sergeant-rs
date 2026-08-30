@@ -315,6 +315,13 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3"
 toml = "1.1.4"
+# S5 W3b (F-SI-01 fix): `tests/w3b_model2vec_manifest_pin.rs` checks a
+# committed digest against `PROVENANCE.md`. `sha2` is already resolved into
+# this exact build's `Cargo.lock` transitively (`lopdf -> pdf-inspector ->
+# anydoc -> sergeant-rs`), so naming it here is R5 (installed dependency),
+# not a new edge in the graph — `blake3` is the crate's own hash and is not
+# SHA-256, so it cannot stand in for this check.
+sha2 = "0.10.9"
 # S3 X4 (F4): `tests/x4_tabular_map.rs` writes a real `.parquet` fixture, so
 # the Parquet reader is proven end-to-end on actual Parquet bytes rather than
 # inferred from a linked symbol. Same rung and same arithmetic as the two
