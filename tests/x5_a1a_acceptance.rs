@@ -418,10 +418,17 @@ const WALK: &[Item] = &[
                offset, because the original bytes are a compressed container the normalizer \
                has already unpacked by the time a unit is visible (see `runtime/atlas/office.rs`'s \
                own module doc and `domain::source::UnitKind`'s doc for the full argument). Output is \
-               derived, never canonical (A1-12). NARROWING, not a deviation from what §17 asks: \
-               `.docx` is this wave's one adopted format (G3's gate order), so `office::extractor_for` \
-               claims nothing else yet — a second Office format is explicitly out of this \
-               sprint's scope. CROSS-CUTTING GAP, CLOSED (S4 Y8): this note used to read 'the \
+               derived, never canonical (A1-12). NARROWING CLOSED (S6): this note used to read \
+               '`.docx` is this wave's one adopted format (G3's gate order), so \
+               `office::extractor_for` claims nothing else yet' — true of G3's spike, and a \
+               NARROWING once that spike ended, which is what the owner ruled \
+               (`twelve-formats-is-0.3.0-criteria-2026-08-30`, J4: '1/12 is a failure of 0.3.0 \
+               completion criteria for estate intelligence'). `office::OFFICE_EXTENSIONS` now \
+               routes eleven formats — doc, docx, epub, odp, ods, odt, pdf, ppt, pptx, rtf, \
+               xlsx — each with its own extractor identity and its own hand-verified fixture; \
+               the twelfth, csv, stays in the relational lane by A1 §6.4/A1-13 \
+               (`office::CSV_IS_NOT_A_DOCUMENT`). §17 item 5 asks for 'at least one' Office \
+               format and always got one; it now gets eleven. CROSS-CUTTING GAP, CLOSED (S4 Y8): this note used to read 'the \
                adapter is invoked here through its own writer (the worker binary) and by tests, \
                not yet by a shipped scan trigger' — true through Y2-Y7, and corrected here. \
                `scan.rs`'s `Walk::file` and `git.rs`'s `extract_blobs` now dispatch a claimed \

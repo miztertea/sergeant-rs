@@ -113,6 +113,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// the real value rather than duplicating it.
 pub const WORKER_ADDRESS_SPACE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 
+/// The data-parallelism environment variable armed on every worker child
+/// (`spawn_and_collect`), and why one thread rather than the host's core
+/// count: see that call site. Named as a constant so the value and its
+/// reason live together and a reader grepping for the variable finds the
+/// argument, not just a string literal.
+const RAYON_THREADS_ENV: &str = "RAYON_NUM_THREADS";
+
 /// How long [`run_worker`] waits, after the child has already exited or been
 /// reaped, for its stdout-draining thread to hand back what it read.
 ///
@@ -979,6 +986,28 @@ fn spawn_and_collect(spawn: &WorkerSpawn) -> Result<Vec<u8>, WorkerFault> {
     // RLIMIT_AS (Linux): the memory-fault class #310's hardening above does
     // not cover — see the module doc's "Memory containment" section.
     cap_worker_address_space(&mut command);
+    // One data-parallel worker thread, because the address space above is
+    // capped and a thread pool sized to the HOST's core count does not fit
+    // inside it (S6). Found the only way this could have been found — a real
+    // scan of a real fixture through the real subprocess: one adapter
+    // frontend builds a `rayon` global pool, that pool's default size is the
+    // host's parallelism (20 cores on this estate's own host), and each
+    // thread's reserved stack counts against `RLIMIT_AS`, so pool
+    // construction failed with EAGAIN and the child died on an unrelated-
+    // looking panic ("The global thread pool has not been initialized").
+    //
+    // The fix is deliberately the SMALLEST one that keeps the bound intact:
+    // an environment variable on the child (R3 — the pool's own documented
+    // configuration knob, no new dependency and no `unsafe` `set_var` in
+    // this process), never a raised `RLIMIT_AS`. Raising a safety ceiling to
+    // accommodate a thread pool would trade a memory bound for parallelism
+    // this process does not want anyway: a worker call extracts ONE document
+    // and exits, and the unit of parallelism here is the worker, several of
+    // which the intelligence lane already runs concurrently up to its own
+    // cap. A library that ignores this variable and sizes its own pool is
+    // still bounded by the ceiling — it fails closed, as a named coverage
+    // row, exactly as it did before this line existed.
+    command.env(RAYON_THREADS_ENV, "1");
 
     let mut process = command
         .spawn()

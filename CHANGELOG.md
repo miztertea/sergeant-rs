@@ -1635,6 +1635,51 @@ them were dead code in every real installation.
   where they under-deliver.
 
 
+### Every document format the normalizer parses is routed (S6)
+
+- **Eleven document formats reach the index, not one.** A local knowledge
+  Source now indexes `.doc`, `.docx`, `.epub`, `.odp`, `.ods`, `.odt`,
+  `.pdf`, `.ppt`, `.pptx`, `.rtf` and `.xlsx`, each with its own extractor
+  identity. Nine of the eleven — every one but `.doc` and `.ppt` — have a
+  hand-verified fixture; those two are binary OLE2 formats no fixture
+  could be hand-authored for in this build environment, so `.doc` is
+  fixtured only through an RTF-content file wearing a `.doc` extension and
+  `.ppt` has no fixture at all. Both are still routed and parsed — the gap
+  is corpus coverage, not routing — and is recorded as a named gap in
+  `tests/fixtures/anydoc_corpus/MANIFEST.md`. The document normalizer had
+  parsed all of them since S4; only `.docx` was routed, behind a code
+  comment that read as a scope boundary. The owner ruled that boundary a
+  narrowing once the spike it served had ended
+  (`twelve-formats-is-0.3.0-criteria-2026-08-30`): *"1/12 is a failure of
+  0.3.0 completion criteria for estate intelligence."*
+- **`.csv` deliberately stays relational.** It is the twelfth format the
+  normalizer parses and the one that must not enter the document lane: A1
+  §6.4 forbids by name normalizing a 100k-row export into 100k Markdown
+  documents, and A1-13 keeps such corpora in DuckDB, read in place. The
+  routing table records the rule at the point of the decision and two tests
+  enforce it from both sides.
+- **Spreadsheets take the document lane, and claim no cell coordinates.**
+  A1 §6.3 settles this directly: readable table normalization is sufficient
+  for knowledge/search, but is not evidence that write-back sheet/cell
+  coordinates were preserved. A workbook therefore reaches retrieval as
+  table text with a structural coordinate — never a `Sheet1!A1`-shaped
+  address it cannot honour.
+- **A scanned PDF is a named coverage gap, never a silent empty document.**
+  Text-bearing PDFs extract natively; an image-only one reports which pages
+  need OCR, the one capability deliberately outside 0.3.0.
+- **A password-protected document is its own coverage answer.** "Locked" and
+  "damaged" no longer share detail text: the normalizer distinguishes them
+  and so does the row an operator reads.
+- **The document-family content filter is exhaustive by construction.** It
+  was an enumerated list, which is exactly why ten new formats could have
+  landed outside `--content document` with no compile error; the office
+  adapter's half is now one code-owned pattern its whole routing table
+  satisfies.
+- Supervised parse workers run with a single data-parallel thread. The PDF
+  frontend builds a thread pool sized to the host's core count, which does
+  not fit inside the worker's address-space ceiling; the ceiling stands and
+  the pool is bounded instead.
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain

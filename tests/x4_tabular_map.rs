@@ -58,7 +58,7 @@ use sergeant_rs::runtime::atlas::db::{
 };
 use sergeant_rs::runtime::atlas::record::{ScanRecord, scan_and_record};
 use sergeant_rs::runtime::atlas::scan::{
-    DATASET_NO_ROOT, KnowledgeSource, claims_for, scan_local_knowledge,
+    DATASET_NO_ROOT, KnowledgeSource, claims_for, scan_local_knowledge, worker_extractor_for,
 };
 use sergeant_rs::runtime::atlas::tabular::{
     ContextFields, DatasetFormat, RowKeyBasis, format_for, reader_identity,
@@ -305,6 +305,18 @@ fn the_tabular_routing_table_is_disjoint_from_the_document_and_grammar_tables() 
             assert!(
                 claims_for(&path).is_none(),
                 "{path} is claimed by both the tabular and the document/grammar tables"
+            );
+            // S6, and specifically for `.csv`: the WORKER table is the one
+            // the office/document adapter contributes to, so disjointness
+            // has to be asserted against it too. A1 §6.4 forbids by name
+            // normalizing a structured export into prose documents, and
+            // `office::CSV_IS_NOT_A_DOCUMENT` records that decision at the
+            // routing table itself; this is the half that fails if a future
+            // edit adds `csv` to it.
+            assert!(
+                worker_extractor_for(&path).is_none(),
+                "{path} is claimed by both the tabular and the worker/document tables — {}",
+                sergeant_rs::runtime::atlas::office::CSV_IS_NOT_A_DOCUMENT
             );
         }
     }

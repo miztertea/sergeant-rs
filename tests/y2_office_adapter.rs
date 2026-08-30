@@ -158,7 +158,7 @@ fn a_docx_worker_returns_document_and_section_units_with_provenance() {
 
     // Contract property (3): deterministic — re-running the same extractor
     // identity against the same bytes reproduces the identical coordinate
-    // for the corresponding unit. `docx_units`'s own purity is proven
+    // for the corresponding unit. `office_units`'s own purity is proven
     // directly in office.rs's own tests (`extraction_is_a_pure_function_of_its_input`);
     // this re-proves it through the wire shape this test actually asserts
     // against, on the real subprocess.

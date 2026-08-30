@@ -4786,7 +4786,7 @@ fn indexable_units(
 ) -> Result<Vec<IndexableUnit>, AtlasError> {
     let mut units: Vec<IndexableUnit> = Vec::new();
 
-    let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;
+    let [doc_a, doc_b, doc_c] = DOCUMENT_EXTRACTOR_IDENTITIES;
     let mut statement = conn.prepare(sql!(
         "SELECT u.source_name, u.relative_path, u.ordinal, u.title, u.byte_start, u.byte_end, \
                 u.body, f.extractor, c.coordinate \
@@ -4796,10 +4796,17 @@ fn indexable_units(
          LEFT JOIN source.unit_coordinates c ON c.generation_id = u.generation_id \
                                              AND c.relative_path = u.relative_path \
                                              AND c.ordinal = u.ordinal \
-         WHERE u.generation_id = ? AND f.extractor IN (?, ?, ?, ?) \
+         WHERE u.generation_id = ? \
+           AND (f.extractor IN (?, ?, ?) OR f.extractor LIKE ?) \
          ORDER BY u.relative_path, u.ordinal"
     ))?;
-    let mut rows = statement.query(duckdb::params![generation_id, doc_a, doc_b, doc_c, doc_d])?;
+    let mut rows = statement.query(duckdb::params![
+        generation_id,
+        doc_a,
+        doc_b,
+        doc_c,
+        DOCUMENT_EXTRACTOR_LIKE
+    ])?;
     while let Some(row) = rows.next()? {
         let extractor: String = row.get(7)?;
         let family = if extractor == crate::runtime::atlas::mail::MAIL_EXTRACTOR {
@@ -6214,7 +6221,7 @@ impl Admissible<'_> {
         let (source_name, content_key) = filter.source.bindings();
         let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
-        let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;
+        let [doc_a, doc_b, doc_c] = DOCUMENT_EXTRACTOR_IDENTITIES;
         let overlay_exclude = overlay_exclude_like();
         let overlay_admit = filter.source.overlay_admit_source_name();
         let out = self.reader.rows(
@@ -6226,7 +6233,7 @@ impl Admissible<'_> {
                  JOIN source.files f ON f.generation_id = u.generation_id \
                                      AND f.relative_path = u.relative_path \
                  WHERE g.state = ? \
-                   AND f.extractor IN (?, ?, ?, ?) \
+                   AND (f.extractor IN (?, ?, ?) OR f.extractor LIKE ?) \
                    AND ( (g.source_name NOT LIKE ? \
                           AND (? IS NULL OR g.source_name = ?)) \
                          OR (? IS NOT NULL AND g.source_name = ?) ) \
@@ -6240,7 +6247,7 @@ impl Admissible<'_> {
                 doc_a,
                 doc_b,
                 doc_c,
-                doc_d,
+                DOCUMENT_EXTRACTOR_LIKE,
                 overlay_exclude,
                 source_name,
                 source_name,
@@ -6613,7 +6620,11 @@ fn optional_text(value: Option<&str>) -> Duck {
 /// list of extractor identities [`AtlasDb::admissible_units`] matches
 /// against — never a client-supplied pattern (F12). Every identity a
 /// document-shaped adapter in this build can write to `source.files`:
-/// Markdown, plain text, Office (`.docx`), and mail (`.eml`). **Not**
+/// Markdown, plain text, every Office/document format the one
+/// `office::OFFICE_EXTENSIONS` table routes (S6 widened that from `.docx`
+/// alone to the eleven document formats its normalizer reads), and mail
+/// (`.eml`).
+/// **Not**
 /// [`crate::runtime::atlas::archive::ZIP_EXTRACTOR`]: a ZIP archive is a
 /// container — its own top-level resource carries no prose, only its
 /// unpacked children do, each under its own (already-listed) extractor
@@ -6626,12 +6637,26 @@ fn optional_text(value: Option<&str>) -> Duck {
 /// document adapter that lands a new identity without updating this list
 /// fails that test rather than silently falling out of (or into)
 /// `--content document`.
-pub const DOCUMENT_EXTRACTOR_IDENTITIES: [&str; 4] = [
+pub const DOCUMENT_EXTRACTOR_IDENTITIES: [&str; 3] = [
     crate::runtime::atlas::text::MARKDOWN_EXTRACTOR,
     crate::runtime::atlas::text::TEXT_EXTRACTOR,
-    crate::runtime::atlas::office::DOCX_EXTRACTOR,
     crate::runtime::atlas::mail::MAIL_EXTRACTOR,
 ];
+
+/// H13.1's content-kind filter, document family, second half: the office/
+/// document adapter's own code-owned `LIKE` pattern (S6).
+///
+/// Every identity `office.rs` writes shares one prefix by construction (see
+/// [`crate::runtime::atlas::office::OFFICE_EXTRACTOR_LIKE`]'s own doc), so
+/// this covers a newly routed format the day it is routed. Before S6 that
+/// adapter contributed exactly ONE enumerated identity to
+/// [`DOCUMENT_EXTRACTOR_IDENTITIES`] above; widening its routing table from
+/// one format to eleven is precisely the change that would otherwise have
+/// dropped ten of them out of `--content document` without a compile error.
+///
+/// Re-exported here rather than referenced inline at each query so the two
+/// halves of the document family read as one decision.
+pub const DOCUMENT_EXTRACTOR_LIKE: &str = crate::runtime::atlas::office::OFFICE_EXTRACTOR_LIKE;
 
 /// H13.1's content-kind filter, code family: the fixed, code-owned `LIKE`
 /// pattern [`AtlasDb::admissible_occurrences`] matches `extractor` against

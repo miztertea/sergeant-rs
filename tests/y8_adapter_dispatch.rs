@@ -27,7 +27,10 @@ use sergeant_rs::runtime::atlas::archive::ZIP_EXTRACTOR;
 use sergeant_rs::runtime::atlas::db::AtlasDb;
 use sergeant_rs::runtime::atlas::lane::scan_local_knowledge_on_lane;
 use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
-use sergeant_rs::runtime::atlas::office::DOCX_EXTRACTOR;
+use sergeant_rs::runtime::atlas::office::{
+    DOCX_EXTRACTOR, EPUB_EXTRACTOR, ODT_EXTRACTOR, PDF_EXTRACTOR, PPTX_EXTRACTOR, RTF_EXTRACTOR,
+    XLSX_EXTRACTOR,
+};
 use sergeant_rs::runtime::atlas::record::record_scan;
 use sergeant_rs::runtime::atlas::scan::{
     KnowledgeSource, SourceScan, scan_local_knowledge_with_worker,
@@ -63,6 +66,186 @@ fn coverage_row<'a>(scan: &'a SourceScan, relative_path: &str) -> &'a CoverageRo
         .iter()
         .find(|r| r.path.as_deref() == Some(relative_path))
         .unwrap_or_else(|| panic!("no coverage row for {relative_path:?}: {:?}", scan.coverage))
+}
+
+/// **S6, end to end: the ten formats that were parsed but never routed.**
+///
+/// Owner ruling `twelve-formats-is-0.3.0-criteria-2026-08-30` (J4): *"1/12 is
+/// a failure of 0.3.0 completion criteria for estate intelligence."* The
+/// parser was linked into this binary the whole time; only the routing table
+/// was one format wide, behind an honest-looking comment.
+///
+/// This is the proof at the layer that matters — a REAL local-knowledge scan,
+/// through the REAL `sgt-atlas-worker` subprocess, over this repo's own
+/// hand-verified fixtures — not `office::extractor_for` answering `Some` in a
+/// unit test. It asserts all four kinds of answer the ruling demanded:
+///
+/// 1. six newly routed formats reach `Indexed` with real text units;
+/// 2. `.csv` is NOT among them — it stays a DATASET, read in place (A1 §6.4,
+///    A1-13). Routing it to the document lane is precisely what §6.4 forbids
+///    by name, so its absence from `scan.files` is an assertion here, not an
+///    omission;
+/// 3. a scanned PDF is a NAMED coverage gap pointing at OCR, never silence
+///    and never a false empty extraction (A1 §15);
+/// 4. an encrypted document is its OWN named gap, with detail text distinct
+///    from a malformed one — the normalizer's failure vocabulary reaching a
+///    coverage row, which is where an operator actually reads it.
+#[test]
+fn a_real_scan_indexes_every_newly_routed_office_format_and_keeps_csv_relational() {
+    let source_root = TempDir::new().expect("source root");
+    let office = |name: &str| format!("anydoc_corpus/office_fixtures/{name}");
+    for (path, source) in [
+        ("slides.pptx", office("15-pptx-slides.pptx")),
+        ("budget.xlsx", office("18-xlsx-sheet.xlsx")),
+        ("notes.odt", office("10-odt-headings.odt")),
+        ("memo.rtf", office("07-rtf-plain.rtf")),
+        ("book.epub", office("20-epub-chapters.epub")),
+        ("paper.pdf", office("22-pdf-text.pdf")),
+        ("scanned.pdf", office("23-pdf-scanned-needs-ocr.pdf")),
+        ("locked.odt", office("14-odt-encrypted.odt")),
+        (
+            "broken.odt",
+            office("13-odt-malformed-unclosed-element.odt"),
+        ),
+    ] {
+        std::fs::write(source_root.path().join(path), fixture(&source))
+            .unwrap_or_else(|e| panic!("write {path}: {e}"));
+    }
+    // The twelfth format. A dataset, not a document — and written from the
+    // same scan so the two lanes are decided by one walk, not by two tests
+    // that could disagree.
+    std::fs::write(
+        source_root.path().join("tickets.csv"),
+        "id,short_description\n1,printer offline\n2,vpn drops\n",
+    )
+    .expect("write csv");
+
+    let source = KnowledgeSource {
+        name: "formats".to_string(),
+        root: source_root.path().to_path_buf(),
+        ignore: Vec::new(),
+        context_fields: ContextFields::none(),
+    };
+    let scan = scan_local_knowledge_with_worker(&source, &worker()).expect("scan");
+
+    // ---------------------------------------------- (1) the six that index
+    for (path, extractor) in [
+        ("slides.pptx", PPTX_EXTRACTOR),
+        ("budget.xlsx", XLSX_EXTRACTOR),
+        ("notes.odt", ODT_EXTRACTOR),
+        ("memo.rtf", RTF_EXTRACTOR),
+        ("book.epub", EPUB_EXTRACTOR),
+        ("paper.pdf", PDF_EXTRACTOR),
+    ] {
+        let row = coverage_row(&scan, path);
+        assert_eq!(
+            row.status,
+            Coverage::Indexed,
+            "{path} must be Indexed through the real worker, not {row:?}"
+        );
+        assert!(
+            scan.extractors.contains(extractor),
+            "{extractor} missing from {:?}",
+            scan.extractors
+        );
+        let file = scan
+            .files
+            .iter()
+            .find(|f| f.relative_path == path)
+            .unwrap_or_else(|| panic!("{path} did not land in source.files"));
+        assert_eq!(
+            file.extractor, extractor,
+            "{path} landed under the wrong identity"
+        );
+        assert!(
+            file.units.iter().any(|u| !u.text.trim().is_empty()),
+            "{path} must carry real text, not an empty success: {:?}",
+            file.units
+        );
+    }
+    // The docx identity is deliberately NOT in this scan — no `.docx` was
+    // written — so the six above are new routing, not the pre-existing one
+    // format passing under a different name.
+    assert!(
+        !scan.extractors.contains(DOCX_EXTRACTOR),
+        "this scan holds no .docx; {DOCX_EXTRACTOR} must not appear: {:?}",
+        scan.extractors
+    );
+
+    // Hand-verifiable content, not merely "non-empty": the fixtures' own
+    // text, from `MANIFEST.md`'s S6 table.
+    let text_of = |path: &str| {
+        scan.files
+            .iter()
+            .find(|f| f.relative_path == path)
+            .map(|f| f.units[0].text.clone())
+            .unwrap_or_else(|| panic!("{path} missing"))
+    };
+    assert_eq!(
+        text_of("budget.xlsx"),
+        "Item | Cost\nWidget | 10\nGadget | 20",
+        "a spreadsheet reaches retrieval as table text (A1 §6.3, OWNER-02)"
+    );
+    assert!(text_of("slides.pptx").contains("Pptx Slide Two"));
+    assert!(text_of("book.epub").contains("Epub Chapter Two"));
+    assert!(text_of("paper.pdf").contains("Pdf Fixture Heading"));
+
+    // --------------------------------------- (2) csv stays in the other lane
+    assert!(
+        scan.files.iter().all(|f| f.relative_path != "tickets.csv"),
+        "csv must not be normalized into a document (A1 §6.4: a 100k-ticket export must NOT \
+         be normalized into 100k Markdown documents just to make it searchable): {:?}",
+        scan.files
+            .iter()
+            .map(|f| &f.relative_path)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        scan.datasets
+            .iter()
+            .any(|d| d.relative_path == "tickets.csv"),
+        "csv must land in the relational lane instead (A1-13): {:?}",
+        scan.datasets
+    );
+
+    // ---------------------------------- (3) the scanned PDF is a NAMED gap
+    let scanned = coverage_row(&scan, "scanned.pdf");
+    assert_ne!(
+        scanned.status,
+        Coverage::Indexed,
+        "an image-only PDF must never index as a document with no text: {scanned:?}"
+    );
+    let detail = scanned
+        .detail
+        .as_deref()
+        .expect("a coverage gap without detail is silence, which A1 §15 forbids");
+    assert!(
+        detail.contains("OCR"),
+        "the gap must name OCR — the one capability deliberately outside 0.3.0: {detail}"
+    );
+    assert!(
+        detail.contains("page 1 of 1"),
+        "and name WHICH pages need it: {detail}"
+    );
+    assert!(
+        scan.files.iter().all(|f| f.relative_path != "scanned.pdf"),
+        "a named gap must not also land as a file with zero units"
+    );
+
+    // ------------------------- (4) encrypted is its own gap, not "malformed"
+    let locked = coverage_row(&scan, "locked.odt");
+    let broken = coverage_row(&scan, "broken.odt");
+    let locked_detail = locked.detail.as_deref().expect("encrypted needs detail");
+    let broken_detail = broken.detail.as_deref().expect("malformed needs detail");
+    assert!(
+        locked_detail.contains("encrypted"),
+        "a password-protected file is a named gap, not a parse failure: {locked_detail}"
+    );
+    assert_ne!(
+        locked_detail, broken_detail,
+        "\"locked\" and \"damaged\" are different problems with different remedies and must \
+         not share coverage detail text"
+    );
 }
 
 /// The one `source.scanned` journal summary a completed scan writes —

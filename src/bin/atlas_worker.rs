@@ -10,9 +10,11 @@
 //!
 //! # Extraction is chosen by `--extractor`, exactly as it is in-process
 //!
-//! `--extractor` is dispatched on, not merely echoed: a value equal to
-//! [`office::DOCX_EXTRACTOR`] runs the real Office adapter
-//! ([`office::docx_units`]) over stdin; a value equal to
+//! `--extractor` is dispatched on, not merely echoed: a value for which
+//! [`office::is_office_extractor`] returns true — any of the eleven
+//! document-format identities the Office adapter claims, not only
+//! [`office::DOCX_EXTRACTOR`] — runs the real Office adapter
+//! ([`office::office_units`]) over stdin; a value equal to
 //! [`archive::ZIP_EXTRACTOR`] runs the real bounded-ZIP adapter
 //! ([`archive::expand`], S4 Y3) over stdin; a value equal to
 //! [`mail::MAIL_EXTRACTOR`] runs the real mail adapter
@@ -60,7 +62,7 @@
 //!
 //! # A failed extraction exits non-zero — it never emits an empty batch
 //!
-//! [`office::docx_units`] returning `Err` is **not** reported as a
+//! [`office::office_units`] returning `Err` is **not** reported as a
 //! `WorkerBatch` with zero units: that would be indistinguishable on the
 //! wire from a document that genuinely extracted to nothing, which is
 //! exactly the "silent empty" F8 forbids (coverage honesty, brief item 5).
@@ -307,8 +309,14 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
     // archive's own admitted children are appended to whatever the flag
     // already supplied.
     let mut declared_children = args.declared_children.clone();
-    let units = if args.extractor == office::DOCX_EXTRACTOR {
-        office::docx_units(input)
+    // `is_office_extractor`, not a literal identity: this binary dispatches
+    // on WHICH ADAPTER owns the identity, and S6 made that eleven identities
+    // (one per document format the normalizer behind that module parses).
+    // Naming them here would
+    // duplicate `office::OFFICE_EXTENSIONS` in a second place that could
+    // drift; the predicate keeps the one table the only table.
+    let units = if office::is_office_extractor(&args.extractor) {
+        office::office_units(input, &args.extractor)
             .map_err(|e| e.to_string())?
             .into_iter()
             .map(|unit| {

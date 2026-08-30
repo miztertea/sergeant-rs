@@ -6,7 +6,7 @@
 //!
 //! A pure function over bytes (F6's adapter-shape mandate, the same shape
 //! [`super::text`]/[`super::office`] already keep), meant to run inside Y1's
-//! supervised worker exactly the way `office::docx_units` does. Named
+//! supervised worker exactly the way `office::office_units` does. Named
 //! `archive` rather than `zip` deliberately: the crate this module is the one
 //! place allowed to name (`zip`, per its own `Cargo.toml` entry) would
 //! otherwise shadow this module's own path — a module is named after the
