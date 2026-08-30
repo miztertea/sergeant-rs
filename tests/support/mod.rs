@@ -794,8 +794,13 @@ impl Drop for CrossProcessLock {
 /// request timeout, and `y6a`'s own repository scan had begun timing out in
 /// CI — a real scan outrunning a fixed client bound, which is the same
 /// defect the product had. Here the wait is over the scan's own reported
-/// completion, with [`SCAN_BUDGET`] as a backstop that fails loudly and
-/// says how far the scan got.
+/// completion, and it carries **no time bound of its own**: elapsed time
+/// never decides whether a scan was correct, because estate size is an
+/// input and any duration chosen for it is wrong at some estate. A test
+/// that hangs is the runner's to kill (`.config/nextest.toml`), which
+/// reports "the harness gave up waiting" — a fact about the harness.
+/// A bound asserted here would instead claim the scan failed, which is a
+/// fact about the product this helper cannot know.
 ///
 /// Returns the status and body of whatever last answered: the acceptance
 /// itself when it carries no `scan_id` (the estate declares nothing to
@@ -819,10 +824,9 @@ pub async fn scan_to_completion(
     let Some(scan_id) = accepted["scan_id"].as_str().map(str::to_string) else {
         return (status, accepted);
     };
-    let deadline = Instant::now() + SCAN_BUDGET;
-    let mut last = accepted;
-    let mut last_status = status;
-    while Instant::now() < deadline {
+    let mut last: serde_json::Value;
+    let mut last_status: reqwest::StatusCode;
+    loop {
         let response = http
             .get(format!("{endpoint}/v1/intelligence/scan/{scan_id}"))
             .bearer_auth(token)
@@ -834,19 +838,10 @@ pub async fn scan_to_completion(
         if last["state"] == "completed" {
             return (last_status, last);
         }
+        // Display/poll cadence only: no outcome depends on this value.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!(
-        "scan {scan_id} did not complete within {SCAN_BUDGET:?}; last poll answered \
-         {last_status}: {last}"
-    );
 }
-
-/// How long [`scan_to_completion`] waits for a scan to finish before
-/// failing the test. Generous on purpose: it is a backstop against a hung
-/// scan, not a bound anything is tuned against — the wait itself ends on
-/// the scan's own reported completion.
-pub const SCAN_BUDGET: Duration = Duration::from_secs(600);
 
 #[cfg(test)]
 mod cross_process_lock_tests {

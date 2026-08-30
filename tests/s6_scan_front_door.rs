@@ -39,7 +39,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -236,17 +236,32 @@ async fn per_source_progress_is_visible_while_the_scan_is_still_running() {
     let handle = start_daemon(&data).await;
     let http = client();
 
-    let accepted_at = Instant::now();
     let (status, accepted) = post_scan(&http, &handle, estate.path()).await;
-    let accept_latency = accepted_at.elapsed();
     assert_eq!(status, 202, "{accepted}");
+    // Shape of the acceptance only. These two assertions do NOT prove the
+    // accept avoided waiting for the scan — measured: with `tokio::spawn`
+    // replaced by `.await`, both still pass, because the body is built
+    // before the work runs. What actually proves non-blocking is
+    // `saw_partial_progress` below, which fails against that same
+    // violation. Kept because the shape is worth pinning; named for what
+    // it is so no later reader mistakes it for the timing proof.
+    //
+    // The wall-clock ratio this replaced (`accept_latency * 4 <
+    // scan_duration`) asserted a property of the host, not the product.
+    assert_eq!(
+        accepted["state"], "running",
+        "the accept must return before the scan finishes: {accepted}"
+    );
+    assert!(
+        accepted["scanned"].as_array().is_some_and(|s| s.is_empty()),
+        "the accept must carry no per-source report yet: {accepted}"
+    );
     let scan_id = accepted["scan_id"].as_str().expect("scan id").to_string();
 
     // Poll fast enough to see the middle of the scan, not only its ends.
     let mut saw_partial_progress = false;
     let mut completed = None;
-    let deadline = Instant::now() + support::SCAN_BUDGET;
-    while Instant::now() < deadline {
+    loop {
         let (status, progress) = poll_scan(&http, &handle, &scan_id).await;
         assert_eq!(status, 200, "{progress}");
         let done = progress["completed_sources"].as_u64().unwrap_or(0);
@@ -257,21 +272,16 @@ async fn per_source_progress_is_visible_while_the_scan_is_still_running() {
             completed = Some(progress);
             break;
         }
+        // Poll cadence only: no outcome depends on this value.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let completed = completed.expect("the scan must reach completion within the budget");
-    let scan_duration = accepted_at.elapsed();
+    let completed = completed.expect("the poll loop returns only on completion");
 
     assert!(
         saw_partial_progress,
         "a finished source must be readable while later sources are still running — that is \
-         what makes minutes-long work watchable rather than opaque; the scan took {scan_duration:?} \
-         and no poll ever saw a partial count: {completed}"
-    );
-    assert!(
-        accept_latency * 4 < scan_duration,
-        "the acceptance must not wait for the scan: accepted in {accept_latency:?} of a \
-         {scan_duration:?} scan"
+         what makes minutes-long work watchable rather than opaque; no poll ever saw a \
+         partial count: {completed}"
     );
     handle.shutdown().await;
 }
