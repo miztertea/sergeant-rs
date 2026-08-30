@@ -59,15 +59,19 @@ use crate::domain::workflow::{
 use crate::runtime::atlas::db::{self as atlas_db, AtlasDb, AtlasError, SourceStatus};
 use crate::runtime::atlas::db::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::atlas::external_git::ExternalGitSource;
+use crate::runtime::atlas::fusion as atlas_fusion;
 use crate::runtime::atlas::git::EstateGitSource;
 use crate::runtime::atlas::lane::{
     acquire_external_git_on_lane, scan_estate_git_on_lane, scan_local_knowledge_on_lane,
     scan_work_overlay_on_lane,
 };
+use crate::runtime::atlas::lexical as atlas_lexical;
 use crate::runtime::atlas::locator;
 use crate::runtime::atlas::overlay::{WorkOverlay, overlay_source_name};
 use crate::runtime::atlas::record::{ScanRecord, record_external_git_scan, record_scan};
 use crate::runtime::atlas::scan::KnowledgeSource;
+use crate::runtime::atlas::semantic as atlas_semantic;
+use crate::runtime::atlas::trace as atlas_trace;
 use crate::runtime::engine::{
     Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
     Next as EngineNext, Step, SubmitContext, SurfaceOutcome,
@@ -591,6 +595,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/map/children", get(map_children))
         .route("/map/symbol", get(map_symbol))
         .route("/map/references", get(map_references))
+        // S5 W5, A2 §14's minimum useful surface — BOTH verbs. Canned and
+        // parameterized like every other Atlas read here: no SQL, no path,
+        // no pattern, and `related`'s query text is the anchor unit's own
+        // stored text rather than anything a client sends.
+        .route("/search", get(search_query))
+        .route("/related", get(related_query))
         .route("/events", get(event_history))
         .route("/events/stream", get(event_stream))
         .route("/system", get(system_info))
@@ -5951,6 +5961,439 @@ async fn map_references(State(state): State<ApiState>, Query(query): Query<MapQu
         }))
         .into_response(),
         Err(response) => *response,
+    }
+}
+
+// ------------------------------------------------------------------
+// S5 W5 — A2 §14's CLI/API surface: `sgt search` and `sgt related`.
+// ------------------------------------------------------------------
+
+/// A2 §14's selectors, as query parameters.
+///
+/// Every one is a **deterministic selector** in A2 §2's sense — a value the
+/// admissibility filter binds and compares for equality. None of them is a
+/// retrieval weight: A2 §14's *"Do not expose raw retrieval weight tuning"*
+/// is met by there being no knob here to expose (`RRF_K` and BM25's `k1`/`b`
+/// are `const`s no request can reach).
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    /// The query text (`sgt search <query>`).
+    #[serde(default)]
+    q: Option<String>,
+    /// `sgt related <coordinate>` — `<source>/<family>:<path>#<ordinal>`.
+    #[serde(default)]
+    coordinate: Option<String>,
+    /// A2 §14's `--source <name>`, optionally `<name>@<content-key>`.
+    #[serde(default)]
+    source: Option<String>,
+    /// A2 §14's `--work <id>`.
+    #[serde(default)]
+    work: Option<String>,
+    /// Which of a multi-repository Work's repositories `--work` addresses.
+    /// Not in §14's list; added because `SourceSelector::WorkBase` names
+    /// exactly one repository and guessing which would be an invented
+    /// answer (**J0 avoided by refusing**, not by picking).
+    #[serde(default)]
+    repo: Option<String>,
+    /// A2 §14's `--content code|document|email|config|all` (plus
+    /// `row-text`, this build's fourth A2 §17 item 2 family).
+    #[serde(default)]
+    content: Option<String>,
+    /// A2 §14's `--type knowledge` (also `repo`, `external`).
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    /// A2 §14's `--external`.
+    #[serde(default)]
+    external: Option<bool>,
+    /// A2 §14's `--top <n>`.
+    #[serde(default)]
+    top: Option<usize>,
+    /// Decision **H4**'s request side: `off` suppresses A2 §6's half, and
+    /// the answer reports `semantic: disabled` rather than looking like a
+    /// host with no model installed.
+    #[serde(default)]
+    semantic: Option<String>,
+}
+
+/// The refusal `--content config` gets, verbatim on the CLI and in the API.
+///
+/// **This is the H13.1 correction carried forward honestly.** A2 §14 lists
+/// `config` among `--content`'s values, and W1 recorded it as a gap: no
+/// stored value distinguishes a `.toml` read through the `text/v1` fallback
+/// unit from a real text document, so a `config` lane would return *some*
+/// config files as though it had returned all of them. The brief's rule is
+/// *"either the value resolves to a lane and SAYS so, or it is not offered —
+/// never a value that returns partial results as though complete"*, so the
+/// value is accepted, named, and refused with its reason rather than
+/// silently answered or reported as a typo.
+pub const CONTENT_CONFIG_GAP: &str = "`--content config` is not available in this build: Atlas \
+     stores no value that distinguishes a config file read through the \
+     text/v1 fallback extractor from an ordinary text document, so a \
+     `config` lane would return some config files as though it had returned \
+     all of them. Use `--content document` or `--source <name>` and read the \
+     coordinates. (A2 §14 lists the value; A1 does not yet store the fact it \
+     needs.)";
+
+impl SearchQuery {
+    /// A2 §2's admissibility filter from the selectors, or a 400 naming what
+    /// was wrong with them.
+    ///
+    /// The `work_id` half of the answer is A2 §13 field 2's attribution.
+    async fn admissibility(
+        &self,
+        state: &ApiState,
+    ) -> Result<(atlas_db::Admissibility, atlas_trace::Attribution), MapRefusal> {
+        let kind = match (self.kind.as_deref(), self.external) {
+            (Some("knowledge"), _) => Some(SourceKind::LocalKnowledge),
+            (Some("repo"), _) => Some(SourceKind::EstateGit),
+            (Some("external"), _) | (None, Some(true)) => Some(SourceKind::ExternalGit),
+            (None, _) => None,
+            (Some(other), _) => {
+                return Err(Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "unknown_type",
+                    format!("unknown --type `{other}`: repo, knowledge or external"),
+                )));
+            }
+        };
+        // `--external` alongside a disagreeing `--type` is refused rather
+        // than resolved by precedence: two selectors that name different
+        // worlds are a caller error, and silently preferring one is the
+        // invented answer A2 §2's "never approximate" forbids.
+        if self.external == Some(true) && kind != Some(SourceKind::ExternalGit) {
+            return Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "conflicting_selectors",
+                "--external and --type name different worlds; pass one",
+            )));
+        }
+        let (source, attribution) = match (&self.source, &self.work) {
+            (Some(_), Some(_)) => {
+                return Err(Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "conflicting_selectors",
+                    "--source and --work are two stage-1 selectors; pass one",
+                )));
+            }
+            (Some(spec), None) => (
+                parse_source_selector(spec),
+                atlas_trace::Attribution::Unmanaged,
+            ),
+            (None, Some(work_id)) => {
+                let repository = self.work_repository(state, work_id).await?;
+                (
+                    atlas_db::SourceSelector::WorkBase {
+                        work_id: work_id.clone(),
+                        repository: repository.clone(),
+                    },
+                    atlas_trace::Attribution::Work {
+                        work_id: work_id.clone(),
+                        repository,
+                    },
+                )
+            }
+            (None, None) => (
+                atlas_db::SourceSelector::Any,
+                atlas_trace::Attribution::Unmanaged,
+            ),
+        };
+        Ok((
+            atlas_db::Admissibility {
+                source,
+                kind,
+                authority: None,
+            },
+            attribution,
+        ))
+    }
+
+    /// Which repository a `--work <id>` search is scoped to.
+    ///
+    /// `SourceSelector::WorkBase` names exactly one repository — deliberately,
+    /// so one Work's overlay over one repository cannot over-claim a sibling
+    /// (see that variant's own doc). A Work targeting several repositories
+    /// therefore has to be told which, and a Work targeting exactly one does
+    /// not: the single-repository case is *resolved from the Work record*,
+    /// never guessed, and the ambiguous case is refused with the flag that
+    /// resolves it.
+    async fn work_repository(&self, state: &ApiState, work_id: &str) -> Result<String, MapRefusal> {
+        let core = CoreGuard::acquire(&state.core).await;
+        let Some(work) = resolve_work(&core, work_id) else {
+            return Err(Box::new(error_response(
+                StatusCode::NOT_FOUND,
+                "work_not_found",
+                format!("no work with id {work_id}"),
+            )));
+        };
+        match (&self.repo, work.repositories.as_slice()) {
+            (Some(repo), repositories) if repositories.iter().any(|r| r == repo) => {
+                Ok(repo.clone())
+            }
+            (Some(repo), _) => Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "repo_not_in_work",
+                format!("work {work_id} does not target repository `{repo}`"),
+            ))),
+            (None, [only]) => Ok(only.clone()),
+            (None, []) => Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "work_has_no_repository",
+                format!("work {work_id} targets no repository, so --work selects nothing"),
+            ))),
+            (None, many) => Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "repo_required",
+                format!(
+                    "work {work_id} targets {} repositories ({}); name one with --repo",
+                    many.len(),
+                    many.join(", ")
+                ),
+            ))),
+        }
+    }
+
+    /// A2 §14's `--content`, as a family narrowing. `None` (or `all`)
+    /// searches every family.
+    fn family(&self) -> Result<Option<atlas_lexical::LexicalFamily>, MapRefusal> {
+        match self.content.as_deref() {
+            None | Some("all") => Ok(None),
+            // §14 spells the mail family `email`; A1's own row spelling is
+            // `mail`. Both are accepted so neither document is wrong.
+            Some("email") | Some("mail") => Ok(Some(atlas_lexical::LexicalFamily::Mail)),
+            Some("config") => Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "content_config_unavailable",
+                CONTENT_CONFIG_GAP,
+            ))),
+            Some(other) => match atlas_lexical::LexicalFamily::parse(other) {
+                Some(family) => Ok(Some(family)),
+                None => Err(Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "unknown_content",
+                    format!("unknown --content `{other}`: code, document, email, row-text or all"),
+                ))),
+            },
+        }
+    }
+
+    /// A2 §14's `--top <n>`, capped by the store regardless (F12).
+    ///
+    /// Purely a display parameter: both retrieval halves run at
+    /// `MAX_ROWS` whatever this says, so it cannot change the order of what
+    /// it returns (`tests/w4_rrf_fusion.rs::
+    /// the_fused_order_does_not_depend_on_the_callers_limit`).
+    fn top(&self) -> usize {
+        self.top
+            .unwrap_or(SEARCH_TOP_DEFAULT)
+            .min(atlas_db::MAX_ROWS)
+    }
+
+    /// Decision **H4**'s request side.
+    fn semantic(&self) -> atlas_semantic::SemanticRequest {
+        match self.semantic.as_deref() {
+            Some("off") => atlas_semantic::SemanticRequest::Suppressed,
+            _ => atlas_semantic::SemanticRequest::Requested,
+        }
+    }
+}
+
+/// How many hits `sgt search` prints when `--top` says nothing.
+///
+/// A **display** default, and provably only that: both retrieval halves run
+/// at `MAX_ROWS` regardless, so this number changes the length of the answer
+/// and never its order. Ten because a terminal page holds it; there is no
+/// measurement behind it and none is claimed.
+pub const SEARCH_TOP_DEFAULT: usize = 10;
+
+/// `--source <name>` or `--source <name>@<content-key>` (A2 §2's exact
+/// generation pin), as a stage-1 selector.
+fn parse_source_selector(spec: &str) -> atlas_db::SourceSelector {
+    match spec.split_once('@') {
+        Some((name, content_key)) if !name.is_empty() && !content_key.is_empty() => {
+            atlas_db::SourceSelector::Exact {
+                source_name: name.to_string(),
+                content_key: content_key.to_string(),
+            }
+        }
+        _ => atlas_db::SourceSelector::Named(spec.to_string()),
+    }
+}
+
+/// One answered hit, with **everything A2 §3 and §17 item 8 require it to
+/// cite**: source, generation, unit, family-shaped coordinate, and the two
+/// values that make an external hit visibly external.
+fn hit_json(hit: &atlas_fusion::FusedHit) -> Value {
+    json!({
+        "coordinate": atlas_lexical::UnitAddress::render(&hit.source_name, &hit.unit_key),
+        "source": hit.source_name,
+        "source_kind": hit.source_kind.as_str(),
+        "authority_class": hit.authority_class.as_str(),
+        "generation_id": hit.generation_id,
+        "content_key": hit.content_key,
+        "unit_key": hit.unit_key,
+        "unit": atlas_trace::coordinate_json(&hit.coordinate),
+        "rrf": hit.rrf,
+        "ranks": {"lexical": hit.origins.lexical, "semantic": hit.origins.semantic},
+        "signals_fired": hit.signals.fired(),
+    })
+}
+
+/// The four disclosure fields every retrieval answer carries, rendered once.
+fn answer_disclosure(answer: &atlas_db::FusedAnswer) -> Value {
+    json!({
+        "semantic": answer.semantic.as_str(),
+        "truncated": answer.truncated,
+        "work_scope": match &answer.scope {
+            atlas_db::WorkScope::NotWorkScoped => json!({"kind": "not_work_scoped"}),
+            atlas_db::WorkScope::BaseOnly => json!({"kind": "base_only"}),
+            atlas_db::WorkScope::BaseAndOverlaySnapshot { overlay_observed_at } => json!({
+                "kind": "base_and_overlay_snapshot",
+                "overlay_observed_at": overlay_observed_at,
+            }),
+        },
+    })
+}
+
+/// `GET /v1/search?q=<text>` — A2 §14's first verb.
+///
+/// A **pure read**. Nothing here indexes, scans, warms or writes: H13.2
+/// rejected query-time scanning precisely so this verb could be one, and
+/// `tests/w1b_overlay_lifecycle_trigger.rs::
+/// the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`
+/// is the structural pin. It reaches Atlas through the read-only
+/// [`with_atlas`], which hands `&AtlasDb`, never `&mut`.
+async fn search_query(State(state): State<ApiState>, Query(query): Query<SearchQuery>) -> Response {
+    let text = match query.q.as_deref().filter(|q| !q.trim().is_empty()) {
+        Some(text) => text.to_string(),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "query_required",
+                "sgt search takes a query: pass ?q=<text>",
+            );
+        }
+    };
+    let (filter, attribution) = match query.admissibility(&state).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let family = match query.family() {
+        Ok(family) => family,
+        Err(response) => return *response,
+    };
+    let lexical = atlas_db::LexicalQuery {
+        text: &text,
+        filter: &filter,
+        family,
+        limit: query.top(),
+        semantic: query.semantic(),
+    };
+    match with_atlas(&state, |atlas| atlas.traced_search(&lexical, attribution)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some((answer, trace))) => {
+            let mut body = json!({
+                "atlas": {"present": true},
+                "query": text,
+                "top": query.top(),
+                "hits": answer.hits.iter().map(hit_json).collect::<Vec<_>>(),
+                "trace": trace.json(),
+            });
+            merge_object(&mut body, answer_disclosure(&answer));
+            Json(body).into_response()
+        }
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/related?coordinate=<source>/<family>:<path>#<ordinal>` — A2
+/// §14's second verb.
+///
+/// Also a pure read, and also bounded: the query text is the **anchor unit's
+/// own stored text**, read out of Atlas, never anything the client sends —
+/// so there is no client-supplied pattern here any more than in `search`.
+async fn related_query(
+    State(state): State<ApiState>,
+    Query(query): Query<SearchQuery>,
+) -> Response {
+    let Some(raw) = query.coordinate.as_deref().filter(|c| !c.trim().is_empty()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "coordinate_required",
+            "sgt related takes a coordinate: pass ?coordinate=<source>/<family>:<path>#<ordinal>",
+        );
+    };
+    let Some(address) = atlas_lexical::UnitAddress::parse(raw) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "coordinate_unparseable",
+            format!(
+                "`{raw}` is not a unit coordinate: expected \
+                 <source>/<family>:<path>#<ordinal>, as `sgt search` prints it"
+            ),
+        );
+    };
+    let (filter, attribution) = match query.admissibility(&state).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let family = match query.family() {
+        Ok(family) => family,
+        Err(response) => return *response,
+    };
+    let request = atlas_db::RelatedRequest {
+        source_name: &address.source_name,
+        unit_key: &address.unit_key,
+        filter: &filter,
+        family,
+        limit: query.top(),
+        semantic: query.semantic(),
+        attribution,
+    };
+    match with_atlas(&state, |atlas| atlas.related(&request)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(None)) => error_response(
+            StatusCode::NOT_FOUND,
+            "coordinate_not_found",
+            format!(
+                "no admissible unit at `{raw}`: the source may not be indexed, \
+                 or the current filter may not admit it"
+            ),
+        ),
+        Ok(Some(Some(related))) => {
+            let mut body = json!({
+                "atlas": {"present": true},
+                "anchor": {
+                    "coordinate": atlas_lexical::UnitAddress::render(
+                        &related.anchor.source_name,
+                        &related.anchor.unit_key,
+                    ),
+                    "source": related.anchor.source_name,
+                    "source_kind": related.anchor.source_kind.as_str(),
+                    "authority_class": related.anchor.authority_class.as_str(),
+                    "generation_id": related.anchor.generation_id,
+                    "content_key": related.anchor.content_key,
+                    "unit_key": related.anchor.unit_key,
+                    "unit": atlas_trace::coordinate_json(&related.anchor.coordinate),
+                },
+                "top": query.top(),
+                "hits": related.answer.hits.iter().map(hit_json).collect::<Vec<_>>(),
+                "trace": related.trace.json(),
+            });
+            merge_object(&mut body, answer_disclosure(&related.answer));
+            Json(body).into_response()
+        }
+        Err(response) => *response,
+    }
+}
+
+/// Fold one flat JSON object's keys into another. Used so the four
+/// disclosure fields are written once (`answer_disclosure`) and appear at the
+/// top level of both answers, rather than being spelled twice and drifting.
+fn merge_object(target: &mut Value, extra: Value) {
+    if let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
     }
 }
 
