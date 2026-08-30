@@ -1324,18 +1324,68 @@ fn dispatch_worker_resource_at_depth(
                 syntax: None,
                 parent,
             });
+            // S5 W7 (F-SF-02): a child's parent coordinate is its IMMEDIATE
+            // parent's, not the dispatched resource's. The worker flattens a
+            // whole tree onto one batch, joining nesting levels with
+            // [`CHILD_PATH_SEPARATOR`], and emits a container before its own
+            // members — so walking that list in order, remembering each
+            // landed container's composed path and its own freshly-composed
+            // F7 key, is enough to hand every child its real parent without
+            // re-entering a single container. `validate_batch` has already
+            // refused any child whose path names a container this batch does
+            // not declare, which is what makes the lookup below well-founded
+            // rather than a best effort.
+            let mut containers: BTreeMap<String, (String, String)> = BTreeMap::new();
             for child in batch.declared_children {
-                land_child(
+                let full_entry_path = child.relative_path;
+                let (child_parent_path, child_parent_key, entry_path) = match full_entry_path
+                    .rsplit_once(CHILD_PATH_SEPARATOR)
+                {
+                    None => (
+                        relative_path.clone(),
+                        parent_key.clone(),
+                        full_entry_path.clone(),
+                    ),
+                    Some((ancestor, own)) => match containers.get(ancestor) {
+                        Some((composed, key)) => (composed.clone(), key.clone(), own.to_string()),
+                        None => {
+                            // Unreachable behind `validate_batch`'s own
+                            // `OrphanedChildPath` refusal, and named
+                            // rather than unwrapped for the same reason
+                            // every other such branch in this module is:
+                            // an honest coverage row beats a panic in the
+                            // sole writer.
+                            coverage.push(CoverageRow {
+                                path: Some(format!(
+                                    "{relative_path}{CHILD_PATH_SEPARATOR}{full_entry_path}"
+                                )),
+                                status: Coverage::Error,
+                                detail: Some(format!(
+                                    "container child names the container {ancestor:?} it came \
+                                         out of, but no such container child was landed from this \
+                                         batch; not landed, rather than re-parented onto \
+                                         {relative_path:?}"
+                                )),
+                                bytes: Some(child.content.len() as u64),
+                            });
+                            continue;
+                        }
+                    },
+                };
+                if let Some(landed) = land_child(
                     worker,
                     filter,
-                    &relative_path,
-                    &parent_key,
-                    child,
+                    &child_parent_path,
+                    &child_parent_key,
+                    entry_path,
+                    child.content,
                     depth,
                     files,
                     coverage,
                     extractors,
-                );
+                ) {
+                    containers.insert(full_entry_path, landed);
+                }
             }
         }
         WorkerOutcome::Refused(row) => {
@@ -1375,6 +1425,15 @@ fn dispatch_worker_resource_at_depth(
 /// stored identity — see [`DeclaredChild`]'s own doc for what that does and
 /// does not vouch for.
 ///
+/// `parent_relative_path`/`parent_key` are the IMMEDIATE parent's, and
+/// `entry_path` is this entry's path RELATIVE TO THAT PARENT (S5 W7
+/// F-SF-02) — the caller decomposes a flattened path and supplies them, so
+/// everything composed here (the child's own path, its [`ChildProvenance`]
+/// and its [`KeySpace::Child`] key) chains one level rather than resolving
+/// to the root container. Returns the container coordinate a landed
+/// container child's own members must be landed against — its composed path
+/// and its own key — and `None` for every other outcome.
+///
 /// [`DeclaredChild`]: crate::runtime::atlas::worker::DeclaredChild
 #[allow(clippy::too_many_arguments)]
 fn land_child(
@@ -1382,15 +1441,15 @@ fn land_child(
     filter: &AcquisitionFilter,
     parent_relative_path: &str,
     parent_key: &str,
-    child: crate::runtime::atlas::worker::DeclaredChild,
+    entry_path: String,
+    content: Vec<u8>,
     depth: u32,
     files: &mut Vec<ScannedFile>,
     coverage: &mut Vec<CoverageRow>,
     extractors: &mut BTreeSet<String>,
-) {
-    let entry_path = child.relative_path;
+) -> Option<(String, String)> {
     let composed = format!("{parent_relative_path}{CHILD_PATH_SEPARATOR}{entry_path}");
-    let byte_len = child.content.len() as u64;
+    let byte_len = content.len() as u64;
     if depth >= crate::runtime::atlas::archive::MAX_NESTING_DEPTH {
         coverage.push(CoverageRow {
             path: Some(composed),
@@ -1403,7 +1462,7 @@ fn land_child(
             )),
             bytes: Some(byte_len),
         });
-        return;
+        return None;
     }
     let Some(extractor) = child_extractor_for(&entry_path) else {
         coverage.push(CoverageRow {
@@ -1415,12 +1474,12 @@ fn land_child(
             )),
             bytes: Some(byte_len),
         });
-        return;
+        return None;
     };
     // The daemon's own hash of the bytes it received, computed on receipt —
     // not the worker's declared value, which `validate_batch` has already
     // cross-checked against exactly this computation.
-    let hash = content_hash(&child.content);
+    let hash = content_hash(&content);
     let provenance = ChildProvenance {
         parent_relative_path: parent_relative_path.to_string(),
         parent_key: parent_key.to_string(),
@@ -1445,9 +1504,10 @@ fn land_child(
             )),
             bytes: Some(byte_len),
         });
+        let local_key = keys.key(&hash, extractor);
         files.push(ScannedFile {
-            relative_path: composed,
-            local_key: keys.key(&hash, extractor),
+            relative_path: composed.clone(),
+            local_key: local_key.clone(),
             content_hash: hash,
             extractor: extractor.to_string(),
             byte_len,
@@ -1456,7 +1516,10 @@ fn land_child(
             syntax: None,
             parent: Some(provenance),
         });
-        return;
+        // The coordinate this container's OWN members are landed against
+        // (F-SF-02): its composed path and its own chained F7 key, never the
+        // resource this batch was dispatched for.
+        return Some((composed, local_key));
     }
     if worker_extractor_for(&entry_path).is_some() {
         dispatch_worker_resource_at_depth(
@@ -1465,7 +1528,7 @@ fn land_child(
             composed,
             &hash,
             keys,
-            child.content,
+            content,
             extractor,
             None,
             Some(provenance),
@@ -1474,7 +1537,7 @@ fn land_child(
             coverage,
             extractors,
         );
-        return;
+        return None;
     }
     let Some(claims) = claims_for(&entry_path) else {
         // Unreachable in practice: `child_extractor_for` answered `Some`, and
@@ -1491,16 +1554,16 @@ fn land_child(
             )),
             bytes: Some(byte_len),
         });
-        return;
+        return None;
     };
-    let Some(text) = as_text(&child.content) else {
+    let Some(text) = as_text(&content) else {
         coverage.push(CoverageRow {
             path: Some(composed),
             status: Coverage::Unsupported,
             detail: Some("not valid UTF-8 text".to_string()),
             bytes: Some(byte_len),
         });
-        return;
+        return None;
     };
     let extracted = extract_resource(claims, text, &hash, keys);
     extractors.extend(extracted.identities.iter().cloned());
@@ -1521,6 +1584,7 @@ fn land_child(
         syntax: extracted.syntax,
         parent: Some(provenance),
     });
+    None
 }
 
 /// Everything one resource's bytes yielded, for every extractor that claimed

@@ -281,6 +281,141 @@ Content-Transfer-Encoding: base64\r\n\r\n"
     );
 }
 
+/// **F-SF-02: a grandchild's parent coordinate is its IMMEDIATE container,
+/// not the root.** A1 §6.6 preserves the "parent archive source/resource" of
+/// an expanded entry, and `KeySpace::Child`'s own doc says a child's F7 key
+/// is `child_key` of "its IMMEDIATE parent's own key — chained, so a
+/// grandchild's key already encodes its whole ancestry".
+///
+/// Before this fix the worker's flattened batch was landed against ONE fixed
+/// coordinate — the dispatched resource's path and key — for every entry in
+/// it, however deep, so `message.eml!/bundle.zip!/report.docx` recorded
+/// `message.eml` as its parent and keyed off the *message's* key with the
+/// whole ancestry mashed into the `entry_path` string. The intermediate
+/// `bundle.zip` is itself a landed resource with its own key; that is the
+/// key a grandchild chains through, and this test reads the PERSISTED row to
+/// say so rather than trusting the in-memory struct.
+#[test]
+fn a_grandchilds_persisted_parent_is_its_immediate_container_not_the_root() {
+    let docx = fixture("anydoc_corpus/docx_fixtures/01-plain-headings-paragraphs.docx");
+    let inner_zip = zip_of(&[("report.docx", &docx)]);
+    let mut raw: Vec<u8> = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: bundle\r\n\
+Date: Mon, 1 Jan 2024 00:00:00 +0000\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"B\"\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\n\
+see attached\r\n--B\r\nContent-Type: application/zip; name=\"bundle.zip\"\r\n\
+Content-Disposition: attachment; filename=\"bundle.zip\"\r\n\
+Content-Transfer-Encoding: base64\r\n\r\n"
+        .to_vec();
+    raw.extend_from_slice(base64_encode(&inner_zip).as_bytes());
+    raw.extend_from_slice(b"\r\n--B--\r\n");
+
+    let (_root, scan) = scan_one("message.eml", &raw);
+
+    let zip_child = scan
+        .files
+        .iter()
+        .find(|f| f.relative_path == "message.eml!/bundle.zip")
+        .expect("the intermediate container lands as its own resource");
+    let grandchild = scan
+        .files
+        .iter()
+        .find(|f| f.relative_path == "message.eml!/bundle.zip!/report.docx")
+        .unwrap_or_else(|| panic!("the grandchild lands: {:?}", scan.files));
+
+    // The in-memory provenance, which is what gets persisted.
+    let provenance = grandchild
+        .parent
+        .as_ref()
+        .expect("a grandchild carries a parent coordinate");
+    assert_eq!(
+        provenance.parent_relative_path, "message.eml!/bundle.zip",
+        "the parent is the ZIP the entry actually came out of, not the root message"
+    );
+    assert_eq!(
+        provenance.parent_key, zip_child.local_key,
+        "the parent key is the intermediate container's OWN composed key"
+    );
+    assert_eq!(
+        provenance.entry_path, "report.docx",
+        "the entry path is relative to that immediate parent, not the whole ancestry as a string"
+    );
+    // And the F7 key chains through it, exactly as `KeySpace::Child`'s doc
+    // claims — one link, not a root-resolved key over a multi-segment path.
+    assert_eq!(
+        grandchild.local_key,
+        sergeant_rs::domain::source::child_key(
+            &zip_child.local_key,
+            "report.docx",
+            &grandchild.content_hash,
+            DOCX_EXTRACTOR,
+        )
+    );
+
+    // Persisted, through the real stage/journal/confirm discipline.
+    let data_dir = TempDir::new().expect("data dir");
+    {
+        let mut db = AtlasDb::open(data_dir.path()).expect("open atlas");
+        let mut journal = Journal::open(data_dir.path()).expect("open journal");
+        record_scan(&mut db, &mut journal, &scan, None).expect("record");
+    }
+    let conn =
+        duckdb::Connection::open(atlas_db_path(data_dir.path())).expect("read the recorded store");
+    let mut statement = conn
+        .prepare(
+            "SELECT parent_relative_path, parent_key, entry_path \
+             FROM source.child_resources WHERE relative_path = ?",
+        )
+        .expect("prepare");
+    let mut rows = statement
+        .query_map(["message.eml!/bundle.zip!/report.docx"], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1, "exactly one persisted row: {rows:?}");
+    let (parent_path, recorded_parent_key, entry_path) = rows.pop().expect("row");
+    assert_eq!(parent_path, "message.eml!/bundle.zip");
+    assert_eq!(recorded_parent_key, zip_child.local_key);
+    assert_eq!(entry_path, "report.docx");
+}
+
+/// **F-SF-02, the daemon-side authority that makes the chaining
+/// well-founded.** A flattened path ASSERTS the container it came out of.
+/// A batch declaring `bundle.zip!/report.md` without also declaring the
+/// container child `bundle.zip` is refused outright, rather than having the
+/// orphan silently re-parented onto the dispatched resource — which is
+/// precisely the root-resolution this finding found.
+#[test]
+fn a_child_naming_a_container_the_batch_never_declared_is_refused() {
+    let batch = batch_with(vec![well_formed(
+        "report.md",
+        "bundle.zip!/report.md",
+        b"# orphan",
+    )]);
+    let err = validate_batch(&identity(), &batch, &deny()).expect_err("must refuse");
+    assert!(
+        matches!(
+            &err,
+            BatchRefusal::OrphanedChildPath { missing_container, .. }
+                if missing_container == "bundle.zip"
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.coverage_row().status, Coverage::Error);
+
+    // The same child, with its container actually declared, is admitted.
+    let whole = batch_with(vec![
+        well_formed("bundle.zip", "bundle.zip", b"PK\x05\x06"),
+        well_formed("report.md", "bundle.zip!/report.md", b"# orphan"),
+    ]);
+    assert_eq!(validate_batch(&identity(), &whole, &deny()), Ok(()));
+}
+
 /// **A child with no claiming extractor is a NAMED COVERAGE GAP, not
 /// silence** (F8, A1 §15). It is not landed as a resource — nothing extracted
 /// it — but it is not dropped either: a `Coverage::Unsupported` row at its own

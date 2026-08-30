@@ -455,6 +455,28 @@ pub enum BatchRefusal {
         /// The summed byte length of every declared child in the batch.
         total_bytes: u64,
     },
+    /// A declared child's path names a container it came out of that the
+    /// batch never declared (S5 W7 F-SF-02).
+    ///
+    /// A flattened path joins every nesting level with
+    /// [`super::scan::CHILD_PATH_SEPARATOR`], so `bundle.zip!/report.docx`
+    /// asserts "this came out of the entry `bundle.zip`, which is in this
+    /// same batch". The daemon composes each landed child's parent
+    /// coordinate — parent path, parent F7 key — from that assertion, so a
+    /// path whose named ancestor is absent, or is present but is not a
+    /// container, would either dangle or be silently re-parented onto the
+    /// root. Refused instead: the ancestor must be declared in this batch
+    /// AND must route to a container adapter
+    /// ([`super::scan::child_is_container`]).
+    OrphanedChildPath {
+        /// The child's declared name.
+        child: String,
+        /// The path it declared.
+        path: String,
+        /// The ancestor entry its path names but the batch does not declare
+        /// as a container.
+        missing_container: String,
+    },
 }
 
 impl BatchRefusal {
@@ -476,7 +498,8 @@ impl BatchRefusal {
             | Self::ChildTooLarge { .. }
             | Self::ChildHashMismatch { .. }
             | Self::ChildAdapterMismatch { .. }
-            | Self::BatchTotalTooLarge { .. } => Coverage::Error,
+            | Self::BatchTotalTooLarge { .. }
+            | Self::OrphanedChildPath { .. } => Coverage::Error,
         };
         let detail = match self {
             Self::IdentityMismatch {
@@ -523,6 +546,16 @@ impl BatchRefusal {
                  before any child could reach the store",
                 super::archive::MAX_TOTAL_EXPANDED_BYTES
             ),
+            Self::OrphanedChildPath {
+                child,
+                path,
+                missing_container,
+            } => format!(
+                "supervised parse worker declared child {child:?} at {path:?}, whose path names \
+                 the container {missing_container:?} it came out of, but the batch declares no \
+                 such container child; refused rather than silently re-parented onto the \
+                 dispatched resource"
+            ),
         };
         CoverageRow {
             path: None,
@@ -552,7 +585,9 @@ fn enclosed_relative_path(path: &str) -> bool {
 /// (S5 W7 F-IN-01), then per child, path safety, then F10 deny-set
 /// membership — on every declared child's name AND its path, because a deny
 /// pattern can match either — then (S5 W7) the per-child byte ceiling, the
-/// child's content hash, and its adapter claim.
+/// child's content hash, its adapter claim, and (S5 W7 F-SF-02) whether the
+/// container its own flattened path names is declared in this same batch as a
+/// container child.
 ///
 /// Checked in this order so the *first* thing wrong with a batch is what a
 /// coverage row names — a batch failing on identity never gets far enough to
@@ -677,6 +712,28 @@ pub fn validate_batch(
                 child: declared.name.clone(),
                 declared: declared.entry_adapter.clone(),
                 derived: derived.map(str::to_string),
+            });
+        }
+        // S5 W7 F-SF-02: a flattened path ASSERTS its own container chain,
+        // and the daemon composes each landed child's parent coordinate from
+        // that assertion. Checked here, with the batch's other declared
+        // children in hand, because that is the only place the assertion can
+        // be checked at all: `land_child` sees one child at a time. A path
+        // naming a container this batch never declared — or naming one that
+        // does not route to a container adapter — is refused rather than
+        // re-parented onto the dispatched resource, which is exactly the
+        // silent root-resolution F-SF-02 found.
+        if let Some((ancestor, _)) = declared
+            .relative_path
+            .rsplit_once(super::scan::CHILD_PATH_SEPARATOR)
+            && !batch.declared_children.iter().any(|other| {
+                other.relative_path == ancestor && super::scan::child_is_container(ancestor)
+            })
+        {
+            return Err(BatchRefusal::OrphanedChildPath {
+                child: declared.name.clone(),
+                path: declared.relative_path.clone(),
+                missing_container: ancestor.to_string(),
             });
         }
     }
