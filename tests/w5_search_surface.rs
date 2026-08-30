@@ -635,6 +635,30 @@ fn item_3s_relational_read_is_reachable_from_outside_the_process() {
 ///   [`UnitCoordinate::Document`]'s `native` — the normalizer's own address,
 ///   `block:<n>` — and that is what this test holds an Office section to.
 ///
+/// # "Office", in this build, means `.docx` — and nothing else
+///
+/// A2 §9's own example output shows a `.pptx` slide and a `.docx` section
+/// side by side, and §9's prose names Word, PowerPoint, Excel, PDF and mail
+/// as things a local knowledge Source *may contain*. This build claims one
+/// of them: `.docx`. `office::extractor_for` routes `.docx` (case-
+/// insensitively) and nothing else — `book.xlsx`, `deck.pptx`, `notes.odt`
+/// and `report.pdf` are all explicitly unclaimed, pinned by
+/// `office::tests::extractor_for_claims_only_docx`, and a knowledge Source
+/// holding them gets an honest `unsupported` coverage row per path rather
+/// than a unit. So item 6's "span" is proven here for the one Office format
+/// that exists, and a Source of `.pptx`/`.xlsx`/PDF cannot be spanned at
+/// all today.
+///
+/// That is a deliberate, pre-existing scope boundary, not a gap this test
+/// discovered: the Y2 wave brief scoped the gate to one Office format
+/// ("NOT in scope: ... a second Office format beyond the one the gate
+/// adopts"), and `tests/fixtures/anydoc_corpus/MANIFEST.md` records the
+/// corpus carrying no spreadsheet/presentation/PDF fixtures for that
+/// reason. It is restated here because this is where a reader checking
+/// item 6 looks, and "normalized Office/docs" in the contract's own words
+/// reads wider than the adapter is. Adding a second format is adapter
+/// work, not a doc fix.
+///
 /// An earlier version of this test asserted `byte_end > byte_start` for "a
 /// document coordinate" of *both* files and passed only because the one hit
 /// it happened to pick per path was the whole-document one. That prose
