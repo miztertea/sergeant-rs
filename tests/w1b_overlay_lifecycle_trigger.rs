@@ -498,7 +498,32 @@ fn an_overlay_scan_failure_degrades_to_base_only_and_is_reported() {
 /// | `self.conn.execute_batch(&v)` | `no field 'conn' on type &Admissible` |
 /// | `self.reader.execute_batch(&v)` | `no method named 'execute_batch'` |
 /// | `self.reader.rows(&v, …)` | `Sql: From<&String> is not satisfied` |
-/// | `self.reader.rows(read_sql!("DELETE FROM source.units"), …)` | `evaluation panicked: … must begin 'SELECT '` |
+/// | `self.reader.rows(read_sql!("DELETE FROM source.units"), …)` | `evaluation panicked: … beginning 'SELECT ' and containing no ';'` |
+///
+/// # The prefix check alone was not enough, and that was proven too
+///
+/// A third round of this closeout landed a write **through** the
+/// `SELECT `-prefix check:
+///
+/// ```ignore
+/// self.reader.rows(read_sql!("SELECT 1; DELETE FROM source.generations"), …)
+/// ```
+///
+/// The prefix sees only the leading `SELECT `, and DuckDB executes **every**
+/// statement in a `;`-separated batch — measured directly against a raw
+/// connection on duckdb 1.10505.0: `prepare` alone runs nothing, `prepare` +
+/// `query` runs the whole batch and returns the *last* statement's result,
+/// and a three-row table came back empty. (A batch containing a `?` bind is
+/// refused at `prepare` instead, so the parameterised spelling of this
+/// exploit errors rather than deleting — the unparameterised one is the real
+/// one.) `ReadSql` now refuses any `;` at all, checked in the same `const`
+/// evaluation as the prefix.
+///
+/// That the check is a `const` and not a scan is the point: const evaluation
+/// sees the **assembled** string, after `concat!` has resolved, so
+/// `read_sql!(concat!("DEL", "ETE FROM t"))` is `DELETE FROM t` by the time
+/// the check runs. A text scanner reads the source spelling and never sees
+/// it. Attempted, and it fails the build.
 ///
 /// # What THIS test is, now
 ///
@@ -591,15 +616,42 @@ fn the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls() {
     );
 
     // (d) And `ReadSql` really is checked, at compile time. `read_sql!` builds
-    //     a named `const` item rather than a `const { .. }` block on purpose:
-    //     a const block inside the lifetime-generic `impl Admissible<'_>` is a
-    //     post-monomorphization error that `cargo check` walks straight past,
-    //     which was observed during the closeout before this shape was chosen.
+    //     an anonymous `const` **item** rather than a `const { .. }` block on
+    //     purpose: a const block — and the generic associated const inside
+    //     `ReadSql::of`, which covers the non-macro path — is a
+    //     post-monomorphization error that `cargo check` walks straight past.
+    //     That was observed during the closeout, twice: once before this
+    //     shape was chosen, and once again when a hand-written `impl SqlText`
+    //     carrying a `DELETE` passed `cargo check` and only failed the moment
+    //     a test actually called it.
     assert!(
-        source.contains("        const CHECKED: $crate::runtime::atlas::db::store::ReadSql =")
-            && source.contains("begins_with_select(sql),"),
-        "`read_sql!` must evaluate `ReadSql::new` as a `const` item, so a statement that is \
-         not a `SELECT` fails the build rather than reaching DuckDB"
+        source.contains("        const _: () = assert!(\n")
+            && source.contains("$crate::runtime::atlas::db::store::is_read_statement("),
+        "`read_sql!` must evaluate `is_read_statement` as a non-generic `const` item, so a \
+         statement that is not one bare `SELECT` fails `cargo check` rather than reaching \
+         DuckDB"
+    );
+
+    // (e) And the rule that `const` enforces is BOTH conditions. The `;` half
+    //     is not decoration: the prefix half alone was defeated during this
+    //     closeout by `"SELECT 1; DELETE FROM source.generations"`, which
+    //     DuckDB runs in full. `is_read_statement`'s own behaviour is pinned
+    //     by a table in `db.rs`'s unit tests
+    //     (`is_read_statement_admits_exactly_one_bare_select`); what is
+    //     checked here is that the function the macro calls still tests both.
+    let read_rule = block_after(
+        &source,
+        "    pub const fn is_read_statement(sql: &str) -> bool {",
+    );
+    assert!(
+        read_rule.contains("let want = b\"SELECT \";"),
+        "`is_read_statement` must still check the seven-byte `SELECT ` prefix"
+    );
+    assert!(
+        read_rule.contains("if bytes[i] == b';' {"),
+        "`is_read_statement` must still refuse a `;` anywhere — DuckDB executes every \
+         statement in a `;`-separated batch, which is how the prefix-only check was \
+         defeated"
     );
 
     // ---------------------------------------------------------------- part 2

@@ -124,7 +124,7 @@ use duckdb::types::Value as Duck;
 use duckdb::{Connection, Statement};
 
 use serde_json::{Map, Value, json};
-use store::{ReadOnly, Sql, Statements, Store};
+use store::{Name, ReadOnly, Sql, Statements, Store};
 
 use crate::domain::event::{Event, unix_millis};
 use crate::domain::execution::{
@@ -165,6 +165,164 @@ use crate::runtime::graph::{
 };
 use crate::runtime::journal::JournalError;
 use crate::runtime::surface::{KIND_SURFACE_MATERIALIZED, KIND_SURFACE_TORN_DOWN};
+
+// ---------------------------------------------------------------------------
+// The three constructors for everything this file hands the database driver.
+//
+// They live here, above every call site, because `macro_rules!` is textually
+// scoped: a macro is usable only *after* its definition in source order, and
+// `rows_sql` — the first caller — is a few hundred lines below.
+//
+// Each one puts its argument into an associated `const`, and that is the
+// entire mechanism; see
+// [`store::SqlText`](crate::runtime::atlas::db::store::SqlText) for why const
+// evaluation, and not a `&'static str` bound, is what makes a caller's string
+// unable to reach DuckDB.
+// ---------------------------------------------------------------------------
+
+/// A statement this crate wrote, in the one type [`store::Store`] will run.
+///
+/// `$text` is placed in an associated `const`, so the compiler evaluates it:
+/// `sql!(Box::leak(caller.to_string().into_boxed_str()))` is E0015 and
+/// `sql!(some_local)` is E0435. Neither is a lint, a scan, or a convention.
+///
+/// The arm is `$text:expr` rather than `$text:literal` on purpose. A literal
+/// arm would reject `sql!(HARDENING_DDL)` — a path, not a literal token —
+/// while adding nothing: the `const` refuses every non-const expression a
+/// literal arm would have refused, and refuses `include_str!`-shaped ones no
+/// differently than the literal arm would have admitted them.
+macro_rules! sql {
+    ($text:expr) => {{
+        struct SqlLiteral;
+        impl $crate::runtime::atlas::db::store::SqlText for SqlLiteral {
+            const TEXT: &'static str = $text;
+        }
+        $crate::runtime::atlas::db::store::Sql::of::<SqlLiteral>()
+    }};
+}
+
+/// The `ops` table list and each table's qualified SQL reference, declared
+/// **once**.
+///
+/// [`Sql`] cannot be built from a runtime string, and an operations table's
+/// name *is* a runtime string at the point it is needed — it comes out of
+/// `TABLES` by value inside a loop. So the qualification is a `match` over
+/// compile-time alternatives rather than an interpolation, and this macro
+/// emits the list and the match from one source so the two cannot drift.
+/// Every arm's right-hand side is the whole reference, quoted: the quoting is
+/// what keeps `usage` (a reserved word) addressable, and the qualification is
+/// what stops a bare name from resolving against DuckDB's default `main`
+/// schema, which this database deliberately leaves empty.
+macro_rules! ops_tables {
+    ($($name:literal => $qualified:literal,)+) => {
+        /// Tables this projection creates, in a stable order. Crate-internal:
+        /// the table list is an implementation detail of the projection, and
+        /// callers get it as data from [`Analytics::table_counts`].
+        const TABLES: &[&str] = &[$($name),+];
+
+        /// One operations table, qualified and quoted for SQL.
+        ///
+        /// Total over [`TABLES`] by construction — both come out of the one
+        /// `ops_tables!` invocation — and
+        /// `every_mutable_table_is_an_ops_table` pins the only other list of
+        /// names that reaches here.
+        fn ops(table: &str) -> Sql {
+            match table {
+                $($name => sql!($qualified),)+
+                other => unreachable!(
+                    "`{other}` is not an `ops` table; every caller takes its name from \
+                     TABLES or MUTABLE_TABLES, which this macro and its test cover"
+                ),
+            }
+        }
+    };
+}
+
+/// [`CANNED_QUERIES`] and the statement each one runs, declared **once**.
+///
+/// Same shape and same reason as [`ops_tables!`]: the *name* a caller asks
+/// for is a runtime string, [`Sql`] cannot be built from one, and the
+/// published `sql` field has to stay `&'static str` because it is displayed
+/// and hashed rather than executed. So the macro emits the fixed list and a
+/// `match` from the same tokens, and the executed statement is never the
+/// field — it is a [`sql!`] over the identical literal.
+macro_rules! canned_queries {
+    ($(CannedQuery { name: $name:literal, question: $question:literal, sql: $statement:literal, },)+) => {
+        /// The canned queries this build answers.
+        ///
+        /// Deliberately a fixed list rather than arbitrary client SQL: §22's
+        /// "clients do not access DuckDB directly" is about the *one-owner*
+        /// property, and an endpoint that executes a client's SQL against the
+        /// daemon's database hands the ownership back. M6 owns presentation;
+        /// this is the data behind it.
+        pub const CANNED_QUERIES: &[CannedQuery] = &[
+            $(CannedQuery { name: $name, question: $question, sql: $statement },)+
+        ];
+
+        /// The statement one canned query runs.
+        ///
+        /// Total over [`CANNED_QUERIES`] by construction, and the only caller
+        /// has already looked the name up in that list.
+        fn canned_sql(name: &str) -> Sql {
+            match name {
+                $($name => sql!($statement),)+
+                other => unreachable!(
+                    "`{other}` is not a canned query; the caller resolves the name \
+                     against CANNED_QUERIES first"
+                ),
+            }
+        }
+    };
+}
+
+/// A table or schema name this crate wrote — [`sql!`] for [`store::Name`].
+macro_rules! name {
+    ($text:expr) => {{
+        struct NameLiteral;
+        impl $crate::runtime::atlas::db::store::SqlText for NameLiteral {
+            const TEXT: &'static str = $text;
+        }
+        $crate::runtime::atlas::db::store::Name::of::<NameLiteral>()
+    }};
+}
+
+/// A [`store::ReadSql`] whose read check runs at **compile time**.
+///
+/// Two things are being enforced, and they are not the same thing:
+///
+/// 1. `$text` is compile-time text ([`sql!`]'s mechanism, unchanged here), so
+///    no caller's string can be the statement.
+/// 2. That text is one bare `SELECT` with no `;` in it — the check
+///    [`store::is_read_statement`] spells out, evaluated in a **named,
+///    non-generic `const` item**.
+///
+/// The shape of (2) is load-bearing. A `const { .. }` block, or the generic
+/// associated const inside `ReadSql::of`, is a post-monomorphization error
+/// that `cargo check` walks straight past — verified by watching exactly that
+/// happen during the S5 closeout. An anonymous `const _` **item** is
+/// evaluated eagerly, so `cargo check` fails too.
+///
+/// And note *why* a const check is the right instrument rather than a scan of
+/// this file's text: const evaluation sees the **assembled** string, after
+/// `concat!` has resolved. `read_sql!(concat!("DEL", "ETE FROM t"))` is
+/// `DELETE FROM t` here. A text scanner reads the source spelling and never
+/// sees it.
+macro_rules! read_sql {
+    ($text:expr) => {{
+        struct ReadSqlLiteral;
+        impl $crate::runtime::atlas::db::store::SqlText for ReadSqlLiteral {
+            const TEXT: &'static str = $text;
+        }
+        const _: () = assert!(
+            $crate::runtime::atlas::db::store::is_read_statement(
+                <ReadSqlLiteral as $crate::runtime::atlas::db::store::SqlText>::TEXT
+            ),
+            "a read-only handle may only run one statement, beginning `SELECT ` and \
+             containing no `;`"
+        );
+        $crate::runtime::atlas::db::store::ReadSql::of::<ReadSqlLiteral>()
+    }};
+}
 
 /// Directory under the data dir holding Atlas's durable store.
 ///
@@ -771,11 +929,11 @@ pub const DATASET_QUERIES: &[DatasetQuery] = &[DATASET_ROW_COUNT, DATASET_COLUMN
 /// deliberately left at their defaults: an option this build does not
 /// understand the failure modes of is not one it should be setting on an
 /// operator's file.
-fn reader_call(format: DatasetFormat) -> &'static str {
+fn reader_call(format: DatasetFormat) -> Sql {
     match format {
-        DatasetFormat::Csv => "read_csv(?, auto_detect = true)",
-        DatasetFormat::Json => "read_json(?, auto_detect = true)",
-        DatasetFormat::Parquet => "read_parquet(?)",
+        DatasetFormat::Csv => sql!("read_csv(?, auto_detect = true)"),
+        DatasetFormat::Json => sql!("read_json(?, auto_detect = true)"),
+        DatasetFormat::Parquet => sql!("read_parquet(?)"),
     }
 }
 
@@ -787,11 +945,10 @@ fn reader_call(format: DatasetFormat) -> &'static str {
 /// covers the answer a reader will actually see, with no formatting step in
 /// between where two builds could disagree about how a `DOUBLE` renders.
 fn rows_sql(format: DatasetFormat) -> Sql {
-    Sql::from_parts(&[
-        "SELECT COLUMNS(*)::VARCHAR FROM ",
-        reader_call(format),
-        " LIMIT ?",
-    ])
+    let mut statement = sql!("SELECT COLUMNS(*)::VARCHAR FROM ");
+    statement.extend(&reader_call(format));
+    statement.extend(&sql!(" LIMIT ?"));
+    statement
 }
 
 /// [`DATASET_ROW_COUNT`]'s SQL for one format.
@@ -800,25 +957,27 @@ fn rows_sql(format: DatasetFormat) -> Sql {
 /// the cap costs one capped scan rather than a full one (F12). The caller asks
 /// for `cap + 1` and learns from the answer whether the cap bit.
 fn row_count_sql(format: DatasetFormat) -> Sql {
-    Sql::from_parts(&[
-        "SELECT count(*)::VARCHAR AS rows FROM (SELECT 1 FROM ",
-        reader_call(format),
-        " LIMIT ?)",
-    ])
+    let mut statement = sql!("SELECT count(*)::VARCHAR AS rows FROM (SELECT 1 FROM ");
+    statement.extend(&reader_call(format));
+    statement.extend(&sql!(" LIMIT ?)"));
+    statement
 }
 
 /// [`DATASET_COLUMN_PROFILE`]'s SQL for one format.
 fn column_profile_sql(format: DatasetFormat) -> Sql {
-    Sql::from_parts(&[
+    let mut statement = sql!(
         "SELECT column_name, count(*)::VARCHAR AS rows, \
          count(value)::VARCHAR AS non_null_rows, \
          count(DISTINCT value)::VARCHAR AS distinct_values \
-         FROM (SELECT COLUMNS(*)::VARCHAR FROM ",
-        reader_call(format),
+         FROM (SELECT COLUMNS(*)::VARCHAR FROM "
+    );
+    statement.extend(&reader_call(format));
+    statement.extend(&sql!(
         " LIMIT ?) \
          UNPIVOT (value FOR column_name IN (COLUMNS(*))) \
-         GROUP BY column_name ORDER BY column_name",
-    ])
+         GROUP BY column_name ORDER BY column_name"
+    ));
+    statement
 }
 
 /// The SQL for one canned query over one format.
@@ -909,36 +1068,65 @@ pub struct DatasetFact {
 /// **Where the compiler, not a scan of this file's text, enforces two of
 /// Atlas's boundaries.**
 ///
-/// Both boundaries below were guarded until the S5 closeout by structural
-/// tests that read `db.rs` as text and looked for forbidden spellings. Both
-/// guards were then defeated by a single hop — a `format!`-assembled verb the
-/// scan's case handling could never match, and a caller's string laundered
-/// through one local rebinding. Widening the spellings would only move the
-/// hop. So the spellings stopped being the load-bearing mechanism and these
-/// types took over; the scans remain as a cheap second net over the shapes a
-/// type cannot see (see `tests/w1b_overlay_lifecycle_trigger.rs` and
+/// Both boundaries below have now been re-cut three times, and the first two
+/// cuts each shipped a claim one hop defeated. The history is kept because it
+/// is the argument for the shape:
+///
+/// 1. **Text scans.** Structural tests read `db.rs` and looked for forbidden
+///    spellings. Defeated by a `format!`-assembled verb the scan's case
+///    handling could never match, and by a caller's string laundered through
+///    one local rebinding.
+/// 2. **`&'static str` types.** [`Sql`] and [`ReadSql`] became newtypes over
+///    `&'static str`, and the doc claimed "that absence is the whole
+///    guarantee". Defeated by `Box::leak`, which turns any runtime `String`
+///    into a `&'static str` — the claim confused *lives for the program's
+///    lifetime* with *written as a literal in this crate*. In the same cut,
+///    [`ReadSql`]'s `SELECT `-prefix check was defeated by
+///    `"SELECT …; DELETE FROM source.generations;"`, because DuckDB executes
+///    every statement in a `;`-separated batch.
+/// 3. **Compile-time text (this one).** The types are built from a
+///    [`SqlText`] implementor's associated **const**, so the text is produced
+///    by const evaluation — which has no heap, no caller, and no running
+///    program to read data out of. `Box::leak` is not a `const fn`; naming a
+///    local in a const is E0435. And [`ReadSql`] additionally refuses any
+///    `;`.
+///
+/// The scans remain as a cheap second net over the shapes a type cannot see
+/// (`tests/w1b_overlay_lifecycle_trigger.rs` and
 /// `tests/x5_a1a_acceptance.rs`, whose docs name their own blind spots).
 ///
 /// This is a **child module on purpose (R4 — the language's own privacy is
 /// the mechanism)**, not a sibling file. A private field is private to its
 /// defining module and its descendants, never to its parent, so nothing in
-/// the rest of `db.rs` can reach [`Store::conn`] or construct a [`Sql`] out
-/// of a runtime string — while `db.rs` remains the single file naming the
-/// database driver, which `tests/x1_atlas_substrate.rs`'s
-/// `atlas_database_has_exactly_one_owner` requires and which a second file
-/// would break.
+/// the rest of `db.rs` can name [`Store::conn`] or the inside of a [`Sql`] —
+/// while `db.rs` remains the single file naming the database driver, which
+/// `tests/x1_atlas_substrate.rs`'s `atlas_database_has_exactly_one_owner`
+/// requires and which a second file would break.
+///
+/// Privacy alone is **not** what carries the guarantee, and it is worth
+/// saying why, because it is the obvious design and it does not work: the
+/// macros below expand at their *call sites*, in `db.rs`, which is the
+/// module's parent. A constructor private to `store` would be unreachable
+/// from the macro too. Const evaluation is the mechanism precisely because it
+/// does not depend on where the code is written.
 ///
 /// # What each type buys
 ///
-/// * [`Sql`] — a statement this crate wrote. Its only constructors take
-///   `&'static str`, so a value that arrived from a caller cannot become one:
-///   `store.execute_batch(user_text)` where `user_text: &str` is a **compile
-///   error**, and so is every `String`. A1a §17 item 13 ("no client SQL
-///   reaches the store") is therefore a property of the type system here.
+/// * [`SqlText`] — the mechanism. Text as an associated `const`, so it is the
+///   compiler that produces it.
+/// * [`Sql`] — a statement this crate wrote. Its only constructor is
+///   `Sql::of::<T: SqlText>()`, which takes no string: there is no
+///   `&str`, `String`, **or `&'static str`** route in. A1a §17 item 13
+///   ("no client SQL reaches the store") is therefore a property of the type
+///   system here.
+/// * [`Name`] — the same, for the table/schema names DuckDB's appender takes.
+///   Not a statement, but a leaked one would still choose which table gets
+///   rows.
 /// * [`Store`] / [`StoreTx`] — the only statement-running surfaces `db.rs`
 ///   has. They take `impl Into<Sql>`, and they wrap the driver's
 ///   `Connection`/`Transaction` rather than deref to them, so no code outside
 ///   this module can hand the driver a `&str` at all.
+/// * [`ReadSql`] — one bare `SELECT`, `;`-free, checked during compilation.
 /// * [`ReadOnly`] — a handle that **cannot write**, because it exposes no
 ///   write call and hands out no `Statement`, no `Appender`, no
 ///   `Transaction`, and no `Connection`. `impl Admissible` holds one of these
@@ -947,43 +1135,111 @@ pub struct DatasetFact {
 ///
 /// # What these types do NOT stop
 ///
-/// Stated because an unstated limit is how a guard becomes a false claim:
+/// Stated because an unstated limit is how a guard becomes a false claim, and
+/// every item here was **attempted** during the S5 closeout rather than
+/// reasoned about:
 ///
-/// * `String::leak`/`Box::leak` manufacture a `&'static str` from a runtime
-///   string. Nothing here sees that; the second-net scan names it too.
-/// * Opening a *new* `Connection` inside this file bypasses every handle
-///   above. Atlas's one-owner rule and DuckDB's own file locking are what
-///   stand against that, plus the second-net scan, which forbids
-///   `Connection::` anywhere the admissibility filter can reach.
-/// * `unsafe` or a `#[cfg(test)]` shim inside this module. The module is
+/// * **Text this crate's own build reads.** `include_str!` and `env!` are
+///   const-evaluable, so a file on the build machine can become a statement.
+///   Attempted and it compiles. What cannot get in is anything a *running*
+///   Sergeant is handed, which is what item 13 is about.
+/// * **A hand-written `impl SqlText` handed to [`ReadSql::of`] directly,
+///   carrying a write.** The check for that path is a generic associated
+///   const, so it fires at monomorphization: attempted, and `cargo check` —
+///   and `cargo build --lib` of a `pub fn` nothing calls — let it through,
+///   while the moment a test actually called it the build failed with
+///   `evaluation panicked: a read-only handle may only run one statement`.
+///   Dead code can hold a bad statement; code that runs cannot. Every call
+///   site in this file uses [`read_sql!`], whose check is a non-generic
+///   `const` item and therefore fails `cargo check`.
+/// * **Opening a *new* `Connection` inside this file**, which bypasses every
+///   handle above. The previous version of this list said "DuckDB's own file
+///   locking" stood against that; **it does not** — measured in the closeout,
+///   a second `Connection::open` on the same file from the same process
+///   succeeded and its `DELETE` returned `Ok`. What stands against it is the
+///   second net, which now requires every `Connection::open*` in this file to
+///   be wrapped in `Store::new(…)` on the spot, and the admissibility scan,
+///   which forbids `Connection::` anywhere the filter can reach.
+/// * **`unsafe` inside this module**, or a `#[cfg(test)]` shim. Attempted via
+///   a const `transmute` to a `&'static str`: rejected, but at *build* rather
+///   than at `cargo check`, and only because the value was invalid — a const
+///   has no way to obtain a runtime address in the first place. The module is
 ///   small enough to read in one sitting, which is the point of keeping it
 ///   small.
+/// * **What a `SELECT` may read.** [`ReadSql`] bounds writes, not reach:
+///   DuckDB's file-reading table functions are still spellable in one. What
+///   keeps that from being a caller's choice is [`SqlText`].
 pub(crate) mod store {
     use duckdb::{Appender, CachedStatement, Connection, Statement, ToSql, Transaction};
 
+    /// Text this crate wrote, carried as a **compile-time constant**.
+    ///
+    /// This trait is the mechanism behind [`Sql`], [`ReadSql`] and [`Name`],
+    /// and it exists because the rule it replaced did not hold. Until the S5
+    /// closeout all three were built from `&'static str`, and the doc here
+    /// claimed that "no caller's value can be among them". That was a
+    /// conceptual error, not a gap in coverage: `&'static str` means *lives
+    /// as long as the program*, **not** *written as a literal in this crate*.
+    /// `Box::leak` and `String::leak` turn any runtime `String` — a caller's,
+    /// verbatim — into a `&'static str`, and the closeout landed exactly
+    /// that: a method doing
+    /// `execute_batch(Box::leak(user_text.to_string().into_boxed_str()))`
+    /// compiled clean and emptied a table.
+    ///
+    /// `TEXT` is an associated **const**, and that is the barrier. A const
+    /// initializer is evaluated by the compiler, with no program running: no
+    /// heap, no caller, no way to observe runtime data. `Box::leak` is not a
+    /// `const fn`, so writing it there is E0015 ("cannot call non-const
+    /// function"); naming a local is E0435 ("attempt to use a non-constant
+    /// value in a constant"). Both are compile errors at `cargo check`.
+    ///
+    /// The barrier is const evaluation, **not** a lifetime and not a macro
+    /// fragment specifier. That is why [`sql!`] can take `$text:expr` and
+    /// still be safe — and why it has to: the DDL constants it wraps
+    /// (`HARDENING_DDL`, `SCHEMA_DDL`) are paths, not literal tokens, so a
+    /// `$text:literal` arm would reject them while adding no safety the
+    /// `const` does not already provide.
+    ///
+    /// # What this does NOT prove
+    ///
+    /// * That the text is valid SQL, or that it is a read. [`ReadSql`] adds
+    ///   the second of those, separately, and nothing here adds the first.
+    /// * That the text was written in this file. "Compile time" includes the
+    ///   build environment: `include_str!` and `env!` are const-evaluable, so
+    ///   text this crate's own **build** reads off disk or out of the
+    ///   environment can become a statement. What cannot is anything a
+    ///   *running* Sergeant is handed — which is what A1a item 13 asks for.
+    /// * Anything about a table name reaching DuckDB's appender by a route
+    ///   other than [`Name`]; see the module doc's blind-spot list.
+    pub trait SqlText {
+        const TEXT: &'static str;
+    }
+
     /// A statement **this crate** wrote.
     ///
-    /// Constructible only from `&'static str` — a literal, a `const`, or a
-    /// concatenation of them. There is deliberately no constructor taking
-    /// `&str` or `String`: that absence is the whole guarantee, so adding one
-    /// (or making the field `pub`) is not a refactor, it is the removal of
-    /// A1a item 13's enforcement.
+    /// The only constructor is [`Sql::of`], and it takes no string at all —
+    /// the text arrives as a [`SqlText`] implementor's associated const.
+    /// There is deliberately no constructor taking `&str`, `String`, **or
+    /// `&'static str`**: that last one is the hole this replaced, not a
+    /// stricter spelling of it. Making the field `pub`, or adding a
+    /// string-taking constructor of any name, is the removal of A1a item 13's
+    /// enforcement rather than a refactor.
     #[derive(Clone)]
     pub struct Sql(String);
 
     impl Sql {
-        /// Assemble a statement from compile-time pieces.
-        ///
-        /// The one interpolation shape Atlas needs: a canned template plus a
-        /// fragment chosen by an enum or read out of a `&'static` table
-        /// (`reader_call`, `TABLES`). Every piece is `'static`, so no
-        /// caller's value can be among them.
-        pub fn from_parts(parts: &[&'static str]) -> Self {
-            Self(parts.concat())
+        /// The one constructor. Call it as `sql!("…")`.
+        pub fn of<T: SqlText>() -> Self {
+            Self(T::TEXT.to_string())
         }
 
-        /// Append another vetted statement — two `Sql`s concatenate, a `&str`
-        /// still cannot join one.
+        /// Append another vetted statement — two `Sql`s concatenate, and
+        /// there is no third thing that can join one.
+        ///
+        /// This is what replaced `from_parts(&[&'static str])`. Assembling a
+        /// statement out of `&'static str` pieces meant every piece was one
+        /// `Box::leak` away from being a caller's, which made the assembled
+        /// whole exactly as weak as the constructor above.
         pub fn extend(&mut self, more: &Sql) {
             self.0.push_str(&more.0);
         }
@@ -994,9 +1250,23 @@ pub(crate) mod store {
         }
     }
 
-    impl From<&'static str> for Sql {
-        fn from(sql: &'static str) -> Self {
-            Self(sql.to_string())
+    /// A table or schema **name** this crate wrote.
+    ///
+    /// Not a statement: DuckDB's appender takes a name through its own C API
+    /// rather than interpolating one into SQL, so a name cannot carry an
+    /// injection. It is [`SqlText`]-constructed for the plainer reason that a
+    /// leaked name would still let a caller choose *which* table rows get
+    /// appended to.
+    pub struct Name(&'static str);
+
+    impl Name {
+        /// The one constructor. Call it as `name!("…")`.
+        pub fn of<T: SqlText>() -> Self {
+            Self(T::TEXT)
+        }
+
+        pub fn text(&self) -> &'static str {
+            self.0
         }
     }
 
@@ -1024,11 +1294,7 @@ pub(crate) mod store {
             params: &[&dyn ToSql],
         ) -> Result<usize, duckdb::Error>;
         fn execute_batch<S: Into<Sql>>(&self, sql: S) -> Result<(), duckdb::Error>;
-        fn appender_to_db(
-            &self,
-            table: &'static str,
-            schema: &'static str,
-        ) -> Result<Appender<'_>, duckdb::Error>;
+        fn appender_to_db(&self, table: Name, schema: Name) -> Result<Appender<'_>, duckdb::Error>;
     }
 
     /// Atlas's connection, with every statement surface narrowed to [`Sql`].
@@ -1108,14 +1374,11 @@ pub(crate) mod store {
             self.conn.execute_batch(sql.into().text())
         }
 
-        /// A table name is not a statement, but it is still interpolated into
-        /// one by the driver, so it is `&'static str` for the same reason.
-        fn appender_to_db(
-            &self,
-            table: &'static str,
-            schema: &'static str,
-        ) -> Result<Appender<'_>, duckdb::Error> {
-            self.conn.appender_to_db(table, schema)
+        /// A table name is not a statement, and the driver does not build
+        /// one out of it — but a leaked name would still choose which table
+        /// gets rows, so it is a [`Name`] for that reason.
+        fn appender_to_db(&self, table: Name, schema: Name) -> Result<Appender<'_>, duckdb::Error> {
+            self.conn.appender_to_db(table.text(), schema.text())
         }
     }
 
@@ -1143,12 +1406,8 @@ pub(crate) mod store {
             self.tx.execute_batch(sql.into().text())
         }
 
-        fn appender_to_db(
-            &self,
-            table: &'static str,
-            schema: &'static str,
-        ) -> Result<Appender<'_>, duckdb::Error> {
-            self.tx.appender_to_db(table, schema)
+        fn appender_to_db(&self, table: Name, schema: Name) -> Result<Appender<'_>, duckdb::Error> {
+            self.tx.appender_to_db(table.text(), schema.text())
         }
     }
 
@@ -1162,40 +1421,109 @@ pub(crate) mod store {
         }
     }
 
-    /// A statement that **reads**: a `&'static str` beginning `SELECT `.
+    /// A statement that **reads**: one bare `SELECT`, containing no `;`.
     ///
     /// [`ReadOnly`] takes one of these rather than a [`Sql`], and the
     /// difference is a hop that used to be open. `ReadOnly` exposes no write
     /// *call* — but DuckDB runs whatever statement it is handed, so
     /// `prepare("DELETE …")` followed by `query()` writes, and a `Sql`
-    /// assembled from a `&'static str` `DELETE` would have been accepted.
-    /// Checked live in the S5 closeout: that exact hop compiled, before this
-    /// type existed.
+    /// holding a `DELETE` would have been accepted. Checked live in the S5
+    /// closeout: that exact hop compiled, before this type existed.
     ///
-    /// The check is deliberately narrow — the statement's first seven bytes —
-    /// because a narrow check that holds is worth more than a verb blacklist
-    /// that a spelling walks past. A `WITH`-prefixed CTE is refused too, and
-    /// widening this to admit one means widening it deliberately, in the one
-    /// place the rule lives.
+    /// # Two conditions, and why the second one is here
     ///
-    /// Build one with [`read_sql!`](crate::read_sql), which evaluates the
-    /// check in a `const` block so a non-`SELECT` is a **compile error**.
-    /// [`ReadSql::new`] called outside a `const` context panics instead;
-    /// that is a loud failure rather than a silent write, but it is not the
-    /// guarantee — the macro is.
+    /// * **Begins `SELECT `.** Deliberately narrow — the statement's first
+    ///   seven bytes — because a narrow check that holds is worth more than a
+    ///   verb blacklist that a spelling walks past. A `WITH`-prefixed CTE is
+    ///   refused too, and widening this to admit one means widening it
+    ///   deliberately, in the one place the rule lives.
+    /// * **Contains no `;` at all.** The prefix check *alone* was defeated in
+    ///   the S5 closeout by
+    ///   `"SELECT … LIMIT 1; DELETE FROM source.generations;"`: the prefix
+    ///   sees only the leading `SELECT `, and **DuckDB executes every
+    ///   statement in a `;`-separated batch**. That was measured on this
+    ///   duckdb (1.10505.0), not taken on faith:
+    ///
+    ///   | probe | result |
+    ///   |---|---|
+    ///   | `prepare(batch)` alone, never queried | nothing runs; 3 rows stay 3 |
+    ///   | `prepare(batch)` + `query([])` | **every** statement runs; 3 rows → 0 |
+    ///   | same via `prepare_cached` | same; 3 rows → 0 |
+    ///   | `query` on a 2-statement batch | returns the **last** statement's result set |
+    ///   | batch containing a `?` bind | refused at `prepare`, "Values were not provided…" |
+    ///
+    ///   The last row is worth stating because it narrows the closeout's own
+    ///   report: the `read_sql!(concat!("SELECT … LIMIT ?; ", "DEL", "ETE …"))`
+    ///   form errors at `prepare` rather than deleting. The *unparameterised*
+    ///   form deletes for real, which is enough — and is why the rule is
+    ///   about `;`, not about binds.
+    ///
+    ///   `;`-free rather than "at most one trailing `;`" because no call site
+    ///   needs a trailing one, and because "trailing" is a claim about
+    ///   parsing that a byte scan is not entitled to make.
+    ///
+    /// # What this does NOT stop — stated, not implied
+    ///
+    /// * It is **stricter than SQL**: `SELECT ';' FROM t` is one harmless
+    ///   statement (measured: a `;` inside a quoted literal does not split
+    ///   anything) and is refused anyway. No call site needs that; one that
+    ///   does must change the rule here, in the open.
+    /// * A `SELECT` still *reads* whatever it names, DuckDB's file-reading
+    ///   table functions (`read_csv`, `read_parquet`) included. This type
+    ///   bounds **writes**, not reach. What keeps that reach from being a
+    ///   caller's choice is [`SqlText`], not this check.
+    /// * It says nothing about what the surrounding code does with the rows.
+    ///
+    /// Build one with [`read_sql!`], which puts the check in a non-generic
+    /// `const` item so a bad statement is a **`cargo check` failure**.
     pub struct ReadSql(&'static str);
 
     impl ReadSql {
-        pub const fn new(sql: &'static str) -> Self {
-            assert!(
-                begins_with_select(sql),
-                "a read-only handle may only run a statement beginning `SELECT `"
-            );
-            Self(sql)
+        /// The one constructor.
+        ///
+        /// Two checks stand behind it, and they fail at different times —
+        /// worth knowing exactly, because "compile time" is not one thing:
+        ///
+        /// * [`read_sql!`] emits a **non-generic** `const` item asserting
+        ///   [`is_read_statement`]. That is evaluated eagerly, so a bad
+        ///   statement written at a call site fails `cargo check`. Every call
+        ///   site in this file takes that path.
+        /// * A hand-written `impl SqlText` handed here instead trips
+        ///   `Check::<T>::OK` below. It is a **generic** associated const,
+        ///   evaluated at monomorphization: it fails `cargo build`, `cargo
+        ///   test` and CI, but is not guaranteed to fail a bare `cargo
+        ///   check`. That gap is why the macro carries its own copy rather
+        ///   than relying on this one.
+        ///
+        /// There is deliberately no runtime panic here. Every route into this
+        /// constructor is checked before a binary exists, and a runtime guard
+        /// would read as though one were not.
+        pub fn of<T: SqlText>() -> Self {
+            struct Check<T: SqlText>(core::marker::PhantomData<T>);
+            impl<T: SqlText> Check<T> {
+                const OK: () = assert!(
+                    is_read_statement(T::TEXT),
+                    "a read-only handle may only run one statement, beginning `SELECT ` and \
+                     containing no `;`"
+                );
+            }
+            // Forces the assertion above to be evaluated for this `T`.
+            #[allow(clippy::let_unit_value)]
+            let () = Check::<T>::OK;
+            Self(T::TEXT)
         }
     }
 
-    const fn begins_with_select(sql: &str) -> bool {
+    /// One bare read: begins `SELECT `, and carries no statement separator.
+    ///
+    /// `const` on purpose — the whole point is that it runs during
+    /// compilation. It also sees the **assembled** string, after `concat!`
+    /// has resolved, which is why it is immune to the verb-splitting that
+    /// defeats a source-text scan: `concat!("DEL", "ETE FROM …")` is already
+    /// `DELETE FROM …` by the time this function sees it, and there is no
+    /// spelling of a write that arrives here looking like something else.
+    /// That is the reason to trust this check and not the scan.
+    pub const fn is_read_statement(sql: &str) -> bool {
         let bytes = sql.as_bytes();
         let want = b"SELECT ";
         if bytes.len() < want.len() {
@@ -1204,6 +1532,12 @@ pub(crate) mod store {
         let mut i = 0;
         while i < want.len() {
             if bytes[i] != want[i] {
+                return false;
+            }
+            i += 1;
+        }
+        while i < bytes.len() {
+            if bytes[i] == b';' {
                 return false;
             }
             i += 1;
@@ -1265,25 +1599,6 @@ pub(crate) mod store {
     }
 }
 
-/// A [`ReadSql`] whose `SELECT `-prefix check runs at **compile time**.
-///
-/// `const { .. }` forces the evaluation, so a statement that is not a read is
-/// a build failure rather than a panic — which is the whole reason
-/// [`Admissible`] can claim it cannot write.
-macro_rules! read_sql {
-    ($sql:expr) => {{
-        // A named `const` **item**, not a `const { .. }` block. Both refuse a
-        // non-`SELECT` statement, but a `const` block inside a
-        // lifetime-generic `impl` is a post-monomorphization error that
-        // `cargo check` does not reach — verified, by watching exactly that
-        // happen during the S5 closeout. The item is evaluated eagerly, so
-        // `cargo check` fails too.
-        const CHECKED: $crate::runtime::atlas::db::store::ReadSql =
-            $crate::runtime::atlas::db::store::ReadSql::new($sql);
-        CHECKED
-    }};
-}
-
 /// The bootstrap DDL every fresh read-write connection onto `atlas.duckdb`
 /// needs before its first query: F4's hardening settings, then A1 §5's five
 /// schema namespaces, then Atlas's own tables — in that order, and always
@@ -1295,9 +1610,9 @@ macro_rules! read_sql {
 /// addition to one caller cannot silently miss the other and leave the
 /// file's shape depend on which struct opened it first.
 fn bootstrap_atlas_ddl(conn: &impl Statements) -> Result<(), duckdb::Error> {
-    conn.execute_batch(HARDENING_DDL)?;
-    conn.execute_batch(SCHEMA_DDL)?;
-    conn.execute_batch(TABLE_DDL)?;
+    conn.execute_batch(sql!(HARDENING_DDL))?;
+    conn.execute_batch(sql!(SCHEMA_DDL))?;
+    conn.execute_batch(sql!(TABLE_DDL))?;
     Ok(())
 }
 
@@ -1399,7 +1714,7 @@ impl AtlasDb {
         // cannot run them even under `IF NOT EXISTS`; skipping them here
         // rather than letting DuckDB refuse them is what keeps this path a
         // read, not a read that happens to trip over a write guard.
-        conn.execute_batch(HARDENING_DDL)?;
+        conn.execute_batch(sql!(HARDENING_DDL))?;
         Ok(Self {
             conn,
             path,
@@ -1441,11 +1756,11 @@ impl AtlasDb {
     /// exactly what Atlas declared — no filtering of our own, which is what
     /// keeps a stray namespace visible here instead of quietly excluded.
     pub fn schema_names(&self) -> Result<Vec<String>, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT schema_name FROM duckdb_schemas() \
              WHERE database_name = current_database() AND NOT internal \
-             ORDER BY schema_name",
-        )?;
+             ORDER BY schema_name"
+        ))?;
         let mut rows = statement.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -1587,10 +1902,12 @@ impl AtlasDb {
             .collect();
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO source.generations \
+            sql!(
+                "INSERT INTO source.generations \
              (generation_id, source_name, source_kind, authority_class, content_key, \
               observed_at, state, summary_event_id, extractors) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)"
+            ),
             duckdb::params![
                 &generation_id,
                 &scan.source_name,
@@ -1618,11 +1935,11 @@ impl AtlasDb {
             }
         }
         for ((language, label, name), occurrences) in index {
-            tx.prepare_cached(
+            tx.prepare_cached(sql!(
                 "INSERT INTO source.symbols \
                  (generation_id, source_name, language, label, name, occurrences) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )?
+                 VALUES (?, ?, ?, ?, ?, ?)"
+            ))?
             .execute(duckdb::params![
                 &generation_id,
                 &scan.source_name,
@@ -1662,10 +1979,12 @@ impl AtlasDb {
         }
         if let Some(provenance) = provenance {
             tx.execute(
-                "INSERT INTO git.provenance \
+                sql!(
+                    "INSERT INTO git.provenance \
                  (generation_id, source_name, origin, requested_ref, resolved_commit, \
                   retrieved_at) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                 VALUES (?, ?, ?, ?, ?, ?)"
+                ),
                 duckdb::params![
                     &generation_id,
                     &scan.source_name,
@@ -1737,8 +2056,10 @@ impl AtlasDb {
         let observed_at = crate::domain::event::rfc3339_utc_now();
         let tx = self.conn.transaction()?;
         let promoted = tx.execute(
-            "UPDATE source.generations SET state = ?, summary_event_id = ? \
-             WHERE generation_id = ? AND state = ?",
+            sql!(
+                "UPDATE source.generations SET state = ?, summary_event_id = ? \
+             WHERE generation_id = ? AND state = ?"
+            ),
             duckdb::params![
                 STATE_CONFIRMED,
                 summary_event_id,
@@ -1844,11 +2165,11 @@ impl AtlasDb {
         let mut upper = prefix.clone();
         let last = upper.pop().expect("overlay prefix is never empty");
         upper.push((last as u8 + 1) as char);
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT generation_id, source_name FROM source.generations \
              WHERE state != ? AND source_name >= ? AND source_name < ? \
-             ORDER BY observed_at DESC, generation_id DESC LIMIT ?",
-        )?;
+             ORDER BY observed_at DESC, generation_id DESC LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![
             STATE_EVICTED,
             prefix,
@@ -1930,12 +2251,12 @@ impl AtlasDb {
         &self,
         source_name: &str,
     ) -> Result<Option<SourceGeneration>, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT generation_id, source_name, source_kind, authority_class, content_key, \
                     observed_at \
              FROM source.generations WHERE source_name = ? AND state = ? \
-             ORDER BY observed_at DESC, generation_id DESC LIMIT 1",
-        )?;
+             ORDER BY observed_at DESC, generation_id DESC LIMIT 1"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
@@ -1970,10 +2291,10 @@ impl AtlasDb {
         generation_id: &str,
         relative_path: &str,
     ) -> Result<Option<String>, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT content_hash FROM source.files \
-             WHERE generation_id = ? AND relative_path = ?",
-        )?;
+             WHERE generation_id = ? AND relative_path = ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![generation_id, relative_path])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get(0)?)),
@@ -1985,13 +2306,13 @@ impl AtlasDb {
     /// order, bounded by `limit` (capped at [`MAX_ROWS`], F12).
     pub fn units(&self, source_name: &str, limit: usize) -> Result<Vec<StoredUnit>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT u.relative_path, u.local_key, u.ordinal, u.unit_kind, u.heading_level, \
                     u.title, u.byte_start, u.byte_end, u.body \
              FROM source.units u JOIN source.generations g USING (generation_id) \
              WHERE g.source_name = ? AND g.state = ? \
-             ORDER BY u.relative_path, u.ordinal LIMIT ?",
-        )?;
+             ORDER BY u.relative_path, u.ordinal LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2023,12 +2344,12 @@ impl AtlasDb {
         limit: usize,
     ) -> Result<Vec<StoredSymbol>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT s.language, s.label, s.name, s.occurrences \
              FROM source.symbols s JOIN source.generations g USING (generation_id) \
              WHERE g.source_name = ? AND g.state = ? \
-             ORDER BY s.language, s.label, s.name LIMIT ?",
-        )?;
+             ORDER BY s.language, s.label, s.name LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2050,13 +2371,13 @@ impl AtlasDb {
         limit: usize,
     ) -> Result<Vec<StoredOccurrence>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT o.relative_path, o.syntax_key, o.extractor, o.language, o.ordinal, \
                     o.label, o.name, o.byte_start, o.byte_end \
              FROM source.occurrences o JOIN source.generations g USING (generation_id) \
              WHERE g.source_name = ? AND g.state = ? \
-             ORDER BY o.relative_path, o.ordinal LIMIT ?",
-        )?;
+             ORDER BY o.relative_path, o.ordinal LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2079,13 +2400,13 @@ impl AtlasDb {
     /// order, bounded by `limit` (capped at [`MAX_ROWS`], F12).
     pub fn edges(&self, source_name: &str, limit: usize) -> Result<Vec<StoredEdge>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT e.relative_path, e.syntax_key, e.extractor, e.language, e.ordinal, \
                     e.edge_kind, e.target, e.byte_start, e.byte_end \
              FROM source.edges e JOIN source.generations g USING (generation_id) \
              WHERE g.source_name = ? AND g.state = ? \
-             ORDER BY e.relative_path, e.ordinal LIMIT ?",
-        )?;
+             ORDER BY e.relative_path, e.ordinal LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2116,12 +2437,12 @@ impl AtlasDb {
         limit: usize,
     ) -> Result<Vec<StoredCoverage>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT c.generation_id, c.path, c.status, c.detail, c.bytes, c.observed_at \
              FROM meta.coverage c JOIN source.generations g USING (generation_id) \
              WHERE g.source_name = ? AND g.state IN (?, ?) \
-             ORDER BY c.observed_at DESC, c.path NULLS FIRST LIMIT ?",
-        )?;
+             ORDER BY c.observed_at DESC, c.path NULLS FIRST LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![
             source_name,
             STATE_CONFIRMED,
@@ -2151,11 +2472,11 @@ impl AtlasDb {
     /// Coverage counts by status for one source's confirmed generation —
     /// what `sgt intelligence status` and the doctor row will read (F8).
     pub fn coverage_counts(&self, source_name: &str) -> Result<BTreeMap<String, u64>, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT c.status, count(*) FROM meta.coverage c \
              JOIN source.generations g USING (generation_id) \
-             WHERE g.source_name = ? AND g.state = ? GROUP BY c.status ORDER BY c.status",
-        )?;
+             WHERE g.source_name = ? AND g.state = ? GROUP BY c.status ORDER BY c.status"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED])?;
         let mut out = BTreeMap::new();
         while let Some(row) = rows.next()? {
@@ -2177,12 +2498,12 @@ impl AtlasDb {
     /// autoloading, so the refusal is a property of the connection instead of
     /// a convention its callers are trusted to keep.
     pub fn hardening(&self) -> Result<Hardening, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT current_setting('autoinstall_known_extensions')::BOOLEAN, \
                     current_setting('autoload_known_extensions')::BOOLEAN, \
                     current_setting('allow_community_extensions')::BOOLEAN, \
-                    current_setting('lock_configuration')::BOOLEAN",
-        )?;
+                    current_setting('lock_configuration')::BOOLEAN"
+        ))?;
         let mut rows = statement.query([])?;
         let row = rows.next()?.ok_or_else(|| AtlasError::UnknownValue {
             column: "current_setting".to_string(),
@@ -2197,11 +2518,11 @@ impl AtlasDb {
         };
         drop(rows);
         drop(statement);
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT extension_name FROM duckdb_extensions() \
              WHERE loaded AND install_mode = 'STATICALLY_LINKED' \
-             ORDER BY extension_name LIMIT ?",
-        )?;
+             ORDER BY extension_name LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![MAX_ROWS as i64])?;
         let mut statically_linked = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2303,7 +2624,7 @@ impl AtlasDb {
         limit: usize,
     ) -> Result<Vec<StoredChildResource>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT c.relative_path, c.local_key, c.parent_relative_path, c.parent_key, \
                     c.entry_path, coalesce(f.content_hash, d.content_hash), \
                     coalesce(f.extractor, d.reader), \
@@ -2320,8 +2641,8 @@ impl AtlasDb {
               AND d.source_name = c.source_name \
               AND d.relative_path = c.relative_path \
              WHERE g.source_name = ? AND g.state = ? \
-             ORDER BY c.relative_path LIMIT ?",
-        )?;
+             ORDER BY c.relative_path LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2347,13 +2668,13 @@ impl AtlasDb {
         limit: usize,
     ) -> Result<Vec<StoredDataset>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT d.relative_path, d.format, d.content_hash, d.reader, d.dataset_key, \
                     d.byte_len, d.columns, d.row_count, d.truncated, d.row_units \
              FROM source.datasets d JOIN source.generations g USING (generation_id) \
              WHERE g.source_name = ? AND g.state = ? \
-             ORDER BY d.relative_path LIMIT ?",
-        )?;
+             ORDER BY d.relative_path LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2386,13 +2707,13 @@ impl AtlasDb {
         limit: usize,
     ) -> Result<Vec<DatasetFact>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT f.relative_path, f.dataset_key, f.query, f.query_identity, f.row_limit, \
                     f.truncated, f.columns, f.rows, f.output_hash \
              FROM source.dataset_facts f JOIN source.generations g USING (generation_id) \
              WHERE g.source_name = ? AND g.state = ? \
-             ORDER BY f.relative_path, f.query LIMIT ?",
-        )?;
+             ORDER BY f.relative_path, f.query LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2423,13 +2744,13 @@ impl AtlasDb {
         limit: usize,
     ) -> Result<Vec<StoredRowUnit>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT r.relative_path, r.dataset_key, r.ordinal, r.row_key, r.key_basis, \
                     r.fields, r.body \
              FROM context.row_units r JOIN source.generations g USING (generation_id) \
              WHERE g.source_name = ? AND g.state = ? \
-             ORDER BY r.relative_path, r.ordinal LIMIT ?",
-        )?;
+             ORDER BY r.relative_path, r.ordinal LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2458,7 +2779,7 @@ impl AtlasDb {
     /// separate statements, so a source's numbers all describe the same world.
     /// Bounded by [`MAX_ROWS`] (F12).
     pub fn indexed_sources(&self) -> Result<Vec<SourceStatus>, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT g.source_name, g.source_kind, g.authority_class, g.generation_id, \
                     g.content_key, g.observed_at, g.extractors, \
                     (SELECT count(*) FROM source.files f \
@@ -2479,8 +2800,8 @@ impl AtlasDb {
              FROM source.generations g \
              LEFT JOIN git.provenance p ON p.generation_id = g.generation_id \
              WHERE g.state = ? \
-             ORDER BY g.source_name LIMIT ?",
-        )?;
+             ORDER BY g.source_name LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![STATE_CONFIRMED, MAX_ROWS as i64])?;
         let mut out: Vec<SourceStatus> = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2551,13 +2872,13 @@ impl AtlasDb {
     /// `limit` (capped at [`MAX_ROWS`], F12).
     pub fn outline(&self, source_name: &str, limit: usize) -> Result<Vec<StoredUnit>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT u.relative_path, u.local_key, u.ordinal, u.unit_kind, u.heading_level, \
                     u.title, u.byte_start, u.byte_end \
              FROM source.units u JOIN source.generations g USING (generation_id) \
              WHERE g.source_name = ? AND g.state = ? AND u.title IS NOT NULL \
-             ORDER BY u.relative_path, u.ordinal LIMIT ?",
-        )?;
+             ORDER BY u.relative_path, u.ordinal LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2596,12 +2917,12 @@ impl AtlasDb {
         limit: usize,
     ) -> Result<Vec<StoredSymbolHit>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT g.source_name, s.language, s.label, s.name, s.occurrences \
              FROM source.symbols s JOIN source.generations g USING (generation_id) \
              WHERE g.state = ? AND s.name = ? \
-             ORDER BY g.source_name, s.language, s.label LIMIT ?",
-        )?;
+             ORDER BY g.source_name, s.language, s.label LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![STATE_CONFIRMED, name, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2628,13 +2949,13 @@ impl AtlasDb {
     /// Bounded by `limit` (capped at [`MAX_ROWS`], F12).
     pub fn references(&self, name: &str, limit: usize) -> Result<Vec<StoredReference>, AtlasError> {
         let limit = limit.min(MAX_ROWS) as i64;
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT g.source_name, o.relative_path, o.language, o.label, o.name, o.ordinal, \
                     o.byte_start, o.byte_end \
              FROM source.occurrences o JOIN source.generations g USING (generation_id) \
              WHERE g.state = ? AND o.name = ? \
-             ORDER BY g.source_name, o.relative_path, o.ordinal LIMIT ?",
-        )?;
+             ORDER BY g.source_name, o.relative_path, o.ordinal LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![STATE_CONFIRMED, name, limit])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -2852,7 +3173,7 @@ impl AtlasDb {
         let mut binds = admissibility.clone();
         binds.push(optional_text(family));
         binds.push(optional_text(family));
-        let mut statement = self.conn.prepare(LEXICAL_CORPUS_SQL)?;
+        let mut statement = self.conn.prepare(sql!(LEXICAL_CORPUS_SQL))?;
         let mut rows = statement.query(duckdb::params_from_iter(binds))?;
         let (units, tokens) = match rows.next()? {
             Some(row) => (
@@ -2881,7 +3202,7 @@ impl AtlasDb {
             binds.push(optional_text(family));
             binds.push(optional_text(family));
             binds.push(Duck::Text(term.clone()));
-            let mut statement = self.conn.prepare(LEXICAL_DOCUMENT_FREQUENCY_SQL)?;
+            let mut statement = self.conn.prepare(sql!(LEXICAL_DOCUMENT_FREQUENCY_SQL))?;
             let mut rows = statement.query(duckdb::params_from_iter(binds))?;
             let document_frequency = match rows.next()? {
                 Some(row) => row.get::<usize, i64>(0)? as u64,
@@ -2900,7 +3221,7 @@ impl AtlasDb {
             binds.push(optional_text(family));
             binds.push(Duck::Text(term.clone()));
             binds.push(Duck::BigInt(remaining as i64 + 1));
-            let mut statement = self.conn.prepare(LEXICAL_POSTINGS_SQL)?;
+            let mut statement = self.conn.prepare(sql!(LEXICAL_POSTINGS_SQL))?;
             let mut rows = statement.query(duckdb::params_from_iter(binds))?;
             while let Some(row) = rows.next()? {
                 if seen >= MAX_ROWS {
@@ -3414,7 +3735,7 @@ impl AtlasDb {
         let mut referencing_paths: BTreeSet<String> = BTreeSet::new();
         let mut anchor_targets: BTreeSet<String> = BTreeSet::new();
         if let Some(symbol) = &anchor_symbol {
-            let mut statement = self.conn.prepare(EDGES_TO_TARGET_SQL)?;
+            let mut statement = self.conn.prepare(sql!(EDGES_TO_TARGET_SQL))?;
             let mut rows =
                 statement.query(duckdb::params![anchor_generation, symbol, MAX_ROWS as i64])?;
             while let Some(row) = rows.next()? {
@@ -3422,7 +3743,7 @@ impl AtlasDb {
             }
         }
         {
-            let mut statement = self.conn.prepare(EDGES_FROM_PATH_SQL)?;
+            let mut statement = self.conn.prepare(sql!(EDGES_FROM_PATH_SQL))?;
             let mut rows = statement.query(duckdb::params![
                 anchor_generation,
                 anchor_coordinate.relative_path(),
@@ -3507,10 +3828,10 @@ impl AtlasDb {
     /// [`ReindexOutcome::truncated`] says so, the same bound and the same
     /// disclosure `lexical_search` uses for its posting scan.
     pub fn reindex_lexical(&mut self) -> Result<ReindexOutcome, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT generation_id FROM source.generations WHERE state != ? \
-             ORDER BY observed_at, generation_id LIMIT ?",
-        )?;
+             ORDER BY observed_at, generation_id LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![STATE_EVICTED, MAX_ROWS as i64 + 1])?;
         let mut targets: Vec<String> = Vec::new();
         while let Some(row) = rows.next()? {
@@ -3524,11 +3845,11 @@ impl AtlasDb {
         let mut indexed = 0u64;
         for generation_id in &targets {
             tx.execute(
-                "DELETE FROM context.lexical_postings WHERE generation_id = ?",
+                sql!("DELETE FROM context.lexical_postings WHERE generation_id = ?"),
                 duckdb::params![generation_id],
             )?;
             tx.execute(
-                "DELETE FROM context.lexical_units WHERE generation_id = ?",
+                sql!("DELETE FROM context.lexical_units WHERE generation_id = ?"),
                 duckdb::params![generation_id],
             )?;
             indexed += index_generation(&tx, generation_id)?;
@@ -3544,14 +3865,14 @@ impl AtlasDb {
     /// safe to call every startup rather than only once at a version
     /// boundary this crate has no other way to detect (F-SF-01).
     pub fn lexical_index_needs_rebuild(&self) -> Result<bool, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT COUNT(*) FROM source.generations g \
              WHERE g.state != ? \
                AND NOT EXISTS ( \
                  SELECT 1 FROM context.lexical_units l \
                  WHERE l.generation_id = g.generation_id \
-               )",
-        )?;
+               )"
+        ))?;
         let mut rows = statement.query(duckdb::params![STATE_EVICTED])?;
         let count: i64 = match rows.next()? {
             Some(row) => row.get(0)?,
@@ -3563,10 +3884,10 @@ impl AtlasDb {
     /// Every generation's state, keyed by id — a diagnostic read, and what a
     /// crash-window test inspects.
     pub fn generation_states(&self) -> Result<BTreeMap<String, String>, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT generation_id, state FROM source.generations \
-             ORDER BY observed_at, generation_id LIMIT ?",
-        )?;
+             ORDER BY observed_at, generation_id LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![MAX_ROWS as i64])?;
         let mut out = BTreeMap::new();
         while let Some(row) = rows.next()? {
@@ -3577,10 +3898,10 @@ impl AtlasDb {
 
     /// Ids and source names of every generation in one state.
     fn generations_in_state(&self, state: &str) -> Result<Vec<(String, String)>, AtlasError> {
-        let mut statement = self.conn.prepare(
+        let mut statement = self.conn.prepare(sql!(
             "SELECT generation_id, source_name FROM source.generations WHERE state = ? \
-             ORDER BY observed_at DESC, generation_id DESC LIMIT ?",
-        )?;
+             ORDER BY observed_at DESC, generation_id DESC LIMIT ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![state, MAX_ROWS as i64])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -3591,9 +3912,9 @@ impl AtlasDb {
 
     /// Which source a generation belongs to.
     fn generation_source(&self, generation_id: &str) -> Result<Option<String>, AtlasError> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT source_name FROM source.generations WHERE generation_id = ?")?;
+        let mut statement = self.conn.prepare(sql!(
+            "SELECT source_name FROM source.generations WHERE generation_id = ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![generation_id])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get(0)?)),
@@ -3611,9 +3932,9 @@ impl AtlasDb {
     /// empty set, which is the same answer a scan that ran none produces —
     /// correct in both cases, because neither could have derived a row.
     fn generation_extractors(&self, generation_id: &str) -> Result<BTreeSet<String>, AtlasError> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT extractors FROM source.generations WHERE generation_id = ?")?;
+        let mut statement = self.conn.prepare(sql!(
+            "SELECT extractors FROM source.generations WHERE generation_id = ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![generation_id])?;
         let Some(row) = rows.next()? else {
             return Ok(BTreeSet::new());
@@ -3628,9 +3949,9 @@ impl AtlasDb {
     /// [`Self::confirm_scan`] needs it to say honestly why the predecessor is
     /// going.
     fn generation_content_key(&self, generation_id: &str) -> Result<Option<String>, AtlasError> {
-        let mut statement = self
-            .conn
-            .prepare("SELECT content_key FROM source.generations WHERE generation_id = ?")?;
+        let mut statement = self.conn.prepare(sql!(
+            "SELECT content_key FROM source.generations WHERE generation_id = ?"
+        ))?;
         let mut rows = statement.query(duckdb::params![generation_id])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get(0)?)),
@@ -3666,12 +3987,12 @@ fn insert_file(
     source_name: &str,
     file: &ScannedFile,
 ) -> Result<(), AtlasError> {
-    conn.prepare_cached(
+    conn.prepare_cached(sql!(
         "INSERT INTO source.files \
          (generation_id, source_name, relative_path, content_hash, extractor, local_key, \
           byte_len, mtime_millis, unit_count) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )?
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ))?
     .execute(duckdb::params![
         generation_id,
         source_name,
@@ -3730,12 +4051,12 @@ fn insert_syntax(
     syntax: &ScannedSyntax,
 ) -> Result<(), AtlasError> {
     for symbol in &syntax.symbols {
-        conn.prepare_cached(
+        conn.prepare_cached(sql!(
             "INSERT INTO source.occurrences \
              (generation_id, source_name, relative_path, syntax_key, extractor, language, \
               ordinal, label, name, byte_start, byte_end) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )?
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))?
         .execute(duckdb::params![
             generation_id,
             source_name,
@@ -3751,12 +4072,12 @@ fn insert_syntax(
         ])?;
     }
     for edge in &syntax.edges {
-        conn.prepare_cached(
+        conn.prepare_cached(sql!(
             "INSERT INTO source.edges \
              (generation_id, source_name, relative_path, syntax_key, extractor, language, \
               ordinal, edge_kind, target, byte_start, byte_end) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )?
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        ))?
         .execute(duckdb::params![
             generation_id,
             source_name,
@@ -3782,12 +4103,12 @@ fn insert_unit(
     file: &ScannedFile,
     unit: &ScannedUnit,
 ) -> Result<(), AtlasError> {
-    conn.prepare_cached(
+    conn.prepare_cached(sql!(
         "INSERT INTO source.units \
          (generation_id, source_name, relative_path, local_key, ordinal, unit_kind, \
           heading_level, title, byte_start, byte_end, body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )?
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ))?
     .execute(duckdb::params![
         generation_id,
         source_name,
@@ -3810,11 +4131,11 @@ fn insert_unit(
     // unit, whose byte span is already its address; a row of `NULL` here
     // would be a declared-but-empty promise for those.
     if let Some(coordinate) = unit.coordinate.as_deref() {
-        conn.prepare_cached(
+        conn.prepare_cached(sql!(
             "INSERT INTO source.unit_coordinates \
              (generation_id, source_name, relative_path, local_key, ordinal, coordinate) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )?
+             VALUES (?, ?, ?, ?, ?, ?)"
+        ))?
         .execute(duckdb::params![
             generation_id,
             source_name,
@@ -4255,12 +4576,12 @@ fn write_dataset(
     dataset: &ScannedDataset,
     read: &IngestedDataset,
 ) -> Result<CoverageRow, AtlasError> {
-    conn.prepare_cached(
+    conn.prepare_cached(sql!(
         "INSERT INTO source.datasets \
          (generation_id, source_name, relative_path, format, content_hash, reader, dataset_key, \
           byte_len, mtime_millis, columns, row_count, truncated, row_units) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )?
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ))?
     .execute(duckdb::params![
         generation_id,
         &scan.source_name,
@@ -4333,12 +4654,12 @@ fn insert_child_resource(
     key: &str,
     parent: &crate::runtime::atlas::scan::ChildProvenance,
 ) -> Result<(), AtlasError> {
-    conn.prepare_cached(
+    conn.prepare_cached(sql!(
         "INSERT INTO source.child_resources \
          (generation_id, source_name, relative_path, local_key, parent_relative_path, \
           parent_key, entry_path) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )?
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ))?
     .execute(duckdb::params![
         generation_id,
         source_name,
@@ -4358,12 +4679,12 @@ fn insert_dataset_fact(
     source_name: &str,
     fact: &DatasetFact,
 ) -> Result<(), AtlasError> {
-    conn.prepare_cached(
+    conn.prepare_cached(sql!(
         "INSERT INTO source.dataset_facts \
          (generation_id, source_name, relative_path, dataset_key, query, query_identity, \
           row_limit, truncated, columns, rows, output_hash, observed_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )?
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ))?
     .execute(duckdb::params![
         generation_id,
         source_name,
@@ -4389,12 +4710,12 @@ fn insert_row_unit(
     dataset: &ScannedDataset,
     unit: &RowUnit,
 ) -> Result<(), AtlasError> {
-    conn.prepare_cached(
+    conn.prepare_cached(sql!(
         "INSERT INTO context.row_units \
          (generation_id, source_name, relative_path, dataset_key, ordinal, row_key, key_basis, \
           fields, body) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )?
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ))?
     .execute(duckdb::params![
         generation_id,
         source_name,
@@ -4466,7 +4787,7 @@ fn indexable_units(
     let mut units: Vec<IndexableUnit> = Vec::new();
 
     let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(sql!(
         "SELECT u.source_name, u.relative_path, u.ordinal, u.title, u.byte_start, u.byte_end, \
                 u.body, f.extractor, c.coordinate \
          FROM source.units u \
@@ -4476,8 +4797,8 @@ fn indexable_units(
                                              AND c.relative_path = u.relative_path \
                                              AND c.ordinal = u.ordinal \
          WHERE u.generation_id = ? AND f.extractor IN (?, ?, ?, ?) \
-         ORDER BY u.relative_path, u.ordinal",
-    )?;
+         ORDER BY u.relative_path, u.ordinal"
+    ))?;
     let mut rows = statement.query(duckdb::params![generation_id, doc_a, doc_b, doc_c, doc_d])?;
     while let Some(row) = rows.next()? {
         let extractor: String = row.get(7)?;
@@ -4516,12 +4837,12 @@ fn indexable_units(
     drop(rows);
     drop(statement);
 
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(sql!(
         "SELECT source_name, relative_path, ordinal, language, label, name, byte_start, byte_end \
          FROM source.occurrences \
          WHERE generation_id = ? AND extractor LIKE ? \
-         ORDER BY relative_path, ordinal",
-    )?;
+         ORDER BY relative_path, ordinal"
+    ))?;
     let mut rows = statement.query(duckdb::params![generation_id, CODE_EXTRACTOR_LIKE])?;
     while let Some(row) = rows.next()? {
         let relative_path: String = row.get(1)?;
@@ -4549,10 +4870,10 @@ fn indexable_units(
     drop(rows);
     drop(statement);
 
-    let mut statement = conn.prepare(
+    let mut statement = conn.prepare(sql!(
         "SELECT source_name, relative_path, dataset_key, ordinal, row_key, fields, body \
-         FROM context.row_units WHERE generation_id = ? ORDER BY relative_path, ordinal",
-    )?;
+         FROM context.row_units WHERE generation_id = ? ORDER BY relative_path, ordinal"
+    ))?;
     let mut rows = statement.query(duckdb::params![generation_id])?;
     while let Some(row) = rows.next()? {
         let relative_path: String = row.get(1)?;
@@ -4626,8 +4947,18 @@ fn index_generation(conn: &impl Statements, generation_id: &str) -> Result<u64, 
         }
     }
     let indexed = unit_rows.len() as u64;
-    append_rows(conn, CONTEXT_SCHEMA, "lexical_units", unit_rows)?;
-    append_rows(conn, CONTEXT_SCHEMA, "lexical_postings", posting_rows)?;
+    append_rows(
+        conn,
+        name!(CONTEXT_SCHEMA),
+        name!("lexical_units"),
+        unit_rows,
+    )?;
+    append_rows(
+        conn,
+        name!(CONTEXT_SCHEMA),
+        name!("lexical_postings"),
+        posting_rows,
+    )?;
     Ok(indexed)
 }
 
@@ -4835,11 +5166,11 @@ fn insert_coverage(
     row: &CoverageRow,
     observed_at: &str,
 ) -> Result<(), AtlasError> {
-    conn.prepare_cached(
+    conn.prepare_cached(sql!(
         "INSERT INTO meta.coverage \
          (generation_id, source_name, path, status, detail, bytes, observed_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
-    )?
+         VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ))?
     .execute(duckdb::params![
         generation_id,
         source_name,
@@ -4866,39 +5197,39 @@ fn evict(
     observed_at: &str,
 ) -> Result<(), AtlasError> {
     conn.execute(
-        "DELETE FROM source.units WHERE generation_id = ?",
+        sql!("DELETE FROM source.units WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM source.unit_coordinates WHERE generation_id = ?",
+        sql!("DELETE FROM source.unit_coordinates WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM source.occurrences WHERE generation_id = ?",
+        sql!("DELETE FROM source.occurrences WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM source.edges WHERE generation_id = ?",
+        sql!("DELETE FROM source.edges WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM source.symbols WHERE generation_id = ?",
+        sql!("DELETE FROM source.symbols WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM source.child_resources WHERE generation_id = ?",
+        sql!("DELETE FROM source.child_resources WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM source.files WHERE generation_id = ?",
+        sql!("DELETE FROM source.files WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM source.datasets WHERE generation_id = ?",
+        sql!("DELETE FROM source.datasets WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM source.dataset_facts WHERE generation_id = ?",
+        sql!("DELETE FROM source.dataset_facts WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     // The F10a-gated units go with everything else an eviction takes. That
@@ -4907,7 +5238,7 @@ fn evict(
     // evicts this one — and *this* delete is what actually retracts the text
     // the wider allowlist exposed.
     conn.execute(
-        "DELETE FROM context.row_units WHERE generation_id = ?",
+        sql!("DELETE FROM context.row_units WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     // S5 W2: the lexical index is derived evidence over the rows deleted
@@ -4917,11 +5248,11 @@ fn evict(
     // gone is an orphan, and there is no window in which one exists (this
     // runs inside the caller's transaction).
     conn.execute(
-        "DELETE FROM context.lexical_postings WHERE generation_id = ?",
+        sql!("DELETE FROM context.lexical_postings WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM context.lexical_units WHERE generation_id = ?",
+        sql!("DELETE FROM context.lexical_units WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     // A no-op DELETE for every non-`external_git` generation (the table has
@@ -4929,15 +5260,15 @@ fn evict(
     // atomicity promise for one that is: a superseded external source's old
     // origin/ref/commit does not linger once its rows are gone.
     conn.execute(
-        "DELETE FROM git.provenance WHERE generation_id = ?",
+        sql!("DELETE FROM git.provenance WHERE generation_id = ?"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "DELETE FROM meta.coverage WHERE generation_id = ? AND path IS NOT NULL",
+        sql!("DELETE FROM meta.coverage WHERE generation_id = ? AND path IS NOT NULL"),
         duckdb::params![generation_id],
     )?;
     conn.execute(
-        "UPDATE source.generations SET state = ? WHERE generation_id = ?",
+        sql!("UPDATE source.generations SET state = ? WHERE generation_id = ?"),
         duckdb::params![STATE_EVICTED, generation_id],
     )?;
     insert_coverage(
@@ -6418,28 +6749,19 @@ const OPS_SCHEMA: &str = "ops";
 /// text, `context.row_units`'s own namespace.
 const CONTEXT_SCHEMA: &str = "context";
 
-/// One operations table, qualified and quoted for SQL.
-///
-/// The quoting is what keeps `usage` (a reserved word) addressable; the
-/// qualification is what stops a bare name from resolving against DuckDB's
-/// default `main` schema, which this database deliberately leaves empty.
-fn ops(table: &'static str) -> Sql {
-    Sql::from_parts(&[OPS_SCHEMA, ".\"", table, "\""])
-}
-
 /// `DELETE FROM <ops table>` — [`ops`] behind a `DELETE`, assembled from
 /// compile-time pieces because [`Sql`] admits no other kind.
-fn delete_from(table: &'static str) -> Sql {
-    let mut sql = Sql::from("DELETE FROM ");
-    sql.extend(&ops(table));
-    sql
+fn delete_from(table: &str) -> Sql {
+    let mut statement = sql!("DELETE FROM ");
+    statement.extend(&ops(table));
+    statement
 }
 
 /// `SELECT COUNT(*) FROM <ops table>` — see [`delete_from`].
-fn count_of(table: &'static str) -> Sql {
-    let mut sql = Sql::from("SELECT COUNT(*) FROM ");
-    sql.extend(&ops(table));
-    sql
+fn count_of(table: &str) -> Sql {
+    let mut statement = sql!("SELECT COUNT(*) FROM ");
+    statement.extend(&ops(table));
+    statement
 }
 
 /// The §22 schema, in the [`OPS_SCHEMA`] namespace. Written on every rebuild;
@@ -6594,13 +6916,7 @@ pub struct CannedQuery {
     pub sql: &'static str,
 }
 
-/// The canned queries this build answers.
-///
-/// Deliberately a fixed list rather than arbitrary client SQL: §22's "clients
-/// do not access DuckDB directly" is about the *one-owner* property, and an
-/// endpoint that executes a client's SQL against the daemon's database hands
-/// the ownership back. M6 owns presentation; this is the data behind it.
-pub const CANNED_QUERIES: &[CannedQuery] = &[
+canned_queries! {
     CannedQuery {
         name: "blocked_time_per_work",
         question: "How long does work remain blocked?",
@@ -6688,7 +7004,7 @@ pub const CANNED_QUERIES: &[CannedQuery] = &[
                    COALESCE(SUM(total_cost_usd), 0) AS total_cost_usd \
             FROM ops.\"usage\" GROUP BY work_id ORDER BY work_id",
     },
-];
+}
 
 /// The result of one canned query: columns and rows as plain JSON.
 #[derive(Debug, Clone, PartialEq)]
@@ -7129,7 +7445,7 @@ impl Analytics {
 
     fn over(conn: Store, path: PathBuf) -> Result<Self, AnalyticsError> {
         conn.set_statement_cache_capacity(STATEMENT_CACHE);
-        conn.execute_batch(OPS_DDL)?;
+        conn.execute_batch(sql!(OPS_DDL))?;
         Ok(Self {
             conn,
             path,
@@ -7220,13 +7536,21 @@ impl Analytics {
 
     /// Write the buffered append-only rows.
     fn flush(&self, appended: &mut Appended) -> Result<(), AnalyticsError> {
-        append_all(&self.conn, "events", std::mem::take(&mut appended.events))?;
         append_all(
             &self.conn,
-            "messages",
+            name!("events"),
+            std::mem::take(&mut appended.events),
+        )?;
+        append_all(
+            &self.conn,
+            name!("messages"),
             std::mem::take(&mut appended.messages),
         )?;
-        append_all(&self.conn, "usage", std::mem::take(&mut appended.usage))?;
+        append_all(
+            &self.conn,
+            name!("usage"),
+            std::mem::take(&mut appended.usage),
+        )?;
         Ok(())
     }
 
@@ -7251,17 +7575,17 @@ impl Analytics {
         }
         append_all(
             &self.conn,
-            "work",
+            name!("work"),
             self.rows.work.values().map(WorkRow::row).collect(),
         )?;
         append_all(
             &self.conn,
-            "stages",
+            name!("stages"),
             self.rows.stages.values().map(StageRow::row).collect(),
         )?;
         append_all(
             &self.conn,
-            "executions",
+            name!("executions"),
             self.rows
                 .executions
                 .values()
@@ -7270,7 +7594,7 @@ impl Analytics {
         )?;
         append_all(
             &self.conn,
-            "tool_calls",
+            name!("tool_calls"),
             self.rows
                 .tool_calls
                 .values()
@@ -7279,7 +7603,7 @@ impl Analytics {
         )?;
         append_all(
             &self.conn,
-            "repositories",
+            name!("repositories"),
             self.rows
                 .repositories
                 .values()
@@ -7288,12 +7612,12 @@ impl Analytics {
         )?;
         append_all(
             &self.conn,
-            "graph_nodes",
+            name!("graph_nodes"),
             self.rows.nodes.values().map(NodeRow::row).collect(),
         )?;
         append_all(
             &self.conn,
-            "graph_edges",
+            name!("graph_edges"),
             self.rows.edges.values().map(EdgeRow::row).collect(),
         )?;
         self.materialized_seq = self.last_seq;
@@ -7670,7 +7994,7 @@ impl Analytics {
             .ok_or_else(|| AnalyticsError::UnknownQuery {
                 name: name.to_string(),
             })?;
-        let (columns, rows) = self.select(canned.sql, duckdb::params![])?;
+        let (columns, rows) = self.select(canned_sql(canned.name), duckdb::params![])?;
         Ok(QueryResult {
             name: canned.name.to_string(),
             question: canned.question.to_string(),
@@ -7718,7 +8042,7 @@ impl Analytics {
                 name: table.to_string(),
             })?;
         self.materialize()?;
-        let mut sql = Sql::from("SELECT * FROM ");
+        let mut sql = sql!("SELECT * FROM ");
         sql.extend(&ops(table));
         let (columns, rows) = self.select(&sql, duckdb::params![])?;
         Ok(QueryResult {
@@ -7739,16 +8063,20 @@ impl Analytics {
     pub fn graph_neighborhood(&mut self, work_id: &str) -> Result<GraphView, AnalyticsError> {
         self.materialize()?;
         let (node_columns, node_rows) = self.select(
-            "SELECT node_id, kind, label, work_id, source_seq FROM ops.graph_nodes \
-             WHERE work_id = ?1 \
-                OR node_id IN (SELECT from_node FROM ops.graph_edges WHERE work_id = ?1) \
-                OR node_id IN (SELECT to_node FROM ops.graph_edges WHERE work_id = ?1) \
-             ORDER BY source_seq, node_id",
+            sql!(
+                "SELECT node_id, kind, label, work_id, source_seq FROM ops.graph_nodes \
+                 WHERE work_id = ?1 \
+                    OR node_id IN (SELECT from_node FROM ops.graph_edges WHERE work_id = ?1) \
+                    OR node_id IN (SELECT to_node FROM ops.graph_edges WHERE work_id = ?1) \
+                 ORDER BY source_seq, node_id"
+            ),
             duckdb::params![work_id],
         )?;
         let (edge_columns, edge_rows) = self.select(
-            "SELECT edge_id, relation, from_node, to_node, source_seq FROM ops.graph_edges \
-             WHERE work_id = ?1 ORDER BY source_seq, edge_id",
+            sql!(
+                "SELECT edge_id, relation, from_node, to_node, source_seq FROM ops.graph_edges \
+                 WHERE work_id = ?1 ORDER BY source_seq, edge_id"
+            ),
             duckdb::params![work_id],
         )?;
         Ok(GraphView {
@@ -7840,21 +8168,18 @@ impl AnalyticsFold<'_> {
     }
 }
 
-/// Tables this projection creates, in a stable order. Crate-internal: the
-/// table list is an implementation detail of the projection, and callers get
-/// it as data from [`Analytics::table_counts`].
-const TABLES: &[&str] = &[
-    "events",
-    "work",
-    "stages",
-    "executions",
-    "messages",
-    "tool_calls",
-    "usage",
-    "repositories",
-    "graph_nodes",
-    "graph_edges",
-];
+ops_tables! {
+    "events" => "ops.\"events\"",
+    "work" => "ops.\"work\"",
+    "stages" => "ops.\"stages\"",
+    "executions" => "ops.\"executions\"",
+    "messages" => "ops.\"messages\"",
+    "tool_calls" => "ops.\"tool_calls\"",
+    "usage" => "ops.\"usage\"",
+    "repositories" => "ops.\"repositories\"",
+    "graph_nodes" => "ops.\"graph_nodes\"",
+    "graph_edges" => "ops.\"graph_edges\"",
+}
 
 /// Bulk-load `rows` into `table` through DuckDB's appender.
 ///
@@ -7863,10 +8188,10 @@ const TABLES: &[&str] = &[
 /// ~4 µs. An empty batch is a no-op rather than an open-and-close.
 fn append_all(
     conn: &impl Statements,
-    table: &'static str,
+    table: Name,
     rows: Vec<Vec<Duck>>,
 ) -> Result<(), AnalyticsError> {
-    append_rows(conn, OPS_SCHEMA, table, rows)?;
+    append_rows(conn, name!(OPS_SCHEMA), table, rows)?;
     Ok(())
 }
 
@@ -7876,8 +8201,8 @@ fn append_all(
 /// DuckDB, not of the `ops` schema.
 fn append_rows(
     conn: &impl Statements,
-    schema: &'static str,
-    table: &'static str,
+    schema: Name,
+    table: Name,
     rows: Vec<Vec<Duck>>,
 ) -> Result<(), duckdb::Error> {
     if rows.is_empty() {
@@ -8006,8 +8331,8 @@ impl Analytics {
         // posture is verified rather than assumed: a clone that somehow
         // reached an unhardened instance is refused here, not left to reach
         // the network later.
-        conn.execute_batch(SCHEMA_DDL)?;
-        conn.execute_batch(TABLE_DDL)?;
+        conn.execute_batch(sql!(SCHEMA_DDL))?;
+        conn.execute_batch(sql!(TABLE_DDL))?;
         let db = AtlasDb {
             conn,
             path: self.path.clone(),
@@ -8063,7 +8388,7 @@ impl Analytics {
         // this connection or any other. Every other read on this type goes
         // through the same call for the same reason.
         self.materialize()?;
-        let mut statement = self.conn.prepare(WORK_GENERATION_JOIN_SQL)?;
+        let mut statement = self.conn.prepare(sql!(WORK_GENERATION_JOIN_SQL))?;
         let mut rows = statement.query([repository])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
@@ -8584,13 +8909,13 @@ mod tests {
         // reproduce the exact shape a pre-W2 store would have.
         db.conn
             .execute(
-                "DELETE FROM context.lexical_postings WHERE generation_id = ?",
+                sql!("DELETE FROM context.lexical_postings WHERE generation_id = ?"),
                 duckdb::params![generation_id],
             )
             .expect("strip postings");
         db.conn
             .execute(
-                "DELETE FROM context.lexical_units WHERE generation_id = ?",
+                sql!("DELETE FROM context.lexical_units WHERE generation_id = ?"),
                 duckdb::params![generation_id],
             )
             .expect("strip units");
@@ -8683,6 +9008,69 @@ mod ops_tests {
         ));
     }
 
+    /// The read rule, as a table — because the two rounds this replaces both
+    /// shipped a rule whose *stated* scope was wider than the bytes it
+    /// checked.
+    ///
+    /// Note the last two rows: this rule is deliberately stricter than SQL,
+    /// and that is a cost, not an oversight.
+    #[test]
+    fn is_read_statement_admits_exactly_one_bare_select() {
+        for (statement, expected) in [
+            ("SELECT 1", true),
+            (
+                "SELECT count(*) FROM source.generations WHERE state = ?",
+                true,
+            ),
+            // Exploit B, and the concat!-split spelling of it: const
+            // evaluation sees the assembled string, so both are one input.
+            ("SELECT 1; DELETE FROM source.generations", false),
+            ("SELECT 1 LIMIT ?; DELETE FROM source.generations;", false),
+            // A trailing separator, on its own.
+            ("SELECT 1;", false),
+            // The prefix rule, unchanged: seven bytes, case-sensitive.
+            ("DELETE FROM source.generations", false),
+            ("select 1", false),
+            (" SELECT 1", false),
+            ("WITH x AS (SELECT 1) SELECT * FROM x", false),
+            ("SELECT", false),
+            ("", false),
+            // Stricter than SQL: one harmless statement, refused anyway.
+            ("SELECT ';' FROM source.generations", false),
+        ] {
+            assert_eq!(
+                store::is_read_statement(statement),
+                expected,
+                "is_read_statement({statement:?})"
+            );
+        }
+    }
+
+    /// [`ops`] is generated from the same tokens as [`TABLES`], so it is total
+    /// over that list by construction. [`MUTABLE_TABLES`] is the one *other*
+    /// list of names that reaches it, and it is written by hand — so a name
+    /// there that is not an `ops` table would reach `ops`'s `unreachable!`
+    /// arm at runtime, during a reset. This is the check that stops that.
+    #[test]
+    fn every_mutable_table_is_an_ops_table() {
+        for table in MUTABLE_TABLES {
+            assert!(
+                TABLES.contains(table),
+                "`{table}` is in MUTABLE_TABLES but not in the ops_tables! list, so \
+                 `delete_from(\"{table}\")` would hit `ops`'s unreachable arm"
+            );
+        }
+        // And `ops` really does answer for every name in the list — the arm
+        // and the entry come from one macro invocation, and this is what
+        // proves that stayed true.
+        for table in TABLES {
+            assert!(
+                ops(table).text().starts_with("ops.\""),
+                "`{table}` must qualify into the ops namespace"
+            );
+        }
+    }
+
     #[test]
     fn the_schema_declares_exactly_the_tables_it_advertises() {
         let mut analytics = Analytics::in_memory(Vec::new()).expect("projection");
@@ -8702,8 +9090,10 @@ mod ops_tests {
         let analytics = Analytics::in_memory(Vec::new()).expect("projection");
         let (columns, rows) = analytics
             .select(
-                "SELECT schema_name, table_name FROM duckdb_tables() \
-                 WHERE database_name = current_database() ORDER BY table_name",
+                sql!(
+                    "SELECT schema_name, table_name FROM duckdb_tables() \
+                     WHERE database_name = current_database() ORDER BY table_name"
+                ),
                 duckdb::params![],
             )
             .expect("select");
@@ -8759,7 +9149,7 @@ mod ops_tests {
         analytics.materialize().expect("materialize");
         let (columns, rows) = analytics
             .select(
-                "SELECT work_id, estate_root FROM ops.work ORDER BY work_id",
+                sql!("SELECT work_id, estate_root FROM ops.work ORDER BY work_id"),
                 duckdb::params![],
             )
             .expect("select");
@@ -8786,7 +9176,7 @@ mod ops_tests {
         let mut analytics = Analytics::in_memory(Vec::new()).expect("projection");
         analytics
             .conn
-            .execute_batch("DROP TABLE ops.events")
+            .execute_batch(sql!("DROP TABLE ops.events"))
             .expect("drop the events table to force the next append to fail");
 
         let mut fold = analytics.fold().expect("fold");
@@ -8813,7 +9203,7 @@ mod ops_tests {
         let mut analytics = Analytics::in_memory(events(vec![odd])).expect("projection");
         analytics.materialize().expect("materialize");
         let (_, rows) = analytics
-            .select("SELECT ts_ms FROM ops.events", duckdb::params![])
+            .select(sql!("SELECT ts_ms FROM ops.events"), duckdb::params![])
             .expect("select");
         assert_eq!(rows, vec![vec![Value::Null]]);
     }
@@ -8961,7 +9351,7 @@ mod ops_tests {
         analytics.materialize().expect("materialize");
         let (_, rows) = analytics
             .select(
-                "SELECT reconcile_disposition FROM ops.executions WHERE execution_id = 'e1'",
+                sql!("SELECT reconcile_disposition FROM ops.executions WHERE execution_id = 'e1'"),
                 duckdb::params![],
             )
             .expect("select");

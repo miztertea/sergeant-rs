@@ -1688,9 +1688,32 @@ fn statement_arguments(lines: &[&str], index: usize) -> Vec<(String, String)> {
         while let Some(at) = body[from..].find(call) {
             let at = from + at;
             let start = at + call.len();
+            // String-literal aware, and the SQL text itself is then dropped
+            // from what gets compared. Before the S5 closeout this loop
+            // counted brackets over the raw bytes, so an argument that was a
+            // bare SQL literal got truncated at the first comma *inside* the
+            // statement — which hid the rest of the argument from the check
+            // AND, once every literal moved inside a `sql!(..)`, started
+            // reporting SQL column names as Rust parameters. Both directions
+            // of that bug are the same missing rule: a name written inside a
+            // statement's text is not a value being passed to it.
             let mut depth = 0i32;
             let mut end = body.len();
-            for (offset, c) in body[start..].char_indices() {
+            let mut argument = String::new();
+            let mut chars = body[start..].char_indices();
+            while let Some((offset, c)) = chars.next() {
+                if c == '"' {
+                    while let Some((_, inner)) = chars.next() {
+                        if inner == '\\' {
+                            chars.next();
+                            continue;
+                        }
+                        if inner == '"' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
                 match c {
                     '(' | '[' | '<' => depth += 1,
                     ')' | ']' | '>' => {
@@ -1706,8 +1729,10 @@ fn statement_arguments(lines: &[&str], index: usize) -> Vec<(String, String)> {
                     }
                     _ => {}
                 }
+                argument.push(c);
             }
-            found.push((call.to_string(), body[start..end].to_string()));
+            let _ = end;
+            found.push((call.to_string(), argument));
             from = start;
         }
     }
@@ -1790,30 +1815,46 @@ fn sql_literal_holes(source: &str, lines: &[&str]) -> Vec<String> {
 ///
 /// # The load-bearing half is the compiler
 ///
-/// Read part 0 first. Since the S5 closeout, `db.rs` runs every statement
-/// through a `Store`/`StoreTx` whose methods take `impl Into<Sql>`, and `Sql`
-/// is constructible **only** from `&'static str`. A caller's string therefore
-/// cannot become a statement: it is a type error, checked by `rustc`, not a
-/// spelling absent from a scan.
+/// Read part 0 first. `db.rs` runs every statement through a `Store`/`StoreTx`
+/// whose methods take `impl Into<Sql>`, and a `Sql` can only be built by
+/// `Sql::of::<T: SqlText>()` — which takes **no string at all**. The text
+/// arrives as `T`'s associated `const`, so it is produced by const
+/// evaluation: no heap, no caller, no running program to read data out of.
 ///
-/// That replaced a check this suite genuinely shipped and that the closeout
-/// re-verify defeated in one hop. Check (b) below looked for a write call
-/// whose *literal first-argument text* named one of the enclosing function's
-/// own string parameters. Adding
+/// # Two rounds of this claim were wrong, and the second is why `&'static str`
+/// # is not the rule
 ///
-/// ```ignore
-/// pub fn evil_run(&self, user_text: &str) -> Result<(), AtlasError> {
-///     let renamed = user_text;
-///     self.conn.execute_batch(renamed)?;
-///     Ok(())
-/// }
-/// ```
+/// * **Round one** looked for a write call whose *literal first-argument
+///   text* named one of the enclosing function's own string parameters.
+///   `let renamed = user_text; self.conn.execute_batch(renamed)` left it
+///   green. One local rebinding was the whole evasion.
+/// * **Round two** made `Sql` a newtype constructible only from
+///   `&'static str` and claimed "that absence is the whole guarantee". It is
+///   not. `&'static str` means *lives for the program's lifetime*, **not**
+///   *written as a literal in this crate*, and
+///   `execute_batch(Box::leak(user_text.to_string().into_boxed_str()))`
+///   compiled clean and took `source.generations` from one row to zero.
 ///
-/// to `db.rs` left this test **green** — a public SQL-taking entry point
-/// handing caller text straight to `execute_batch`, which is exactly what
-/// item 13 forbids. One local rebinding was the whole evasion. The same
-/// method now fails to compile: `argument requires that '1 must outlive
-/// 'static`.
+/// Round three moves the barrier to const evaluation, which does not care
+/// where the code is written or what its lifetime says. Re-attempted against
+/// this build, with the exact compiler error each one now produces:
+///
+/// | attempt | result |
+/// |---|---|
+/// | `execute_batch(Box::leak(user.to_string().into_boxed_str()))` | `Sql: From<&str> is not satisfied` |
+/// | `execute_batch(sql!(leaked))` | E0435 `attempt to use a non-constant value in a constant` |
+/// | `impl SqlText for E { const TEXT = Box::leak(..) }` | E0015 `cannot call non-const associated function Box::<str>::leak` |
+/// | `String::leak` in place of `Box::leak` | E0435, as above |
+/// | `store::Sql(user_text.to_string())` — the struct literal, from `db.rs` | E0603 `tuple struct constructor Sql is private` |
+/// | `name!(leaked)` into the appender | E0435 |
+/// | `const TEXT = unsafe { transmute(..) }` | E0080 at build; a const cannot obtain a runtime address at all |
+/// | `const TEXT = ONCE_LOCK.get()...` | E0015 `cannot call non-const method OnceLock::get` |
+///
+/// Two attempts **compiled**, and both are named in `db.rs`'s own blind-spot
+/// list rather than left for a later round to find:
+/// `const TEXT = include_str!(..)` (build-time text, not runtime text), and a
+/// second raw `Connection::open` inside `db.rs` — which part 4 below is the
+/// net for.
 ///
 /// # What the remaining scans are, and are not
 ///
@@ -1851,6 +1892,16 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
     );
     let store = block_after(&db, "pub(crate) mod store {");
 
+    //    The mechanism itself: text as an associated `const`. This is the one
+    //    assertion that carries the claim — if `TEXT` stops being a const,
+    //    every attempt in the table above starts compiling again.
+    assert!(
+        store.contains("    pub trait SqlText {\n        const TEXT: &'static str;\n    }"),
+        "`SqlText::TEXT` must be an associated `const`: const evaluation is what a runtime \
+         string cannot survive, and a `fn text() -> &'static str` in its place would take \
+         `Box::leak` output happily"
+    );
+
     //    Every `pub fn` on `Sql`, exhaustively — not a list of *expected*
     //    names, which is how the guard this replaces was evaded: a
     //    constructor spelled `from_owned(text: String)` matches no
@@ -1866,12 +1917,13 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
     assert_eq!(
         sql_methods,
         vec![
-            "pub fn from_parts(parts: &[&'static str]) -> Self {",
+            "pub fn of<T: SqlText>() -> Self {",
             "pub fn extend(&mut self, more: &Sql) {",
             "pub fn text(&self) -> &str {",
         ],
-        "`Sql` may gain no method that turns a runtime string into a statement; every \
-         constructor here takes `&'static str` or another already-vetted `Sql`"
+        "`Sql` may gain no method that takes a string of any kind — `&str`, `String`, and \
+         `&'static str` alike. The last of those is the round-two hole, not a stricter \
+         spelling of the rule"
     );
 
     //    And the conversions, which are constructors by another name.
@@ -1882,12 +1934,10 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
         .collect();
     assert_eq!(
         sql_conversions,
-        vec![
-            "impl From<&'static str> for Sql {",
-            "impl From<&Sql> for Sql {"
-        ],
-        "an `impl From<String> for Sql` (or `From<&str>`) is client SQL reaching the store, \
-         however it is spelled"
+        vec!["impl From<&Sql> for Sql {"],
+        "`Sql` converts from an already-vetted `Sql` and from nothing else. An \
+         `impl From<&'static str> for Sql` is exactly what round two shipped, and \
+         `Box::leak` walks through it"
     );
 
     //    `ReadSql` — the read-only handle's own statement type — the same way.
@@ -1899,9 +1949,40 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
         .collect();
     assert_eq!(
         read_sql_methods,
-        vec!["pub const fn new(sql: &'static str) -> Self {"],
-        "`ReadSql` has one constructor and it takes `&'static str`"
+        vec!["pub fn of<T: SqlText>() -> Self {"],
+        "`ReadSql` has one constructor and it takes no string, the same as `Sql::of`"
     );
+
+    //    `Name` too — a table name is not a statement, but a leaked one still
+    //    chooses which table DuckDB's appender writes to.
+    let name_impl = block_after(&db, "    impl Name {");
+    let name_methods: Vec<&str> = name_impl
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub fn ") || line.starts_with("pub const fn "))
+        .collect();
+    assert_eq!(
+        name_methods,
+        vec![
+            "pub fn of<T: SqlText>() -> Self {",
+            "pub fn text(&self) -> &'static str {",
+        ],
+        "`Name` is constructed the same way as `Sql`; a `&'static str` constructor here \
+         re-opens the appender to a leaked table name"
+    );
+
+    //    And the three macros are the only way any of that is reached, each
+    //    putting its argument into a `const`. A macro that passed `$text`
+    //    along as a value instead would be the round-two hole again, with the
+    //    call sites unchanged.
+    for macro_name in ["sql", "name", "read_sql"] {
+        let body = block_after(&db, &format!("macro_rules! {macro_name} {{"));
+        assert!(
+            body.contains("const TEXT: &'static str = $text;"),
+            "`{macro_name}!` must bind `$text` to an associated `const`; that binding is \
+             the check, not the type it produces"
+        );
+    }
 
     for surface in [
         "fn prepare<S: Into<Sql>>",
@@ -1921,6 +2002,28 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
         2,
         "`AtlasDb` and `Analytics` must both hold the wrapper, never a raw `Connection`"
     );
+
+    // 0b. The one hop that compiled. A second `Connection::open` inside this
+    //     file bypasses `Store` entirely, and DuckDB does NOT stop it — a
+    //     second open on the same file from the same process succeeded in the
+    //     closeout, and its `DELETE` returned `Ok`. So every `Connection::`
+    //     construction in this file must be wrapped in `Store::new(..)` on
+    //     the spot. This is a text scan and therefore a second net, but it is
+    //     the only net there is for this hop.
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim_start().starts_with("//") || line.trim_start().starts_with("///") {
+            continue;
+        }
+        for at in line.match_indices("Connection::open").map(|(at, _)| at) {
+            assert!(
+                line[..at].ends_with("Store::new("),
+                "db.rs:{} opens a raw duckdb Connection that is not immediately wrapped in \
+                 `Store::new(..)` — an unwrapped one takes a `&str` statement and answers \
+                 to nothing in the store module: {line}",
+                index + 1
+            );
+        }
+    }
 
     // 1. No public API takes SQL. The scan walks whole `pub fn` *signatures* —
     //    accumulating lines until the parameter list's parentheses close —
@@ -2010,31 +2113,22 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
     //    wherever it sits, and the resulting list is pinned exhaustively — the
     //    same discipline item 12 applies to the CLI's `AtlasDb::` call list.
     //
-    //    **S5 W1c added four holes to this list, and none of them widens the
-    //    surface.** The operations projection moved into this file when A1
-    //    §5's one database absorbed `ops`, and it addresses its own tables by
-    //    name through `ops(table)`. The four fillers are `MUTABLE_TABLES` and
-    //    `TABLES` — `&'static [&'static str]` constants in this same file —
-    //    never a caller's string: `Analytics::table_rows` is the only one of
-    //    them that takes a name from outside, and it looks that name up in
-    //    `TABLES` and returns `UnknownTable` before any formatting happens.
-    //    Item 13 forbids handing the store a query; a fixed set of table
-    //    names chosen by the module that declared them is not one.
-    // **The list is now empty, and that is the S5 closeout's doing.** Every
-    // fragment that used to be interpolated into a SQL literal at runtime —
-    // `reader_call(format)` in the three dataset statements, `ops(table)` in
-    // the projection's own DELETE/COUNT/SELECT — is now assembled by
-    // `Sql::from_parts`, which takes `&[&'static str]` and nothing else. So
-    // there is no interpolation in any SQL literal in this file to pin: the
-    // shape this check existed to bound cannot occur, rather than occurring
-    // in a list someone keeps up to date. A new hole appearing here is a
-    // regression to be argued for, not a line to append.
+    //    **The list is empty, and that is the closeout's doing.** Every
+    //    fragment that used to be interpolated into a SQL literal at runtime
+    //    — `reader_call(format)` in the three dataset statements, `ops(table)`
+    //    in the projection's own DELETE/COUNT/SELECT — is now a vetted `Sql`
+    //    concatenated onto another with `Sql::extend`, and each piece is its
+    //    own `sql!(..)` over compile-time text. So there is no interpolation
+    //    in any SQL literal in this file to pin: the shape this check existed
+    //    to bound cannot occur, rather than occurring in a list someone keeps
+    //    up to date. A new hole appearing here is a regression to be argued
+    //    for, not a line to append.
     let holes = sql_literal_holes(&db, &lines);
     assert_eq!(
         holes,
         Vec::<String>::new(),
         "no SQL literal in db.rs may interpolate anything; assemble the statement from \
-         `&'static str` pieces with `Sql::from_parts` instead"
+         vetted `sql!(..)` pieces with `Sql::extend` instead"
     );
 
     // 3. The verb set is closed, and the two deferred verbs stay deferred. The
