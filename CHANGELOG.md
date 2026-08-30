@@ -1588,7 +1588,13 @@ them were dead code in every real installation.
 - **Eleven document formats reach the index, not one.** A local knowledge
   Source now indexes `.doc`, `.docx`, `.epub`, `.odp`, `.ods`, `.odt`,
   `.pdf`, `.ppt`, `.pptx`, `.rtf` and `.xlsx`, each with its own extractor
-  identity and its own hand-verified fixture. The document normalizer had
+  identity. Nine of the eleven — every one but `.doc` and `.ppt` — have a
+  hand-verified fixture; those two are binary OLE2 formats no fixture
+  could be hand-authored for in this build environment, so `.doc` is
+  fixtured only through an RTF-content file wearing a `.doc` extension and
+  `.ppt` has no fixture at all. Both are still routed and parsed — the gap
+  is corpus coverage, not routing — and is recorded as a named gap in
+  `tests/fixtures/anydoc_corpus/MANIFEST.md`. The document normalizer had
   parsed all of them since S4; only `.docx` was routed, behind a code
   comment that read as a scope boundary. The owner ruled that boundary a
   narrowing once the spike it served had ended
