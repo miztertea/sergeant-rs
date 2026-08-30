@@ -171,7 +171,11 @@ fn the_regex_backend_is_selected_without_the_progress_bar_and_indicatif_stays_ou
 }
 
 /// The `deny.toml` exception is **exactly two named advisory ids** — the
-/// anydoc one and this wave's — and nothing broader.
+/// pre-existing S4 Y2 one (RUSTSEC-2026-0192) and this wave's — and nothing
+/// broader. (The other entry's subject crate is deliberately not named here:
+/// `tests/y2_office_boundary.rs::anydoc_is_named_nowhere_but_the_office_adapter`
+/// keeps that name inside its own adapter, and this file is not an
+/// exception to it.)
 ///
 /// The ruling: *"never a broadened rule, never a disabled gate … The next
 /// advisory must still fail the gate."* This test pins the shape; the

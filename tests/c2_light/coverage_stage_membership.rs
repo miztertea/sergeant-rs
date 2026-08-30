@@ -65,6 +65,16 @@ const ALLOWLIST: &[(&str, &str)] = &[
          w3_prune_measurement are here. Its figures are recorded, dated, in \
          the estate's knowledge library instead.",
     ),
+    (
+        "w3b_semantic_scan_measurement",
+        "S5 W3b: A2-07's exact-cosine scan cost. Its one test is \
+         `#[ignore]`d and needs the committed 32 MB model assets, so it \
+         contributes no coverage under instrumentation — the same reason \
+         w1d_overlay_scan_measurement, w2_startup_measurement and \
+         w3_prune_measurement are here. Its figures are recorded, dated, in \
+         the estate's knowledge library instead \
+         (knowledge/evidence/perf/model2vec-footprint-and-scan-2026-08-30.md).",
+    ),
 ];
 
 fn repo_root() -> PathBuf {
