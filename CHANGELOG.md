@@ -1358,9 +1358,60 @@ them were dead code in every real installation.
   key `(source_name, relative_path, ordinal, unit_key)` ascending, accumulated
   through a `BTreeMap` rather than a hash map. A capped posting scan says so
   on the answer rather than quietly returning different scores.
-- No CLI surface yet (that is a later wave), no semantic retrieval, no
-  fusion, and no ANN/vector index — A2 §16 lists that last one as an explicit
-  non-goal until measurements prove exact scanning inadequate.
+- No CLI surface yet (that is a later wave) and no fusion. Semantic retrieval
+  arrived in the next wave — see "Semantic retrieval" below; there is still no
+  ANN/vector index, which A2 §16 lists as an explicit non-goal until
+  measurements prove exact scanning inadequate.
+
+
+### Semantic retrieval (S5)
+
+- **Atlas can now be searched by meaning, not only by words.** A small local
+  static embedding model — `model2vec-rs` with `potion-code-16M-v2` (A2 §6,
+  decision A2-06) — ranks the admissible set by exact cosine similarity. No
+  GPU, no remote embedding API, no inference tokens: it is tokenization and a
+  mean-pool over a matrix, in process. `AtlasDb::semantic_search` takes the
+  same query value the lexical half takes, so the two rank lists a later wave
+  will fuse are produced from one filter.
+- **The model ships with the release.** The three runtime files
+  (`config.json`, `model.safetensors`, `tokenizer.json`, ~33.5 MB,
+  `minishlab/potion-code-16M-v2` at a pinned revision SHA, MIT) ride in the
+  root of every release archive and installer beside `sgt`. **Release
+  artifacts grow ~33.5 MB per target**; that is a recorded cost, not a
+  surprise. Provenance and per-file sha256 are in
+  `assets/semantic-model/PROVENANCE.md`, and a test fails if the committed
+  bytes and the recorded digests ever disagree.
+- **Nothing is downloaded, ever, at run time.** `model2vec-rs` is compiled
+  `default-features = false, features = ["local-only"]`, so its HuggingFace
+  downloader and HTTP client are not in the binary at all — A2-12's "no
+  stage-time surprise download" is met by absence of a code path rather than
+  by a policy. A test reads the Cargo manifest and lockfile and fails if that
+  declaration ever changes.
+- **A host without the assets still answers.** A `cargo install` from source,
+  or a hand-copied binary, has no model beside it: the search degrades to the
+  deterministic filter plus BM25 and reports `semantic: not_installed` in a
+  required field, distinct from `disabled` when a caller asked for the
+  semantic half to be left out (A2 §15, A2-13). Both paths are tested.
+- **The filter still runs first, and ranking still never widens it.** Semantic
+  candidates come from the admissible generations, so a unit outside the
+  caller's world is never embedded and cannot be scored — A2 §8, enforced the
+  same structural way the lexical half enforces it. An external decoy that
+  ranks first with no filter is proven absent once the source filter closes.
+- **Deterministic, including its ties**: score descending by total order, then
+  the same stated key the lexical list uses — the two are inputs to the same
+  future fusion, so they must break ties identically.
+- **Exact cosine, no index** (A2-07). Measured rather than assumed: ~7,000
+  units/second on a debug build of this host, linear in the admissible set,
+  plus a one-time model load per handle. A measurement like that is the only
+  thing that would ever justify ANN machinery, and this one does not.
+- Accepted risk, scoped and dated: `model2vec-rs` reaches the unmaintained
+  `paste` crate through `tokenizers`, unavoidably (RUSTSEC-2024-0436, no safe
+  upgrade, no feature combination drops it). `deny.toml` ignores **that one
+  advisory id and nothing else**; a different advisory arriving through the
+  same subtree still fails the gate, which is proven by a script that injects
+  one rather than asserted. A second advisory that *was* avoidable
+  (RUSTSEC-2025-0119) was removed from the lockfile by configuration instead
+  of being excepted.
 
 
 ### Container children are real resources (S5)

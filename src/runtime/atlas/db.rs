@@ -2949,7 +2949,6 @@ impl AtlasDb {
         })
     }
 
-
     /// A2 §6's model for this handle, loaded lazily and **at most once**.
     ///
     /// `None` means A2-13's supported degraded state: no complete asset
@@ -4031,7 +4030,10 @@ fn insert_row_unit(
 /// *"embedding raw binary documents rather than A1 evidence units"* non-goal
 /// is satisfied the same way — what this returns IS A1's evidence units, and
 /// the semantic half has no other way to reach text.
-fn indexable_units(conn: &Connection, generation_id: &str) -> Result<Vec<IndexableUnit>, AtlasError> {
+fn indexable_units(
+    conn: &Connection,
+    generation_id: &str,
+) -> Result<Vec<IndexableUnit>, AtlasError> {
     let mut units: Vec<IndexableUnit> = Vec::new();
 
     let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;

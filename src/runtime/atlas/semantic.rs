@@ -193,7 +193,10 @@ pub fn resolve(request: SemanticRequest, model: Option<&SemanticModel>) -> Seman
 /// already in this crate's graph for backend transport — so the manifest, not
 /// a scan, is where the pin belongs.
 pub fn installed_model() -> Option<SemanticModel> {
-    SemanticEngine::load().ok().flatten().map(|engine| engine.descriptor)
+    SemanticEngine::load()
+        .ok()
+        .flatten()
+        .map(|engine| engine.descriptor)
 }
 
 // ---------------------------------------------------------------------------

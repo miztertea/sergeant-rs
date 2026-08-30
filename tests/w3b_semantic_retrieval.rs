@@ -148,7 +148,7 @@ const CASES: [(&str, &str); 5] = [
         "architecture/adr-042.md",
     ),
     ("running out of storage space", "ops/disk-pressure.md"),
-        (
+    (
         // NOT "do not leak secrets" — a terse abstract phrasing this model
         // measurably does NOT answer (it ranks the ADR and the settings
         // loader above the right document). Recorded rather than hidden:
@@ -433,9 +433,7 @@ fn the_gate_2_wins_are_semantic_because_bm25_alone_does_not_produce_them() {
             .hits
             .first()
             .map(|hit| format!("{}:{}", hit.source_name, hit.coordinate.relative_path()));
-        println!(
-            "QUERY {query:?}\n   bm25 first: {first:?}\n   expected  : knowledge:{expected}"
-        );
+        println!("QUERY {query:?}\n   bm25 first: {first:?}\n   expected  : knowledge:{expected}");
         if first.as_deref() == Some(format!("knowledge:{expected}").as_str()) {
             lexical_agrees += 1;
         }
@@ -567,7 +565,10 @@ fn tied_semantic_scores_are_broken_by_the_stated_key_not_by_scan_order() {
     let order: Vec<String> = ranked(&answer).into_iter().map(|(path, _)| path).collect();
     assert_eq!(
         order,
-        vec!["knowledge:aaa.rs".to_string(), "knowledge:zzz.md".to_string()],
+        vec![
+            "knowledge:aaa.rs".to_string(),
+            "knowledge:zzz.md".to_string()
+        ],
         "tied scores must follow the stated key ascending, not the order the three \
          family reads happened to produce them in"
     );
