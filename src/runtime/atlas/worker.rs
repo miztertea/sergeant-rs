@@ -443,6 +443,18 @@ pub enum BatchRefusal {
         /// own path.
         derived: Option<String>,
     },
+    /// The batch's declared children, summed, exceed
+    /// [`super::archive::MAX_TOTAL_EXPANDED_BYTES`] — the SAME whole-tree
+    /// budget a single container's own expansion walk already enforces
+    /// (S5 W7 F-IN-01). A worker's own accounting inside one expansion is
+    /// not proof that a batch it hands back stays under budget: the daemon
+    /// re-derives the cumulative total across `declared_children` itself,
+    /// exactly as it re-derives every other per-child property, rather than
+    /// trusting the worker's claim for this one property alone.
+    BatchTotalTooLarge {
+        /// The summed byte length of every declared child in the batch.
+        total_bytes: u64,
+    },
 }
 
 impl BatchRefusal {
@@ -463,7 +475,8 @@ impl BatchRefusal {
             | Self::UnsafeChildPath { .. }
             | Self::ChildTooLarge { .. }
             | Self::ChildHashMismatch { .. }
-            | Self::ChildAdapterMismatch { .. } => Coverage::Error,
+            | Self::ChildAdapterMismatch { .. }
+            | Self::BatchTotalTooLarge { .. } => Coverage::Error,
         };
         let detail = match self {
             Self::IdentityMismatch {
@@ -504,6 +517,12 @@ impl BatchRefusal {
                  but this build's own routing table derives {derived:?} for that path; refused \
                  before it could reach the store"
             ),
+            Self::BatchTotalTooLarge { total_bytes } => format!(
+                "supervised parse worker's batch declared {total_bytes} total bytes across its \
+                 children, over the {}-byte MAX_TOTAL_EXPANDED_BYTES whole-tree budget; refused \
+                 before any child could reach the store",
+                super::archive::MAX_TOTAL_EXPANDED_BYTES
+            ),
         };
         CoverageRow {
             path: None,
@@ -529,18 +548,21 @@ fn enclosed_relative_path(path: &str) -> bool {
 }
 
 /// The AUTHORITY over a returned batch (G2, panel-adjudicated): identity,
-/// then path safety, then F10 deny-set membership — on every declared
-/// child's name AND its path, because a deny pattern can match either — then
-/// (S5 W7) the per-child byte ceiling, the child's content hash, and its
-/// adapter claim.
+/// then the batch's cumulative declared size against the whole-tree budget
+/// (S5 W7 F-IN-01), then per child, path safety, then F10 deny-set
+/// membership — on every declared child's name AND its path, because a deny
+/// pattern can match either — then (S5 W7) the per-child byte ceiling, the
+/// child's content hash, and its adapter claim.
 ///
 /// Checked in this order so the *first* thing wrong with a batch is what a
 /// coverage row names — a batch failing on identity never gets far enough to
 /// be told its child paths were also unsafe, which keeps one refusal one
-/// reason. Within a child, the ceiling is checked before the hash for the
-/// same reason S4's own O(N²)-before-the-cap bug taught: the cheap bound
-/// comes first, so an oversized payload is never hashed to find out it was
-/// oversized.
+/// reason. The cumulative-size check runs before any per-child work for the
+/// same cheap-bound-first reason S4's own O(N²)-before-the-cap bug taught:
+/// a batch already over budget is refused without hashing or path-checking
+/// a single one of its children. Within a child, the ceiling is checked
+/// before the hash for the same reason: the cheap bound comes first, so an
+/// oversized payload is never hashed to find out it was oversized.
 ///
 /// # Every declared child is checked before any byte reaches the store
 ///
@@ -589,6 +611,24 @@ pub fn validate_batch(
             expected: identity.extractor.clone(),
             got: batch.extractor.clone(),
         });
+    }
+    // F-IN-01: the per-child ceiling below bounds one entry; it never
+    // bounded the batch as a whole. A batch of many individually-in-bounds
+    // children can still exceed the SAME whole-tree budget
+    // [`super::archive::MAX_TOTAL_EXPANDED_BYTES`] a single container's own
+    // expansion walk already enforces — so the daemon re-derives the
+    // cumulative total here too, rather than trusting the worker's own
+    // accounting for this one property alone. Checked before the loop's
+    // per-child hash/adapter work, in the same before-allocation spirit as
+    // the per-child ceiling: the cheap sum comes first.
+    let mut cumulative_bytes: u64 = 0;
+    for declared in &batch.declared_children {
+        cumulative_bytes = cumulative_bytes.saturating_add(declared.content.len() as u64);
+        if cumulative_bytes > super::archive::MAX_TOTAL_EXPANDED_BYTES {
+            return Err(BatchRefusal::BatchTotalTooLarge {
+                total_bytes: cumulative_bytes,
+            });
+        }
     }
     for declared in &batch.declared_children {
         if !enclosed_relative_path(&declared.relative_path) {

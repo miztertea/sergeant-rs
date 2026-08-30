@@ -34,7 +34,7 @@ use tempfile::TempDir;
 
 use sergeant_rs::domain::source::{Coverage, CoverageRow, content_hash};
 use sergeant_rs::runtime::atlas::archive::{
-    MAX_ENTRY_UNCOMPRESSED_BYTES, MAX_NESTING_DEPTH, ZIP_EXTRACTOR,
+    MAX_ENTRY_UNCOMPRESSED_BYTES, MAX_NESTING_DEPTH, MAX_TOTAL_EXPANDED_BYTES, ZIP_EXTRACTOR,
 };
 use sergeant_rs::runtime::atlas::db::{AtlasDb, atlas_db_path};
 use sergeant_rs::runtime::atlas::deny::AcquisitionFilter;
@@ -541,6 +541,42 @@ fn a_nested_container_cannot_escape_the_shared_depth_ceiling_by_recursing() {
     assert!(
         detail.contains("never re-enters a container") && detail.contains("not claimed here"),
         "the landed row states what it knows and no more: {detail:?}"
+    );
+}
+
+/// **F-IN-01: a flat batch of many individually-in-bounds children still
+/// cannot exceed the whole-tree budget.** Before this fix, `validate_batch`
+/// checked only the per-child ceiling and never summed `declared_children`,
+/// so 40 declared children of 4MiB each (160MiB) against a 128MiB
+/// `MAX_TOTAL_EXPANDED_BYTES` budget were all individually in-bounds and the
+/// whole batch was wrongly accepted. This is distinct from
+/// `a_nested_container_cannot_escape_the_shared_depth_ceiling_by_recursing`
+/// above, which covers the budget enforced *inside* one container's own
+/// expansion walk (recursion); this is a flat batch, no recursion, and the
+/// gap was in the daemon's own cross-check of what a worker hands back.
+#[test]
+fn a_batch_whose_children_sum_past_the_whole_tree_budget_is_refused_before_any_child_lands() {
+    let per_child = 4 * 1024 * 1024u64; // 4MiB
+    assert!(
+        per_child <= MAX_CHILD_CONTENT_BYTES,
+        "each child on its own must be within the per-child ceiling"
+    );
+    let count = 40; // 40 * 4MiB = 160MiB, over the 128MiB whole-tree budget
+    assert!(
+        (count as u64) * per_child > MAX_TOTAL_EXPANDED_BYTES,
+        "this test's own arithmetic must actually exceed the budget it means to test"
+    );
+    let children: Vec<DeclaredChild> = (0..count)
+        .map(|i| {
+            let name = format!("child-{i}.bin");
+            well_formed(&name, &name, &vec![0u8; per_child as usize])
+        })
+        .collect();
+    let batch = batch_with(children);
+    let err = validate_batch(&identity(), &batch, &deny()).expect_err("must refuse");
+    assert!(
+        matches!(err, BatchRefusal::BatchTotalTooLarge { total_bytes } if total_bytes > MAX_TOTAL_EXPANDED_BYTES),
+        "{err:?}"
     );
 }
 
