@@ -69,7 +69,7 @@
 /// Two variants rather than a `bool` on the query struct: at a construction
 /// site `semantic: SemanticRequest::Suppressed` says which way round it is
 /// and `semantic: false` does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticRequest {
     /// Use the semantic half if it is available. The default a caller who
     /// said nothing about it should get — A2-13 keeps semantic retrieval
@@ -91,7 +91,7 @@ pub enum SemanticRequest {
 /// identity with unchanged bytes and unchanged bytes under a new identity
 /// are different situations, and a trace that records only one of them
 /// cannot tell them apart.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticModel {
     /// The model's pinned identity — repository and revision, as installed.
     pub identity: String,
@@ -106,7 +106,7 @@ pub struct SemanticModel {
 /// not an `Option`, so there is no "unset" to forget. The three variants are
 /// A2 §15's and H4's own vocabulary, and [`Self::as_str`] is their wire
 /// spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticStatus {
     /// A model was installed, the caller wanted it, and it contributed to
     /// this answer. The answer is complete in A2 §7's sense: both halves
