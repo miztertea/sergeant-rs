@@ -8958,6 +8958,249 @@ mod tests {
             "reindex_lexical must backfill the generation's postings"
         );
     }
+
+    // -----------------------------------------------------------------
+    // ROUND 3 ATTACK — item 6 (documented gap, confirmed): a hand-written
+    // `impl SqlText` with write-shaped text, handed to `ReadSql::of`
+    // directly, trips a generic associated const evaluated at
+    // monomorphization rather than eagerly. Measured: `cargo check --lib
+    // --tests` on this exact code passed clean; `cargo test --lib` (which
+    // must link) failed with E0080 at
+    // `ReadSql::of::<EvilWrite>::Check::<EvilWrite>::OK` before any test
+    // body could run. No write ever executes — the gap is a `cargo check`
+    // blind spot, not a build/test/CI one, exactly as db.rs's module doc
+    // claims. Left out of the tree (this comment is the record); the code
+    // that reproduces it is in the round-3 report.
+    //
+    // ROUND 3 ATTACK — item 1: `Box::leak`/`String::leak` into `Sql` via
+    // the real `sql!` macro, feeding a runtime string that only exists
+    // because a test constructed it (standing in for "caller text").
+    // -----------------------------------------------------------------
+    #[test]
+    fn round3_item1_box_leak_into_sql_via_macro() {
+        let runtime_text: String = format!("{}{}", "DELETE FROM ", "source.generations");
+        // Measured (uncommented one line at a time, `cargo check --lib
+        // --tests`, then reverted — this comment is the record):
+        //
+        // sql!(Box::leak(runtime_text.into_boxed_str())) — E0435, "attempt
+        // to use a non-constant value in a constant", pointing at
+        // `runtime_text` itself: naming *any* local inside the macro's
+        // `const TEXT: &'static str = $text;` is rejected before the
+        // compiler even gets to evaluating `Box::leak`.
+        //
+        // sql!(Box::leak(format!("DELETE FROM {}", "source.generations")
+        //     .into_boxed_str())) — no named local, everything inline —
+        // gives E0015, "cannot call non-const fn `Box::<str>::leak` in
+        // constants".
+        //
+        // Both fail `cargo check`, not just `cargo build`: this route is
+        // closed strictly earlier than item 6's gap. Left commented
+        // because leaving either uncommented fails `cargo check` for the
+        // whole crate, which is the finding, not a state to leave in the
+        // tree.
+        //
+        // let _ = sql!(Box::leak(format!("DELETE FROM {}",
+        //     "source.generations").into_boxed_str()));
+        let _ = runtime_text; // silence unused-var; text never reaches Sql
+    }
+
+    // -----------------------------------------------------------------
+    // ROUND 3 ATTACK — item 2: a `;` batch through `read_sql!`, spelled
+    // several ways, to see whether any spelling reaches DuckDB without
+    // tripping `is_read_statement`'s compile-time `;` scan.
+    // -----------------------------------------------------------------
+    #[test]
+    fn round3_item2_semicolon_batch_spellings() {
+        // Plain: read_sql!("SELECT 1; DELETE FROM source.generations;")
+        //   -> E0080 at `cargo check`, is_read_statement's assert! fires
+        //      (measured below, uncommented then reverted).
+        //
+        // concat!: read_sql!(concat!("SELECT 1 LIMIT ", "1; DELETE FROM ",
+        //     "source.generations;"))
+        //   -> same E0080. is_read_statement runs on the ASSEMBLED string
+        //      (concat! resolves before the const fn runs), so splitting
+        //      "DELETE" across concat! arms changes nothing — the `;` is
+        //      still a `;` in the assembled bytes.
+        //
+        // escape: read_sql!("SELECT 1\u{3b} DELETE FROM source.generations")
+        //   -> `\u{3b}` is the ASCII semicolon (0x3B) once the Rust string
+        //      literal is parsed — same byte, same E0080. Rust resolves
+        //      the escape at lexing, long before `is_read_statement` ever
+        //      runs, so there is no "unescaped form" for it to miss.
+        //
+        // adjacent literals: read_sql!("SELECT 1" ";" " DELETE FROM t")
+        //   -> not valid as `$text:expr` to begin with (three adjacent
+        //      string literals are not one expression without `concat!`
+        //      or `+`); with `concat!` it collapses to the concat! case
+        //      above.
+        //
+        // unicode lookalike (؛ U+061B ARABIC SEMICOLON, ; U+037E GREEK
+        // QUESTION MARK, ; U+FF1B FULLWIDTH SEMICOLON): none of these are
+        // byte 0x3B, so `is_read_statement` does NOT reject them — but
+        // DuckDB's parser does not treat them as statement separators
+        // either (measured against duckdb 1.10505.0 via a raw-connection
+        // probe: `SELECT 1\u{FF1B}` is one statement, a syntax error at
+        // the lookalike character, not two statements). There is no
+        // spelling that is simultaneously (a) invisible to the byte scan
+        // and (b) a real batch separator to DuckDB, because DuckDB only
+        // ever treats 0x3B as a separator, and the scan already covers
+        // every 0x3B.
+        //
+        // None of the four uncommented below compiled; all four are
+        // commented out because leaving any one in fails `cargo check`
+        // for the whole crate, which is the finding.
+        //
+        // let _ = read_sql!("SELECT 1; DELETE FROM source.generations;");
+        // let _ = read_sql!(concat!("SELECT 1 LIMIT ", "1; DELETE FROM ",
+        //     "source.generations;"));
+        // let _ = read_sql!("SELECT 1\u{3b} DELETE FROM source.generations");
+    }
+
+    /// The one item-2 spelling `is_read_statement` does NOT reject —
+    /// a byte scan for `;` (0x3B) has no opinion about a unicode
+    /// lookalike — run for real through the guarded pipeline
+    /// (`sql!`/`Store` to seed, `read_sql!`/`ReadOnly` to attack),
+    /// verified by row count rather than by reasoning about whether
+    /// DuckDB's parser would accept it.
+    #[test]
+    fn round3_item2_unicode_lookalike_reaches_duckdb_but_does_not_write() {
+        let atlas = AtlasDb::open_in_memory().expect("atlas");
+        atlas
+            .conn
+            .execute_batch(sql!(
+                "CREATE TABLE main.round3_t2(x INTEGER); \
+                 INSERT INTO main.round3_t2 VALUES (1), (2), (3);"
+            ))
+            .expect("seed");
+        let before: i64 = atlas
+            .conn
+            .prepare(sql!("SELECT count(*) FROM main.round3_t2"))
+            .expect("prepare count")
+            .query_row([], |r| r.get(0))
+            .expect("count");
+        assert_eq!(before, 3);
+
+        // FULLWIDTH SEMICOLON U+FF1B — compiles clean through `read_sql!`
+        // (confirmed: this file's `cargo check` passes with this exact
+        // line in place), because it is not byte 0x3B.
+        let attack = read_sql!("SELECT x FROM main.round3_t2； DELETE FROM main.round3_t2");
+        let reader = atlas.conn.reader();
+        let result: Result<Vec<i64>, duckdb::Error> =
+            reader.rows(attack, &[], |r| r.get::<_, i64>(0));
+
+        let after: i64 = atlas
+            .conn
+            .prepare(sql!("SELECT count(*) FROM main.round3_t2"))
+            .expect("prepare count")
+            .query_row([], |r| r.get(0))
+            .expect("count");
+
+        // The finding: DuckDB's parser rejects the lookalike as a syntax
+        // error inside the identifier/statement — it is not treated as a
+        // separator, so no second statement ever gets a chance to run.
+        assert!(result.is_err(), "expected a parse error, got {result:?}");
+        assert_eq!(before, after, "row count must be unchanged either way");
+    }
+
+    /// ROUND 3 ATTACK — item 3: a statement beginning `SELECT ` that
+    /// writes anyway. `is_read_statement`'s prefix check rejects any
+    /// statement not literally starting with the seven bytes `SELECT `,
+    /// which already excludes `ATTACH`, `COPY … TO`, `INSTALL`, `LOAD`,
+    /// `PRAGMA`, `SET`, and `CALL` by construction — none of those begin
+    /// with `SELECT `. What is left to try is a `SELECT`-prefixed
+    /// statement that writes through DuckDB's own grammar: a
+    /// data-modifying CTE (`WITH d AS (DELETE … RETURNING *) SELECT …`,
+    /// nested as a derived table so the outer statement still starts with
+    /// `SELECT `) and a scalar function with a side effect. Both run for
+    /// real, through `read_sql!`/`ReadOnly`, against a seeded table,
+    /// verified by row count.
+    #[test]
+    fn round3_item3_select_prefixed_statement_that_would_write() {
+        let atlas = AtlasDb::open_in_memory().expect("atlas");
+        atlas
+            .conn
+            .execute_batch(sql!(
+                "CREATE TABLE main.round3_t3(x INTEGER); \
+                 INSERT INTO main.round3_t3 VALUES (1), (2), (3);"
+            ))
+            .expect("seed");
+        let row_count = |atlas: &AtlasDb| -> i64 {
+            atlas
+                .conn
+                .prepare(sql!("SELECT count(*) FROM main.round3_t3"))
+                .expect("prepare count")
+                .query_row([], |r| r.get(0))
+                .expect("count")
+        };
+        let before = row_count(&atlas);
+        assert_eq!(before, 3);
+        let reader = atlas.conn.reader();
+
+        // A data-modifying CTE nested inside an outer SELECT's FROM
+        // clause, so the assembled text still begins `SELECT ` and
+        // `is_read_statement` admits it.
+        let nested_modifying_cte = read_sql!(
+            "SELECT n FROM (WITH d AS (DELETE FROM main.round3_t3 RETURNING x) \
+             SELECT count(*) AS n FROM d) z"
+        );
+        let r1: Result<Vec<i64>, duckdb::Error> =
+            reader.rows(nested_modifying_cte, &[], |r| r.get::<_, i64>(0));
+        assert!(
+            r1.is_err(),
+            "this duckdb build (1.10505.0) does not support a CTE nested \
+             inside a derived table at all — duckdb's own parser error \
+             fires at prepare(), before any write could happen; got {r1:?}"
+        );
+        assert_eq!(
+            before,
+            row_count(&atlas),
+            "nested modifying CTE must not write"
+        );
+
+        // A scalar function with a plausible side effect, admitted
+        // because it is a bare SELECT.
+        let side_effect_select = read_sql!("SELECT setseed(0.5)");
+        let r2: Result<Vec<i64>, duckdb::Error> =
+            reader.rows(side_effect_select, &[], |_r| Ok(0i64));
+        assert!(r2.is_ok(), "setseed is a pure scalar call; got {r2:?}");
+        assert_eq!(before, row_count(&atlas), "setseed must not write");
+    }
+
+    /// ROUND 3 ATTACK — item 4: reach a writable handle from inside the
+    /// read path. `ReadOnly` hands a mapping closure `&duckdb::Row`,
+    /// which implements `AsRef<duckdb::Statement>` (checked in the
+    /// `duckdb` 1.10505.0 source, `src/row.rs`), so the closure CAN reach
+    /// `&Statement`. Whether that is writable is the whole question.
+    /// Every write-capable method on `duckdb::Statement` —
+    /// `execute`, `insert`, `raw_execute` — takes `&mut self`
+    /// (`src/statement.rs`), so calling one through a shared `&Statement`
+    /// is rejected before this even reaches DuckDB, at the borrow
+    /// checker, not `is_read_statement`.
+    #[test]
+    fn round3_item4_row_as_ref_statement_cannot_write() {
+        let atlas = AtlasDb::open_in_memory().expect("atlas");
+        atlas
+            .conn
+            .execute_batch(sql!(
+                "CREATE TABLE main.round3_t4(x INTEGER); \
+                 INSERT INTO main.round3_t4 VALUES (1);"
+            ))
+            .expect("seed");
+        let reader = atlas.conn.reader();
+        let sql = read_sql!("SELECT x FROM main.round3_t4");
+        let result: Result<Vec<i64>, duckdb::Error> = reader.rows(sql, &[], |row| {
+            let _stmt: &duckdb::Statement<'_> = row.as_ref();
+            // _stmt.execute(duckdb::params![]) — does not compile:
+            //   error[E0596]: cannot borrow `*_stmt` as mutable, as it is
+            //   behind a `&` reference
+            // every write method needs `&mut Statement`, and this closure
+            // only ever has `&Statement`. Measured by uncommenting the
+            // line above against this exact test and reverting; the
+            // build error is the finding.
+            row.get::<_, i64>(0)
+        });
+        assert_eq!(result.expect("read"), vec![1]);
+    }
 }
 
 #[cfg(test)]
