@@ -1443,29 +1443,34 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
         // Expansion out of what retrieval found, along stored structure —
         // deterministic, and bounded by the same constant everything else is.
         // The `false` from `contribute` is the point: an edge step 5 already
-        // held is not re-contributed here.
-        let mut offered = 0usize;
-        if let Some((answer, _)) = &retrieval {
-            let paths: BTreeSet<&str> = answer
-                .hits
-                .iter()
-                .map(|hit| hit.coordinate.relative_path())
-                .collect();
-            for pin in &source_generations {
-                for edge in atlas
-                    .edges(&pin.source_name, STEP_ROW_CAP)
-                    .unwrap_or_default()
-                {
-                    if !paths.contains(edge.relative_path.as_str()) {
-                        continue;
-                    }
-                    offered += 1;
-                    step.contribute(Tier::Referenced, edge_relationship(pin, &edge));
-                }
+        // held is not re-contributed here. Shares step 3/5's per-generation
+        // loop (`contribute_generation_rows`, **R2**); the retrieval-hit
+        // filter folds into the fetch closure instead of a second hand-rolled
+        // loop.
+        match &retrieval {
+            Some((answer, _)) => {
+                let paths: BTreeSet<&str> = answer
+                    .hits
+                    .iter()
+                    .map(|hit| hit.coordinate.relative_path())
+                    .collect();
+                contribute_generation_rows(
+                    &mut step,
+                    &source_generations,
+                    Tier::Referenced,
+                    "no stored structure to expand from what retrieval found",
+                    |source_name| {
+                        atlas.edges(source_name, STEP_ROW_CAP).map(|edges| {
+                            edges
+                                .into_iter()
+                                .filter(|edge| paths.contains(edge.relative_path.as_str()))
+                                .collect()
+                        })
+                    },
+                    edge_relationship,
+                );
             }
-        }
-        if offered == 0 {
-            step.note("no stored structure to expand from what retrieval found");
+            None => step.note("no stored structure to expand from what retrieval found"),
         }
     }
     // ---- 9. pack Bound; emit useful remainder as Referenced
