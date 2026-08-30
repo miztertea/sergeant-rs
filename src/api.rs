@@ -5166,37 +5166,6 @@ async fn run_work_overlay_hook(
         }
     }
 
-    // **S6 D1 — whose world is this overlay?** A Work's surface belongs to
-    // exactly one estate, and `WorkIndexRow::estate_root` is where that
-    // coordinate already lives (H1 touch point #6: folded once from the
-    // `work.submitted` envelope's `workspace_id`). Read it rather than
-    // inventing one.
-    //
-    // A Work with **no** recorded estate root — a pre-Phase-C line still in
-    // the journal — gets no overlay generation at all, and `--work` reports
-    // `BaseOnly` for it, which is exactly true. The alternative would be
-    // recording an overlay of unknown provenance, and there is no estate it
-    // could honestly be admitted from; an unbound generation is inadmissible
-    // everywhere anyway, so writing one would only be a lie with rows behind
-    // it.
-    let estate_binding = {
-        let core = CoreGuard::acquire(&state.core).await;
-        let root = core
-            .registry
-            .state()
-            .work_index
-            .get(&work_id)
-            .and_then(|row| row.estate_root.clone());
-        root.map(crate::domain::source::EstateBinding::Estate)
-    };
-    let Some(estate_binding) = estate_binding else {
-        tracing::error!(
-            work_id = %work_id,
-            "this Work records no estate root, so its surface cannot be bound to an estate;              no overlay generation is written and `--work` stays base-only"
-        );
-        return;
-    };
-
     // F-IN-01: from here on this task is actually reading the surface (a
     // git tree listing, diff, and blob read per binding, next), so a newer
     // coalescing hook queued for this Work must no longer be dropped on the
@@ -5246,6 +5215,40 @@ async fn run_work_overlay_hook(
             }
         };
         let mut core = CoreGuard::acquire(&state.core).await;
+        // **S6 D1 — whose world is this overlay?** A Work's surface belongs to
+        // exactly one estate, and `WorkIndexRow::estate_root` is where that
+        // coordinate already lives (H1 touch point #6: folded once from the
+        // `work.submitted` envelope's `workspace_id`). Read it rather than
+        // inventing one — and read it under the `CoreGuard` this arm was
+        // already taking, never a second one of its own. An extra acquire on
+        // this path is an extra acquire on the *surface-bind* path, which is
+        // the submission burst path: `tests/m2_daemon_api.rs::
+        // t12_submission_throughput_has_an_automated_floor` measured exactly
+        // that regression when this read had its own guard (14-15 units
+        // against a 12.0 ceiling on an idle host, base 4.6 s → 8.2 s), and
+        // passes with the read folded in here.
+        //
+        // A Work with **no** recorded estate root — a pre-Phase-C line still
+        // in the journal — gets no overlay generation at all, and `--work`
+        // reports `BaseOnly` for it, which is exactly true. There is no
+        // estate an overlay of unknown provenance could honestly be admitted
+        // from, and an unbound generation is inadmissible everywhere anyway,
+        // so writing one would only be a lie with rows behind it.
+        let estate_root = core
+            .registry
+            .state()
+            .work_index
+            .get(&work_id)
+            .and_then(|row| row.estate_root.clone());
+        let Some(estate_root) = estate_root else {
+            tracing::error!(
+                work_id = %work_id,
+                "this Work records no estate root, so its surface cannot be bound to an \
+                 estate; no overlay generation is written and `--work` stays base-only"
+            );
+            continue;
+        };
+        let estate_binding = crate::domain::source::EstateBinding::Estate(estate_root);
         let recorded = with_existing_atlas_write(&state, |atlas| {
             record_scan(
                 atlas,

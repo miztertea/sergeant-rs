@@ -31,7 +31,7 @@
 /// filter that does nothing (that is exactly how the leak survived: this
 /// file's ancestors all passed).
 #[allow(dead_code)]
-const D1_ESTATE: &str = "/estates/c1b_tiers_and_budget";
+const D1_ESTATE: &str = "/estates/demo";
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

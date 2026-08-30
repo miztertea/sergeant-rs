@@ -36,16 +36,10 @@
 //! `tests/w1d_overlay_scan_measurement.rs`, which is `#[ignore]`d and never
 //! part of a pass/fail claim.
 
-/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
-/// single-estate: every generation it records is bound to this one root and
-/// every filter it builds is admitted from it. The cross-estate case — two
-/// estates on one host daemon, which is where the axis actually earns its
-/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
-/// here, because a suite that never crosses estates cannot notice an estate
-/// filter that does nothing (that is exactly how the leak survived: this
-/// file's ancestors all passed).
-#[allow(dead_code)]
-const D1_ESTATE: &str = "/estates/w1d_overlay_freshness";
+// S6 D1: this suite's one filter is admitted from its own real estate root
+// (see the `Admissibility::within_estate` call below), because the daemon
+// recorded these generations under that exact root. The cross-estate case is
+// `tests/d1_estate_isolation.rs`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -384,13 +378,16 @@ async fn a_running_works_modified_file_is_findable_through_work_scope() {
     //    stand at this point, which is exactly the state under test.
     handle.shutdown().await;
     let db = AtlasDb::open(data.path()).expect("atlas");
+    // S6 D1: the estate coordinate is the one the daemon recorded these
+    // generations under — this test's own real estate root, resolved by the
+    // same `admit_addressed_estate` gate the request went through. A
+    // stand-in constant would admit nothing, which is the point of the axis.
     let filter = Admissibility {
-        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: work_id.clone(),
             repository: "product".to_string(),
         },
-        ..Admissibility::within_estate(D1_ESTATE)
+        ..Admissibility::within_estate(estate.path().to_string_lossy().into_owned())
     };
     let admitted = db.admissible_units(&filter, 500).expect("admissible units");
     assert!(

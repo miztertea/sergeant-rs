@@ -50,7 +50,7 @@
 /// filter that does nothing (that is exactly how the leak survived: this
 /// file's ancestors all passed).
 #[allow(dead_code)]
-const D1_ESTATE: &str = "/estates/c1d_attribution_nesting_audit";
+const D1_ESTATE: &str = "/estates/demo";
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -891,7 +891,7 @@ const FAKE: &str = sergeant_rs::backend::fake::FAKE_BACKEND_NAME;
 /// Opened and dropped before `daemon::start_with`: one Atlas file is one
 /// DuckDB instance, and the daemon's own handle must be the only one open on
 /// it (`AtlasDb::open`'s contract).
-fn seed_atlas(data_dir: &Path) {
+fn seed_atlas(data_dir: &Path, estate_root: &Path) {
     let mut journal = Journal::open(data_dir).expect("journal");
     let mut db = AtlasDb::open(data_dir).expect("atlas");
     let knowledge = scan(
@@ -912,7 +912,13 @@ fn seed_atlas(data_dir: &Path) {
         &mut journal,
         &knowledge,
         None,
-        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        // S6 D1: this world is compiled by a real daemon addressed at a real
+        // estate root, so the generation is bound to that root — not to a
+        // stand-in constant, which the estate axis would (correctly) refuse
+        // to admit from anywhere.
+        &sergeant_rs::domain::source::EstateBinding::Estate(
+            estate_root.to_string_lossy().into_owned(),
+        ),
     )
     .expect("record knowledge source");
 }
@@ -1040,7 +1046,7 @@ async fn each_nested_leaf_actor_gets_its_own_snapshot_and_the_container_gets_non
     write_stage(&investigate, "00-lead", "lead the investigation");
     write_stage(&investigate, "10-code", "read the code");
 
-    seed_atlas(data.path());
+    seed_atlas(data.path(), &estate);
 
     let (registry, fake) = one_fake([
         sergeant_rs::backend::fake::FakeStep::complete_with("oriented"),
@@ -1217,7 +1223,7 @@ async fn a_child_work_inherits_no_parent_prompt_and_gets_its_own_binding() {
     write_package(&child_package, "childflow", &["00-only"]);
     write_stage(&child_package, "00-only", "the child's own procedure");
 
-    seed_atlas(data.path());
+    seed_atlas(data.path(), &estate);
 
     let (registry, fake) = one_fake([
         sergeant_rs::backend::fake::FakeStep::complete_with("parent done"),

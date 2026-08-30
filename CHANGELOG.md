@@ -23,6 +23,30 @@ head, so every gate below is proven at every sprint boundary even though
 nothing is actually tagged or published until the program-completion
 release.
 
+### Estate isolation in retrieval (S6)
+
+- **`sgt search`, `sgt related` and compiled context no longer read another
+  estate's indexed code.** Atlas is host-scoped — one daemon, one store,
+  every estate ever addressed on this host writing into it — and A2 §2's
+  admissibility pipeline names *"source / **estate** / Work generation
+  filter"* as its first operation. The estate half was never implemented:
+  from one estate, a search returned another estate's private functions as
+  the top hit (measured 2026-08-30). Generations now carry the estate they
+  were indexed for (`source.generation_estates`), and every admissibility
+  query filters on it before any ranking.
+- The estate axis is **default-deny**, unlike the content-kind and authority
+  axes beside it: a filter that names no estate admits nothing, and there is
+  no "every estate" value. Reading another estate's world means addressing
+  that estate, which runs the ordinary admission check.
+- `external_git` sources stay host-scoped and readable from every estate,
+  which is A1 §9's deliberate design and not the defect; `sgt intelligence
+  status` still spans every admitted estate, which is H1 §5's.
+- **Upgrade note: re-scan.** A generation indexed by an earlier build carries
+  no estate coordinate, and a generation whose origin was never recorded
+  cannot be attributed to one after the fact. Those generations are
+  inadmissible from every estate until `sgt intelligence scan` runs again —
+  fail-closed rather than admitting evidence whose owner is unknown.
+
 ### Host runtime (S1)
 
 - One Sergeant daemon per user installation now serves every admitted

@@ -161,8 +161,8 @@ impl std::fmt::Display for AuthorityClass {
 ///
 /// # Why this exists
 ///
-/// Atlas is host-scoped: one daemon, one `atlas.duckdb`, every estate ever
-/// addressed on this host writing into it ([`crate::api`]'s `data_dir`).
+/// Atlas is host-scoped: one daemon, one Atlas database file, every estate
+/// ever addressed on this host writing into it ([`crate::api`]'s `data_dir`).
 /// Until S6 D1 nothing recorded *which* estate a generation came from, so
 /// `sgt search` from estate A returned estate B's indexed code as hit #1
 /// (measured 2026-08-30, `knowledge/evidence/resources/host-atlas-series/
