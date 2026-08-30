@@ -3,6 +3,7 @@
 
 pub mod atlas;
 pub mod blob;
+pub mod context;
 pub mod engine;
 pub mod estates;
 pub(crate) mod fsutil;

@@ -51,8 +51,8 @@ use crate::domain::work::{
     KIND_WORK_WAITING, ScopeRequest, Work, WorkState,
 };
 use crate::domain::workflow::{
-    self, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
-    KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
+    self, KIND_CONTEXT_COMPILED, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
+    KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
     KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
     WorkflowDefinition,
 };
@@ -6793,6 +6793,10 @@ pub const SSE_EVENT_KINDS: &[&str] = &[
     KIND_STAGE_FAILED,
     KIND_STAGE_CANCELED,
     KIND_STAGE_OUTPUT_MISSING,
+    // C1 §15: the compiled-context snapshot, journaled at stage entry. One
+    // kind per fresh execution, never one per evidence unit — the same
+    // affordability argument `source.scanned` makes below.
+    KIND_CONTEXT_COMPILED,
     KIND_EXECUTION_RESERVED,
     KIND_EXECUTION_STARTED,
     KIND_EXECUTION_STOPPED,
