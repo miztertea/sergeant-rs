@@ -188,6 +188,7 @@ pub mod office;
 pub mod overlay;
 pub mod record;
 pub mod scan;
+pub mod semantic;
 pub mod syntax;
 pub mod tabular;
 pub mod text;

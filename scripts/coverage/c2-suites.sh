@@ -308,3 +308,18 @@ cov_stage_end 1 "the f258_nextest_thread_budget test binary must write its own p
 cov_stage_begin c2-w2_lexical_retrieval
 cov_run cargo llvm-cov --no-report --test w2_lexical_retrieval --locked || cov_fail "w2_lexical_retrieval failed under instrumentation"
 cov_stage_end 1 "the w2_lexical_retrieval test binary must write its own profile"
+# S5 W3, wired at birth (the #231 lesson, same as x5/y2/y5/y6/w1/w1b/w1c/w1d/w2
+# above): decision H4's degraded-honesty field — A2 §15's "reports that
+# coverage/capability honestly" as a REQUIRED `semantic: applied |
+# not_installed | disabled` on every search answer, distinct from A2 §13's
+# optional model-identity field. Proves a no-model run still answers through
+# the lexical half and says `not_installed`, that `disabled` and
+# `not_installed` stay distinguishable when the optional field alone is not,
+# and that the field cannot become optional or defaulted. There is no
+# `applied` case: F5's deny gate failed on the A2-06 candidate and the
+# adoption escalated (tests/fixtures/model2vec_corpus/SPIKE-F5.md), so this
+# host has no model. Builds one Atlas store in a tempdir; no daemon, no
+# estate, no subprocess. Floor 1.
+cov_stage_begin c2-w3_semantic_degradation
+cov_run cargo llvm-cov --no-report --test w3_semantic_degradation --locked || cov_fail "w3_semantic_degradation failed under instrumentation"
+cov_stage_end 1 "the w3_semantic_degradation test binary must write its own profile"
