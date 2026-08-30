@@ -307,8 +307,14 @@ fn normal_batch(args: &Args, input: &[u8]) -> Result<WorkerBatch, String> {
     // archive's own admitted children are appended to whatever the flag
     // already supplied.
     let mut declared_children = args.declared_children.clone();
-    let units = if args.extractor == office::DOCX_EXTRACTOR {
-        office::docx_units(input)
+    // `is_office_extractor`, not a literal identity: this binary dispatches
+    // on WHICH ADAPTER owns the identity, and S6 made that eleven identities
+    // (one per document format the normalizer behind that module parses).
+    // Naming them here would
+    // duplicate `office::OFFICE_EXTENSIONS` in a second place that could
+    // drift; the predicate keeps the one table the only table.
+    let units = if office::is_office_extractor(&args.extractor) {
+        office::office_units(input, &args.extractor)
             .map_err(|e| e.to_string())?
             .into_iter()
             .map(|unit| {

@@ -35,8 +35,8 @@ use tempfile::TempDir;
 use sergeant_rs::domain::event::rfc3339_utc_now;
 use sergeant_rs::domain::source::{AuthorityClass, SourceKind, UnitKind};
 use sergeant_rs::runtime::atlas::db::{
-    Admissibility, AtlasDb, CODE_EXTRACTOR_LIKE, DOCUMENT_EXTRACTOR_IDENTITIES, SourceSelector,
-    WorkScope,
+    Admissibility, AtlasDb, CODE_EXTRACTOR_LIKE, DOCUMENT_EXTRACTOR_IDENTITIES,
+    DOCUMENT_EXTRACTOR_LIKE, SourceSelector, WorkScope,
 };
 use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
 use sergeant_rs::runtime::atlas::office::DOCX_EXTRACTOR;
@@ -791,10 +791,20 @@ fn code_extractor_like_covers_every_syntax_language_and_rejects_an_unknown_ident
 /// H13.1's structural pin, document family — the same shape
 /// `tests/x1_atlas_substrate.rs`'s one-owner test uses: read every document
 /// adapter module's own `pub const ..._EXTRACTOR` declaration as text, and
-/// assert [`DOCUMENT_EXTRACTOR_IDENTITIES`] is EXACTLY that set. A new
-/// document adapter that lands a new identity without updating the filter's
-/// allowlist fails this test rather than silently falling out of (or into)
-/// `--content document`.
+/// assert the filter admits EXACTLY that set.
+///
+/// **Reshaped by S6, and the reshaping is the point.** The document family
+/// used to be one enumerated array, with the office adapter contributing a
+/// single identity to it. Widening that adapter's routing table from one
+/// format to eleven (owner ruling
+/// `twelve-formats-is-0.3.0-criteria-2026-08-30`) would have dropped ten new
+/// identities outside `--content document` with no compile error and no
+/// failing test — the identities are `&'static str`s, not a type the
+/// compiler can count. So the family is now an array PLUS one code-owned
+/// `LIKE` pattern ([`DOCUMENT_EXTRACTOR_LIKE`], the same F12-safe shape
+/// [`CODE_EXTRACTOR_LIKE`] already had for the code family), and this test
+/// asserts the union is exact: every constant those modules declare is
+/// admitted by one half or the other, and nothing else is.
 #[test]
 fn document_extractor_identities_matches_every_known_document_adapter_constant() {
     fn extractor_constants(source: &str) -> Vec<String> {
@@ -817,10 +827,10 @@ fn document_extractor_identities_matches_every_known_document_adapter_constant()
     for module in ["text.rs", "office.rs", "mail.rs"] {
         let text = std::fs::read_to_string(root.join(module))
             .unwrap_or_else(|e| panic!("read {module}: {e}"));
-        // office.rs/mail.rs each carry other `_EXTRACTOR`-shaped consts too
-        // (e.g. a version constant) — the module-local ones this filter
-        // actually needs are exactly `DOCX_EXTRACTOR`/`MAIL_EXTRACTOR`; text.rs
-        // carries only the two it always has.
+        // The scan keys on `pub const ..._EXTRACTOR: &str = "…"` exactly, so
+        // office.rs's own `..._EXTRACTOR_LIKE` pattern constant (a different
+        // spelling) is not swept up as if it were an identity a row could
+        // carry.
         expected.extend(extractor_constants(&text));
     }
     // ZIP_EXTRACTOR is a real `pub const ..._EXTRACTOR` too, and is
@@ -830,26 +840,60 @@ fn document_extractor_identities_matches_every_known_document_adapter_constant()
     // above stays a real assertion rather than one this test quietly
     // narrows to pass.
     let archive_text = std::fs::read_to_string(root.join("archive.rs")).expect("read archive.rs");
+    let zip = sergeant_rs::runtime::atlas::archive::ZIP_EXTRACTOR.to_string();
     expected.extend(extractor_constants(&archive_text));
 
-    let mut allowlisted: BTreeSet<String> = DOCUMENT_EXTRACTOR_IDENTITIES
+    let prefix = DOCUMENT_EXTRACTOR_LIKE
+        .strip_suffix('%')
+        .expect("the pattern is a prefix match");
+    let enumerated: BTreeSet<String> = DOCUMENT_EXTRACTOR_IDENTITIES
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-    // Restate the container exclusion explicitly rather than special-casing
-    // the scan: the allowlist plus the one named exclusion must equal the
-    // full set every document/container adapter module declares.
-    allowlisted.insert(sergeant_rs::runtime::atlas::archive::ZIP_EXTRACTOR.to_string());
 
-    assert_eq!(
-        allowlisted, expected,
-        "DOCUMENT_EXTRACTOR_IDENTITIES (plus the one named container exclusion, ZIP_EXTRACTOR) \
-         must equal exactly the extractor constants text.rs/office.rs/mail.rs/archive.rs declare"
-    );
+    // Every declared identity is admitted by exactly one half of the family,
+    // or is the one named container exclusion. "Exactly one" matters: an
+    // identity in both halves would mean the enumerated list had started
+    // duplicating what the pattern already covers.
+    for identity in &expected {
+        if *identity == zip {
+            assert!(
+                !enumerated.contains(identity) && !identity.starts_with(prefix),
+                "the container exclusion must be admitted by neither half: {identity}"
+            );
+            continue;
+        }
+        let by_list = enumerated.contains(identity);
+        let by_pattern = identity.starts_with(prefix);
+        assert!(
+            by_list ^ by_pattern,
+            "{identity} must be admitted by exactly one of DOCUMENT_EXTRACTOR_IDENTITIES \
+             or DOCUMENT_EXTRACTOR_LIKE (list={by_list}, pattern={by_pattern})"
+        );
+    }
+    // And nothing in the enumerated half is invented: each names a constant
+    // one of those modules actually declares.
+    for identity in &enumerated {
+        assert!(
+            expected.contains(identity),
+            "DOCUMENT_EXTRACTOR_IDENTITIES names {identity}, which no document adapter declares"
+        );
+    }
+
     assert!(expected.contains(MARKDOWN_EXTRACTOR));
     assert!(expected.contains(TEXT_EXTRACTOR));
     assert!(expected.contains(DOCX_EXTRACTOR));
     assert!(expected.contains(MAIL_EXTRACTOR));
+    // The office adapter's eleven routed formats are the pattern half, and
+    // the count is asserted so deleting a routed format is a failing test
+    // rather than a quiet narrowing — the exact failure mode this ruling was
+    // written about.
+    assert_eq!(
+        expected.iter().filter(|i| i.starts_with(prefix)).count(),
+        11,
+        "eleven document formats route through the office adapter (csv is the twelfth \
+         and stays relational — see office::CSV_IS_NOT_A_DOCUMENT)"
+    );
 }
 
 // -------------------------------------------------------------- --work scope

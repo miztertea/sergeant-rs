@@ -136,3 +136,138 @@ the gate adopts." A corrupt-zip (as opposed to well-formed-zip/malformed-XML)
 fixture is also not included here — it exercises a different, more generic
 failure path (archive integrity, not document structure) that this
 corpus's malformed fixture deliberately does not conflate with.
+
+---
+
+# Office fixture corpus (S6) — the other ten routed formats
+
+Authority: `knowledge/rulings/owner-rulings/twelve-formats-is-0.3.0-criteria-2026-08-30.md`
+(J4) — *"1/12 is a failure of 0.3.0 completion criteria for estate
+intelligence."* Sibling builder: `build_office_fixtures.py`; the fixtures
+live in `office_fixtures/`.
+
+## Same discipline as the `.docx` corpus above, for the same reason
+
+Every fixture below is **hand-authored as its own source text** — raw ODF /
+OOXML / XHTML XML parts inside a plain `zipfile` archive, or, for RTF and
+PDF, a literal text file. Nothing is exported from an office suite and
+nothing is produced by a document library; `build_office_fixtures.py` writes
+every byte as a literal string. So the author knew the exact expected
+extraction before any parser ran, and a reviewer can reproduce that
+knowledge without trusting the extractor:
+
+```
+unzip -p office_fixtures/10-odt-headings.odt content.xml
+cat office_fixtures/07-rtf-plain.rtf
+```
+
+**Where the expected answer lives.** Unlike the `.docx` corpus, these
+fixtures do *not* get a `manifest.json` of raw-container counts. That file
+exists because the docx corpus was written *before* any extractor existed
+and had to pin its answer in a vocabulary no extractor could bias. That is
+no longer the situation: the adapter exists, its contract is
+[`OfficeUnit`], and the strongest hand-verifiable claim is now the **whole
+rendered text of the document unit**, asserted verbatim in
+`src/runtime/atlas/office.rs`'s own tests (`rtf_fixture_…`,
+`odt_fixture_…`, `odp_fixture_…`, `pptx_fixture_…`, `epub_fixture_…`,
+`xlsx_fixture_…`, `ods_fixture_…`, `text_bearing_pdf_…`). A reviewer reads
+the fixture's one text-bearing part and the assertion side by side; adding a
+second count file in a second vocabulary would only create a place to drift.
+
+## What each fixture covers
+
+| Fixture | Format | Covers |
+|---|---|---|
+| `07-rtf-plain.rtf` | rtf | Two `\pard … \par` paragraphs; no headings, so one document unit and no sections |
+| `08-doc-rtf-in-disguise.doc` | doc | **Byte-identical to 07**, under a `.doc` extension — the "RTF files wearing a .doc extension are common in the wild" case the normalizer's own dispatcher names; proves extension routing and identical extraction |
+| `09-rtf-deep-nesting.rtf` | rtf | Adversarial: 400 nested groups. **Parses** — see "Findings" below |
+| `10-odt-headings.odt` | odt | Two `text:h` headings at outline levels 1 and 2, a paragraph under each |
+| `11-ods-sheet.ods` | ods | A 3×2 `table:table`; asserted identical to the `.xlsx` fixture's extraction |
+| `12-odp-slides.odp` | odp | Two `draw:page` slides, title + outline frame each; one section per slide |
+| `13-odt-malformed-unclosed-element.odt` | odt | Adversarial: well-formed zip and manifest, `content.xml` has an unclosed `<text:p>` |
+| `14-odt-encrypted.odt` | odt | A `manifest:encryption-data` entry in `META-INF/manifest.xml` — the named ENCRYPTED gap, distinct from a parse failure |
+| `15-pptx-slides.pptx` | pptx | Two slides reached through the real OPC chain (`_rels/.rels` → `ppt/presentation.xml` → `sldIdLst` → `slideN.xml`) |
+| `16-pptx-malformed-unclosed-element.pptx` | pptx | Adversarial: unclosed `<a:t>` in `slide1.xml` |
+| `17-pptx-hostile-entry-expansion.pptx` | pptx | Adversarial: `ppt/slides/slide1.xml` declares 140 MiB uncompressed, past `max_entry_bytes` (128 MiB) and under the worker's 512 MiB `RLIMIT_AS` — same sizing and reasoning as `06-hostile-entry-expansion.docx` |
+| `18-xlsx-sheet.xlsx` | xlsx | A 3×2 worksheet through the OPC chain; **no unit claims a cell coordinate** |
+| `19-xlsx-malformed-unclosed-element.xlsx` | xlsx | Adversarial: unclosed `<t>` in `sheet1.xml` |
+| `20-epub-chapters.epub` | epub | OPF title plus two spine chapters, in spine order |
+| `21-epub-malformed-unclosed-element.epub` | epub | Adversarial: unclosed `<p>` in `chapter2.xhtml` |
+| `22-pdf-text.pdf` | pdf | A text-bearing PDF: real `Tj` operators at two font sizes, extracted natively |
+| `23-pdf-scanned-needs-ocr.pdf` | pdf | An image-only page (an `XObject` image, no text operator anywhere) — the named OCR coverage gap, never a false empty extraction |
+
+## Pass criterion
+
+For a valid fixture: the whole document-unit text matches the assertion in
+`office.rs`'s test for it, exactly. For an adversarial one: the named
+`OfficeError` variant, and nothing else — any units at all, partial or
+otherwise, is a failure of that fixture, not partial credit.
+
+## Named corpus gaps (S6) — recorded, not faked
+
+1. **Binary Word 97–2003 (`.doc`) and binary PowerPoint 97–2003 (`.ppt`)
+   have no fixture.** Both are OLE2 compound files carrying BIFF/PPT record
+   streams. They cannot be hand-authored as readable text, which means they
+   cannot satisfy this corpus's own criterion (a reviewer opens the file and
+   checks the extraction), and no OLE-writing library is available in this
+   build environment (`olefile` is absent; there is no office suite on the
+   host). `.doc` and `.ppt` are **routed** — `DOC_EXTRACTOR`/`PPT_EXTRACTOR`
+   claim them and the normalizer's own frontends parse them — but only the
+   RTF-in-disguise `.doc` path is fixtured here. Closing this needs either a
+   real file the owner is content to publish under this repository's licence,
+   or a checked-in OLE2 writer; it is not parser work and was not attempted
+   as such.
+2. **`.docm`/`.xlsm`/`.xlsb`/`.xls`/`.pptm`/`.ppsx`/`.ppsm`/`.pps`/`.pot`
+   are not routed.** The normalizer parses them behind the same frontends,
+   but they are outside the twelve the ruling names and outside this corpus,
+   so claiming them would widen what the fixtures actually cover (R1).
+
+## Findings (S6) — recorded, not fixed
+
+* **There is no RTF-specific size or nesting bound.** The normalizer's fixed
+  limits cover archives, XML depth/nodes, spreadsheet grid expansion and
+  binary record depth — nothing bounds an RTF group nest or an RTF document's
+  size. `09-rtf-deep-nesting.rtf` (400 nested groups) parses clean rather
+  than being refused. The parser is iterative, so this is not a stack
+  overflow; but for RTF and for `.doc` bytes that are RTF, the only bounds
+  are Sergeant's own: `scan::MAX_RESOURCE_BYTES` daemon-side and
+  `worker::WORKER_ADDRESS_SPACE_LIMIT_BYTES` (`RLIMIT_AS`) around the
+  subprocess. Stated here because "every Office file is a ZIP, so the
+  container bounds apply" is true of nine of the eleven routed formats and
+  **not** of RTF or of PDF.
+* **A zip bomb parked in a part the frontend never reads proves nothing.**
+  The first draft of `17-pptx-hostile-entry-expansion.pptx` put its 140 MiB
+  entry in `ppt/media/image1.bin`; the document parsed clean, because that
+  part is never opened. Entry limits are enforced at read time, not at open
+  time, so a hostile-entry fixture must target a part the frontend actually
+  reads. The shipped fixture targets `ppt/slides/slide1.xml`.
+* **PDF has no document model at all.** `to_document` refuses `Format::Pdf`
+  by name; PDFs convert straight to Markdown. `office.rs` therefore has a
+  second code path for PDF that re-uses `text.rs`'s own Markdown sectioner
+  (R2) and addresses sections `md-offset:<n>` rather than `block:<n>`.
+* **PDF headings are inferred from font size.** In an early draft of
+  `22-pdf-text.pdf` — one 24 pt line and one 12 pt line — the 12 pt body line
+  came back as an `##` heading. Adding two more 12 pt lines gave the
+  heuristic an unambiguous body size and the body became a paragraph. This is
+  a property of the PDF converter's layout inference, not a bug this adapter
+  can fix; it is recorded because a reviewer hand-verifying a PDF fixture
+  needs to know the heading structure is inferred, not declared.
+* **The PDF frontend needs a thread pool, and the supervised worker's address
+  space cap did not fit one.** Routing `22-pdf-text.pdf` through a real scan
+  killed the worker with a panic that named nothing about PDFs at all — *"The
+  global thread pool has not been initialized: ThreadPoolBuildError { IOError
+  (EAGAIN) }"*. The PDF converter builds a `rayon` global pool sized to the
+  host's parallelism (20 cores here); each thread's reserved stack counts
+  against the `RLIMIT_AS` ceiling `worker.rs` arms on every child, and pool
+  construction failed. The fix arms `RAYON_NUM_THREADS=1` on the child
+  (`worker.rs`'s `spawn_and_collect`) — **never** a raised ceiling, since a
+  worker call extracts one document and exits and the unit of parallelism is
+  the worker itself. Reproduced directly:
+  `(ulimit -v 524288; sgt-atlas-worker --generation g --extractor
+  "anydoc/0.2.4+pdf/v1" < 22-pdf-text.pdf)` panics, and the same command with
+  `RAYON_NUM_THREADS=1` emits a batch. The regression pin is
+  `tests/y8_adapter_dispatch.rs`'s
+  `a_real_scan_indexes_every_newly_routed_office_format_and_keeps_csv_relational`,
+  which was watched red against this exact failure. This is also evidence
+  toward re-deriving `WORKER_ADDRESS_SPACE_LIMIT_BYTES`'s own PROVISIONAL 512
+  MiB against a real corpus, which its doc still asks for.

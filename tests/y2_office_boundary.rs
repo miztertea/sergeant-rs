@@ -246,12 +246,35 @@ fn office_public_api(text: &str) -> Vec<String> {
 /// it, or (b) if the wider surface is an intentional, reviewed change,
 /// update this constant to match and explain why in the same diff.
 const EXPECTED_PUBLIC_API: &[&str] = &[
+    // S6 (owner ruling twelve-formats-is-0.3.0-criteria-2026-08-30, J4)
+    // widened this surface, deliberately and as a reviewed diff, which is
+    // exactly what this baseline exists to force: one extractor identity per
+    // routed format, the one routing table they live in, the constant that
+    // records why `csv` is NOT in it, the `LIKE` pattern the document-family
+    // filter matches them by, and `docx_units` generalized into
+    // `office_units`. Every added item is this crate's OWN vocabulary — a
+    // `&str`, a `&[(&str, &str)]`, `OfficeUnit`/`OfficeError` — so nothing
+    // here is a re-export or alias that could let a normalizer's own types
+    // cross the boundary under a different name.
     "pub const DOCX_EXTRACTOR: &str = \"anydoc/0.2.4+docx/v1\";",
-    "pub const DOCX_EXTENSIONS: &[&str] = &[\"docx\"];",
+    "pub const DOC_EXTRACTOR: &str = \"anydoc/0.2.4+doc/v1\";",
+    "pub const ODT_EXTRACTOR: &str = \"anydoc/0.2.4+odt/v1\";",
+    "pub const PPT_EXTRACTOR: &str = \"anydoc/0.2.4+ppt/v1\";",
+    "pub const PPTX_EXTRACTOR: &str = \"anydoc/0.2.4+pptx/v1\";",
+    "pub const ODP_EXTRACTOR: &str = \"anydoc/0.2.4+odp/v1\";",
+    "pub const RTF_EXTRACTOR: &str = \"anydoc/0.2.4+rtf/v1\";",
+    "pub const EPUB_EXTRACTOR: &str = \"anydoc/0.2.4+epub/v1\";",
+    "pub const XLSX_EXTRACTOR: &str = \"anydoc/0.2.4+xlsx/v1\";",
+    "pub const ODS_EXTRACTOR: &str = \"anydoc/0.2.4+ods/v1\";",
+    "pub const PDF_EXTRACTOR: &str = \"anydoc/0.2.4+pdf/v1\";",
+    "pub const OFFICE_EXTRACTOR_LIKE: &str = \"anydoc/%\";",
+    "pub const OFFICE_EXTENSIONS: &[(&str, &str)] = &[\n(\"doc\", DOC_EXTRACTOR),\n(\"docx\", DOCX_EXTRACTOR),\n(\"epub\", EPUB_EXTRACTOR),\n(\"odp\", ODP_EXTRACTOR),\n(\"ods\", ODS_EXTRACTOR),\n(\"odt\", ODT_EXTRACTOR),\n(\"pdf\", PDF_EXTRACTOR),\n(\"ppt\", PPT_EXTRACTOR),\n(\"pptx\", PPTX_EXTRACTOR),\n(\"rtf\", RTF_EXTRACTOR),\n(\"xlsx\", XLSX_EXTRACTOR),\n];",
+    "pub const CSV_IS_NOT_A_DOCUMENT: &str = \"csv stays relational (A1 §6.4, A1-13): a dataset is read in place by DuckDB, never \\\nnormalized into prose documents\";",
     "pub fn extractor_for(relative: &str) -> Option<&'static str> {",
+    "pub fn is_office_extractor(extractor: &str) -> bool {",
     "pub struct OfficeUnit {\npub kind: UnitKind,\npub heading_level: Option<u8>,\npub title: Option<String>,\npub coordinate: Option<String>,\npub text: String,\n}",
-    "pub enum OfficeError {\n#[error(\"malformed document: {0}\")]\nMalformed(String),\n#[error(\"resource limit exceeded: {0}\")]\nResourceLimit(String),\n#[error(\"needs OCR, unsupported in this build: {0}\")]\nNeedsOcr(String),\n#[error(\"document is encrypted\")]\nEncrypted,\n}",
-    "pub fn docx_units(bytes: &[u8]) -> Result<Vec<OfficeUnit>, OfficeError> {",
+    "pub enum OfficeError {\n#[error(\"malformed document: {0}\")]\nMalformed(String),\n#[error(\"resource limit exceeded: {0}\")]\nResourceLimit(String),\n#[error(\"needs OCR, unsupported in this build: {0}\")]\nNeedsOcr(String),\n#[error(\"document is encrypted or password-protected\")]\nEncrypted,\n#[error(\"unsupported document: {0}\")]\nUnsupported(String),\n}",
+    "pub fn office_units(bytes: &[u8], extractor: &str) -> Result<Vec<OfficeUnit>, OfficeError> {",
 ];
 
 #[test]
