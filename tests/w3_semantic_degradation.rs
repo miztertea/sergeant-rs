@@ -44,7 +44,7 @@ use sergeant_rs::runtime::atlas::db::{
 use sergeant_rs::runtime::atlas::record::record_scan;
 use sergeant_rs::runtime::atlas::scan::{ScannedFile, ScannedUnit, SourceScan};
 use sergeant_rs::runtime::atlas::semantic::{
-    SemanticRequest, SemanticStatus, installed_model, resolve,
+    MODEL_DIR_ENV, SemanticRequest, SemanticStatus, installed_model, resolve,
 };
 use sergeant_rs::runtime::atlas::tabular::ContextFields;
 use sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR;
@@ -88,7 +88,25 @@ fn only_knowledge() -> Admissibility {
 
 /// One recorded generation holding one Markdown document — the smallest
 /// corpus that makes "the lexical half still answers" a real assertion.
+/// **The precondition every test in this file rests on, made explicit
+/// (S5 W3b).**
+///
+/// Until W3b there was no model to install, so "this host has none" was true
+/// by construction. Now the assets ship with the release and
+/// `runtime::atlas::semantic::model_dir` resolves `$SGT_SEMANTIC_MODEL_DIR`
+/// first — so a developer with that variable exported would have turned this
+/// whole suite red for a reason that has nothing to do with what it tests.
+/// Removing it here states the world these tests describe: a build with the
+/// dependency present and the assets absent, which is exactly the
+/// `cargo install`-from-source case A2 §15 has to keep working.
+///
+/// Safe because cargo-nextest runs every test in its own process.
+fn assume_no_model_assets() {
+    unsafe { std::env::remove_var(MODEL_DIR_ENV) };
+}
+
 fn estate() -> Estate {
+    assume_no_model_assets();
     let data = tempfile::tempdir().expect("data dir");
     let mut journal = Journal::open(data.path()).expect("journal");
     let mut db = AtlasDb::open(data.path()).expect("atlas");
@@ -213,6 +231,7 @@ fn disabled_and_not_installed_are_distinguishable_when_the_model_field_alone_is_
 /// then still not be used.
 #[test]
 fn a_suppressed_request_reports_disabled_even_with_no_model_installed() {
+    assume_no_model_assets();
     assert_eq!(installed_model(), None, "precondition: this host has none");
     let estate = estate();
     let answer = estate.search("PaymentRetryPolicy", SemanticRequest::Suppressed);

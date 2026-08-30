@@ -315,11 +315,39 @@ cov_stage_end 1 "the w2_lexical_retrieval test binary must write its own profile
 # optional model-identity field. Proves a no-model run still answers through
 # the lexical half and says `not_installed`, that `disabled` and
 # `not_installed` stay distinguishable when the optional field alone is not,
-# and that the field cannot become optional or defaulted. There is no
-# `applied` case: F5's deny gate failed on the A2-06 candidate and the
-# adoption escalated (tests/fixtures/model2vec_corpus/SPIKE-F5.md), so this
-# host has no model. Builds one Atlas store in a tempdir; no daemon, no
-# estate, no subprocess. Floor 1.
+# and that the field cannot become optional or defaulted. It deliberately
+# covers only the DEGRADED half — every test in it removes
+# $SGT_SEMANTIC_MODEL_DIR first, so it describes a build with the model2vec
+# dependency present and the assets absent (a `cargo install` from source).
+# The `applied` case is W3b's `w3b_semantic_retrieval`, below. Builds one
+# Atlas store in a tempdir; no daemon, no estate, no subprocess. Floor 1.
 cov_stage_begin c2-w3_semantic_degradation
 cov_run cargo llvm-cov --no-report --test w3_semantic_degradation --locked || cov_fail "w3_semantic_degradation failed under instrumentation"
 cov_stage_end 1 "the w3_semantic_degradation test binary must write its own profile"
+
+# S5 W3b. Two suites, added at birth (#231).
+#
+# `w3b_semantic_retrieval` is F5 gate 2 — the hand-verified fixture corpus,
+# A2 §8's non-vacuous negative, the tie-break determinism pin, and the
+# degraded/suppressed paths. It loads the committed 32 MB model once per
+# test process, so it is slower than its neighbours; it still spawns no
+# daemon and no subprocess. Floor 1.
+#
+# `w3b_model2vec_manifest_pin` is A2-12's structural pin: it reads
+# Cargo.toml, Cargo.lock and deny.toml as data. It executes almost no
+# product code by design, so it is here for completeness of accounting
+# rather than for coverage — a suite invoked by no stage script is exactly
+# the accounting gap the 2026-08-19 and 2026-08-22 blocks above closed.
+# Floor 1.
+#
+# NOT wired here, deliberately: `w3b_semantic_scan_measurement` is
+# `#[ignore]`d and is a measurement, not a gate — the same treatment
+# w1d_overlay_scan_measurement, w2_startup_measurement and
+# w3_prune_measurement get.
+cov_stage_begin c2-w3b_semantic_retrieval
+cov_run cargo llvm-cov --no-report --test w3b_semantic_retrieval --locked || cov_fail "w3b_semantic_retrieval failed under instrumentation"
+cov_stage_end 1 "the w3b_semantic_retrieval test binary must write its own profile"
+
+cov_stage_begin c2-w3b_model2vec_manifest_pin
+cov_run cargo llvm-cov --no-report --test w3b_model2vec_manifest_pin --locked || cov_fail "w3b_model2vec_manifest_pin failed under instrumentation"
+cov_stage_end 1 "the w3b_model2vec_manifest_pin test binary must write its own profile"
