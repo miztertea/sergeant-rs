@@ -31,7 +31,7 @@ registry-normalized manifest and source, not against the recon's snapshot:
 | Claim | Result | Source |
 |---|---|---|
 | Crate exists, is the official one | `model2vec-rs 0.2.1` — "Official Rust Implementation of Model2Vec", repo `github.com/MinishLab/model2vec-rs` | `cargo info model2vec-rs` |
-| License MIT | `LICENSE` file is verbatim MIT ("MIT License / Copyright (c) 2025 The Minish Lab"); the manifest declares `license-file`, **not** an SPDX `license` expression, so `cargo deny` emits `warning[no-license-field]` and then clears it by scanning the file — `licenses ok` | `~/.cargo/registry/src/.../model2vec-rs-0.2.1/LICENSE`; `deny-candidate-b-full.txt` |
+| License MIT | `LICENSE` file is verbatim MIT ("MIT License / Copyright (c) 2025 The Minish Lab"); the manifest declares `license-file`, **not** an SPDX `license` expression, so `cargo deny` emits `warning[no-license-field]` and then clears it by scanning the file — `licenses ok` | `~/.cargo/registry/src/.../model2vec-rs-0.2.1/LICENSE`; candidate B's `cargo deny check` run below |
 | Runtime need is three files | Confirmed in code: `match_local_layout` requires `config.json` + `tokenizer.json` + `model.safetensors` to all `exists()` | `src/model.rs:35-44` of the crate |
 | No GPU, no server | Confirmed: `pool_ids` is a mean-pool over `ndarray` rows in-process; no ONNX, no CUDA, no HTTP in the non-`hf-hub` build | `src/model.rs`, `Cargo.toml` `[dependencies]` |
 | A local-only build is expressible | Confirmed and load-bearing — see below | crate `Cargo.toml` `[features]` |
@@ -71,11 +71,12 @@ advisories ok, bans ok, licenses ok, sources ok
 (exit 0)
 ```
 
-`grep -cE '^error\[' deny-baseline-full.txt` → **0**. Full output:
-`deny-baseline-full.txt`, beside this file. Note this is a *stronger*
-baseline than S4's anydoc spike had: the pre-existing yanked-`chacha20`
-failure that spike had to exclude is gone from this graph, so every error
-below is attributable to this spike with no subtraction needed.
+`grep -cE '^error\[' deny-baseline-full.txt` → **0** (full baseline output
+was captured live during this run and is not retained here — decisive fact
+above). Note this is a *stronger* baseline than S4's anydoc spike had: the
+pre-existing yanked-`chacha20` failure that spike had to exclude is gone
+from this graph, so every error below is attributable to this spike with
+no subtraction needed.
 
 ### Candidate A — `model2vec-rs` alone
 
@@ -95,7 +96,8 @@ advisories FAILED, bans ok, licenses ok, sources ok
 (exit 1)
 ```
 
-**Two** new advisories. Full output: `deny-candidate-a-full.txt`.
+**Two** new advisories (the `error[...]` lines above are the decisive fact;
+the full run's unrelated duplicate-crate warnings are not retained here).
 
 ### Candidate B — the same, with the regex backend selected directly
 
@@ -142,8 +144,9 @@ advisories FAILED, bans ok, licenses ok, sources ok
 (exit 1)
 ```
 
-Full output: `deny-candidate-b-full.txt`. Exactly **one** new `error[...]`
-line against a baseline with none:
+The full advisory block is quoted above. Exactly **one** new `error[...]`
+line against a baseline with none — the decisive check, reproducible from
+each run's own output:
 
 ```
 $ diff <(grep -E '^error\[' deny-baseline-full.txt) \
