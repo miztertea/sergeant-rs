@@ -3985,20 +3985,32 @@ impl Engine {
         //
         // With no compiler installed it is `(authored, None)` and the rest of
         // this function cannot tell C1 exists (§21 item 13).
+        //
+        // Scoped to `StageKind::Actor` (§3: "The existing engine already
+        // binds a workflow/stage and launches a fresh actor... C1 inserts a
+        // deterministic compilation step before the actor start"; §21 item
+        // 1: "fresh ordinary actor stage launches"). An `Execute` stage
+        // launches a Docker container, never an actor, and the backend never
+        // reads `StartRequest.context` for it — compiling a snapshot it
+        // cannot see would be unasked-for scope doing unread work.
         // ---------------------------------------------------------------
-        let (context, snapshot) = self.compile_stage_context(
-            core,
-            work_id,
-            &stage,
-            index,
-            attempt,
-            &execution_id,
-            &intent,
-            &surface,
-            &run,
-            stage_profile.as_ref().map(|p| p.name.as_str()),
-            &authored,
-        );
+        let (context, snapshot) = if stage.kind == StageKind::Actor {
+            self.compile_stage_context(
+                core,
+                work_id,
+                &stage,
+                index,
+                attempt,
+                &execution_id,
+                &intent,
+                &surface,
+                &run,
+                stage_profile.as_ref().map(|p| p.name.as_str()),
+                &authored,
+            )
+        } else {
+            (authored.clone(), None)
+        };
         if let Some(snapshot) = snapshot {
             self.commit(core, work_id, KIND_CONTEXT_COMPILED, snapshot)?;
         }

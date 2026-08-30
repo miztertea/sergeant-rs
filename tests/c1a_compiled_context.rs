@@ -887,6 +887,141 @@ async fn an_unindexed_estate_launches_on_the_existing_stage_context_path() {
     handle.shutdown().await;
 }
 
+/// Whether the local Docker Engine answers at all — same probe and skip
+/// convention as `tests/m7_docker_executor.rs`/`tests/a4_blob_ref_pinning.rs`
+/// (CONTRIBUTING.md's environment posture): a host with no Docker reachable
+/// skips loudly rather than failing on a shape it cannot express.
+fn docker_unavailable() -> Option<&'static str> {
+    match std::process::Command::new("docker").arg("version").output() {
+        Ok(out) if out.status.success() => None,
+        Ok(_) => Some("SKIPPED-ENV: `docker version` exited nonzero on this host"),
+        Err(_) => Some("SKIPPED-ENV: no `docker` binary reachable on this host"),
+    }
+}
+
+macro_rules! require_docker {
+    () => {
+        if let Some(reason) = docker_unavailable() {
+            eprintln!("{reason}");
+            return;
+        }
+    };
+}
+
+/// **F-SF-01**: C1 §3 scopes the compilation step to *"the actor start"* —
+/// §21 item 1's *"fresh ordinary actor stage launches"* — never to an
+/// `Execute` (Docker) stage, which never reaches an actor and whose backend
+/// never reads `StartRequest.context` at all. Against a real daemon and a
+/// real Docker Engine, a mixed actor → execute → actor workflow must journal
+/// a `context.compiled` snapshot for its two actor stages and **none** for
+/// the execute stage in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_execute_stage_launch_is_never_compiled() {
+    require_docker!();
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (_repo, _head) = support::scaffold_solo_estate(&estate, "solo");
+
+    let workflow_dir = estate.join(".sergeant/workflows/mixed");
+    std::fs::create_dir_all(workflow_dir.join("00-first")).expect("stage dir");
+    std::fs::create_dir_all(workflow_dir.join("20-third")).expect("stage dir");
+    std::fs::write(
+        workflow_dir.join("00-first/CONTEXT.md"),
+        "first stage context",
+    )
+    .expect("context");
+    std::fs::write(
+        workflow_dir.join("20-third/CONTEXT.md"),
+        "third stage context",
+    )
+    .expect("context");
+    std::fs::write(
+        workflow_dir.join("workflow.toml"),
+        concat!(
+            "[workflow]\n",
+            "name = \"mixed\"\n",
+            "version = \"1\"\n",
+            "stages = [\"00-first\", \"10-second\", \"20-third\"]\n",
+            "\n",
+            "[stage.\"10-second\"]\n",
+            "kind = \"execute\"\n",
+            "image = \"alpine:3.24\"\n",
+            "command = [\"true\"]\n",
+            "workdir = \"/estate\"\n",
+            "workspace_access = \"read_only\"\n",
+            "network = \"none\"\n",
+        ),
+    )
+    .expect("workflow.toml");
+
+    let (registry, fake) = one_fake([
+        sergeant_rs::backend::fake::FakeStep::complete_with("first done"),
+        sergeant_rs::backend::fake::FakeStep::complete_with("third done"),
+    ]);
+    let handle = sergeant_rs::daemon::start_with(
+        data.path(),
+        sergeant_rs::daemon::DaemonConfig {
+            backends: std::sync::Arc::new(registry),
+            default_backend: Some(FAKE.to_string()),
+            claude: None,
+            docker: Some(sergeant_rs::backend::docker::DockerConfig::new(data.path())),
+            ..sergeant_rs::daemon::DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .expect("client");
+    let body = serde_json::json!({
+        "command_id": ulid::Ulid::generate().to_string(),
+        "intent": "prove an execute stage is never compiled",
+        "estate_root": &estate,
+        "origin": {"client": "cli", "cwd": &estate},
+        "workflow": "mixed",
+    });
+    let response = client
+        .post(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    let status = response.status();
+    let value: Value = response.json().await.expect("json body");
+    assert_eq!(status, 201, "submit rejected: {value}");
+    assert_eq!(value["work"]["state"], "completed", "{value}");
+    let work_id = value["work"]["id"].as_str().expect("work id").to_string();
+
+    let starts = fake.starts();
+    assert_eq!(
+        starts.len(),
+        2,
+        "only the two actor stages reach the fake: {starts:?}"
+    );
+
+    let snapshots = events_of(data.path(), &work_id, KIND_CONTEXT_COMPILED);
+    let compiled_stage_ids: BTreeSet<String> = snapshots
+        .iter()
+        .map(|e| {
+            e.payload["coordinate"]["stage"]
+                .as_str()
+                .expect("stage coordinate")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        compiled_stage_ids,
+        BTreeSet::from(["00-first".to_string(), "20-third".to_string()]),
+        "the execute stage must never appear among compiled stages: {compiled_stage_ids:?}"
+    );
+
+    handle.shutdown().await;
+}
+
 /// A two-stage workflow whose stage contexts are exactly the two strings the
 /// live tests compare against.
 fn write_two_stage_workflow(estate: &Path) {
