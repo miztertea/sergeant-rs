@@ -1486,6 +1486,7 @@ fn pack(
     let mut demoted = 0usize;
     let mut unrendered = 0usize;
     let mut withheld_external = 0usize;
+    let mut resolve_failed = 0usize;
 
     for unit in units {
         let mut candidate = unit.clone();
@@ -1510,12 +1511,24 @@ fn pack(
             {
                 if external.contains(generation_id) {
                     withheld_external += 1;
-                } else if let Ok(Some(evidence)) = resolve(atlas, &candidate.coordinate) {
-                    candidate.excerpt = match evidence {
-                        SourceEvidence::Unit { text, .. } => Some(text),
-                        SourceEvidence::Relationship(relationship) => relationship.detail,
-                        _ => None,
-                    };
+                } else {
+                    // Err(_) (a genuine Atlas read failure) and an honest
+                    // Ok(None)/Ok(Some(WorkRecord)) both leave no excerpt,
+                    // but they are not the same outcome (F-IN-02): a real
+                    // backend error is counted and journaled in step 9's
+                    // note rather than silently absorbed into "nothing to
+                    // render".
+                    match resolve(atlas, &candidate.coordinate) {
+                        Ok(Some(evidence)) => {
+                            candidate.excerpt = match evidence {
+                                SourceEvidence::Unit { text, .. } => Some(text),
+                                SourceEvidence::Relationship(relationship) => relationship.detail,
+                                _ => None,
+                            };
+                        }
+                        Ok(None) => {}
+                        Err(_) => resolve_failed += 1,
+                    }
                 }
             }
             let cost = render_chunk(&candidate).len() as u64;
@@ -1558,6 +1571,12 @@ fn pack(
         note.push_str(&format!(
             "; {withheld_external} external unit(s) rendered as coordinates only, pending §21 \
              item 9's external labeling (C1c)"
+        ));
+    }
+    if resolve_failed > 0 {
+        note.push_str(&format!(
+            "; {resolve_failed} Bound unit(s) failed to resolve during packing (an Atlas read \
+             error, not a missing row) and were rendered as coordinates only"
         ));
     }
     if unrendered > 0 {
