@@ -2399,12 +2399,22 @@ impl AtlasDb {
     /// `source.child_resources` and every syntax-derived edge lives in
     /// `source.edges`. Both lookups are equalities on the coordinate's own
     /// fields; neither scans a generation.
+    ///
+    /// `ordinal` (F-IN-01) discriminates two edges that legitimately share
+    /// every other field — e.g. the same file importing the same target
+    /// twice — which `(generation_id, edge_kind, relative_path, target)`
+    /// alone cannot: without it, `rows.next()` took whichever matching row
+    /// DuckDB returned first, non-deterministically. `None` widens back to
+    /// the old any-match behavior, which is correct for the child-resource
+    /// branch (no ordinal column) and for a coordinate pinned before this
+    /// field existed.
     pub fn resolve_relationship(
         &self,
         generation_id: &str,
         kind: &str,
         from: &str,
         to: &str,
+        ordinal: Option<u64>,
     ) -> Result<Option<ResolvedRelationship>, AtlasError> {
         if kind == CHILD_RESOURCE_RELATIONSHIP {
             let mut statement = self.conn.prepare(sql!(
@@ -2425,13 +2435,21 @@ impl AtlasDb {
                 detail: row.get::<usize, Option<String>>(2)?,
             }));
         }
+        let ordinal_param = ordinal.map(|o| o as i64);
         let mut statement = self.conn.prepare(sql!(
             "SELECT e.relative_path, e.target, e.ordinal, e.language \
              FROM source.edges e \
              WHERE e.generation_id = ? AND e.edge_kind = ? AND e.relative_path = ? \
-               AND e.target = ?"
+               AND e.target = ? AND (? IS NULL OR e.ordinal = ?)"
         ))?;
-        let mut rows = statement.query(duckdb::params![generation_id, kind, from, to])?;
+        let mut rows = statement.query(duckdb::params![
+            generation_id,
+            kind,
+            from,
+            to,
+            ordinal_param,
+            ordinal_param
+        ])?;
         let Some(row) = rows.next()? else {
             return Ok(None);
         };

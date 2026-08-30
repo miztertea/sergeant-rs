@@ -396,6 +396,13 @@ pub enum EvidenceCoordinate {
         /// The end it names. **Unresolved** for a syntax edge, exactly as
         /// [`StoredEdge::target`] is.
         to: String,
+        /// Position within `from`'s edge list (F-IN-01) — an edge's own
+        /// per-row identity alongside `kind`/`from`/`to`, since two distinct
+        /// edges (e.g. the same file importing the same target twice)
+        /// legitimately share every other field. `None` for a child-resource
+        /// row, which has no ordinal, exactly as
+        /// [`crate::runtime::atlas::db::ResolvedRelationship::ordinal`] is.
+        ordinal: Option<u64>,
     },
 }
 
@@ -543,6 +550,7 @@ impl EvidenceCoordinate {
                 kind,
                 from,
                 to,
+                ordinal,
             } => json!({
                 "shape": "relationship",
                 "source": source_name,
@@ -550,6 +558,7 @@ impl EvidenceCoordinate {
                 "kind": kind,
                 "from": from,
                 "to": to,
+                "ordinal": ordinal,
             }),
         }
     }
@@ -1388,9 +1397,10 @@ pub fn resolve(
             kind,
             from,
             to,
+            ordinal,
             ..
         } => Ok(atlas
-            .resolve_relationship(generation_id, kind, from, to)?
+            .resolve_relationship(generation_id, kind, from, to, *ordinal)?
             .map(SourceEvidence::Relationship)),
     }
 }
@@ -2117,6 +2127,7 @@ fn child_relationship(pin: &GenerationPin, child: &StoredChildResource) -> Evide
         kind: "child_resource".to_string(),
         from: child.parent_relative_path.clone(),
         to: child.relative_path.clone(),
+        ordinal: None,
     }
 }
 
@@ -2130,6 +2141,7 @@ fn edge_relationship(pin: &GenerationPin, edge: &StoredEdge) -> EvidenceCoordina
         kind: edge.kind.clone(),
         from: edge.relative_path.clone(),
         to: edge.target.clone(),
+        ordinal: Some(edge.ordinal),
     }
 }
 

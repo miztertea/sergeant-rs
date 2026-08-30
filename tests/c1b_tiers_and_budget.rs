@@ -32,6 +32,7 @@ use sergeant_rs::domain::workflow::{StageDefinition, StageKind, StageRecord, Sta
 use sergeant_rs::runtime::atlas::db::{AtlasDb, LexicalQuery, SourceSelector};
 use sergeant_rs::runtime::atlas::overlay::overlay_source_name;
 use sergeant_rs::runtime::atlas::record::record_scan;
+use sergeant_rs::runtime::atlas::scan::{EDGE_IMPORT, ScannedEdge, ScannedSyntax};
 use sergeant_rs::runtime::atlas::semantic::SemanticRequest;
 use sergeant_rs::runtime::context::{
     CompileRequest, ContextSnapshot, EvidenceCoordinate, EvidenceUnit, RenderBudget, ResearchStep,
@@ -795,5 +796,91 @@ fn external_evidence_renders_as_a_coordinate_and_never_as_body_text() {
         pack.note.as_deref().unwrap_or_default().contains("item 9"),
         "packing must say why it withheld the body: {:?}",
         pack.note
+    );
+}
+
+// ==================================================================== fixes
+
+/// **F-IN-01.** `AtlasDb::resolve_relationship`'s edge lookup used to filter
+/// only on `(generation_id, edge_kind, relative_path, target)` — no
+/// `ordinal`, no `ORDER BY`, no `LIMIT` — so two edges that legitimately
+/// share every one of those fields (the same file importing the same target
+/// twice) were indistinguishable to the query, and `rows.next()` returned
+/// whichever DuckDB happened to return first regardless of which coordinate
+/// asked. Two edges are planted here sharing kind/from/to and differing only
+/// in `ordinal`; each coordinate's own pinned ordinal must come back, not an
+/// arbitrary one of the two.
+#[test]
+fn resolve_relationship_discriminates_sibling_edges_by_ordinal() {
+    let data = tempfile::tempdir().expect("data dir");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+
+    let mut code = file("src/lib.rs", vec![unit(0, "lib", "fn main() {}")]);
+    code.syntax = Some(ScannedSyntax {
+        language: "rust",
+        extractor: "syntax-rust/v1".to_string(),
+        syntax_key: "syntax-key/rust/src/lib.rs".to_string(),
+        symbols: Vec::new(),
+        edges: vec![
+            ScannedEdge {
+                ordinal: 0,
+                kind: EDGE_IMPORT,
+                target: "crate::shared".to_string(),
+                byte_start: 0,
+                byte_end: 1,
+            },
+            ScannedEdge {
+                ordinal: 7,
+                kind: EDGE_IMPORT,
+                target: "crate::shared".to_string(),
+                byte_start: 40,
+                byte_end: 41,
+            },
+        ],
+    });
+    let base = scan(
+        REPOSITORY,
+        SourceKind::EstateGit,
+        AuthorityClass::EstateMutable,
+        vec![code],
+    );
+    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    let generation_id = db
+        .confirmed_generation(REPOSITORY)
+        .expect("read")
+        .expect("the base generation is confirmed")
+        .id;
+
+    let asked_for_0 = db
+        .resolve_relationship(
+            &generation_id,
+            EDGE_IMPORT,
+            "src/lib.rs",
+            "crate::shared",
+            Some(0),
+        )
+        .expect("read")
+        .expect("the ordinal-0 edge resolves");
+    assert_eq!(
+        asked_for_0.ordinal,
+        Some(0),
+        "asked for ordinal 0, got the other sibling edge back: {asked_for_0:?}"
+    );
+
+    let asked_for_7 = db
+        .resolve_relationship(
+            &generation_id,
+            EDGE_IMPORT,
+            "src/lib.rs",
+            "crate::shared",
+            Some(7),
+        )
+        .expect("read")
+        .expect("the ordinal-7 edge resolves");
+    assert_eq!(
+        asked_for_7.ordinal,
+        Some(7),
+        "asked for ordinal 7, got the other sibling edge back: {asked_for_7:?}"
     );
 }
