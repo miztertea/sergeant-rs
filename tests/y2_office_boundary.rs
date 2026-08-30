@@ -169,7 +169,7 @@ fn the_office_adapter_actually_names_anydoc() {
 
 /// Extract every `pub`/`pub(crate)` item [`OWNER`] declares, as normalized
 /// text: a `fn` contributes its signature only (a body edit is not a surface
-/// change — [`docx_units`]'s own internals, for instance, must stay free to
+/// change — [`office_units`]'s own internals, for instance, must stay free to
 /// change without touching this baseline); a `struct`/`enum`/`const`/`type`/
 /// `use` contributes its full span (so a struct picking up a new field, or a
 /// brand new top-level item of any kind, shows up too), with `///` doc-only

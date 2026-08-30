@@ -12,7 +12,7 @@
 //!
 //! `--extractor` is dispatched on, not merely echoed: a value equal to
 //! [`office::DOCX_EXTRACTOR`] runs the real Office adapter
-//! ([`office::docx_units`]) over stdin; a value equal to
+//! ([`office::office_units`]) over stdin; a value equal to
 //! [`archive::ZIP_EXTRACTOR`] runs the real bounded-ZIP adapter
 //! ([`archive::expand`], S4 Y3) over stdin; a value equal to
 //! [`mail::MAIL_EXTRACTOR`] runs the real mail adapter
@@ -60,7 +60,7 @@
 //!
 //! # A failed extraction exits non-zero — it never emits an empty batch
 //!
-//! [`office::docx_units`] returning `Err` is **not** reported as a
+//! [`office::office_units`] returning `Err` is **not** reported as a
 //! `WorkerBatch` with zero units: that would be indistinguishable on the
 //! wire from a document that genuinely extracted to nothing, which is
 //! exactly the "silent empty" F8 forbids (coverage honesty, brief item 5).

@@ -483,7 +483,7 @@ pub struct CoverageRow {
 /// **Decided: no new variant.** A `.docx`, normalized, decomposes into
 /// exactly the same shape Markdown already has — one unit for the whole
 /// resource, plus flat, heading-delimited sections tiling what came after
-/// it — because `office::docx_units` walks the normalizer's own heading
+/// it — because `office::office_units` walks the normalizer's own heading
 /// transitions the identical way `text::markdown_units` walks ATX heading
 /// transitions.
 /// Reusing `Document`/`Section` is R1/R2 (Ponytail): a format-specific pair

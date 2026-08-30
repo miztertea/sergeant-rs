@@ -5,7 +5,7 @@
 //! ```
 //!
 //! A pure function over bytes (F6), meant to run inside Y1's supervised
-//! worker exactly the way `office::docx_units`/`archive::expand` already do.
+//! worker exactly the way `office::office_units`/`archive::expand` already do.
 //! Message shape follows A1 §6.5 verbatim: from/to/cc, sent timestamp,
 //! subject, text AND html bodies, message id and thread/references ids,
 //! attachments. Provenance carries parser identity + version
@@ -205,7 +205,7 @@
 //! encrypted/S-MIME), [`MailError::Degraded`] (the caveat-1 signal) — never
 //! a `MailMessage` with partial fields standing in for a refusal. A caller
 //! (the worker binary) turns that `Err` into a non-zero exit exactly as
-//! `office::docx_units`'s own failure does, which the daemon-side transport
+//! `office::office_units`'s own failure does, which the daemon-side transport
 //! already turns into a named [`crate::domain::source::Coverage::Error`]
 //! row (R2 — the SAME "a failed extraction exits non-zero, never an empty
 //! batch" rule `atlas_worker.rs`'s own module doc states for Office).
