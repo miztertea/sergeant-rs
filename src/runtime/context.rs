@@ -1493,15 +1493,29 @@ fn pack(
             // Only resolve while the budget could still hold the answer:
             // resolving past exhaustion would be a read whose result is
             // thrown away.
+            // Two coordinate shapes carry a body worth resolving here: an
+            // Atlas unit's text, and a Relationship's `detail` (F-SF-01 —
+            // this used to match Atlas only, so §5 step 3's relationships
+            // stayed coordinate-only forever even though they resolve to
+            // real evidence exactly like an Atlas unit does).
+            let generation_id = match &candidate.coordinate {
+                EvidenceCoordinate::Atlas { generation_id, .. }
+                | EvidenceCoordinate::Relationship { generation_id, .. } => {
+                    Some(generation_id.as_str())
+                }
+                _ => None,
+            };
             if bound_spent < budget.bound_bytes
-                && let EvidenceCoordinate::Atlas { generation_id, .. } = &candidate.coordinate
+                && let Some(generation_id) = generation_id
             {
-                if external.contains(generation_id.as_str()) {
+                if external.contains(generation_id) {
                     withheld_external += 1;
-                } else if let Ok(Some(SourceEvidence::Unit { text, .. })) =
-                    resolve(atlas, &candidate.coordinate)
-                {
-                    candidate.excerpt = Some(text);
+                } else if let Ok(Some(evidence)) = resolve(atlas, &candidate.coordinate) {
+                    candidate.excerpt = match evidence {
+                        SourceEvidence::Unit { text, .. } => Some(text),
+                        SourceEvidence::Relationship(relationship) => relationship.detail,
+                        _ => None,
+                    };
                 }
             }
             let cost = render_chunk(&candidate).len() as u64;

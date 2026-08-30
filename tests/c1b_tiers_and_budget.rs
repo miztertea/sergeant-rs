@@ -32,7 +32,7 @@ use sergeant_rs::domain::workflow::{StageDefinition, StageKind, StageRecord, Sta
 use sergeant_rs::runtime::atlas::db::{AtlasDb, LexicalQuery, SourceSelector};
 use sergeant_rs::runtime::atlas::overlay::overlay_source_name;
 use sergeant_rs::runtime::atlas::record::record_scan;
-use sergeant_rs::runtime::atlas::scan::{EDGE_IMPORT, ScannedEdge, ScannedSyntax};
+use sergeant_rs::runtime::atlas::scan::{ChildProvenance, EDGE_IMPORT, ScannedEdge, ScannedSyntax};
 use sergeant_rs::runtime::atlas::semantic::SemanticRequest;
 use sergeant_rs::runtime::context::{
     CompileRequest, ContextSnapshot, EvidenceCoordinate, EvidenceUnit, RenderBudget, ResearchStep,
@@ -800,6 +800,70 @@ fn external_evidence_renders_as_a_coordinate_and_never_as_body_text() {
 }
 
 // ==================================================================== fixes
+
+/// **F-SF-01.** §5 step 3's own Bound tier — *"exact structural/document/
+/// tabular/mail relationships"* — used to stay coordinate-only forever: only
+/// `EvidenceCoordinate::Atlas` ever got an excerpt resolved during packing.
+/// A `Relationship` coordinate resolves to real evidence too
+/// ([`resolve`] already proved that for item 3/4's other tests), so packing
+/// must render it exactly as it renders an Atlas unit's body: the one extra
+/// fact the storing table holds (§6.6's entry path, for a child resource)
+/// reaches the prompt, not just the coordinate line.
+#[test]
+fn a_bound_relationship_unit_renders_its_resolved_detail_into_the_prompt() {
+    const ENTRY_PATH: &str = "attachments/report.pdf";
+    let data = tempfile::tempdir().expect("data dir");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+
+    let base = scan(
+        REPOSITORY,
+        SourceKind::EstateGit,
+        AuthorityClass::EstateMutable,
+        vec![file(
+            "docs/architecture.md",
+            vec![unit(0, "Architecture", "The daemon owns the journal.")],
+        )],
+    );
+    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+
+    let mut child = file(
+        "mail/inbox.mbox/attachments/report.pdf",
+        vec![unit(0, "Report", "Report body.")],
+    );
+    child.parent = Some(ChildProvenance {
+        parent_relative_path: "mail/inbox.mbox".to_string(),
+        parent_key: "key/mail/inbox.mbox".to_string(),
+        entry_path: ENTRY_PATH.to_string(),
+    });
+    let overlay = scan(
+        &overlay_source_name(WORK_ID, REPOSITORY),
+        SourceKind::EstateGit,
+        AuthorityClass::EstateMutable,
+        vec![child],
+    );
+    record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+
+    let snapshot = compiled(&db, RenderBudget::DEFAULT);
+
+    let relationship = snapshot
+        .bound
+        .iter()
+        .find(|unit| matches!(unit.coordinate, EvidenceCoordinate::Relationship { .. }))
+        .expect("step 3 contributed the child-resource relationship as a Bound unit");
+    assert_eq!(
+        relationship.excerpt.as_deref(),
+        Some(ENTRY_PATH),
+        "a Bound Relationship unit must resolve to its stored detail (the entry path), not \
+         stay coordinate-only: {relationship:?}"
+    );
+
+    let rendered = snapshot.render_onto(AUTHORED);
+    assert!(
+        rendered.contains(ENTRY_PATH),
+        "the resolved relationship detail never reached the rendered prompt: {rendered}"
+    );
+}
 
 /// **F-IN-01.** `AtlasDb::resolve_relationship`'s edge lookup used to filter
 /// only on `(generation_id, edge_kind, relative_path, target)` — no
