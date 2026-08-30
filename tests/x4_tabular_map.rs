@@ -883,18 +883,24 @@ fn a_dataset_with_no_path_to_read_in_place_is_named_rather_than_mislabelled() {
 // -------------------------------------------------------------- F11
 
 /// **F11's named deferral, pinned.** `map` ships F11's own five verbs, plus
-/// exactly one verb a later wave's own consumer earned, and nothing else.
+/// exactly the verbs a later wave's own consumer earned, and nothing else.
 ///
 /// `neighbors` and `changed` are deferred to S5/S6, where their consumers
 /// exist. A verb that shipped now would answer from nothing — the same false
 /// promise the empty-table doctrine refuses — so the absence is asserted
-/// rather than left to a reviewer to notice. `children` is the counterpart
-/// case and belongs in the same list for the same reason: S5 W7 (F-SF-03)
-/// landed `source.child_resources` rows with no read path at all, which is
-/// the same false promise from the other direction, so the verb shipped when
-/// the rows did.
+/// rather than left to a reviewer to notice. `children` and `facts` are the
+/// counterpart case and belong in the same list for the same reason: S5 W7
+/// (F-SF-03) landed `source.child_resources` rows with no read path at all,
+/// and the S5 closeout (F-AC-03) found `source.dataset_facts` in the same
+/// state while A2 §17 item 3 was claimed met on it — the same false promise
+/// from the other direction, so each verb shipped when its rows became
+/// evidence someone outside this process was owed.
+///
+/// The list stays exact in both directions. It is not a floor a new verb may
+/// be added under quietly; a verb added here without rows behind it, or rows
+/// landed without the verb, fails this test.
 #[test]
-fn f11_map_ships_five_verbs_and_defers_neighbors_and_changed() {
+fn map_ships_only_the_verbs_whose_rows_exist_and_defers_neighbors_and_changed() {
     let output = Command::new(env!("CARGO_BIN_EXE_sgt"))
         .args(["map", "--help"])
         .output()
@@ -923,10 +929,11 @@ fn f11_map_ships_five_verbs_and_defers_neighbors_and_changed() {
             "stats",
             "outline",
             "children",
+            "facts",
             "symbol",
             "references",
         ]),
-        "`sgt map` ships F11's five verbs plus `children`, and nothing else"
+        "`sgt map` ships F11's five verbs plus `children` and `facts`, and nothing else"
     );
 
     let status = Command::new(env!("CARGO_BIN_EXE_sgt"))
@@ -1158,6 +1165,35 @@ async fn f11_the_map_surface_answers_over_http_and_through_the_verb() {
         titles.iter().any(|t| t == "Guide"),
         "the verb must return the same rows the route does: {titles:?}"
     );
+
+    // A2 §17 item 3's relational read, over the wire and through the verb.
+    // Before the S5 closeout (F-AC-03) the stored aggregates had no caller in
+    // `src/` at all, so the item was met only inside the test binary.
+    let (status, body) = get(&handle, "/v1/map/facts?source=team%20notes").await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    let facts = body["facts"].as_array().expect("facts");
+    assert!(
+        facts.iter().any(|f| f["path"] == "rows.csv"),
+        "the scanned dataset's canned answers reach a client: {body}"
+    );
+    let facts_out = sgt_while_serving(
+        cwd.path(),
+        data.path(),
+        &["--json", "map", "facts", "team notes"],
+    )
+    .await;
+    facts_out.assert_ok("sgt map facts");
+    let keys: Vec<String> = facts_out.json()["facts"]
+        .as_array()
+        .expect("facts")
+        .iter()
+        .filter_map(|f| f["dataset_key"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        keys.iter().all(|k| !k.is_empty()),
+        "every aggregate carries the key a row-text hit joins on: {keys:?}"
+    );
+    assert!(!keys.is_empty(), "and there is at least one to join to");
 
     let status_out = sgt_while_serving(
         cwd.path(),

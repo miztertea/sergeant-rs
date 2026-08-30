@@ -78,6 +78,7 @@ fn scan(units: usize) -> SourceScan {
                 title: None,
                 byte_start: 0,
                 byte_end: body(i).len() as u64,
+                coordinate: None,
                 text: body(i),
             }],
             syntax: None,

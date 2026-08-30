@@ -41,7 +41,7 @@
 //! destination, not an oversight.** `sgt search` is a pure reader — H13.2
 //! rejected query-time scanning specifically to keep it one, and
 //! `tests/w1b_overlay_lifecycle_trigger.rs::
-//! the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`
+//! the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls`
 //! pins it structurally. Journaling a row per query would make every search a
 //! write, which is the property that pin exists to forbid (**J5** — the pin
 //! is a governing constraint, and a lower rung cannot override it). §13's
@@ -463,6 +463,7 @@ pub fn coordinate_json(coordinate: &UnitCoordinate) -> serde_json::Value {
             title,
             byte_start,
             byte_end,
+            native,
         } => serde_json::json!({
             "family": "document",
             "path": relative_path,
@@ -470,6 +471,10 @@ pub fn coordinate_json(coordinate: &UnitCoordinate) -> serde_json::Value {
             "title": title,
             "byte_start": byte_start,
             "byte_end": byte_end,
+            // A2 §9: a result cites the original source path *and native
+            // coordinate*. `null` where the byte span already is the
+            // address (every Markdown/text unit).
+            "native": native,
         }),
         UnitCoordinate::Mail {
             relative_path,
@@ -477,6 +482,7 @@ pub fn coordinate_json(coordinate: &UnitCoordinate) -> serde_json::Value {
             title,
             byte_start,
             byte_end,
+            native,
         } => serde_json::json!({
             "family": "mail",
             "path": relative_path,
@@ -484,6 +490,9 @@ pub fn coordinate_json(coordinate: &UnitCoordinate) -> serde_json::Value {
             "title": title,
             "byte_start": byte_start,
             "byte_end": byte_end,
+            // Which body of the message this is — the only thing telling a
+            // message's two bodies apart (A1 §6.5).
+            "native": native,
         }),
         UnitCoordinate::RowText {
             relative_path,

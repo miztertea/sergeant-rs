@@ -62,6 +62,7 @@ fn document(text: &str) -> ScannedUnit {
         title: None,
         byte_start: 0,
         byte_end: text.len() as u64,
+        coordinate: None,
         text: text.to_string(),
     }
 }
@@ -605,6 +606,89 @@ fn an_authority_filter_for_external_admits_only_the_external_source() {
     };
     let names = occurrence_names(&estate, &filter);
     assert_eq!(names, vec!["widget_vendor".to_string()], "{names:?}");
+}
+
+/// **A2 §2 stage 2 ships with no caller, and that is only honest while the
+/// authority axis is degenerate** (S5 closeout F-AC-01).
+///
+/// `Admissibility::authority` is `None` at the one production construction
+/// site (`SearchQuery::admissibility`, serving both `/v1/search` and
+/// `/v1/related`), so the two tests above exercise a stage nothing in
+/// production can ask for. That is defensible today for exactly one reason:
+/// every producer in this build pairs a source kind with one fixed authority
+/// class, so `authority_class` is a *total function* of `source_kind` and
+/// `--type repo|knowledge|external` already names every world an
+/// `--authority` selector could name. A2 §14's selector list carries no
+/// authority flag either, so the CLI is complete against the contract, and a
+/// second spelling of `--type` is the abstraction R1 exists to refuse.
+///
+/// None of that is a property of the *design* — A1 keeps the two columns
+/// apart deliberately — so it is pinned rather than assumed. The moment a
+/// producer lands a generation whose authority is not implied by its kind
+/// (a read-only estate mount, an externally-authored local knowledge
+/// source), this test fails, and at that point the selector has to ship:
+/// `--type` would no longer be able to express what stage 2 filters on.
+///
+/// Read from the producers themselves, not from a list maintained beside
+/// them, so a new producer cannot be added without this seeing it.
+#[test]
+fn the_authority_axis_earns_no_selector_only_while_it_is_a_function_of_source_kind() {
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pairs: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut walked = 0usize;
+    let mut stack = vec![src.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source file");
+            // A `SourceScan` literal spells the two fields adjacently, in
+            // this order, in every producer. A producer that spells them
+            // apart is itself a change to this stage and is meant to be
+            // noticed here.
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("kind: SourceKind::") {
+                rest = &rest[at + "kind: SourceKind::".len()..];
+                let Some(comma) = rest.find(',') else { break };
+                let kind = rest[..comma].trim().to_string();
+                let after = &rest[comma + 1..];
+                let head: String = after.chars().take(64).collect();
+                let Some(auth_at) = head.find("authority: AuthorityClass::") else {
+                    continue;
+                };
+                let tail = &head[auth_at + "authority: AuthorityClass::".len()..];
+                let Some(end) = tail.find(',') else { continue };
+                walked += 1;
+                pairs.insert((kind, tail[..end].trim().to_string()));
+            }
+        }
+    }
+    assert!(
+        walked >= 4,
+        "the scan must actually find the producers it is about; found {walked}"
+    );
+    let expected: BTreeSet<(String, String)> = [
+        ("LocalKnowledge", "EstateReadonly"),
+        ("EstateGit", "EstateMutable"),
+        ("ExternalGit", "External"),
+    ]
+    .into_iter()
+    .map(|(k, a)| (k.to_string(), a.to_string()))
+    .collect();
+    assert_eq!(
+        pairs, expected,
+        "a source kind is paired with a new authority class somewhere in `src/`. \
+         `authority_class` is no longer a function of `source_kind`, so `--type` can no \
+         longer express what A2 §2's stage 2 filters on, and `Admissibility::authority` \
+         needs the production caller it has never had (`SearchQuery::admissibility` sets \
+         it to `None`). Wire the selector — do not extend this list."
+    );
 }
 
 /// A bare `Admissibility::default()` — `SourceSelector::Any`, no authority

@@ -245,6 +245,17 @@ pub struct ScannedUnit {
     pub byte_start: u64,
     /// End offset into the original file bytes, exclusive.
     pub byte_end: u64,
+    /// The normalizer's own native address for this unit, when
+    /// `byte_start`/`byte_end` cannot say where it is (A2 §9's *"native
+    /// coordinate"*).
+    ///
+    /// `None` for every in-process text/Markdown unit, whose byte span is
+    /// the address. `Some` for a unit an adapter extracted out of a
+    /// container it had to decode first — an Office section's `block:<n>`,
+    /// a mail body's `text-body`/`html-body` — where no offset into the
+    /// original bytes corresponds to the unit. The full contract the value
+    /// satisfies is [`crate::runtime::atlas::worker::WorkerUnit::coordinate`]'s.
+    pub coordinate: Option<String>,
     /// The unit's own text, exactly as it appears in the original.
     pub text: String,
 }
@@ -1373,13 +1384,20 @@ fn dispatch_worker_resource_at_depth(
                 .units
                 .into_iter()
                 .enumerate()
+                // S5 closeout (F-AC-02): everything the adapter knew about
+                // the unit lands, not just its span. Dropping `title`,
+                // `heading_level` and the native `coordinate` here is what
+                // left every worker-routed family (mail, Office, archive
+                // children) without the provenance A2 §17 item 2 and §9
+                // require, while the in-process path below kept it.
                 .map(|(ordinal, unit)| ScannedUnit {
                     ordinal: ordinal as u64,
                     kind: unit.kind,
-                    heading_level: None,
-                    title: None,
+                    heading_level: unit.heading_level,
+                    title: unit.title,
                     byte_start: unit.byte_start,
                     byte_end: unit.byte_end,
+                    coordinate: unit.coordinate,
                     text: unit.text,
                 })
                 .collect();
@@ -1846,6 +1864,9 @@ pub fn extract_units(text: &str, extractor: &str) -> Vec<ScannedUnit> {
             title: unit.title,
             byte_start: unit.byte_start as u64,
             byte_end: unit.byte_end as u64,
+            // A text/Markdown unit's byte span IS its address, so there is
+            // no second, native one to carry (`ScannedUnit::coordinate`).
+            coordinate: None,
             text: text[unit.byte_start..unit.byte_end].to_string(),
         })
         .collect()

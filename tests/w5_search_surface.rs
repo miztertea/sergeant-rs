@@ -8,6 +8,7 @@
 //! | §17 item 8 — external evidence is visibly external **from the answer alone** | [`an_external_hit_is_identifiable_as_external_from_the_answer_alone`] |
 //! | §17 item 8 — and the same is true of a fused answer, not only a lexical one | [`a_fused_answer_carries_the_source_kind_and_authority_class_of_every_hit`] |
 //! | §17 item 3 — a relational aggregate **joins to retrieved row evidence** | [`a_relational_aggregate_and_a_retrieved_row_join_on_one_shared_row_identity`] |
+//! | §17 item 3 — and that relational read is **reachable outside the test binary** | [`item_3s_relational_read_is_reachable_from_outside_the_process`] |
 //! | §17 item 6 — one query **spans** a normalized Office document and a Markdown one | [`one_local_knowledge_query_spans_a_normalized_docx_and_a_markdown_file`] |
 //! | §13 — all nine trace fields are recorded | [`the_trace_records_every_one_of_a2_section_13s_nine_fields`] |
 //! | §13 — the tokenizer version is not a promise to remember | [`the_lexical_tokenizer_version_is_pinned_to_the_tokenizers_actual_output`] |
@@ -120,6 +121,7 @@ fn document_unit(title: Option<&str>, text: &str) -> ScannedUnit {
         title: title.map(str::to_string),
         byte_start: 0,
         byte_end: text.len() as u64,
+        coordinate: None,
         text: text.to_string(),
     }
 }
@@ -499,6 +501,105 @@ fn a_relational_aggregate_and_a_retrieved_row_join_on_one_shared_row_identity() 
     );
 }
 
+/// **A2 §17 item 3, the reachability half** (S5 closeout F-AC-03).
+///
+/// [`a_relational_aggregate_and_a_retrieved_row_join_on_one_shared_row_identity`]
+/// really performs the join — but it performed it entirely through `pub`
+/// library functions that, at the close of S5, had no caller anywhere in
+/// `src/`: `dataset_probe`, `dataset_facts` and `admissible_datasets`. An
+/// acceptance item met only inside the test binary is this program's
+/// signature defect, and it is what this test exists to make impossible to
+/// repeat. It pins two things:
+///
+/// 1. the aggregate half of the join is served by the read the daemon route
+///    actually calls — `dataset_facts`, which reads only rows the store
+///    already holds — and that read joins to a retrieved row on
+///    `dataset_key`, A2 §4's shared row identity;
+/// 2. that read has a daemon route AND a CLI verb, in the shape
+///    `GET /v1/map/children` / `sgt map children` set in W7.
+///
+/// `dataset_probe` is deliberately *not* reachable and is asserted so: its
+/// own doc says `path` is a file path this process will open, *"so this is
+/// not, and must not become, an HTTP-reachable surface"*. The distinction is
+/// the point — one of these two reads is safe to expose and one is not, and
+/// "neither is exposed" was not the same as "the unsafe one is not".
+#[test]
+fn item_3s_relational_read_is_reachable_from_outside_the_process() {
+    let estate = estate();
+
+    // (1) The aggregate, through the read the route calls — no probe, no
+    // path, no client-named file: rows the store already holds.
+    let facts = estate
+        .db
+        .dataset_facts("library", 100)
+        .expect("stored relational evidence");
+    assert!(
+        !facts.is_empty(),
+        "a scanned dataset lands its canned queries' answers"
+    );
+
+    // The retrieval half, and the join key.
+    let answer = estate.search("INC0012345", &only_library(), Some(LexicalFamily::RowText));
+    let hit = answer
+        .hits
+        .iter()
+        .find(|hit| hit.coordinate.relative_path() == "tickets.csv")
+        .expect("a row-text hit for the ticket");
+    let UnitCoordinate::RowText {
+        relative_path,
+        dataset_key,
+        ..
+    } = &hit.coordinate
+    else {
+        panic!("expected a row-text coordinate, got {:?}", hit.coordinate);
+    };
+    let fact = facts
+        .iter()
+        .find(|f| &f.dataset_key == dataset_key)
+        .unwrap_or_else(|| {
+            panic!("the retrieved row's dataset key must name stored evidence: {dataset_key}")
+        });
+    assert_eq!(
+        &fact.relative_path, relative_path,
+        "the aggregate and the retrieved row cite one file"
+    );
+    assert!(
+        !fact.query_identity.is_empty() && !fact.output_hash.is_empty(),
+        "and the aggregate is checkable, not merely present: {fact:?}"
+    );
+
+    // (2) The surface. Without this, (1) is another green test for a
+    // capability nothing can call.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let api = std::fs::read_to_string(manifest.join("src/api.rs")).expect("read src/api.rs");
+    let cli = std::fs::read_to_string(manifest.join("src/cli.rs")).expect("read src/cli.rs");
+    assert!(
+        api.contains("atlas.dataset_facts("),
+        "item 3's relational read must have a daemon route that calls it — \
+         `dataset_facts` reached no production caller at the close of S5"
+    );
+    assert!(
+        api.contains(r#".route("/map/facts", get(map_facts))"#),
+        "and that route must be mounted, not merely written"
+    );
+    assert!(
+        cli.contains("/v1/map/facts?source="),
+        "and a CLI verb must reach it, in the shape `sgt map children` set"
+    );
+    // The negative half: the producer that opens a file the caller names
+    // stays off the wire, exactly as its own doc requires. A *call*, not a
+    // mention — the route's own doc names it to say why it is absent.
+    assert!(
+        !api.contains(".dataset_probe("),
+        "`dataset_probe` opens a path the caller supplies and must never \
+         become an HTTP-reachable surface (its own doc)"
+    );
+    assert!(
+        !cli.contains("dataset_probe"),
+        "and no CLI verb may reach it either"
+    );
+}
+
 // ============================================================ §17 item 6
 
 /// **A2 §17 item 6**: *"local knowledge Source searches can span normalized
@@ -513,6 +614,56 @@ fn a_relational_aggregate_and_a_retrieved_row_join_on_one_shared_row_identity() 
 ///
 /// The `.docx` here is a real Office file read by the real adapter in a real
 /// subprocess (see [`estate`]); the Markdown is a real file on the same root.
+///
+/// # Which coordinates carry a real byte span, and which honestly do not
+///
+/// *"Coordinates intact"* is not *"every hit cites a byte range"*, and this
+/// test asserts the true version rather than the convenient one:
+///
+/// * **Markdown** is its own bytes, so every document-family unit of
+///   `notes.md` carries a real span into the original file and no native
+///   coordinate — the span **is** the address. (The same file also produces
+///   a `Code`-family hit, its tree-sitter heading; item 6 is about the
+///   document family, so the span claims below skip it.)
+/// * **A `.docx`** can promise that for exactly one unit. The whole-document
+///   unit truthfully spans the whole input, in any container format. Every
+///   **section** unit carries `0`/`0` **by design** — `sgt-atlas-worker`'s
+///   own `normal_batch` calls that "not applicable" honestly, because the
+///   original bytes are a compressed ZIP/XML container and no offset into
+///   them corresponds to a position in the normalized text
+///   (`office::OfficeUnit`'s own doc). What a section cites instead is
+///   [`UnitCoordinate::Document`]'s `native` — the normalizer's own address,
+///   `block:<n>` — and that is what this test holds an Office section to.
+///
+/// # "Office", in this build, means `.docx` — and nothing else
+///
+/// A2 §9's own example output shows a `.pptx` slide and a `.docx` section
+/// side by side, and §9's prose names Word, PowerPoint, Excel, PDF and mail
+/// as things a local knowledge Source *may contain*. This build claims one
+/// of them: `.docx`. `office::extractor_for` routes `.docx` (case-
+/// insensitively) and nothing else — `book.xlsx`, `deck.pptx`, `notes.odt`
+/// and `report.pdf` are all explicitly unclaimed, pinned by
+/// `office::tests::extractor_for_claims_only_docx`, and a knowledge Source
+/// holding them gets an honest `unsupported` coverage row per path rather
+/// than a unit. So item 6's "span" is proven here for the one Office format
+/// that exists, and a Source of `.pptx`/`.xlsx`/PDF cannot be spanned at
+/// all today.
+///
+/// That is a deliberate, pre-existing scope boundary, not a gap this test
+/// discovered: the Y2 wave brief scoped the gate to one Office format
+/// ("NOT in scope: ... a second Office format beyond the one the gate
+/// adopts"), and `tests/fixtures/anydoc_corpus/MANIFEST.md` records the
+/// corpus carrying no spreadsheet/presentation/PDF fixtures for that
+/// reason. It is restated here because this is where a reader checking
+/// item 6 looks, and "normalized Office/docs" in the contract's own words
+/// reads wider than the adapter is. Adding a second format is adapter
+/// work, not a doc fix.
+///
+/// An earlier version of this test asserted `byte_end > byte_start` for "a
+/// document coordinate" of *both* files and passed only because the one hit
+/// it happened to pick per path was the whole-document one. That prose
+/// claimed a guarantee the adapter does not make; this one states the
+/// guarantee the adapter actually makes, and checks both halves of it.
 #[test]
 fn one_local_knowledge_query_spans_a_normalized_docx_and_a_markdown_file() {
     let estate = estate();
@@ -532,35 +683,107 @@ fn one_local_knowledge_query_spans_a_normalized_docx_and_a_markdown_file() {
         "and the Markdown one, from the SAME query: {paths:?}"
     );
 
-    // "without losing original path/source coordinates": both coordinates
-    // still name the original resource — the `.docx` path, not a normalized
-    // intermediate — and both cite the one source they came from.
-    for path in ["report.docx", "notes.md"] {
-        let hit = answer
+    // "without losing original path/source coordinates": every hit from
+    // either file still names the original resource — the `.docx` path, not
+    // a normalized intermediate — and cites the one source it came from.
+    let hits_for = |path: &str| {
+        answer
             .hits
             .iter()
-            .find(|hit| hit.coordinate.relative_path() == path)
-            .expect("hit for the path just asserted present");
-        assert_eq!(hit.source_name, "library");
-        assert_eq!(hit.source_kind, SourceKind::LocalKnowledge);
-        assert!(
-            matches!(hit.coordinate, UnitCoordinate::Document { .. }),
-            "both are document-family units: {:?}",
-            hit.coordinate
-        );
+            .filter(|hit| hit.coordinate.relative_path() == path)
+            .collect::<Vec<_>>()
+    };
+    for path in ["report.docx", "notes.md"] {
+        for hit in hits_for(path) {
+            assert_eq!(hit.source_name, "library");
+            assert_eq!(hit.source_kind, SourceKind::LocalKnowledge);
+        }
+    }
+
+    // The Markdown half: the span IS the address, for every document unit.
+    let mut markdown_documents = 0;
+    for hit in hits_for("notes.md") {
         let UnitCoordinate::Document {
             byte_start,
             byte_end,
+            native,
             ..
         } = &hit.coordinate
         else {
-            unreachable!("asserted above")
+            // The same file's tree-sitter heading is a `Code` coordinate;
+            // the document-family claim is what item 6 is about.
+            continue;
         };
         assert!(
-            byte_end > byte_start,
-            "a document coordinate cites a real span of the original resource"
+            native.is_none(),
+            "a Markdown unit needs no native coordinate — its span is its \
+             address: {:?}",
+            hit.coordinate
         );
+        assert!(
+            byte_end > byte_start,
+            "and that span is a real one: {:?}",
+            hit.coordinate
+        );
+        markdown_documents += 1;
     }
+    assert!(
+        markdown_documents > 0,
+        "the Markdown half of the span must not be vacuous"
+    );
+
+    // The Office half: one byte-recoverable whole-document unit, and
+    // sections that cite `block:<n>` rather than inventing a span.
+    let office = hits_for("report.docx");
+    let (mut whole_document, mut sections) = (0, 0);
+    for hit in &office {
+        let UnitCoordinate::Document {
+            byte_start,
+            byte_end,
+            native,
+            ..
+        } = &hit.coordinate
+        else {
+            panic!(
+                "an Office hit is a document-family unit: {:?}",
+                hit.coordinate
+            )
+        };
+        match native {
+            None => {
+                assert!(
+                    byte_end > byte_start,
+                    "the whole-document unit spans the whole `.docx`: {:?}",
+                    hit.coordinate
+                );
+                whole_document += 1;
+            }
+            Some(native) => {
+                assert_eq!(
+                    (*byte_start, *byte_end),
+                    (0, 0),
+                    "an Office section is not byte-recoverable and must not \
+                     claim a span: {:?}",
+                    hit.coordinate
+                );
+                assert!(
+                    !native.is_empty(),
+                    "so its native coordinate is the only address it has: {:?}",
+                    hit.coordinate
+                );
+                sections += 1;
+            }
+        }
+    }
+    assert_eq!(
+        whole_document, 1,
+        "exactly one `.docx` unit carries a real span — the whole-document \
+         one: {office:?}"
+    );
+    assert!(
+        sections >= 1,
+        "and the honest-`0`/`0` half is not vacuous either: {office:?}"
+    );
 }
 
 // ============================================================ §13 the trace
@@ -955,7 +1178,7 @@ fn the_search_cli_exposes_a2_section_14s_selectors_and_no_weight_knob() {
 ///
 /// H13.2 rejected query-time scanning specifically to keep it one, and
 /// `tests/w1b_overlay_lifecycle_trigger.rs::
-/// the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`
+/// the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls`
 /// pins the store side. This pins the *route* side: both handlers reach Atlas
 /// through the read-only `with_atlas`, never `with_atlas_write` or
 /// `with_existing_atlas_write`, so no index-on-demand, scan-if-stale or

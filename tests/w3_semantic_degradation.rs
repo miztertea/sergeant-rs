@@ -134,6 +134,7 @@ fn estate() -> Estate {
                 title: None,
                 byte_start: 0,
                 byte_end: NOTE_MD.len() as u64,
+                coordinate: None,
                 text: NOTE_MD.to_string(),
             }],
             syntax: None,

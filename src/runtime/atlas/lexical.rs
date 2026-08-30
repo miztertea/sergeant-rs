@@ -489,6 +489,16 @@ pub enum UnitCoordinate {
         byte_start: u64,
         /// End offset into the original file bytes, exclusive.
         byte_end: u64,
+        /// A2 §9's *native coordinate* — the normalizer's own address for
+        /// this unit inside the document it was extracted from, when the
+        /// byte span cannot be one.
+        ///
+        /// `None` for a Markdown/text unit, whose span IS its address.
+        /// `Some` for a unit an adapter had to decode a container to reach:
+        /// an Office section carries the block address its normalizer
+        /// assigned, and the span is `0`/`0` because no offset into the
+        /// compressed original corresponds to it.
+        native: Option<String>,
     },
     /// A2 §3's email coordinate, as far as A1's stored rows carry it: the
     /// `.eml` resource's path, the unit within it, and its byte span.
@@ -499,10 +509,19 @@ pub enum UnitCoordinate {
         ordinal: u64,
         /// The unit's title — the subject, for a message's own body unit.
         title: Option<String>,
-        /// Start offset into the original file bytes.
+        /// Start offset into the original file bytes — `0`/`0` for a
+        /// message body, which is not byte-recoverable into the original
+        /// wire bytes (a decoded Content-Transfer-Encoding is a transform).
         byte_start: u64,
         /// End offset into the original file bytes, exclusive.
         byte_end: u64,
+        /// A2 §9's *native coordinate*: which body of the message this unit
+        /// is (`text-body`/`html-body`, A1 §6.5's `text/html body`).
+        ///
+        /// This is the **only** thing that distinguishes a message's two
+        /// bodies — they share a path, and neither has a byte span — so a
+        /// mail hit without it does not cite its evidence.
+        native: Option<String>,
     },
     /// A2 §3's structured-text coordinate:
     /// `source/generation/dataset/row-id/field-set`.

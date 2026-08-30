@@ -13,7 +13,7 @@
 //! H13.2's chosen mechanism is the daemon-side surface-lifecycle hook. Not
 //! query-time scanning: that would make a read verb a writer, against the
 //! daemon-is-sole-writer boundary. `sgt search` stays a pure reader —
-//! [`the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self`]
+//! [`the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls`]
 //! is the structural half of that claim, and the daemon-sole-writer /
 //! no-client-SQL suites own the rest.
 //!
@@ -464,37 +464,359 @@ fn an_overlay_scan_failure_degrades_to_base_only_and_is_reported() {
     );
 }
 
-/// `sgt search` cannot write, structurally: every admissibility method takes
-/// `&self`.
+/// `sgt search` cannot write — **and since the S5 closeout that is enforced
+/// by the compiler, not by this scan.**
+///
+/// # What changed, and why
 ///
 /// H13.2 rejected query-time scanning because it would make a read verb a
-/// writer. That decision is worth exactly as much as what enforces it, and
-/// this is the cheapest thing that does: a `&self` method cannot reach
-/// `stage_scan`, `confirm_scan`, `evict_work_overlays` or
-/// `record_overlay_unavailable`, all of which need `&mut self`. Wiring the
-/// overlay into a query path would not compile without first changing a
-/// signature this test reads.
+/// writer. Through S5 that decision was guarded two ways, and both were
+/// weaker than they read:
+///
+/// 1. `&self` vs `&mut self` — no proof of anything, because DuckDB's own
+///    `Connection::execute`, `execute_batch` and `prepare` all take `&self`.
+/// 2. A transitive scan of `admissible_*` bodies for write-capable
+///    spellings — which the closeout re-verify **defeated in one hop**. Its
+///    `WRITE_CAPABLE` list mixed lowercase call syntax (`.execute_batch(`)
+///    with uppercase SQL verbs (`DELETE `) and tested
+///    `body.to_uppercase().contains(verb)`, so the three call-syntax entries
+///    could never match anything: uppercasing the body turns `.execute_batch(`
+///    into `.EXECUTE_BATCH(`. Inserting
+///    `let v = format!("{}ETE FROM source.units", "DEL"); self.conn.execute_batch(&v);`
+///    into `admissible_datasets` left this test **green**.
+///
+/// So the mechanism moved. `db.rs` now implements the whole A2 §2 filter on
+/// `Admissible`, a struct whose only field is a `ReadOnly` — a handle with no
+/// write call on it, which hands out no `Statement`, `Appender`,
+/// `Transaction` or `Connection`, and whose two query methods take a
+/// `ReadSql` that a `const` item proves begins `SELECT `. **A write inside
+/// the admissibility filter is a compile error**, verified by inserting each
+/// of these and watching the build fail:
+///
+/// | inserted into `Admissible::datasets` | result |
+/// |---|---|
+/// | `self.conn.execute_batch(&v)` | `no field 'conn' on type &Admissible` |
+/// | `self.reader.execute_batch(&v)` | `no method named 'execute_batch'` |
+/// | `self.reader.rows(&v, …)` | `Sql: From<&String> is not satisfied` |
+/// | `self.reader.rows(read_sql!("DELETE FROM source.units"), …)` | `evaluation panicked: … beginning 'SELECT ' and containing no ';'` |
+///
+/// # The prefix check alone was not enough, and that was proven too
+///
+/// A third round of this closeout landed a write **through** the
+/// `SELECT `-prefix check:
+///
+/// ```ignore
+/// self.reader.rows(read_sql!("SELECT 1; DELETE FROM source.generations"), …)
+/// ```
+///
+/// The prefix sees only the leading `SELECT `, and DuckDB executes **every**
+/// statement in a `;`-separated batch — measured directly against a raw
+/// connection on duckdb 1.10505.0: `prepare` alone runs nothing, `prepare` +
+/// `query` runs the whole batch and returns the *last* statement's result,
+/// and a three-row table came back empty. (A batch containing a `?` bind is
+/// refused at `prepare` instead, so the parameterised spelling of this
+/// exploit errors rather than deleting — the unparameterised one is the real
+/// one.) `ReadSql` now refuses any `;` at all, checked in the same `const`
+/// evaluation as the prefix.
+///
+/// That the check is a `const` and not a scan is the point: const evaluation
+/// sees the **assembled** string, after `concat!` has resolved, so
+/// `read_sql!(concat!("DEL", "ETE FROM t"))` is `DELETE FROM t` by the time
+/// the check runs. A text scanner reads the source spelling and never sees
+/// it. Attempted, and it fails the build.
+///
+/// # What THIS test is, now
+///
+/// The compiler owns the claim. This test owns two things the compiler
+/// cannot state for a future reader: that the wiring is still in place (part
+/// 1), and a cheap second net over the shapes a type does not see (part 2).
+/// Part 1 is the one that must never be relaxed — deleting it would let
+/// someone quietly reintroduce a `Connection` field on `Admissible` and lose
+/// the guarantee with no test going red.
+///
+/// # What the second net cannot see — stated, not implied
+///
+/// The scan reads source text, so it is blind to exactly what source text is
+/// blind to. It does **not** see: a write assembled from pieces no single
+/// line spells (`concat!`, a `const` defined elsewhere in the file and named
+/// here, a byte array); a call reached through a trait object or a function
+/// pointer; anything in another file. Those are the hops that defeated its
+/// predecessor, and the reason it is no longer the load-bearing check. It is
+/// kept because it is nearly free and because it *does* catch the one shape
+/// the type system still permits: a literal SQL write verb sitting in a
+/// method the filter can reach.
 #[test]
-fn the_admissibility_filter_cannot_write_because_every_method_takes_an_immutable_self() {
-    let db = std::fs::read_to_string(
+fn the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls() {
+    let source = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime/atlas/db.rs"),
     )
     .expect("read db.rs");
-    let mut checked = 0;
-    for (index, line) in db.lines().enumerate() {
-        let Some(name) = line.trim().strip_prefix("pub fn admissible_") else {
-            continue;
-        };
-        checked += 1;
-        let signature: String = db.lines().skip(index).take(6).collect::<Vec<_>>().join(" ");
+    let lines: Vec<&str> = source.lines().collect();
+
+    // ---------------------------------------------------------------- part 1
+    // The compile-time guarantee is still wired. Each assertion below is a
+    // load-bearing piece of it; none is cosmetic.
+
+    // (a) The filter's own type holds a read-only handle and NOTHING else. A
+    //     second field of any connection-ish type would restore the hop the
+    //     closeout closed, and would not change one character of the scan
+    //     below.
+    assert!(
+        source.contains("struct Admissible<'conn> {\n    reader: ReadOnly<'conn>,\n}"),
+        "`Admissible` must hold exactly one field, a `ReadOnly` — that single field is the \
+         whole reason a write inside the admissibility filter does not compile"
+    );
+
+    // (b) The public methods are delegates onto it, so the public path cannot
+    //     do anything the filter's own type forbids.
+    for family in ["generations", "units", "occurrences", "datasets"] {
+        let delegate = format!("        self.admissible().{family}(filter, limit)\n    }}");
         assert!(
-            signature.contains("&self,") && !signature.contains("&mut self"),
-            "admissible_{name} must take &self — a query path that could write is exactly what \
-             H13.2 rejected when it chose the lifecycle hook over query-time scanning"
+            source.contains(&delegate),
+            "`AtlasDb::admissible_{family}` must be a one-line delegate onto `Admissible`; \
+             any logic that stays on `AtlasDb` runs with `self.conn` in scope and is \
+             therefore outside the guarantee"
+        );
+    }
+
+    // (c) The read-only handle really is write-free: it exposes exactly two
+    //     operations, and neither hands back a value with a write on it. This
+    //     is spelled as an allowlist of `pub fn`s in the `ReadOnly` impl
+    //     rather than a denylist of forbidden method names, because a
+    //     denylist is what the old scan was.
+    let read_only_impl = block_after(&source, "    impl ReadOnly<'_> {");
+    let exposed: Vec<&str> = read_only_impl
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("pub fn "))
+        .filter_map(|rest| rest.split(['(', '<', ' ']).next())
+        .collect();
+    assert_eq!(
+        exposed,
+        vec!["rows", "first"],
+        "`ReadOnly` must expose only its two mapping queries; anything else — a `prepare`, a \
+         `connection`, a `Statement` accessor — is a write one dot away"
+    );
+    for handed_out in [
+        "-> Statement",
+        "-> CachedStatement",
+        "-> Appender",
+        "-> Connection",
+    ] {
+        assert!(
+            !read_only_impl.contains(handed_out),
+            "`ReadOnly` must hand out no {handed_out} — a value with a write on it defeats \
+             the whole type"
         );
     }
     assert_eq!(
-        checked, 4,
-        "the four A2 §2 content-family methods must all be covered; a new one must be added here"
+        read_only_impl.matches("sql: ReadSql,").count(),
+        2,
+        "both `ReadOnly` queries must take a `ReadSql`, never a `Sql`: a `Sql` may be any \
+         statement this crate wrote, DELETE included, and DuckDB runs what it is handed"
     );
+
+    // (d) And `ReadSql` really is checked, at compile time. `read_sql!` builds
+    //     an anonymous `const` **item** rather than a `const { .. }` block on
+    //     purpose: a const block — and the generic associated const inside
+    //     `ReadSql::of`, which covers the non-macro path — is a
+    //     post-monomorphization error that `cargo check` walks straight past.
+    //     That was observed during the closeout, twice: once before this
+    //     shape was chosen, and once again when a hand-written `impl SqlText`
+    //     carrying a `DELETE` passed `cargo check` and only failed the moment
+    //     a test actually called it.
+    assert!(
+        source.contains("        const _: () = assert!(\n")
+            && source.contains("$crate::runtime::atlas::db::store::is_read_statement("),
+        "`read_sql!` must evaluate `is_read_statement` as a non-generic `const` item, so a \
+         statement that is not one bare `SELECT` fails `cargo check` rather than reaching \
+         DuckDB"
+    );
+
+    // (e) And the rule that `const` enforces is BOTH conditions. The `;` half
+    //     is not decoration: the prefix half alone was defeated during this
+    //     closeout by `"SELECT 1; DELETE FROM source.generations"`, which
+    //     DuckDB runs in full. `is_read_statement`'s own behaviour is pinned
+    //     by a table in `db.rs`'s unit tests
+    //     (`is_read_statement_admits_exactly_one_bare_select`); what is
+    //     checked here is that the function the macro calls still tests both.
+    let read_rule = block_after(
+        &source,
+        "    pub const fn is_read_statement(sql: &str) -> bool {",
+    );
+    assert!(
+        read_rule.contains("let want = b\"SELECT \";"),
+        "`is_read_statement` must still check the seven-byte `SELECT ` prefix"
+    );
+    assert!(
+        read_rule.contains("if bytes[i] == b';' {"),
+        "`is_read_statement` must still refuse a `;` anywhere — DuckDB executes every \
+         statement in a `;`-separated batch, which is how the prefix-only check was \
+         defeated"
+    );
+
+    // ---------------------------------------------------------------- part 2
+    // The second net. Cheap, honest, and explicitly NOT the guarantee.
+
+    // Every function defined in db.rs, by name, with the body text a caller
+    // of it would actually run. Bodies end at the closing brace on the
+    // function's own indentation — brace counting would trip over the `{}`
+    // in a `format!`, and this file has many.
+    let mut bodies: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        let indent = &line[..line.len() - trimmed.len()];
+        let Some(rest) = trimmed
+            .strip_prefix("pub fn ")
+            .or_else(|| trimmed.strip_prefix("fn "))
+            .or_else(|| trimmed.strip_prefix("pub(crate) fn "))
+        else {
+            continue;
+        };
+        let Some(name) = rest.split(['(', '<', ' ']).next() else {
+            continue;
+        };
+        let closing = format!("{indent}}}");
+        let mut body = String::new();
+        for next in lines.iter().skip(index + 1) {
+            if *next == closing {
+                break;
+            }
+            // Prose is not code: a comment naming a `DELETE` this function
+            // does not perform must not fail the scan.
+            if !next.trim_start().starts_with("//") {
+                body.push_str(next);
+                body.push('\n');
+            }
+        }
+        bodies.insert(name.to_string(), body);
+    }
+
+    /// A call into the driver that can write. Matched **case-sensitively
+    /// against the body as written**, which is the bug the closeout found:
+    /// these were previously compared against `body.to_uppercase()`, where
+    /// `.execute_batch(` had become `.EXECUTE_BATCH(` and could never match.
+    const WRITE_CALLS: [&str; 6] = [
+        ".execute(",
+        ".execute_batch(",
+        ".appender(",
+        ".appender_to_db(",
+        // Reaching for a connection of its own is how a read path would get
+        // around the read-only handle without ever naming a write.
+        "Connection::",
+        "Store::new(",
+    ];
+
+    /// An SQL verb that writes. Matched against the **uppercased** body, so
+    /// `delete from` in a runtime-built string is caught too.
+    const WRITE_VERBS: [&str; 9] = [
+        "INSERT ",
+        "UPDATE ",
+        "DELETE ",
+        "DROP ",
+        "CREATE ",
+        "ALTER ",
+        "ATTACH ",
+        "COPY ",
+        "TRUNCATE ",
+    ];
+
+    /// Does `body` call `name` — as a free function, or on `self`?
+    ///
+    /// The receiver matters: `statement.query(...)` is duckdb's `query`, not
+    /// this file's `Analytics::query`, and following that name would walk
+    /// the closure into every unrelated method that happens to share a
+    /// spelling. `self.` and no-receiver calls are the ones that really are
+    /// this file's own code.
+    fn calls(body: &str, name: &str) -> bool {
+        let needle = format!("{name}(");
+        if body.contains(&format!("self.{needle}")) {
+            return true;
+        }
+        let bytes = body.as_bytes();
+        let mut from = 0;
+        while let Some(at) = body[from..].find(&needle) {
+            let at = from + at;
+            let before = at.checked_sub(1).map(|i| bytes[i] as char);
+            match before {
+                // A receiver, or a longer identifier ending in this name.
+                Some(c) if c == '.' || c == '_' || c.is_alphanumeric() => {}
+                _ => return true,
+            }
+            from = at + needle.len();
+        }
+        false
+    }
+
+    // Seeded from the *implementation*, not from the delegates. Seeding on
+    // `pub fn admissible_` would now walk four one-line bodies and prove
+    // nothing — a vacuous net is worse than none, because it reads like one
+    // that works.
+    let admissible_impl = block_after(&source, "impl Admissible<'_> {");
+    let mut seeds: Vec<String> = admissible_impl
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("fn "))
+        .filter_map(|rest| rest.split(['(', '<', ' ']).next())
+        .map(str::to_string)
+        .collect();
+    seeds.sort();
+    assert_eq!(
+        seeds,
+        vec![
+            "datasets",
+            "generations",
+            "newest_overlay_observed_at",
+            "occurrences",
+            "units",
+            "work_scope",
+        ],
+        "the four A2 §2 content-family methods and their two helpers must all be covered; a \
+         new one must be added here"
+    );
+
+    for seed in &seeds {
+        // Everything this method can reach inside db.rs, transitively.
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut queue = vec![seed.clone()];
+        while let Some(current) = queue.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            let Some(body) = bodies.get(&current) else {
+                continue;
+            };
+            for call in WRITE_CALLS {
+                assert!(
+                    !body.contains(call),
+                    "{seed} reaches {current}, which contains {call:?} — the admissibility \
+                     filter is the read side of H13.2's decision"
+                );
+            }
+            for verb in WRITE_VERBS {
+                assert!(
+                    !body.to_uppercase().contains(verb),
+                    "{seed} reaches {current}, which contains the SQL verb {verb:?}"
+                );
+            }
+            for callee in bodies.keys() {
+                if calls(body, callee) {
+                    queue.push(callee.clone());
+                }
+            }
+        }
+    }
+}
+
+/// The text of the `{ .. }` block opened by the line `header`, up to the
+/// closing brace at that line's own indentation.
+fn block_after(source: &str, header: &str) -> String {
+    let at = source
+        .find(header)
+        .unwrap_or_else(|| panic!("db.rs must still contain `{header}`"));
+    let indent = header.len() - header.trim_start().len();
+    let closing = format!("\n{}}}", " ".repeat(indent));
+    let rest = &source[at + header.len()..];
+    let end = rest
+        .find(&closing)
+        .unwrap_or_else(|| panic!("`{header}` must close at its own indentation"));
+    rest[..end].to_string()
 }
