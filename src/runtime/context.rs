@@ -947,9 +947,19 @@ impl EvidenceProvenance {
             "title": self.title,
             "heading_level": self.heading_level,
             "byte_span": self.byte_span.map(|(start, end)| json!([start, end])),
-            // Always null in this release: OCR is deferred outside 0.3.0 by
-            // owner ruling and this build derives no OCR evidence.
-            "ocr": Value::Null,
+            // Reads self.ocr rather than hardcoding null: OCR is deferred
+            // outside 0.3.0 by owner ruling and this build never constructs
+            // an OcrProvenance, so today this is always null in practice —
+            // but the JSON must track the struct's own state, not assert an
+            // absence the field itself no longer guarantees.
+            "ocr": self.ocr.as_ref().map(|ocr| json!({
+                "page": ocr.page,
+                "asset": ocr.asset,
+                "bbox": ocr.bbox,
+                "engine": ocr.engine,
+                "model": ocr.model,
+                "confidence": ocr.confidence,
+            })),
         })
     }
 }
@@ -2902,5 +2912,55 @@ fn reachable_scope(filter: &Admissibility, work_id: &str) -> ReachableScope {
         source_name,
         work_id: work,
         capabilities: vec!["map", "search", "related", "query"],
+    }
+}
+
+#[cfg(test)]
+mod ocr_json_tests {
+    use super::{EvidenceProvenance, OcrProvenance};
+
+    /// F-IN-01: `EvidenceProvenance::json()` must *read* `self.ocr`, not
+    /// hardcode the `ocr` key to null. With `ocr: None` the two behave
+    /// identically, so this constructs a `Some(OcrProvenance)` — never
+    /// produced by this build's own pipeline, since OCR is deferred outside
+    /// 0.3.0, but exactly the shape a future OCR extractor will hand to this
+    /// struct — and asserts the JSON reflects it instead of asserting null.
+    #[test]
+    fn json_reflects_a_present_ocr_provenance_rather_than_hardcoding_null() {
+        let provenance = EvidenceProvenance {
+            ocr: Some(OcrProvenance {
+                page: Some(3),
+                asset: Some("img-1".to_string()),
+                bbox: Some("10,20,30,40".to_string()),
+                engine: "tesseract".to_string(),
+                model: "eng-best".to_string(),
+                confidence: Some("0.92".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let json = provenance.json();
+        let ocr = &json["ocr"];
+        assert!(
+            !ocr.is_null(),
+            "a present OcrProvenance must not render as null: {json}"
+        );
+        assert_eq!(ocr["page"], 3);
+        assert_eq!(ocr["asset"], "img-1");
+        assert_eq!(ocr["bbox"], "10,20,30,40");
+        assert_eq!(ocr["engine"], "tesseract");
+        assert_eq!(ocr["model"], "eng-best");
+        assert_eq!(ocr["confidence"], "0.92");
+    }
+
+    /// The absent case still renders `null`, not an omitted key — §20's
+    /// non-goal is hiding provenance, and this is the case this build
+    /// actually produces today.
+    #[test]
+    fn json_still_renders_null_when_ocr_is_absent() {
+        let provenance = EvidenceProvenance::default();
+        let json = provenance.json();
+        assert!(json.get("ocr").is_some(), "the ocr key must be present");
+        assert!(json["ocr"].is_null());
     }
 }
