@@ -903,10 +903,14 @@ pub struct ContextSnapshot {
     pub referenced: Vec<EvidenceUnit>,
     /// **13.** `Reachable capability/scope descriptor`.
     pub reachable: Option<ReachableScope>,
-    /// **14.** `rendered payload blob/artifact pointer`. **`None` this
-    /// wave**: C1b owns §14's budget and therefore owns rendering resource
-    /// *content*, which is the only payload big enough to need decision
-    /// C1-09's blob seam. What this wave renders is coordinates, inline.
+    /// **14.** `rendered payload blob/artifact pointer`. **`None`, and now
+    /// for a reason rather than a deferral**: decision C1-09's blob seam is
+    /// for *"large snapshot payloads"*, and §14's hard budgets
+    /// ([`RenderBudget`]) cap the whole rendered payload at ten kilobytes,
+    /// which is small enough to live inline in the stage's `CONTEXT.md`. A
+    /// pointer would be a second place to look for something that is already
+    /// in front of the reader. A wave that renders something the budget does
+    /// not bound is the wave that needs this field.
     pub payload_pointer: Option<String>,
     /// **15.** `budget` — §14's two hard automatic-render budgets and what
     /// each tier actually spent ([`BudgetReport`]). `None` only for a
