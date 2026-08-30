@@ -118,6 +118,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use duckdb::types::Value as Duck;
 use duckdb::{Connection, Statement};
@@ -142,7 +143,8 @@ use crate::runtime::atlas::lexical::{
 };
 use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
 use crate::runtime::atlas::semantic::{
-    SemanticModel, SemanticRequest, SemanticStatus, installed_model, resolve as resolve_semantic,
+    SemanticEngine, SemanticHit, SemanticModel, SemanticRequest, SemanticStatus, cosine,
+    rank_semantic, resolve as resolve_semantic,
 };
 use crate::runtime::atlas::tabular::{
     DatasetFormat, RowKeyBasis, RowUnit, ScannedDataset, row_units,
@@ -879,6 +881,18 @@ fn bootstrap_atlas_ddl(conn: &Connection) -> Result<(), duckdb::Error> {
 pub struct AtlasDb {
     conn: Connection,
     path: PathBuf,
+    /// A2 §6's model, loaded **at most once per handle** and only when a
+    /// query first needs it.
+    ///
+    /// Not a per-call [`crate::runtime::atlas::semantic::installed_model`]:
+    /// that reads 32 MB of weights and parses a 1 MB tokenizer, which is a
+    /// thing to do once, not once per search. `OnceLock` rather than a
+    /// process-wide `static` on purpose — the asset directory is resolved
+    /// from `$SGT_SEMANTIC_MODEL_DIR`/the executable's directory, so two
+    /// handles in one process (a test suite's) must be able to disagree
+    /// about what is installed instead of racing to cache the first answer
+    /// for everyone.
+    semantic: OnceLock<Option<SemanticEngine>>,
 }
 
 impl std::fmt::Debug for AtlasDb {
@@ -958,7 +972,11 @@ impl AtlasDb {
         // rather than letting DuckDB refuse them is what keeps this path a
         // read, not a read that happens to trip over a write guard.
         conn.execute_batch(HARDENING_DDL)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            semantic: OnceLock::new(),
+        })
     }
 
     fn over(conn: Connection, path: PathBuf) -> Result<Self, AtlasError> {
@@ -974,7 +992,11 @@ impl AtlasDb {
         // and evicting one here would be a decision taken without the
         // evidence that decides it (see this module's doc, and
         // `record::reconcile_sources`, which the daemon runs at startup).
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            semantic: OnceLock::new(),
+        })
     }
 
     /// Where this database lives (`:memory:` for [`AtlasDb::open_in_memory`]).
@@ -2807,7 +2829,7 @@ impl AtlasDb {
         // model this host actually has — so EVERY return path below carries
         // it, including the three early ones. A status computed only on the
         // path that produces hits is exactly the omittable field H4 forbids.
-        let semantic_model = installed_model();
+        let semantic_model = self.semantic_engine().map(|e| e.descriptor().clone());
         let semantic = resolve_semantic(query.semantic, semantic_model.as_ref());
         let semantic_model = match semantic {
             SemanticStatus::Applied => semantic_model,
@@ -2925,6 +2947,144 @@ impl AtlasDb {
             semantic,
             semantic_model,
         })
+    }
+
+
+    /// A2 §6's model for this handle, loaded lazily and **at most once**.
+    ///
+    /// `None` means A2-13's supported degraded state: no complete asset
+    /// directory was found (see
+    /// [`crate::runtime::atlas::semantic::model_dir`]). A directory that
+    /// exists but will not load is also reported as `None` *here* — the
+    /// error is logged rather than propagated, because a broken model must
+    /// not turn a lexical search into a failure; the honest answer is
+    /// `semantic: not_installed` plus the lexical half, which is exactly
+    /// what A2 §15 asks for.
+    pub fn semantic_engine(&self) -> Option<&SemanticEngine> {
+        self.semantic
+            .get_or_init(|| match SemanticEngine::load() {
+                Ok(engine) => engine,
+                Err(error) => {
+                    log::warn!("{error}");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// A2 §6's semantic retrieval: **exact cosine over the admissible set**,
+    /// deterministic in its ties, every hit carrying A1's own coordinate.
+    ///
+    /// Takes the same [`LexicalQuery`] the lexical half takes, and that is
+    /// deliberate: W4 fuses the two rank lists with RRF, and two lists
+    /// produced from two differently-spelled filters are not fusable. One
+    /// query value, one filter, two rankers.
+    ///
+    /// # What this does, in order
+    ///
+    /// 1. Resolves H4's status. If it is not
+    ///    [`SemanticStatus::Applied`] — no assets installed, or the caller
+    ///    suppressed the semantic half — the answer is **empty hits with the
+    ///    status saying why**, not an error and not a silent lexical
+    ///    substitution.
+    /// 2. Embeds the query once.
+    /// 3. Walks the **admissible generations**
+    ///    ([`Self::admissible_generations`]) and, for each, the units
+    ///    [`indexable_units`] derives — the same units the lexical index is
+    ///    built from, so the two halves rank over one corpus.
+    /// 4. Embeds each generation's unit texts in one batch and scores them
+    ///    with [`cosine`].
+    /// 5. Orders by [`rank_semantic`].
+    ///
+    /// # A2 §8's prohibition is structural, not procedural
+    ///
+    /// *"The reranker must never silently cross an authority/source filter
+    /// merely because a candidate scores well."* Step 3 is the whole of that
+    /// guarantee: a generation the filter excludes is never enumerated, so
+    /// its units are never embedded and cannot be scored at all. There is no
+    /// post-filter to forget to apply.
+    /// `tests/w3b_semantic_retrieval.rs::
+    /// an_inadmissible_unit_that_scores_first_unfiltered_is_absent_once_filtered`
+    /// shows the same unit ranking first with the filter open and absent with
+    /// it closed — the negative made non-vacuous the way W2 made its own.
+    ///
+    /// # A2-07: this is a linear scan and there is no index
+    ///
+    /// Decision A2-07 (**R1**) and A2 §16's *"vector database/ANN engine
+    /// before measurement"* non-goal. Every admissible unit is embedded and
+    /// scored on every query; nothing is cached, pruned or approximated. The
+    /// cost of that is measured rather than assumed —
+    /// `knowledge/evidence/perf/model2vec-footprint-and-scan-2026-08-30.md`
+    /// records the figure, and a figure like it is the only thing that could
+    /// ever justify adding an index.
+    ///
+    /// # Bounds, and saying so
+    ///
+    /// The scan visits at most [`MAX_ROWS`] units across all admissible
+    /// generations (F12). Because a cap changes *which* units could be
+    /// ranked rather than merely shortening the list,
+    /// [`SemanticAnswer::truncated`] says when it bit — the same disclosure,
+    /// for the same reason, as [`LexicalAnswer::truncated`].
+    pub fn semantic_search(&self, query: &LexicalQuery<'_>) -> Result<SemanticAnswer, AtlasError> {
+        let scope = self.work_scope(query.filter, true)?;
+        let engine = self.semantic_engine();
+        let descriptor = engine.map(|e| e.descriptor().clone());
+        let semantic = resolve_semantic(query.semantic, descriptor.as_ref());
+        let mut answer = SemanticAnswer {
+            hits: Vec::new(),
+            scope,
+            truncated: false,
+            semantic,
+            semantic_model: match semantic {
+                SemanticStatus::Applied => descriptor,
+                _ => None,
+            },
+        };
+        let engine = match (semantic, engine) {
+            (SemanticStatus::Applied, Some(engine)) => engine,
+            _ => return Ok(answer),
+        };
+        let limit = query.limit.min(MAX_ROWS);
+        if query.text.trim().is_empty() || limit == 0 {
+            return Ok(answer);
+        }
+        let query_vector = engine.embed_query(query.text);
+
+        let admitted = self.admissible_generations(query.filter, MAX_ROWS)?;
+        let family = query.family;
+        let mut hits: Vec<SemanticHit> = Vec::new();
+        let mut seen = 0usize;
+        'generations: for generation in &admitted.hits {
+            let units = indexable_units(&self.conn, &generation.id)?;
+            let units: Vec<IndexableUnit> = units
+                .into_iter()
+                .filter(|unit| family.is_none_or(|wanted| unit.family == wanted))
+                .collect();
+            if units.is_empty() {
+                continue;
+            }
+            let texts: Vec<String> = units.iter().map(|unit| unit.text.clone()).collect();
+            let vectors = engine.embed(&texts);
+            for (unit, vector) in units.iter().zip(vectors.iter()) {
+                if seen >= MAX_ROWS {
+                    answer.truncated = true;
+                    break 'generations;
+                }
+                seen += 1;
+                hits.push(SemanticHit {
+                    score: cosine(&query_vector, vector),
+                    source_name: unit.source_name.clone(),
+                    generation_id: generation.id.clone(),
+                    content_key: generation.content_key.clone(),
+                    unit_key: unit.unit_key.clone(),
+                    coordinate: unit.coordinate(),
+                });
+            }
+        }
+        hits.sort_by(rank_semantic);
+        hits.truncate(limit);
+        answer.hits = hits;
+        Ok(answer)
     }
 
     /// Rebuild the whole lexical index from the A1 rows it is derived from.
@@ -3859,7 +4019,19 @@ fn insert_row_unit(
 /// so a cap here would add no new bound — it would only drop units out of the
 /// index silently, which is exactly the reported-never-silent discipline this
 /// wave is required to keep.
-fn index_generation(conn: &Connection, generation_id: &str) -> Result<u64, AtlasError> {
+/// Every indexable unit of one generation, in the order the three family
+/// reads produce them — **the one place a generation's retrievable text is
+/// derived**, so the lexical index ([`index_generation`]) and the semantic
+/// scan ([`AtlasDb::semantic_search`]) cannot drift into two different
+/// corpora.
+///
+/// Extracted from `index_generation` by S5 W3b for exactly that reason (R2):
+/// A2-02 forbids *"a second chunk/source identity system"*, and the cheapest
+/// way to keep one is to have one function that produces it. A2 §16's
+/// *"embedding raw binary documents rather than A1 evidence units"* non-goal
+/// is satisfied the same way — what this returns IS A1's evidence units, and
+/// the semantic half has no other way to reach text.
+fn indexable_units(conn: &Connection, generation_id: &str) -> Result<Vec<IndexableUnit>, AtlasError> {
     let mut units: Vec<IndexableUnit> = Vec::new();
 
     let [doc_a, doc_b, doc_c, doc_d] = DOCUMENT_EXTRACTOR_IDENTITIES;
@@ -3969,6 +4141,12 @@ fn index_generation(conn: &Connection, generation_id: &str) -> Result<u64, Atlas
     }
     drop(rows);
     drop(statement);
+
+    Ok(units)
+}
+
+fn index_generation(conn: &Connection, generation_id: &str) -> Result<u64, AtlasError> {
+    let units = indexable_units(conn, generation_id)?;
 
     // The two batches, appended rather than inserted row by row. This file
     // already carries the measurement that decides it (see [`Analytics`]'s
@@ -4104,6 +4282,52 @@ struct IndexableUnit {
     byte_start: Option<u64>,
     byte_end: Option<u64>,
     text: String,
+}
+
+impl IndexableUnit {
+    /// A1's coordinate for this unit — the same value
+    /// [`coordinate_of`] reconstructs from a stored
+    /// `context.lexical_units` row, built here from the row the unit was
+    /// derived from instead.
+    ///
+    /// Two constructions of one value is a drift risk, so it is pinned:
+    /// `tests/w3b_semantic_retrieval.rs::
+    /// a_semantic_hit_and_a_lexical_hit_on_the_same_unit_carry_the_identical_coordinate`
+    /// runs both paths over one generation and compares them.
+    fn coordinate(&self) -> UnitCoordinate {
+        match self.family {
+            LexicalFamily::Code => UnitCoordinate::Code {
+                relative_path: self.relative_path.clone(),
+                language: self.language.clone().unwrap_or_default(),
+                label: self.label.clone().unwrap_or_default(),
+                symbol: self.symbol.clone().unwrap_or_default(),
+                ordinal: self.ordinal,
+                byte_start: self.byte_start.unwrap_or(0),
+                byte_end: self.byte_end.unwrap_or(0),
+            },
+            LexicalFamily::Document => UnitCoordinate::Document {
+                relative_path: self.relative_path.clone(),
+                ordinal: self.ordinal,
+                title: self.title.clone(),
+                byte_start: self.byte_start.unwrap_or(0),
+                byte_end: self.byte_end.unwrap_or(0),
+            },
+            LexicalFamily::Mail => UnitCoordinate::Mail {
+                relative_path: self.relative_path.clone(),
+                ordinal: self.ordinal,
+                title: self.title.clone(),
+                byte_start: self.byte_start.unwrap_or(0),
+                byte_end: self.byte_end.unwrap_or(0),
+            },
+            LexicalFamily::RowText => UnitCoordinate::RowText {
+                relative_path: self.relative_path.clone(),
+                dataset_key: self.dataset_key.clone().unwrap_or_default(),
+                ordinal: self.ordinal,
+                row_key: self.row_key.clone().unwrap_or_default(),
+                fields: self.fields.as_deref().map(split_names).unwrap_or_default(),
+            },
+        }
+    }
 }
 
 /// Column/field names as one stored value: JSON, so a name containing a comma
@@ -4867,6 +5091,35 @@ pub struct LexicalAnswer {
     /// only when [`Self::semantic`] is
     /// [`SemanticStatus::Applied`]. Optional because the contract says
     /// "if used"; it is **not** the field that reports degradation.
+    pub semantic_model: Option<SemanticModel>,
+}
+
+/// One semantic answer: A2 §6's cosine rank list, [`WorkScope`], whether the
+/// scan hit its cap, and the same two H4 fields [`LexicalAnswer`] carries.
+///
+/// **The two H4 fields are here for the same reason they are there, and they
+/// are load-bearing on this type in a way they are not on the lexical one:**
+/// an empty `hits` on a semantic answer is ambiguous by itself — the corpus
+/// held nothing similar, no model is installed, or the caller suppressed the
+/// half. [`Self::semantic`] is the field that says which, and it is not an
+/// `Option`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticAnswer {
+    /// The ranked hits, best first, ties broken by
+    /// [`crate::runtime::atlas::semantic::SemanticHit::tie_break_key`] —
+    /// the same stated key the lexical list uses, because these are RRF's
+    /// two inputs.
+    pub hits: Vec<SemanticHit>,
+    /// What this answer covers — see [`WorkScope`].
+    pub scope: WorkScope,
+    /// Whether the unit scan reached [`MAX_ROWS`] and stopped.
+    pub truncated: bool,
+    /// A2 §15's required honesty (decision **H4**). On this type it is also
+    /// the only thing that distinguishes "nothing scored" from "nothing
+    /// ran".
+    pub semantic: SemanticStatus,
+    /// A2 §13's *"semantic model identity/hash **if used**"*, populated only
+    /// when [`Self::semantic`] is [`SemanticStatus::Applied`].
     pub semantic_model: Option<SemanticModel>,
 }
 
@@ -6614,6 +6867,7 @@ impl Analytics {
         let db = AtlasDb {
             conn,
             path: self.path.clone(),
+            semantic: OnceLock::new(),
         };
         let posture = db.hardening()?;
         if !posture.locked
