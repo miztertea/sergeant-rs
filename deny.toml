@@ -63,8 +63,56 @@ yanked = "deny"
 # NOT covered by this entry: the pre-existing, unrelated yanked `chacha20`
 # via `ulid` -> `rand` (sergeant-rs#328) stays a live failure of its own —
 # this exception does not touch it and does not suppress it.
+# S5 W3b (F5, gate 1): a SECOND scoped, dated exception for a single named
+# advisory. It sits beside the anydoc entry above and does not touch,
+# generalise or replace it — two named IDs, not a relaxed rule.
+#
+# RUSTSEC-2024-0436 — `paste` 1.0.15 is unmaintained and archived; the
+# advisory itself says "No safe upgrade is available!". Reached
+# unconditionally via `paste -> tokenizers 0.21.4 -> model2vec-rs 0.2.1`,
+# and A2 §6's semantic half needs a Model2Vec implementation (decision
+# A2-06). Verified unavoidable rather than asserted, in
+# tests/fixtures/model2vec_corpus/SPIKE-F5.md:
+#   - `paste` is NOT optional in `tokenizers 0.21.4` — no `optional = true`,
+#     no feature guard, so no feature combination drops it;
+#   - `tokenizers 0.23.1` still depends on it;
+#   - `model2vec-rs` requires `tokenizers = "0.21"` regardless;
+#   - the alternative crate `model2vec 0.3.0` requires the same.
+#   Every Rust Model2Vec reads `tokenizer.json` through `tokenizers`, and
+#   `tokenizers` goes through `paste`.
+#
+# Owner ruling (J4), 2026-08-30:
+# knowledge/rulings/owner-rulings/model2vec-paste-advisory-2026-08-30.md —
+# "Model2Vec is ADOPTED — it always was (A2-06) … RUSTSEC-2024-0436 is
+# accepted as a SCOPED, DATED cargo-deny exception naming that advisory ID
+# specifically — never a broadened rule, never a disabled gate … The next
+# advisory must still fail the gate."
+#
+# NOT excepted, and must never be: **RUSTSEC-2025-0119** (`number_prefix` via
+# `indicatif` via `tokenizers/progressbar`). It is AVOIDED, not ignored —
+# `Cargo.toml` declares `tokenizers` directly with `fancy-regex` alone, which
+# drops `indicatif`/`number_prefix` from `Cargo.lock` entirely. The ruling's
+# decision 3 is explicit: "The second advisory stays avoided, not excepted."
+# `tests/w3b_model2vec_manifest_pin.rs` fails if either crate reappears in
+# the lockfile.
+#
+# Scoped by ID, and PROVEN so rather than asserted, against this exact file,
+# by `tests/fixtures/model2vec_corpus/prove-exception-is-scoped.sh`
+# (rerunnable; last recorded run:
+# tests/fixtures/model2vec_corpus/F5-exception-narrowness-proof.md) — it runs
+# `cargo deny check advisories` against THIS file with a synthetic advisory
+# injected against `tokenizers` (the crate directly between `paste` and
+# `model2vec-rs`) under a fresh id this entry has never heard of, and asserts
+# that advisory still fails the gate while RUSTSEC-2024-0436 stays ignored.
+#
+# Revisit triggers (ruling, "Revisit triggers" — any one reopens this):
+# - a `tokenizers` release that drops or replaces `paste`;
+# - a `paste` release resolving the advisory;
+# - a NEW advisory arriving through the model2vec subtree — by design this
+#   entry will not suppress it, and the gate going red IS the trigger firing.
 ignore = [
   { id = "RUSTSEC-2026-0192", reason = "anydoc's pdf-inspector->lopdf leg pulls unmaintained ttf-parser unconditionally; accepted risk per owner ruling knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md (J4), scoped to this one advisory ID only — see the comment above for revisit triggers." },
+  { id = "RUSTSEC-2024-0436", reason = "model2vec-rs -> tokenizers pulls unmaintained/archived paste unconditionally (no safe upgrade); accepted risk per owner ruling knowledge/rulings/owner-rulings/model2vec-paste-advisory-2026-08-30.md (J4), scoped to this one advisory ID only — see the comment above for revisit triggers." },
 ]
 
 [bans]

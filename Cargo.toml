@@ -95,6 +95,27 @@ duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
 # build, plus `bstr` and `fnv`.
 globset = { version = "0.4.20", default-features = false }
 include_dir = { version = "0.7.4", default-features = false }
+# S5 W3b (F5 gate 1 — SETTLED by owner ruling, J4): A2 §6's local static
+# embedding model, and decision A2-06's own named candidate ("Spike Model2Vec
+# Rust for optional local semantic retrieval", [EXT-MODEL2VEC]). W3's spike
+# recorded the full rung check (tests/fixtures/model2vec_corpus/SPIKE-F5.md);
+# it is not re-derived here.
+#
+# `default-features = false, features = ["local-only"]` is LOAD-BEARING, not
+# tidiness. The crate's defaults are `["onig", "hf-hub"]`, and
+# `hf-hub = ["dep:hf-hub", "dep:ureq"]` — an HTTP client and a HuggingFace
+# downloader. Turning them off and turning `local-only` on is what makes
+# A2-12 ("Explicitly install/pin semantic assets; no stage-time surprise
+# download") true by ABSENCE OF A CODE PATH: every download item in the crate
+# is `#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]`, so the
+# fetcher is not compiled and cannot be called. Pinned by
+# `tests/w3b_model2vec_manifest_pin.rs`, which reads THIS manifest.
+#
+# The `paste` advisory (RUSTSEC-2024-0436) reaching the graph through
+# `tokenizers` is unavoidable and is a scoped, dated `deny.toml` exception
+# naming that one ID — owner ruling
+# knowledge/rulings/owner-rulings/model2vec-paste-advisory-2026-08-30.md.
+model2vec-rs = { version = "0.2.1", default-features = false, features = ["local-only"] }
 # S4 Y2 (G3): the office adapter's own recovery watch
 # (`runtime/atlas/office.rs`) needs the `log` facade directly — anydoc's own
 # module doc names it as the sanctioned signal ("Recovery and skipped-content
@@ -146,6 +167,25 @@ serde_json = "1.0.151"
 thiserror = "2.0.19"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
+# S5 W3b: NOT a second parser — the SAME `tokenizers` `model2vec-rs` already
+# pulls (its own edge is `default-features = false` on the same `0.21` line,
+# so Cargo unifies them into one package). Declared directly for ONE reason:
+# `tokenizers` refuses to build with no regex backend (`compile_error!("One
+# of the `onig`, or `fancy-regex` features must be enabled")`,
+# tokenizers-0.21.4/src/utils/mod.rs:15), and `model2vec-rs`'s own way of
+# supplying one — its `fancy-regex` feature — bundles
+# `tokenizers/progressbar` with it, which drags in `indicatif` ->
+# `number_prefix` and RUSTSEC-2025-0119. Selecting the backend here selects
+# it WITHOUT the progress bar, and `indicatif`/`number_prefix` leave
+# `Cargo.lock` entirely.
+#
+# That is avoidance by configuration, not suppression: RUSTSEC-2025-0119 has
+# NO `deny.toml` entry and must never get one (owner ruling
+# model2vec-paste-advisory-2026-08-30.md, decision 3: "The second advisory
+# stays avoided, not excepted"). `tests/w3b_model2vec_manifest_pin.rs` fails
+# if this line loses `fancy-regex` or gains `progressbar`, and if
+# `indicatif`/`number_prefix` reappear in `Cargo.lock`.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 toml = "1.1.4"
 toml_edit = { version = "0.25", features = ["parse", "display"] }
 tracing = "0.1.44"
@@ -275,6 +315,13 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["t
 serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3"
 toml = "1.1.4"
+# S5 W3b (F-SI-01 fix): `tests/w3b_model2vec_manifest_pin.rs` checks a
+# committed digest against `PROVENANCE.md`. `sha2` is already resolved into
+# this exact build's `Cargo.lock` transitively (`lopdf -> pdf-inspector ->
+# anydoc -> sergeant-rs`), so naming it here is R5 (installed dependency),
+# not a new edge in the graph — `blake3` is the crate's own hash and is not
+# SHA-256, so it cannot stand in for this check.
+sha2 = "0.10.9"
 # S3 X4 (F4): `tests/x4_tabular_map.rs` writes a real `.parquet` fixture, so
 # the Parquet reader is proven end-to-end on actual Parquet bytes rather than
 # inferred from a linked symbol. Same rung and same arithmetic as the two
@@ -309,6 +356,25 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 # 2026-08-18) measured this exact generated installer's mechanics against a
 # real archive and found them correct.
 installers = ["shell"]
+
+# S5 W3b (owner ruling model2vec-paste-advisory-2026-08-30.md, J4 — "ship the
+# weights, do not build a fetch mechanism"). `include` *"copies additional
+# files or directories into the root of all archives and installers"*
+# (cargo-dist's own config reference, read via `ctx7 docs
+# /axodotdev/cargo-dist`; globs are NOT supported, which is why this names the
+# directory rather than a pattern). So `assets/semantic-model/` arrives as
+# `semantic-model/` beside `sgt`, which is the second place
+# `runtime::atlas::semantic::model_dir` looks.
+#
+# Files on disk, NOT `include_bytes!`: `model2vec-rs`'s `local-only` loader
+# takes a DIRECTORY PATH, so embedding the weights would mean 33.5 MB of
+# binary growth *and* unpacking them to a temp directory at load time to end
+# up exactly where `include` puts them for free.
+#
+# Accepted, recorded rather than discovered later: **release size grows
+# ~33.5 MB per target**. Provenance, digests and license:
+# assets/semantic-model/PROVENANCE.md.
+include = ["assets/semantic-model/"]
 
 # dist's expected release-build profile name. Inherits release rather than
 # adding new optimization flags of its own (R1: no new tuning surface until
