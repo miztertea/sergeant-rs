@@ -8,6 +8,7 @@
 //! | §17 item 8 — external evidence is visibly external **from the answer alone** | [`an_external_hit_is_identifiable_as_external_from_the_answer_alone`] |
 //! | §17 item 8 — and the same is true of a fused answer, not only a lexical one | [`a_fused_answer_carries_the_source_kind_and_authority_class_of_every_hit`] |
 //! | §17 item 3 — a relational aggregate **joins to retrieved row evidence** | [`a_relational_aggregate_and_a_retrieved_row_join_on_one_shared_row_identity`] |
+//! | §17 item 3 — and that relational read is **reachable outside the test binary** | [`item_3s_relational_read_is_reachable_from_outside_the_process`] |
 //! | §17 item 6 — one query **spans** a normalized Office document and a Markdown one | [`one_local_knowledge_query_spans_a_normalized_docx_and_a_markdown_file`] |
 //! | §13 — all nine trace fields are recorded | [`the_trace_records_every_one_of_a2_section_13s_nine_fields`] |
 //! | §13 — the tokenizer version is not a promise to remember | [`the_lexical_tokenizer_version_is_pinned_to_the_tokenizers_actual_output`] |
@@ -497,6 +498,105 @@ fn a_relational_aggregate_and_a_retrieved_row_join_on_one_shared_row_identity() 
     assert!(
         !row_key.is_empty(),
         "the row also carries its own stable identity, so two answers about it join"
+    );
+}
+
+/// **A2 §17 item 3, the reachability half** (S5 closeout F-AC-03).
+///
+/// [`a_relational_aggregate_and_a_retrieved_row_join_on_one_shared_row_identity`]
+/// really performs the join — but it performed it entirely through `pub`
+/// library functions that, at the close of S5, had no caller anywhere in
+/// `src/`: `dataset_probe`, `dataset_facts` and `admissible_datasets`. An
+/// acceptance item met only inside the test binary is this program's
+/// signature defect, and it is what this test exists to make impossible to
+/// repeat. It pins two things:
+///
+/// 1. the aggregate half of the join is served by the read the daemon route
+///    actually calls — `dataset_facts`, which reads only rows the store
+///    already holds — and that read joins to a retrieved row on
+///    `dataset_key`, A2 §4's shared row identity;
+/// 2. that read has a daemon route AND a CLI verb, in the shape
+///    `GET /v1/map/children` / `sgt map children` set in W7.
+///
+/// `dataset_probe` is deliberately *not* reachable and is asserted so: its
+/// own doc says `path` is a file path this process will open, *"so this is
+/// not, and must not become, an HTTP-reachable surface"*. The distinction is
+/// the point — one of these two reads is safe to expose and one is not, and
+/// "neither is exposed" was not the same as "the unsafe one is not".
+#[test]
+fn item_3s_relational_read_is_reachable_from_outside_the_process() {
+    let estate = estate();
+
+    // (1) The aggregate, through the read the route calls — no probe, no
+    // path, no client-named file: rows the store already holds.
+    let facts = estate
+        .db
+        .dataset_facts("library", 100)
+        .expect("stored relational evidence");
+    assert!(
+        !facts.is_empty(),
+        "a scanned dataset lands its canned queries' answers"
+    );
+
+    // The retrieval half, and the join key.
+    let answer = estate.search("INC0012345", &only_library(), Some(LexicalFamily::RowText));
+    let hit = answer
+        .hits
+        .iter()
+        .find(|hit| hit.coordinate.relative_path() == "tickets.csv")
+        .expect("a row-text hit for the ticket");
+    let UnitCoordinate::RowText {
+        relative_path,
+        dataset_key,
+        ..
+    } = &hit.coordinate
+    else {
+        panic!("expected a row-text coordinate, got {:?}", hit.coordinate);
+    };
+    let fact = facts
+        .iter()
+        .find(|f| &f.dataset_key == dataset_key)
+        .unwrap_or_else(|| {
+            panic!("the retrieved row's dataset key must name stored evidence: {dataset_key}")
+        });
+    assert_eq!(
+        &fact.relative_path, relative_path,
+        "the aggregate and the retrieved row cite one file"
+    );
+    assert!(
+        !fact.query_identity.is_empty() && !fact.output_hash.is_empty(),
+        "and the aggregate is checkable, not merely present: {fact:?}"
+    );
+
+    // (2) The surface. Without this, (1) is another green test for a
+    // capability nothing can call.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let api = std::fs::read_to_string(manifest.join("src/api.rs")).expect("read src/api.rs");
+    let cli = std::fs::read_to_string(manifest.join("src/cli.rs")).expect("read src/cli.rs");
+    assert!(
+        api.contains("atlas.dataset_facts("),
+        "item 3's relational read must have a daemon route that calls it — \
+         `dataset_facts` reached no production caller at the close of S5"
+    );
+    assert!(
+        api.contains(r#".route("/map/facts", get(map_facts))"#),
+        "and that route must be mounted, not merely written"
+    );
+    assert!(
+        cli.contains("/v1/map/facts?source="),
+        "and a CLI verb must reach it, in the shape `sgt map children` set"
+    );
+    // The negative half: the producer that opens a file the caller names
+    // stays off the wire, exactly as its own doc requires. A *call*, not a
+    // mention — the route's own doc names it to say why it is absent.
+    assert!(
+        !api.contains(".dataset_probe("),
+        "`dataset_probe` opens a path the caller supplies and must never \
+         become an HTTP-reachable surface (its own doc)"
+    );
+    assert!(
+        !cli.contains("dataset_probe"),
+        "and no CLI verb may reach it either"
     );
 }
 

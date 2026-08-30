@@ -593,6 +593,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/map/stats", get(map_stats))
         .route("/map/outline", get(map_outline))
         .route("/map/children", get(map_children))
+        .route("/map/facts", get(map_facts))
         .route("/map/symbol", get(map_symbol))
         .route("/map/references", get(map_references))
         // S5 W5, A2 §14's minimum useful surface — BOTH verbs. Canned and
@@ -5902,6 +5903,51 @@ async fn map_children(State(state): State<ApiState>, Query(query): Query<MapQuer
     }
 }
 
+/// `GET /v1/map/facts?source=<name>` — the derived relational evidence one
+/// source's confirmed generation holds: every canned dataset query's stored
+/// answer, with the identity and output hash that make it checkable
+/// (A1 §6.4).
+///
+/// This is A2 §17 item 3's **relational** read, and it exists because that
+/// item asks for two things that must both be reachable from outside the
+/// process: a relational answer available *independently of text retrieval*,
+/// and one that *joins to retrieved row evidence*. The join key is
+/// `dataset_key`, which `sgt search --content row-text` already prints on
+/// every row hit; without this route the aggregate half of that join had no
+/// caller outside the test suite (S5 closeout F-AC-03).
+///
+/// It reads rows the store already holds — never a path a client named. The
+/// producer that opens a dataset file, `AtlasDb::dataset_probe`, is
+/// deliberately NOT routed here and its own doc says why.
+async fn map_facts(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let source = match query.source() {
+        Ok(source) => source.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.dataset_facts(&source, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(facts)) => Json(json!({
+            "atlas": {"present": true},
+            "source": source,
+            "limit": limit,
+            "facts": facts.iter().map(|f| json!({
+                "path": f.relative_path,
+                "dataset_key": f.dataset_key,
+                "query": f.query,
+                "query_identity": f.query_identity,
+                "row_limit": f.row_limit,
+                "truncated": f.truncated,
+                "columns": f.columns,
+                "rows": f.rows,
+                "output_hash": f.output_hash,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
 /// `GET /v1/map/symbol?name=<symbol>` — the symbol index, by exact name.
 async fn map_symbol(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
     let name = match query.name() {
@@ -8153,6 +8199,35 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body["children"].is_array(), "{body}");
 
+        // `map facts` is the READ side of `source.dataset_facts` — A2 §17
+        // item 3's relational half, which had no production caller at all
+        // before the S5 closeout (F-AC-03). The scanned source holds one
+        // dataset, so this is a real answer, not an empty envelope.
+        let (status, body) = body_json(
+            map_facts(
+                State(state.clone()),
+                Query(MapQuery {
+                    source: Some("notes".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let facts = body["facts"].as_array().expect("facts");
+        assert!(
+            !facts.is_empty(),
+            "the scanned dataset's stored answers: {body}"
+        );
+        assert!(
+            facts.iter().all(
+                |f| !f["dataset_key"].as_str().unwrap_or_default().is_empty()
+                    && !f["output_hash"].as_str().unwrap_or_default().is_empty()
+            ),
+            "every fact carries the join key and the hash that makes it checkable: {body}"
+        );
+
         // `map repos` is repository sources; a knowledge source is not one.
         let (status, body) = body_json(map_repos(State(state.clone())).await).await;
         assert_eq!(status, StatusCode::OK);
@@ -8174,6 +8249,11 @@ mod tests {
 
         let (status, body) =
             body_json(map_outline(State(state.clone()), Query(MapQuery::default())).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "source_required");
+
+        let (status, body) =
+            body_json(map_facts(State(state.clone()), Query(MapQuery::default())).await).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"]["code"], "source_required");
 

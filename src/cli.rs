@@ -689,6 +689,21 @@ pub enum MapCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// One source's stored relational evidence: every canned dataset
+    /// query's answer, with the query identity and output hash that make it
+    /// checkable (A1 §6.4).
+    ///
+    /// A2 §17 item 3's relational read. `dataset_key` is the join key
+    /// `sgt search --content row-text` prints on every row hit, so an
+    /// aggregate and the example rows behind it cite one identity instead of
+    /// becoming two unrelated representations (A2 §4).
+    Facts {
+        /// Declared source name.
+        source: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// The symbol index, by exact name.
     Symbol {
         /// Symbol name, matched exactly — never as a pattern.
@@ -1895,6 +1910,14 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         limit_query(*limit)
                     ),
                     "children",
+                ),
+                MapCommand::Facts { source, limit } => (
+                    format!(
+                        "/v1/map/facts?source={}{}",
+                        crate::api::urlencode(source),
+                        limit_query(*limit)
+                    ),
+                    "facts",
                 ),
                 MapCommand::Symbol { name, limit } => (
                     format!(

@@ -887,7 +887,7 @@ const WALK: &[Item] = &[
             ),
             at(
                 "tests/x4_tabular_map.rs",
-                "f11_map_ships_five_verbs_and_defers_neighbors_and_changed",
+                "map_ships_only_the_verbs_whose_rows_exist_and_defers_neighbors_and_changed",
             ),
             at(
                 "tests/x4_tabular_map.rs",
@@ -1936,12 +1936,15 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
             "stats",
             "outline",
             "children",
+            "facts",
             "symbol",
             "references",
         ]),
         "`sgt map` ships F11's five verbs plus `children` (S5 W7 F-SF-03, the canned read \
-         `source.child_resources` had no consumer for) and no others — `neighbors` and \
-         `changed` land with the waves whose consumers need them: {text}"
+         `source.child_resources` had no consumer for) and `facts` (S5 closeout F-AC-03, \
+         the same for `source.dataset_facts`, which A2 §17 item 3 was claimed met on) and \
+         no others — `neighbors` and `changed` land with the waves whose consumers need \
+         them: {text}"
     );
     for forbidden in ["--sql", "--query", "--where"] {
         assert!(

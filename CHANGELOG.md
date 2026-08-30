@@ -1553,6 +1553,35 @@ them were dead code in every real installation.
   that distinguishes the two bodies
   (`w2_lexical_retrieval::lexical_search_returns_mail_units_with_exact_a1_provenance`).
 
+### The relational half of a search has a surface (S5 closeout)
+
+- **`sgt map facts <source>` / `GET /v1/map/facts?source=<name>`** — one
+  source's stored relational evidence: every canned dataset query's answer
+  with the query identity and output hash that make it checkable (A1 §6.4).
+  A2 §17 item 3 asks for a relational answer available *independently of
+  text retrieval* that *joins to retrieved row evidence*; the join was
+  performed, but only between two library calls with no caller anywhere in
+  `src/`, so no consumer outside this process could reach the aggregate
+  half. `dataset_key` — the key `sgt search --content row-text` already
+  prints on every row hit — is the join, and both sides are now readable
+  from outside
+  (`w5_search_surface::item_3s_relational_read_is_reachable_from_outside_the_process`).
+- `AtlasDb::dataset_probe` is deliberately **not** on that surface and the
+  new test asserts it stays off: it opens a file path the caller names,
+  which is a different property from its query being canned, and its own doc
+  already said it must never become HTTP-reachable. The scan-time producer
+  that computes these facts is unchanged.
+- Two reads remain test-only and are named here rather than left implied.
+  `AtlasDb::datasets` is the per-dataset inventory — `sgt map stats` reports
+  each source's dataset *count*, not those rows. The three content-kind
+  observers `admissible_units`/`admissible_occurrences`/`admissible_datasets`
+  return one family's admissible set; §2's filter itself is production-
+  reachable, because every search runs the same `WHERE` through
+  `admissible_generations`, so what has no surface is reading a family's
+  admitted set back, not the filtering. Both are cited as test evidence
+  today; if either earns a surface it is S6's intelligence read, and no §17
+  item is claimed met by their existence.
+
 
 ## [0.2.4] - 2026-08-25
 
