@@ -10,8 +10,10 @@
 //!
 //! # Extraction is chosen by `--extractor`, exactly as it is in-process
 //!
-//! `--extractor` is dispatched on, not merely echoed: a value equal to
-//! [`office::DOCX_EXTRACTOR`] runs the real Office adapter
+//! `--extractor` is dispatched on, not merely echoed: a value for which
+//! [`office::is_office_extractor`] returns true — any of the eleven
+//! document-format identities the Office adapter claims, not only
+//! [`office::DOCX_EXTRACTOR`] — runs the real Office adapter
 //! ([`office::office_units`]) over stdin; a value equal to
 //! [`archive::ZIP_EXTRACTOR`] runs the real bounded-ZIP adapter
 //! ([`archive::expand`], S4 Y3) over stdin; a value equal to
