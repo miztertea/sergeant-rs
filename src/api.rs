@@ -588,6 +588,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/map/repos", get(map_repos))
         .route("/map/stats", get(map_stats))
         .route("/map/outline", get(map_outline))
+        .route("/map/children", get(map_children))
         .route("/map/symbol", get(map_symbol))
         .route("/map/references", get(map_references))
         .route("/events", get(event_history))
@@ -5853,6 +5854,44 @@ async fn map_outline(State(state): State<ApiState>, Query(query): Query<MapQuery
     }
 }
 
+/// `GET /v1/map/children?source=<name>` — one source's container children,
+/// with A1 §6.6's four preserved fields (S5 W7 F-SF-03).
+///
+/// The read path `source.child_resources` did not have. The parent
+/// coordinate is written per landed child and the entry content hash and
+/// entry adapter are deliberately not duplicated beside it — they live on
+/// the resource's own row and are joined back here — which is a design only
+/// as long as some bounded surface actually performs that join. A1-15 keeps
+/// arbitrary client SQL off the public surface, so a canned read is the only
+/// way those fields can be reached at all.
+async fn map_children(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let source = match query.source() {
+        Ok(source) => source.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.child_resources(&source, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(children)) => Json(json!({
+            "atlas": {"present": true},
+            "source": source,
+            "limit": limit,
+            "children": children.iter().map(|c| json!({
+                "path": c.relative_path,
+                "key": c.key,
+                "parent": c.parent_relative_path,
+                "parent_key": c.parent_key,
+                "entry_path": c.entry_path,
+                "content_hash": c.content_hash,
+                "extractor": c.extractor,
+                "lane": c.lane,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
 /// `GET /v1/map/symbol?name=<symbol>` — the symbol index, by exact name.
 async fn map_symbol(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
     let name = match query.name() {
@@ -7634,6 +7673,27 @@ mod tests {
                 .contains("definition sites"),
             "the answer must say what it actually is (A1-09): {body}"
         );
+
+        // `map children` is the READ side of `source.child_resources`
+        // (S5 W7 F-SF-03) — wired to a real reader, and answering with the
+        // `children` envelope even when this particular source has no
+        // container child. What the rows carry is pinned end to end by
+        // `tests/w7_container_children.rs::the_parent_coordinate_is_readable_
+        // through_the_daemons_own_bounded_reader`, which scans a real
+        // archive.
+        let (status, body) = body_json(
+            map_children(
+                State(state.clone()),
+                Query(MapQuery {
+                    source: Some("notes".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["children"].is_array(), "{body}");
 
         // `map repos` is repository sources; a knowledge source is not one.
         let (status, body) = body_json(map_repos(State(state.clone())).await).await;

@@ -417,6 +417,9 @@ fn changed_file(overlay: &WorkOverlay, path: &str, out: &mut Extracted) -> Strin
         mtime_millis: None,
         units: extracted.units,
         syntax: extracted.syntax,
+        // An overlay path is acquired directly, never expanded out of a
+        // container (S5 W7).
+        parent: None,
     });
     hash
 }

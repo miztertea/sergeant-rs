@@ -91,6 +91,7 @@ fn scan(source_name: &str, content_key: &str, body: &str) -> SourceScan {
             text: body.to_string(),
         }],
         syntax: None,
+        parent: None,
     };
     SourceScan {
         source_name: source_name.to_string(),

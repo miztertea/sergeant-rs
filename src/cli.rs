@@ -557,6 +557,16 @@ pub enum MapCommand {
         #[arg(long)]
         limit: Option<usize>,
     },
+    /// One source's container children (A1 §6.6): each expanded entry's own
+    /// coordinate, its IMMEDIATE parent's path and key, its entry path, and
+    /// the entry content hash and adapter joined back from its own row.
+    Children {
+        /// Declared source name.
+        source: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// The symbol index, by exact name.
     Symbol {
         /// Symbol name, matched exactly — never as a pattern.
@@ -1717,6 +1727,14 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         limit_query(*limit)
                     ),
                     "outline",
+                ),
+                MapCommand::Children { source, limit } => (
+                    format!(
+                        "/v1/map/children?source={}{}",
+                        crate::api::urlencode(source),
+                        limit_query(*limit)
+                    ),
+                    "children",
                 ),
                 MapCommand::Symbol { name, limit } => (
                     format!(

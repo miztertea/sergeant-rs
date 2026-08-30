@@ -304,33 +304,48 @@
 //! child as `adapter=zip` erases exactly the information F7's key exists to
 //! carry).
 //!
-//! # A named seam: not yet wired onto the wire batch
+//! # The seam that WAS here is closed (S5 W7)
 //!
 //! [`expand`] is proven directly, in-process, against every admission and
-//! bounds claim above (mirroring `office.rs`'s own `#[cfg(test)]` block), and
-//! — since S4 Y8 wired `scan.rs`'s and `git.rs`'s own routing tables to
-//! dispatch a claimed `.zip` to the real worker from a real scan
-//! (`tests/y8_adapter_dispatch.rs`) — a real container's admitted children
-//! really do reach [`super::worker::validate_batch`]'s daemon-side authority
-//! (path safety, F10 deny-set membership) from production code, not only
-//! from this file's own tests and `tests/y3_zip_adapter.rs`'s subprocess
-//! proof. What STILL does not reach the daemon is a child's own CONTENT:
-//! [`super::worker::DeclaredChild`] does not yet carry a child's content
-//! bytes, content hash, or composed key on the wire — it still ships exactly
-//! the `name`/`relative_path` pair Y1 defined for its own synthetic
-//! `--declare-child` test fixture, and Y8's own dispatch fix records a
-//! validated child's name in its container's own coverage detail rather than
-//! inventing a `source.files` row this wire shape cannot honestly back.
-//! Widening that shared wire type to carry a child's real bytes is a
-//! decision with its own security/footprint shape (JSON-embedding
-//! potentially-large binary content on every worker round trip) that no
-//! wave's brief through Y8 has settled and this module does not decide
-//! unilaterally (J0: no rung above resolves it, and it changes a contract
-//! every later wave depends on) — recorded here, not silently deferred, so
-//! the wave that IS given that authority has one place to look. §17 item 7's
-//! register row (`tests/x5_a1a_acceptance.rs`) states this exact split as
-//! `met-with-deviation`: dispatch met, content-on-the-wire the named
-//! deviation.
+//! bounds claim above (mirroring `office.rs`'s own `#[cfg(test)]` block).
+//! S4 Y8 wired `scan.rs`'s and `git.rs`'s own routing tables to dispatch a
+//! claimed `.zip` to the real worker from a real scan
+//! (`tests/y8_adapter_dispatch.rs`), so a real container's admitted children
+//! reached [`super::worker::validate_batch`]'s daemon-side authority — but a
+//! child's own CONTENT still did not: [`super::worker::DeclaredChild`] was
+//! `name`/`relative_path` only, and a validated child landed as a name in its
+//! container's coverage detail rather than as a resource. That was the named
+//! seam register items 7 and 8 carried as `met-with-deviation`.
+//!
+//! S5 W7 closed it, and this is the shape of the answer, because it changes
+//! what THIS module's output means downstream:
+//!
+//! * `DeclaredChild` now carries the child's bytes, the worker's own hash of
+//!   them and the child's downstream adapter claim, and
+//!   `src/bin/atlas_worker.rs` FLATTENS the whole tree [`expand`] returns
+//!   (a nested archive's own members, a nested message's own attachments) into
+//!   one `declared_children` list at `/`-joined paths. Nothing about this
+//!   file's own bounds changes: the flattening walks a recursion
+//!   `expand_at_depth` already performed under [`MAX_NESTING_DEPTH`] and the
+//!   whole-tree cumulative-byte accumulator, and admits no byte those bounds
+//!   did not already admit.
+//! * Because the tree arrives flat, the daemon LANDS children and never
+//!   re-enters a container to find more — which is what keeps ONE depth
+//!   counter and ONE budget rather than a second, daemon-side pair
+//!   (`tests/w7_container_children.rs`'s
+//!   `container_children_share_one_depth_counter_and_one_budget_not_a_second_pair`
+//!   fails if a second is ever introduced).
+//! * The daemon hashes what it RECEIVES, on receipt, and stores that value
+//!   (H15 option (b); [`super::worker::DeclaredChild`]'s own doc states, at
+//!   length, what that hash does and does not vouch for — it identifies the
+//!   bytes that reached the store, not "what is really inside the archive").
+//!
+//! One narrower gap this module named is NOT closed and is not claimed to be:
+//! a per-entry [`CoverageRow`] still has no field on `WorkerBatch` to travel
+//! in, so an entry-level refusal here (a symlink, a duplicate name, the depth
+//! ceiling) is proven in this file's own tests but does not reach the daemon
+//! — `src/bin/atlas_worker.rs`'s own module doc, "A named gap", states it from
+//! the wire's side, unchanged by W7.
 //!
 //! # Reused by Y4's mail adapter (R2) — and the reverse direction wired here
 //!
@@ -743,6 +758,31 @@ pub(crate) fn expand_at_depth(
             continue;
         }
         let path = enclosed.to_string_lossy().replace('\\', "/");
+
+        // S5 W7 (F-SF-04): the container-coordinate separator is RESERVED,
+        // not merely conventional. A composed child path joins every nesting
+        // level with [`super::scan::CHILD_PATH_SEPARATOR`], so an entry whose
+        // own enclosed path contains that sequence would compose to exactly
+        // the same string a genuine two-level nesting composes to — an entry
+        // literally named `bundle.zip!/report.docx` would be indistinguishable
+        // from `report.docx` inside `bundle.zip`, and neither the composed
+        // path nor the stored `entry_path` could be decomposed back. Refused
+        // with its own named row rather than admitted under a coordinate that
+        // does not mean what it says.
+        if path.contains(super::scan::CHILD_PATH_SEPARATOR) {
+            coverage.push(CoverageRow {
+                path: Some(raw_name.clone()),
+                status: Coverage::Excluded,
+                detail: Some(format!(
+                    "entry name contains {:?}, the reserved container-coordinate separator; a \
+                     child path is composed by joining nesting levels with it, so admitting this \
+                     name would forge a nesting boundary that does not exist",
+                    super::scan::CHILD_PATH_SEPARATOR
+                )),
+                bytes: None,
+            });
+            continue;
+        }
 
         // Entry-type classification: this module masks the entry's own Unix
         // mode bits (S_IFMT) directly rather than composing `zip`'s
@@ -1410,6 +1450,48 @@ mod tests {
         );
         assert_eq!(expansion.children[0].relative_path, "readme.txt");
         assert_eq!(expansion.children[0].content, b"hello");
+    }
+
+    /// **F-SF-04.** The container-coordinate separator is reserved: an entry
+    /// whose own name carries `!/` would compose to exactly the coordinate a
+    /// genuine two-level nesting composes to, so it is refused with its own
+    /// named row rather than admitted under a forged one.
+    #[test]
+    fn an_entry_name_carrying_the_reserved_container_separator_is_refused() {
+        let expansion = expand(
+            &build(&[
+                ("readme.txt", b"ok" as &[u8]),
+                ("bundle.zip!/report.md", b"# forged"),
+            ]),
+            "parent-key",
+        );
+        assert!(
+            expansion
+                .children
+                .iter()
+                .all(|c| c.relative_path != "bundle.zip!/report.md"),
+            "a forged nesting coordinate must not be admitted: {:?}",
+            expansion.children
+        );
+        let row = expansion
+            .coverage
+            .iter()
+            .find(|r| r.path.as_deref() == Some("bundle.zip!/report.md"))
+            .expect("the refusal is a NAMED row, not silence");
+        assert_eq!(row.status, Coverage::Excluded);
+        assert!(
+            row.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reserved container-coordinate separator"),
+            "{row:?}"
+        );
+        assert_eq!(
+            expansion.children.len(),
+            1,
+            "the innocent sibling is still admitted: {:?}",
+            expansion.children
+        );
     }
 
     /// Overwrites the external-file-attributes field (bytes 38..42 of the

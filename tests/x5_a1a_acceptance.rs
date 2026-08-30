@@ -41,8 +41,8 @@
 //! | 4 | online-only/unreadable local resources are reported as coverage gaps, not silently indexed as empty | met | `y6b_online_only::an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_trigger` |
 //! | 5 | Markdown/text and at least one Office format normalize into document units with provenance | met | `y2_office_adapter::a_docx_worker_returns_document_and_section_units_with_provenance` |
 //! | 6 | CSV/JSON/Parquet stay relational, with a deterministic aggregate and selected text-field context units sharing row identity | met | `x4_tabular_map::datasets_are_registered_and_read_in_place_as_derived_evidence` |
-//! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | met-with-deviation | `y3_zip_adapter::a_zip_worker_declares_admitted_children_through_the_real_subprocess` |
-//! | 8 | `.eml` or the chosen first mail format produces structured message evidence | met-with-deviation | `y4_mail_adapter::a_mail_worker_returns_message_shape_and_attachment_with_provenance` |
+//! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | met | `w7_container_children::an_admitted_zip_entry_lands_as_its_own_resource_with_all_four_preserved_fields` |
+//! | 8 | `.eml` or the chosen first mail format produces structured message evidence | met | `w7_container_children::a_docx_inside_a_zip_inside_an_eml_reaches_the_office_adapter_by_the_same_route` |
 //! | 9 | image/scanned evidence enters the OCR fallback with page/region/engine provenance | deferred-post-s4 | — |
 //! | 10 | external Git acquisition resolves an exact commit in a no-Work-checkout cache | met | `src/runtime/atlas/external_git::a_refresh_resolves_the_origins_new_tip_over_the_same_cache` |
 //! | 11 | source parsing uses content/extractor identity so unchanged resources reuse cached facts | met | `x2_knowledge_sources::a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one` |
@@ -136,6 +136,16 @@ enum Verdict {
     Met,
     /// Shipped and proven, but not in the shape §17's wording assumes — the
     /// deviation is named in the row's `note` with the decision that took it.
+    ///
+    /// **No row carries this as of S5 W7** (items 7 and 8, the last two, moved
+    /// to [`Self::Met`] when container children became real resources). It is
+    /// kept rather than deleted because it is this register's VOCABULARY, not
+    /// a row: a future wave that has to record "shipped, but not in §17's
+    /// shape" must reach for the same word with the same meaning, and
+    /// [`Verdict::as_str`]'s mapping is what the walk table is held to. The
+    /// allow is therefore about an empty *census*, never about an unused
+    /// concept.
+    #[allow(dead_code)]
     MetWithDeviation,
     /// Not fully provable today. The `note` names what is missing and the
     /// sprint that owns it. Never a pass.
@@ -451,8 +461,36 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 7,
-        verdict: Verdict::MetWithDeviation,
+        verdict: Verdict::Met,
         checks: &[
+            at(
+                "tests/w7_container_children.rs",
+                "an_admitted_zip_entry_lands_as_its_own_resource_with_all_four_preserved_fields",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_child_with_no_claiming_extractor_is_a_named_coverage_gap",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_csv_inside_a_zip_reaches_the_relational_lane_a_loose_csv_reaches",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_grandchilds_persisted_parent_is_its_immediate_container_not_the_root",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "the_parent_coordinate_is_readable_through_the_daemons_own_bounded_reader",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_nested_container_cannot_escape_the_shared_depth_ceiling_by_recursing",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "container_children_share_one_depth_counter_and_one_budget_not_a_second_pair",
+            ),
             at(
                 "tests/y3_zip_adapter.rs",
                 "a_zip_worker_declares_admitted_children_through_the_real_subprocess",
@@ -513,32 +551,86 @@ const WALK: &[Item] = &[
                IMMEDIATE parent's own key — chained, not resolved to the root archive, so a \
                grandchild's key encodes its whole ancestry without a stored chain. No entry is \
                ever executed and nothing is written to a real path (deliverable d): the adapter \
-               is pure bytes-in/structs-out, never touches a filesystem. NAMED SEAM, not a \
-               silent gap: `worker::DeclaredChild`/`WorkerBatch` do not yet carry a child's \
-               content bytes, hash, or composed key on the wire — only `name`/`relative_path`, \
-               Y1's own original shape — so per-entry coverage rows and F7 provenance are proven \
-               exhaustively against `archive::expand`'s own return value (in-process) but do not \
-               yet reach the daemon; widening that shared wire type is left to the wave that \
-               wires real daemon-side persistence, stated explicitly in `archive.rs`'s own \
-               module doc rather than silently deferred. DISPATCH CLOSED, NAMED SEAM STANDS (S4 \
-               Y8): a claimed `.zip` now reaches the worker from a real scan — `scan.rs`'s \
-               `Walk::file` and `git.rs`'s `extract_blobs` route it through `run_worker` and \
-               daemon-side `validate_batch`, proven end to end by the newly-added check above, \
-               closing the 'not yet by a shipped scan trigger' half of what this note used to \
-               say. What did NOT close, and is why this row is `met-with-deviation` rather than \
-               `met`: the named seam two paragraphs up. `WorkerBatch`'s declared children still \
-               carry only a name and a path, so an admitted ZIP entry does not land as its own \
-               `source.files` row with real content — only as a name recorded, validated and \
-               visible, in its container's own coverage detail. DESTINATION: widening \
-               `WorkerBatch`/`DeclaredChild` to carry a child's content bytes, hash, or composed \
-               key is a security/footprint decision (J0 — no rung above this wave's own brief \
-               resolves it, and it changes a contract every later wave depends on); it is left to \
-               whichever wave is given that authority explicitly, not assumed here.",
+               is pure bytes-in/structs-out, never touches a filesystem. DISPATCH CLOSED (S4 Y8): a \
+               claimed `.zip` reaches the worker from a real scan — `scan.rs`'s `Walk::file` and \
+               `git.rs`'s `extract_blobs` route it through `run_worker` and daemon-side \
+               `validate_batch`. CHILD CONTENT CLOSED (S5 W7), which is what moved this row from \
+               `met-with-deviation` to `met`: `DeclaredChild` now carries the child's BYTES, the \
+               worker's own hash of them and its downstream adapter claim, the worker flattens \
+               the whole expansion tree onto one batch, and each admitted entry lands as its OWN \
+               resource — its own composed path (`bundle.zip!/notes/a.md`), its own units from \
+               the adapter its own extension routes to, and a `source.child_resources` row \
+               carrying A1 §6.6's parent coordinate (parent resource path + parent key + entry \
+               path) beside the entry content hash and entry adapter its `source.files` row \
+               already holds. All four §6.6 fields are preserved, and the first check above \
+               asserts each one. A child claimed by the TABULAR routing table takes the \
+               relational lane instead (S5 W7 F-SF-01): it is registered in `source.datasets` \
+               and read in place, never prose-flattened (A1-13), and writes the same \
+               `source.child_resources` parent-coordinate row keyed by its `dataset_key` — \
+               because DuckDB reads a dataset from a path and a child's bytes exist only in \
+               memory, the daemon materialises those bytes into a per-read scratch directory \
+               under its OWN data dir, named by its own content hash rather than the entry's \
+               name, and removes it when the read ends. Nothing executes it and no container is \
+               unpacked to disk. SCOPED HONESTLY: that registration happens on a FILESYSTEM \
+               source walk. An estate-git walk registers no dataset row for a LOOSE file of \
+               those extensions either (`DATASET_NO_ROOT`), so its container children answer \
+               with their own `DATASET_CHILD_NOT_REGISTERED` detail naming that equivalence \
+               rather than borrowing a reason that is no longer true of a child; an overlay \
+               scan produces no container child at all. Route equivalence is the claim, per \
+               walk, and it holds on every walk — not 'every walk registers datasets'. THE COORDINATE IS READ, NOT ONLY WRITTEN (S5 W7 F-SF-03): \
+               `AtlasDb::child_resources` is the canned read behind `GET /v1/map/children` and \
+               `sgt map children`, answering with all four §6.6 fields for both lanes in one \
+               list — the parent coordinate from `source.child_resources`, the entry content \
+               hash and entry adapter JOINED BACK from the resource's own row. That join is why \
+               those two fields are not duplicated beside the coordinate (F-SI-01), and until \
+               this reader existed the non-duplication was a hole rather than a design: every \
+               occurrence of the table in `src/` was DDL, INSERT or DELETE, and A1-15 keeps \
+               arbitrary client SQL off the public surface, so two of the four preserved fields \
+               were reachable only by opening the database file directly. AND THE PARENT IS THE \
+               IMMEDIATE ONE (S5 W7 F-SF-02): the daemon composes each child's coordinate from \
+               the container its own flattened path names, not from the dispatched resource, so \
+               a grandchild records the intermediate archive and chains its key through that \
+               archive's own key — `validate_batch` refuses a child naming a container the \
+               batch never declared (`OrphanedChildPath`), which is what makes that composition \
+               well-founded rather than a best effort. H15, the wave's named J0-shaped question, was answered as its \
+               brief recommended and the code states honestly: the worker returns child bytes \
+               and the DAEMON hashes what it receives, on receipt, before storing (option (b)), \
+               because option (a) — the daemon re-opening the container — would have moved ZIP \
+               and MIME parsing into the sole writer, defeating the supervised-worker boundary \
+               PDEATHSIG/RLIMIT_AS/the own process group exist to hold. The honest claim, made \
+               in `DeclaredChild`'s own doc rather than glossed: a child's content hash \
+               identifies THE BYTES THAT REACHED THE STORE, not 'what is really inside the \
+               archive' — the daemon cannot vouch for a correspondence it never observed. What \
+               it does vouch for is checked: per-child ceiling (an alias of \
+               `scan::MAX_RESOURCE_BYTES`, refused from the ENCODED length before the decoded \
+               buffer is allocated), the daemon's own hash against the worker's claim, and the \
+               adapter claim against this build's own routing table — each its own \
+               `BatchRefusal`, each refusing the WHOLE batch rather than landing part of it. \
+               BOUNDS UNCHANGED, which the brief required: child bytes count against the \
+               EXISTING whole-tree byte budget and the EXISTING depth counter, because the \
+               worker flattens a tree `archive::expand` already walked under both — \
+               `container_children_share_one_depth_counter_and_one_budget_not_a_second_pair` \
+               reads the source and fails if a second constant of either kind is ever defined. \
+               ONE NARROWER GAP REMAINS AND IS NOT CLAIMED CLOSED: `WorkerBatch` still has no \
+               `CoverageRow` field, so an ENTRY-level refusal (a symlink, a duplicate name, the \
+               depth ceiling) is proven in `archive.rs`'s own tests but does not reach the \
+               daemon — `src/bin/atlas_worker.rs`'s own module doc, 'A named gap', states it, and \
+               W7 deliberately did not widen it. That gap is about a coverage row's transport, \
+               not about whether a bounded ZIP exposes child resources, which is what this item \
+               asks and what the checks above now prove end to end.",
     },
     Item {
         number: 8,
-        verdict: Verdict::MetWithDeviation,
+        verdict: Verdict::Met,
         checks: &[
+            at(
+                "tests/w7_container_children.rs",
+                "a_docx_inside_a_zip_inside_an_eml_reaches_the_office_adapter_by_the_same_route",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_child_whose_received_bytes_do_not_match_its_declared_hash_is_refused_rather_than_stored",
+            ),
             at(
                 "tests/y4_mail_adapter.rs",
                 "a_mail_worker_returns_message_shape_and_attachment_with_provenance",
@@ -626,18 +718,35 @@ const WALK: &[Item] = &[
                exists to discharge a specific owner ruling over a RUSTSEC advisory G4's own deny \
                gate did not find; Y3's `archive.rs` (a second real container adapter) already set \
                the precedent of no dedicated one-owner test, which this wave follows rather than \
-               diverging from unprompted. DISPATCH CLOSED, NAMED SEAM STANDS (S4 Y8), same \
-               correction as item 7's own: a claimed `.eml` now reaches the worker from a real \
-               scan (the newly-added check above proves it end to end), closing the 'not yet by \
-               a shipped scan trigger' half of what this note used to say. Mail's own message \
-               body (text/html) is a real `WorkerUnit` and lands as real content — no deviation \
-               there. What does not land is an attachment's own bytes: `WorkerBatch`'s declared \
-               children carry only a name and a path, the identical wire-shape gap item 7's note \
-               states in full (`archive.rs`'s own module doc, 'A named seam' — mail reuses \
-               `archive.rs`'s container machinery, so it inherits the identical wire limit). An \
-               attachment is validated daemon-side and its name lands, visibly, in the message's \
-               own coverage detail — never as its own `source.files` row with real content. Same \
-               destination as item 7: a J0 decision this wave's brief does not settle.",
+               diverging from unprompted. DISPATCH CLOSED (S4 Y8): a claimed `.eml` \
+               reaches the worker from a real scan. ATTACHMENT CONTENT CLOSED (S5 W7), which is \
+               what moved this row to `met`: mail reuses `archive.rs`'s container machinery, so \
+               it inherited the identical wire limit item 7's note describes, and it inherits \
+               the identical fix. An attachment now lands as its OWN resource carrying the \
+               PARENT-MESSAGE COORDINATE A1 §6.5 requires ('attachments recurse through the same \
+               content adapters and retain a parent-message coordinate') — and both halves of \
+               that sentence are now literally true, not one of them: the first check above \
+               drives a real `.docx` inside a real `.zip` inside a real `.eml` and asserts the \
+               grandchild's extractor is the OFFICE adapter's own identity, reached through \
+               `scan::child_extractor_for` — which is `format_for` unioned with \
+               `worker_extractor_for` unioned with `claims_for`, the same THREE tables in the \
+               same order a loose file on disk goes through, so there is one dispatcher in this \
+               build and not a second one for children (R2). That third table was missing until \
+               S5 W7's F-SF-01 fix, and its absence was exactly A1 §1's own motivating payload \
+               ('100k ServiceNow tickets in CSV/JSON/Parquet inside an archive') not working: a \
+               `.csv` child answered `None` and landed as a gap whose detail said 'nothing in \
+               this build claims its extension' while `tabular.rs` claims csv/tsv/json/jsonl/ \
+               ndjson/parquet. It now takes the relational lane a loose one takes — registered, not \
+               prose-flattened (A1-13) — with the daemon materialising the child's bytes into \
+               its own scratch directory under the data dir, named by its own content hash and \
+               removed when the read ends, because DuckDB reads a dataset from a path and a \
+               child's bytes exist only in memory. A child dataset carries the same A1 §6.6 \
+               parent coordinate a child file does, into the same `source.child_resources` \
+               table. The message's own body units are unchanged. H15's trust model, the \
+               per-child ceiling, the hash and adapter cross-checks, and the single shared \
+               depth/byte budget are item 7's note in full and are not restated here; the one \
+               narrower gap named there (no `CoverageRow` field on `WorkerBatch`) applies to \
+               mail identically and is likewise not claimed closed.",
     },
     Item {
         number: 9,
@@ -1649,9 +1758,17 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
         .collect();
     assert_eq!(
         verbs,
-        BTreeSet::from(["repos", "stats", "outline", "symbol", "references"]),
-        "`sgt map` ships F11's five verbs and no others — `neighbors` and `changed` land \
-         with the waves whose consumers need them: {text}"
+        BTreeSet::from([
+            "repos",
+            "stats",
+            "outline",
+            "children",
+            "symbol",
+            "references",
+        ]),
+        "`sgt map` ships F11's five verbs plus `children` (S5 W7 F-SF-03, the canned read \
+         `source.child_resources` had no consumer for) and no others — `neighbors` and \
+         `changed` land with the waves whose consumers need them: {text}"
     );
     for forbidden in ["--sql", "--query", "--where"] {
         assert!(

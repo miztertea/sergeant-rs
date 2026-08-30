@@ -489,9 +489,18 @@ pub(crate) fn extract_blobs(
                         // Not a fact a Git object has — see `extract_blobs`'s
                         // own in-process branch below, same reasoning.
                         None,
-                        &mut out.files,
-                        &mut out.coverage,
-                        &mut out.extractors,
+                        crate::runtime::atlas::scan::ChildSink {
+                            files: &mut out.files,
+                            coverage: &mut out.coverage,
+                            extractors: &mut out.extractors,
+                            // This walk registers no dataset rows at all —
+                            // its own loose files claimed by that table get
+                            // `DATASET_NO_ROOT` above, so a child of the same
+                            // extension gets the same answer (S5 W7
+                            // F-SF-01's `DATASET_CHILD_NOT_REGISTERED`).
+                            datasets: None,
+                            context_fields: &ContextFields::none(),
+                        },
                     ),
                     None => out.coverage.push(CoverageRow {
                         path: Some(entry.path.clone()),
@@ -541,6 +550,9 @@ pub(crate) fn extract_blobs(
                 mtime_millis: None,
                 units: extracted.units,
                 syntax: extracted.syntax,
+                // A Git tree entry is acquired directly, never expanded out
+                // of a container (S5 W7).
+                parent: None,
             });
         }
     }

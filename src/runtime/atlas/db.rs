@@ -71,7 +71,7 @@
 //!
 //! # Scope today
 //!
-//! The seven tables the three walks write, and nothing else. Every table
+//! The tables the three walks write, and nothing else. Every table
 //! lands in the wave that lands its writer (the empty-table refusal
 //! doctrine); a declared-but-never populated table is a false promise, not
 //! completeness — which is why `source.symbols`, `source.occurrences` and
@@ -417,6 +417,15 @@ CREATE TABLE IF NOT EXISTS source.files (\n\
   byte_len      BIGINT NOT NULL,\n\
   mtime_millis  BIGINT,\n\
   unit_count    BIGINT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS source.child_resources (\n\
+  generation_id        TEXT NOT NULL,\n\
+  source_name          TEXT NOT NULL,\n\
+  relative_path        TEXT NOT NULL,\n\
+  local_key            TEXT NOT NULL,\n\
+  parent_relative_path TEXT NOT NULL,\n\
+  parent_key           TEXT NOT NULL,\n\
+  entry_path           TEXT NOT NULL\n\
 );\n\
 CREATE TABLE IF NOT EXISTS source.units (\n\
   generation_id TEXT NOT NULL,\n\
@@ -1109,10 +1118,19 @@ impl AtlasDb {
         // in, so one unreadable CSV read inside the staging transaction would
         // take every other row of the scan down with it — see
         // [`read_dataset`], which is where that argument lives.
+        // S5 W7 (F-SF-01): a container child dataset carries its own bytes and
+        // is materialised under the daemon's own data directory for the
+        // length of its read — `self.path` is `<data-dir>/atlas.duckdb`, so
+        // its parent is that directory.
+        let scratch_root = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(CHILD_DATASET_SCRATCH);
         let reads: Vec<IngestedDataset> = scan
             .datasets
             .iter()
-            .map(|dataset| read_dataset(&self.conn, scan, dataset))
+            .map(|dataset| read_dataset(&self.conn, scan, dataset, &scratch_root))
             .collect();
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -1852,6 +1870,10 @@ impl AtlasDb {
             dataset_key: String::new(),
             byte_len: 0,
             mtime_millis: None,
+            // A probe names a path the caller already has; it never carries
+            // bytes and is never a container child.
+            content: None,
+            parent: None,
         };
         // The same two-step [`read_dataset`] uses, for the same reason: the
         // envelope a fact carries has to describe the read that produced it,
@@ -1876,6 +1898,69 @@ impl AtlasDb {
             MAX_ROWS as i64,
             truncated,
         )
+    }
+
+    /// Container children of one source's confirmed generation, with A1
+    /// §6.6's four preserved fields, in path order, bounded by `limit`
+    /// (capped at [`MAX_ROWS`], F12).
+    ///
+    /// **The read side of `source.child_resources`** (S5 W7 F-SF-03). The
+    /// table's own insert comment says the entry content hash and entry
+    /// adapter "are already columns on the resource's own row ... and a
+    /// reader joins back to it on that key rather than being handed a second,
+    /// driftable copy". This is that reader, and it is the reason the
+    /// non-duplication is a design and not a hole: without it two of §6.6's
+    /// four fields were reachable only by opening the database file directly,
+    /// which A1-15 keeps off the public surface.
+    ///
+    /// Both lanes, one answer: a child that landed as a `source.files`
+    /// resource and one that landed as a `source.datasets` registration
+    /// (S5 W7 F-SF-01) are the same fact about the same generation, so they
+    /// come back in one list with `lane` saying which table holds the
+    /// resource. `content_hash`/`extractor`/`lane` are `Option` because the
+    /// join is a LEFT JOIN: a child row whose own resource row is missing
+    /// would be a real defect, and this answers with the coordinate it does
+    /// have rather than dropping the row and hiding it.
+    pub fn child_resources(
+        &self,
+        source_name: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredChildResource>, AtlasError> {
+        let limit = limit.min(MAX_ROWS) as i64;
+        let mut statement = self.conn.prepare(
+            "SELECT c.relative_path, c.local_key, c.parent_relative_path, c.parent_key, \
+                    c.entry_path, coalesce(f.content_hash, d.content_hash), \
+                    coalesce(f.extractor, d.reader), \
+                    CASE WHEN f.relative_path IS NOT NULL THEN 'file' \
+                         WHEN d.relative_path IS NOT NULL THEN 'dataset' END \
+             FROM source.child_resources c \
+             JOIN source.generations g USING (generation_id) \
+             LEFT JOIN source.files f \
+               ON f.generation_id = c.generation_id \
+              AND f.source_name = c.source_name \
+              AND f.relative_path = c.relative_path \
+             LEFT JOIN source.datasets d \
+               ON d.generation_id = c.generation_id \
+              AND d.source_name = c.source_name \
+              AND d.relative_path = c.relative_path \
+             WHERE g.source_name = ? AND g.state = ? \
+             ORDER BY c.relative_path LIMIT ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![source_name, STATE_CONFIRMED, limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(StoredChildResource {
+                relative_path: row.get(0)?,
+                key: row.get(1)?,
+                parent_relative_path: row.get(2)?,
+                parent_key: row.get(3)?,
+                entry_path: row.get(4)?,
+                content_hash: row.get(5)?,
+                extractor: row.get(6)?,
+                lane: row.get(7)?,
+            });
+        }
+        Ok(out)
     }
 
     /// Registered datasets of one source's confirmed generation, in path
@@ -3016,6 +3101,31 @@ fn insert_file(
         file.mtime_millis,
         file.units.len() as i64,
     ])?;
+    if let Some(parent) = &file.parent {
+        // A1 §6.6's parent-provenance fields (S5 W7): parent resource,
+        // parent key, entry path. In their own table, not as three more
+        // columns on `source.files`: this file's own module doc states the
+        // rule ("These tables are only ever added to, never altered" — the
+        // DDL is `IF NOT EXISTS`, so a column added to an existing table
+        // would silently not appear in a database that already has it), and
+        // X3b's rows already set the precedent of a new table carrying its
+        // own copy of the coordinates it needs.
+        //
+        // The other two of §6.6's four fields — entry content hash, entry
+        // adapter (F-SI-01) — are NOT duplicated here: they are already
+        // columns on the `source.files` row this same INSERT just wrote for
+        // this exact (generation_id, source_name, relative_path), and a
+        // reader joins back to it on that key rather than being handed a
+        // second, driftable copy.
+        insert_child_resource(
+            conn,
+            generation_id,
+            source_name,
+            &file.relative_path,
+            &file.local_key,
+            parent,
+        )?;
+    }
     for unit in &file.units {
         insert_unit(conn, generation_id, source_name, file, unit)?;
     }
@@ -3294,7 +3404,70 @@ pub const DATASET_GLOB_PATH: &str = "the path contains a glob metacharacter (* ?
 ///
 /// So the reads happen first, each failure captured as a value, and the
 /// transaction that follows writes only rows it already holds.
-fn read_dataset(conn: &Connection, scan: &SourceScan, dataset: &ScannedDataset) -> IngestedDataset {
+/// The daemon-owned scratch directory child dataset bytes are materialised
+/// under, relative to the data directory (S5 W7 F-SF-01). One directory, so
+/// a leaked scratch dir is obvious and sweepable; each read gets its own
+/// unique subdirectory inside it and removes it on drop.
+const CHILD_DATASET_SCRATCH: &str = "atlas-child-datasets";
+
+/// The detail a child dataset's coverage row carries when the sole writer
+/// could not give its bytes a path to be read from (S5 W7 F-SF-01).
+const DATASET_CHILD_NOT_MATERIALISED: &str =
+    "a container child's bytes could not be written to daemon-owned scratch to be read in place";
+
+/// One materialised child dataset: a private directory under the daemon's
+/// own data directory, removed when this value is dropped (S5 W7 F-SF-01).
+struct MaterialisedChild {
+    dir: PathBuf,
+    file: PathBuf,
+}
+
+impl Drop for MaterialisedChild {
+    fn drop(&mut self) {
+        // Best effort by necessity — a failed cleanup must not turn a
+        // successful read into an error — but not silent: the directory is
+        // under the daemon's own data dir, so a leaked one is visible there
+        // rather than in `$TMPDIR` where nobody would connect it to Atlas.
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Write one child dataset's bytes where [`read_dataset`]'s own reader can
+/// open them, under a name the daemon composed (S5 W7 F-SF-01).
+///
+/// R3/R5 before R7: `std::fs` plus the already-installed `ulid` for the
+/// unique directory component — no new dependency, and deliberately not
+/// `$TMPDIR`, so the bytes never leave the directory the daemon already owns
+/// exclusively.
+fn materialise_child_dataset(
+    scratch_root: &Path,
+    dataset: &ScannedDataset,
+    bytes: &[u8],
+) -> std::io::Result<MaterialisedChild> {
+    let dir = scratch_root.join(ulid::Ulid::generate().to_string());
+    std::fs::create_dir_all(&dir)?;
+    let extension = dataset
+        .format
+        .extensions()
+        .first()
+        .copied()
+        .unwrap_or("data");
+    // The daemon's own hash, never the entry's own name.
+    let file = dir.join(format!("{}.{extension}", dataset.content_hash));
+    let child = MaterialisedChild {
+        dir,
+        file: file.clone(),
+    };
+    std::fs::write(&file, bytes)?;
+    Ok(child)
+}
+
+fn read_dataset(
+    conn: &Connection,
+    scan: &SourceScan,
+    dataset: &ScannedDataset,
+    scratch_root: &Path,
+) -> IngestedDataset {
     let refused = |status: Coverage, detail: String| IngestedDataset {
         columns: Vec::new(),
         row_count: 0,
@@ -3305,13 +3478,46 @@ fn read_dataset(conn: &Connection, scan: &SourceScan, dataset: &ScannedDataset) 
         detail,
     };
     let failed = |detail: String| refused(Coverage::Error, detail);
-    let Some(root) = scan.root.as_ref() else {
-        // Unreachable from the three walks in this build — only a filesystem
-        // walk registers datasets — but stated rather than assumed, because
-        // this is a public store and the alternative is a panic.
-        return failed(crate::runtime::atlas::scan::DATASET_NO_ROOT.to_string());
+    // Held for the whole function: dropping it removes the directory, so
+    // every `return` below cleans up without a second cleanup path to forget.
+    let materialised;
+    let absolute = match &dataset.content {
+        Some(bytes) => {
+            // S5 W7 (F-SF-01). A container child has no path DuckDB can read
+            // in place, so the sole writer gives it one for the length of
+            // this read and takes it away again.
+            //
+            // The three properties that make this safe are all here, not
+            // implied: the DIRECTORY is daemon-owned scratch under the data
+            // directory (never `$TMPDIR`, never anywhere a source root or a
+            // Work surface can see); the FILENAME is the daemon's own content
+            // hash plus the format's own extension — never the entry's own
+            // name, so nothing attacker-controlled reaches a path, and no
+            // glob metacharacter can appear in one (`GLOB_METACHARACTERS` is
+            // still checked below, over the whole absolute string, exactly as
+            // it is for a loose dataset); and NOTHING EXECUTES IT — it is
+            // opened by a `read_csv`/`read_json`/`read_parquet` table
+            // function and by nothing else, which is A1 §6.6's "no archive
+            // entry is executed" holding unchanged.
+            match materialise_child_dataset(scratch_root, dataset, bytes) {
+                Ok(scratch) => {
+                    materialised = scratch;
+                    materialised.file.clone()
+                }
+                Err(e) => return failed(format!("{DATASET_CHILD_NOT_MATERIALISED}: {e}")),
+            }
+        }
+        None => {
+            let Some(root) = scan.root.as_ref() else {
+                // Unreachable from the three walks in this build — only a
+                // filesystem walk registers a dataset that has a path — but
+                // stated rather than assumed, because this is a public store
+                // and the alternative is a panic.
+                return failed(crate::runtime::atlas::scan::DATASET_NO_ROOT.to_string());
+            };
+            root.join(&dataset.relative_path)
+        }
     };
-    let absolute = root.join(&dataset.relative_path);
     let Some(absolute) = absolute.to_str().map(str::to_owned) else {
         return failed("the dataset's path is not valid UTF-8".to_string());
     };
@@ -3465,6 +3671,21 @@ fn write_dataset(
         read.truncated,
         read.units.len() as i64,
     ])?;
+    if let Some(parent) = &dataset.parent {
+        // A1 §6.6's parent coordinate, in the SAME table a child
+        // `source.files` row writes it to (S5 W7 F-SF-01). "This resource
+        // expanded out of that container" is one fact about one generation;
+        // splitting it across two tables by which lane the entry routed to
+        // would make every reader join twice to ask one question.
+        insert_child_resource(
+            conn,
+            generation_id,
+            &scan.source_name,
+            &dataset.relative_path,
+            &dataset.dataset_key,
+            parent,
+        )?;
+    }
     for fact in &read.facts {
         insert_dataset_fact(conn, generation_id, &scan.source_name, fact)?;
     }
@@ -3477,6 +3698,52 @@ fn write_dataset(
         detail: Some(read.detail.clone()),
         bytes: Some(dataset.byte_len),
     })
+}
+
+/// Insert one child resource's A1 §6.6 parent coordinate.
+///
+/// One function for both lanes (S5 W7 F-SF-01): a child that landed as a
+/// `source.files` row and a child that landed as a `source.datasets`
+/// registration write the identical shape, so the row means the same thing
+/// whichever table holds the resource it names. `key` is that resource's own
+/// F7 key in its own table — `local_key` for a file, `dataset_key` for a
+/// dataset.
+///
+/// The other two of §6.6's four fields — entry content hash, entry adapter —
+/// are NOT duplicated here (F-SI-01): they are already columns on the
+/// resource's own row for this same
+/// `(generation_id, source_name, relative_path)`, and
+/// [`AtlasDb::child_resources`] — the canned read behind
+/// `GET /v1/map/children` and `sgt map children` — joins back to it there
+/// rather than being handed a second, driftable copy. That reader is what
+/// makes the non-duplication a design instead of a hole (S5 W7 F-SF-03):
+/// before it existed these rows were written and read by nothing, and A1-15
+/// keeps arbitrary client SQL off the surface, so the coordinate was
+/// reachable only by opening the database file directly.
+fn insert_child_resource(
+    conn: &Connection,
+    generation_id: &str,
+    source_name: &str,
+    relative_path: &str,
+    key: &str,
+    parent: &crate::runtime::atlas::scan::ChildProvenance,
+) -> Result<(), AtlasError> {
+    conn.prepare_cached(
+        "INSERT INTO source.child_resources \
+         (generation_id, source_name, relative_path, local_key, parent_relative_path, \
+          parent_key, entry_path) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )?
+    .execute(duckdb::params![
+        generation_id,
+        source_name,
+        relative_path,
+        key,
+        &parent.parent_relative_path,
+        &parent.parent_key,
+        &parent.entry_path,
+    ])?;
+    Ok(())
 }
 
 /// Insert one derived-evidence row (A1 §6.4).
@@ -3901,6 +4168,10 @@ fn evict(
         duckdb::params![generation_id],
     )?;
     conn.execute(
+        "DELETE FROM source.child_resources WHERE generation_id = ?",
+        duckdb::params![generation_id],
+    )?;
+    conn.execute(
         "DELETE FROM source.files WHERE generation_id = ?",
         duckdb::params![generation_id],
     )?;
@@ -4110,6 +4381,32 @@ pub struct Hardening {
     /// `json` and `parquet` are here because the feature flags put them here,
     /// which is why nothing has to be fetched to read a dataset.
     pub statically_linked: Vec<String>,
+}
+
+/// One container child of a confirmed generation, as
+/// [`AtlasDb::child_resources`] answers it — A1 §6.6's four preserved
+/// fields, with the parent coordinate from `source.child_resources` and the
+/// entry content hash / entry adapter joined back from the resource's own
+/// row (S5 W7 F-SF-03).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredChildResource {
+    /// The child's own composed path, e.g. `bundle.zip!/notes/a.md`.
+    pub relative_path: String,
+    /// Its own F7 key — `local_key` for a file, `dataset_key` for a dataset.
+    pub key: String,
+    /// §6.6's "parent archive source/resource": the IMMEDIATE parent's own
+    /// composed path, chained rather than resolved to the root container.
+    pub parent_relative_path: String,
+    /// That parent's own F7 key.
+    pub parent_key: String,
+    /// §6.6's "entry path", relative to that immediate parent.
+    pub entry_path: String,
+    /// §6.6's "entry content hash", read back from the resource's own row.
+    pub content_hash: Option<String>,
+    /// §6.6's "entry adapter", read back from the resource's own row.
+    pub extractor: Option<String>,
+    /// Which table holds the resource this row names: `file` or `dataset`.
+    pub lane: Option<String>,
 }
 
 /// One registered tabular dataset, read back out of the store (X4).
@@ -6472,6 +6769,7 @@ mod tests {
                     text: body.to_string(),
                 }],
                 syntax: None,
+                parent: None,
             }],
             coverage: vec![CoverageRow {
                 path: Some("doc.md".to_string()),

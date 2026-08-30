@@ -164,12 +164,52 @@ pub struct WorkerUnit {
     pub text: String,
 }
 
-/// One child resource a worker declares out of the bytes it was given (a
-/// future archive entry, mail attachment, or similar container member).
+/// The most bytes one declared child may carry across the pipe.
+///
+/// **Not a second, independently-sized number** (S5 W7, the brief's own
+/// requirement): it is [`super::scan::MAX_RESOURCE_BYTES`] itself, the one
+/// ceiling this build already states for "the most bytes one resource may
+/// be", which [`super::archive::MAX_ENTRY_UNCOMPRESSED_BYTES`] already
+/// aliases for the same reason (R2 — reuse the number that exists, do not
+/// tune a new one). `tests/w7_container_children.rs`'s
+/// `container_children_share_one_depth_counter_and_one_budget_not_a_second_pair`
+/// fails if this ever stops being an alias.
+pub const MAX_CHILD_CONTENT_BYTES: u64 = super::scan::MAX_RESOURCE_BYTES;
+
+/// One child resource a worker declares out of the bytes it was given (an
+/// archive entry, a mail attachment, or a descendant of either).
 ///
 /// Untrusted by construction: [`validate_batch`] is what decides whether
-/// `relative_path` may ever reach a filesystem or a store, and the daemon
-/// runs that check on every declared child before touching either.
+/// `relative_path` may ever reach a filesystem or a store, whether `content`
+/// is small enough to keep, whether the bytes that arrived are the bytes the
+/// worker said it was sending, and whether the adapter claim is the one this
+/// build's own routing table would make. The daemon runs every one of those
+/// checks on every declared child before a byte reaches the store.
+///
+/// # What the child's content hash does and does not vouch for (H15)
+///
+/// The daemon hashes a top-level resource's bytes *itself*, before the
+/// worker runs — [`WorkerIdentity::resource_hash`] is "evidence the worker
+/// never chose". A child's bytes are inside a container the daemon does not
+/// parse, so that exact property is not available for a child, and pretending
+/// otherwise would be the dishonest part. W7 takes the other route (H15
+/// option (b), the brief's recommendation, adopted here): **the worker
+/// returns the bytes and the daemon hashes what it receives, on receipt,
+/// before storing.** [`content_hash`](Self::content_hash) is the *worker's*
+/// claim about those bytes; the daemon computes its own BLAKE3 of what
+/// actually arrived, refuses the batch when the two disagree
+/// ([`BatchRefusal::ChildHashMismatch`]), and stores its own value.
+///
+/// So the stored identity of a child says: *these are the bytes that reached
+/// the store, and this is their hash.* It does **not** say "this is what is
+/// really inside that archive" — the daemon never observed the inside of the
+/// archive and cannot vouch for a correspondence it never saw. What this
+/// route does preserve is the property that actually matters: the daemon
+/// still hashes, still validates, still decides, and no ZIP or MIME parser
+/// runs outside the supervised worker's own process group (option (a) —
+/// re-opening the container daemon-side — would have moved exactly that
+/// parsing into the sole writer, which is what PDEATHSIG/RLIMIT_AS/the own
+/// process group exist to prevent).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeclaredChild {
     /// The child's own name, exactly as the worker declared it — checked
@@ -179,7 +219,120 @@ pub struct DeclaredChild {
     /// from the coordinate a naive check might use.
     pub name: String,
     /// Where the child lives relative to its parent resource, `/`-separated.
+    /// For a descendant (an entry of an archive that was itself an
+    /// attachment) this is the whole chain from the parent resource down,
+    /// joined by `/` — the worker flattens the tree it already expanded
+    /// under one shared depth counter rather than the daemon re-entering a
+    /// container to find it (see [`validate_batch`]'s own doc).
     pub relative_path: String,
+    /// The child's own bytes, hex on the wire (see [`child_content_hex`] for
+    /// why hex and not a new base64 dependency), bounded by
+    /// [`MAX_CHILD_CONTENT_BYTES`] **before the decoded buffer is
+    /// allocated**.
+    #[serde(with = "child_content_hex")]
+    pub content: Vec<u8>,
+    /// The worker's own BLAKE3 hex of `content` — a claim, cross-checked
+    /// against the daemon's own hash of what arrived (this type's own doc,
+    /// "What the child's content hash does and does not vouch for"), exactly
+    /// as [`WorkerBatch::resource_hash`] is cross-checked for the parent.
+    pub content_hash: String,
+    /// A1 §6.6's fourth preserved field: the CHILD's own downstream
+    /// extractor identity — never the container adapter that unpacked it.
+    /// `None` when nothing in this build claims the child's extension, which
+    /// is a named coverage gap daemon-side, not silence.
+    ///
+    /// A claim, like `content_hash`: the daemon re-derives it from the
+    /// child's own path through [`super::scan::child_extractor_for`] — the
+    /// same routing table a loose file of that name goes through — and
+    /// refuses a batch whose claim disagrees
+    /// ([`BatchRefusal::ChildAdapterMismatch`]).
+    #[serde(default)]
+    pub entry_adapter: Option<String>,
+}
+
+/// Hex codec for [`DeclaredChild::content`] on the JSON wire.
+///
+/// **Why hex, and not base64** (R3 then R5, checked in order): the wire is
+/// `serde_json`, and `Vec<u8>` serializes there as an array of decimal
+/// integers — around 3.4× expansion and a parse cost per byte. Base64 (1.33×)
+/// would be smaller, but no crate in this build's own `Cargo.toml` exposes
+/// base64 as a direct dependency, and `mail.rs`'s own test helper already set
+/// this build's precedent of writing the few lines rather than taking the
+/// dependency (`mail.rs`'s `base64_encode`, "no crate in this build's own
+/// Cargo.toml exposes base64"). Hex at 2× is worse than base64 and better
+/// than the default, needs no dependency decision, and — the property that
+/// decided it — decodes with a ceiling checked from the ENCODED length alone,
+/// before any decoded buffer exists.
+pub mod child_content_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Refuse a declared payload whose ENCODED length already proves it is
+    /// over `limit` — computed from the string's own length, before a single
+    /// output byte is allocated. Then decode into a buffer sized by the same
+    /// bounded length, so the largest allocation this function can be talked
+    /// into is `limit` bytes, whatever the worker claimed.
+    ///
+    /// S4's own O(N²)-before-the-cap bug is the shape being avoided: the cap
+    /// comes first, not after the work.
+    pub fn decode_bounded(encoded: &str, limit: u64) -> Result<Vec<u8>, String> {
+        if !encoded.len().is_multiple_of(2) {
+            return Err(format!(
+                "declared child content is {} hex characters, which is not a whole number of \
+                 bytes",
+                encoded.len()
+            ));
+        }
+        let declared_bytes = encoded.len() as u64 / 2;
+        if declared_bytes > limit {
+            return Err(format!(
+                "declared child content is {declared_bytes} bytes, over the {limit}-byte \
+                 per-child ceiling; refused before the decoded buffer was allocated"
+            ));
+        }
+        let mut out = Vec::with_capacity(declared_bytes as usize);
+        let (pairs, rest) = encoded.as_bytes().as_chunks::<2>();
+        debug_assert!(rest.is_empty(), "the even-length check above guarantees it");
+        for [high, low] in pairs {
+            out.push((hex_nibble(*high)? << 4) | hex_nibble(*low)?);
+        }
+        Ok(out)
+    }
+
+    /// Lower-case hex of `bytes`.
+    pub fn encode(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(DIGITS[(byte >> 4) as usize] as char);
+            out.push(DIGITS[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    fn hex_nibble(c: u8) -> Result<u8, String> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            _ => Err(format!(
+                "declared child content contains {:?}, which is not a hex digit",
+                c as char
+            )),
+        }
+    }
+
+    /// `serde`'s serialize half.
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&encode(bytes))
+    }
+
+    /// `serde`'s deserialize half — the transport-level ceiling. The
+    /// AUTHORITY-level one is [`super::validate_batch`]'s own check, which
+    /// runs whether or not a batch arrived through this function.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        decode_bounded(&encoded, super::MAX_CHILD_CONTENT_BYTES).map_err(serde::de::Error::custom)
+    }
 }
 
 /// One supervised worker's whole answer for one resource: bytes in,
@@ -253,6 +406,77 @@ pub enum BatchRefusal {
         /// The deny pattern that matched.
         pattern: String,
     },
+    /// A declared child carries more bytes than [`MAX_CHILD_CONTENT_BYTES`]
+    /// (S5 W7). The AUTHORITY-level half of the ceiling
+    /// [`child_content_hex::deserialize`] already enforces at the transport
+    /// level — stated twice on purpose, because `validate_batch` is the
+    /// daemon's authority over a batch however that batch was constructed,
+    /// and a batch built in-process never passes through the wire decoder at
+    /// all.
+    ChildTooLarge {
+        /// The child's declared name.
+        child: String,
+        /// How many bytes it carried.
+        bytes: u64,
+    },
+    /// The bytes that arrived for a declared child do not hash to the value
+    /// the worker declared for them (S5 W7). The daemon's own hash of what it
+    /// received is what would have been stored — this refusal is what stops a
+    /// batch whose two halves disagree from being stored at all.
+    ChildHashMismatch {
+        /// The child's declared name.
+        child: String,
+        /// What the worker claimed.
+        declared: String,
+        /// What the daemon computed over the bytes that actually arrived.
+        computed: String,
+    },
+    /// A declared child claims a downstream adapter this build's own routing
+    /// table would not choose for that path (S5 W7) — A1 §6.6's `entry
+    /// adapter` field, cross-checked rather than trusted.
+    ChildAdapterMismatch {
+        /// The child's declared name.
+        child: String,
+        /// What the worker claimed.
+        declared: Option<String>,
+        /// What [`super::scan::child_extractor_for`] derives from the child's
+        /// own path.
+        derived: Option<String>,
+    },
+    /// The batch's declared children, summed, exceed
+    /// [`super::archive::MAX_TOTAL_EXPANDED_BYTES`] — the SAME whole-tree
+    /// budget a single container's own expansion walk already enforces
+    /// (S5 W7 F-IN-01). A worker's own accounting inside one expansion is
+    /// not proof that a batch it hands back stays under budget: the daemon
+    /// re-derives the cumulative total across `declared_children` itself,
+    /// exactly as it re-derives every other per-child property, rather than
+    /// trusting the worker's claim for this one property alone.
+    BatchTotalTooLarge {
+        /// The summed byte length of every declared child in the batch.
+        total_bytes: u64,
+    },
+    /// A declared child's path names a container it came out of that the
+    /// batch never declared (S5 W7 F-SF-02).
+    ///
+    /// A flattened path joins every nesting level with
+    /// [`super::scan::CHILD_PATH_SEPARATOR`], so `bundle.zip!/report.docx`
+    /// asserts "this came out of the entry `bundle.zip`, which is in this
+    /// same batch". The daemon composes each landed child's parent
+    /// coordinate — parent path, parent F7 key — from that assertion, so a
+    /// path whose named ancestor is absent, or is present but is not a
+    /// container, would either dangle or be silently re-parented onto the
+    /// root. Refused instead: the ancestor must be declared in this batch
+    /// AND must route to a container adapter
+    /// ([`super::scan::child_is_container`]).
+    OrphanedChildPath {
+        /// The child's declared name.
+        child: String,
+        /// The path it declared.
+        path: String,
+        /// The ancestor entry its path names but the batch does not declare
+        /// as a container.
+        missing_container: String,
+    },
 }
 
 impl BatchRefusal {
@@ -269,7 +493,13 @@ impl BatchRefusal {
     pub fn coverage_row(&self) -> CoverageRow {
         let status = match self {
             Self::DeniedChildName { .. } => Coverage::Excluded,
-            Self::IdentityMismatch { .. } | Self::UnsafeChildPath { .. } => Coverage::Error,
+            Self::IdentityMismatch { .. }
+            | Self::UnsafeChildPath { .. }
+            | Self::ChildTooLarge { .. }
+            | Self::ChildHashMismatch { .. }
+            | Self::ChildAdapterMismatch { .. }
+            | Self::BatchTotalTooLarge { .. }
+            | Self::OrphanedChildPath { .. } => Coverage::Error,
         };
         let detail = match self {
             Self::IdentityMismatch {
@@ -287,6 +517,44 @@ impl BatchRefusal {
             Self::DeniedChildName { child, pattern } => format!(
                 "supervised parse worker declared child {child:?}, which matches the F10 \
                  deny set ({pattern}); refused before it could reach the store"
+            ),
+            Self::ChildTooLarge { child, bytes } => format!(
+                "supervised parse worker declared child {child:?} carrying {bytes} bytes, over \
+                 the {MAX_CHILD_CONTENT_BYTES}-byte per-child ceiling; refused before it could \
+                 reach the store"
+            ),
+            Self::ChildHashMismatch {
+                child,
+                declared,
+                computed,
+            } => format!(
+                "supervised parse worker declared child {child:?} with content hash {declared:?}, \
+                 but the bytes that arrived hash to {computed:?}; refused rather than stored"
+            ),
+            Self::ChildAdapterMismatch {
+                child,
+                declared,
+                derived,
+            } => format!(
+                "supervised parse worker declared child {child:?} claiming adapter {declared:?}, \
+                 but this build's own routing table derives {derived:?} for that path; refused \
+                 before it could reach the store"
+            ),
+            Self::BatchTotalTooLarge { total_bytes } => format!(
+                "supervised parse worker's batch declared {total_bytes} total bytes across its \
+                 children, over the {}-byte MAX_TOTAL_EXPANDED_BYTES whole-tree budget; refused \
+                 before any child could reach the store",
+                super::archive::MAX_TOTAL_EXPANDED_BYTES
+            ),
+            Self::OrphanedChildPath {
+                child,
+                path,
+                missing_container,
+            } => format!(
+                "supervised parse worker declared child {child:?} at {path:?}, whose path names \
+                 the container {missing_container:?} it came out of, but the batch declares no \
+                 such container child; refused rather than silently re-parented onto the \
+                 dispatched resource"
             ),
         };
         CoverageRow {
@@ -313,13 +581,46 @@ fn enclosed_relative_path(path: &str) -> bool {
 }
 
 /// The AUTHORITY over a returned batch (G2, panel-adjudicated): identity,
-/// then path safety, then F10 deny-set membership — on every declared
-/// child's name AND its path, because a deny pattern can match either.
+/// then the batch's cumulative declared size against the whole-tree budget
+/// (S5 W7 F-IN-01), then per child, path safety, then F10 deny-set
+/// membership — on every declared child's name AND its path, because a deny
+/// pattern can match either — then (S5 W7) the per-child byte ceiling, the
+/// child's content hash, its adapter claim, and (S5 W7 F-SF-02) whether the
+/// container its own flattened path names is declared in this same batch as a
+/// container child.
 ///
 /// Checked in this order so the *first* thing wrong with a batch is what a
 /// coverage row names — a batch failing on identity never gets far enough to
 /// be told its child paths were also unsafe, which keeps one refusal one
-/// reason.
+/// reason. The cumulative-size check runs before any per-child work for the
+/// same cheap-bound-first reason S4's own O(N²)-before-the-cap bug taught:
+/// a batch already over budget is refused without hashing or path-checking
+/// a single one of its children. Within a child, the ceiling is checked
+/// before the hash for the same reason: the cheap bound comes first, so an
+/// oversized payload is never hashed to find out it was oversized.
+///
+/// # Every declared child is checked before any byte reaches the store
+///
+/// This function is called by [`run_worker`] on the whole batch, and a single
+/// refused child refuses the whole batch — `Err` here means nothing from this
+/// batch is landed, not "land the good ones". That is deliberate: a batch
+/// containing one child the daemon refuses is a batch whose producer is
+/// buggy, compromised, or running against a different deny set, and partial
+/// trust in such an answer is exactly what a validator exists to withhold.
+///
+/// # Why the daemon never re-enters a container to find a grandchild
+///
+/// A worker flattens the whole expansion tree it already walked — under the
+/// ONE depth counter and the ONE whole-tree byte budget
+/// [`super::archive::MAX_NESTING_DEPTH`]/
+/// [`super::archive::MAX_TOTAL_EXPANDED_BYTES`] already govern, shared with
+/// [`super::mail`] — into one flat `declared_children` list. The daemon
+/// therefore lands children; it does not recurse into them looking for more.
+/// A second, daemon-side recursion would have been a second depth counter and
+/// a second budget, which the brief forbids and
+/// `tests/w7_container_children.rs`'s
+/// `container_children_share_one_depth_counter_and_one_budget_not_a_second_pair`
+/// fails on.
 pub fn validate_batch(
     identity: &WorkerIdentity,
     batch: &WorkerBatch,
@@ -346,6 +647,24 @@ pub fn validate_batch(
             got: batch.extractor.clone(),
         });
     }
+    // F-IN-01: the per-child ceiling below bounds one entry; it never
+    // bounded the batch as a whole. A batch of many individually-in-bounds
+    // children can still exceed the SAME whole-tree budget
+    // [`super::archive::MAX_TOTAL_EXPANDED_BYTES`] a single container's own
+    // expansion walk already enforces — so the daemon re-derives the
+    // cumulative total here too, rather than trusting the worker's own
+    // accounting for this one property alone. Checked before the loop's
+    // per-child hash/adapter work, in the same before-allocation spirit as
+    // the per-child ceiling: the cheap sum comes first.
+    let mut cumulative_bytes: u64 = 0;
+    for declared in &batch.declared_children {
+        cumulative_bytes = cumulative_bytes.saturating_add(declared.content.len() as u64);
+        if cumulative_bytes > super::archive::MAX_TOTAL_EXPANDED_BYTES {
+            return Err(BatchRefusal::BatchTotalTooLarge {
+                total_bytes: cumulative_bytes,
+            });
+        }
+    }
     for declared in &batch.declared_children {
         if !enclosed_relative_path(&declared.relative_path) {
             return Err(BatchRefusal::UnsafeChildPath {
@@ -368,6 +687,53 @@ pub fn validate_batch(
             return Err(BatchRefusal::DeniedChildName {
                 child: declared.name.clone(),
                 pattern,
+            });
+        }
+        if declared.content.len() as u64 > MAX_CHILD_CONTENT_BYTES {
+            return Err(BatchRefusal::ChildTooLarge {
+                child: declared.name.clone(),
+                bytes: declared.content.len() as u64,
+            });
+        }
+        // The daemon's own hash of the bytes that actually arrived — this
+        // value, not the worker's claim, is what a landed child is stored
+        // under (`DeclaredChild`'s own doc, H15).
+        let computed = crate::domain::source::content_hash(&declared.content);
+        if computed != declared.content_hash {
+            return Err(BatchRefusal::ChildHashMismatch {
+                child: declared.name.clone(),
+                declared: declared.content_hash.clone(),
+                computed,
+            });
+        }
+        let derived = super::scan::child_extractor_for(&declared.relative_path);
+        if declared.entry_adapter.as_deref() != derived {
+            return Err(BatchRefusal::ChildAdapterMismatch {
+                child: declared.name.clone(),
+                declared: declared.entry_adapter.clone(),
+                derived: derived.map(str::to_string),
+            });
+        }
+        // S5 W7 F-SF-02: a flattened path ASSERTS its own container chain,
+        // and the daemon composes each landed child's parent coordinate from
+        // that assertion. Checked here, with the batch's other declared
+        // children in hand, because that is the only place the assertion can
+        // be checked at all: `land_child` sees one child at a time. A path
+        // naming a container this batch never declared — or naming one that
+        // does not route to a container adapter — is refused rather than
+        // re-parented onto the dispatched resource, which is exactly the
+        // silent root-resolution F-SF-02 found.
+        if let Some((ancestor, _)) = declared
+            .relative_path
+            .rsplit_once(super::scan::CHILD_PATH_SEPARATOR)
+            && !batch.declared_children.iter().any(|other| {
+                other.relative_path == ancestor && super::scan::child_is_container(ancestor)
+            })
+        {
+            return Err(BatchRefusal::OrphanedChildPath {
+                child: declared.name.clone(),
+                path: declared.relative_path.clone(),
+                missing_container: ancestor.to_string(),
             });
         }
     }
@@ -872,6 +1238,22 @@ mod tests {
         AcquisitionFilter::new(&[]).expect("compile default deny set")
     }
 
+    /// One declared child carrying `content`, with the two cross-checked
+    /// fields filled the only way that can pass — the same composition
+    /// `sgt-atlas-worker`'s own `declared_child` performs, so a test that
+    /// wants a REFUSAL has to go out of its way to make one, rather than
+    /// getting one by forgetting a field.
+    fn child(name: &str, relative_path: &str, content: &[u8]) -> DeclaredChild {
+        DeclaredChild {
+            name: name.to_string(),
+            relative_path: relative_path.to_string(),
+            content: content.to_vec(),
+            content_hash: crate::domain::source::content_hash(content),
+            entry_adapter: super::super::scan::child_extractor_for(relative_path)
+                .map(str::to_string),
+        }
+    }
+
     #[test]
     fn a_matching_batch_with_no_children_is_accepted() {
         assert_eq!(validate_batch(&identity(), &batch(), &deny()), Ok(()));
@@ -929,10 +1311,9 @@ mod tests {
     #[test]
     fn a_declared_child_named_dotenv_is_refused_by_the_deny_set() {
         let mut with_child = batch();
-        with_child.declared_children.push(DeclaredChild {
-            name: ".env".to_string(),
-            relative_path: ".env".to_string(),
-        });
+        with_child
+            .declared_children
+            .push(child(".env", ".env", b"SECRET=1"));
         let err = validate_batch(&identity(), &with_child, &deny()).expect_err("must refuse");
         assert!(matches!(err, BatchRefusal::DeniedChildName { .. }));
     }
@@ -942,10 +1323,11 @@ mod tests {
     #[test]
     fn a_declared_child_at_a_traversal_path_is_refused_by_path_safety() {
         let mut with_child = batch();
-        with_child.declared_children.push(DeclaredChild {
-            name: "innocuous.txt".to_string(),
-            relative_path: "../../etc/passwd".to_string(),
-        });
+        with_child.declared_children.push(child(
+            "innocuous.txt",
+            "../../etc/passwd",
+            b"root:x:0:0",
+        ));
         let err = validate_batch(&identity(), &with_child, &deny()).expect_err("must refuse");
         assert_eq!(
             err,
@@ -962,10 +1344,9 @@ mod tests {
     #[test]
     fn a_denied_name_refuses_even_under_an_innocuous_looking_path() {
         let mut with_child = batch();
-        with_child.declared_children.push(DeclaredChild {
-            name: "id_rsa".to_string(),
-            relative_path: "assets/id_rsa".to_string(),
-        });
+        with_child
+            .declared_children
+            .push(child("id_rsa", "assets/id_rsa", b"-----BEGIN"));
         let err = validate_batch(&identity(), &with_child, &deny()).expect_err("must refuse");
         assert!(matches!(err, BatchRefusal::DeniedChildName { .. }));
     }
@@ -973,10 +1354,9 @@ mod tests {
     #[test]
     fn an_ordinary_nested_child_path_is_enclosed_and_allowed() {
         let mut with_child = batch();
-        with_child.declared_children.push(DeclaredChild {
-            name: "logo.png".to_string(),
-            relative_path: "assets/images/logo.png".to_string(),
-        });
+        with_child
+            .declared_children
+            .push(child("logo.png", "assets/images/logo.png", b"\x89PNG"));
         assert_eq!(validate_batch(&identity(), &with_child, &deny()), Ok(()));
     }
 

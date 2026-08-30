@@ -1363,6 +1363,59 @@ them were dead code in every real installation.
   non-goal until measurements prove exact scanning inadequate.
 
 
+### Container children are real resources (S5)
+
+- **An archive entry or a mail attachment now lands as its own resource,
+  with its own content.** Until this wave the worker wire carried a child's
+  name and path and nothing else, so an admitted ZIP entry or mail
+  attachment reached the daemon as a name recorded in its container's
+  coverage detail — never a resource with its own content key. A1 §6.6 says
+  an expanded entry preserves four things (parent archive source/resource,
+  entry path, entry content hash, entry adapter) and two of them did not
+  exist on the wire. All four are preserved now: a child lands at its own
+  composed path (`bundle.zip!/notes/a.md`), with the daemon's own hash of
+  its bytes, the adapter its own extension routes to, and a
+  `source.child_resources` row carrying the parent coordinate
+  (`w7_container_children::an_admitted_zip_entry_lands_as_its_own_resource_with_all_four_preserved_fields`).
+- **Child bytes go through the same adapter dispatch every other resource
+  goes through** (A1-17, A1 §6.5). A `.docx` inside a `.zip` inside an
+  `.eml` reaches the Office adapter by the route a loose `.docx` takes:
+  `scan::child_extractor_for` is the existing worker-adapter table unioned
+  with the existing in-process one, in the same order the filesystem walk
+  consults them — one dispatcher, not a second one for children. A child no
+  adapter claims is a named coverage gap, never silence
+  (`w7_container_children::a_docx_inside_a_zip_inside_an_eml_reaches_the_office_adapter_by_the_same_route`,
+  `::a_child_with_no_claiming_extractor_is_a_named_coverage_gap`).
+- **The daemon hashes what it receives, and says exactly what that vouches
+  for.** A child's bytes live inside a container the daemon does not parse,
+  so the daemon cannot hash them before the worker runs the way it hashes a
+  top-level resource. The alternative — re-opening the container
+  daemon-side — would have moved ZIP and MIME parsing into the sole writer,
+  which is what the supervised worker exists to prevent. So the worker
+  returns the bytes and the daemon hashes them on receipt, before storing,
+  and the stored hash identifies *the bytes that reached the store*, not
+  "what is really inside the archive": a correspondence the daemon never
+  observed and does not claim. The worker's own declared hash is
+  cross-checked against it and a disagreement refuses the whole batch
+  (`w7_container_children::a_child_whose_received_bytes_do_not_match_its_declared_hash_is_refused_rather_than_stored`).
+- **Every existing boundary still holds, and one new one is checked before
+  allocation.** Path safety and F10's deny set are unchanged. A per-child
+  byte ceiling — an alias of the resource ceiling this build already had,
+  not a new number — refuses from the encoded length before the decoded
+  buffer is allocated, and again as daemon authority independent of
+  transport. Child bytes count against the existing whole-tree byte budget
+  and the existing depth counter, because the worker flattens a tree the
+  archive adapter already walked under both; a test reads the source and
+  fails if a second constant of either kind is ever defined
+  (`w7_container_children::container_children_share_one_depth_counter_and_one_budget_not_a_second_pair`,
+  `::a_nested_container_cannot_escape_the_shared_depth_ceiling_by_recursing`).
+- Contract acceptance items 7 and 8 move from `met-with-deviation` to `met`.
+  One narrower gap is named and deliberately not closed: a per-entry
+  coverage row still has no field on the worker batch to travel in, so an
+  entry-level refusal is proven in the adapter's own tests and does not
+  reach the daemon.
+
+
 ## [0.2.4] - 2026-08-25
 
 sergeant-rs narrows to a product-documents-only repo, codex actors gain

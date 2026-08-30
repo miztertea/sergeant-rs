@@ -882,12 +882,17 @@ fn a_dataset_with_no_path_to_read_in_place_is_named_rather_than_mislabelled() {
 
 // -------------------------------------------------------------- F11
 
-/// **F11's named deferral, pinned.** `map` ships five verbs and exactly five.
+/// **F11's named deferral, pinned.** `map` ships F11's own five verbs, plus
+/// exactly one verb a later wave's own consumer earned, and nothing else.
 ///
 /// `neighbors` and `changed` are deferred to S5/S6, where their consumers
 /// exist. A verb that shipped now would answer from nothing — the same false
 /// promise the empty-table doctrine refuses — so the absence is asserted
-/// rather than left to a reviewer to notice.
+/// rather than left to a reviewer to notice. `children` is the counterpart
+/// case and belongs in the same list for the same reason: S5 W7 (F-SF-03)
+/// landed `source.child_resources` rows with no read path at all, which is
+/// the same false promise from the other direction, so the verb shipped when
+/// the rows did.
 #[test]
 fn f11_map_ships_five_verbs_and_defers_neighbors_and_changed() {
     let output = Command::new(env!("CARGO_BIN_EXE_sgt"))
@@ -913,8 +918,15 @@ fn f11_map_ships_five_verbs_and_defers_neighbors_and_changed() {
         .collect();
     assert_eq!(
         verbs,
-        strings(&["repos", "stats", "outline", "symbol", "references"]),
-        "`sgt map` ships five verbs and exactly five"
+        strings(&[
+            "repos",
+            "stats",
+            "outline",
+            "children",
+            "symbol",
+            "references",
+        ]),
+        "`sgt map` ships F11's five verbs plus `children`, and nothing else"
     );
 
     let status = Command::new(env!("CARGO_BIN_EXE_sgt"))
