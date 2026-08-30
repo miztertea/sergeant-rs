@@ -1017,4 +1017,73 @@ fn content_config_is_refused_by_name_rather_than_answered_partially() {
         4,
         "A2 §17 item 2's four families, and no fifth invented to satisfy a flag"
     );
+
+    // The static properties above hold regardless of whether `--content
+    // config` is actually refused — this drives the real decision
+    // (`sergeant_rs::api::content_family`, what `SearchSelectors::family`
+    // resolves to) so a deleted `Some("config") => Err(...)` arm falling
+    // through to the generic `unknown_content` branch would be caught here,
+    // not waved through.
+    let Err(response) = sergeant_rs::api::content_family(Some("config")) else {
+        panic!("--content config must be refused, not resolved to a family");
+    };
+    let (status, code, message) = response_body_json(*response);
+    assert_eq!(
+        status,
+        axum::http::StatusCode::BAD_REQUEST,
+        "the refusal is a 400, same as any other bad selector"
+    );
+    assert_eq!(
+        code, "content_config_unavailable",
+        "the specific code this arm returns — `unknown_content` is a different, generic gap"
+    );
+    assert_eq!(
+        message, gap,
+        "the wire body carries CONTENT_CONFIG_GAP verbatim, not a paraphrase"
+    );
+
+    // A neighbouring value that IS a real lane still resolves normally, so
+    // the refusal is `config`-specific rather than a blanket content-family
+    // failure.
+    assert_eq!(
+        sergeant_rs::api::content_family(Some("code")).expect("`code` is a real lane"),
+        Some(LexicalFamily::Code)
+    );
+}
+
+/// Synchronously decode an axum `Response`'s status and its JSON error
+/// body's `code`/`message` fields — the same buffered-`Json`-body technique
+/// `tests/i9_floor_pinning.rs` uses for `below_floor_refusal`, reused here
+/// for `content_family`'s refusal.
+fn response_body_json(
+    response: axum::response::Response,
+) -> (axum::http::StatusCode, String, String) {
+    use http_body_util::BodyExt;
+    let status = response.status();
+    let mut collect = std::pin::pin!(response.into_body().collect());
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let collected = match collect.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(result) => {
+            result.expect("content_family's body must not itself error")
+        }
+        std::task::Poll::Pending => panic!(
+            "content_family's response body was not immediately ready — it must be a fully \
+             buffered Json body, never a stream"
+        ),
+    };
+    let bytes = collected.to_bytes();
+    let json: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("content_family's body must be JSON");
+    (
+        status,
+        json["error"]["code"]
+            .as_str()
+            .expect("body has an `error.code` field")
+            .to_string(),
+        json["error"]["message"]
+            .as_str()
+            .expect("body has an `error.message` field")
+            .to_string(),
+    )
 }

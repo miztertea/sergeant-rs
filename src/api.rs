@@ -6034,6 +6034,39 @@ pub const CONTENT_CONFIG_GAP: &str = "`--content config` is not available in thi
      coordinates. (A2 §14 lists the value; A1 does not yet store the fact it \
      needs.)";
 
+/// A2 §14's `--content`, resolved to a lexical family — or the refusal it
+/// earns. `None` (or `all`) searches every family; `config` is named by
+/// A2 §14 but refused with [`CONTENT_CONFIG_GAP`] rather than answered
+/// partially (see that constant's own doc).
+///
+/// `SearchQuery::family` is the only caller inside this crate; the function
+/// stands on its own — rather than staying an inherent method on the private
+/// `SearchQuery` — so a test can drive the actual `config` refusal arm
+/// directly instead of only asserting static properties of its message.
+pub fn content_family(
+    content: Option<&str>,
+) -> Result<Option<atlas_lexical::LexicalFamily>, Box<Response>> {
+    match content {
+        None | Some("all") => Ok(None),
+        // §14 spells the mail family `email`; A1's own row spelling is
+        // `mail`. Both are accepted so neither document is wrong.
+        Some("email") | Some("mail") => Ok(Some(atlas_lexical::LexicalFamily::Mail)),
+        Some("config") => Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "content_config_unavailable",
+            CONTENT_CONFIG_GAP,
+        ))),
+        Some(other) => match atlas_lexical::LexicalFamily::parse(other) {
+            Some(family) => Ok(Some(family)),
+            None => Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "unknown_content",
+                format!("unknown --content `{other}`: code, document, email, row-text or all"),
+            ))),
+        },
+    }
+}
+
 impl SearchQuery {
     /// A2 §2's admissibility filter from the selectors, or a 400 naming what
     /// was wrong with them.
@@ -6155,25 +6188,7 @@ impl SearchQuery {
     /// A2 §14's `--content`, as a family narrowing. `None` (or `all`)
     /// searches every family.
     fn family(&self) -> Result<Option<atlas_lexical::LexicalFamily>, MapRefusal> {
-        match self.content.as_deref() {
-            None | Some("all") => Ok(None),
-            // §14 spells the mail family `email`; A1's own row spelling is
-            // `mail`. Both are accepted so neither document is wrong.
-            Some("email") | Some("mail") => Ok(Some(atlas_lexical::LexicalFamily::Mail)),
-            Some("config") => Err(Box::new(error_response(
-                StatusCode::BAD_REQUEST,
-                "content_config_unavailable",
-                CONTENT_CONFIG_GAP,
-            ))),
-            Some(other) => match atlas_lexical::LexicalFamily::parse(other) {
-                Some(family) => Ok(Some(family)),
-                None => Err(Box::new(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "unknown_content",
-                    format!("unknown --content `{other}`: code, document, email, row-text or all"),
-                ))),
-            },
-        }
+        content_family(self.content.as_deref())
     }
 
     /// A2 §14's `--top <n>`, capped by the store regardless (F12).
