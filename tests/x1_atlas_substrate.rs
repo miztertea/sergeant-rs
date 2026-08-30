@@ -114,9 +114,23 @@ fn atlas_database_has_exactly_one_owner() {
     // would compile and be reachable estate-wide — and a consumer written
     // against it names the lowercase crate token nowhere, so the scan above
     // would not see it either. The field declaration is pinned directly.
+    //
+    // Since the S5 closeout the field is a `Store` — `db.rs`'s own child
+    // module wrapping the driver's `Connection` so that every statement
+    // surface takes a `Sql` (A1a §17 item 13's compile-time half). The
+    // one-owner rule is unchanged and is why that wrapper is a *child
+    // module of this file* rather than a sibling file: a sibling would be a
+    // second module naming the driver, which the loop above forbids and
+    // which no "these two files may both touch the driver" exception is
+    // going to be added for.
     assert!(
-        db.contains("\n    conn: Connection,"),
+        db.contains("\n    conn: Store,"),
         "the Atlas connection must stay a private field"
+    );
+    assert!(
+        db.contains("\n        conn: Connection,\n    }"),
+        "the raw driver connection must stay a private field of the `store` child module — \
+         that privacy is what stops the rest of db.rs handing the driver a runtime string"
     );
     assert!(
         !db.contains("pub fn conn") && !db.contains("-> &Connection"),
