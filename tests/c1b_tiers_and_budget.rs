@@ -22,26 +22,28 @@
 //! §5 step 2 — so every "it did not fit" assertion below is about evidence
 //! that really was selected, not about evidence that happened to be missing.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
-use sergeant_rs::domain::event::rfc3339_utc_now;
-use sergeant_rs::domain::source::{AuthorityClass, SourceKind, UnitKind};
+use sergeant_rs::domain::source::{AuthorityClass, SourceKind};
 use sergeant_rs::domain::workflow::{StageDefinition, StageKind, StageRecord, StageStatus};
 use sergeant_rs::runtime::atlas::db::{AtlasDb, LexicalQuery, SourceSelector};
 use sergeant_rs::runtime::atlas::overlay::overlay_source_name;
 use sergeant_rs::runtime::atlas::record::record_scan;
-use sergeant_rs::runtime::atlas::scan::{ScannedFile, ScannedUnit, SourceScan};
 use sergeant_rs::runtime::atlas::semantic::SemanticRequest;
-use sergeant_rs::runtime::atlas::tabular::ContextFields;
-use sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR;
 use sergeant_rs::runtime::context::{
     CompileRequest, ContextSnapshot, EvidenceCoordinate, EvidenceUnit, RenderBudget, ResearchStep,
     SourceEvidence, Tier, compile, resolve,
 };
 use sergeant_rs::runtime::journal::Journal;
+
+mod support;
+// `unit`/`file`/`scan` fixture builders live in `tests/support` (R2 — F-SI-01:
+// this file and `tests/c1a_compiled_context.rs` had built byte-identical
+// copies of the same three functions).
+use support::{file, scan, unit};
 
 // ===================================================================
 // Fixture
@@ -77,58 +79,6 @@ fn huge_body() -> String {
         body.push_str(" retention policy retention policy retention policy");
     }
     body
-}
-
-fn unit(ordinal: u64, title: &str, text: &str) -> ScannedUnit {
-    ScannedUnit {
-        ordinal,
-        kind: UnitKind::Section,
-        heading_level: Some(1),
-        title: Some(title.to_string()),
-        byte_start: 0,
-        byte_end: text.len() as u64,
-        coordinate: None,
-        text: text.to_string(),
-    }
-}
-
-fn file(relative_path: &str, units: Vec<ScannedUnit>) -> ScannedFile {
-    let bytes: u64 = units.iter().map(|u| u.text.len() as u64).sum();
-    ScannedFile {
-        relative_path: relative_path.to_string(),
-        content_hash: format!("hash/{relative_path}"),
-        extractor: MARKDOWN_EXTRACTOR.to_string(),
-        local_key: format!("key/{relative_path}"),
-        byte_len: bytes,
-        mtime_millis: None,
-        units,
-        syntax: None,
-        parent: None,
-    }
-}
-
-fn scan(
-    source_name: &str,
-    kind: SourceKind,
-    authority: AuthorityClass,
-    files: Vec<ScannedFile>,
-) -> SourceScan {
-    let mut extractors = BTreeSet::new();
-    extractors.insert(MARKDOWN_EXTRACTOR.to_string());
-    SourceScan {
-        source_name: source_name.to_string(),
-        kind,
-        authority,
-        content_key: format!("{source_name}@generation-1"),
-        revision: None,
-        observed_at: rfc3339_utc_now(),
-        files,
-        coverage: Vec::new(),
-        extractors,
-        datasets: Vec::new(),
-        root: None,
-        context_fields: ContextFields::none(),
-    }
 }
 
 struct Fixture {
