@@ -1582,6 +1582,58 @@ them were dead code in every real installation.
   today; if either earns a surface it is S6's intelligence read, and no §17
   item is claimed met by their existence.
 
+### Compiled actor context (S6)
+
+- **A stage that launches a fresh actor now compiles its world first.** C1
+  §3's compilation step is one call inserted into the existing stage launch
+  path (`Engine::reserve_stage`), between the execution id being allocated
+  and the adapter being asked to PREPARE — not a second execution pipeline.
+  The compiled world is *appended* to the stage's authored `CONTEXT.md` by
+  the same rule the branch-status fact already used: the authored bytes are
+  untouched, and the appended section carries evidence **coordinates**,
+  never resource bodies (C1 §20's first non-goal).
+- **§5's nine research steps are enforceable runtime order, not advice.**
+  `ResearchLedger::enter` refuses any step that is not §5's next one, and
+  reports a fuzzy step (A2 lexical/semantic retrieval) that jumps a
+  deterministic one as `CognitionBeforeComputation`, naming both steps.
+  Every step is entered even when it has nothing to contribute, recording
+  why, so skipping is unrepresentable and C1 §18's degradation stays
+  visible. Contribution is first-contributor-wins at resource granularity,
+  so a resource that is both an exact Work-changed resource (step 2) and a
+  top lexical hit (step 6) is attributed to step 2 and step 6's record shows
+  it offered and lost — which is what makes the order observable in the
+  snapshot rather than only in the call order.
+- **Retrieval is consumed, not reimplemented.** Steps 6 and 7 are S5's
+  `AtlasDb::traced_search`/`fused_search` and its A2 §13 nine-field trace,
+  retained on the snapshot. No new SQL statement was added: every read this
+  step needs already existed on `AtlasDb`, so S5's rebuilt statement
+  boundary is untouched.
+- **The snapshot pins generations, and a pin re-resolves.** One field per
+  line of C1 §15's list, in §15's order, journaled as a new
+  `context.compiled` event (also on the SSE event-kind list) once per fresh
+  execution: snapshot id, estate/work/stage/execution coordinate, journal
+  watermark, Work base + overlay generation, source generations (by id
+  *and* content key), coverage states, retrieval generation/model, profile,
+  selection-plan hash, Bound and Referenced evidence, the Reachable scope
+  descriptor, and the rendered size. The lines a later wave fills
+  (`query_result_ids`, `payload_pointer`, `budget`) are present and empty
+  rather than absent.
+- **Scoped to actor launches.** Only a `StageKind::Actor` launch compiles;
+  an `Execute` (container) stage never reaches an actor, never reads
+  `StartRequest.context`, and is left exactly as it was.
+- **An estate with no intelligence still launches on the existing path**
+  (C1 §21 item 13). With no Atlas database on this host no compiler is
+  installed, so nothing is compiled, nothing is journaled, and the
+  `StartRequest` is byte-identical to the one built before C1 existed —
+  a property of the installed-or-not `Option`, not of a branch. An estate
+  that *has* Atlas but no confirmed generation still receives its authored
+  `CONTEXT.md` byte for byte, with the degradation stated in the journal
+  instead of left as an empty snapshot to interpret.
+- Budget and tier resolution, structured query results, authority and
+  provenance, and attribution/nesting/audit are **not** in this change;
+  they are C1b/C1c/C1d, and the places that under-deliver until then say so
+  where they under-deliver.
+
 
 ## [0.2.4] - 2026-08-25
 

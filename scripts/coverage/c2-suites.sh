@@ -381,9 +381,10 @@ cov_run cargo llvm-cov --no-report --test w5_search_surface --locked || cov_fail
 cov_stage_end 1 "the w5_search_surface test binary must write its own profile"
 
 # S6 C1a — C1 §3's compilation step and §5's enforceable runtime order.
-# Fifteen in-process tests over a real Atlas built by the ordinary
-# `record_scan` path (the compiler, the §5 gate, §15's snapshot), plus two
-# live-daemon tests over a real estate for §21 items 1 and 13. Floor 1.
+# Fourteen in-process tests over a real Atlas built by the ordinary
+# `record_scan` path (the compiler, the §5 gate, §15's snapshot), plus three
+# live-daemon tests over a real estate for §21 items 1 and 13 and for the
+# actor-only scoping of the step. Floor 1.
 cov_stage_begin c2-c1a_compiled_context
 cov_run cargo llvm-cov --no-report --test c1a_compiled_context --locked || cov_fail "c1a_compiled_context failed under instrumentation"
 cov_stage_end 1 "the c1a_compiled_context test binary must write its own profile"
