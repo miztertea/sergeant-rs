@@ -571,7 +571,13 @@ const WALK: &[Item] = &[
                memory, the daemon materialises those bytes into a per-read scratch directory \
                under its OWN data dir, named by its own content hash rather than the entry's \
                name, and removes it when the read ends. Nothing executes it and no container is \
-               unpacked to disk. THE COORDINATE IS READ, NOT ONLY WRITTEN (S5 W7 F-SF-03): \
+               unpacked to disk. SCOPED HONESTLY: that registration happens on a FILESYSTEM \
+               source walk. An estate-git walk registers no dataset row for a LOOSE file of \
+               those extensions either (`DATASET_NO_ROOT`), so its container children answer \
+               with their own `DATASET_CHILD_NOT_REGISTERED` detail naming that equivalence \
+               rather than borrowing a reason that is no longer true of a child; an overlay \
+               scan produces no container child at all. Route equivalence is the claim, per \
+               walk, and it holds on every walk — not 'every walk registers datasets'. THE COORDINATE IS READ, NOT ONLY WRITTEN (S5 W7 F-SF-03): \
                `AtlasDb::child_resources` is the canned read behind `GET /v1/map/children` and \
                `sgt map children`, answering with all four §6.6 fields for both lanes in one \
                list — the parent coordinate from `source.child_resources`, the entry content \
