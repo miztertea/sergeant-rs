@@ -141,6 +141,9 @@ use crate::runtime::atlas::lexical::{
     rank_order, term_frequencies,
 };
 use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
+use crate::runtime::atlas::semantic::{
+    SemanticModel, SemanticRequest, SemanticStatus, installed_model, resolve as resolve_semantic,
+};
 use crate::runtime::atlas::tabular::{
     DatasetFormat, RowKeyBasis, RowUnit, ScannedDataset, row_units,
 };
@@ -2800,12 +2803,24 @@ impl AtlasDb {
     /// answer covers.
     pub fn lexical_search(&self, query: &LexicalQuery<'_>) -> Result<LexicalAnswer, AtlasError> {
         let scope = self.work_scope(query.filter, true)?;
+        // H4: resolved once, up front, from the caller's request and the
+        // model this host actually has — so EVERY return path below carries
+        // it, including the three early ones. A status computed only on the
+        // path that produces hits is exactly the omittable field H4 forbids.
+        let semantic_model = installed_model();
+        let semantic = resolve_semantic(query.semantic, semantic_model.as_ref());
+        let semantic_model = match semantic {
+            SemanticStatus::Applied => semantic_model,
+            _ => None,
+        };
         let terms = query_terms(query.text);
         let limit = query.limit.min(MAX_ROWS);
         let empty = LexicalAnswer {
             hits: Vec::new(),
             scope: scope.clone(),
             truncated: false,
+            semantic,
+            semantic_model: semantic_model.clone(),
         };
         if terms.is_empty() || limit == 0 {
             return Ok(empty);
@@ -2907,6 +2922,8 @@ impl AtlasDb {
             hits,
             scope,
             truncated,
+            semantic,
+            semantic_model,
         })
     }
 
@@ -4805,16 +4822,34 @@ pub struct LexicalQuery<'a> {
     pub family: Option<LexicalFamily>,
     /// How many hits to return, capped at [`MAX_ROWS`] (F12).
     pub limit: usize,
+    /// Whether the caller wants A2 §6's semantic half used at all
+    /// (decision **H4**). Required, and deliberately not defaulted: a caller
+    /// that never states it cannot later claim it did not know its answer was
+    /// lexical-only. What it resolves to on the answer is
+    /// [`LexicalAnswer::semantic`].
+    pub semantic: SemanticRequest,
 }
 
 /// What one [`AtlasDb::lexical_search`] answered, with everything a caller
 /// must be able to state about it.
 ///
-/// Three fields, none decorative: the ranked hits, the [`WorkScope`] every
-/// `--work`-filtered answer has to render (see that type's own doc), and
-/// whether the posting scan hit its cap. A capped scan is not a shorter list
-/// — it is a list whose *scores* were computed over fewer postings than
-/// exist, so it is a different answer and says so.
+/// Five fields, none decorative: the ranked hits, the [`WorkScope`] every
+/// `--work`-filtered answer has to render (see that type's own doc), whether
+/// the posting scan hit its cap, and S5 W3's two semantic fields. A capped
+/// scan is not a shorter list — it is a list whose *scores* were computed
+/// over fewer postings than exist, so it is a different answer and says so.
+///
+/// # The two semantic fields are two fields on purpose (decision H4)
+///
+/// [`Self::semantic`] is **required** and [`Self::semantic_model`] is
+/// **optional**, and collapsing them would destroy the property H4 exists
+/// for. A2 §15 requires a degraded answer to *"report that
+/// coverage/capability honestly"*; H4 makes that mechanical — a consumer
+/// reads a value that is always present rather than inferring degradation
+/// from a missing model identity, which cannot distinguish "no model
+/// installed" from "the caller turned it off" from "nobody filled the field
+/// in". See [`crate::runtime::atlas::semantic`] for the full argument and
+/// the test that pins it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LexicalAnswer {
     /// The ranked hits, best first, ties broken by
@@ -4824,6 +4859,15 @@ pub struct LexicalAnswer {
     pub scope: WorkScope,
     /// Whether the posting scan reached [`MAX_ROWS`] and stopped.
     pub truncated: bool,
+    /// A2 §15's required honesty about the semantic half: `applied`,
+    /// `not_installed` or `disabled` (decision **H4**). Never an `Option` —
+    /// there is no "unset" for a consumer to misread as "fine".
+    pub semantic: SemanticStatus,
+    /// A2 §13's *"semantic model identity/hash **if used**"* — populated
+    /// only when [`Self::semantic`] is
+    /// [`SemanticStatus::Applied`]. Optional because the contract says
+    /// "if used"; it is **not** the field that reports degradation.
+    pub semantic_model: Option<SemanticModel>,
 }
 
 /// Outcome of [`AtlasDb::reindex_lexical`]: how many units were indexed,
@@ -7154,6 +7198,7 @@ mod tests {
                 filter: &Admissibility::default(),
                 family: None,
                 limit: 10,
+                semantic: SemanticRequest::Requested,
             })
             .expect("search");
         assert!(
@@ -7173,6 +7218,7 @@ mod tests {
                 filter: &Admissibility::default(),
                 family: None,
                 limit: 10,
+                semantic: SemanticRequest::Requested,
             })
             .expect("search");
         assert!(

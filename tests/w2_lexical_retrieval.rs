@@ -48,6 +48,7 @@ use sergeant_rs::runtime::atlas::record::{ScanRecord, record_scan, scan_and_reco
 use sergeant_rs::runtime::atlas::scan::{
     KnowledgeSource, ScannedFile, ScannedSymbol, ScannedSyntax, ScannedUnit, SourceScan,
 };
+use sergeant_rs::runtime::atlas::semantic::SemanticRequest;
 use sergeant_rs::runtime::atlas::tabular::ContextFields;
 use sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR;
 use sergeant_rs::runtime::journal::Journal;
@@ -210,6 +211,7 @@ impl Estate {
                 filter,
                 family,
                 limit: 50,
+                semantic: SemanticRequest::Requested,
             })
             .expect("lexical search")
     }
@@ -673,6 +675,7 @@ fn another_works_overlay_unit_never_surfaces_through_a_lexical_query() {
             filter: &mine,
             family: None,
             limit: 50,
+            semantic: SemanticRequest::Requested,
         })
         .expect("lexical search");
     let sources: BTreeSet<String> = answer
@@ -704,6 +707,7 @@ fn another_works_overlay_unit_never_surfaces_through_a_lexical_query() {
             filter: &named,
             family: None,
             limit: 50,
+            semantic: SemanticRequest::Requested,
         })
         .expect("lexical search");
     assert!(
@@ -720,6 +724,7 @@ fn another_works_overlay_unit_never_surfaces_through_a_lexical_query() {
             filter: &mine,
             family: None,
             limit: 50,
+            semantic: SemanticRequest::Requested,
         })
         .expect("lexical search");
     assert!(
@@ -843,6 +848,7 @@ fn equal_scores_are_broken_by_the_stated_key_not_by_row_arrival_order() {
             filter: &filter,
             family: None,
             limit: 50,
+            semantic: SemanticRequest::Requested,
         })
         .expect("lexical search");
     let order: Vec<&str> = answer
@@ -1001,6 +1007,7 @@ fn a_bounded_answer_reports_true_when_the_posting_scan_is_actually_capped() {
             filter: &Admissibility::default(),
             family: None,
             limit: MAX_ROWS,
+            semantic: SemanticRequest::Requested,
         })
         .expect("lexical search");
     assert!(
