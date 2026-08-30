@@ -608,9 +608,9 @@ pub struct SearchSelectors {
     /// estate.
     #[arg(long)]
     pub external: bool,
-    /// How many hits to print. A display bound only — both retrieval halves
-    /// always rank the whole admissible set, so this cannot change the order
-    /// of what it returns.
+    /// How many hits to print (default 10). A display bound only — both
+    /// retrieval halves always rank the whole admissible set, so this cannot
+    /// change the order of what it returns.
     #[arg(long)]
     pub top: Option<usize>,
     /// Leave A2 §6's semantic half out even where a model is installed. The
