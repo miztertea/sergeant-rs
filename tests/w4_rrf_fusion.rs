@@ -873,9 +873,16 @@ fn every_one_of_a2_section_8s_nine_signals_actually_fires() {
     );
 }
 
-/// A code estate: `retry_charge` is defined in `src/payments/retry.rs`,
+/// A code estate: `retry_charge` is defined in `payments/retry.rs`,
 /// `src/payments/caller.rs` imports it (an inbound edge to the anchor), and
-/// `tests/retry_test.rs` defines a same-named symbol on a non-canonical path.
+/// `payments/aaa_retry_test.rs` defines a same-named symbol on a
+/// non-canonical path, in the **same directory** as the canonical
+/// definition. Same directory so signal 5 (same section) ties too, and the
+/// non-canonical path's name is deliberately spelled to sort *before* the
+/// canonical one's (`aaa_retry_test.rs` < `retry.rs`) — F-TH-02: an ordering
+/// assertion this suite's own tie-break key would already satisfy proves
+/// nothing about signal 7, so the fixture is built so the tie-break key
+/// alone would rank the wrong one first.
 fn code_estate() -> Estate {
     let data = tempfile::tempdir().expect("data dir");
     let mut journal = Journal::open(data.path()).expect("journal");
@@ -885,9 +892,9 @@ fn code_estate() -> Estate {
         SourceKind::EstateGit,
         AuthorityClass::EstateMutable,
         vec![
-            code_file("src/payments/retry.rs", "retry_charge", &[]),
+            code_file("payments/retry.rs", "retry_charge", &[]),
             code_file("src/payments/caller.rs", "charge_once", &["retry_charge"]),
-            code_file("tests/retry_test.rs", "retry_charge", &[]),
+            code_file("payments/aaa_retry_test.rs", "retry_charge", &[]),
         ],
     );
     record_scan(&mut db, &mut journal, &scan, None).expect("record repo-a");
@@ -1021,9 +1028,20 @@ fn a_work_changed_unit_is_promoted_over_its_unchanged_base() {
     assert!(!answer.hits[1].signals.work_changed_unit);
 }
 
-/// **Signal 7 does work.** `src/payments/retry.rs` and `tests/retry_test.rs`
-/// define the same symbol with identical indexed text, so they tie on both
-/// halves; the canonical path wins.
+/// **Signal 7 does work (F-TH-02 fix).** `payments/retry.rs` and
+/// `payments/aaa_retry_test.rs` define the same symbol with identical
+/// indexed text and **the same directory**, so they tie on both halves *and*
+/// on signal 5 (same module/section) — a fixture that let them differ by
+/// directory would let signal 5 decide the order before signal 7 ever got a
+/// turn, since [`RerankSignals::priority`] compares signal 5 first.
+/// [`LexicalHit::tie_break_key`]'s stated key (`source_name`, then
+/// `relative_path`) would, absent the signal, rank `aaa_retry_test.rs` first
+/// — the *opposite* of what this test asserts, since `"aaa_retry_test.rs" <
+/// "retry.rs"`. So the ordering assertion below is only satisfiable because
+/// signal 7 promotes the canonical path over the alphabetically-earlier
+/// tie-break winner, unlike the pre-fix fixture (`src/payments/retry.rs` vs.
+/// `tests/retry_test.rs`), where the tie-break key already produced the
+/// asserted order with no help from the signal.
 #[test]
 fn a_test_path_loses_to_a_canonical_one_at_an_equal_fused_score() {
     use_repository_assets();
@@ -1033,15 +1051,23 @@ fn a_test_path_loses_to_a_canonical_one_at_an_equal_fused_score() {
     let order = labelled(&answer);
     let canonical = order
         .iter()
-        .position(|label| label.ends_with("src/payments/retry.rs"))
+        .position(|label| label.ends_with("payments/retry.rs"))
         .expect("the canonical definition must be a hit");
     let test_path = order
         .iter()
-        .position(|label| label.ends_with("tests/retry_test.rs"))
+        .position(|label| label.ends_with("payments/aaa_retry_test.rs"))
         .expect("the test-path definition must be a hit");
+    // Non-vacuous: without the signal the stated tie-break key would put
+    // the test path first, not the canonical one.
+    assert!(
+        "payments/aaa_retry_test.rs" < "payments/retry.rs",
+        "the fixture only discriminates if the tie-break key would order \
+         these the other way round"
+    );
     assert!(
         canonical < test_path,
-        "the canonical implementation must outrank the test path: {order:#?}"
+        "the canonical implementation must outrank the test path despite \
+         losing the tie-break key: {order:#?}"
     );
     assert!(answer.hits[canonical].signals.canonical_path);
     assert!(!answer.hits[test_path].signals.canonical_path);
