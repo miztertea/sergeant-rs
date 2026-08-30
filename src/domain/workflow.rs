@@ -119,6 +119,24 @@ pub const KIND_STAGE_CANCELED: &str = "stage.canceled";
 /// re-prompted once this attempt" from "first time seeing this" without
 /// re-deriving it from raw journal replay at every `StageCompleted`.
 pub const KIND_STAGE_OUTPUT_MISSING: &str = "stage.output_missing";
+/// **C1 §15's snapshot provenance**, journaled at the instant the world was
+/// compiled — between the execution id being allocated and the adapter being
+/// asked to PREPARE, so it names the exact fresh execution it was compiled
+/// for (§21 item 1).
+///
+/// Journaled rather than written to a new store, because C1-09 says so:
+/// *"Reuse existing artifact/blob/output mechanics for large snapshot
+/// payloads... Split-hardening landed artifact/output lifecycle; no new
+/// payload store needed."* The journal is the estate's durable record of what
+/// happened, and *"what world did Sergeant present?"* (§15) is a fact about
+/// what happened.
+///
+/// Present even for a **degraded** compilation — §18's degradation is
+/// *"visible, not fatal or fabricated"*, and a snapshot that says
+/// `intelligence_disabled` is the visible form of it. An engine with no
+/// compiler installed journals nothing at all, which is the other, stronger
+/// half of §21 item 13: the existing stage launch path with nothing added.
+pub const KIND_CONTEXT_COMPILED: &str = "context.compiled";
 /// The named `needs_input` reason #260 Q3 requires when a stage's declared
 /// `output/` artifact is still missing after its one bounded re-prompt:
 /// carried in the `stage.needs_input`/`work.needs_input` payload's

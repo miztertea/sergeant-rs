@@ -1203,6 +1203,36 @@ pub async fn start_with(
     if let Some(cap) = config.intelligence_lane_cap {
         engine = engine.with_intelligence_lane_cap(cap);
     }
+    // C1 §3: install the compilation step, so a stage launch actually
+    // compiles a world instead of the capability shipping green and
+    // unreachable.
+    //
+    // Derived from `analytics`, never `AtlasDb::open` — one file is one
+    // DuckDB instance, and a second `open` is a second instance whose writes
+    // and the projection's silently overwrite each other (`Analytics::atlas`,
+    // and this module's own Atlas startup-reconciliation doc). This is the
+    // same `Connection::try_clone` handle `ApiState::atlas` is derived from,
+    // taken once and held for the process because a compilation happens on
+    // every stage entry.
+    //
+    // A host that cannot produce a handle installs no compiler and therefore
+    // keeps §18's first rung: the existing stage launch path, unchanged
+    // (§21 item 13). That is reported, not silent.
+    if crate::runtime::atlas::db::atlas_db_path(data_dir).exists() {
+        match analytics.atlas() {
+            Ok(atlas) => {
+                engine = engine.with_context_compiler(Arc::new(
+                    crate::runtime::context::AtlasContextCompiler::new(atlas),
+                ));
+            }
+            Err(e) => tracing::warn!(
+                target: "sergeant::atlas",
+                error = %e,
+                "atlas could not be opened for C1 context compilation; stages launch on the \
+                 existing context path with no compiled snapshot"
+            ),
+        }
+    }
     let engine = Arc::new(engine);
     let reconciled = recovery::reconcile(&engine, &estates, &mut core)?;
     // Backstop, not load-bearing: `reconcile` already leaves nothing open on

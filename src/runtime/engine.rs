@@ -48,12 +48,12 @@ use crate::domain::work::{
     KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_WAITING, Work, WorkState,
 };
 use crate::domain::workflow::{
-    DEFAULT_WORKFLOW, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
-    KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
-    KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
-    REASON_STAGE_OUTPUT_MISSING, SOURCE_EMBEDDED, StageBinding, StageDefinition, StageKind,
-    StageRecord, StageStatus, WorkflowDefinition, WorkflowError, declared_output_artifact,
-    declared_required_columns, has_required_table_columns,
+    DEFAULT_WORKFLOW, KIND_CONTEXT_COMPILED, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED,
+    KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED,
+    KIND_STAGE_NEEDS_INPUT, KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING,
+    KIND_WORKFLOW_BOUND, REASON_STAGE_OUTPUT_MISSING, SOURCE_EMBEDDED, StageBinding,
+    StageDefinition, StageKind, StageRecord, StageStatus, WorkflowDefinition, WorkflowError,
+    declared_output_artifact, declared_required_columns, has_required_table_columns,
 };
 use crate::runtime::preflight::{self, GitPreflight, PreflightRefusal};
 use crate::runtime::projection::{WorkRegistry, WorkRun, is_absorbing};
@@ -1300,6 +1300,19 @@ pub struct Engine {
     pub intelligence_lane: Arc<Semaphore>,
     /// The cap [`Self::intelligence_lane`] was built with.
     pub intelligence_lane_cap: usize,
+    /// **C1 §3's compilation step**, installed or not.
+    ///
+    /// `None` is §18's first rung — *"intelligence disabled → existing stage
+    /// CONTEXT + Work bindings"* — and it is `None` by construction for every
+    /// engine nobody installed one on, which is what makes §21 item 13 a
+    /// property of the type rather than a branch someone has to remember to
+    /// write: with no compiler there is no compilation, no journaled
+    /// snapshot, and a `StartRequest` byte-identical to the one this engine
+    /// built before C1 existed.
+    ///
+    /// A port rather than an `AtlasDb`, so the engine keeps knowing nothing
+    /// about Atlas — see [`crate::runtime::context::ContextCompiler`].
+    context_compiler: Option<Arc<dyn crate::runtime::context::ContextCompiler>>,
 }
 
 /// Whose declared output contract one [`Engine::check_output_contract`] pass
@@ -1351,6 +1364,7 @@ impl Engine {
             execution_permits: Arc::new(Mutex::new(BTreeMap::new())),
             intelligence_lane: Arc::new(Semaphore::new(default_intelligence_lane_cap())),
             intelligence_lane_cap: default_intelligence_lane_cap(),
+            context_compiler: None,
         }
     }
 
@@ -1392,6 +1406,20 @@ impl Engine {
     pub fn with_intelligence_lane_cap(mut self, cap: usize) -> Self {
         self.intelligence_lane = Arc::new(Semaphore::new(cap));
         self.intelligence_lane_cap = cap;
+        self
+    }
+
+    /// Install C1 §3's compilation step (`daemon::run_until_signal`).
+    ///
+    /// A builder rather than a `new` parameter for the reason every other
+    /// builder here is one: an engine nobody installs one on keeps exactly
+    /// the behaviour it had, which is §21 item 13's requirement and every
+    /// existing test's assumption at once.
+    pub fn with_context_compiler(
+        mut self,
+        compiler: Arc<dyn crate::runtime::context::ContextCompiler>,
+    ) -> Self {
+        self.context_compiler = Some(compiler);
         self
     }
 
@@ -3934,6 +3962,58 @@ impl Engine {
         };
 
         let execution_id = ulid::Ulid::generate().to_string();
+        // §12: procedure is data. The stage's own `CONTEXT.md`, plus the one
+        // opt-in fact #260 mechanism 3 already appends (see below).
+        let authored = if stage.receives_branch_status {
+            branch_status_context(&stage.context, &surface)
+        } else {
+            stage.context.clone()
+        };
+        // ---------------------------------------------------------------
+        // C1 §3's compilation step — here, and nowhere else.
+        //
+        //   stage about to enter → resolve Work/estate/source generations →
+        //   run deterministic research plan → compile Bound + Referenced +
+        //   Reachable snapshot → launch ordinary fresh execution
+        //
+        // *"C1 is not a second execution pipeline"* (§3, decision C1-01,
+        // **R2**): this is one call, inserted between the execution id being
+        // allocated and the adapter being asked to PREPARE, on the launch
+        // path that already existed. Nothing below it changed — the same
+        // `StartRequest`, the same `prepare`, the same reservation, the same
+        // `Next::Launch`.
+        //
+        // With no compiler installed it is `(authored, None)` and the rest of
+        // this function cannot tell C1 exists (§21 item 13).
+        //
+        // Scoped to `StageKind::Actor` (§3: "The existing engine already
+        // binds a workflow/stage and launches a fresh actor... C1 inserts a
+        // deterministic compilation step before the actor start"; §21 item
+        // 1: "fresh ordinary actor stage launches"). An `Execute` stage
+        // launches a Docker container, never an actor, and the backend never
+        // reads `StartRequest.context` for it — compiling a snapshot it
+        // cannot see would be unasked-for scope doing unread work.
+        // ---------------------------------------------------------------
+        let (context, snapshot) = if stage.kind == StageKind::Actor {
+            self.compile_stage_context(
+                core,
+                work_id,
+                &stage,
+                index,
+                attempt,
+                &execution_id,
+                &intent,
+                &surface,
+                &run,
+                stage_profile.as_ref().map(|p| p.name.as_str()),
+                &authored,
+            )
+        } else {
+            (authored.clone(), None)
+        };
+        if let Some(snapshot) = snapshot {
+            self.commit(core, work_id, KIND_CONTEXT_COMPILED, snapshot)?;
+        }
         let request = StartRequest {
             work_id: work_id.to_string(),
             execution_id: execution_id.clone(),
@@ -3945,15 +4025,12 @@ impl Engine {
             // the actor verbatim; sergeant never interprets it — except for
             // Amendment 9 Q5 / #260 mechanism 3's opt-in wire, where a stage
             // that declared `receives_branch_status = true` gets the
-            // engine's own commits-on-branch-since-base fact appended. The
-            // engine still shares no output vocabulary: this is a fact it
-            // already computes ([`WorkSurface::commits_since_base`]), not an
-            // interpretation of the stage's procedure.
-            context: if stage.receives_branch_status {
-                branch_status_context(&stage.context, &surface)
-            } else {
-                stage.context.clone()
-            },
+            // engine's own commits-on-branch-since-base fact appended, and
+            // C1 §3's compiled-context section, appended by exactly the same
+            // rule and for exactly the same reason: the authored content is
+            // untouched and a reader can tell which part sergeant added.
+            // Both are computed just above.
+            context,
             // §24.8: the profile carries the model, so the stage's profile
             // carries the stage's model. There is no per-stage model field.
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
@@ -5175,6 +5252,80 @@ fn handle_of(execution: &ExecutionRecord) -> ExecutionHandle {
     ExecutionHandle {
         execution_id: execution.execution_id.clone(),
         native_id: execution.native_id.clone(),
+    }
+}
+
+impl Engine {
+    /// **C1 §3's compilation step**: compile the world for the fresh
+    /// execution about to start, and return the context the actor will
+    /// actually receive plus the §15 snapshot to journal.
+    ///
+    /// `(authored.to_string(), None)` when no compiler is installed — §18's
+    /// first rung and §21 item 13, decided by whether the field is `Some`
+    /// and by nothing else. There is deliberately no second condition here: a
+    /// condition is a thing that can be got wrong, and "no compiler ⇒ nothing
+    /// added" must be the one case nobody can get wrong.
+    ///
+    /// A **degraded** snapshot (intelligence installed but this world has no
+    /// confirmed generation, or an Atlas read failed) is still journaled and
+    /// still renders nothing: §18's degradation is *"visible, not fatal or
+    /// fabricated"*, and `ContextSnapshot::render_onto` returns the authored
+    /// context byte-for-byte when there is nothing compiled.
+    ///
+    /// # Why this runs under the core lock, said rather than assumed
+    ///
+    /// §22.6's budget keeps *external effects* out from under the guard — a
+    /// process spawn, a container create, a repository walk (see
+    /// [`crate::api`]'s `spawn_work_overlay_hook`, which exists for exactly
+    /// that reason). This is none of those: it is a bounded set of reads of
+    /// already-derived local tables, every one of them capped at
+    /// [`crate::runtime::context::STEP_ROW_CAP`] or Atlas's own `MAX_ROWS`,
+    /// touching no filesystem the Work owns and spawning nothing (**J3** —
+    /// §22.6 names the effects it governs and a bounded local read is not
+    /// among them). It has to run here regardless: the compiled world must be
+    /// in the `StartRequest` before the adapter is asked to PREPARE, and
+    /// PREPARE is *"identity only — no process, no I/O"*, so there is no
+    /// later point at which the context could still be composed.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_stage_context(
+        &self,
+        core: &Core,
+        work_id: &str,
+        stage: &StageDefinition,
+        index: usize,
+        attempt: u32,
+        execution_id: &str,
+        intent: &str,
+        surface: &WorkSurface,
+        run: &WorkRun,
+        profile: Option<&str>,
+        authored: &str,
+    ) -> (String, Option<Value>) {
+        let Some(compiler) = self.context_compiler.as_ref() else {
+            return (authored.to_string(), None);
+        };
+        let estate_root = Self::work_estate_root(core, work_id);
+        let bindings = surface.binding_summary();
+        let request = crate::runtime::context::CompileRequest {
+            estate_root: estate_root.as_deref(),
+            work_id,
+            intent,
+            stage,
+            stage_index: index,
+            attempt,
+            execution_id,
+            // §15's *"journal watermark"*: the next sequence this journal
+            // will write, read before the compilation, so the snapshot names
+            // the exact prefix of the journal its world could have reflected.
+            journal_watermark: core.journal.next_seq(),
+            bindings: &bindings,
+            prior_stages: &run.stages,
+            profile,
+        };
+        let mut snapshot = compiler.compile(&request);
+        let context = snapshot.render_onto(authored);
+        snapshot.rendered_bytes = context.len().saturating_sub(authored.len()) as u64;
+        (context, Some(snapshot.json()))
     }
 }
 
