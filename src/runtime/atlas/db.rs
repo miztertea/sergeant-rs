@@ -425,9 +425,7 @@ CREATE TABLE IF NOT EXISTS source.child_resources (\n\
   local_key            TEXT NOT NULL,\n\
   parent_relative_path TEXT NOT NULL,\n\
   parent_key           TEXT NOT NULL,\n\
-  entry_path           TEXT NOT NULL,\n\
-  content_hash         TEXT NOT NULL,\n\
-  extractor            TEXT NOT NULL\n\
+  entry_path           TEXT NOT NULL\n\
 );\n\
 CREATE TABLE IF NOT EXISTS source.units (\n\
   generation_id TEXT NOT NULL,\n\
@@ -3028,18 +3026,26 @@ fn insert_file(
         file.units.len() as i64,
     ])?;
     if let Some(parent) = &file.parent {
-        // A1 §6.6's first two preserved fields (S5 W7). In its own table, not
-        // as two more columns on `source.files`: this file's own module doc
-        // states the rule ("These tables are only ever added to, never
-        // altered" — the DDL is `IF NOT EXISTS`, so a column added to an
-        // existing table would silently not appear in a database that
-        // already has it), and X3b's rows already set the precedent of a new
-        // table carrying its own copy of the coordinates it needs.
+        // A1 §6.6's parent-provenance fields (S5 W7): parent resource,
+        // parent key, entry path. In their own table, not as three more
+        // columns on `source.files`: this file's own module doc states the
+        // rule ("These tables are only ever added to, never altered" — the
+        // DDL is `IF NOT EXISTS`, so a column added to an existing table
+        // would silently not appear in a database that already has it), and
+        // X3b's rows already set the precedent of a new table carrying its
+        // own copy of the coordinates it needs.
+        //
+        // The other two of §6.6's four fields — entry content hash, entry
+        // adapter (F-SI-01) — are NOT duplicated here: they are already
+        // columns on the `source.files` row this same INSERT just wrote for
+        // this exact (generation_id, source_name, relative_path), and a
+        // reader joins back to it on that key rather than being handed a
+        // second, driftable copy.
         conn.prepare_cached(
             "INSERT INTO source.child_resources \
              (generation_id, source_name, relative_path, local_key, parent_relative_path, \
-              parent_key, entry_path, content_hash, extractor) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              parent_key, entry_path) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )?
         .execute(duckdb::params![
             generation_id,
@@ -3049,8 +3055,6 @@ fn insert_file(
             &parent.parent_relative_path,
             &parent.parent_key,
             &parent.entry_path,
-            &file.content_hash,
-            &file.extractor,
         ])?;
     }
     for unit in &file.units {

@@ -339,10 +339,20 @@ fn a_landed_childs_parent_coordinate_is_persisted_in_its_own_table() {
 
     let conn =
         duckdb::Connection::open(atlas_db_path(data_dir.path())).expect("read the recorded store");
+    // F-SI-01: content_hash and extractor are not duplicated on
+    // `child_resources` — they are already columns on the `source.files`
+    // row for this same (generation_id, source_name, relative_path), joined
+    // back to here rather than re-read from a second copy.
     let mut statement = conn
         .prepare(
-            "SELECT parent_relative_path, parent_key, entry_path, content_hash, extractor \
-             FROM source.child_resources WHERE relative_path = ?",
+            "SELECT c.parent_relative_path, c.parent_key, c.entry_path, f.content_hash, \
+             f.extractor \
+             FROM source.child_resources c \
+             JOIN source.files f \
+               ON f.generation_id = c.generation_id \
+              AND f.source_name = c.source_name \
+              AND f.relative_path = c.relative_path \
+             WHERE c.relative_path = ?",
         )
         .expect("prepare");
     let mut rows = statement
