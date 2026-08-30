@@ -185,9 +185,12 @@ pub struct RerankSignals {
     /// **3.** The caller named a source (`--source`, `--source@sha`,
     /// `--work`). Uniform — see the type's own doc.
     pub caller_selected_source: bool,
-    /// **4.** The unit came from this Work's overlay generation, i.e. it is a
-    /// unit the Work has **changed** — reachable since S5 W1d made the
-    /// overlay reflect in-flight changes rather than a freshly-cut worktree.
+    /// **4.** The unit's path is one the Work has **changed** — its
+    /// overlay-generation content hash differs from the base generation's
+    /// hash at the same path (F-SF-01) — not merely one visible under the
+    /// overlay's source name, which every unchanged path under it is too.
+    /// Reachable since S5 W1d made the overlay reflect in-flight changes
+    /// rather than a freshly-cut worktree.
     pub work_changed_unit: bool,
     /// **5.** Same module/package/document section as the top RRF candidate —
     /// [`same_section`].

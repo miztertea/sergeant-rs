@@ -1642,6 +1642,27 @@ impl AtlasDb {
         }))
     }
 
+    /// `source.files`' recorded content hash for one path in one
+    /// generation, when that generation has a row for it at all (F-SF-01:
+    /// [`Self::rerank_signals`]'s only use — telling a Work-changed path
+    /// from a merely-visible one by comparing this against the base
+    /// generation's hash for the same path).
+    fn file_content_hash(
+        &self,
+        generation_id: &str,
+        relative_path: &str,
+    ) -> Result<Option<String>, AtlasError> {
+        let mut statement = self.conn.prepare(
+            "SELECT content_hash FROM source.files \
+             WHERE generation_id = ? AND relative_path = ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![generation_id, relative_path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Units of one source's confirmed generation, in path then ordinal
     /// order, bounded by `limit` (capped at [`MAX_ROWS`], F12).
     pub fn units(&self, source_name: &str, limit: usize) -> Result<Vec<StoredUnit>, AtlasError> {
@@ -3195,6 +3216,29 @@ impl AtlasDb {
         // `--work` one. `None` for every other selector, so no non-Work query
         // can accidentally match a unit whose source merely looks like one.
         let overlay_source = query.filter.source.overlay_admit_source_name();
+        // Signal 4's other half (F-SF-01): an overlay generation's universe
+        // is the base tree *plus* whatever the surface changed
+        // (`extract_overlay`, overlay.rs), so every unchanged path is
+        // indexed under the same overlay source name as every changed one —
+        // source-name equality alone cannot tell "the Work touched this"
+        // from "this is merely visible under the Work's view". The overlay
+        // schema carries no per-unit changed/unchanged flag, but
+        // `source.files` already carries a content hash per path (F7), and
+        // an unchanged path's overlay row is read from the exact same blob
+        // as the base tree's (overlay.rs's own doc: "an overlay and a plain
+        // estate-git scan of the same base agree on every unchanged path by
+        // construction"). So a path whose overlay content hash differs from
+        // the base generation's content hash at the same path — or is
+        // absent from the base entirely — is a path the Work actually
+        // changed; one whose hash matches is not, regardless of source
+        // name.
+        let base_generation_id = match &query.filter.source {
+            SourceSelector::WorkBase { repository, .. } => self
+                .confirmed_generation(repository)?
+                .map(|generation| generation.id),
+            _ => None,
+        };
+        let mut base_content_hash: BTreeMap<String, Option<String>> = BTreeMap::new();
         // Signal 9: the caller pinned an exact generation, so A2 §8's
         // "unless caller pinned stale" suppresses the current-generation
         // preference.
@@ -3238,14 +3282,34 @@ impl AtlasDb {
 
         for hit in hits.iter_mut() {
             let same_generation = hit.generation_id == anchor_generation;
+            let work_changed_unit = match overlay_source.as_deref() {
+                Some(overlay) if overlay == hit.source_name => match &base_generation_id {
+                    Some(base_id) => {
+                        let relative_path = hit.coordinate.relative_path();
+                        if !base_content_hash.contains_key(relative_path) {
+                            let hash = self.file_content_hash(base_id, relative_path)?;
+                            base_content_hash.insert(relative_path.to_string(), hash);
+                        }
+                        let base_hash = base_content_hash
+                            .get(relative_path)
+                            .and_then(Option::as_deref);
+                        let overlay_hash =
+                            self.file_content_hash(&hit.generation_id, relative_path)?;
+                        base_hash != overlay_hash.as_deref()
+                    }
+                    // No confirmed base generation to compare against —
+                    // nothing here can be shown to differ from it, so this
+                    // signal stays honestly false rather than guessing.
+                    None => false,
+                },
+                _ => false,
+            };
             hit.signals = RerankSignals {
                 exact_match: exact_match(&terms, &hit.coordinate),
                 definition_over_reference: identifier_like
                     && hit.coordinate.family() == LexicalFamily::Code,
                 caller_selected_source: selected_source,
-                work_changed_unit: overlay_source
-                    .as_deref()
-                    .is_some_and(|overlay| overlay == hit.source_name),
+                work_changed_unit,
                 same_section_as_anchor: same_section(&anchor_coordinate, &hit.coordinate),
                 structural_relationship: same_generation
                     && (referencing_paths.contains(hit.coordinate.relative_path())

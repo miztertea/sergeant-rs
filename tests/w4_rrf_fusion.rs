@@ -36,7 +36,11 @@
 //! **That reranking reranks** — three tests show a candidate moving because
 //! of a signal ([`an_exact_name_match_is_promoted_over_a_better_fused_score`],
 //! [`a_work_changed_unit_is_promoted_over_its_unchanged_base`],
-//! [`a_test_path_loses_to_a_canonical_one_at_an_equal_fused_score`]).
+//! [`a_test_path_loses_to_a_canonical_one_at_an_equal_fused_score`]), and a
+//! fourth ([`an_overlay_unit_whose_content_matches_the_base_is_not_marked_work_changed`])
+//! proves the negative: a path merely visible under a Work's overlay, whose
+//! content is byte-identical to the base's, must not be marked Work-changed
+//! (F-SF-01).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -465,9 +469,21 @@ fn document_unit(text: &str) -> ScannedUnit {
 }
 
 fn scanned_file(relative_path: &str, units: Vec<ScannedUnit>) -> ScannedFile {
+    scanned_file_with_hash(relative_path, &format!("hash/{relative_path}"), units)
+}
+
+/// [`scanned_file`], with an explicit `content_hash` rather than the derived
+/// per-path default — what F-SF-01's fixtures need to say "this overlay path
+/// carries the *same* bytes as the base" (equal hash) or "*different* bytes"
+/// (distinct hash) independently of the path the two generations share.
+fn scanned_file_with_hash(
+    relative_path: &str,
+    content_hash: &str,
+    units: Vec<ScannedUnit>,
+) -> ScannedFile {
     ScannedFile {
         relative_path: relative_path.to_string(),
-        content_hash: format!("hash/{relative_path}"),
+        content_hash: content_hash.to_string(),
         extractor: MARKDOWN_EXTRACTOR.to_string(),
         local_key: format!("key/{relative_path}"),
         byte_len: 64,
@@ -810,8 +826,11 @@ fn every_one_of_a2_section_8s_nine_signals_actually_fires() {
     show("retry_charge", &answer);
     observe(&answer);
 
-    // (c) a Work overlay: signal 4.
-    let work = overlay_estate();
+    // (c) a Work overlay whose file actually changed: signal 4.
+    let work = overlay_estate(
+        "Settlement is posted to the ledger at the end of the day, after the Work's fix.",
+        "hash/docs/ledger.md/edited-by-work",
+    );
     let answer = work.fused(
         "settlement",
         &Admissibility {
@@ -877,7 +896,15 @@ fn code_estate() -> Estate {
 
 /// A Work estate: the base repository plus this Work's overlay generation
 /// over the same repository (S5 W1b/W1d's `work:<id>/<repo>` source name).
-fn overlay_estate() -> Estate {
+///
+/// `overlay_text`/`overlay_hash` are the overlay's own content identity for
+/// `docs/ledger.md` — distinct from the base's whenever the fixture means to
+/// represent an actual edit. F-SF-01: the signal is a content-hash
+/// comparison against the base generation, not a source-name check, so a
+/// fixture that wants "the Work changed this" must actually give the
+/// overlay a different hash, and one that wants "merely visible under the
+/// overlay" must give it the base's own hash.
+fn overlay_estate(overlay_text: &str, overlay_hash: &str) -> Estate {
     let data = tempfile::tempdir().expect("data dir");
     let mut journal = Journal::open(data.path()).expect("journal");
     let mut db = AtlasDb::open(data.path()).expect("atlas");
@@ -885,8 +912,9 @@ fn overlay_estate() -> Estate {
         "repo-a",
         SourceKind::EstateGit,
         AuthorityClass::EstateMutable,
-        vec![scanned_file(
+        vec![scanned_file_with_hash(
             "docs/ledger.md",
+            "hash/docs/ledger.md/base",
             vec![document_unit(
                 "Settlement is posted to the ledger at the end of the day.",
             )],
@@ -897,11 +925,10 @@ fn overlay_estate() -> Estate {
         "work:01WORK/repo-a",
         SourceKind::EstateGit,
         AuthorityClass::EstateMutable,
-        vec![scanned_file(
+        vec![scanned_file_with_hash(
             "docs/ledger.md",
-            vec![document_unit(
-                "Settlement is posted to the ledger at the end of the day.",
-            )],
+            overlay_hash,
+            vec![document_unit(overlay_text)],
         )],
     );
     record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
@@ -914,16 +941,58 @@ fn overlay_estate() -> Estate {
 
 // --------------------------------------------- reranking actually reranks
 
-/// **Signal 4 does work.** A Work-changed unit and its unchanged base carry
-/// byte-identical text, so they tie on both halves and RRF cannot separate
-/// them; the stated tie-break key would put `repo-a` before
-/// `work:01WORK/repo-a`. A2 §8's *"Work-changed unit"* signal is what puts
-/// the overlay first — and this is only reachable because S5 W1d made the
+/// **F-SF-01 regression: signal 4 is a content comparison, not a source-name
+/// check.** The overlay's `docs/ledger.md` carries the *same* content hash
+/// as the base's — a path the overlay universe includes (`extract_overlay`'s
+/// base ∪ changed) but the Work never actually touched. Under the pre-fix
+/// implementation (`overlay_source == hit.source_name`) this unit would
+/// still have been marked Work-changed purely for living under the overlay
+/// source; the fixed signal must say `false`, matching the base's.
+#[test]
+fn an_overlay_unit_whose_content_matches_the_base_is_not_marked_work_changed() {
+    use_repository_assets();
+    let estate = overlay_estate(
+        "Settlement is posted to the ledger at the end of the day.",
+        "hash/docs/ledger.md/base",
+    );
+    let filter = Admissibility {
+        source: SourceSelector::WorkBase {
+            work_id: "01WORK".to_string(),
+            repository: "repo-a".to_string(),
+        },
+        kind: None,
+        authority: None,
+    };
+    let answer = estate.fused("settlement ledger", &filter, 50);
+    show("unchanged-overlay", &answer);
+    assert_eq!(
+        answer.hits.len(),
+        2,
+        "base and overlay must both be present"
+    );
+    for hit in &answer.hits {
+        assert!(
+            !hit.signals.work_changed_unit,
+            "a byte-identical overlay path must not be marked Work-changed: {:#?}",
+            labelled(&answer)
+        );
+    }
+}
+
+/// **Signal 4 does work.** The overlay's `docs/ledger.md` carries a
+/// genuinely different content hash from the base's — a real edit — and A2
+/// §8's *"Work-changed unit"* signal promotes it to the top regardless of
+/// the two candidates' RRF standing, because [`rerank_order`] compares
+/// [`crate::runtime::atlas::fusion::RerankSignals::priority`] before it ever
+/// falls back to RRF order. This is only reachable because S5 W1d made the
 /// overlay reflect in-flight changes.
 #[test]
 fn a_work_changed_unit_is_promoted_over_its_unchanged_base() {
     use_repository_assets();
-    let estate = overlay_estate();
+    let estate = overlay_estate(
+        "Settlement is posted to the ledger at the end of the day, after the Work's fix.",
+        "hash/docs/ledger.md/edited-by-work",
+    );
     let filter = Admissibility {
         source: SourceSelector::WorkBase {
             work_id: "01WORK".to_string(),
@@ -946,12 +1015,6 @@ fn a_work_changed_unit_is_promoted_over_its_unchanged_base() {
     );
     assert_eq!(answer.hits[0].source_name, "work:01WORK/repo-a");
     assert!(!answer.hits[1].signals.work_changed_unit);
-    // Non-vacuous: without the signal the stated key puts the base first.
-    assert!(
-        "repo-a" < "work:01WORK/repo-a",
-        "the fixture only discriminates if the tie-break key would order these \
-         the other way round"
-    );
 }
 
 /// **Signal 7 does work.** `src/payments/retry.rs` and `tests/retry_test.rs`
