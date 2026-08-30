@@ -1788,14 +1788,139 @@ fn sql_literal_holes(source: &str, lines: &[&str]) -> Vec<String> {
 /// §17.13 — the map and status surfaces answer in source/generation/coverage
 /// terms, and there is no way to hand the store a query.
 ///
-/// Three things have to be true at once, and each is checked here: the store
-/// exposes no "run this SQL" entry point; the SQL that does exist is canned,
-/// with the only varying fragment chosen by an enum; and the shipped verb set
-/// is closed.
+/// # The load-bearing half is the compiler
+///
+/// Read part 0 first. Since the S5 closeout, `db.rs` runs every statement
+/// through a `Store`/`StoreTx` whose methods take `impl Into<Sql>`, and `Sql`
+/// is constructible **only** from `&'static str`. A caller's string therefore
+/// cannot become a statement: it is a type error, checked by `rustc`, not a
+/// spelling absent from a scan.
+///
+/// That replaced a check this suite genuinely shipped and that the closeout
+/// re-verify defeated in one hop. Check (b) below looked for a write call
+/// whose *literal first-argument text* named one of the enclosing function's
+/// own string parameters. Adding
+///
+/// ```ignore
+/// pub fn evil_run(&self, user_text: &str) -> Result<(), AtlasError> {
+///     let renamed = user_text;
+///     self.conn.execute_batch(renamed)?;
+///     Ok(())
+/// }
+/// ```
+///
+/// to `db.rs` left this test **green** — a public SQL-taking entry point
+/// handing caller text straight to `execute_batch`, which is exactly what
+/// item 13 forbids. One local rebinding was the whole evasion. The same
+/// method now fails to compile: `argument requires that '1 must outlive
+/// 'static`.
+///
+/// # What the remaining scans are, and are not
+///
+/// Parts 1–3 stay, as second nets over what a type does not see, and their
+/// limits are named rather than implied:
+///
+/// * (1a) is a name-based scan of public signatures. It sees a
+///   string-typed parameter under a *plausible* SQL name. It cannot see one
+///   under an implausible one — and it no longer has to, because such a
+///   parameter cannot reach a statement.
+/// * (1b) follows no dataflow. One local rebinding hides a parameter from
+///   it; so does a struct field, a closure capture, or a helper call. It is
+///   kept because it is nearly free, not because it is sound.
+/// * (2) pins every interpolation hole in every SQL literal. It reads
+///   literals character by character and is the strongest of the three, but
+///   it still only sees this one file.
+/// * (3) pins the shipped verb set, which is a contract about the API
+///   surface rather than about SQL.
 #[test]
 fn a1a_item_13_no_client_sql_reaches_the_store() {
     let db = read("src/runtime/atlas/db.rs");
     let lines: Vec<&str> = db.lines().collect();
+
+    // 0. **The guarantee.** `Sql` is the only thing the store will run, and
+    //    it cannot be built out of a caller's string.
+    //
+    //    Each assertion here is load-bearing. Removing any one of them is
+    //    removing item 13's enforcement, not tidying a test — which is the
+    //    whole reason they are spelled out rather than left to "the code
+    //    compiles".
+    assert!(
+        db.contains("    pub struct Sql(String);"),
+        "`Sql`'s field must stay private to the `store` child module — a `pub` field, or a \
+         move to a sibling module, hands the rest of db.rs a String-to-Sql conversion"
+    );
+    let store = block_after(&db, "pub(crate) mod store {");
+
+    //    Every `pub fn` on `Sql`, exhaustively — not a list of *expected*
+    //    names, which is how the guard this replaces was evaded: a
+    //    constructor spelled `from_owned(text: String)` matches no
+    //    "plausible SQL name" and would have slipped past a filtered scan.
+    //    The whole set is pinned, so a new constructor of ANY name fails
+    //    here and has to be argued for.
+    let sql_impl = block_after(&db, "    impl Sql {");
+    let sql_methods: Vec<&str> = sql_impl
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub fn ") || line.starts_with("pub const fn "))
+        .collect();
+    assert_eq!(
+        sql_methods,
+        vec![
+            "pub fn from_parts(parts: &[&'static str]) -> Self {",
+            "pub fn extend(&mut self, more: &Sql) {",
+            "pub fn text(&self) -> &str {",
+        ],
+        "`Sql` may gain no method that turns a runtime string into a statement; every \
+         constructor here takes `&'static str` or another already-vetted `Sql`"
+    );
+
+    //    And the conversions, which are constructors by another name.
+    let sql_conversions: Vec<&str> = store
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with("for Sql {"))
+        .collect();
+    assert_eq!(
+        sql_conversions,
+        vec![
+            "impl From<&'static str> for Sql {",
+            "impl From<&Sql> for Sql {"
+        ],
+        "an `impl From<String> for Sql` (or `From<&str>`) is client SQL reaching the store, \
+         however it is spelled"
+    );
+
+    //    `ReadSql` — the read-only handle's own statement type — the same way.
+    let read_sql_impl = block_after(&db, "    impl ReadSql {");
+    let read_sql_methods: Vec<&str> = read_sql_impl
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub fn ") || line.starts_with("pub const fn "))
+        .collect();
+    assert_eq!(
+        read_sql_methods,
+        vec!["pub const fn new(sql: &'static str) -> Self {"],
+        "`ReadSql` has one constructor and it takes `&'static str`"
+    );
+
+    for surface in [
+        "fn prepare<S: Into<Sql>>",
+        "fn prepare_cached<S: Into<Sql>>",
+        "fn execute<S: Into<Sql>>",
+        "fn execute_batch<S: Into<Sql>>",
+    ] {
+        assert!(
+            store.contains(surface),
+            "every statement surface must take `impl Into<Sql>`: {surface}"
+        );
+    }
+    // And nothing outside that module holds the driver's own connection, so
+    // there is no second route to a `&str` statement.
+    assert_eq!(
+        db.matches("\n    conn: Store,").count(),
+        2,
+        "`AtlasDb` and `Analytics` must both hold the wrapper, never a raw `Connection`"
+    );
 
     // 1. No public API takes SQL. The scan walks whole `pub fn` *signatures* —
     //    accumulating lines until the parameter list's parentheses close —
@@ -1840,6 +1965,12 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
         //   b. no public function hands one of its OWN string parameters to
         //      the store as a statement — the flow item 13 actually forbids,
         //      whatever the parameter is called.
+        //
+        // (b) is a SECOND NET and is documented as one at the top of this
+        // test: it compares literal argument text and follows no dataflow, so
+        // one local rebinding hides a parameter from it. It caught nothing
+        // the type system does not already refuse; it is kept because it is
+        // free, and because it fails loudly if someone widens `Sql`.
         for spelling in SQL_PARAMETER_SPELLINGS {
             for typing in [": &str", ": String", ": &String", ": Option<&str>"] {
                 assert!(
@@ -1889,24 +2020,21 @@ fn a1a_item_13_no_client_sql_reaches_the_store() {
     //    `TABLES` and returns `UnknownTable` before any formatting happens.
     //    Item 13 forbids handing the store a query; a fixed set of table
     //    names chosen by the module that declared them is not one.
+    // **The list is now empty, and that is the S5 closeout's doing.** Every
+    // fragment that used to be interpolated into a SQL literal at runtime —
+    // `reader_call(format)` in the three dataset statements, `ops(table)` in
+    // the projection's own DELETE/COUNT/SELECT — is now assembled by
+    // `Sql::from_parts`, which takes `&[&'static str]` and nothing else. So
+    // there is no interpolation in any SQL literal in this file to pin: the
+    // shape this check existed to bound cannot occur, rather than occurring
+    // in a list someone keeps up to date. A new hole appearing here is a
+    // regression to be argued for, not a line to append.
     let holes = sql_literal_holes(&db, &lines);
     assert_eq!(
-        holes.iter().map(String::as_str).collect::<Vec<_>>(),
-        vec![
-            "rows_sql: {} <- reader_call(format)",
-            "row_count_sql: {} <- reader_call(format)",
-            "column_profile_sql: {} <- reader_call(format)",
-            "reset: {} <- }",
-            "materialize: {} <- }",
-            concat!(
-                "table_counts: {} <- let count: i64 = ",
-                "statement.query_row(duckdb::params![], |row| row.get(0))?;"
-            ),
-            "table_rows: {} <- let (columns, rows) = self.select(&sql, duckdb::params![])?;",
-        ],
-        "the exhaustive list of (function, hole, filler) triples for every interpolation in \
-         every SQL literal in db.rs. A new hole — positional or named, on any line — is a \
-         query-surface decision, not a refactor"
+        holes,
+        Vec::<String>::new(),
+        "no SQL literal in db.rs may interpolate anything; assemble the statement from \
+         `&'static str` pieces with `Sql::from_parts` instead"
     );
 
     // 3. The verb set is closed, and the two deferred verbs stay deferred. The
@@ -2004,4 +2132,19 @@ fn a1a_item_14_the_inherited_contract_pins_still_exist() {
             "the {family} pin `{test}` is gone from {file}; §17.14 is about these surviving"
         );
     }
+}
+
+/// The text of the `{ .. }` block opened by the line `header`, up to the
+/// closing brace at that line's own indentation.
+fn block_after(source: &str, header: &str) -> String {
+    let at = source
+        .find(header)
+        .unwrap_or_else(|| panic!("db.rs must still contain `{header}`"));
+    let indent = header.len() - header.trim_start().len();
+    let closing = format!("\n{}}}", " ".repeat(indent));
+    let rest = &source[at + header.len()..];
+    let end = rest
+        .find(&closing)
+        .unwrap_or_else(|| panic!("`{header}` must close at its own indentation"));
+    rest[..end].to_string()
 }
