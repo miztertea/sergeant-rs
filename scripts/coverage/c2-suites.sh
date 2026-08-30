@@ -388,3 +388,11 @@ cov_stage_end 1 "the w5_search_surface test binary must write its own profile"
 cov_stage_begin c2-c1a_compiled_context
 cov_run cargo llvm-cov --no-report --test c1a_compiled_context --locked || cov_fail "c1a_compiled_context failed under instrumentation"
 cov_stage_end 1 "the c1a_compiled_context test binary must write its own profile"
+
+# S6 C1b, wired at birth (the #231 lesson): C1 §2's three tiers and §14's two
+# hard rendering budgets — items 3, 4 and 5. Nine in-process tests over a real
+# Atlas built by the ordinary `record_scan` path, including a 64 KiB unit the
+# budget must refuse to render. No daemon, no estate, no subprocess. Floor 1.
+cov_stage_begin c2-c1b_tiers_and_budget
+cov_run cargo llvm-cov --no-report --test c1b_tiers_and_budget --locked || cov_fail "c1b_tiers_and_budget failed under instrumentation"
+cov_stage_end 1 "the c1b_tiers_and_budget test binary must write its own profile"

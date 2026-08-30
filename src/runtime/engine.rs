@@ -5321,6 +5321,11 @@ impl Engine {
             bindings: &bindings,
             prior_stages: &run.stages,
             profile,
+            // §14's hard automatic-render budget. One value, written by a
+            // human and measured against this repository's own shipped stage
+            // procedures — see `RenderBudget`'s own doc. Nothing tunes it at
+            // runtime (§20: no learned context policy).
+            budget: crate::runtime::context::RenderBudget::DEFAULT,
         };
         let mut snapshot = compiler.compile(&request);
         let context = snapshot.render_onto(authored);

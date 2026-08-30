@@ -2335,6 +2335,133 @@ impl AtlasDb {
         Ok(out)
     }
 
+    /// **One exact unit, by its pinned coordinate** — C1 §21 item 4's
+    /// *"Referenced coordinates resolve **without broad rediscovery**"*, as a
+    /// keyed lookup.
+    ///
+    /// Every predicate is an equality on the coordinate a
+    /// [`crate::runtime::context::EvidenceCoordinate`] already carries:
+    /// `(generation_id, relative_path, ordinal)` is `source.units`' own
+    /// identity, so this reads one row and never ranks, scans a corpus, or
+    /// consults `context.lexical_units`. That is the difference item 4 is
+    /// about: [`Self::units`] lists a generation and [`Self::lexical_search`]
+    /// *searches* it; this resolves a pointer someone was already handed.
+    ///
+    /// Keyed on `generation_id` and **not** on `state = confirmed`, unlike
+    /// [`Self::units`]: a snapshot pins an exact generation precisely so it
+    /// re-resolves later, and a pin that stopped resolving the moment a newer
+    /// generation was confirmed would be a description rather than a pin
+    /// (§15). Nothing widens by it — a generation id only ever reaches a
+    /// caller through the admissibility filter that admitted it.
+    pub fn resolve_unit(
+        &self,
+        generation_id: &str,
+        relative_path: &str,
+        ordinal: u64,
+    ) -> Result<Option<StoredUnit>, AtlasError> {
+        let mut statement = self.conn.prepare(sql!(
+            "SELECT u.relative_path, u.local_key, u.ordinal, u.unit_kind, u.heading_level, \
+                    u.title, u.byte_start, u.byte_end, u.body \
+             FROM source.units u \
+             WHERE u.generation_id = ? AND u.relative_path = ? AND u.ordinal = ?"
+        ))?;
+        let mut rows = statement.query(duckdb::params![
+            generation_id,
+            relative_path,
+            ordinal as i64
+        ])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let kind: String = row.get(3)?;
+        Ok(Some(StoredUnit {
+            relative_path: row.get(0)?,
+            local_key: row.get(1)?,
+            ordinal: row.get::<usize, i64>(2)? as u64,
+            kind: UnitKind::parse(&kind).ok_or_else(|| AtlasError::UnknownValue {
+                column: "unit_kind".to_string(),
+                value: kind.clone(),
+            })?,
+            heading_level: row.get::<usize, Option<i64>>(4)?.map(|v| v as u8),
+            title: row.get(5)?,
+            byte_start: row.get::<usize, i64>(6)? as u64,
+            byte_end: row.get::<usize, i64>(7)? as u64,
+            body: row.get(8)?,
+        }))
+    }
+
+    /// **One exact stored relationship, by its pinned coordinate** — item 4's
+    /// other coordinate shape, resolved the same keyed way as
+    /// [`Self::resolve_unit`].
+    ///
+    /// `kind` picks the table because the two relationships C1 §5 contributes
+    /// are stored in two: a container/document/mail parent-child row lives in
+    /// `source.child_resources` and every syntax-derived edge lives in
+    /// `source.edges`. Both lookups are equalities on the coordinate's own
+    /// fields; neither scans a generation.
+    ///
+    /// `ordinal` (F-IN-01) discriminates two edges that legitimately share
+    /// every other field — e.g. the same file importing the same target
+    /// twice — which `(generation_id, edge_kind, relative_path, target)`
+    /// alone cannot: without it, `rows.next()` took whichever matching row
+    /// DuckDB returned first, non-deterministically. `None` widens back to
+    /// the old any-match behavior, which is correct for the child-resource
+    /// branch (no ordinal column) and for a coordinate pinned before this
+    /// field existed.
+    pub fn resolve_relationship(
+        &self,
+        generation_id: &str,
+        kind: &str,
+        from: &str,
+        to: &str,
+        ordinal: Option<u64>,
+    ) -> Result<Option<ResolvedRelationship>, AtlasError> {
+        if kind == CHILD_RESOURCE_RELATIONSHIP {
+            let mut statement = self.conn.prepare(sql!(
+                "SELECT c.parent_relative_path, c.relative_path, c.entry_path \
+                 FROM source.child_resources c \
+                 WHERE c.generation_id = ? AND c.parent_relative_path = ? \
+                   AND c.relative_path = ?"
+            ))?;
+            let mut rows = statement.query(duckdb::params![generation_id, from, to])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            return Ok(Some(ResolvedRelationship {
+                kind: CHILD_RESOURCE_RELATIONSHIP.to_string(),
+                from: row.get(0)?,
+                to: row.get(1)?,
+                ordinal: None,
+                detail: row.get::<usize, Option<String>>(2)?,
+            }));
+        }
+        let ordinal_param = ordinal.map(|o| o as i64);
+        let mut statement = self.conn.prepare(sql!(
+            "SELECT e.relative_path, e.target, e.ordinal, e.language \
+             FROM source.edges e \
+             WHERE e.generation_id = ? AND e.edge_kind = ? AND e.relative_path = ? \
+               AND e.target = ? AND (? IS NULL OR e.ordinal = ?)"
+        ))?;
+        let mut rows = statement.query(duckdb::params![
+            generation_id,
+            kind,
+            from,
+            to,
+            ordinal_param,
+            ordinal_param
+        ])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedRelationship {
+            kind: kind.to_string(),
+            from: row.get(0)?,
+            to: row.get(1)?,
+            ordinal: Some(row.get::<usize, i64>(2)? as u64),
+            detail: row.get::<usize, Option<String>>(3)?,
+        }))
+    }
+
     /// The symbol index of one source's confirmed generation, in
     /// `(language, label, name)` order, bounded by `limit` (capped at
     /// [`MAX_ROWS`], F12).
@@ -5406,6 +5533,41 @@ pub struct StoredEdge {
     pub byte_start: u64,
     /// End offset into the original file bytes, exclusive.
     pub byte_end: u64,
+}
+
+/// The relationship kind C1 §5 step 3 contributes for a container/document/
+/// mail parent-child row, and the one value of
+/// [`AtlasDb::resolve_relationship`]'s `kind` that reads
+/// `source.child_resources` rather than `source.edges`.
+///
+/// Declared here rather than spelled twice: the producer is
+/// [`crate::runtime::context`]'s `child_relationship` and the consumer is the
+/// resolver, and a literal in each is exactly the drift that would make a
+/// coordinate unresolvable while both files still looked right.
+pub const CHILD_RESOURCE_RELATIONSHIP: &str = "child_resource";
+
+/// One stored relationship, re-resolved from its exact coordinate by
+/// [`AtlasDb::resolve_relationship`].
+///
+/// Deliberately not [`StoredEdge`] or [`StoredChildResource`]: the two tables
+/// answer with different columns, and the thing item 4 asks for is that the
+/// pinned coordinate *resolves to the row it names* — the ends, and whatever
+/// one extra fact that table holds about them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRelationship {
+    /// The relationship's kind, as the coordinate named it.
+    pub kind: String,
+    /// The end it leaves from.
+    pub from: String,
+    /// The end it names — **unresolved** for a syntax edge, exactly as
+    /// [`StoredEdge::target`] is.
+    pub to: String,
+    /// Position within its file's edge list, for an edge. `None` for a
+    /// child-resource row, which has no ordinal.
+    pub ordinal: Option<u64>,
+    /// The one extra fact the storing table holds: §6.6's entry path for a
+    /// child resource, the grammar's language for an edge.
+    pub detail: Option<String>,
 }
 
 /// One coverage row read back out of the store, with the generation it

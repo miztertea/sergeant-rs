@@ -15,7 +15,7 @@
 //! | **item 10** — the snapshot pins generations that **re-resolve** | [`the_snapshot_pins_generations_that_re_resolve_to_the_same_evidence`] |
 //! | **item 10** — the retrieval generation/model is pinned when retrieval ran | [`the_snapshot_pins_the_retrieval_generation_and_model_it_actually_used`] |
 //! | §15 — one field per line of §15's list, in §15's order | [`the_snapshot_carries_one_field_per_line_of_section_15s_list`] |
-//! | §20 — no raw corpus stuffing: coordinates render, bodies do not | [`the_rendered_section_carries_coordinates_and_never_a_resource_body`] |
+//! | §2 — a Bound unit renders its coordinate **and** the body §14's budget allowed | [`the_rendered_section_carries_the_coordinate_beside_the_body_it_bound`] |
 //! | §15 — the selection-plan hash is a hash of the PLAN, not of the selection | [`the_selection_plan_hash_separates_two_plans_that_selected_the_same_evidence`] |
 //! | **item 13** — no compiler installed ⇒ the stage context is byte-identical | [`a_stage_with_no_compiler_installed_gets_its_authored_context_byte_for_byte`] |
 //! | **item 13** — intelligence *unavailable* ⇒ the same, and it says why | [`an_estate_with_no_confirmed_generation_leaves_the_context_byte_identical_and_says_why`] |
@@ -32,17 +32,13 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 use tempfile::TempDir;
 
-use sergeant_rs::domain::event::rfc3339_utc_now;
-use sergeant_rs::domain::source::{AuthorityClass, SourceKind, UnitKind};
+use sergeant_rs::domain::source::{AuthorityClass, SourceKind};
 use sergeant_rs::domain::workflow::{
     KIND_CONTEXT_COMPILED, StageDefinition, StageKind, StageRecord, StageStatus,
 };
 use sergeant_rs::runtime::atlas::db::AtlasDb;
 use sergeant_rs::runtime::atlas::overlay::overlay_source_name;
 use sergeant_rs::runtime::atlas::record::record_scan;
-use sergeant_rs::runtime::atlas::scan::{ScannedFile, ScannedUnit, SourceScan};
-use sergeant_rs::runtime::atlas::tabular::ContextFields;
-use sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR;
 use sergeant_rs::runtime::context::{
     Cognition, CompileRequest, ContextSnapshot, Degradation, EvidenceCoordinate, OrderViolation,
     ResearchLedger, ResearchStep, Tier, compile,
@@ -80,57 +76,10 @@ const REPOSITORY: &str = "demo-repo";
 /// the ordering test from being vacuous.
 const CONTESTED_BODY: &str = "The retention retention retention policy this Work changes.";
 
-fn unit(ordinal: u64, title: &str, text: &str) -> ScannedUnit {
-    ScannedUnit {
-        ordinal,
-        kind: UnitKind::Section,
-        heading_level: Some(1),
-        title: Some(title.to_string()),
-        byte_start: 0,
-        byte_end: text.len() as u64,
-        coordinate: None,
-        text: text.to_string(),
-    }
-}
-
-fn file(relative_path: &str, units: Vec<ScannedUnit>) -> ScannedFile {
-    let bytes: u64 = units.iter().map(|u| u.text.len() as u64).sum();
-    ScannedFile {
-        relative_path: relative_path.to_string(),
-        content_hash: format!("hash/{relative_path}"),
-        extractor: MARKDOWN_EXTRACTOR.to_string(),
-        local_key: format!("key/{relative_path}"),
-        byte_len: bytes,
-        mtime_millis: None,
-        units,
-        syntax: None,
-        parent: None,
-    }
-}
-
-fn scan(
-    source_name: &str,
-    kind: SourceKind,
-    authority: AuthorityClass,
-    files: Vec<ScannedFile>,
-) -> SourceScan {
-    let mut extractors = BTreeSet::new();
-    extractors.insert(MARKDOWN_EXTRACTOR.to_string());
-    SourceScan {
-        source_name: source_name.to_string(),
-        kind,
-        authority,
-        content_key: format!("{source_name}@generation-1"),
-        revision: None,
-        observed_at: rfc3339_utc_now(),
-        files,
-        coverage: Vec::new(),
-        extractors,
-        datasets: Vec::new(),
-        root: None,
-        context_fields: ContextFields::none(),
-    }
-}
+// `unit`/`file`/`scan` fixture builders live in `tests/support` (R2 — F-SI-01:
+// this file and `tests/c1b_tiers_and_budget.rs` had built byte-identical
+// copies of the same three functions).
+use support::{file, scan, unit};
 
 /// A real Atlas holding two confirmed generations: the Work's base repository
 /// and the Work's own overlay over it.
@@ -240,6 +189,7 @@ fn compiled(atlas: Option<&AtlasDb>) -> ContextSnapshot {
             bindings: &bindings,
             prior_stages: &prior,
             profile: Some("standard"),
+            budget: sergeant_rs::runtime::context::RenderBudget::DEFAULT,
         },
     )
 }
@@ -601,19 +551,28 @@ fn the_snapshot_carries_one_field_per_line_of_section_15s_list() {
     // an absent field cannot be told from a forgotten one.
     assert_eq!(json["query_result_ids"], serde_json::json!([]));
     assert_eq!(json["payload_pointer"], Value::Null);
-    assert_eq!(json["budget"], Value::Null);
+    // §15's `budget` line stopped being empty when C1b landed §14's two
+    // budgets; `tests/c1b_tiers_and_budget.rs` owns what it says.
+    assert_eq!(json["budget"]["unit"], "bytes", "{json}");
 }
 
 // ============================================================ §20's non-goals
 
-/// §20's first non-goal: *"raw corpus stuffing"*.
+/// §20's first non-goal: *"raw corpus stuffing"* — and what C1b changed
+/// about it.
 ///
-/// The rendered section names the resource and never carries its body. The
-/// body text is in the fixture and in the store, so a renderer that reached
-/// for it would have it — this is a check that it does not, not that it
-/// could not.
+/// C1a rendered coordinates and never a body, because §2's Bound tier
+/// (*"evidence deliberately **rendered into** the actor's initial context"*)
+/// cannot be delivered safely without §14's budget, and that budget was the
+/// next wave's. C1b landed it, so a Bound body now renders — **inside a hard
+/// budget**, which is the whole difference between §2's Bound tier and §20's
+/// first non-goal. This test pins that the authored procedure is still
+/// untouched, that the coordinate is still there beside the body, and that
+/// Reachable still renders; `tests/c1b_tiers_and_budget.rs` owns the budget
+/// itself, including that a source larger than the budget cannot fill Bound
+/// with body text.
 #[test]
-fn the_rendered_section_carries_coordinates_and_never_a_resource_body() {
+fn the_rendered_section_carries_the_coordinate_beside_the_body_it_bound() {
     let fixture = fixture();
     let snapshot = compiled(Some(&fixture.db));
     let rendered = snapshot.render_onto("authored stage procedure");
@@ -624,12 +583,9 @@ fn the_rendered_section_carries_coordinates_and_never_a_resource_body() {
     );
     assert!(rendered.contains("notes/plan.md"), "{rendered}");
     assert!(
-        !rendered.contains(CONTESTED_BODY),
-        "a resource BODY reached the prompt: {rendered}"
-    );
-    assert!(
-        !rendered.contains("The daemon owns the journal"),
-        "a resource BODY reached the prompt: {rendered}"
+        rendered.contains(CONTESTED_BODY),
+        "§2's Bound tier renders evidence INTO the context, within §14's \
+         budget: {rendered}"
     );
     assert!(rendered.contains("REACHABLE"), "{rendered}");
 }
@@ -666,6 +622,7 @@ fn the_selection_plan_hash_separates_two_plans_that_selected_the_same_evidence()
             bindings: &bindings,
             prior_stages: &[],
             profile: Some("standard"),
+            budget: sergeant_rs::runtime::context::RenderBudget::DEFAULT,
         },
     );
     assert_ne!(

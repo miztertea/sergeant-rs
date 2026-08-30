@@ -647,6 +647,72 @@ pub fn scaffold_solo_estate(root: &Path, name: &str) -> (PathBuf, String) {
     (root.join("repos").join(name), head)
 }
 
+/// A C1a/C1b Atlas-scan fixture unit: one section, deliberately minimal
+/// (heading level 1, no coordinate) so callers only ever vary ordinal, title
+/// and text (R2 — shared by `tests/c1a_compiled_context.rs` and
+/// `tests/c1b_tiers_and_budget.rs`, which built byte-identical copies of this
+/// before F-SI-01).
+pub fn unit(
+    ordinal: u64,
+    title: &str,
+    text: &str,
+) -> sergeant_rs::runtime::atlas::scan::ScannedUnit {
+    sergeant_rs::runtime::atlas::scan::ScannedUnit {
+        ordinal,
+        kind: sergeant_rs::domain::source::UnitKind::Section,
+        heading_level: Some(1),
+        title: Some(title.to_string()),
+        byte_start: 0,
+        byte_end: text.len() as u64,
+        coordinate: None,
+        text: text.to_string(),
+    }
+}
+
+/// A C1a/C1b Atlas-scan fixture file wrapping [`unit`]s. See [`unit`]'s doc.
+pub fn file(
+    relative_path: &str,
+    units: Vec<sergeant_rs::runtime::atlas::scan::ScannedUnit>,
+) -> sergeant_rs::runtime::atlas::scan::ScannedFile {
+    let bytes: u64 = units.iter().map(|u| u.text.len() as u64).sum();
+    sergeant_rs::runtime::atlas::scan::ScannedFile {
+        relative_path: relative_path.to_string(),
+        content_hash: format!("hash/{relative_path}"),
+        extractor: sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR.to_string(),
+        local_key: format!("key/{relative_path}"),
+        byte_len: bytes,
+        mtime_millis: None,
+        units,
+        syntax: None,
+        parent: None,
+    }
+}
+
+/// A C1a/C1b Atlas-scan fixture source wrapping [`file`]s. See [`unit`]'s doc.
+pub fn scan(
+    source_name: &str,
+    kind: sergeant_rs::domain::source::SourceKind,
+    authority: sergeant_rs::domain::source::AuthorityClass,
+    files: Vec<sergeant_rs::runtime::atlas::scan::ScannedFile>,
+) -> sergeant_rs::runtime::atlas::scan::SourceScan {
+    let mut extractors = std::collections::BTreeSet::new();
+    extractors.insert(sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR.to_string());
+    sergeant_rs::runtime::atlas::scan::SourceScan {
+        source_name: source_name.to_string(),
+        kind,
+        authority,
+        content_key: format!("{source_name}@generation-1"),
+        revision: None,
+        observed_at: sergeant_rs::domain::event::rfc3339_utc_now(),
+        files,
+        coverage: Vec::new(),
+        extractors,
+        datasets: Vec::new(),
+        root: None,
+        context_fields: sergeant_rs::runtime::atlas::tabular::ContextFields::none(),
+    }
+}
+
 /// A cross-process mutex over a fixed OS resource a test cannot make
 /// per-process-unique (#305: `t5_disabled_export_runs_no_exporter_machinery`
 /// must bind the daemon's literal `DEFAULT_OTLP_ENDPOINT`, port 0 or a
