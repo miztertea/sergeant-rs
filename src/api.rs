@@ -6180,6 +6180,19 @@ impl SearchQuery {
             atlas_db::Admissibility {
                 source,
                 kind,
+                // A2 §2's stage 2. `None` narrows nothing, and no selector
+                // sets it, because in this build `authority_class` is a
+                // total function of `source_kind` — every producer pairs
+                // LocalKnowledge/EstateReadonly, EstateGit/EstateMutable and
+                // ExternalGit/External — so `--type` above already names
+                // every world an authority selector could name, and A2 §14's
+                // selector list carries no authority flag. That is a
+                // property of today's producers, not of the design, so it is
+                // pinned rather than assumed:
+                // `w1_deterministic_filter::the_authority_axis_earns_no_\
+                // selector_only_while_it_is_a_function_of_source_kind` fails
+                // the moment a producer breaks the pairing, which is when
+                // this field needs a caller.
                 authority: None,
             },
             attribution,
