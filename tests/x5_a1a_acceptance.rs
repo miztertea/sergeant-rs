@@ -736,7 +736,7 @@ const WALK: &[Item] = &[
                ('100k ServiceNow tickets in CSV/JSON/Parquet inside an archive') not working: a \
                `.csv` child answered `None` and landed as a gap whose detail said 'nothing in \
                this build claims its extension' while `tabular.rs` claims csv/tsv/json/jsonl/ \
-               parquet. It now takes the relational lane a loose one takes — registered, not \
+               ndjson/parquet. It now takes the relational lane a loose one takes — registered, not \
                prose-flattened (A1-13) — with the daemon materialising the child's bytes into \
                its own scratch directory under the data dir, named by its own content hash and \
                removed when the read ends, because DuckDB reads a dataset from a path and a \
