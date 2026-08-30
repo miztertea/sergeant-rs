@@ -151,6 +151,119 @@ impl std::fmt::Display for AuthorityClass {
     }
 }
 
+// ---------------------------------------------------------------------
+// S6 D1 — A2 §2 stage 1's **estate** axis.
+// ---------------------------------------------------------------------
+
+/// The estate coordinate a generation was indexed **for** — A2 §2 stage 1's
+/// *"source / **estate** / Work generation filter"*, recorded at scan time
+/// so a query can filter on it.
+///
+/// # Why this exists
+///
+/// Atlas is host-scoped: one daemon, one `atlas.duckdb`, every estate ever
+/// addressed on this host writing into it ([`crate::api`]'s `data_dir`).
+/// Until S6 D1 nothing recorded *which* estate a generation came from, so
+/// `sgt search` from estate A returned estate B's indexed code as hit #1
+/// (measured 2026-08-30, `knowledge/evidence/resources/host-atlas-series/
+/// estate-isolation-absent-2026-08-30.md`). `README.md`: *"An estate is the
+/// exact directory containing `sergeant.toml`. It can hold one repository
+/// or hundreds without combining histories."* Estates do not combine, and
+/// two estates on one host are not one world.
+///
+/// The shared store is deliberate and stays (one Atlas database, no
+/// `ATTACH` — A1 §5); what was missing is the **query-time** filter, and
+/// this is the fact that filter needs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EstateBinding {
+    /// Indexed for exactly one estate, named by its **canonical exact
+    /// root** — the same string every estate-scoped route resolves through
+    /// `admit_addressed_estate`, so the recorded value and the queried
+    /// value are produced by one resolver rather than two spellings.
+    Estate(String),
+    /// Host-scoped **by design**, and readable from every estate on this
+    /// host: an `external_git` source acquired through
+    /// `POST /v1/intelligence/sources`, which reads no `estate_root` at all
+    /// (A1 §9, and that handler's own doc). This variant is the one and
+    /// only way a generation is admissible outside the estate that scanned
+    /// it, and it is never chosen for `estate_git` or `local_knowledge`
+    /// bytes — those are the estate's own.
+    Host,
+}
+
+/// The `estate_scope` column value for a host-scoped generation.
+pub const ESTATE_SCOPE_HOST: &str = "host";
+
+/// The `estate_scope` column value for an estate-bound generation.
+pub const ESTATE_SCOPE_ESTATE: &str = "estate";
+
+impl EstateBinding {
+    /// The `(estate_scope, estate_root)` pair this binding stores.
+    pub fn columns(&self) -> (&'static str, Option<&str>) {
+        match self {
+            Self::Estate(root) => (ESTATE_SCOPE_ESTATE, Some(root.as_str())),
+            Self::Host => (ESTATE_SCOPE_HOST, None),
+        }
+    }
+}
+
+/// A2 §2 stage 1's estate axis **on the query side** — the one
+/// default-**DENY** field of
+/// [`Admissibility`](crate::runtime::atlas::db::Admissibility).
+///
+/// # Read this before assuming it behaves like the other axes
+///
+/// `Admissibility::kind` and `Admissibility::authority` both document
+/// *"`None` admits every kind — narrows only what a caller explicitly asked
+/// to narrow"*. **This axis is the opposite, deliberately.** An estate axis
+/// that defaulted to "admit everything" would leave the S6 D1 leak exactly
+/// where it was found: every existing consumer omitted the estate, so a
+/// default-allow axis would have changed nothing. So:
+///
+/// * [`Self::NoEstate`] — the `Default` — admits **nothing at all**. Not
+///   "every estate": a caller that could not name an estate root gets an
+///   empty world, because "I do not know whose evidence this is" is not a
+///   licence to read all of it.
+/// * [`Self::Estate`] admits that one estate's generations plus the
+///   generations recorded [`EstateBinding::Host`] — and nothing else.
+///
+/// There is no "every estate" variant, and adding one would be a
+/// confidentiality regression, not a feature: reading another estate's
+/// world is done by *addressing that estate*, which is an explicit act with
+/// its own admission check.
+///
+/// A generation with **no** binding row at all — one indexed by a build
+/// older than S6 D1 — is inadmissible from everywhere. That is fail-closed
+/// on purpose and is repaired by `sgt intelligence scan`, which records the
+/// binding; admitting an unattributable generation is precisely the defect.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EstateAdmission {
+    /// Admits nothing. The `Default`, so a construction site that forgets
+    /// this axis fails closed rather than leaking.
+    #[default]
+    NoEstate,
+    /// Admits exactly this canonical estate root's generations, plus
+    /// [`EstateBinding::Host`] ones.
+    Estate(String),
+}
+
+impl EstateAdmission {
+    /// The estate root this admission binds into the SQL predicate, or
+    /// `None` for [`Self::NoEstate`] — which the predicate's own `? IS NOT
+    /// NULL` turns into "admit nothing", host-scoped rows included.
+    pub fn bind(&self) -> Option<&str> {
+        match self {
+            Self::NoEstate => None,
+            Self::Estate(root) => Some(root.as_str()),
+        }
+    }
+
+    /// The admission an addressed estate root earns.
+    pub fn of(root: &std::path::Path) -> Self {
+        Self::Estate(root.to_string_lossy().into_owned())
+    }
+}
+
 /// One exact observed world for one source (§3).
 ///
 /// `id` is opaque and unique per observation; `content_key` is what makes two

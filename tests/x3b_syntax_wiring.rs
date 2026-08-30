@@ -24,6 +24,17 @@
 //! * **F6: it runs on the intelligence lane**, over X3a's batched blobs.
 //! * **F1/ruling §4: the rows live and die with their generation.**
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/x3b_syntax_wiring";
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -111,9 +122,14 @@ fn recorded_polyglot() -> (TempDir, TempDir, PathBuf, AtlasDb, String) {
     let (repo_dir, mount, sha) = repo(POLYGLOT);
     let data = tempfile::tempdir().expect("data");
     let (mut db, mut journal) = store(data.path());
-    let (record, _) =
-        scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &sha), None)
-            .expect("record");
+    let (record, _) = scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &sha),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
     let ScanRecord::Recorded { generation_id, .. } = record else {
         panic!("expected a recorded generation, got {record:?}");
     };
@@ -239,7 +255,14 @@ fn one_name_in_two_files_is_one_symbol_and_two_occurrences() {
     ]);
     let data = tempfile::tempdir().expect("data");
     let (mut db, mut journal) = store(data.path());
-    scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &sha), None).expect("record");
+    scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &sha),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
 
     let symbols = db.symbols("product", 100).expect("symbols");
     let shared: Vec<_> = symbols.iter().filter(|s| s.name == "shared").collect();
@@ -385,7 +408,14 @@ fn a_language_this_build_does_not_claim_is_unsupported_not_almost_parsed() {
     ]);
     let data = tempfile::tempdir().expect("data");
     let (mut db, mut journal) = store(data.path());
-    scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &sha), None).expect("record");
+    scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &sha),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
 
     let coverage = db.coverage("product", 100).expect("coverage");
     let tsx = coverage
@@ -423,7 +453,14 @@ fn a_file_a_grammar_cannot_parse_is_an_error_row_with_no_partial_symbols() {
     ]);
     let data = tempfile::tempdir().expect("data");
     let (mut db, mut journal) = store(data.path());
-    scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &sha), None).expect("record");
+    scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &sha),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
 
     let coverage = db.coverage("product", 100).expect("coverage");
     let broken = coverage
@@ -481,7 +518,14 @@ fn the_scan_summary_counts_symbols_and_edges() {
     let (_repo, mount, sha) = repo(POLYGLOT);
     let data = tempfile::tempdir().expect("data");
     let (mut db, mut journal) = store(data.path());
-    scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &sha), None).expect("record");
+    scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &sha),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
 
     let summary = journal
         .replay_from_floor()
@@ -555,7 +599,14 @@ async fn extraction_on_the_intelligence_lane_produces_the_same_symbols() {
     // And the rows the lane's scan produces record exactly as the direct one's
     // do — one writer, whichever route the scan took.
     let (mut db, mut journal) = store(data.path());
-    record_scan(&mut db, &mut journal, &on_lane.scan, None).expect("record");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &on_lane.scan,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
     assert!(!db.symbols("product", 500).expect("symbols").is_empty());
 }
 
@@ -568,14 +619,26 @@ fn evicting_a_generation_takes_its_syntax_rows_with_it() {
     let (_repo, mount, sha) = repo(&[("a.rs", "pub fn first() {}\n")]);
     let data = tempfile::tempdir().expect("data");
     let (mut db, mut journal) = store(data.path());
-    scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &sha), None).expect("record");
+    scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &sha),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
     assert_eq!(db.symbols("product", 100).expect("symbols").len(), 1);
 
     // A second commit changes the bytes, so ruling §4 evicts the predecessor.
     let next = commit(&mount, &[("a.rs", "pub fn second() {}\n")], "two");
-    let (record, _) =
-        scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &next), None)
-            .expect("record");
+    let (record, _) = scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &next),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
     let ScanRecord::Recorded { evicted, .. } = record else {
         panic!("expected a recorded generation, got {record:?}");
     };
@@ -611,8 +674,14 @@ fn syntax_rows_survive_reopening_the_store() {
     let data = tempfile::tempdir().expect("data");
     {
         let (mut db, mut journal) = store(data.path());
-        scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &sha), None)
-            .expect("record");
+        scan_and_record_estate_git(
+            &mut db,
+            &mut journal,
+            &source(&mount, &sha),
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record");
     }
     let db = AtlasDb::open(data.path()).expect("reopen");
     let symbols = db.symbols("product", 100).expect("symbols");

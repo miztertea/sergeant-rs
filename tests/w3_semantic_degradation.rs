@@ -31,6 +31,17 @@
 //! unit-tested in `src/runtime/atlas/semantic.rs` against a constructed
 //! model value; it is the *host* that has none.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w3_semantic_degradation";
+
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -80,6 +91,7 @@ impl Estate {
 
 fn only_knowledge() -> Admissibility {
     Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named("knowledge".to_string()),
         kind: None,
         authority: None,
@@ -146,7 +158,14 @@ fn estate() -> Estate {
         root: None,
         context_fields: ContextFields::none(),
     };
-    record_scan(&mut db, &mut journal, &scan, None).expect("record knowledge");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &scan,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record knowledge");
     Estate { _data: data, db }
 }
 

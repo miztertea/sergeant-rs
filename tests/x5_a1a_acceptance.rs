@@ -103,6 +103,17 @@
 //! ("no silent pass") applies to the DISPATCH half of a capability just as
 //! much as to the capability's own existence.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/x5_a1a_acceptance";
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1238,7 +1249,14 @@ fn a1a_item_3_a_knowledge_source_is_indexed_without_becoming_a_repo_or_getting_a
         ignore: Vec::new(),
         context_fields: Default::default(),
     };
-    let record = scan_and_record(&mut db, &mut journal, &source, None).expect("scan");
+    let record = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("scan");
     let generation = match record {
         ScanRecord::Recorded { generation_id, .. } => generation_id,
         other => panic!("a readable source must record a generation, got {other:?}"),

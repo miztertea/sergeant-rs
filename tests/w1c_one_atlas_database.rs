@@ -33,6 +33,17 @@
 //! contract depends on staying absent. [`lock_order_is_atlas_then_analytics`]
 //! pins that structurally rather than leaving it prose-only.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w1c_one_atlas_database";
+
 use std::collections::BTreeSet;
 
 use serde_json::json;
@@ -159,6 +170,7 @@ fn one_statement_joins_ops_work_identity_to_source_generations() {
         &mut journal,
         &scan("repo-a", "repo-a@key-1", "fn base() {}\n"),
         None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
     )
     .expect("record base");
     record_scan(
@@ -170,6 +182,7 @@ fn one_statement_joins_ops_work_identity_to_source_generations() {
             "fn overlaid() {}\n",
         ),
         None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
     )
     .expect("record overlay");
 
@@ -269,6 +282,7 @@ fn deleting_atlas_duckdb_rebuilds_ops_and_loses_source_facts() {
         &mut event_log,
         &scan("repo-a", "repo-a@key-1", "fn base() {}\n"),
         None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
     )
     .expect("record base");
     let sources_before = db.indexed_sources().expect("indexed sources");

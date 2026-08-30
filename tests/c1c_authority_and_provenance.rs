@@ -29,6 +29,17 @@
 //! prompt aesthetics"*). The **native/extractor** half of item 8 is fully
 //! delivered and is what the tests above check.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/c1c_authority_and_provenance";
+
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
@@ -193,7 +204,14 @@ fn injection_world(body: &str) -> (TempDir, AtlasDb) {
             )],
         )],
     );
-    record_scan(&mut db, &mut journal, &estate, None).expect("record estate source");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &estate,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record estate source");
 
     let external = scan(
         "vendor-docs",
@@ -201,7 +219,14 @@ fn injection_world(body: &str) -> (TempDir, AtlasDb) {
         AuthorityClass::External,
         vec![file("AGENTS.md", vec![unit(0, "Retention", body)])],
     );
-    record_scan(&mut db, &mut journal, &external, None).expect("record external source");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &external,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record external source");
     (data, db)
 }
 
@@ -480,7 +505,14 @@ fn a_document_excerpt_carries_extractor_native_coordinate_and_heading() {
             vec![unit(0, "Architecture", "The daemon owns the journal.")],
         )],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
     let overlay = scan(
         &overlay_source_name(WORK_ID, REPOSITORY),
         SourceKind::EstateGit,
@@ -493,7 +525,14 @@ fn a_document_excerpt_carries_extractor_native_coordinate_and_heading() {
             ),
         ],
     );
-    record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &overlay,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record overlay");
 
     let snapshot = compiled(&db, &bindings(), &prior_stages());
     let docx = unit_at(&snapshot, "decks/current-state.docx");
@@ -617,7 +656,14 @@ fn dataset_world(rows: usize) -> (TempDir, TempDir, AtlasDb) {
         ignore: Vec::new(),
         context_fields: ContextFields::declared(&["ticket".to_string()]),
     };
-    scan_and_record(&mut db, &mut journal, &source, None).expect("scan and record");
+    scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("scan and record");
     (data, knowledge, db)
 }
 
@@ -805,6 +851,7 @@ fn a_bound_query_result_and_a_retrieved_row_join_on_the_dataset_key() {
         .lexical_search(&LexicalQuery {
             text: "INC0000007",
             filter: &sergeant_rs::runtime::atlas::db::Admissibility {
+                estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
                 source: SourceSelector::Named("library".to_string()),
                 kind: None,
                 authority: None,
@@ -860,7 +907,14 @@ fn knowledge_evidence_is_selected_without_widening_the_works_mutation_scope() {
                 vec![unit(0, "Architecture", "The daemon owns the journal.")],
             )],
         );
-        record_scan(&mut db, &mut journal, &base, None).expect("record base");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &base,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record base");
         let overlay = scan(
             &overlay_source_name(WORK_ID, REPOSITORY),
             SourceKind::EstateGit,
@@ -870,7 +924,14 @@ fn knowledge_evidence_is_selected_without_widening_the_works_mutation_scope() {
                 vec![unit(0, "Plan", "The retention policy this Work changes.")],
             )],
         );
-        record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &overlay,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record overlay");
         if with_knowledge {
             std::fs::write(
                 knowledge.path().join("cases.csv"),
@@ -883,7 +944,14 @@ fn knowledge_evidence_is_selected_without_widening_the_works_mutation_scope() {
                 ignore: Vec::new(),
                 context_fields: ContextFields::declared(&["case".to_string()]),
             };
-            scan_and_record(&mut db, &mut journal, &source, None).expect("scan knowledge");
+            scan_and_record(
+                &mut db,
+                &mut journal,
+                &source,
+                None,
+                &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+            )
+            .expect("scan knowledge");
         }
         (data, knowledge, db)
     }
@@ -990,7 +1058,14 @@ fn a_second_repository_mount_is_never_admitted_however_relevant_it_is() {
             vec![unit(0, "Architecture", "The daemon owns the journal.")],
         )],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
     // The bait: a different mount, saturated with the intent's own words.
     let other = scan(
         "other-repo",
@@ -1005,7 +1080,14 @@ fn a_second_repository_mount_is_never_admitted_however_relevant_it_is() {
             )],
         )],
     );
-    record_scan(&mut db, &mut journal, &other, None).expect("record the other mount");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &other,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record the other mount");
     std::fs::write(
         knowledge.path().join("cases.csv"),
         "case,outcome\nC-1,retained\n",
@@ -1021,6 +1103,7 @@ fn a_second_repository_mount_is_never_admitted_however_relevant_it_is() {
             context_fields: ContextFields::declared(&["case".to_string()]),
         },
         None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
     )
     .expect("scan knowledge");
 

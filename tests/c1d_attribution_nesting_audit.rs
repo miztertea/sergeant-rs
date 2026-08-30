@@ -41,6 +41,17 @@
 //! `context.contradiction_observed` (§9's detection does not exist, and
 //! scoring disagreement is the synthesized consensus §9 forbids).
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/c1d_attribution_nesting_audit";
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -165,7 +176,14 @@ fn evidence_world() -> (TempDir, AtlasDb) {
             vec![unit(0, "Architecture", "The daemon owns the journal.")],
         )],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
 
     let deck = ScannedFile {
         relative_path: "decks/retention.pptx".to_string(),
@@ -199,7 +217,14 @@ fn evidence_world() -> (TempDir, AtlasDb) {
             ),
         ],
     );
-    record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &overlay,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record overlay");
     (data, db)
 }
 
@@ -882,7 +907,14 @@ fn seed_atlas(data_dir: &Path) {
             )],
         )],
     );
-    record_scan(&mut db, &mut journal, &knowledge, None).expect("record knowledge source");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &knowledge,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record knowledge source");
 }
 
 async fn start(

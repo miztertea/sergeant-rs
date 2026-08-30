@@ -23,6 +23,17 @@
 //!   reconciliation promotes rather than evicts. Both-present is a rule in
 //!   both directions — journal-present/database-evicted breaks it too.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/x2_knowledge_sources";
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -274,7 +285,14 @@ fn a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one()
     let mut db = AtlasDb::open(data.path()).expect("atlas");
     let mut journal = Journal::open(data.path()).expect("journal");
 
-    let first = scan_and_record(&mut db, &mut journal, &source, None).expect("scan");
+    let first = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("scan");
     let ScanRecord::Recorded {
         generation_id: first_generation,
         evicted,
@@ -308,7 +326,14 @@ fn a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one()
 
     // A re-scan of unchanged bytes: no new generation, no new summary, no
     // eviction. Ruling §4 stated as behavior.
-    let again = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    let again = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("rescan");
     assert!(
         matches!(&again, ScanRecord::Unchanged { generation_id, .. } if *generation_id == first_generation),
         "an unchanged source must reuse its generation, got {again:?}"
@@ -322,7 +347,14 @@ fn a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one()
     // Edit one byte: a new generation, and the old one evicted with a row
     // that says so rather than simply vanishing.
     std::fs::write(notes.path().join("index.md"), "# Index\n\nedited\n").expect("write");
-    let third = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    let third = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("rescan");
     let ScanRecord::Recorded {
         generation_id: second_generation,
         evicted,
@@ -380,7 +412,14 @@ fn the_scan_summary_is_one_compact_event_with_provenance_and_no_path_list() {
     ]);
     let mut db = AtlasDb::open(data.path()).expect("atlas");
     let mut journal = Journal::open(data.path()).expect("journal");
-    scan_and_record(&mut db, &mut journal, &source("notes", notes.path()), None).expect("scan");
+    scan_and_record(
+        &mut db,
+        &mut journal,
+        &source("notes", notes.path()),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("scan");
 
     let summaries = scan_summaries(data.path());
     assert_eq!(summaries.len(), 1);
@@ -509,8 +548,14 @@ async fn source_facts_survive_a_real_daemon_restart() {
     let generation = {
         let mut db = AtlasDb::open(data.path()).expect("atlas");
         let mut journal = Journal::open(data.path()).expect("journal");
-        let record = scan_and_record(&mut db, &mut journal, &source("notes", notes.path()), None)
-            .expect("scan");
+        let record = scan_and_record(
+            &mut db,
+            &mut journal,
+            &source("notes", notes.path()),
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("scan");
         let ScanRecord::Recorded { generation_id, .. } = record else {
             panic!("expected a recorded generation");
         };
@@ -603,7 +648,13 @@ async fn a_crash_between_the_rows_and_the_summary_reports_neither() {
         let scan = scan_local_knowledge(&source).expect("scan");
         // Step 1 only. The process "dies" here: no journal append, no
         // confirmation.
-        match db.stage_scan(&scan).expect("stage") {
+        match db
+            .stage_scan(
+                &scan,
+                &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+            )
+            .expect("stage")
+        {
             sergeant_rs::runtime::atlas::db::ScanCommit::Staged { generation_id } => generation_id,
             other => panic!("expected a staged generation, got {other:?}"),
         }
@@ -666,7 +717,14 @@ async fn a_crash_between_the_rows_and_the_summary_reports_neither() {
     // window, it does not poison the source.
     let mut db = AtlasDb::open(data.path()).expect("atlas");
     let mut journal = Journal::open(data.path()).expect("journal");
-    let record = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    let record = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("rescan");
     assert!(matches!(record, ScanRecord::Recorded { .. }), "{record:?}");
     assert!(!db.units("notes", 100).expect("units").is_empty());
     data.reap();
@@ -701,7 +759,13 @@ async fn a_crash_after_the_summary_but_before_confirmation_completes_the_scan() 
         let mut journal = Journal::open(data.path()).expect("journal");
         let scan = scan_local_knowledge(&source).expect("scan");
         // Step 1.
-        let staged = match db.stage_scan(&scan).expect("stage") {
+        let staged = match db
+            .stage_scan(
+                &scan,
+                &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+            )
+            .expect("stage")
+        {
             sergeant_rs::runtime::atlas::db::ScanCommit::Staged { generation_id } => generation_id,
             other => panic!("expected a staged generation, got {other:?}"),
         };
@@ -758,7 +822,14 @@ async fn a_crash_after_the_summary_but_before_confirmation_completes_the_scan() 
     // a re-scan of unchanged bytes reuses it rather than churning a new one.
     let mut db = AtlasDb::open(data.path()).expect("atlas");
     let mut journal = Journal::open(data.path()).expect("journal");
-    let again = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    let again = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("rescan");
     assert!(
         matches!(&again, ScanRecord::Unchanged { generation_id, .. } if *generation_id == staged),
         "{again:?}"
@@ -789,7 +860,14 @@ fn an_unreachable_root_keeps_the_generation_it_cannot_rescan() {
 
     let mut db = AtlasDb::open(data.path()).expect("atlas");
     let mut journal = Journal::open(data.path()).expect("journal");
-    let first = scan_and_record(&mut db, &mut journal, &source, None).expect("scan");
+    let first = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("scan");
     let ScanRecord::Recorded { generation_id, .. } = first else {
         panic!("expected a recorded generation, got {first:?}");
     };
@@ -799,7 +877,14 @@ fn an_unreachable_root_keeps_the_generation_it_cannot_rescan() {
     // The drive goes away.
     std::fs::remove_dir_all(&root).expect("remove the root");
 
-    let second = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    let second = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("rescan");
     let ScanRecord::RootUnavailable {
         generation_id: still,
         detail,
@@ -856,7 +941,14 @@ fn an_unreachable_root_keeps_the_generation_it_cannot_rescan() {
         "# Index\n\nbody\n\n## Deep\n\nmore\n",
     )
     .expect("write");
-    let third = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    let third = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("rescan");
     assert!(
         matches!(&third, ScanRecord::Unchanged { generation_id: id, .. } if *id == generation_id),
         "{third:?}"
@@ -865,7 +957,14 @@ fn an_unreachable_root_keeps_the_generation_it_cannot_rescan() {
     // But a root that is genuinely readable and genuinely empty is a real
     // observation, and it does supersede.
     std::fs::remove_file(root.join("index.md")).expect("remove");
-    let fourth = scan_and_record(&mut db, &mut journal, &source, None).expect("rescan");
+    let fourth = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("rescan");
     assert!(
         matches!(&fourth, ScanRecord::Recorded { evicted, .. } if evicted.as_deref() == Some(generation_id.as_str())),
         "an emptied-but-readable root is evidence of emptiness: {fourth:?}"
@@ -898,7 +997,14 @@ fn case_variants_of_the_denied_families_never_reach_a_unit() {
     ]);
     let mut db = AtlasDb::open(data.path()).expect("atlas");
     let mut journal = Journal::open(data.path()).expect("journal");
-    scan_and_record(&mut db, &mut journal, &source("notes", notes.path()), None).expect("scan");
+    scan_and_record(
+        &mut db,
+        &mut journal,
+        &source("notes", notes.path()),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("scan");
 
     let units = db.units("notes", 100).expect("units");
     assert!(

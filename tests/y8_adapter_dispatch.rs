@@ -14,6 +14,17 @@
 //! [`run_worker`]: sergeant_rs::runtime::atlas::worker::run_worker
 //! [`scan_local_knowledge_on_lane`]: sergeant_rs::runtime::atlas::lane::scan_local_knowledge_on_lane
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/y8_adapter_dispatch";
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -467,7 +478,14 @@ fn a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_g
     let data_dir = TempDir::new().expect("data dir");
     let mut db = AtlasDb::open(data_dir.path()).expect("open atlas");
     let mut journal = Journal::open(data_dir.path()).expect("open journal");
-    let record = record_scan(&mut db, &mut journal, &scan, None).expect("record");
+    let record = record_scan(
+        &mut db,
+        &mut journal,
+        &scan,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
     assert!(
         matches!(
             record,

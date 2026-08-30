@@ -17,6 +17,17 @@
 //! * **F6's intelligence lane has a real consumer, and it is not the execution
 //!   lane.**
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/x3a_git_plumbing";
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -237,8 +248,14 @@ fn stored_estate_git_keys_are_blob_oids_and_a_rescan_evicts_nothing() {
     let mut db = AtlasDb::open(data.path()).expect("open atlas");
     let mut journal = journal_at(data.path());
 
-    let (recorded, drift) =
-        scan_and_record_estate_git(&mut db, &mut journal, &src, None).expect("record");
+    let (recorded, drift) = scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &src,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
     assert!(drift.is_none());
     let generation = match &recorded {
         ScanRecord::Recorded {
@@ -279,7 +296,14 @@ fn stored_estate_git_keys_are_blob_oids_and_a_rescan_evicts_nothing() {
     );
 
     // Re-scanning the same commit is the same world: ruling §4 evicts nothing.
-    let (again, _) = scan_and_record_estate_git(&mut db, &mut journal, &src, None).expect("rescan");
+    let (again, _) = scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &src,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("rescan");
     assert!(
         matches!(&again, ScanRecord::Unchanged { generation_id, .. } if *generation_id == generation),
         "an unchanged tree churned a generation: {again:?}"
@@ -295,8 +319,14 @@ fn a_new_commit_with_an_identical_tree_is_the_same_generation() {
     let (_dir, mount, shas) = repo(&[&[("a.md", "# A\n")]]);
     let mut db = AtlasDb::open(data.path()).expect("open atlas");
     let mut journal = journal_at(data.path());
-    scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &shas[0]), None)
-        .expect("record");
+    scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &shas[0]),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
 
     // An empty commit: new SHA, new message, byte-identical tree.
     git(
@@ -306,9 +336,14 @@ fn a_new_commit_with_an_identical_tree_is_the_same_generation() {
     .expect("empty commit");
     let second = git(&mount, &["rev-parse", "HEAD"]).expect("head");
     assert_ne!(second, shas[0]);
-    let (record, _) =
-        scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &second), None)
-            .expect("record");
+    let (record, _) = scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &second),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
     assert!(
         matches!(record, ScanRecord::Unchanged { .. }),
         "a commit that changed no source byte evicted a generation: {record:?}"
@@ -343,8 +378,14 @@ fn a_work_overlay_is_scoped_to_its_work_and_evicted_with_it() {
     let mut journal = journal_at(data.path());
     // A plain estate-git generation for the same repository, which must
     // survive the Work's eviction untouched.
-    scan_and_record_estate_git(&mut db, &mut journal, &source(&mount, &base), None)
-        .expect("record mount");
+    scan_and_record_estate_git(
+        &mut db,
+        &mut journal,
+        &source(&mount, &base),
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record mount");
 
     let overlay = WorkOverlay {
         work_id: "01WORK".to_string(),
@@ -353,8 +394,14 @@ fn a_work_overlay_is_scoped_to_its_work_and_evicted_with_it() {
         base_sha: base.clone(),
         ignore: Vec::new(),
     };
-    let recorded =
-        scan_and_record_overlay(&mut db, &mut journal, &overlay, None).expect("record overlay");
+    let recorded = scan_and_record_overlay(
+        &mut db,
+        &mut journal,
+        &overlay,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record overlay");
     let overlay_generation = match &recorded {
         ScanRecord::Recorded { generation_id, .. } => generation_id.clone(),
         other => panic!("expected a recorded overlay, got {other:?}"),

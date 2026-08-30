@@ -32,6 +32,17 @@
 //! Neither substitutes for the other and this file does not pretend to be
 //! both.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w5_search_surface";
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -245,7 +256,14 @@ fn estate() -> Estate {
     // would report the `.docx` `unsupported` and item 6 would be testing
     // nothing.
     let scan = scan_local_knowledge_with_worker(&library, &worker()).expect("scan library");
-    record_scan(&mut db, &mut journal, &scan, None).expect("record library");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &scan,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record library");
 
     let vendor = hand_built_scan(
         "vendor-lib",
@@ -254,7 +272,14 @@ fn estate() -> Estate {
         "docs/vendor.md",
         "Heading conventions in the vendor's own manual: Heading, Heading, Heading.",
     );
-    record_scan(&mut db, &mut journal, &vendor, None).expect("record vendor-lib");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &vendor,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record vendor-lib");
 
     Estate {
         _data: data,
@@ -264,11 +289,12 @@ fn estate() -> Estate {
 }
 
 fn any() -> Admissibility {
-    Admissibility::default()
+    Admissibility::within_estate(D1_ESTATE)
 }
 
 fn only_library() -> Admissibility {
     Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named("library".to_string()),
         kind: None,
         authority: None,

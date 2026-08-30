@@ -28,6 +28,17 @@
 //! extraction; this suite proves what the ADMISSIBILITY FILTER does with
 //! it.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w1_deterministic_filter";
+
 use std::collections::BTreeSet;
 
 use tempfile::TempDir;
@@ -204,7 +215,14 @@ fn estate() -> Estate {
             ),
         ],
     );
-    record_scan(&mut db, &mut journal, &repo_a, None).expect("record repo-a");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &repo_a,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record repo-a");
 
     let repo_b = scan(
         "repo-b",
@@ -218,7 +236,14 @@ fn estate() -> Estate {
             Some(syntax("rust", "syntax-rust/v1", "function", "widget_b")),
         )],
     );
-    record_scan(&mut db, &mut journal, &repo_b, None).expect("record repo-b");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &repo_b,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record repo-b");
 
     let notes = scan(
         "notes",
@@ -232,7 +257,14 @@ fn estate() -> Estate {
             None,
         )],
     );
-    record_scan(&mut db, &mut journal, &notes, None).expect("record notes");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &notes,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record notes");
 
     let vendor = scan(
         "vendor-lib",
@@ -251,7 +283,14 @@ fn estate() -> Estate {
             )),
         )],
     );
-    record_scan(&mut db, &mut journal, &vendor, None).expect("record vendor-lib");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &vendor,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record vendor-lib");
 
     Estate {
         _data: data,
@@ -262,6 +301,7 @@ fn estate() -> Estate {
 
 fn named(source_name: &str) -> Admissibility {
     Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named(source_name.to_string()),
         kind: None,
         authority: None,
@@ -326,6 +366,7 @@ fn a_named_source_filter_admits_only_that_sources_generation() {
 fn an_exact_generation_pin_matches_its_own_key_and_returns_nothing_for_a_stale_one() {
     let estate = estate();
     let exact = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Exact {
             source_name: "repo-a".to_string(),
             content_key: REPO_A_KEY.to_string(),
@@ -341,6 +382,7 @@ fn an_exact_generation_pin_matches_its_own_key_and_returns_nothing_for_a_stale_o
     assert_eq!(hit.hits[0].source_name, "repo-a");
 
     let stale = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Exact {
             source_name: "repo-a".to_string(),
             content_key: "repo-a@a-key-nothing-was-ever-confirmed-under".to_string(),
@@ -395,8 +437,14 @@ fn a_superseded_generation_does_not_leak_through_any_admissible_method() {
             Some(syntax("rust", "syntax-rust/v1", "function", "widget_a_v2")),
         )],
     );
-    let recorded = record_scan(&mut estate.db, &mut estate.journal, &repo_a_v2, None)
-        .expect("record repo-a v2");
+    let recorded = record_scan(
+        &mut estate.db,
+        &mut estate.journal,
+        &repo_a_v2,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record repo-a v2");
     let evicted = match recorded {
         ScanRecord::Recorded { evicted, .. } => evicted,
         other => panic!("expected a recorded, superseding scan of repo-a, got {other:?}"),
@@ -457,6 +505,7 @@ fn a_superseded_generation_does_not_leak_through_any_admissible_method() {
     // like the never-confirmed stale key above, but this key WAS once the
     // real confirmed generation's own.
     let stale_exact = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Exact {
             source_name: "repo-a".to_string(),
             content_key: REPO_A_KEY.to_string(),
@@ -486,6 +535,7 @@ fn a_superseded_generation_does_not_leak_through_any_admissible_method() {
 fn a_knowledge_kind_selector_admits_only_local_knowledge_sources() {
     let estate = estate();
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Any,
         kind: Some(SourceKind::LocalKnowledge),
         authority: None,
@@ -518,6 +568,7 @@ fn stage_4_composes_with_a_named_source_and_with_a_work_base_selector() {
     // both halves of the composed filter agree — the generation is
     // admitted.
     let matching = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named("repo-a".to_string()),
         kind: Some(SourceKind::EstateGit),
         authority: None,
@@ -534,6 +585,7 @@ fn stage_4_composes_with_a_named_source_and_with_a_work_base_selector() {
     // proving `kind` genuinely narrows a `Named` selector's own answer
     // rather than being ignored once a source name is given.
     let disagreeing = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named("repo-a".to_string()),
         kind: Some(SourceKind::LocalKnowledge),
         authority: None,
@@ -551,6 +603,7 @@ fn stage_4_composes_with_a_named_source_and_with_a_work_base_selector() {
     // selector this finding named specifically as inexpressible before this
     // fix: `--work <id> --type repo` still reads repo-a's base generation.
     let work_and_kind = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: "01WORKID000000000000000000".to_string(),
             repository: "repo-a".to_string(),
@@ -580,6 +633,7 @@ fn stage_4_composes_with_a_named_source_and_with_a_work_base_selector() {
 fn an_authority_filter_excludes_external_content_when_not_requested() {
     let estate = estate();
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Any,
         kind: None,
         authority: Some(AuthorityClass::EstateMutable),
@@ -600,6 +654,7 @@ fn an_authority_filter_excludes_external_content_when_not_requested() {
 fn an_authority_filter_for_external_admits_only_the_external_source() {
     let estate = estate();
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Any,
         kind: None,
         authority: Some(AuthorityClass::External),
@@ -691,7 +746,7 @@ fn the_authority_axis_earns_no_selector_only_while_it_is_a_function_of_source_ki
     );
 }
 
-/// A bare `Admissibility::default()` — `SourceSelector::Any`, no authority
+/// A bare `Admissibility::within_estate(D1_ESTATE)` — `SourceSelector::Any`, no authority
 /// — is "every confirmed generation this store holds": the un-narrowed
 /// case has to stay complete, or every negative test above would be
 /// meaningless (it would be indistinguishable from a filter that excludes
@@ -701,7 +756,7 @@ fn an_unfiltered_admissibility_admits_every_confirmed_source() {
     let estate = estate();
     let generations = estate
         .db
-        .admissible_generations(&Admissibility::default(), 500)
+        .admissible_generations(&Admissibility::within_estate(D1_ESTATE), 500)
         .expect("admissible generations");
     let mut names: Vec<&str> = generations
         .hits
@@ -916,6 +971,7 @@ fn document_extractor_identities_matches_every_known_document_adapter_constant()
 fn a_work_base_selector_reads_like_its_named_repository_and_states_base_only_without_an_overlay() {
     let estate = estate();
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: "01WORKID000000000000000000".to_string(),
             repository: "repo-a".to_string(),
@@ -951,6 +1007,7 @@ fn a_non_work_selector_reports_not_work_scoped() {
         SourceSelector::Any,
     ] {
         let filter = Admissibility {
+            estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
             source: selector.clone(),
             kind: None,
             authority: None,
@@ -1009,7 +1066,14 @@ fn a_toml_files_config_content_lives_in_the_code_lane_and_also_leaves_a_document
     let data = tempfile::tempdir().expect("data dir");
     let mut journal = Journal::open(data.path()).expect("journal");
     let mut db = AtlasDb::open(data.path()).expect("atlas");
-    record_scan(&mut db, &mut journal, &scanned, None).expect("record manifest");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &scanned,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record manifest");
 
     let filter = named("manifest");
 
@@ -1072,8 +1136,22 @@ fn a_source_filter_excludes_another_sources_dataset() {
     let data = tempfile::tempdir().expect("data dir");
     let mut journal = Journal::open(data.path()).expect("journal");
     let mut db = AtlasDb::open(data.path()).expect("atlas");
-    record_scan(&mut db, &mut journal, &scan_a, None).expect("record data-a");
-    record_scan(&mut db, &mut journal, &scan_b, None).expect("record data-b");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &scan_a,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record data-a");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &scan_b,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record data-b");
 
     let hits = db
         .admissible_datasets(&named("data-a"), 500)
@@ -1154,7 +1232,14 @@ fn a_work_filter_admits_its_own_overlay_and_no_other_works() {
             Some(syntax("rust", "syntax-rust/v1", "function", "widget_base")),
         )],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
 
     // Two overlay generations over that same base, one per Work, each under
     // its own `work:<id>/<repo>` source coordinate.
@@ -1179,7 +1264,14 @@ fn a_work_filter_admits_its_own_overlay_and_no_other_works() {
                 Some(syntax("rust", "syntax-rust/v1", "function", symbol)),
             )],
         );
-        let recorded = record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+        let recorded = record_scan(
+            &mut db,
+            &mut journal,
+            &overlay,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record overlay");
         assert!(
             matches!(recorded, ScanRecord::Recorded { .. }),
             "the fixture must actually be journaled and confirmed, or the exclusions below \
@@ -1188,6 +1280,7 @@ fn a_work_filter_admits_its_own_overlay_and_no_other_works() {
     }
 
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: MINE.to_string(),
             repository: "repo-a".to_string(),
@@ -1301,7 +1394,14 @@ fn a_work_filter_does_not_admit_its_own_overlay_over_a_different_repository() {
                 Some(syntax("rust", "syntax-rust/v1", "function", "base")),
             )],
         );
-        record_scan(&mut db, &mut journal, &base, None).expect("record base");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &base,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record base");
 
         let overlay = scan(
             &sergeant_rs::runtime::atlas::overlay::overlay_source_name(MINE, repo),
@@ -1320,7 +1420,14 @@ fn a_work_filter_does_not_admit_its_own_overlay_over_a_different_repository() {
                 )),
             )],
         );
-        let recorded = record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+        let recorded = record_scan(
+            &mut db,
+            &mut journal,
+            &overlay,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record overlay");
         assert!(
             matches!(recorded, ScanRecord::Recorded { .. }),
             "the fixture must actually land, or the exclusion below proves nothing: {recorded:?}"
@@ -1331,6 +1438,7 @@ fn a_work_filter_does_not_admit_its_own_overlay_over_a_different_repository() {
     // own repo-a overlay, and must NOT admit repo-b's base or MINE's own
     // repo-b overlay — the repository name is a real filter, not decoration.
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: MINE.to_string(),
             repository: "repo-a".to_string(),
@@ -1401,7 +1509,14 @@ fn work_scope_declares_base_only_when_the_answer_cannot_structurally_carry_overl
             Some(syntax("rust", "syntax-rust/v1", "function", "base")),
         )],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
 
     let overlay = scan(
         &sergeant_rs::runtime::atlas::overlay::overlay_source_name(MINE, "repo-a"),
@@ -1415,7 +1530,14 @@ fn work_scope_declares_base_only_when_the_answer_cannot_structurally_carry_overl
             Some(syntax("rust", "syntax-rust/v1", "function", "overlaid")),
         )],
     );
-    let recorded = record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+    let recorded = record_scan(
+        &mut db,
+        &mut journal,
+        &overlay,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record overlay");
     assert!(matches!(recorded, ScanRecord::Recorded { .. }));
 
     let work_base = SourceSelector::WorkBase {
@@ -1425,6 +1547,7 @@ fn work_scope_declares_base_only_when_the_answer_cannot_structurally_carry_overl
 
     // The overlay genuinely stands, and an unnarrowed --work answer says so.
     let unnarrowed = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: work_base.clone(),
         kind: None,
         authority: None,
@@ -1453,6 +1576,7 @@ fn work_scope_declares_base_only_when_the_answer_cannot_structurally_carry_overl
     // A kind narrowing to anything but EstateGit excludes every row an
     // overlay could ever have written.
     let knowledge_narrowed = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: work_base.clone(),
         kind: Some(SourceKind::LocalKnowledge),
         authority: None,
@@ -1468,6 +1592,7 @@ fn work_scope_declares_base_only_when_the_answer_cannot_structurally_carry_overl
 
     // An authority narrowing to anything but EstateMutable does the same.
     let authority_narrowed = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: work_base,
         kind: None,
         authority: Some(AuthorityClass::External),

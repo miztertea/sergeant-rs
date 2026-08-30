@@ -182,7 +182,7 @@ use crate::backend::BindingSummary;
 use crate::domain::source::{AuthorityClass, SourceGeneration};
 use crate::domain::workflow::{StageDefinition, StageRecord};
 use crate::runtime::atlas::db::{
-    Admissibility, AtlasDb, AtlasError, DatasetFact, LexicalQuery, SourceSelector,
+    Admissibility, AtlasDb, AtlasError, DatasetFact, EstateAdmission, LexicalQuery, SourceSelector,
     StoredChildResource, StoredDataset, StoredEdge, StoredUnit,
 };
 use crate::runtime::atlas::overlay::overlay_source_name;
@@ -2537,8 +2537,28 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
     // the research plan. A world with no confirmed generation is §18's
     // "unavailable" rung, answered before a single step runs.
     let repository = request.bindings.first().map(|b| b.repository.clone());
+    // **§4's first compiler input, made load-bearing (S6 D1).** *"estate
+    // coordinate"* heads §4's list and §3 resolves *"Work/estate/source
+    // generations"* in that order, but until S6 D1 nothing downstream could
+    // act on it: `Admissibility` had no estate axis, so a compilation in one
+    // estate could bind another estate's evidence into a snapshot — the same
+    // absent filter `sgt search` leaked through. The coordinate the snapshot
+    // already renders (`SnapshotCoordinate::estate_root`, above) is now the
+    // one the admissibility filter binds, so what a snapshot *says* it was
+    // compiled in and what it was *allowed to read* are the same fact rather
+    // than two.
+    //
+    // A request that carries no estate root compiles a snapshot that reads
+    // nothing (`EstateAdmission::NoEstate` admits nothing) and lands on §18's
+    // `NoConfirmedGeneration` rung — reported degradation, not a silent
+    // widening to every estate on the host.
+    let estate = match request.estate_root {
+        Some(root) => EstateAdmission::of(root),
+        None => EstateAdmission::NoEstate,
+    };
     let filter = match &repository {
         Some(repository) => Admissibility {
+            estate: estate.clone(),
             source: SourceSelector::WorkBase {
                 work_id: request.work_id.to_string(),
                 repository: repository.clone(),
@@ -2546,7 +2566,10 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
             kind: None,
             authority: None,
         },
-        None => Admissibility::default(),
+        None => Admissibility {
+            estate: estate.clone(),
+            ..Admissibility::default()
+        },
     };
     let admitted = match atlas.admissible_generations(&filter, STEP_ROW_CAP) {
         Ok(admitted) => admitted,
@@ -2591,7 +2614,14 @@ pub fn compile(atlas: Option<&AtlasDb>, request: &CompileRequest<'_>) -> Context
     // the first one did.
     if repository.is_some() {
         for authority in [AuthorityClass::EstateReadonly, AuthorityClass::External] {
+            // The knowledge/external passes are the ones that most needed
+            // the estate axis: `SourceSelector::Any` deliberately spans every
+            // source name, so before S6 D1 they spanned every *estate*'s
+            // knowledge sources too. The authority narrowing was never a
+            // containment boundary — it says what class of bytes may be read,
+            // not whose.
             let pass = Admissibility {
+                estate: estate.clone(),
                 source: SourceSelector::Any,
                 kind: None,
                 authority: Some(authority),

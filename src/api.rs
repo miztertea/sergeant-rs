@@ -5166,6 +5166,37 @@ async fn run_work_overlay_hook(
         }
     }
 
+    // **S6 D1 — whose world is this overlay?** A Work's surface belongs to
+    // exactly one estate, and `WorkIndexRow::estate_root` is where that
+    // coordinate already lives (H1 touch point #6: folded once from the
+    // `work.submitted` envelope's `workspace_id`). Read it rather than
+    // inventing one.
+    //
+    // A Work with **no** recorded estate root — a pre-Phase-C line still in
+    // the journal — gets no overlay generation at all, and `--work` reports
+    // `BaseOnly` for it, which is exactly true. The alternative would be
+    // recording an overlay of unknown provenance, and there is no estate it
+    // could honestly be admitted from; an unbound generation is inadmissible
+    // everywhere anyway, so writing one would only be a lie with rows behind
+    // it.
+    let estate_binding = {
+        let core = CoreGuard::acquire(&state.core).await;
+        let root = core
+            .registry
+            .state()
+            .work_index
+            .get(&work_id)
+            .and_then(|row| row.estate_root.clone());
+        root.map(crate::domain::source::EstateBinding::Estate)
+    };
+    let Some(estate_binding) = estate_binding else {
+        tracing::error!(
+            work_id = %work_id,
+            "this Work records no estate root, so its surface cannot be bound to an estate;              no overlay generation is written and `--work` stays base-only"
+        );
+        return;
+    };
+
     // F-IN-01: from here on this task is actually reading the surface (a
     // git tree listing, diff, and blob read per binding, next), so a newer
     // coalescing hook queued for this Work must no longer be dropped on the
@@ -5216,7 +5247,13 @@ async fn run_work_overlay_hook(
         };
         let mut core = CoreGuard::acquire(&state.core).await;
         let recorded = with_existing_atlas_write(&state, |atlas| {
-            record_scan(atlas, &mut core.journal, &scanned.scan, None)
+            record_scan(
+                atlas,
+                &mut core.journal,
+                &scanned.scan,
+                None,
+                &estate_binding,
+            )
         })
         .await;
         // The scan appended `source.scanned` straight to the journal;
@@ -5305,6 +5342,13 @@ async fn intelligence_scan(
         Ok(root) => root,
         Err((status, body)) => return (status, Json(body)).into_response(),
     };
+    // **S6 D1 — A2 §2 stage 1's estate coordinate.** `root` is the canonical
+    // exact estate root this request addressed (`admit_addressed_estate`), and
+    // it is the same string `SearchQuery::admissibility` binds at query time —
+    // one resolver, one spelling, so a recorded binding and a queried
+    // admission cannot drift apart.
+    let estate_binding =
+        crate::domain::source::EstateBinding::Estate(root.to_string_lossy().into_owned());
     let estate =
         match Estate::from_config_allow_empty(&root.join(crate::domain::estate::MANIFEST_FILE)) {
             Ok(estate) => estate,
@@ -5400,7 +5444,13 @@ async fn intelligence_scan(
         let counts = scanned.scan.counts();
         let mut core = CoreGuard::acquire(&state.core).await;
         let outcome = with_atlas_write(&state, |atlas| {
-            record_scan(atlas, &mut core.journal, &scanned.scan, None)
+            record_scan(
+                atlas,
+                &mut core.journal,
+                &scanned.scan,
+                None,
+                &estate_binding,
+            )
         })
         .await;
         // The scan appended `source.scanned` straight to the journal;
@@ -5472,7 +5522,7 @@ async fn intelligence_scan(
         // the next source.
         let mut core = CoreGuard::acquire(&state.core).await;
         let outcome = with_atlas_write(&state, |atlas| {
-            record_scan(atlas, &mut core.journal, &scan, None)
+            record_scan(atlas, &mut core.journal, &scan, None, &estate_binding)
         })
         .await;
         // The scan appended `source.scanned` straight to the journal;
@@ -6023,6 +6073,19 @@ async fn map_references(State(state): State<ApiState>, Query(query): Query<MapQu
 /// are `const`s no request can reach).
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
+    /// **A2 §2 stage 1's estate coordinate** — the exact canonical estate
+    /// root this search is asked *from*, the same `?estate_root=` every
+    /// other estate-scoped GET carries.
+    ///
+    /// Not one of A2 §14's flags, and not a selector a user types: it is the
+    /// address of the world the question is asked in. Atlas is host-scoped
+    /// (one daemon, one store, every estate ever addressed on this host), so
+    /// without it a search has no way to tell whose evidence it is reading —
+    /// which is exactly how S6 D1's cross-estate leak worked. Absent, the
+    /// request is refused rather than answered widely; see
+    /// [`SearchQuery::admissibility`].
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
     /// The query text (`sgt search <query>`).
     #[serde(default)]
     q: Option<String>,
@@ -6176,8 +6239,20 @@ impl SearchQuery {
                 atlas_trace::Attribution::Unmanaged,
             ),
         };
+        // **A2 §2 stage 1, and the one axis that denies by default.**
+        // `admit_addressed_estate` is the same admission gate every other
+        // estate-scoped route runs, so a root that does not admit is refused
+        // here rather than silently widening the world; a request that named
+        // no estate at all is refused too (`NOT_FOUND`, "the operation has
+        // no object"). Falling back to "every estate" is the defect this
+        // exists to close, not an available fallback.
+        let estate = match admit_addressed_estate(state, self.estate_root.as_deref(), "searching") {
+            Ok(estate) => atlas_db::EstateAdmission::of(&estate.root),
+            Err((status, body)) => return Err(Box::new((status, Json(body)).into_response())),
+        };
         Ok((
             atlas_db::Admissibility {
+                estate,
                 source,
                 kind,
                 // A2 §2's stage 2. `None` narrows nothing, and no selector
@@ -8123,6 +8198,9 @@ mod tests {
                     context_fields: crate::runtime::atlas::tabular::ContextFields::none(),
                 },
                 None,
+                &crate::domain::source::EstateBinding::Estate(
+                    data_dir.to_string_lossy().into_owned(),
+                ),
             )
             .expect("scan and record");
         }

@@ -28,6 +28,17 @@
 //! is what the numbers demonstrate, and nothing here says anything about a
 //! corpus two orders of magnitude larger than the largest run below.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w3b_semantic_scan_measurement";
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -140,9 +151,17 @@ fn exact_cosine_scan_cost_by_corpus_size() {
         let data = tempfile::tempdir().expect("data dir");
         let mut journal = Journal::open(data.path()).expect("journal");
         let mut db = AtlasDb::open(data.path()).expect("atlas");
-        record_scan(&mut db, &mut journal, &scan(units), None).expect("record");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &scan(units),
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record");
 
         let filter = Admissibility {
+            estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
             source: SourceSelector::Named("knowledge".to_string()),
             kind: None,
             authority: None,

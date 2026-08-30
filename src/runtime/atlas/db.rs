@@ -130,9 +130,21 @@ use crate::domain::event::{Event, unix_millis};
 use crate::domain::execution::{
     KIND_EXECUTION_RECONCILED, KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
+/// A2 §2 stage 1's estate axis, re-exported beside [`Admissibility`] — every
+/// caller that builds a filter has to name it, and naming it beside the
+/// struct it is a field of is what keeps that from being a scavenger hunt.
+pub use crate::domain::source::EstateAdmission;
 use crate::domain::source::{
-    AuthorityClass, Coverage, CoverageRow, SourceGeneration, SourceKind, UnitKind,
+    AuthorityClass, Coverage, CoverageRow, EstateBinding, SourceGeneration, SourceKind, UnitKind,
 };
+
+/// S6 D1: the single estate this file's own unit tests record and query
+/// under. The **cross-estate** case — the one this axis exists for — is an
+/// end-to-end suite (`tests/d1_estate_isolation.rs`), not a unit test here,
+/// because the leak was in what the daemon passed to this filter, not in
+/// this filter's arithmetic.
+#[cfg(test)]
+const TEST_ESTATE: &str = "/estates/db-unit";
 use crate::domain::work::{KIND_WORK_SUBMITTED, WorkState};
 use crate::domain::workflow::{
     KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
@@ -568,6 +580,11 @@ SET lock_configuration = true;\n";
 ///   promise — and keeps the reported-never-silent eviction discipline
 ///   identical to every other table's.
 const TABLE_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS source.generation_estates (\n\
+  generation_id TEXT NOT NULL,\n\
+  estate_scope  TEXT NOT NULL,\n\
+  estate_root   TEXT\n\
+);\n\
 CREATE TABLE IF NOT EXISTS source.generations (\n\
   generation_id    TEXT NOT NULL,\n\
   source_name      TEXT NOT NULL,\n\
@@ -749,6 +766,39 @@ const STATE_CONFIRMED: &str = "confirmed";
 /// because "this world was observed and is no longer indexed" is evidence.
 const STATE_EVICTED: &str = "evicted";
 
+/// A2 §2 stage 1's **estate** clause, over the `g` alias — the first thing
+/// the admissibility predicate asks, because A2 §2 puts the
+/// *"source / estate / Work generation filter"* first and nothing may rank
+/// before it (A2 §8).
+///
+/// Two binds, both the same estate root:
+///
+/// ```text
+/// (?estate IS NOT NULL) AND EXISTS (binding row for g whose scope is
+///                                   `host`, or whose root = ?estate)
+/// ```
+///
+/// **The `? IS NOT NULL` guard is the default-deny half and is not
+/// redundant.** With no estate named
+/// ([`EstateAdmission::NoEstate`](crate::domain::source::EstateAdmission::NoEstate),
+/// the `Default`), the bind is SQL `NULL` and this clause is false for every
+/// row — host-scoped rows included. Without it, an unnamed estate would
+/// still have admitted every `EstateBinding::Host` generation, which is a
+/// smaller leak but the same class of one.
+///
+/// A generation with **no** row in `source.generation_estates` — anything
+/// indexed by a build older than S6 D1 — fails the `EXISTS` and is
+/// inadmissible everywhere. Fail-closed, repaired by re-scanning; see
+/// [`EstateAdmission`](crate::domain::source::EstateAdmission)'s own doc.
+macro_rules! admissible_estate_clause {
+    () => {
+        "? IS NOT NULL \
+         AND EXISTS (SELECT 1 FROM source.generation_estates ge \
+                     WHERE ge.generation_id = g.generation_id \
+                       AND (ge.estate_scope = 'host' OR ge.estate_root = ?))"
+    };
+}
+
 /// A2 §2's composed stage-1/2/4 admissibility predicate over the `g` alias,
 /// as a **compile-time literal** the three W2 statements below splice in with
 /// `concat!`.
@@ -763,18 +813,21 @@ const STATE_EVICTED: &str = "evicted";
 /// [`AtlasDb::admissibility_binds`], in this order:
 ///
 /// ```text
-/// state, overlay-exclude LIKE, source_name x2, overlay-admit x2,
+/// state, estate x2, overlay-exclude LIKE, source_name x2, overlay-admit x2,
 /// content_key x2, source_kind x2, authority_class x2
 /// ```
 macro_rules! admissible_generations_where {
     () => {
-        "g.state = ? \
-         AND ( (g.source_name NOT LIKE ? \
+        concat!(
+            "g.state = ? AND ",
+            admissible_estate_clause!(),
+            " AND ( (g.source_name NOT LIKE ? \
                 AND (? IS NULL OR g.source_name = ?)) \
                OR (? IS NOT NULL AND g.source_name = ?) ) \
          AND (? IS NULL OR g.content_key = ?) \
          AND (? IS NULL OR g.source_kind = ?) \
          AND (? IS NULL OR g.authority_class = ?)"
+        )
     };
 }
 
@@ -1816,8 +1869,12 @@ impl AtlasDb {
     /// nothing has confirmed would be indistinguishable from a completed one
     /// after the state column was promoted — the atomic batch is what makes
     /// "provisional" mean "all of it, or none of it, awaiting a summary".
-    pub fn stage_scan(&mut self, scan: &SourceScan) -> Result<ScanCommit, AtlasError> {
-        self.stage_scan_impl(scan, None)
+    pub fn stage_scan(
+        &mut self,
+        scan: &SourceScan,
+        estate: &EstateBinding,
+    ) -> Result<ScanCommit, AtlasError> {
+        self.stage_scan_impl(scan, estate, None)
     }
 
     /// [`Self::stage_scan`] for an `external_git` scan, with A1 §9's
@@ -1830,14 +1887,16 @@ impl AtlasDb {
     pub fn stage_external_git_scan(
         &mut self,
         scan: &SourceScan,
+        estate: &EstateBinding,
         provenance: &ExternalGitProvenance,
     ) -> Result<ScanCommit, AtlasError> {
-        self.stage_scan_impl(scan, Some(provenance))
+        self.stage_scan_impl(scan, estate, Some(provenance))
     }
 
     fn stage_scan_impl(
         &mut self,
         scan: &SourceScan,
+        estate: &EstateBinding,
         provenance: Option<&ExternalGitProvenance>,
     ) -> Result<ScanCommit, AtlasError> {
         // Asked before the `content_key` comparison below, because the two
@@ -1864,6 +1923,7 @@ impl AtlasDb {
                 },
                 &scan.observed_at,
             )?;
+            bind_generation_estate(&self.conn, &current.id, estate)?;
             return Ok(ScanCommit::RootUnavailable {
                 generation_id: current.id,
                 content_key: current.content_key,
@@ -1874,6 +1934,18 @@ impl AtlasDb {
             && current.content_key == scan.content_key
             && self.generation_extractors(&current.id)? == scan.extractors
         {
+            // **The two-estates-one-world case.** A generation is reached by
+            // content key, so a second estate that declares a source whose
+            // bytes hash identically gets `Unchanged` and stages nothing —
+            // and would then have no binding row of its own, leaving it
+            // unable to see a world it legitimately indexed. So the binding
+            // is recorded here too, which is why
+            // `source.generation_estates` is many-rows-per-generation rather
+            // than a column on `source.generations`: two estates can have
+            // observed the same world, and each one's claim on it is its
+            // own row. It is not a widening — an estate only ever gets a row
+            // for a generation its own scan actually produced or matched.
+            bind_generation_estate(&self.conn, &current.id, estate)?;
             return Ok(ScanCommit::Unchanged {
                 generation_id: current.id,
                 content_key: current.content_key,
@@ -1919,6 +1991,14 @@ impl AtlasDb {
                 &extractors,
             ],
         )?;
+        // S6 D1 — A2 §2 stage 1's estate coordinate, written inside the SAME
+        // staging transaction as the generation row it describes, for the
+        // reason `git.provenance` is (module doc): a binding written as a
+        // follow-up could be lost while the generation survived, and a
+        // generation with no binding row is inadmissible from every estate.
+        // "Half-recorded" would therefore read as "indexed but invisible",
+        // which is the silent partial this store refuses everywhere else.
+        bind_generation_estate(&tx, &generation_id, estate)?;
         // The symbol *index* is a rollup across the whole generation, so it is
         // accumulated as the files are written and inserted once — not once
         // per file, which would make `occurrences` a per-file count wearing a
@@ -3284,8 +3364,11 @@ impl AtlasDb {
         let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
         let overlay_admit = filter.source.overlay_admit_source_name();
+        let estate = filter.estate.bind();
         vec![
             Duck::Text(STATE_CONFIRMED.to_string()),
+            optional_text(estate),
+            optional_text(estate),
             Duck::Text(overlay_exclude_like()),
             optional_text(source_name),
             optional_text(source_name),
@@ -5367,6 +5450,43 @@ fn parse_rows(stored: &str) -> Vec<Vec<Option<String>>> {
     serde_json::from_str(stored).unwrap_or_default()
 }
 
+/// **S6 D1 — record A2 §2 stage 1's estate coordinate for one generation.**
+///
+/// Idempotent by construction: the row is written only when this exact
+/// `(generation_id, scope, root)` claim is not already there, so a re-scan
+/// that lands on `ScanCommit::Unchanged` does not accumulate duplicates and
+/// a second estate's identical world adds exactly one row.
+///
+/// The absence of a row is meaningful and is *not* repaired here: a
+/// generation staged by a build older than S6 D1 has none, and is
+/// inadmissible from every estate until it is re-scanned. Backfilling one
+/// would mean inventing an estate for evidence whose origin was never
+/// recorded — the invented answer A2 §2's "never approximate" forbids, and
+/// on the confidentiality axis the expensive direction to be wrong in.
+fn bind_generation_estate(
+    conn: &impl Statements,
+    generation_id: &str,
+    estate: &EstateBinding,
+) -> Result<(), AtlasError> {
+    let (scope, root) = estate.columns();
+    conn.prepare_cached(sql!(
+        "INSERT INTO source.generation_estates (generation_id, estate_scope, estate_root) \
+         SELECT ?, ?, ? WHERE NOT EXISTS ( \
+           SELECT 1 FROM source.generation_estates \
+            WHERE generation_id = ? AND estate_scope = ? \
+              AND estate_root IS NOT DISTINCT FROM ?)"
+    ))?
+    .execute(duckdb::params![
+        generation_id,
+        scope,
+        root,
+        generation_id,
+        scope,
+        root
+    ])?;
+    Ok(())
+}
+
 /// Insert one coverage observation.
 fn insert_coverage(
     conn: &impl Statements,
@@ -5884,8 +6004,26 @@ pub struct StoredReference {
 /// retrieve/rank).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Admissibility {
+    /// Stage 1's **estate** half — `--source`/`--source@sha`/`--work` name
+    /// a source, and this names the *estate whose world those are read in*.
+    ///
+    /// **The one default-DENY axis in this struct, and it must stay that
+    /// way.** [`Self::kind`] and [`Self::authority`] below both say "`None`
+    /// admits every value — narrows only what a caller explicitly asked to
+    /// narrow"; this field is the deliberate opposite, because an estate
+    /// axis that defaulted to admit-everything would have left S6 D1's
+    /// measured cross-estate leak untouched (every consumer omitted the
+    /// estate — that omission is the defect). [`EstateAdmission::NoEstate`]
+    /// is the `Default` and admits **nothing**;
+    /// [`EstateAdmission::Estate`] admits one canonical estate root plus
+    /// the generations recorded
+    /// [`EstateBinding::Host`](crate::domain::source::EstateBinding::Host).
+    /// There is no "every estate" value. See
+    /// [`EstateAdmission`](crate::domain::source::EstateAdmission).
+    pub estate: EstateAdmission,
     /// Stage 1: which source(s) may be seen at all — `--source`/
-    /// `--source@sha`/`--work`, or none of those (every source).
+    /// `--source@sha`/`--work`, or none of those (every source *within
+    /// [`Self::estate`]*, never across estates).
     pub source: SourceSelector,
     /// Stage 4: the optional repo/knowledge/external grouping
     /// (`--type repo|knowledge|external`), the same [`SourceKind`] axis
@@ -5904,6 +6042,24 @@ pub struct Admissibility {
     /// asked to narrow; there is no implicit default-deny beyond what
     /// `source`/`kind` already select.
     pub authority: Option<AuthorityClass>,
+}
+
+impl Admissibility {
+    /// Everything one estate may see: [`EstateAdmission::Estate`] on the
+    /// estate axis, and every other axis left at its own admit-everything
+    /// default.
+    ///
+    /// This — not `Admissibility::default()` — is the ordinary starting
+    /// point for a filter. `default()` is deliberately *empty*: its estate
+    /// axis is [`EstateAdmission::NoEstate`], which admits nothing, so a
+    /// construction site that forgets the estate fails closed instead of
+    /// reading every estate on the host.
+    pub fn within_estate(estate_root: impl Into<String>) -> Self {
+        Self {
+            estate: EstateAdmission::Estate(estate_root.into()),
+            ..Self::default()
+        }
+    }
 }
 
 /// A2 §2's stage-1 source/estate/Work-generation selector. Stage 4's
@@ -6388,24 +6544,34 @@ impl Admissible<'_> {
         let (source_name, content_key) = filter.source.bindings();
         let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
+        // A2 §2 stage 1's estate axis. `None` here is `EstateAdmission::NoEstate`
+        // and the predicate's `? IS NOT NULL` makes it admit nothing at all.
+        let estate = filter.estate.bind();
         let overlay_exclude = overlay_exclude_like();
         let overlay_admit = filter.source.overlay_admit_source_name();
         let out = self.reader.rows(
             read_sql!(
                 "SELECT generation_id, source_name, source_kind, authority_class, content_key, \
                         observed_at \
-                 FROM source.generations \
-                 WHERE state = ? \
-                   AND ( (source_name NOT LIKE ? \
-                          AND (? IS NULL OR source_name = ?)) \
-                         OR (? IS NOT NULL AND source_name = ?) ) \
-                   AND (? IS NULL OR content_key = ?) \
-                   AND (? IS NULL OR source_kind = ?) \
-                   AND (? IS NULL OR authority_class = ?) \
-                 ORDER BY source_name, observed_at DESC, generation_id DESC LIMIT ?"
+                 FROM source.generations g \
+                 WHERE g.state = ? \
+                   AND ? IS NOT NULL \
+                   AND EXISTS (SELECT 1 FROM source.generation_estates ge \
+                               WHERE ge.generation_id = g.generation_id \
+                                 AND (ge.estate_scope = 'host' \
+                                      OR ge.estate_root = ?)) \
+                   AND ( (g.source_name NOT LIKE ? \
+                          AND (? IS NULL OR g.source_name = ?)) \
+                         OR (? IS NOT NULL AND g.source_name = ?) ) \
+                   AND (? IS NULL OR g.content_key = ?) \
+                   AND (? IS NULL OR g.source_kind = ?) \
+                   AND (? IS NULL OR g.authority_class = ?) \
+                 ORDER BY g.source_name, g.observed_at DESC, g.generation_id DESC LIMIT ?"
             ),
             duckdb::params![
                 STATE_CONFIRMED,
+                estate,
+                estate,
                 overlay_exclude,
                 source_name,
                 source_name,
@@ -6481,6 +6647,7 @@ impl Admissible<'_> {
         let (source_name, content_key) = filter.source.bindings();
         let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
+        let estate = filter.estate.bind();
         let [doc_a, doc_b, doc_c] = DOCUMENT_EXTRACTOR_IDENTITIES;
         let overlay_exclude = overlay_exclude_like();
         let overlay_admit = filter.source.overlay_admit_source_name();
@@ -6493,6 +6660,11 @@ impl Admissible<'_> {
                  JOIN source.files f ON f.generation_id = u.generation_id \
                                      AND f.relative_path = u.relative_path \
                  WHERE g.state = ? \
+                   AND ? IS NOT NULL \
+                   AND EXISTS (SELECT 1 FROM source.generation_estates ge \
+                               WHERE ge.generation_id = g.generation_id \
+                                 AND (ge.estate_scope = 'host' \
+                                      OR ge.estate_root = ?)) \
                    AND (f.extractor IN (?, ?, ?) OR f.extractor LIKE ?) \
                    AND ( (g.source_name NOT LIKE ? \
                           AND (? IS NULL OR g.source_name = ?)) \
@@ -6504,6 +6676,8 @@ impl Admissible<'_> {
             ),
             duckdb::params![
                 STATE_CONFIRMED,
+                estate,
+                estate,
                 doc_a,
                 doc_b,
                 doc_c,
@@ -6585,6 +6759,9 @@ impl Admissible<'_> {
         let (source_name, content_key) = filter.source.bindings();
         let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
+        // A2 §2 stage 1's estate axis. `None` here is `EstateAdmission::NoEstate`
+        // and the predicate's `? IS NOT NULL` makes it admit nothing at all.
+        let estate = filter.estate.bind();
         let overlay_exclude = overlay_exclude_like();
         let overlay_admit = filter.source.overlay_admit_source_name();
         let out = self.reader.rows(
@@ -6593,6 +6770,11 @@ impl Admissible<'_> {
                         o.ordinal, o.label, o.name, o.byte_start, o.byte_end \
                  FROM source.occurrences o JOIN source.generations g USING (generation_id) \
                  WHERE g.state = ? \
+                   AND ? IS NOT NULL \
+                   AND EXISTS (SELECT 1 FROM source.generation_estates ge \
+                               WHERE ge.generation_id = g.generation_id \
+                                 AND (ge.estate_scope = 'host' \
+                                      OR ge.estate_root = ?)) \
                    AND o.extractor LIKE ? \
                    AND ( (g.source_name NOT LIKE ? \
                           AND (? IS NULL OR g.source_name = ?)) \
@@ -6604,6 +6786,8 @@ impl Admissible<'_> {
             ),
             duckdb::params![
                 STATE_CONFIRMED,
+                estate,
+                estate,
                 CODE_EXTRACTOR_LIKE,
                 overlay_exclude,
                 source_name,
@@ -6661,6 +6845,9 @@ impl Admissible<'_> {
         let (source_name, content_key) = filter.source.bindings();
         let source_kind = filter.kind.map(SourceKind::as_str);
         let authority = filter.authority.map(AuthorityClass::as_str);
+        // A2 §2 stage 1's estate axis. `None` here is `EstateAdmission::NoEstate`
+        // and the predicate's `? IS NOT NULL` makes it admit nothing at all.
+        let estate = filter.estate.bind();
         let overlay_exclude = overlay_exclude_like();
         let overlay_admit = filter.source.overlay_admit_source_name();
         let out = self.reader.rows(
@@ -6669,6 +6856,11 @@ impl Admissible<'_> {
                         d.dataset_key, d.byte_len, d.columns, d.row_count, d.truncated, d.row_units \
                  FROM source.datasets d JOIN source.generations g USING (generation_id) \
                  WHERE g.state = ? \
+                   AND ? IS NOT NULL \
+                   AND EXISTS (SELECT 1 FROM source.generation_estates ge \
+                               WHERE ge.generation_id = g.generation_id \
+                                 AND (ge.estate_scope = 'host' \
+                                      OR ge.estate_root = ?)) \
                    AND ( (g.source_name NOT LIKE ? \
                           AND (? IS NULL OR g.source_name = ?)) \
                          OR (? IS NOT NULL AND g.source_name = ?) ) \
@@ -6679,6 +6871,8 @@ impl Admissible<'_> {
             ),
             duckdb::params![
                 STATE_CONFIRMED,
+                estate,
+                estate,
                 overlay_exclude,
                 source_name,
                 source_name,
@@ -8769,7 +8963,10 @@ mod tests {
             "a read-only open must see the generation the write path confirmed"
         );
 
-        let write = reader.stage_scan(&scan_of("notes", "# Two\n"));
+        let write = reader.stage_scan(
+            &scan_of("notes", "# Two\n"),
+            &EstateBinding::Estate(TEST_ESTATE.to_string()),
+        );
         assert!(
             write.is_err(),
             "a connection opened AccessMode::ReadOnly must refuse a write, proving this is a \
@@ -8839,7 +9036,10 @@ mod tests {
 
     /// Stage and confirm one generation, returning its id.
     fn record(db: &mut AtlasDb, scan: &SourceScan, event: &str) -> String {
-        let ScanCommit::Staged { generation_id } = db.stage_scan(scan).expect("stage") else {
+        let ScanCommit::Staged { generation_id } = db
+            .stage_scan(scan, &EstateBinding::Estate(TEST_ESTATE.to_string()))
+            .expect("stage")
+        else {
             panic!("expected a staged generation");
         };
         db.confirm_scan(&generation_id, event).expect("confirm");
@@ -8873,8 +9073,13 @@ mod tests {
         let mut db = AtlasDb::open(dir.path()).expect("open");
         let scan = external_scan_of("upstream", "# One\n", "tree-oid-1");
         let expected = provenance("commit-sha-1");
-        let ScanCommit::Staged { generation_id } =
-            db.stage_external_git_scan(&scan, &expected).expect("stage")
+        let ScanCommit::Staged { generation_id } = db
+            .stage_external_git_scan(
+                &scan,
+                &EstateBinding::Estate(TEST_ESTATE.to_string()),
+                &expected,
+            )
+            .expect("stage")
         else {
             panic!("expected staged");
         };
@@ -8926,7 +9131,11 @@ mod tests {
         let ScanCommit::Staged {
             generation_id: first_id,
         } = db
-            .stage_external_git_scan(&first, &provenance("commit-1"))
+            .stage_external_git_scan(
+                &first,
+                &EstateBinding::Estate(TEST_ESTATE.to_string()),
+                &provenance("commit-1"),
+            )
             .expect("stage first")
         else {
             panic!("expected staged");
@@ -8937,7 +9146,11 @@ mod tests {
         let ScanCommit::Staged {
             generation_id: second_id,
         } = db
-            .stage_external_git_scan(&second, &provenance("commit-2"))
+            .stage_external_git_scan(
+                &second,
+                &EstateBinding::Estate(TEST_ESTATE.to_string()),
+                &provenance("commit-2"),
+            )
             .expect("stage second")
         else {
             panic!("expected staged");
@@ -9062,7 +9275,12 @@ mod tests {
         }];
         assert!(unreachable.root_unavailable().is_some(), "fixture");
 
-        let commit = atlas.stage_scan(&unreachable).expect("stage");
+        let commit = atlas
+            .stage_scan(
+                &unreachable,
+                &EstateBinding::Estate(TEST_ESTATE.to_string()),
+            )
+            .expect("stage");
         assert!(
             matches!(&commit, ScanCommit::RootUnavailable { generation_id, .. } if *generation_id == good),
             "{commit:?}"
@@ -9104,7 +9322,9 @@ mod tests {
         emptied.content_key = crate::domain::source::generation_key(&BTreeMap::new());
         emptied.coverage.clear();
         assert!(matches!(
-            atlas.stage_scan(&emptied).expect("stage"),
+            atlas
+                .stage_scan(&emptied, &EstateBinding::Estate(TEST_ESTATE.to_string()))
+                .expect("stage"),
             ScanCommit::Staged { .. }
         ));
     }
@@ -9118,7 +9338,10 @@ mod tests {
         let staged = {
             let mut atlas = AtlasDb::open(dir.path()).expect("atlas");
             let ScanCommit::Staged { generation_id } = atlas
-                .stage_scan(&scan_of("notes", "# Pending\n"))
+                .stage_scan(
+                    &scan_of("notes", "# Pending\n"),
+                    &EstateBinding::Estate(TEST_ESTATE.to_string()),
+                )
                 .expect("stage")
             else {
                 panic!("expected a staged generation");
@@ -9212,7 +9435,7 @@ mod tests {
         let before = db
             .lexical_search(&LexicalQuery {
                 text: "PaymentRetryPolicy",
-                filter: &Admissibility::default(),
+                filter: &Admissibility::within_estate(TEST_ESTATE),
                 family: None,
                 limit: 10,
                 semantic: SemanticRequest::Requested,
@@ -9232,7 +9455,7 @@ mod tests {
         let after = db
             .lexical_search(&LexicalQuery {
                 text: "PaymentRetryPolicy",
-                filter: &Admissibility::default(),
+                filter: &Admissibility::within_estate(TEST_ESTATE),
                 family: None,
                 limit: 10,
                 semantic: SemanticRequest::Requested,

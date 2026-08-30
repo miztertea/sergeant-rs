@@ -42,6 +42,17 @@
 //! content is byte-identical to the base's, must not be marked Work-changed
 //! (F-SF-01).
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w4_rrf_fusion";
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -587,6 +598,7 @@ impl Estate {
 
 fn named(source: &str) -> Admissibility {
     Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named(source.to_string()),
         kind: None,
         authority: None,
@@ -594,7 +606,7 @@ fn named(source: &str) -> Admissibility {
 }
 
 fn everything() -> Admissibility {
-    Admissibility::default()
+    Admissibility::within_estate(D1_ESTATE)
 }
 
 fn labelled(answer: &FusedAnswer) -> Vec<String> {
@@ -656,7 +668,14 @@ fn knowledge_estate(with_decoy: bool) -> Estate {
         ignore: Vec::new(),
         context_fields: ContextFields::none(),
     };
-    scan_and_record(&mut db, &mut journal, &knowledge, None).expect("record knowledge");
+    scan_and_record(
+        &mut db,
+        &mut journal,
+        &knowledge,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record knowledge");
     if with_decoy {
         let vendor = hand_built_scan(
             "vendor-lib",
@@ -670,7 +689,14 @@ fn knowledge_estate(with_decoy: bool) -> Estate {
                 )],
             )],
         );
-        record_scan(&mut db, &mut journal, &vendor, None).expect("record vendor-lib");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &vendor,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record vendor-lib");
     }
     Estate {
         _data: data,
@@ -824,6 +850,7 @@ fn every_one_of_a2_section_8s_nine_signals_actually_fires() {
     observe(&knowledge.fused(
         "asynchronous settlement",
         &Admissibility {
+            estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
             source: SourceSelector::Any,
             kind: Some(SourceKind::LocalKnowledge),
             authority: None,
@@ -845,6 +872,7 @@ fn every_one_of_a2_section_8s_nine_signals_actually_fires() {
     let answer = work.fused(
         "settlement",
         &Admissibility {
+            estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
             source: SourceSelector::WorkBase {
                 work_id: "01WORK".to_string(),
                 repository: "repo-a".to_string(),
@@ -904,7 +932,14 @@ fn code_estate() -> Estate {
             code_file("payments/aaa_retry_test.rs", "retry_charge", &[]),
         ],
     );
-    record_scan(&mut db, &mut journal, &scan, None).expect("record repo-a");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &scan,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record repo-a");
     Estate {
         _data: data,
         _root: None,
@@ -938,7 +973,14 @@ fn overlay_estate(overlay_text: &str, overlay_hash: &str) -> Estate {
             )],
         )],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
     let overlay = hand_built_scan(
         "work:01WORK/repo-a",
         SourceKind::EstateGit,
@@ -949,7 +991,14 @@ fn overlay_estate(overlay_text: &str, overlay_hash: &str) -> Estate {
             vec![document_unit(overlay_text)],
         )],
     );
-    record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &overlay,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record overlay");
     Estate {
         _data: data,
         _root: None,
@@ -974,6 +1023,7 @@ fn an_overlay_unit_whose_content_matches_the_base_is_not_marked_work_changed() {
         "hash/docs/ledger.md/base",
     );
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: "01WORK".to_string(),
             repository: "repo-a".to_string(),
@@ -1012,6 +1062,7 @@ fn a_work_changed_unit_is_promoted_over_its_unchanged_base() {
         "hash/docs/ledger.md/edited-by-work",
     );
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: "01WORK".to_string(),
             repository: "repo-a".to_string(),
@@ -1160,6 +1211,7 @@ fn the_three_filter_shaped_signals_are_uniform_because_admissibility_already_app
     let typed = estate.fused(
         "settlement",
         &Admissibility {
+            estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
             source: SourceSelector::Any,
             kind: Some(SourceKind::LocalKnowledge),
             authority: None,

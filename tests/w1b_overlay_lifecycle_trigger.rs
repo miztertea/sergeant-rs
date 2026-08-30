@@ -27,6 +27,17 @@
 //! duration as the thing under test — only that a state is eventually
 //! reached, generously bounded, on the slowest supported target.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w1b_overlay_lifecycle_trigger";
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -321,11 +332,12 @@ async fn a_bound_work_surface_is_scanned_as_an_overlay_and_evicted_when_it_retir
     //    stated on the answer — never a stale claim about a surface that no
     //    longer exists.
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: work_id.clone(),
             repository: "product".to_string(),
         },
-        ..Admissibility::default()
+        ..Admissibility::within_estate(D1_ESTATE)
     };
     let admitted = db
         .admissible_generations(&filter, 500)
@@ -449,11 +461,12 @@ fn an_overlay_scan_failure_degrades_to_base_only_and_is_reported() {
          staging an empty one would make --work claim an overlay it never read"
     );
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: work_id.to_string(),
             repository: "product".to_string(),
         },
-        ..Admissibility::default()
+        ..Admissibility::within_estate(D1_ESTATE)
     };
     assert_eq!(
         db.admissible_generations(&filter, 500)

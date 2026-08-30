@@ -1856,9 +1856,15 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // side effect (ADR 0009's no-spawn posture, the same one
             // `sgt map` takes).
             let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            // S6 D1: A2 §2 stage 1's estate coordinate rides with every
+            // query. `search` was already estate-scoped at this end — it
+            // refuses outside an estate root, like every non-host-scoped verb
+            // — but the daemon never learned *which* estate was asking, and
+            // Atlas is host-scoped. This is that missing half.
             let path = format!(
-                "/v1/search?q={}{}",
+                "/v1/search?q={}{}{}",
                 crate::api::urlencode(&query),
+                estate_query_param(&estate),
                 selectors.query_string()
             );
             let result = client.get(&path).await?;
@@ -1875,8 +1881,9 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         } => {
             let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
             let path = format!(
-                "/v1/related?coordinate={}{}",
+                "/v1/related?coordinate={}{}{}",
                 crate::api::urlencode(&coordinate),
+                estate_query_param(&estate),
                 selectors.query_string()
             );
             let result = client.get(&path).await?;
@@ -2266,6 +2273,23 @@ fn estate_root(estate: &Option<EstateRoot>) -> PathBuf {
 /// the matched command turned out to be in.
 fn estate_root_opt(estate: &Option<EstateRoot>) -> Option<&Path> {
     estate.as_ref().map(|e| e.path.as_path())
+}
+
+/// `&estate_root=<canonical root>` for a GET whose query string already
+/// started — A2 §2 stage 1's estate coordinate on `sgt search`/`sgt related`.
+///
+/// Empty when no root was admitted, which is not a fallback to "every
+/// estate": the daemon refuses a search that addressed no estate, because
+/// Atlas is host-scoped and an unaddressed query has no world to be about
+/// (S6 D1).
+fn estate_query_param(estate: &Option<EstateRoot>) -> String {
+    match estate_root_opt(estate) {
+        Some(root) => format!(
+            "&estate_root={}",
+            crate::api::urlencode(&root.to_string_lossy())
+        ),
+        None => String::new(),
+    }
 }
 
 /// The most an `--intent-file` may hold (#166).

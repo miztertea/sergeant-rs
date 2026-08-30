@@ -58,6 +58,17 @@
 //! `not_installed` case below would race the others, and that is why this
 //! repository's runner is nextest.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w3b_semantic_retrieval";
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -299,7 +310,14 @@ fn estate(with_decoy: bool) -> Estate {
         ignore: Vec::new(),
         context_fields: ContextFields::none(),
     };
-    scan_and_record(&mut db, &mut journal, &knowledge, None).expect("record knowledge");
+    scan_and_record(
+        &mut db,
+        &mut journal,
+        &knowledge,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record knowledge");
 
     if with_decoy {
         let vendor = hand_built_scan(
@@ -314,7 +332,14 @@ fn estate(with_decoy: bool) -> Estate {
                 )],
             )],
         );
-        record_scan(&mut db, &mut journal, &vendor, None).expect("record vendor-lib");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &vendor,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record vendor-lib");
     }
 
     Estate {
@@ -326,6 +351,7 @@ fn estate(with_decoy: bool) -> Estate {
 
 fn only_knowledge() -> Admissibility {
     Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named("knowledge".to_string()),
         kind: None,
         authority: None,
@@ -334,6 +360,7 @@ fn only_knowledge() -> Admissibility {
 
 fn everything() -> Admissibility {
     Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Any,
         kind: None,
         authority: None,
@@ -540,7 +567,14 @@ fn tied_semantic_scores_are_broken_by_the_stated_key_not_by_scan_order() {
         AuthorityClass::EstateReadonly,
         vec![scanned_file("zzz.md", vec![document_unit(tied)]), code],
     );
-    record_scan(&mut db, &mut journal, &scan, None).expect("record");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &scan,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record");
 
     let filter = only_knowledge();
     let answer = db

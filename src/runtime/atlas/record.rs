@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 
 use crate::domain::event::{EventDraft, EventSource};
+use crate::domain::source::EstateBinding;
 use crate::domain::source::KIND_SOURCE_SCANNED;
 use crate::runtime::atlas::db::{AtlasDb, AtlasError, ScanCommit};
 use crate::runtime::atlas::deny::BadPattern;
@@ -132,8 +133,15 @@ pub fn scan_and_record(
     journal: &mut Journal,
     source: &KnowledgeSource,
     workspace_id: Option<&str>,
+    estate: &EstateBinding,
 ) -> Result<ScanRecord, ScanRecordError> {
-    record_scan(db, journal, &scan_local_knowledge(source)?, workspace_id)
+    record_scan(
+        db,
+        journal,
+        &scan_local_knowledge(source)?,
+        workspace_id,
+        estate,
+    )
 }
 
 /// [`scan_and_record`] for one estate-git source: the same three steps, over a
@@ -155,9 +163,10 @@ pub fn scan_and_record_estate_git(
     journal: &mut Journal,
     source: &EstateGitSource,
     workspace_id: Option<&str>,
+    estate: &EstateBinding,
 ) -> Result<(ScanRecord, Option<EstateDriftObservation>), ScanRecordError> {
     let scanned = scan_estate_git(source)?;
-    let record = record_scan(db, journal, &scanned.scan, workspace_id)?;
+    let record = record_scan(db, journal, &scanned.scan, workspace_id, estate)?;
     Ok((record, scanned.drift))
 }
 
@@ -206,11 +215,19 @@ pub fn record_external_git_scan(
     acquired: &crate::runtime::atlas::external_git::ExternalGitScan,
     workspace_id: Option<&str>,
 ) -> Result<ScanRecord, ScanRecordError> {
+    // **`EstateBinding::Host`, and only here.** An external Git source is
+    // acquired through `POST /v1/intelligence/sources`, which reads no
+    // `estate_root` at all (A1 §9, and S6 D1's brief names that as
+    // deliberate, not the defect). It is the one source kind whose bytes are
+    // host-scoped by design, so it is the one kind whose generations are
+    // admissible from every estate on this host. Every other kind's estate
+    // is named by its caller.
     record_scan_impl(
         db,
         journal,
         &acquired.scan,
         workspace_id,
+        &EstateBinding::Host,
         Some(&acquired.provenance),
     )
 }
@@ -225,9 +242,10 @@ pub fn scan_and_record_overlay(
     journal: &mut Journal,
     overlay: &WorkOverlay,
     workspace_id: Option<&str>,
+    estate: &EstateBinding,
 ) -> Result<ScanRecord, ScanRecordError> {
     let scanned = scan_work_overlay(overlay)?;
-    record_scan(db, journal, &scanned.scan, workspace_id)
+    record_scan(db, journal, &scanned.scan, workspace_id, estate)
 }
 
 /// **F1's crash-window coupling itself**, over an already-completed scan of
@@ -238,8 +256,9 @@ pub fn record_scan(
     journal: &mut Journal,
     scan: &SourceScan,
     workspace_id: Option<&str>,
+    estate: &EstateBinding,
 ) -> Result<ScanRecord, ScanRecordError> {
-    record_scan_impl(db, journal, scan, workspace_id, None)
+    record_scan_impl(db, journal, scan, workspace_id, estate, None)
 }
 
 /// [`record_scan`]'s actual body, widened to carry
@@ -252,11 +271,12 @@ fn record_scan_impl(
     journal: &mut Journal,
     scan: &SourceScan,
     workspace_id: Option<&str>,
+    estate: &EstateBinding,
     provenance: Option<&crate::runtime::atlas::external_git::ExternalGitProvenance>,
 ) -> Result<ScanRecord, ScanRecordError> {
     let staged = match provenance {
-        Some(provenance) => db.stage_external_git_scan(scan, provenance)?,
-        None => db.stage_scan(scan)?,
+        Some(provenance) => db.stage_external_git_scan(scan, estate, provenance)?,
+        None => db.stage_scan(scan, estate)?,
     };
     let staged = match staged {
         ScanCommit::Unchanged {

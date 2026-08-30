@@ -43,6 +43,17 @@
 //! The `sgt map --help` subprocess still pins F11's *named deferral* —
 //! `map neighbors` and `map changed` must not exist yet.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/x4_tabular_map";
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -94,7 +105,14 @@ fn record(source: &KnowledgeSource) -> Recorded {
     let data = tempfile::tempdir().expect("data dir");
     let mut journal = Journal::open(data.path()).expect("journal");
     let mut db = AtlasDb::open(data.path()).expect("atlas");
-    let record = scan_and_record(&mut db, &mut journal, source, None).expect("scan and record");
+    let record = scan_and_record(
+        &mut db,
+        &mut journal,
+        source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("scan and record");
     Recorded {
         _data: data,
         db,
@@ -546,6 +564,7 @@ fn f10a_a_declared_allowlist_exposes_only_its_columns_with_stable_row_identity()
         &mut journal,
         &source("support", dir.path(), &["title"]),
         None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
     )
     .expect("re-scan");
     let after = db.row_units("support", MAX_ROWS).expect("row units");
@@ -610,6 +629,7 @@ fn f10a_narrowing_an_allowlist_retracts_the_units_it_exposed() {
         &mut journal,
         &source("support", dir.path(), &["title"]),
         None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
     )
     .expect("re-scan");
     let ScanRecord::Recorded { evicted, .. } = &record else {
@@ -1116,6 +1136,7 @@ async fn f11_the_map_surface_answers_over_http_and_through_the_verb() {
             &mut journal,
             &source("team notes", root.path(), &[]),
             None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
         )
         .expect("scan and record");
     }

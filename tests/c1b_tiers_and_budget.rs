@@ -22,6 +22,17 @@
 //! §5 step 2 — so every "it did not fit" assertion below is about evidence
 //! that really was selected, not about evidence that happened to be missing.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/c1b_tiers_and_budget";
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -112,7 +123,14 @@ fn fixture() -> Fixture {
             file(TWIN_PATH, vec![unit(0, "Twin", TWIN_BASE)]),
         ],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
 
     let overlay = scan(
         &overlay_source_name(WORK_ID, REPOSITORY),
@@ -124,7 +142,14 @@ fn fixture() -> Fixture {
             file(TWIN_PATH, vec![unit(0, "Twin", TWIN_OVERLAY)]),
         ],
     );
-    record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &overlay,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record overlay");
 
     Fixture { _data: data, db }
 }
@@ -582,6 +607,7 @@ fn a_coordinate_resolves_by_direct_lookup_not_by_rediscovery() {
     // The search surface, over the same admissible world, does not reach the
     // twin at all — and resolution did not need it to.
     let filter = sergeant_rs::runtime::atlas::db::Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: WORK_ID.to_string(),
             repository: REPOSITORY.to_string(),
@@ -742,14 +768,28 @@ fn external_and_estate_bodies_render_differently_only_because_of_authority_class
         AuthorityClass::EstateReadonly,
         vec![file("estate.md", vec![unit(0, "Estate", SHARED_BODY)])],
     );
-    record_scan(&mut db, &mut journal, &estate, None).expect("record estate source");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &estate,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record estate source");
     let external = scan(
         "vendor-docs",
         SourceKind::ExternalGit,
         AuthorityClass::External,
         vec![file("vendor.md", vec![unit(0, "Vendor", SHARED_BODY)])],
     );
-    record_scan(&mut db, &mut journal, &external, None).expect("record external source");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &external,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record external source");
 
     // No binding, so the admissibility filter is the whole admitted world —
     // which is the only shape in which external evidence reaches this
@@ -868,7 +908,14 @@ fn a_bound_relationship_unit_renders_its_resolved_detail_into_the_prompt() {
             vec![unit(0, "Architecture", "The daemon owns the journal.")],
         )],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
 
     let mut child = file(
         "mail/inbox.mbox/attachments/report.pdf",
@@ -885,7 +932,14 @@ fn a_bound_relationship_unit_renders_its_resolved_detail_into_the_prompt() {
         AuthorityClass::EstateMutable,
         vec![child],
     );
-    record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &overlay,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record overlay");
 
     let snapshot = compiled(&db, RenderBudget::DEFAULT);
 
@@ -952,7 +1006,14 @@ fn resolve_relationship_discriminates_sibling_edges_by_ordinal() {
         AuthorityClass::EstateMutable,
         vec![code],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
     let generation_id = db
         .confirmed_generation(REPOSITORY)
         .expect("read")

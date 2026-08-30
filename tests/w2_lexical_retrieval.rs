@@ -33,6 +33,17 @@
 //! the whole mail adapter deleted. A family's provenance test has to land the
 //! family the way production lands it.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w2_lexical_retrieval";
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -250,7 +261,14 @@ fn estate() -> Estate {
             "short_description".to_string(),
         ]),
     };
-    scan_and_record(&mut db, &mut journal, &knowledge, None).expect("record knowledge");
+    scan_and_record(
+        &mut db,
+        &mut journal,
+        &knowledge,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record knowledge");
 
     // The mail source is REAL: this repo's own `.eml` fixture, walked
     // through the real supervised worker subprocess the production `.eml`
@@ -284,7 +302,14 @@ fn estate() -> Estate {
         "the mail fixture must have routed through the real mail adapter: {:?}",
         mailbox.extractors
     );
-    record_scan(&mut db, &mut journal, &mailbox, None).expect("record mailbox");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &mailbox,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record mailbox");
 
     let decoy = decoy_body();
     let vendor = hand_built_scan(
@@ -298,7 +323,14 @@ fn estate() -> Estate {
             vec![document_unit(None, &decoy)],
         )],
     );
-    record_scan(&mut db, &mut journal, &vendor, None).expect("record vendor-lib");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &vendor,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record vendor-lib");
 
     Estate {
         _data: data,
@@ -312,6 +344,7 @@ fn estate() -> Estate {
 /// Only the `knowledge` source: the world the six-form tests run in.
 fn only_knowledge() -> Admissibility {
     Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named("knowledge".to_string()),
         kind: None,
         authority: None,
@@ -500,6 +533,7 @@ fn lexical_search_returns_a_document_unit_with_exact_a1_provenance() {
 fn lexical_search_returns_mail_units_with_exact_a1_provenance() {
     let estate = estate();
     let filter = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named("mailbox".to_string()),
         kind: None,
         authority: None,
@@ -638,7 +672,7 @@ fn lexical_search_returns_a_selected_row_text_unit_with_exact_a1_provenance() {
 #[test]
 fn an_inadmissible_unit_with_a_perfect_lexical_match_is_never_returned() {
     let estate = estate();
-    let unfiltered = Admissibility::default();
+    let unfiltered = Admissibility::within_estate(D1_ESTATE);
     let wide = estate.search("PaymentRetryPolicy", &unfiltered, None);
     assert_eq!(
         wide.hits.first().map(|hit| hit.source_name.as_str()),
@@ -650,12 +684,14 @@ fn an_inadmissible_unit_with_a_perfect_lexical_match_is_never_returned() {
 
     for filter in [
         Admissibility {
+            estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
             source: SourceSelector::Any,
             kind: None,
             authority: Some(AuthorityClass::EstateReadonly),
         },
         only_knowledge(),
         Admissibility {
+            estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
             source: SourceSelector::Any,
             kind: Some(SourceKind::LocalKnowledge),
             authority: None,
@@ -705,7 +741,14 @@ fn another_works_overlay_unit_never_surfaces_through_a_lexical_query() {
             )
         }],
     );
-    record_scan(&mut db, &mut journal, &base, None).expect("record base");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &base,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record base");
 
     for (work_id, symbol) in [(MINE, "widget_mine"), (OTHER, "widget_theirs")] {
         let overlay = hand_built_scan(
@@ -722,7 +765,14 @@ fn another_works_overlay_unit_never_surfaces_through_a_lexical_query() {
                 )
             }],
         );
-        let recorded = record_scan(&mut db, &mut journal, &overlay, None).expect("record overlay");
+        let recorded = record_scan(
+            &mut db,
+            &mut journal,
+            &overlay,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record overlay");
         assert!(
             matches!(recorded, ScanRecord::Recorded { .. }),
             "the overlay fixture must be journaled and confirmed: {recorded:?}"
@@ -730,6 +780,7 @@ fn another_works_overlay_unit_never_surfaces_through_a_lexical_query() {
     }
 
     let mine = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::WorkBase {
             work_id: MINE.to_string(),
             repository: "repo-a".to_string(),
@@ -765,6 +816,7 @@ fn another_works_overlay_unit_never_surfaces_through_a_lexical_query() {
     );
 
     let named = Admissibility {
+        estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
         source: SourceSelector::Named("repo-a".to_string()),
         kind: None,
         authority: None,
@@ -813,9 +865,10 @@ fn another_works_overlay_unit_never_surfaces_through_a_lexical_query() {
 fn every_generation_a_lexical_hit_cites_is_one_the_admissibility_filter_admits() {
     let estate = estate();
     for filter in [
-        Admissibility::default(),
+        Admissibility::within_estate(D1_ESTATE),
         only_knowledge(),
         Admissibility {
+            estate: sergeant_rs::domain::source::EstateAdmission::Estate(D1_ESTATE.to_string()),
             source: SourceSelector::Any,
             kind: None,
             authority: Some(AuthorityClass::EstateReadonly),
@@ -862,7 +915,7 @@ fn a_query_with_no_terms_returns_no_hits_rather_than_the_whole_corpus() {
 #[test]
 fn the_same_query_over_the_same_generations_returns_the_same_ordered_result() {
     let estate = estate();
-    let filter = Admissibility::default();
+    let filter = Admissibility::within_estate(D1_ESTATE);
     let first = estate.search("PaymentRetryPolicy INC0012345 payments", &filter, None);
     for _ in 0..5 {
         let again = estate.search("PaymentRetryPolicy INC0012345 payments", &filter, None);
@@ -906,10 +959,17 @@ fn equal_scores_are_broken_by_the_stated_key_not_by_row_arrival_order() {
                 vec![document_unit(None, "PaymentRetryPolicy")],
             )],
         );
-        record_scan(&mut db, &mut journal, &scan, None).expect("record tie fixture");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &scan,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record tie fixture");
     }
 
-    let filter = Admissibility::default();
+    let filter = Admissibility::within_estate(D1_ESTATE);
     let answer = db
         .lexical_search(&LexicalQuery {
             text: "PaymentRetryPolicy",
@@ -965,8 +1025,14 @@ fn a_superseded_generations_postings_are_evicted_with_it() {
             "short_description".to_string(),
         ]),
     };
-    let recorded = scan_and_record(&mut estate.db, &mut estate.journal, &knowledge, None)
-        .expect("re-record knowledge");
+    let recorded = scan_and_record(
+        &mut estate.db,
+        &mut estate.journal,
+        &knowledge,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("re-record knowledge");
     assert!(
         matches!(recorded, ScanRecord::Recorded { .. }),
         "the re-scan must actually supersede: {recorded:?}"
@@ -1009,7 +1075,7 @@ fn a_superseded_generations_postings_are_evicted_with_it() {
 #[test]
 fn the_lexical_index_rebuilds_from_the_a1_rows_it_derives_from() {
     let mut estate = estate();
-    let filter = Admissibility::default();
+    let filter = Admissibility::within_estate(D1_ESTATE);
     let before = estate.search("PaymentRetryPolicy INC0012345", &filter, None);
     let outcome = estate.db.reindex_lexical().expect("reindex");
     assert!(outcome.indexed > 0, "the rebuild must actually index units");
@@ -1030,7 +1096,11 @@ fn the_lexical_index_rebuilds_from_the_a1_rows_it_derives_from() {
 #[test]
 fn a_bounded_answer_states_whether_the_posting_scan_was_capped() {
     let estate = estate();
-    let answer = estate.search("PaymentRetryPolicy", &Admissibility::default(), None);
+    let answer = estate.search(
+        "PaymentRetryPolicy",
+        &Admissibility::within_estate(D1_ESTATE),
+        None,
+    );
     assert!(
         !answer.truncated,
         "this corpus is far under the cap; a true flag here means the cap logic is wrong"
@@ -1068,12 +1138,19 @@ fn a_bounded_answer_reports_true_when_the_posting_scan_is_actually_capped() {
         "bulk@key-1",
         vec![scanned_file("bulk.md", MARKDOWN_EXTRACTOR, units)],
     );
-    record_scan(&mut db, &mut journal, &bulk, None).expect("record bulk");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &bulk,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record bulk");
 
     let answer = db
         .lexical_search(&LexicalQuery {
             text: "needleterm",
-            filter: &Admissibility::default(),
+            filter: &Admissibility::within_estate(D1_ESTATE),
             family: None,
             limit: MAX_ROWS,
             semantic: SemanticRequest::Requested,

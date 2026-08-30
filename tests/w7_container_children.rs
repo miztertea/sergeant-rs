@@ -26,6 +26,17 @@
 //!
 //! Every test below names the claim it pins. The negative ones are the point.
 
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/w7_container_children";
+
 use std::io::{Cursor, Write as _};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -337,7 +348,14 @@ fn a_csv_inside_a_zip_reaches_the_relational_lane_a_loose_csv_reaches() {
     {
         let mut db = AtlasDb::open(data_dir.path()).expect("open atlas");
         let mut journal = Journal::open(data_dir.path()).expect("open journal");
-        record_scan(&mut db, &mut journal, &scan, None).expect("record");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &scan,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record");
     }
     let db = AtlasDb::open(data_dir.path()).expect("reopen atlas");
     let stored = db
@@ -449,7 +467,14 @@ Content-Transfer-Encoding: base64\r\n\r\n"
     {
         let mut db = AtlasDb::open(data_dir.path()).expect("open atlas");
         let mut journal = Journal::open(data_dir.path()).expect("open journal");
-        record_scan(&mut db, &mut journal, &scan, None).expect("record");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &scan,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record");
     }
     let conn =
         duckdb::Connection::open(atlas_db_path(data_dir.path())).expect("read the recorded store");
@@ -562,7 +587,14 @@ fn a_landed_childs_parent_coordinate_is_persisted_in_its_own_table() {
     {
         let mut db = AtlasDb::open(data_dir.path()).expect("open atlas");
         let mut journal = Journal::open(data_dir.path()).expect("open journal");
-        record_scan(&mut db, &mut journal, &scan, None).expect("record");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &scan,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record");
     }
 
     let conn =
@@ -638,7 +670,14 @@ fn the_parent_coordinate_is_readable_through_the_daemons_own_bounded_reader() {
     {
         let mut db = AtlasDb::open(data_dir.path()).expect("open atlas");
         let mut journal = Journal::open(data_dir.path()).expect("open journal");
-        record_scan(&mut db, &mut journal, &scan, None).expect("record");
+        record_scan(
+            &mut db,
+            &mut journal,
+            &scan,
+            None,
+            &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+        )
+        .expect("record");
     }
 
     let db = AtlasDb::open(data_dir.path()).expect("reopen atlas");
