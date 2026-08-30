@@ -184,7 +184,14 @@ fn declared_child(name: String, relative_path: String, content: Vec<u8>) -> Decl
 ///
 /// Every admitted entry at this level, then — for an entry that is itself a
 /// container the adapter ALREADY opened — that container's own members, at
-/// their `/`-joined path beneath it. The recursion this walks is one
+/// their [`scan::CHILD_PATH_SEPARATOR`]-joined path beneath it. That
+/// separator, not a plain `/`, at EVERY level (S5 W7 F-SF-04): `/` is what
+/// separates directory components *inside* one container, so joining nesting
+/// levels with it too made `bundle.zip/report.docx` mean either "an entry
+/// named that" or "an entry inside an entry", and the daemon could not tell
+/// which. `!/` is reserved — `archive.rs` and `mail.rs` refuse an entry name
+/// carrying it — so splitting a composed path on it recovers the exact
+/// container chain. The recursion this walks is one
 /// `archive::expand` already performed under
 /// [`archive::MAX_NESTING_DEPTH`] and its whole-tree cumulative byte budget;
 /// flattening it adds no depth and admits no byte those bounds did not
@@ -200,10 +207,18 @@ fn flatten_zip(expansion: &archive::ZipExpansion, prefix: &str, out: &mut Vec<De
             child.content.clone(),
         ));
         if let Some(nested) = &child.nested {
-            flatten_zip(nested, &format!("{path}/"), out);
+            flatten_zip(
+                nested,
+                &format!("{path}{}", scan::CHILD_PATH_SEPARATOR),
+                out,
+            );
         }
         if let Some(nested) = &child.nested_mail {
-            flatten_mail(nested, &format!("{path}/"), out);
+            flatten_mail(
+                nested,
+                &format!("{path}{}", scan::CHILD_PATH_SEPARATOR),
+                out,
+            );
         }
     }
 }
@@ -222,10 +237,18 @@ fn flatten_mail(message: &mail::MailMessage, prefix: &str, out: &mut Vec<Declare
             attachment.content.clone(),
         ));
         if let Some(nested) = &attachment.nested_message {
-            flatten_mail(nested, &format!("{path}/"), out);
+            flatten_mail(
+                nested,
+                &format!("{path}{}", scan::CHILD_PATH_SEPARATOR),
+                out,
+            );
         }
         if let Some(nested) = &attachment.nested_archive {
-            flatten_zip(nested, &format!("{path}/"), out);
+            flatten_zip(
+                nested,
+                &format!("{path}{}", scan::CHILD_PATH_SEPARATOR),
+                out,
+            );
         }
     }
 }

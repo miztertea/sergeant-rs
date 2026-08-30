@@ -253,7 +253,7 @@ Content-Transfer-Encoding: base64\r\n\r\n"
     let docx_child = scan
         .files
         .iter()
-        .find(|f| f.relative_path == "message.eml!/bundle.zip/report.docx")
+        .find(|f| f.relative_path == "message.eml!/bundle.zip!/report.docx")
         .unwrap_or_else(|| {
             panic!(
                 "the grandchild must reach the office adapter: {:?}",
@@ -519,8 +519,8 @@ fn a_nested_container_cannot_escape_the_shared_depth_ceiling_by_recursing() {
     for reachable in [
         "a.zip",
         "a.zip!/inner.zip",
-        "a.zip!/inner.zip/b.zip",
-        "a.zip!/inner.zip/b.zip/c.zip",
+        "a.zip!/inner.zip!/b.zip",
+        "a.zip!/inner.zip!/b.zip!/c.zip",
     ] {
         assert!(
             paths.contains(&reachable),
@@ -545,7 +545,7 @@ fn a_nested_container_cannot_escape_the_shared_depth_ceiling_by_recursing() {
     // gap: per-entry ZIP coverage has nowhere to go on the wire yet"), which
     // W7 does not widen and does not claim to have closed. What this asserts
     // is that the landed row does not claim otherwise.
-    let deepest = row(&scan, "a.zip!/inner.zip/b.zip/c.zip");
+    let deepest = row(&scan, "a.zip!/inner.zip!/b.zip!/c.zip");
     assert_eq!(deepest.status, Coverage::Indexed);
     let detail = deepest.detail.clone().unwrap_or_default();
     assert!(

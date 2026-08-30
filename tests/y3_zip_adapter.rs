@@ -185,7 +185,7 @@ fn a_nested_archive_declares_both_levels_flattened_onto_one_wire_batch() {
         .collect();
     assert_eq!(
         paths,
-        vec!["inner.zip", "inner.zip/leaf.md"],
+        vec!["inner.zip", "inner.zip!/leaf.md"],
         "the nested archive and its own member both reach the wire"
     );
     assert_eq!(batch.declared_children[0].name, "inner.zip");

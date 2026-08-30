@@ -1136,12 +1136,22 @@ pub fn child_is_container(relative: &str) -> bool {
 /// `!/` is the long-established archive-coordinate convention (JAR URLs, and
 /// every tool that reads them), taken for the reason it was chosen there: it
 /// reads as "inside", and it is not what an ordinary directory separator
-/// looks like. The authoritative, unambiguous decomposition is not this
-/// string, though — it is [`ChildProvenance`], persisted per child in
-/// `source.child_resources`, which carries the parent path, the parent key
-/// and the entry path as their own columns (A1 §6.6's first two preserved
-/// fields). This separator is what makes a child addressable in the same
+/// looks like. This separator is what makes a child addressable in the same
 /// column every other resource is addressable in.
+///
+/// **It joins EVERY nesting level, and it is RESERVED** (S5 W7 F-SF-04).
+/// `src/bin/atlas_worker.rs`'s `flatten_zip`/`flatten_mail` compose a
+/// grandchild's path with this string, not a plain `/` — `/` already means
+/// "a directory component inside one container", so using it for the
+/// container boundary too made `bundle.zip/report.docx` mean either "an
+/// entry with that name" or "an entry inside an entry" with nothing to tell
+/// them apart. [`super::archive`] and [`super::mail`] therefore REFUSE an
+/// entry name or attachment filename containing this sequence, each with its
+/// own named coverage row, so a composed path splits back into its exact
+/// container chain. That chain is what [`ChildProvenance`] records
+/// column-by-column in `source.child_resources` — the parent resource's own
+/// composed path, the parent's own F7 key, and the entry path RELATIVE TO
+/// THAT IMMEDIATE PARENT (A1 §6.6's first two preserved fields).
 pub const CHILD_PATH_SEPARATOR: &str = "!/";
 
 /// The sentinel [`WorkerIdentity::generation_id`] a per-resource worker

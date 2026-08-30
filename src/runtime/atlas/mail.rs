@@ -551,6 +551,25 @@ fn build_mail_message(
             });
             continue;
         }
+        // S5 W7 (F-SF-04): the same reserved-separator rule `archive.rs`
+        // applies to a ZIP entry name, applied here for the identical
+        // reason — an attachment literally named `bundle.zip!/report.docx`
+        // would compose to the exact coordinate a genuine `report.docx`
+        // inside an attached `bundle.zip` composes to.
+        if filename.contains(super::scan::CHILD_PATH_SEPARATOR) {
+            coverage.push(CoverageRow {
+                path: Some(filename.clone()),
+                status: Coverage::Excluded,
+                detail: Some(format!(
+                    "attachment name contains {:?}, the reserved container-coordinate separator; \
+                     a child path is composed by joining nesting levels with it, so admitting \
+                     this name would forge a nesting boundary that does not exist",
+                    super::scan::CHILD_PATH_SEPARATOR
+                )),
+                bytes: None,
+            });
+            continue;
+        }
         if !seen_names.insert(filename.clone()) {
             coverage.push(CoverageRow {
                 path: Some(filename.clone()),
@@ -1379,6 +1398,34 @@ mod tests {
             .find(|r| r.path.as_deref() == Some("C:/Windows/System32/evil.zip"))
             .expect("a coverage row names the refusal");
         assert_eq!(row.status, Coverage::Excluded);
+    }
+
+    /// **F-SF-04.** The container-coordinate separator is reserved on this
+    /// side too: an attachment literally named `bundle.zip!/report.md` would
+    /// compose to exactly the coordinate `report.md` inside an attached
+    /// `bundle.zip` composes to, so it is refused with its own named row.
+    #[test]
+    fn an_attachment_name_carrying_the_reserved_container_separator_is_refused() {
+        let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: x\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"B\"\r\n\r\n--B\r\nContent-Type: text/plain\r\n\r\nbody\r\n--B\r\nContent-Type: text/markdown; name=\"bundle.zip!/report.md\"\r\nContent-Disposition: attachment; filename=\"bundle.zip!/report.md\"\r\nContent-Transfer-Encoding: base64\r\n\r\nAAAA\r\n--B--\r\n";
+        let message = parse_message(raw, "parent-key").expect("outer message parses");
+        assert!(
+            message.attachments.is_empty(),
+            "a forged nesting coordinate must never be admitted: {:?}",
+            message.attachments
+        );
+        let row = message
+            .coverage
+            .iter()
+            .find(|r| r.path.as_deref() == Some("bundle.zip!/report.md"))
+            .expect("a coverage row names the refusal");
+        assert_eq!(row.status, Coverage::Excluded);
+        assert!(
+            row.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reserved container-coordinate separator"),
+            "{row:?}"
+        );
     }
 
     #[test]

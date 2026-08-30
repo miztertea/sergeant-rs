@@ -759,6 +759,31 @@ pub(crate) fn expand_at_depth(
         }
         let path = enclosed.to_string_lossy().replace('\\', "/");
 
+        // S5 W7 (F-SF-04): the container-coordinate separator is RESERVED,
+        // not merely conventional. A composed child path joins every nesting
+        // level with [`super::scan::CHILD_PATH_SEPARATOR`], so an entry whose
+        // own enclosed path contains that sequence would compose to exactly
+        // the same string a genuine two-level nesting composes to — an entry
+        // literally named `bundle.zip!/report.docx` would be indistinguishable
+        // from `report.docx` inside `bundle.zip`, and neither the composed
+        // path nor the stored `entry_path` could be decomposed back. Refused
+        // with its own named row rather than admitted under a coordinate that
+        // does not mean what it says.
+        if path.contains(super::scan::CHILD_PATH_SEPARATOR) {
+            coverage.push(CoverageRow {
+                path: Some(raw_name.clone()),
+                status: Coverage::Excluded,
+                detail: Some(format!(
+                    "entry name contains {:?}, the reserved container-coordinate separator; a \
+                     child path is composed by joining nesting levels with it, so admitting this \
+                     name would forge a nesting boundary that does not exist",
+                    super::scan::CHILD_PATH_SEPARATOR
+                )),
+                bytes: None,
+            });
+            continue;
+        }
+
         // Entry-type classification: this module masks the entry's own Unix
         // mode bits (S_IFMT) directly rather than composing `zip`'s
         // `is_dir()`/`is_symlink()`/`is_file()` predicates the way an earlier
@@ -1425,6 +1450,48 @@ mod tests {
         );
         assert_eq!(expansion.children[0].relative_path, "readme.txt");
         assert_eq!(expansion.children[0].content, b"hello");
+    }
+
+    /// **F-SF-04.** The container-coordinate separator is reserved: an entry
+    /// whose own name carries `!/` would compose to exactly the coordinate a
+    /// genuine two-level nesting composes to, so it is refused with its own
+    /// named row rather than admitted under a forged one.
+    #[test]
+    fn an_entry_name_carrying_the_reserved_container_separator_is_refused() {
+        let expansion = expand(
+            &build(&[
+                ("readme.txt", b"ok" as &[u8]),
+                ("bundle.zip!/report.md", b"# forged"),
+            ]),
+            "parent-key",
+        );
+        assert!(
+            expansion
+                .children
+                .iter()
+                .all(|c| c.relative_path != "bundle.zip!/report.md"),
+            "a forged nesting coordinate must not be admitted: {:?}",
+            expansion.children
+        );
+        let row = expansion
+            .coverage
+            .iter()
+            .find(|r| r.path.as_deref() == Some("bundle.zip!/report.md"))
+            .expect("the refusal is a NAMED row, not silence");
+        assert_eq!(row.status, Coverage::Excluded);
+        assert!(
+            row.detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reserved container-coordinate separator"),
+            "{row:?}"
+        );
+        assert_eq!(
+            expansion.children.len(),
+            1,
+            "the innocent sibling is still admitted: {:?}",
+            expansion.children
+        );
     }
 
     /// Overwrites the external-file-attributes field (bytes 38..42 of the
