@@ -5377,8 +5377,29 @@ impl Engine {
         // attributed to this execution (§21 item 11). A degraded compilation
         // journals the snapshot and no audit events — see
         // `ContextSnapshot::audit_events`.
-        let mut events: Vec<(&'static str, Value)> = vec![(KIND_CONTEXT_COMPILED, snapshot.json())];
-        events.extend(snapshot.audit_events());
+        let audit_events = snapshot.audit_events();
+        // F-IN-01: the caller below commits `context.compiled` and each
+        // audit event as separate, non-transactional journal writes — a
+        // mid-sequence commit failure can leave fewer audit rows for this
+        // `execution_id` than this compilation actually produced, and that
+        // truncation is otherwise indistinguishable from a compilation that
+        // legitimately bound/referenced/queried nothing (§16's own
+        // documented degraded case). Naming the count this compilation
+        // produced, on the one event committed first and always (degraded
+        // or not), lets a reader compare it against the audit rows actually
+        // observed for the execution and tell the two apart — a raw fact
+        // recorded alongside the rest of §15's snapshot, not a policy
+        // change to how or whether anything commits.
+        let mut compiled_payload = snapshot.json();
+        if let Value::Object(ref mut map) = compiled_payload {
+            map.insert(
+                "audit_event_count".to_string(),
+                Value::from(audit_events.len()),
+            );
+        }
+        let mut events: Vec<(&'static str, Value)> =
+            vec![(KIND_CONTEXT_COMPILED, compiled_payload)];
+        events.extend(audit_events);
         (context, events)
     }
 }
