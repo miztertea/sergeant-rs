@@ -351,3 +351,16 @@ cov_stage_end 1 "the w3b_semantic_retrieval test binary must write its own profi
 cov_stage_begin c2-w3b_model2vec_manifest_pin
 cov_run cargo llvm-cov --no-report --test w3b_model2vec_manifest_pin --locked || cov_fail "w3b_model2vec_manifest_pin failed under instrumentation"
 cov_stage_end 1 "the w3b_model2vec_manifest_pin test binary must write its own profile"
+
+# S5 W4, wired at birth (the #231 lesson, same as w1/w1b/w1c/w1d/w2/w3/w3b
+# above): A2 §7's Reciprocal Rank Fusion and A2 §8's deterministic
+# reranking — the one RRF expression, the four determinism hazards with a
+# rule and a test each, all nine of A2 §8's signals proved to actually fire,
+# and the A2 §8 prohibition proved a third time (fusion is where a second
+# list could smuggle an inadmissible candidate in). Loads the committed
+# model once per test process, like w3b_semantic_retrieval; builds Atlas
+# stores in tempdirs and records scans through the ordinary `record_scan`
+# path. No daemon, no estate, no subprocess of any kind. Floor 1.
+cov_stage_begin c2-w4_rrf_fusion
+cov_run cargo llvm-cov --no-report --test w4_rrf_fusion --locked || cov_fail "w4_rrf_fusion failed under instrumentation"
+cov_stage_end 1 "the w4_rrf_fusion test binary must write its own profile"

@@ -255,6 +255,36 @@ fn case_split(word: &str) -> Vec<&str> {
     parts
 }
 
+/// Whether `text` **names an identifier** — A2 §8's *"when the query is
+/// identifier-like"*, and the gate on that signal
+/// ([`crate::runtime::atlas::fusion::RerankSignals::definition_over_reference`]).
+///
+/// True when any compound in the text is one this tokenizer would split:
+/// it holds a separator (`payment_retry_policy`, `Foo::bar`) or splits at a
+/// camel/digit boundary (`PaymentRetryPolicy`, `INC0012345`). A query of
+/// ordinary words — *"how do we retry a failed payment charge"* — is not
+/// identifier-like, and neither is a single lowercase word, because a
+/// one-word query cannot distinguish "the symbol `retry`" from "the topic
+/// retry" and guessing which was meant is not something evidence supports.
+///
+/// It reuses [`compounds_of`] and [`case_split`] — the same two functions
+/// [`tokenize`] runs — rather than re-deriving what an identifier looks like
+/// (**R2**); a second definition of "identifier-shaped" would be a second
+/// tokenizer, drifting from the first the first time either changed.
+pub fn is_identifier_like(text: &str) -> bool {
+    compounds_of(text).into_iter().any(|(start, end)| {
+        let compound = &text[start..end];
+        if !compound.chars().any(char::is_alphanumeric) {
+            return false;
+        }
+        let words: Vec<&str> = compound
+            .split(is_separator)
+            .filter(|w| !w.is_empty())
+            .collect();
+        words.len() > 1 || words.iter().any(|word| case_split(word).len() > 1)
+    })
+}
+
 /// Distinct query terms, in a deterministic order — [`tokenize`] with
 /// repeats folded away, because a term repeated in the *query* multiplies a
 /// document's score without saying anything more about the document.
@@ -596,6 +626,27 @@ mod tests {
             average_length: 5.0,
         };
         assert!(bm25_contribution(corpus, 10, 3, 5) >= 0.0);
+    }
+
+    #[test]
+    fn identifier_shaped_queries_are_recognised_and_prose_is_not() {
+        for identifier in [
+            "PaymentRetryPolicy",
+            "payment_retry_policy",
+            "payment-retry-policy",
+            "Foo::bar",
+            "INC0012345",
+            "where is retry_charge defined",
+        ] {
+            assert!(is_identifier_like(identifier), "{identifier}");
+        }
+        for prose in [
+            "how do we retry a failed payment charge",
+            "retry",
+            "what did we decide about asynchronous settlement",
+        ] {
+            assert!(!is_identifier_like(prose), "{prose}");
+        }
     }
 
     #[test]

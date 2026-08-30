@@ -1414,6 +1414,59 @@ them were dead code in every real installation.
   of being excepted.
 
 
+### Rank fusion and deterministic reranking (S5)
+
+- **The two halves are now one answer.** `AtlasDb::fused_search` runs the BM25
+  and cosine halves over one query value and one admissibility filter and
+  fuses their rank lists with Reciprocal Rank Fusion — A2 §7's one expression,
+  `RRF(d) = Σ 1/(k + rank_i(d))`, and nothing around it. No weights, no score
+  normalization, no pluggable scorer, no learned or self-tuning ranker
+  (A2-08's **R6**; A2 §16's non-goals). `k = 60` is the published default,
+  a constant with its provenance written down rather than a tuning knob:
+  A2 §14 forbids exposing raw retrieval weight tuning, and there is nothing
+  here to expose.
+- **Determinism is pinned where it actually breaks, not where the formula
+  is.** RRF is exactly reproducible; the hazards are around it, and each has a
+  stated rule and its own test: candidate collection order (both input lists
+  are re-sorted with their own stated orders before any rank is assigned, so
+  `rank_i(d)` is a function of the hits and not of arrival), tie-breaking (one
+  stated key, the same `(source_name, relative_path, ordinal, unit_key)` both
+  halves already use), float summation order (two terms, added lexical-then-
+  semantic, an absent list contributing a literal zero), and `HashMap`
+  iteration (there is none — a structural test fails on the token). Two of the
+  four were checked by breaking the rule and watching the test go red; where
+  one such check turned out vacuous, a second test that does discriminate was
+  added rather than the claim being softened. This matters because A2 §4/§13
+  make a result derived evidence carrying an output hash and recorded ranks,
+  and a nondeterministic ranker cannot honour either.
+- **All nine of A2 §8's rerank signals are computed, and a test fails if any
+  one of them is ever declared but never fires.** Exact symbol/heading/filename
+  match; definition over reference when the query is identifier-like;
+  caller-selected source; Work-changed unit (reachable now that the overlay
+  reflects in-flight changes); same module/package/document section; inbound or
+  outbound structural relationship read from A1's own `source.edges`; canonical
+  implementation vs test/example/legacy path; knowledge source when `--type
+  knowledge` was requested; current generation unless the caller pinned one.
+  All of them reuse structure and provenance A1 already stores — §8's own
+  *"rather than training another ranker"*.
+- **Three of the nine are structurally uniform, and that is written down
+  rather than hidden.** Caller-selected source, `--type knowledge` and
+  current-generation cannot reorder anything, because A2-01 already turned each
+  of them into a *boundary*: an unselected source, a non-knowledge generation
+  and a superseded generation are not admissible, so there is nothing on the
+  wrong side of the preference left to outrank. They are still computed and
+  still carried, so a search trace can state them.
+- **The prohibition is proved a third time.** *"The reranker must never
+  silently cross an authority/source filter merely because a candidate scores
+  well."* Fusion is exactly where a second list could smuggle a candidate in,
+  so the negative is not inherited from the lexical and semantic waves: an
+  external decoy is shown winning the semantic list **and** the fused answer
+  with the filter open, and absent from the fused answer with it closed.
+- **The fused order does not depend on the caller's `limit`.** Both halves run
+  at the store's row ceiling so `rank_i(d)` is the rank within the admissible
+  set rather than within the slice a caller wanted to display; a narrower limit
+  returns a prefix of the wider answer, never a differently-ordered one.
+
 ### Container children are real resources (S5)
 
 - **An archive entry or a mail attachment now lands as its own resource,

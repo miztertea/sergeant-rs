@@ -121,7 +121,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use duckdb::types::Value as Duck;
-use duckdb::{Connection, Statement};
+use duckdb::{Connection, Statement, Transaction};
 use serde_json::{Map, Value, json};
 
 use crate::domain::event::{Event, unix_millis};
@@ -137,9 +137,12 @@ use crate::domain::workflow::{
     KIND_STAGE_FAILED, KIND_STAGE_NEEDS_INPUT, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
 };
 use crate::runtime::atlas::external_git::ExternalGitProvenance;
+use crate::runtime::atlas::fusion::{
+    FusedHit, RerankSignals, exact_match, fuse, is_canonical_path, rerank, same_section, symbol_of,
+};
 use crate::runtime::atlas::lexical::{
-    Bm25Corpus, LexicalFamily, LexicalHit, UnitCoordinate, bm25_contribution, query_terms,
-    rank_order, term_frequencies,
+    Bm25Corpus, LexicalFamily, LexicalHit, UnitCoordinate, bm25_contribution, is_identifier_like,
+    query_terms, rank_order, term_frequencies,
 };
 use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
 use crate::runtime::atlas::semantic::{
@@ -649,6 +652,15 @@ const LEXICAL_POSTINGS_SQL: &str = concat!(
       ORDER BY l.source_name, l.relative_path, l.ordinal, l.unit_key \
       LIMIT ?"
 );
+
+/// **Signal 6, inbound.** Every path in one generation holding an edge whose
+/// target is the anchor's symbol — i.e. the files that *reference* the
+/// anchor. A literal with bound values, like every other statement in this
+/// file (item 13's no-client-SQL pin).
+const EDGES_TO_TARGET_SQL: &str = "SELECT DISTINCT relative_path FROM source.edges      WHERE generation_id = ? AND target = ? ORDER BY relative_path LIMIT ?";
+
+/// **Signal 6, outbound.** Every symbol the anchor's own file references.
+const EDGES_FROM_PATH_SQL: &str = "SELECT DISTINCT target FROM source.edges      WHERE generation_id = ? AND relative_path = ? ORDER BY target LIMIT ?";
 
 /// The default row ceiling on a read from this store (F12).
 ///
@@ -1628,6 +1640,27 @@ impl AtlasDb {
             content_key: row.get(4)?,
             observed_at: row.get(5)?,
         }))
+    }
+
+    /// `source.files`' recorded content hash for one path in one
+    /// generation, when that generation has a row for it at all (F-SF-01:
+    /// [`Self::rerank_signals`]'s only use — telling a Work-changed path
+    /// from a merely-visible one by comparing this against the base
+    /// generation's hash for the same path).
+    fn file_content_hash(
+        &self,
+        generation_id: &str,
+        relative_path: &str,
+    ) -> Result<Option<String>, AtlasError> {
+        let mut statement = self.conn.prepare(
+            "SELECT content_hash FROM source.files \
+             WHERE generation_id = ? AND relative_path = ?",
+        )?;
+        let mut rows = statement.query(duckdb::params![generation_id, relative_path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
     }
 
     /// Units of one source's confirmed generation, in path then ordinal
@@ -3084,6 +3117,232 @@ impl AtlasDb {
         hits.truncate(limit);
         answer.hits = hits;
         Ok(answer)
+    }
+
+    /// A2 §7's Reciprocal Rank Fusion followed by A2 §8's deterministic
+    /// reranking: **one answer built from the two rank lists, inside one
+    /// admissibility filter.**
+    ///
+    /// # What this does, in order
+    ///
+    /// 1. Runs [`Self::lexical_search`] and [`Self::semantic_search`] over
+    ///    **the same [`LexicalQuery`] value** — one filter, both halves. Two
+    ///    lists produced from two differently-spelled filters are not
+    ///    fusable, which is why `semantic_search` was given this query type
+    ///    in W3b rather than one of its own.
+    /// 2. Fuses them with
+    ///    [`crate::runtime::atlas::fusion::fuse`] — A2 §7's one expression.
+    /// 3. Computes A2 §8's nine signals for every candidate
+    ///    ([`Self::rerank_signals`]) and reranks
+    ///    ([`crate::runtime::atlas::fusion::rerank`]).
+    /// 4. Truncates to the caller's `limit`.
+    ///
+    /// # Both halves run at [`MAX_ROWS`], not at the caller's `limit`
+    ///
+    /// `rank_i(d)` must be the candidate's rank **within the admissible
+    /// set**, not within whatever slice the caller wanted to display. If the
+    /// halves were run at `limit`, a unit at lexical rank 12 would be absent
+    /// from the lexical list at `limit = 10` and present at `limit = 20`, and
+    /// the fused *order of the first ten* would change with a display
+    /// parameter — a determinism hazard that looks like nothing until two
+    /// callers disagree. It costs no extra scanning: both halves already
+    /// score the whole admissible set and only truncate at the end.
+    /// `tests/w4_rrf_fusion.rs::
+    /// the_fused_order_does_not_depend_on_the_callers_limit` is the pin.
+    ///
+    /// # The prohibition
+    ///
+    /// *"The reranker must never silently cross an authority/source filter
+    /// merely because a candidate scores well."* Every candidate here came
+    /// from one of the two filtered lists;
+    /// [`crate::runtime::atlas::fusion::fuse`] holds no store handle and
+    /// cannot fetch one, and [`Self::rerank_signals`] only ever *marks*
+    /// candidates that already exist — its two `source.edges` reads are
+    /// scoped to the anchor's own (already admissible) generation and their
+    /// results are membership tests, never a source of new hits.
+    pub fn fused_search(&self, query: &LexicalQuery<'_>) -> Result<FusedAnswer, AtlasError> {
+        let full = LexicalQuery {
+            text: query.text,
+            filter: query.filter,
+            family: query.family,
+            limit: MAX_ROWS,
+            semantic: query.semantic,
+        };
+        // F-IN-01: `lexical_search` and `semantic_search` are two
+        // independent reads of `source.generations`/`source.edges`; without
+        // an enclosing transaction a concurrent writer's commit landing
+        // between them (e.g. `confirm_scan` promoting a generation) could
+        // hand back a fused answer built from two different committed
+        // states of the store — undermining A2 §4's output-hash
+        // reproducibility exactly as much as any of the four named
+        // determinism hazards would. `lexical_search`/`semantic_search`/
+        // `rerank_signals` all take `&self`, so the ordinary `Connection::
+        // transaction` (which requires `&mut self` to rule out nesting) is
+        // not available without widening every one of their signatures;
+        // `Transaction::new_unchecked` (R5) is the crate's own documented
+        // escape hatch for exactly this "`&mut Connection` is unacceptable"
+        // case, and opens the same snapshot-isolated transaction from a
+        // shared `&Connection`. It is dropped (and rolled back — nothing
+        // here writes) on every exit path, `?` included.
+        let snapshot = Transaction::new_unchecked(&self.conn)?;
+        let lexical = self.lexical_search(&full)?;
+        let semantic = self.semantic_search(&full)?;
+        let mut hits = fuse(&lexical.hits, &semantic.hits);
+        self.rerank_signals(query, &mut hits)?;
+        drop(snapshot);
+        rerank(&mut hits);
+        hits.truncate(query.limit.min(MAX_ROWS));
+        Ok(FusedAnswer {
+            hits,
+            scope: lexical.scope,
+            truncated: lexical.truncated || semantic.truncated,
+            semantic: lexical.semantic,
+            semantic_model: lexical.semantic_model,
+        })
+    }
+
+    /// Fill in A2 §8's nine signals for every fused candidate, from A1's own
+    /// structure and provenance — *"rather than training another ranker"*
+    /// (§8), decision **A2-09 (R2)**: *"Structural relationships already
+    /// exist; reuse them."*
+    ///
+    /// The *anchor* for the two relational signals (5 and 6) is the candidate
+    /// RRF ranked first — `hits` arrives in
+    /// [`crate::runtime::atlas::fusion::rrf_order`], so the anchor is a
+    /// function of the fused score and the stated tie-break key, never of
+    /// iteration order.
+    fn rerank_signals(
+        &self,
+        query: &LexicalQuery<'_>,
+        hits: &mut [FusedHit],
+    ) -> Result<(), AtlasError> {
+        let Some(anchor) = hits.first() else {
+            return Ok(());
+        };
+        let anchor_coordinate = anchor.coordinate.clone();
+        let anchor_generation = anchor.generation_id.clone();
+        let anchor_symbol = symbol_of(&anchor_coordinate).map(str::to_string);
+
+        let terms = query_terms(query.text);
+        let identifier_like = is_identifier_like(query.text);
+        // Signal 3: the caller named a source at all. See
+        // `RerankSignals`'s own doc for why this is uniform.
+        let selected_source = !matches!(query.filter.source, SourceSelector::Any);
+        // Signal 8: `--type knowledge`.
+        let knowledge_requested = query.filter.kind == Some(SourceKind::LocalKnowledge);
+        // Signal 4: this Work's overlay source name, when the filter is a
+        // `--work` one. `None` for every other selector, so no non-Work query
+        // can accidentally match a unit whose source merely looks like one.
+        let overlay_source = query.filter.source.overlay_admit_source_name();
+        // Signal 4's other half (F-SF-01): an overlay generation's universe
+        // is the base tree *plus* whatever the surface changed
+        // (`extract_overlay`, overlay.rs), so every unchanged path is
+        // indexed under the same overlay source name as every changed one —
+        // source-name equality alone cannot tell "the Work touched this"
+        // from "this is merely visible under the Work's view". The overlay
+        // schema carries no per-unit changed/unchanged flag, but
+        // `source.files` already carries a content hash per path (F7), and
+        // an unchanged path's overlay row is read from the exact same blob
+        // as the base tree's (overlay.rs's own doc: "an overlay and a plain
+        // estate-git scan of the same base agree on every unchanged path by
+        // construction"). So a path whose overlay content hash differs from
+        // the base generation's content hash at the same path — or is
+        // absent from the base entirely — is a path the Work actually
+        // changed; one whose hash matches is not, regardless of source
+        // name.
+        let base_generation_id = match &query.filter.source {
+            SourceSelector::WorkBase { repository, .. } => self
+                .confirmed_generation(repository)?
+                .map(|generation| generation.id),
+            _ => None,
+        };
+        let mut base_content_hash: BTreeMap<String, Option<String>> = BTreeMap::new();
+        // Signal 9: the caller pinned an exact generation, so A2 §8's
+        // "unless caller pinned stale" suppresses the current-generation
+        // preference.
+        let pinned = matches!(query.filter.source, SourceSelector::Exact { .. });
+
+        // Signal 6, both directions, read once from the anchor's own
+        // generation.
+        let mut referencing_paths: BTreeSet<String> = BTreeSet::new();
+        let mut anchor_targets: BTreeSet<String> = BTreeSet::new();
+        if let Some(symbol) = &anchor_symbol {
+            let mut statement = self.conn.prepare(EDGES_TO_TARGET_SQL)?;
+            let mut rows =
+                statement.query(duckdb::params![anchor_generation, symbol, MAX_ROWS as i64])?;
+            while let Some(row) = rows.next()? {
+                referencing_paths.insert(row.get(0)?);
+            }
+        }
+        {
+            let mut statement = self.conn.prepare(EDGES_FROM_PATH_SQL)?;
+            let mut rows = statement.query(duckdb::params![
+                anchor_generation,
+                anchor_coordinate.relative_path(),
+                MAX_ROWS as i64
+            ])?;
+            while let Some(row) = rows.next()? {
+                anchor_targets.insert(row.get(0)?);
+            }
+        }
+
+        // Signal 9's other half: which generation is each source's current
+        // confirmed one. A `BTreeMap` cache, not a per-hit query.
+        let mut current: BTreeMap<String, Option<String>> = BTreeMap::new();
+        for hit in hits.iter() {
+            if !current.contains_key(&hit.source_name) {
+                let confirmed = self
+                    .confirmed_generation(&hit.source_name)?
+                    .map(|generation| generation.id);
+                current.insert(hit.source_name.clone(), confirmed);
+            }
+        }
+
+        for hit in hits.iter_mut() {
+            let same_generation = hit.generation_id == anchor_generation;
+            let work_changed_unit = match overlay_source.as_deref() {
+                Some(overlay) if overlay == hit.source_name => match &base_generation_id {
+                    Some(base_id) => {
+                        let relative_path = hit.coordinate.relative_path();
+                        if !base_content_hash.contains_key(relative_path) {
+                            let hash = self.file_content_hash(base_id, relative_path)?;
+                            base_content_hash.insert(relative_path.to_string(), hash);
+                        }
+                        let base_hash = base_content_hash
+                            .get(relative_path)
+                            .and_then(Option::as_deref);
+                        let overlay_hash =
+                            self.file_content_hash(&hit.generation_id, relative_path)?;
+                        base_hash != overlay_hash.as_deref()
+                    }
+                    // No confirmed base generation to compare against —
+                    // nothing here can be shown to differ from it, so this
+                    // signal stays honestly false rather than guessing.
+                    None => false,
+                },
+                _ => false,
+            };
+            hit.signals = RerankSignals {
+                exact_match: exact_match(&terms, &hit.coordinate),
+                definition_over_reference: identifier_like
+                    && hit.coordinate.family() == LexicalFamily::Code,
+                caller_selected_source: selected_source,
+                work_changed_unit,
+                same_section_as_anchor: same_section(&anchor_coordinate, &hit.coordinate),
+                structural_relationship: same_generation
+                    && (referencing_paths.contains(hit.coordinate.relative_path())
+                        || symbol_of(&hit.coordinate)
+                            .is_some_and(|symbol| anchor_targets.contains(symbol))),
+                canonical_path: is_canonical_path(hit.coordinate.relative_path()),
+                knowledge_source_requested: knowledge_requested,
+                current_generation: pinned
+                    || current
+                        .get(&hit.source_name)
+                        .and_then(Option::as_deref)
+                        .is_some_and(|id| id == hit.generation_id),
+            };
+        }
+        Ok(())
     }
 
     /// Rebuild the whole lexical index from the A1 rows it is derived from.
@@ -5122,6 +5381,41 @@ pub struct SemanticAnswer {
     pub semantic: SemanticStatus,
     /// A2 §13's *"semantic model identity/hash **if used**"*, populated only
     /// when [`Self::semantic`] is [`SemanticStatus::Applied`].
+    pub semantic_model: Option<SemanticModel>,
+}
+
+/// What one [`AtlasDb::fused_search`] answered: A2 §7's fused, A2 §8's
+/// reranked list, plus **the same four disclosure fields the two half-answers
+/// carry**.
+///
+/// The four are not copied out of tidiness. A fused answer is degraded in
+/// exactly the ways its inputs were, and a consumer that could not see that
+/// would read a lexical-only list as a fused one:
+///
+/// * [`Self::scope`] — `--work`'s overlay half is a snapshot, and a fused
+///   answer built over it inherits that ([`WorkScope`]).
+/// * [`Self::truncated`] — **either** half hitting [`MAX_ROWS`] truncates
+///   this answer, because a capped input list changes `rank_i(d)` for every
+///   candidate below the cap and therefore changes the fused score, not just
+///   the length of a list.
+/// * [`Self::semantic`] / [`Self::semantic_model`] — decision **H4**. When
+///   the status is not [`SemanticStatus::Applied`] this "fused" answer fused
+///   one list with an empty one, which is A2 §15's degraded state and must be
+///   readable as such rather than inferred from a suspiciously lexical-looking
+///   ordering.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedAnswer {
+    /// The reranked hits, best first — A2 §7's score then A2 §8's signals,
+    /// ties broken by
+    /// [`crate::runtime::atlas::fusion::FusedHit::tie_break_key`].
+    pub hits: Vec<FusedHit>,
+    /// What this answer covers — see [`WorkScope`].
+    pub scope: WorkScope,
+    /// Whether **either** input list hit [`MAX_ROWS`] and stopped.
+    pub truncated: bool,
+    /// A2 §15's required honesty about the semantic half (decision **H4**).
+    pub semantic: SemanticStatus,
+    /// A2 §13's *"semantic model identity/hash **if used**"*.
     pub semantic_model: Option<SemanticModel>,
 }
 

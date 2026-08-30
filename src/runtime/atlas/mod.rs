@@ -179,6 +179,7 @@ pub mod archive;
 pub mod db;
 pub mod deny;
 pub mod external_git;
+pub mod fusion;
 pub mod git;
 pub mod lane;
 pub mod lexical;
