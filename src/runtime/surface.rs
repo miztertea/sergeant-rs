@@ -1980,26 +1980,47 @@ fn composed_stage_id(dir: &Path, worktree_root: &Path) -> Option<String> {
 /// for them to survive — but the returned [`RetainedStageOutput`] carries
 /// its real disposition so a caller never reads a promoted deliverable back
 /// as mere evidence (never "silently demoted").
+///
+/// #297: scoped to the ids the package at `workflow_source` actually
+/// declares ([`crate::domain::workflow::declared_stage_ids`]), and fails
+/// closed — no package, or a package that will not load, retains nothing
+/// rather than falling back to the unscoped walk. A `<dir>/output/` an
+/// earlier Work merged into the base branch lives in this worktree too, and
+/// is not this Work's evidence to copy out and report as its own.
 fn retain_stage_outputs(
     binding: &RepositoryBinding,
     workflow_source: Option<&Path>,
 ) -> Vec<RetainedStageOutput> {
+    // #297: fail closed, the same posture `finalize_sweep` already takes.
+    // Without a package there is nothing that says which directories in
+    // this worktree are this Work's stages, and the unscoped walk is what
+    // copied another Work's already-merged evidence into this Work's
+    // evidence area. The flat `.dirty.patch` still captures the worktree's
+    // content either way, so nothing here discards content — it stops
+    // labeling a stranger's directory as one of this run's stages.
+    let Some(workflow_source) = workflow_source else {
+        return Vec::new();
+    };
+    let Some(declared) = crate::domain::workflow::declared_stage_ids(workflow_source) else {
+        return Vec::new();
+    };
     let Some(surface_root) = binding.worktree_path.parent() else {
         return Vec::new();
     };
     let dest_root = surface_root.join(format!("{}.output", binding.repository));
     let mut outputs = Vec::new();
     for (stage_id, output_dir) in stage_output_dirs(&binding.worktree_path) {
+        // #297: only ids this workflow declares — leaves and containers.
+        if !declared.contains(&stage_id) {
+            continue;
+        }
         // A composed id nests the destination the same way it nests the
         // source: `<repo>.output/10-investigate/00-lead/`.
         let dest = dest_root.join(&stage_id);
         let bytes = copy_declared_output_artifacts(&output_dir, &dest, &binding.worktree_path);
         if bytes > 0 {
-            let disposition = workflow_source
-                .map(|source| {
-                    crate::domain::workflow::declared_output_disposition(source, &stage_id)
-                })
-                .unwrap_or(crate::domain::workflow::OutputDisposition::Evidence);
+            let disposition =
+                crate::domain::workflow::declared_output_disposition(workflow_source, &stage_id);
             outputs.push(RetainedStageOutput {
                 stage: stage_id,
                 path: dest,
@@ -2829,6 +2850,20 @@ mod tests {
 
     fn teardown_of(surface: &WorkSurface) -> TeardownReport {
         teardown(fixture_data_dir(surface), surface, None)
+    }
+
+    /// [`teardown_of`] for a fixture that has stage outputs to retain:
+    /// writes a real workflow package at `package_dir` declaring `stages`
+    /// and binds it. #297 scopes retention to the ids a bound package
+    /// declares, so a fixture with stage outputs needs a package that
+    /// actually declares them — which is what every real run has.
+    fn teardown_declaring(
+        surface: &WorkSurface,
+        package_dir: &Path,
+        stages: &[&str],
+    ) -> TeardownReport {
+        write_workflow_package(package_dir, "workflow-package", stages);
+        teardown(fixture_data_dir(surface), surface, Some(package_dir))
     }
 
     /// [`rematerialize`] against the data dir this fixture surface belongs to.
@@ -5449,7 +5484,11 @@ mod tests {
         // takes the `RetainedDirty` path at all.
         std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
 
-        let report = teardown_of(&surface);
+        let report = teardown_declaring(
+            &surface,
+            &dir.path().join("workflow-package"),
+            &["10-hypothesize", "20-panel"],
+        );
         let BindingDisposition::RetainedDirty { patch, outputs, .. } =
             &report.bindings[0].disposition
         else {
@@ -5493,6 +5532,117 @@ mod tests {
         );
     }
 
+    /// #297 on the dirty path: `retain_stage_outputs` walks the same
+    /// unscoped `stage_output_dirs` shape `finalize_sweep` does, so a
+    /// directory an earlier Work merged into the base branch was copied out
+    /// and reported as *this* Work's retained evidence — one Work's
+    /// evidence area silently accumulating another's. Scoped to the ids the
+    /// bound package declares, only this run's own stage is retained. The
+    /// declared stage is asserted retained in the same run, so a filter
+    /// matching nothing could not pass either.
+    #[test]
+    fn dirty_teardown_leaves_an_undeclared_stage_directory_out_of_retained_output() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01FOREIGNDIRTY",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        let panel_output = worktree.join("20-panel").join("output");
+        std::fs::create_dir_all(&panel_output).expect("panel output dir");
+        std::fs::write(panel_output.join("findings.md"), "four-axis findings")
+            .expect("panel artifact");
+
+        // Another Work's already-merged evidence, sitting in the base
+        // branch this surface was cut from. Not a declared stage.
+        let foreign_output = worktree.join("99-foreign").join("output");
+        std::fs::create_dir_all(&foreign_output).expect("foreign output dir");
+        std::fs::write(
+            foreign_output.join("leftover.md"),
+            "another Work's evidence",
+        )
+        .expect("foreign artifact");
+
+        let workflow_source = dir.path().join("workflow-package");
+        write_workflow_package(&workflow_source, "workflow-package", &["20-panel"]);
+
+        std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
+
+        let report = teardown(fixture_data_dir(&surface), &surface, Some(&workflow_source));
+        let BindingDisposition::RetainedDirty { outputs, .. } = &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        let retained: Vec<&str> = outputs.iter().map(|o| o.stage.as_str()).collect();
+        assert_eq!(
+            retained,
+            ["20-panel"],
+            "#297: only the running workflow's own declared stage is this Work's to retain"
+        );
+        let evidence_root = outputs[0].path.parent().expect("evidence root");
+        assert!(
+            !evidence_root.join("99-foreign").exists(),
+            "an undeclared directory must not be copied into this Work's evidence area"
+        );
+    }
+
+    /// #297, fail closed on the dirty path: with no workflow package bound
+    /// (the embedded default, or a run that never resolved a workflow),
+    /// nothing declares which directories are this Work's stages, so
+    /// nothing is retained as a per-stage copy — never a fallback to the
+    /// unscoped walk. The flat `.dirty.patch` still captures the worktree's
+    /// content, so this narrows what is *labeled* as a stage's output, it
+    /// does not discard the content.
+    #[test]
+    fn dirty_teardown_retains_no_stage_output_without_a_bound_workflow_package() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let data = tempfile::TempDir::new().expect("tempdir");
+        let spec = repo(&dir.path().join("solo"));
+
+        let surface = materialize(
+            data.path(),
+            data.path(),
+            "01NOPACKAGE",
+            std::slice::from_ref(&spec),
+        )
+        .expect("materialize");
+        let worktree = surface.bindings[0].worktree_path.clone();
+
+        let panel_output = worktree.join("20-panel").join("output");
+        std::fs::create_dir_all(&panel_output).expect("panel output dir");
+        std::fs::write(panel_output.join("findings.md"), "four-axis findings")
+            .expect("panel artifact");
+        std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
+
+        let report = teardown_of(&surface);
+        let BindingDisposition::RetainedDirty { patch, outputs, .. } =
+            &report.bindings[0].disposition
+        else {
+            panic!(
+                "expected RetainedDirty: {:?}",
+                report.bindings[0].disposition
+            );
+        };
+        assert!(
+            outputs.is_empty(),
+            "#297: with no package to declare stage ids, the sweep retains nothing: {outputs:?}"
+        );
+        assert!(
+            patch.is_some(),
+            "the flat patch still captures the worktree's content"
+        );
+    }
+
     /// F-IN-02: `retain_dirty`/`retain_stage_outputs` must read the same
     /// declared `Promote`/`Evidence` disposition the clean-path
     /// `finalize_sweep` already honors, not copy every stage's output into
@@ -5529,6 +5679,11 @@ mod tests {
             .expect("ship artifact");
 
         let workflow_source = dir.path().join("workflow-package");
+        write_workflow_package(
+            &workflow_source,
+            "workflow-package",
+            &["20-panel", "30-ship"],
+        );
         let ship_readme_dir = workflow_source.join("30-ship").join("output");
         std::fs::create_dir_all(&ship_readme_dir).expect("declared output dir");
         std::fs::write(
@@ -5628,7 +5783,11 @@ mod tests {
 
         std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
 
-        let report = teardown_of(&surface);
+        let report = teardown_declaring(
+            &surface,
+            &dir.path().join("workflow-package"),
+            &["20-panel"],
+        );
         let BindingDisposition::RetainedDirty { outputs, .. } = &report.bindings[0].disposition
         else {
             panic!(
@@ -5685,6 +5844,16 @@ mod tests {
         // The nested leaf declares `promote` at its composed path in the
         // package — the disposition read must reach it too, not just the copy.
         let workflow_source = dir.path().join("workflow-package");
+        write_workflow_package(
+            &workflow_source.join("10-investigate"),
+            "10-investigate",
+            &["00-lead"],
+        );
+        write_workflow_package(
+            &workflow_source,
+            "workflow-package",
+            &["00-orient", "10-investigate"],
+        );
         let declared = workflow_source
             .join("10-investigate")
             .join("00-lead")
@@ -5856,7 +6025,11 @@ mod tests {
 
         std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
 
-        let report = teardown_of(&surface);
+        let report = teardown_declaring(
+            &surface,
+            &dir.path().join("workflow-package"),
+            &["20-panel"],
+        );
         let BindingDisposition::RetainedDirty { outputs, .. } = &report.bindings[0].disposition
         else {
             panic!(
@@ -5900,7 +6073,11 @@ mod tests {
         std::fs::write(panel_output.join("findings.md"), "real artifact").expect("real artifact");
         std::fs::write(worktree.join("wip.rs"), "// still working\n").expect("dirty edit");
 
-        let report = teardown_of(&surface);
+        let report = teardown_declaring(
+            &surface,
+            &dir.path().join("workflow-package"),
+            &["20-panel"],
+        );
         let BindingDisposition::RetainedDirty {
             patch: Some(info),
             outputs,
