@@ -835,6 +835,17 @@ pub async fn scan_to_completion(
             .expect("scan status request");
         last_status = response.status();
         last = response.json().await.expect("json body");
+        // A poll that does not answer `200` is terminal, not slow. The only
+        // non-success this endpoint has is `404` — never accepted here,
+        // accepted before a restart, or aged past `RETAINED_SCANS`
+        // (`intelligence_scan_status`'s own doc) — and no id in that state
+        // ever becomes a tracked, completing scan. Waiting on it is waiting
+        // forever, which is the one failure this unbounded loop must not
+        // have; the status is reported rather than polled through.
+        assert!(
+            last_status.is_success(),
+            "GET {endpoint}/v1/intelligence/scan/{scan_id} answered {last_status}: {last}\nthis              daemon does not track that scan, so no amount of further polling can complete it"
+        );
         if last["state"] == "completed" {
             return (last_status, last);
         }
