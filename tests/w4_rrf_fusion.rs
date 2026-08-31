@@ -67,7 +67,8 @@ use sergeant_rs::runtime::atlas::fusion::{
     ALPHA_NATURAL, ALPHA_SYMBOL, BOOST_ADJACENCY, BOOST_DEFINITION, BOOST_EXACT_MATCH,
     BOOST_WORK_CHANGED, FILE_COHERENCE_BOOST_FRAC, FILE_SATURATION_DECAY, FusedHit,
     PENALTY_NON_CANONICAL, RRF_K, RankOrigins, RerankSignals, fuse, is_symbol_query,
-    rerank, resolve_alpha, rrf_contribution, rrf_order,
+    STEM_BOOST_MULTIPLIER, path_stem_match_ratio, rerank, resolve_alpha, rrf_contribution,
+    rrf_order,
 };
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, LexicalHit, UnitCoordinate};
 use sergeant_rs::runtime::atlas::record::{record_scan, scan_and_record};
@@ -445,11 +446,19 @@ fn the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment() {
         // `the_anchor_does_not_boost_itself_for_being_in_its_own_section`.
         (4, |s| s.same_section_as_anchor = true, 1.0),
         (5, |s| s.structural_relationship = true, BOOST_ADJACENCY),
-        (6, |s| s.canonical_path = false, PENALTY_NON_CANONICAL),
+        // Signal 7 is a separate stage, not a boost — see `path_penalty`.
+        (6, |s| s.canonical_path = false, 1.0),
         (7, |s| s.knowledge_source_requested = true, 1.0),
         (8, |s| s.current_generation = true, 1.0),
     ];
     assert_eq!(cases.len(), 9, "A2 §8 lists nine signals");
+    // Signal 7 on its own, in the stage it actually belongs to.
+    assert_eq!(one(|_| {}).path_penalty(), 1.0);
+    assert_eq!(
+        one(|s| s.canonical_path = false).path_penalty(),
+        PENALTY_NON_CANONICAL
+    );
+
     for (index, set, factor) in cases {
         let signals = one(set);
         let key = signals.priority();
@@ -486,7 +495,7 @@ fn the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment() {
             scored("b.rs", "u2", 0.010, neutral),
             scored("a.rs", "u1", 0.005, one(|s| s.exact_match = true)),
         ];
-        rerank(&mut hits);
+        rerank(&mut hits, "");
         hits[0].unit_key.clone()
     };
     assert_eq!(gap_covered, "u1", "0.005 x 3.0 = 0.015 must beat 0.010");
@@ -496,7 +505,7 @@ fn the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment() {
             scored("b.rs", "u2", 0.100, neutral),
             scored("a.rs", "u1", 0.005, one(|s| s.exact_match = true)),
         ];
-        rerank(&mut hits);
+        rerank(&mut hits, "");
         hits[0].unit_key.clone()
     };
     assert_eq!(
@@ -729,8 +738,17 @@ fn knowledge_estate(with_decoy: bool) -> Estate {
             "vendor-lib",
             SourceKind::ExternalGit,
             AuthorityClass::External,
+            // **The name earns the stem boost too.** Since the semble-parity
+            // port, `path_stem_boost` multiplies a candidate by how much of
+            // the question is in its file name, so a decoy called `leak.md`
+            // could no longer take first place from
+            // `payments/decline-handling.md` however well it scored — and
+            // this test's non-vacuity guard is precisely that the decoy DOES
+            // take first place when nothing excludes it. The decoy is named
+            // after the question so the guard keeps discriminating; what it
+            // proves is unchanged.
             vec![scanned_file(
-                "docs/leak.md",
+                "docs/retry-a-failed-payment-charge.md",
                 vec![document_unit(
                     "How do we retry a failed payment charge? When a card charge fails the caller \
                      retries the failed payment after a back-off delay.",
@@ -799,7 +817,7 @@ fn an_inadmissible_unit_that_wins_the_semantic_list_never_reaches_the_fused_answ
     show("unfiltered", &open);
     assert_eq!(
         labelled(&open).first().map(String::as_str),
-        Some("vendor-lib:docs/leak.md"),
+        Some("vendor-lib:docs/retry-a-failed-payment-charge.md"),
         "the decoy must win the fused answer when nothing excludes it"
     );
 
@@ -1200,7 +1218,7 @@ fn an_exact_name_match_is_promoted_over_a_better_fused_score() {
     for hit in hits.iter_mut() {
         hit.signals.exact_match = hit.coordinate.relative_path() == "a.rs";
     }
-    rerank(&mut hits);
+    rerank(&mut hits, "");
     assert_eq!(
         paths(&hits),
         vec!["a.rs", "b.rs"],
@@ -1269,7 +1287,7 @@ fn a_boolean_signal_no_longer_outranks_an_arbitrary_score_gap() {
     );
 
     let mut hits = vec![weak_but_flagged, strong_and_plain];
-    rerank(&mut hits);
+    rerank(&mut hits, "");
     assert_eq!(
         hits[0].unit_key, "u-context",
         "a single fired boolean outranked a 3.5x better fused score"
@@ -1318,7 +1336,7 @@ fn a_test_path_is_penalised_multiplicatively_not_ranked_after_a_later_signal() {
     );
 
     let mut hits = vec![test_helper, implementation];
-    rerank(&mut hits);
+    rerank(&mut hits, "");
     assert_eq!(
         hits[0].unit_key, "u-impl",
         "a test path outranked the implementation on a mid-list signal"
@@ -1380,7 +1398,7 @@ fn a_second_chunk_of_the_same_file_is_decayed_so_one_file_cannot_take_every_slot
         "the fixture only discriminates if the crowded file wins on raw score"
     );
 
-    rerank(&mut hits);
+    rerank(&mut hits, "");
     let order: Vec<&str> = hits.iter().map(|h| h.unit_key.as_str()).collect();
     assert_eq!(order[0], "u-busy-0", "the file's best chunk keeps its score");
     assert!(
@@ -1458,7 +1476,7 @@ fn the_anchor_does_not_boost_itself_for_being_in_its_own_section() {
     );
 
     let mut hits = vec![anchor_heading, the_definition];
-    rerank(&mut hits);
+    rerank(&mut hits, "");
     assert_eq!(
         hits[0].unit_key, "u-const",
         "the anchor kept first place on a boost it gave itself"
@@ -1505,7 +1523,7 @@ fn a_file_whose_chunks_collectively_score_well_has_its_best_chunk_boosted() {
         "the fixture only discriminates if the lone chunk wins on raw score"
     );
 
-    rerank(&mut hits);
+    rerank(&mut hits, "");
     assert_eq!(
         hits[0].unit_key, "u-x1",
         "the coherent file's best chunk was not boosted: {:?}",
@@ -1518,6 +1536,95 @@ fn a_file_whose_chunks_collectively_score_well_has_its_best_chunk_boosted() {
         "boost was not 1 + {FILE_COHERENCE_BOOST_FRAC}: {}",
         hits[0].adjusted
     );
+}
+
+/// **semble's NL stem boost — `boosting.py::_boost_stem_matches`.**
+///
+/// For a natural-language query semble boosts candidates whose **file stem or
+/// immediate parent directory** matches the query's keywords, by the fraction
+/// of keywords matched: *"Uses prefix matching for morphological variants
+/// (e.g. `dependency` matches `dependencies`). Matches file stems and the
+/// immediate parent directory name."* Keywords are words longer than two
+/// characters that are not in its shipped stopword list; a match is exact or
+/// a ≥3-character prefix overlap in either direction; the boost applies only
+/// once the match ratio reaches `0.10`.
+///
+/// This is the single largest measured gap between the two systems. On the
+/// 52-question set the prose categories scored `doctrine 1/10, knowledge
+/// 0/6, memory 0/4` against semble's `4/10, 5/6, 2/4` on the same questions:
+/// a document *named after the question* was not preferred at all, because
+/// A2 §8's signal 1 requires a query **term** to equal the file name
+/// exactly and `one-atlas-database-2026-08-29.md` never will.
+///
+/// Symbol queries take semble's other branch and are deliberately not
+/// boosted here — see [`the_stem_boost_does_not_fire_for_a_symbol_query`].
+///
+/// **Non-vacuous:** the second assertion is a real file in the corpus with a
+/// real query from the committed question set, and the third shows an
+/// unrelated path getting nothing.
+#[test]
+fn a_file_named_after_the_question_is_boosted_by_the_fraction_of_words_it_matches() {
+    let query = "ruling that there is only one atlas database";
+    let named =
+        path_stem_match_ratio(query, "rulings/owner-rulings/one-atlas-database-2026-08-29.md");
+    let unrelated = path_stem_match_ratio(query, "src/backend/codex.rs");
+    assert_eq!(unrelated, 0.0, "an unrelated path must not be boosted");
+    assert!(
+        named > 0.4,
+        "a file named after the question must match well above a third of its \
+         keywords: got {named}"
+    );
+    assert_eq!(STEM_BOOST_MULTIPLIER, 1.0);
+
+    // And it decides an order the fused scores would have lost.
+    let canonical = RerankSignals {
+        canonical_path: true,
+        ..Default::default()
+    };
+    // The document sits at 60% of the leader's score. A multiplicative
+    // `x(1 + ratio)` gives it 0.0072 x 1.667 = 0.0120 and it still loses to
+    // the leader's 0.0144; semble's additive `+= max_score x ratio` gives it
+    // 0.0177 and it wins. That difference is the point — measured, it was
+    // worth +5 p@5 and nothing at all on p@1 in the weaker form.
+    let mut hits = vec![
+        scored("src/backend/codex.rs", "u-noise", 0.012, canonical),
+        scored(
+            "rulings/owner-rulings/one-atlas-database-2026-08-29.md",
+            "u-ruling",
+            0.007_2,
+            canonical,
+        ),
+    ];
+    rerank(&mut hits, query);
+    assert_eq!(
+        hits[0].unit_key, "u-ruling",
+        "the file named after the question lost to a better-fused unrelated one"
+    );
+}
+
+/// A **symbol** query takes semble's other branch: `apply_query_boost` calls
+/// `_boost_symbol_definitions`, never `_boost_stem_matches`
+/// (`boosting.py::apply_query_boost`'s `if is_symbol_query(query)`). We have
+/// a stronger equivalent of the definition boost already — A2 §8's signal 1
+/// is a tree-sitter symbol identity, not a regex over chunk text — so only
+/// the NL branch is ported, and the symbol branch must stay out of its way.
+#[test]
+fn the_stem_boost_does_not_fire_for_a_symbol_query() {
+    assert!(is_symbol_query("SourceKind"));
+    assert_eq!(
+        path_stem_match_ratio("SourceKind", "src/domain/source.rs"),
+        0.0,
+        "a symbol query must not also collect the NL stem boost"
+    );
+}
+
+/// Stopwords and the two-character floor are semble's, and they matter: a
+/// query made only of them must boost nothing, or every path in the corpus
+/// gets the same lift and the signal is noise.
+#[test]
+fn stopwords_and_short_words_are_not_keywords() {
+    assert_eq!(path_stem_match_ratio("how do we do it", "src/domain/work.rs"), 0.0);
+    assert_eq!(path_stem_match_ratio("of on or the to", "src/domain/work.rs"), 0.0);
 }
 
 // --------------------------------- the three filter-shaped signals

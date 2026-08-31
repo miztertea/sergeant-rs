@@ -56,8 +56,9 @@ use sergeant_rs::runtime::atlas::db::{
     SourceSelector,
 };
 use sergeant_rs::runtime::atlas::fusion::{
-    ALPHA_NATURAL, ALPHA_SYMBOL, BOOST_EXACT_MATCH, FILE_SATURATION_DECAY, PENALTY_NON_CANONICAL,
-    RRF_K, RerankSignals,
+    ALPHA_NATURAL, ALPHA_SYMBOL, BOOST_EXACT_MATCH, FILE_COHERENCE_BOOST_FRAC,
+    FILE_SATURATION_DECAY, PENALTY_NON_CANONICAL, RRF_K, RerankSignals, STEM_BOOST_MULTIPLIER,
+    STEM_MATCH_MIN_RATIO,
 };
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, UnitAddress, UnitCoordinate, tokenize};
 use sergeant_rs::runtime::atlas::record::record_scan;
@@ -988,7 +989,7 @@ fn the_lexical_tokenizer_version_is_pinned_to_the_tokenizers_actual_output() {
 fn the_retrieval_policy_version_is_pinned_to_the_actual_rrf_and_rerank_policy() {
     assert_eq!(
         RETRIEVAL_POLICY_VERSION,
-        "rrf-k60+alpha-blend+a2s8-score-adjust/3"
+        "rrf-k60+alpha-blend+a2s8-score-adjust+semble-boosts/4"
     );
     assert_eq!(
         RRF_K, 60.0,
@@ -1003,6 +1004,15 @@ fn the_retrieval_policy_version_is_pinned_to_the_actual_rrf_and_rerank_policy() 
         (BOOST_EXACT_MATCH, PENALTY_NON_CANONICAL, FILE_SATURATION_DECAY),
         (3.0, 0.3, 0.5),
         "the recorded version says score-adjust; the multipliers must agree"
+    );
+    assert_eq!(
+        (
+            FILE_COHERENCE_BOOST_FRAC,
+            STEM_BOOST_MULTIPLIER,
+            STEM_MATCH_MIN_RATIO
+        ),
+        (0.2, 1.0, 0.10),
+        "the recorded version says semble-boosts; those constants must agree"
     );
     // Nine signals, and the array the rerank key is built from is nine long.
     let all = RerankSignals {

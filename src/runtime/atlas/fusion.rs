@@ -74,7 +74,7 @@ use std::collections::BTreeMap;
 
 use crate::domain::source::{AuthorityClass, SourceKind};
 
-use crate::runtime::atlas::lexical::{LexicalHit, UnitCoordinate, rank_order};
+use crate::runtime::atlas::lexical::{LexicalHit, UnitCoordinate, query_terms, rank_order};
 use crate::runtime::atlas::semantic::{SemanticHit, rank_semantic};
 
 /// RRF's `k`.
@@ -433,11 +433,8 @@ impl RerankSignals {
     /// [`FILE_COHERENCE_BOOST_FRAC`], which supplies that preference without
     /// an anchor.
     ///
-    /// Signal 7 is spelled as its negative: a canonical path is the norm and
-    /// scores 1.0; a test/example/legacy path multiplies by
-    /// [`PENALTY_NON_CANONICAL`], which is semble's shape
-    /// (`penalties.py::_file_path_penalty`) and A2 §8's preference *for* the
-    /// canonical one either way.
+    /// Signal 7 is **not** here — it is [`Self::path_penalty`], applied in a
+    /// later stage, for the reason that method states.
     pub fn multiplier(&self) -> f64 {
         let mut factor = 1.0;
         if self.exact_match {
@@ -452,10 +449,26 @@ impl RerankSignals {
         if self.structural_relationship {
             factor *= BOOST_ADJACENCY;
         }
-        if !self.canonical_path {
-            factor *= PENALTY_NON_CANONICAL;
-        }
         factor
+    }
+
+    /// **Signal 7 on its own**, because semble applies path penalties in a
+    /// different *stage* from its boosts: `search.py` runs
+    /// `boost_multi_chunk_files` and `apply_query_boost` first and only then
+    /// `rerank_topk(..., penalise_paths=True)`. The order matters — a boost
+    /// computed relative to the answer's maximum must be computed before the
+    /// penalty, or a penalised candidate is charged twice.
+    ///
+    /// Stated positively in A2 §8 (*"canonical implementation vs
+    /// test/example/legacy path"*) and negatively here, which is semble's
+    /// spelling (`penalties.py::_file_path_penalty`): canonical is the norm
+    /// at `1.0`, everything else multiplies by [`PENALTY_NON_CANONICAL`].
+    pub fn path_penalty(&self) -> f64 {
+        if self.canonical_path {
+            1.0
+        } else {
+            PENALTY_NON_CANONICAL
+        }
     }
 }
 
@@ -702,8 +715,13 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit], alpha: f64) -> Vec
 /// semble's `penalties.py::rerank_topk`, in its order:
 ///
 /// 1. each candidate's score is multiplied by its signal factor
-///    ([`RerankSignals::multiplier`], which already carries signal 7's path
-///    penalty);
+///    ([`RerankSignals::multiplier`]);
+/// 2. a file whose chunks score well collectively has its best chunk
+///    boosted ([`boost_multi_chunk_files`]);
+/// 3. semble's NL query boost is added — `max_score ×
+///    STEM_BOOST_MULTIPLIER × `[`path_stem_match_ratio`];
+/// 4. signal 7's path penalty multiplies what is left
+///    ([`RerankSignals::path_penalty`]);
 /// 2. candidates are put in that order;
 /// 3. a greedy pass decays each chunk after the first from an
 ///    already-seen file by [`FILE_SATURATION_DECAY`] per excess chunk —
@@ -717,11 +735,30 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit], alpha: f64) -> Vec
 /// This walks every candidate instead, so `adjusted` is a function of the
 /// answer alone and `tests/w4_rrf_fusion.rs::
 /// the_fused_order_does_not_depend_on_the_callers_limit` stays true.
-pub fn rerank(hits: &mut [FusedHit]) {
+pub fn rerank(hits: &mut [FusedHit], query: &str) {
+    // Stage 1 — A2 §8's signals as boosts. Signal 7 is deliberately not
+    // here; it is a later stage, as in semble.
     for hit in hits.iter_mut() {
         hit.adjusted = hit.rrf * hit.signals.multiplier();
     }
+    // Stage 2 — file coherence.
     boost_multi_chunk_files(hits);
+    // Stage 3 — semble's `apply_query_boost`, NL branch: additive against
+    // the answer's largest score, computed once, before any boost is added.
+    let max_score = hits
+        .iter()
+        .map(|hit| hit.adjusted)
+        .fold(0.0_f64, f64::max);
+    if max_score > 0.0 {
+        for hit in hits.iter_mut() {
+            let ratio = path_stem_match_ratio(query, hit.coordinate.relative_path());
+            hit.adjusted += max_score * STEM_BOOST_MULTIPLIER * ratio;
+        }
+    }
+    // Stage 4 — path penalties.
+    for hit in hits.iter_mut() {
+        hit.adjusted *= hit.signals.path_penalty();
+    }
     hits.sort_by(rerank_order);
 
     let mut seen_per_file: BTreeMap<String, u32> = BTreeMap::new();
@@ -734,6 +771,106 @@ pub fn rerank(hits: &mut [FusedHit]) {
         *already += 1;
     }
     hits.sort_by(rerank_order);
+}
+
+/// The minimum fraction of a query's keywords a path must match before the
+/// stem boost applies — semble's `_boost_stem_matches` guard, `0.10`.
+pub const STEM_MATCH_MIN_RATIO: f64 = 0.10;
+
+/// semble's `_STEM_BOOST_MULTIPLIER` — *"additive boost multiplier for NL
+/// queries when file stems match query words"*. A full keyword match is worth
+/// the whole of the answer's largest score. See [`BOOST_EXACT_MATCH`] for the
+/// provenance rule that governs every constant in this module.
+pub const STEM_BOOST_MULTIPLIER: f64 = 1.0;
+
+/// The shortest prefix overlap that counts as a keyword match — semble's
+/// `_count_keyword_matches`, *"allowing prefix overlap (min 3 chars)"*, which
+/// is how `dependency` matches `dependencies`.
+const STEM_MATCH_MIN_PREFIX: usize = 3;
+
+/// semble's `_STOPWORDS`, verbatim — *"common English stopwords excluded from
+/// file-stem matching for NL queries"* (`boosting.py`). Adopted whole (R5)
+/// rather than re-derived: a stopword list is exactly the kind of thing that
+/// looks arbitrary and is not.
+const STOPWORDS: [&str; 30] = [
+    "and", "are", "does", "for", "from", "has", "have", "how", "not", "the", "was", "what", "when",
+    "where", "which", "who", "why", "with", "a", "an", "as", "at", "be", "by", "do", "if", "in",
+    "is", "it", "of",
+];
+
+/// semble's `boosting.py::_boost_stem_matches`, as a multiplier: **how much
+/// of the question is in this file's name.**
+///
+/// Keywords are the query's words longer than two characters that are not
+/// [`STOPWORDS`]; the path's *stem* and its *immediate parent directory* are
+/// tokenized with the retrieval path's own tokenizer
+/// ([`crate::runtime::atlas::lexical::query_terms`], R2 — the same splitting
+/// the index already does, rather than a second identifier splitter); a
+/// keyword counts if it equals a part or shares a
+/// [`STEM_MATCH_MIN_PREFIX`]-character prefix with one in either direction.
+/// The result is `matched/keywords` once that fraction reaches
+/// [`STEM_MATCH_MIN_RATIO`], and `0.0` otherwise. [`rerank`] then **adds**
+/// `ratio × STEM_BOOST_MULTIPLIER × (the answer's largest score)` to the
+/// candidate, which is semble's own form — `boost = max_score *
+/// _STEM_BOOST_MULTIPLIER; boosted[chunk] += boost * match_ratio`. Additive
+/// against the answer's maximum, not multiplicative against the candidate's
+/// own score: a well-named document buried at a tenth of the top score is
+/// lifted to the top by it, which a `×(1 + ratio)` — capped at doubling —
+/// cannot do. That difference was measured: as a multiplier it moved p@5 by
+/// +5 and p@1 not at all.
+///
+/// **Symbol queries get nothing here**, because semble's `apply_query_boost`
+/// sends them down `_boost_symbol_definitions` instead. Our equivalent of
+/// that branch is A2 §8's signal 1, which is a tree-sitter symbol identity
+/// rather than a regex over chunk text, and is stronger; adding a stem boost
+/// on top would double-count it.
+///
+/// # Why this is not a new ranking idea
+///
+/// A2 §8 already asks for *"exact symbol / heading / filename match"*. Signal
+/// 1 implements it as **exact term equality**, which a real document name
+/// like `one-atlas-database-2026-08-29.md` can never satisfy for the question
+/// *"ruling that there is only one atlas database"*. This is the same
+/// contract signal, graded — the shape semble ships and the shape A2 §8's own
+/// words allow.
+pub fn path_stem_match_ratio(query: &str, relative_path: &str) -> f64 {
+    if is_symbol_query(query) {
+        return 0.0;
+    }
+    let keywords: Vec<String> = query
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| word.len() > 2)
+        .map(str::to_lowercase)
+        .filter(|word| !STOPWORDS.contains(&word.as_str()))
+        .collect();
+    if keywords.is_empty() {
+        return 0.0;
+    }
+
+    let path = relative_path.rsplit('/').next().unwrap_or(relative_path);
+    let stem = path.split_once('.').map_or(path, |(stem, _)| stem);
+    let parent = match relative_path.rfind('/') {
+        Some(cut) => relative_path[..cut].rsplit('/').next().unwrap_or(""),
+        None => "",
+    };
+    let mut parts = query_terms(stem);
+    parts.extend(query_terms(parent));
+
+    let matched = keywords
+        .iter()
+        .filter(|keyword| {
+            parts.iter().any(|part| {
+                let (short, long) = if keyword.len() <= part.len() {
+                    (keyword.as_str(), part.as_str())
+                } else {
+                    (part.as_str(), keyword.as_str())
+                };
+                short.len() >= STEM_MATCH_MIN_PREFIX && long.starts_with(short)
+            })
+        })
+        .count();
+    let ratio = matched as f64 / keywords.len() as f64;
+    if ratio >= STEM_MATCH_MIN_RATIO { ratio } else { 0.0 }
 }
 
 /// semble's `boosting.py::boost_multi_chunk_files`: a file whose candidate

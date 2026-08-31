@@ -3860,7 +3860,7 @@ impl AtlasDb {
         let mut hits = fuse(&lexical.hits, &semantic.hits, resolve_alpha(query.text));
         self.rerank_signals(query, &mut hits)?;
         drop(snapshot);
-        rerank(&mut hits);
+        rerank(&mut hits, query.text);
         hits.truncate(query.limit.min(MAX_ROWS));
         Ok(FusedAnswer {
             hits,
