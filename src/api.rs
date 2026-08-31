@@ -1518,7 +1518,12 @@ async fn healthz() -> Json<Value> {
 /// one directory; what changed is *which* — the host runtime root (D2),
 /// no longer any estate's. Which estates this daemon serves is a different
 /// question, and it has its own route: `GET /v1/estates`.
-fn system_body(state: &ApiState, journal_head: u64, admission_paused: bool) -> Value {
+fn system_body(
+    state: &ApiState,
+    journal_head: u64,
+    admission_paused: bool,
+    unabsorbed_holds: u64,
+) -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "api_revision": API_REVISION,
@@ -1529,6 +1534,13 @@ fn system_body(state: &ApiState, journal_head: u64, admission_paused: bool) -> V
         // so `sgt status` can say why a submit is being turned away without
         // an operator having to decode the journal for `admission.paused`.
         "admission_paused": admission_paused,
+        // #334 / F-IN-01: `Core::unabsorbed_holds` was otherwise only
+        // readable from a test assertion — no operator-facing surface
+        // reported it. Zero is the invariant; nonzero means a
+        // direct-journal writer released a lock hold without calling
+        // `absorb_journaled`, which `sgt status` turns into a visible
+        // warning below.
+        "unabsorbed_holds": unabsorbed_holds,
     })
 }
 
@@ -1537,7 +1549,13 @@ async fn system_info(State(state): State<ApiState>) -> Json<Value> {
     let core = CoreGuard::acquire(&state.core).await;
     let head = core.registry.last_seq();
     let admission_paused = core.registry.state().admission_paused;
-    Json(system_body(&state, head, admission_paused))
+    let unabsorbed_holds = core.unabsorbed_holds();
+    Json(system_body(
+        &state,
+        head,
+        admission_paused,
+        unabsorbed_holds,
+    ))
 }
 
 /// The event source all API-origin events carry.
@@ -8474,6 +8492,49 @@ mod tests {
             "test.seeded",
             json!({"n": n}),
         )
+    }
+
+    /// F-IN-01: `Core::unabsorbed_holds` must reach an operator-facing
+    /// surface, not only a test assertion on the field itself
+    /// (`tests/f334_journal_integrity.rs` already pins the counter's own
+    /// correctness). This drives the exact same direct-journal-append shape
+    /// those tests use, releases the hold through the real
+    /// `CoreGuard::drop` path, and asserts the breach is visible on
+    /// `GET /v1/system` — the JSON `sgt status` reads. Delete the
+    /// `"unabsorbed_holds"` key from [`system_body`] (or stop threading
+    /// [`Core::unabsorbed_holds`] into it) and this goes red.
+    #[tokio::test]
+    async fn unabsorbed_holds_is_reported_on_v1_system() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+
+        {
+            let mut guard = CoreGuard::acquire(&state.core).await;
+            guard
+                .journal
+                .append(seeded(1))
+                .expect("append straight to the journal, skipping `commit`/`absorb_journaled`");
+            // Guard drops here: `CoreGuard`'s `Drop` backstop calls
+            // `flush`, which calls `absorb_before_release`, which is where
+            // the breach is counted (this is the real release path, not a
+            // hand-rolled substitute for it).
+        }
+
+        let before = {
+            let core = CoreGuard::acquire(&state.core).await;
+            core.unabsorbed_holds()
+        };
+        assert_eq!(
+            before, 1,
+            "the fixture must actually produce a breach, or this test is not testing the wiring"
+        );
+
+        let Json(system) = system_info(State(state)).await;
+        assert_eq!(
+            system["unabsorbed_holds"], 1,
+            "GET /v1/system must report the same breach count `sgt status` warns an operator \
+             about, not leave it readable only from a test assertion: {system}"
+        );
     }
 
     /// The group commit, end to end (#44): one lock hold, N appends, **one**
