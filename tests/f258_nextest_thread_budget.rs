@@ -119,6 +119,56 @@ fn m7_heavy_test_is_still_scheduled_alone_via_threads_required() {
 /// reworded around an exact-phrase guard would be the same defect wearing
 /// different words. Either configure the termination and the citation
 /// becomes true, or do not point at this file.
+/// Does `support` point at `.config/nextest.toml` (by path or by naming
+/// "the nextest config"/"nextest configuration") as though it were the
+/// thing that ends a hang? Matching only the literal path
+/// `.config/nextest.toml` is not enough — that exact substring need not
+/// appear for the module to still be making the claim in prose (e.g.
+/// "the nextest configuration kills any test that hangs here"). So this
+/// also matches on the paraphrase, and then treats a mention as an honest
+/// *disclosure* rather than a false citation when it sits next to the
+/// module's own negation of exactly that claim ("sets no", "never
+/// killed", "does not configure", "no runner") — the wording the real,
+/// honest doc-comment in `tests/support/mod.rs` actually uses.
+fn cites_this_config_as_a_hang_bound(support: &str) -> bool {
+    fn mentions_config(paragraph: &str) -> bool {
+        paragraph.contains(".config/nextest.toml")
+            || paragraph.contains("nextest.toml")
+            || paragraph.contains("nextest config")
+            || paragraph.contains("nextest configuration")
+    }
+    fn disclaims(paragraph: &str) -> bool {
+        paragraph.contains("sets no")
+            || paragraph.contains("never killed")
+            || paragraph.contains("does not configure")
+            || paragraph.contains("no runner")
+    }
+    // Scoped per doc-comment paragraph, not the whole file: an honest
+    // disclaimer elsewhere in the module must not launder an unrelated
+    // affirmative claim made in a different paragraph. Paragraphs are
+    // `///`-line blocks separated by a bare `///` line (or a blank line
+    // outside doc comments).
+    let lower = support.to_lowercase();
+    let mut paragraph = String::new();
+    let mut found = false;
+    for line in lower.lines() {
+        let stripped = line.trim().trim_start_matches("///").trim();
+        if stripped.is_empty() {
+            if mentions_config(&paragraph) && !disclaims(&paragraph) {
+                found = true;
+            }
+            paragraph.clear();
+        } else {
+            paragraph.push(' ');
+            paragraph.push_str(stripped);
+        }
+    }
+    if mentions_config(&paragraph) && !disclaims(&paragraph) {
+        found = true;
+    }
+    found
+}
+
 #[test]
 fn the_shared_test_support_module_may_not_cite_this_config_as_a_hang_bound_it_does_not_configure() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -139,7 +189,7 @@ fn the_shared_test_support_module_may_not_cite_this_config_as_a_hang_bound_it_do
 
     let support_path = repo_root.join("tests/support/mod.rs");
     let support = std::fs::read_to_string(&support_path).expect("read tests/support/mod.rs");
-    let cites = support.contains(".config/nextest.toml");
+    let cites = cites_this_config_as_a_hang_bound(&support);
 
     assert!(
         !cites || terminates,
