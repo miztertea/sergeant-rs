@@ -1962,13 +1962,16 @@ fn composed_stage_id(dir: &Path, worktree_root: &Path) -> Option<String> {
 /// retained-evidence area [`capture_dirty_patch`] writes its patch into.
 /// A stage directory is any directory in the worktree that has an
 /// `output/` subdirectory ([`stage_output_dirs`], at any nesting depth —
-/// E11); nothing here consults the workflow catalog
-/// (Rule 4, the ICM convention (relocated: sergeant-rs-workspace knowledge/evidence/reference/icm/convention.md): "no engine collection, no artifact
-/// manifest machinery" — the worktree's own filesystem shape is ground
-/// truth, exactly as [`capture_dirty_patch`] already treats it). Returns
-/// one [`RetainedStageOutput`] per stage directory that actually had a
-/// real (non-`README.md`) file to copy; a stage whose `output/` is empty
-/// or holds only its own declaration is not reported.
+/// E11); which of those directories is *this run's own* is then narrowed
+/// against the workflow catalog (see the #297 note below) rather than
+/// trusted on filesystem shape alone — the worktree's shape is where the
+/// walk starts (Rule 4, the ICM convention (relocated: sergeant-rs-workspace
+/// knowledge/evidence/reference/icm/convention.md): "no engine collection,
+/// no artifact manifest machinery"), but is no longer where it stops, since
+/// that shape includes another Work's already-merged stage directories
+/// too. Returns one [`RetainedStageOutput`] per stage directory that
+/// actually had a real (non-`README.md`) file to copy; a stage whose
+/// `output/` is empty or holds only its own declaration is not reported.
 ///
 /// F-IN-02: `workflow_source` is read here for the *same* reason
 /// [`finalize_sweep`] reads it on the clean-teardown path — a stage's
