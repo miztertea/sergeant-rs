@@ -50,7 +50,7 @@
 //! procedure can be told apart from a same-named workflow whose content later
 //! changed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -1697,6 +1697,46 @@ pub enum OutputDisposition {
     Evidence,
 }
 
+/// #297: every stage id the workflow package at `package_dir` actually
+/// declares — the only ids a Work's sweep may touch in its own worktree.
+///
+/// `stage_output_dirs` keys the worktree walk by composed stage id and
+/// deliberately consults no catalog, so on its own it cannot tell one of
+/// *this* workflow's stage directories from a directory another Work
+/// already merged into the base branch. Intersecting that walk with this
+/// set is what makes the difference; without it a foreign `<dir>/output/`
+/// reads as an undeclared stage, classifies `Evidence` by
+/// [`declared_output_disposition`]'s "silence promotes nothing" default,
+/// and is copied out and removed in the finalize commit — deleting another
+/// Work's merged evidence when that branch merges.
+///
+/// Leaves **and** containers: [`WorkflowDefinition::stages`] is leaves only
+/// (W1-02, "the container itself is never a stage"), but a container may
+/// declare its own `output/` contract, which the engine gates at container
+/// closure (W1 §4, decision W1-13). A leaves-only set would silently stop
+/// sweeping container output — the same loss in the other direction.
+///
+/// `None` — never an empty set standing in for "unknown" — when the
+/// package cannot be loaded at all. Both callers fail closed on it: an
+/// unreadable package sweeps nothing rather than falling back to the
+/// unscoped walk (#297's own fix text).
+pub(crate) fn declared_stage_ids(package_dir: &Path) -> Option<BTreeSet<String>> {
+    let definition = WorkflowDefinition::load_dir(package_dir).ok()?;
+    Some(
+        definition
+            .stages
+            .into_iter()
+            .map(|stage| stage.id)
+            .chain(
+                definition
+                    .containers
+                    .into_iter()
+                    .map(|container| container.container_id),
+            )
+            .collect(),
+    )
+}
+
 /// #260 Q4: read one stage's declared disposition out of its authored
 /// `output/README.md`, the same file [`declared_output_artifact`] reads.
 ///
@@ -2203,6 +2243,76 @@ mod tests {
         assert_eq!(
             declared_output_disposition_from_readme(""),
             OutputDisposition::Evidence
+        );
+    }
+
+    /// #297: the sweep must be scoped to the *running workflow's own*
+    /// declared stage ids, so a directory another Work already merged into
+    /// the base branch is never mistaken for one of this Work's stages.
+    /// The declared set is every leaf **and** every container: a container
+    /// is not a `StageDefinition` (W1-02) but may declare its own output
+    /// contract, gated at `engine.rs`'s `OutputContract::Container` per W1
+    /// §4 / W1-13, so scoping to leaves alone would stop sweeping a
+    /// container's declared output — the opposite loss.
+    #[test]
+    fn declared_stage_ids_are_the_running_workflows_leaves_and_containers() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let wf = workflow_dir(dir.path(), "nested-two");
+        write_package(
+            &wf,
+            "nested-two",
+            &["00-orient", "10-investigate", "20-implement"],
+        );
+        write_stage(&wf, "00-orient", "orient");
+        write_stage(&wf, "20-implement", "implement");
+        let investigate = wf.join("10-investigate");
+        write_package(&investigate, "10-investigate", &["00-lead", "10-code"]);
+        write_stage(&investigate, "00-lead", "lead the squad");
+        write_stage(&investigate, "10-code", "read the code");
+
+        let ids = declared_stage_ids(&wf).expect("a loadable package declares its ids");
+
+        let mut listed: Vec<&str> = ids.iter().map(String::as_str).collect();
+        listed.sort_unstable();
+        assert_eq!(
+            listed,
+            [
+                "00-orient",
+                "10-investigate",
+                "10-investigate/00-lead",
+                "10-investigate/10-code",
+                "20-implement",
+            ],
+            "the declared set is composed leaf ids union container ids, in the same \
+             `/`-joined shape `composed_stage_id` builds from a worktree"
+        );
+        assert!(
+            !ids.contains("99-foreign"),
+            "a directory this workflow never declared is not a declared stage id"
+        );
+        assert!(
+            !ids.contains("00-lead"),
+            "a nested leaf is declared only under its composed id, never bare"
+        );
+    }
+
+    /// #297, fail closed: a `workflow_source` whose package will not load
+    /// yields no declared set at all, so the callers sweep nothing rather
+    /// than falling back to the unscoped worktree walk.
+    #[test]
+    fn declared_stage_ids_is_none_when_the_package_will_not_load() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let missing = dir.path().join("no-such-package");
+        assert!(
+            declared_stage_ids(&missing).is_none(),
+            "an absent package declares nothing"
+        );
+
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).expect("empty dir");
+        assert!(
+            declared_stage_ids(&empty).is_none(),
+            "a directory with no workflow.toml declares nothing"
         );
     }
 
