@@ -149,6 +149,17 @@ pub enum ManifestError {
          re-add it with different settings (`sgt repo remove {name}`)"
     )]
     RepoAlreadyDeclared { name: String, path: String },
+    /// `sgt knowledge add` for a name the manifest already declares.
+    ///
+    /// Mirrors [`Self::RepoAlreadyDeclared`], and refuses for the same
+    /// reason: a second entry under one name would silently merge two
+    /// sources' coverage, and this pen never overwrites a declaration the
+    /// operator can see in the file.
+    #[error(
+        "knowledge source {name:?} is already declared in {path}; edit the entry by hand, or \
+         remove it there first if you want to re-add it with a different path or ignore list"
+    )]
+    KnowledgeAlreadyDeclared { name: String, path: String },
     /// `sgt repo add`/`sgt repo remove`/`sgt group add` named a repository
     /// the manifest has not declared.
     #[error(
@@ -711,6 +722,117 @@ pub fn remove_repo(estate_root: &Path, name: &str) -> Result<(), ManifestError> 
 
     validate(estate_root, &doc)?;
     commit(estate_root, &doc)
+}
+
+/// `sgt knowledge add <name> <path> [--ignore <glob>]...` (F11's
+/// manifest-direct shape): append one `[[knowledge]]` entry.
+///
+/// A **pure manifest edit**, and the shape is the point (A1-03). Unlike
+/// [`add_repo`], nothing is cloned, verified, created or touched on disk:
+/// declaring a knowledge source grants read access to Atlas's scanner and no
+/// authority at all, so there is nothing here to populate-or-verify. The path
+/// is written exactly as the operator gave it — a relative one stays relative
+/// and resolves against the estate root, the same convention `surfaces_dir`
+/// and `data_dir` already use.
+///
+/// Every validation that matters is [`Estate::from_config_structural`]'s,
+/// reached through [`validate`] before anything is committed: the plain-name
+/// rule, the duplicate check, and F9's path-containment refusal
+/// ([`EstateError::KnowledgePathInsideEstate`]). This function deliberately
+/// re-implements none of them — one validator, one answer, whether the entry
+/// arrived through this pen or a hand edit.
+///
+/// The source's *existence* is not checked, here or at parse: a knowledge
+/// path on an unplugged drive is a coverage fact the scanner reports
+/// (`unavailable`), not a reason to refuse the declaration.
+pub fn add_knowledge(
+    estate_root: &Path,
+    name: &str,
+    path: &Path,
+    ignore: &[String],
+    context_fields: &[String],
+) -> Result<(), ManifestError> {
+    if !is_plain_name(name) {
+        return Err(ManifestError::InvalidName {
+            name: name.to_string(),
+        });
+    }
+    let manifest_path = estate_root.join(MANIFEST_FILE);
+    let _lock = ManifestLock::acquire(estate_root)?;
+    let (mut doc, _existed) = read_document(&manifest_path)?;
+
+    if knowledge_names(&doc).iter().any(|n| n == name) {
+        return Err(ManifestError::KnowledgeAlreadyDeclared {
+            name: name.to_string(),
+            path: manifest_path.display().to_string(),
+        });
+    }
+
+    let mut table = Table::new();
+    table.insert("name", value(name));
+    table.insert(
+        "path",
+        value(
+            path.to_str()
+                .ok_or_else(|| ManifestError::InvalidName {
+                    name: path.display().to_string(),
+                })?
+                .to_string(),
+        ),
+    );
+    if !ignore.is_empty() {
+        let mut array = toml_edit::Array::new();
+        for glob in ignore {
+            array.push(glob.as_str());
+        }
+        table.insert("ignore", Item::Value(array.into()));
+    }
+    // F10a. Written only when there is something to write: an absent key and
+    // an empty array mean the same thing (no column is exposed), and the
+    // absent one is the honest spelling of a default nobody chose.
+    if !context_fields.is_empty() {
+        let mut array = toml_edit::Array::new();
+        for column in context_fields {
+            array.push(column.as_str());
+        }
+        table.insert("context_fields", Item::Value(array.into()));
+    }
+    knowledge_array_mut(&mut doc, &manifest_path)?.push(table);
+
+    validate(estate_root, &doc)?;
+    commit(estate_root, &doc)
+}
+
+/// The `[[knowledge]]` array of tables, creating it if absent. Fails closed
+/// on a hand edit that put something else under the key, exactly as
+/// [`repo_array_mut`] does.
+fn knowledge_array_mut<'a>(
+    doc: &'a mut DocumentMut,
+    manifest_path: &Path,
+) -> Result<&'a mut ArrayOfTables, ManifestError> {
+    let item = doc
+        .entry("knowledge")
+        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
+    item.as_array_of_tables_mut()
+        .ok_or_else(|| ManifestError::MalformedSection {
+            path: manifest_path.display().to_string(),
+            key: "knowledge".to_string(),
+            expected: "an array of tables ([[knowledge]] entries)".to_string(),
+        })
+}
+
+/// Declared `[[knowledge]]` names, in file order.
+fn knowledge_names(doc: &DocumentMut) -> Vec<String> {
+    doc.get("knowledge")
+        .and_then(Item::as_array_of_tables)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|table| table.get("name").and_then(Item::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `sgt group add <name> <repo>... [--brief <text>]`: mkdir-p create

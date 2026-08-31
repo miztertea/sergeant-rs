@@ -35,10 +35,14 @@
 /// The `agy --print --output-format stream-json` adapter (W1 of the *Sergeant
 /// speaks Antigravity* sprint, `sergeant-rs-workspace's knowledge/evidence/reference/agy-adapter-2026-08-23.md` —
 /// see the module's own doc comment for the measurements it rests on).
-/// Registration in `daemon.rs` and every CLI surface remain W2's gap (K2:
-/// this wave is the adapter and nothing else): this module compiles, is unit-
-/// and contract-tested, and is reachable by nothing yet.
+/// Registered in `daemon.rs` (the agy-adapter sprint's W2) and reachable via
+/// `sgt agy` and `--backend agy`.
 pub mod agy;
+/// Child-process lifecycle shared by every adapter (#310): the one
+/// process-group kill, the probe-child hardening that makes a `SIGKILL`ed
+/// daemon take its probe children with it, and the per-walk registry a
+/// daemon's own `kill` reaps through.
+pub mod child;
 pub mod claude;
 /// The `codex exec` adapter (W1 of the *Sergeant speaks Codex* sprint,
 /// `knowledge/evidence/resources/h-series/w1-spec.md`, closing deviation D6
@@ -57,9 +61,9 @@ pub mod fake;
 /// and contract-tested, and is reachable by nothing yet.
 pub mod opencode;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -283,6 +287,121 @@ pub struct StartRequest {
     /// read it as a mutation surface of nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<BindingSummary>,
+    /// W1 §6 (S2 E5/E6): the canonical estate root this Work was submitted
+    /// against — the third of the three values [`causation_env`] injects, and
+    /// the only one this request did not already carry.
+    ///
+    /// Same source as the `workspace_id` stamp every committed event gets
+    /// (`WorkIndexRow::estate_root`, folded once from `work.submitted`), so
+    /// an actor's `sgt -C "$SERGEANT_ESTATE_ROOT" run` addresses exactly the
+    /// estate the daemon will validate its claim against — never a root
+    /// re-derived from a worktree path.
+    ///
+    /// `#[serde(default)]` on [`Self::instruction_policy`]'s precedent: a
+    /// `StartRequest` journaled before this field existed replays as `None`,
+    /// which is exactly what it was — no estate coordinate was transported,
+    /// so no causation env was injected either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estate_root: Option<PathBuf>,
+}
+
+/// `SERGEANT_ESTATE_ROOT` — the estate a child `sgt -C … run` must address
+/// (W1 §6, S2 E5).
+///
+/// **Not `SGT_ESTATE_ROOT`.** [`crate::harness`]'s variable of that
+/// near-identical name is a different mechanism entirely: it is set once when
+/// `sgt <harness>` execs a Captain session, it is read back only to decorate
+/// an exact-root refusal message, and it never travels to a managed
+/// execution. This one is set per managed execution, carries the estate the
+/// *daemon* recorded for that Work, and is validated against the journal
+/// before any relation is recorded. Neither may be read in place of the
+/// other.
+pub const SERGEANT_ESTATE_ROOT_ENV: &str = "SERGEANT_ESTATE_ROOT";
+/// `SERGEANT_WORK_ID` — the Work whose execution is running (W1 §6, S2 E5).
+pub const SERGEANT_WORK_ID_ENV: &str = "SERGEANT_WORK_ID";
+/// `SERGEANT_EXECUTION_ID` — the execution itself (W1 §6, S2 E5).
+pub const SERGEANT_EXECUTION_ID_ENV: &str = "SERGEANT_EXECUTION_ID";
+
+/// The three causation values one managed execution transports to whatever it
+/// launches (W1-07, S2 E6) — one helper, so a sixth adapter adds a call and
+/// not a sixth copy of the merge.
+///
+/// **Exactly three values, and this is the rung log for that.** W1-07 is R7:
+/// R1 yes (a child `sgt run` cannot name its parent otherwise); R2 no — no
+/// managed-execution identity env existed; R3–R6 cannot supply product
+/// lineage. Binary discoverability is deliberately *not* a fourth value: a
+/// child resolves `sgt` off the inherited PATH exactly as the adapters
+/// already resolve `claude`/`codex`/`agy`/`opencode`, with the same
+/// PATH-diagnostic failure mode and no new mechanism.
+///
+/// **Merged last, always.** `Profile.env` is workflow-authored plaintext and
+/// occupies the same map; injecting after it means the transport hint is at
+/// least what sergeant itself intended to send. That is a hygiene property,
+/// not a security one — W1 §6 is explicit that "environment variables are a
+/// transport hint, not trusted lineage", and the daemon validates every claim
+/// against its own journal regardless of what reached the actor.
+///
+/// **Never handed to a probe.** A probe is not a `StartRequest`-bound
+/// execution: it has no work, no execution, and no estate. Taking
+/// `&StartRequest` rather than three loose strings is what makes that
+/// structural — there is nothing to pass at a probe call site.
+///
+/// A request with no `estate_root` (a Work submitted with no repository
+/// context, or a pre-S2 journal line replayed) omits that one pair rather
+/// than inventing a root. The other two are always present.
+pub fn causation_env(request: &StartRequest) -> BTreeMap<String, String> {
+    causation_env_from_parts(
+        request.estate_root.as_deref(),
+        &request.work_id,
+        &request.execution_id,
+    )
+}
+
+/// The same triple as [`causation_env`], rebuilt on RESUME.
+///
+/// A restarted adapter's `resume()` has a [`ResumeRequest`] (which carries
+/// the re-supplied `estate_root`, S2 E6) and an [`ExecutionHandle`] (which
+/// already carries the execution id — `ResumeRequest` itself does not need a
+/// second copy of it). Before this helper existed, `resume()` had nothing to
+/// build the causation triple from and passed an empty map to
+/// `launch_config` instead — not just for the reconciliation snapshot but
+/// for the env cached for the rest of that execution's life, silently
+/// dropping causation for every turn spawned after a daemon restart. This is
+/// the fix: the same three values, re-supplied exactly as the model pin and
+/// the profile already are on the same path.
+pub fn resume_causation_env(
+    request: &ResumeRequest,
+    execution_id: &str,
+) -> BTreeMap<String, String> {
+    causation_env_from_parts(
+        request.estate_root.as_deref(),
+        &request.work_id,
+        execution_id,
+    )
+}
+
+/// Shared body for [`causation_env`] and [`resume_causation_env`] — one place
+/// that knows the three names and the omit-when-absent rule for the estate
+/// root, so START and RESUME cannot drift into building the triple two
+/// different ways.
+fn causation_env_from_parts(
+    estate_root: Option<&std::path::Path>,
+    work_id: &str,
+    execution_id: &str,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    if let Some(root) = estate_root {
+        env.insert(
+            SERGEANT_ESTATE_ROOT_ENV.to_string(),
+            root.to_string_lossy().into_owned(),
+        );
+    }
+    env.insert(SERGEANT_WORK_ID_ENV.to_string(), work_id.to_string());
+    env.insert(
+        SERGEANT_EXECUTION_ID_ENV.to_string(),
+        execution_id.to_string(),
+    );
+    env
 }
 
 /// Everything a backend needs to RESUME an execution it no longer remembers
@@ -335,16 +454,29 @@ pub struct ResumeRequest {
     /// claim, not a claim of absence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<BindingSummary>,
+    /// S2 E6/W1 §6, re-supplied on RESUME for the same reason the model pin,
+    /// the profile, and the bindings are: [`causation_env`] needs it to
+    /// rebuild the `SERGEANT_ESTATE_ROOT`/`SERGEANT_WORK_ID`/
+    /// `SERGEANT_EXECUTION_ID` triple for every turn a restarted adapter
+    /// spawns after reattaching, not only for the reconciliation snapshot
+    /// itself. Before this field existed, an adapter's `resume()` had
+    /// nothing to build that triple from and cached an empty env for the
+    /// rest of the execution's life — silently dropping causation for every
+    /// turn after a daemon restart. Same source as
+    /// [`StartRequest::estate_root`]: the Work's own journaled estate root,
+    /// never re-derived from a worktree path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estate_root: Option<PathBuf>,
 }
 
 impl ResumeRequest {
     /// A resume request carrying only the two things every caller has: the
-    /// work and its surface. Model, profile and instruction policy all
-    /// default to `None` — "not re-supplied" — which adapters must treat as
-    /// absent, never invented; an adapter that needs *some* concrete policy
-    /// to launch under falls back to its own safe default (today,
-    /// `InstructionPolicy::default()` = `Suppress`) only at that point, not
-    /// here.
+    /// work and its surface. Model, profile, instruction policy, and estate
+    /// root all default to `None` — "not re-supplied" — which adapters must
+    /// treat as absent, never invented; an adapter that needs *some*
+    /// concrete policy to launch under falls back to its own safe default
+    /// (today, `InstructionPolicy::default()` = `Suppress`) only at that
+    /// point, not here.
     pub fn new(work_id: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             work_id: work_id.into(),
@@ -353,6 +485,7 @@ impl ResumeRequest {
             profile: None,
             instruction_policy: None,
             bindings: Vec::new(),
+            estate_root: None,
         }
     }
 }
@@ -873,6 +1006,120 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
     fn stop(&self, handle: &ExecutionHandle) -> Result<Completion, BackendError>;
 }
 
+/// Per-backend probe readiness (#293) — what a caller waits on when it needs
+/// a backend's PROBE evidence and the daemon has not finished collecting it.
+///
+/// **Why this exists.** The daemon publishes its runtime descriptor and starts
+/// serving *before* it walks the backend probes, because the walk is a set of
+/// real CLI invocations (measured on Cerberus 2026-08-25: ~6.4s serially with
+/// five adapters installed, against a 10s client auto-spawn budget) and a
+/// daemon is healthy when it can accept and route requests, not when every
+/// third-party CLI has printed `--help`. That leaves a window in which a
+/// backend's evidence does not exist yet, and exactly one thing may happen in
+/// it: a caller that needs the evidence **waits**. Nothing fabricates a
+/// capability, nothing defaults one, and no submission is refused that the
+/// old probe-walk-first ordering would have accepted — the only difference a
+/// client can observe is *when* the answer arrives.
+///
+/// **Per backend, not per walk.** The wait is keyed by backend name and is
+/// released by that backend's own `backend.probed` record becoming durable,
+/// so a Work routed to a fast adapter is never held up by a slow one it will
+/// never touch. That is also what keeps the M4 evidence order intact:
+/// `backend.probed` for a backend is durable before any Work routed to it is.
+///
+/// **Blocking, not async, deliberately (R2).** Its one real caller is
+/// [`crate::runtime::router`]'s tier walk, which is synchronous and runs
+/// inside the planning path's `block_in_place`; a `Condvar` rendezvous is the
+/// same primitive `fake::Gate` already uses here and needs no runtime
+/// assumptions at all. An async gate would have forced the wait up into the
+/// handler, where the backend the request will route to is not yet known.
+#[derive(Debug, Default)]
+pub struct ProbeGate {
+    state: Mutex<ProbeGateState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct ProbeGateState {
+    /// Backends still owed a durable `backend.probed` record. Empty means
+    /// nothing waits — which is both the initial state and the final one.
+    pending: BTreeSet<String>,
+}
+
+impl ProbeGate {
+    /// A gate that owes nothing: every wait returns at once.
+    ///
+    /// This is the resting state for every registry that is not a running
+    /// daemon's — unit tests, `sgt doctor`'s own in-process adapters, the CLI
+    /// preflight — and it is also the daemon's own state until it arms the
+    /// gate, which matters: restart reconciliation reads capabilities before
+    /// the walk is spawned, and a gate armed any earlier would wait for a
+    /// walk that has not started.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Arm the gate: these backends now owe evidence, and waits for them
+    /// block until [`ProbeGate::mark`] or [`ProbeGate::settle`] says
+    /// otherwise. Called once, immediately before the probe walk is spawned.
+    pub fn expect(&self, names: impl IntoIterator<Item = String>) {
+        self.state.lock().expect("probe gate lock").pending = names.into_iter().collect();
+        self.changed.notify_all();
+    }
+
+    /// Record that `name`'s probe evidence is durable, releasing its waiters.
+    pub fn mark(&self, name: &str) {
+        self.state
+            .lock()
+            .expect("probe gate lock")
+            .pending
+            .remove(name);
+        self.changed.notify_all();
+    }
+
+    /// Record that the walk is over, however it ended.
+    ///
+    /// Called unconditionally when the walk drains, so a probe that panicked,
+    /// a backend that left the registry, or a journal append that failed
+    /// cannot leave a request waiting forever on evidence that is never
+    /// coming. Failing open here is right: the alternative is a daemon that
+    /// serves reads and hangs every submission, which is worse than the
+    /// defect the reordering fixed.
+    pub fn settle(&self) {
+        self.state.lock().expect("probe gate lock").pending.clear();
+        self.changed.notify_all();
+    }
+
+    /// Whether nothing is owed.
+    pub fn is_settled(&self) -> bool {
+        self.state
+            .lock()
+            .expect("probe gate lock")
+            .pending
+            .is_empty()
+    }
+
+    /// Block until `name`'s probe evidence is durable.
+    ///
+    /// Returns immediately for a backend the gate is not waiting on — an
+    /// unarmed gate, an already-probed backend, or a name that is not in the
+    /// registry at all.
+    pub fn wait_for(&self, name: &str) {
+        let mut state = self.state.lock().expect("probe gate lock");
+        while state.pending.contains(name) {
+            state = self.changed.wait(state).expect("probe gate wait");
+        }
+    }
+
+    /// Block until every backend the gate is waiting on has its evidence.
+    pub fn wait_all(&self) {
+        let mut state = self.state.lock().expect("probe gate lock");
+        while !state.pending.is_empty() {
+            state = self.changed.wait(state).expect("probe gate wait");
+        }
+    }
+}
+
 /// The set of backends this daemon can route to.
 ///
 /// Compiled-in rather than configured: M3 has exactly one backend to register,
@@ -881,12 +1128,31 @@ pub trait Backend: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default, Clone)]
 pub struct BackendRegistry {
     backends: BTreeMap<String, Arc<dyn Backend>>,
+    /// #293's probe readiness, carried here because the registry is what is
+    /// already threaded through every path that resolves a backend by name —
+    /// the router's tier walk above all. A registry that is not a running
+    /// daemon's keeps the owed-nothing default and never waits; a clone
+    /// shares the original's gate, which is what makes
+    /// `daemon::start_with`'s "clone the configured registry, add the real
+    /// adapters" step carry one gate rather than forking it.
+    probe_gate: Arc<ProbeGate>,
 }
 
 impl BackendRegistry {
     /// An empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach the probe-readiness gate this registry's callers wait on.
+    pub fn with_probe_gate(mut self, gate: Arc<ProbeGate>) -> Self {
+        self.probe_gate = gate;
+        self
+    }
+
+    /// This registry's probe-readiness gate.
+    pub fn probe_gate(&self) -> &Arc<ProbeGate> {
+        &self.probe_gate
     }
 
     /// Register a backend under its own name.
@@ -913,5 +1179,106 @@ impl BackendRegistry {
         Self::new().with(Arc::new(fake::FakeBackend::from_env(
             fake::FAKE_BACKEND_NAME,
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request() -> StartRequest {
+        StartRequest {
+            work_id: "01WORK".to_string(),
+            execution_id: "01EXEC".to_string(),
+            stage_id: "00-only".to_string(),
+            attempt: 1,
+            cwd: PathBuf::from("/data/surfaces/01WORK"),
+            intent: "do the thing".to_string(),
+            context: String::new(),
+            model: None,
+            profile: None,
+            execute: None,
+            instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
+            estate_root: Some(PathBuf::from("/home/dev/estate")),
+        }
+    }
+
+    /// E5: the names are the contract's, spelled `SERGEANT_*`, and there are
+    /// exactly three of them. A fourth value (a binary path, a data dir)
+    /// would be a new mechanism W1-07's rung table already refused.
+    #[test]
+    fn causation_env_is_exactly_the_contracts_three_names() {
+        let env = causation_env(&request());
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "SERGEANT_ESTATE_ROOT",
+                "SERGEANT_EXECUTION_ID",
+                "SERGEANT_WORK_ID"
+            ],
+            "exactly three pairs, named as W1 §6 names them"
+        );
+        assert_eq!(env["SERGEANT_ESTATE_ROOT"], "/home/dev/estate");
+        assert_eq!(env["SERGEANT_WORK_ID"], "01WORK");
+        assert_eq!(env["SERGEANT_EXECUTION_ID"], "01EXEC");
+    }
+
+    /// E5's other half: `SGT_ESTATE_ROOT` is a different mechanism and this
+    /// helper must never emit it. A caller that wired the harness variable
+    /// and believed W1-07 satisfied is exactly the confusion both recon
+    /// seats flagged.
+    #[test]
+    fn causation_env_never_emits_the_harnesss_own_sgt_variable() {
+        let env = causation_env(&request());
+        assert!(
+            !env.contains_key(crate::harness::ESTATE_ROOT_ENV),
+            "the harness's SGT_ESTATE_ROOT is a different mechanism: {env:?}"
+        );
+        assert!(
+            env.keys().all(|k| k.starts_with("SERGEANT_")),
+            "every injected name carries the contract's own prefix: {env:?}"
+        );
+    }
+
+    /// A Work submitted with no repository context has no estate coordinate.
+    /// The pair is omitted rather than filled with an invented root — a
+    /// child addressing `""` would be refused by admission anyway, and a
+    /// guess is what W1 §6 forbids.
+    #[test]
+    fn causation_env_omits_the_estate_root_it_does_not_have() {
+        let mut request = request();
+        request.estate_root = None;
+        let env = causation_env(&request);
+        assert_eq!(
+            env.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["SERGEANT_EXECUTION_ID", "SERGEANT_WORK_ID"],
+            "no root recorded means no root transported: {env:?}"
+        );
+    }
+
+    /// The journal-replay contract every added `StartRequest` field carries
+    /// (`instruction_policy`/`bindings`' own precedent): a request journaled
+    /// before this field existed replays as `None`, not as an error and not
+    /// as an invented root.
+    #[test]
+    fn a_start_request_journaled_before_estate_root_existed_still_replays() {
+        let pre_s2 = serde_json::json!({
+            "work_id": "01WORK",
+            "execution_id": "01EXEC",
+            "stage_id": "00-only",
+            "attempt": 1,
+            "cwd": "/data/surfaces/01WORK",
+            "intent": "do the thing",
+            "context": "",
+        });
+        let replayed: StartRequest =
+            serde_json::from_value(pre_s2).expect("a pre-S2 request must still replay");
+        assert_eq!(replayed.estate_root, None);
+        assert_eq!(
+            causation_env(&replayed).len(),
+            2,
+            "and it transports only what it actually knows"
+        );
     }
 }

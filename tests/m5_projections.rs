@@ -1,11 +1,29 @@
 //! M5 acceptance tests (sergeant-rs-workspace's knowledge/evidence/gauntlet/contracts/M5.md).
 //!
 //! 1. Rebuild determinism: real work through the daemon → DuckDB populated →
-//!    delete the `.duckdb` file → restart → the §22 canned queries return
+//!    delete `atlas.duckdb` → restart → the §22 canned queries return
 //!    identical results, row for row.
-//! 2. One owner: nothing outside `daemon`/`runtime` opens the DuckDB file —
-//!    the `duckdb` crate is reachable from exactly one module, no `Connection`
-//!    escapes it, and clients have only the API.
+//!
+//!    **What deleting that file costs changed in S5 W1c, and this suite no
+//!    longer claims otherwise.** `ops.*` used to be the only thing in its own
+//!    file, so deleting it was free by construction. A1 §5 declares one
+//!    physical database, so `ops` is now a schema inside `atlas.duckdb`
+//!    beside `meta`, `source`, `git` and `context` — and *those* persist
+//!    across restarts, because they are derived from source bytes plus
+//!    extractor identity and no journal replay reproduces them (F1).
+//!    Deleting the file therefore still rebuilds `ops` exactly, which is what
+//!    acceptance 1 measures and all it ever measured; it also discards every
+//!    confirmed source generation, which must be rescanned. That loss is
+//!    proven, not merely documented, by
+//!    `tests/w1c_one_atlas_database.rs`'s
+//!    `deleting_atlas_duckdb_rebuilds_ops_and_loses_source_facts`. The
+//!    daemon's own rebuild path never deletes the file — it drops and refolds
+//!    the `ops` schema.
+//! 2. One owner: nothing outside `daemon`/`runtime` opens the DuckDB file.
+//!    Since S5 W1c there is one database, so there is one assertion, and it
+//!    lives in `tests/x1_atlas_substrate.rs`'s
+//!    `atlas_database_has_exactly_one_owner` — see the note where `t2` used
+//!    to be.
 //! 3. Graph provenance: every edge of `/v1/graph/work/{id}` carries a
 //!    `source_seq` resolving to a real journal event whose *content* justifies
 //!    that edge.
@@ -43,11 +61,10 @@ use sergeant_rs::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeConfig};
 use sergeant_rs::backend::fake::{FAKE_BACKEND_NAME, FakeBackend, FakeStep};
 use sergeant_rs::daemon::{self, DaemonConfig, DaemonHandle};
 use sergeant_rs::domain::event::Event;
-use sergeant_rs::runtime::analytics::{
-    Analytics, AnalyticsError, CANNED_QUERIES, DUCKDB_FILE, PROJECTIONS_DIR, duckdb_path,
-};
+use sergeant_rs::runtime::atlas::db::{Analytics, AnalyticsError, CANNED_QUERIES, atlas_db_path};
 use sergeant_rs::runtime::graph::{GraphContext, GraphEdge};
 use sergeant_rs::runtime::journal::{Journal, JournalError};
+use sergeant_rs::runtime::startup::PROJECTIONS_DIR;
 use sergeant_rs::telemetry::{DEFAULT_OTLP_ENDPOINT, Telemetry, TelemetryConfig};
 
 mod support;
@@ -114,7 +131,7 @@ fn estate() -> (TempDir, PathBuf, String) {
 /// sit at `pending` forever.
 async fn start_fake(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     script: impl IntoIterator<Item = FakeStep>,
 ) -> (DaemonHandle, FakeBackend) {
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
@@ -124,7 +141,6 @@ async fn start_fake(
         DaemonConfig {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -168,14 +184,19 @@ async fn get_status(handle: &DaemonHandle, path: &str) -> (reqwest::StatusCode, 
     (status, resp.json().await.expect("json body"))
 }
 
-/// Submit work. `cwd` is §13.3 recorded evidence and nothing else — since
-/// §5.2 the plan is made against the estate the daemon was *bound* to, so
-/// this argument decides nothing about topology; it is passed the estate root
-/// only so `origin.cwd` in the journal names something real.
+/// Submit work addressed at `estate_root` (D4), which every call site here
+/// also passes as `cwd`.
+///
+/// `cwd` is still §13.3 recorded evidence and nothing else: §5.2 gave it no
+/// authority over topology, and H1 does not give it any back — what decides
+/// is the addressed root, which the daemon then admits. `extra` can override
+/// `estate_root` (a `null` addresses none), which is how the no-topology
+/// cases in this file stay reachable.
 async fn submit(handle: &DaemonHandle, cwd: &Path, intent: &str, extra: Value) -> Value {
     let mut body = json!({
         "command_id": ulid(),
         "intent": intent,
+        "estate_root": cwd,
         "origin": {"client": "cli", "cwd": cwd},
     });
     if let Some(fields) = extra.as_object() {
@@ -344,10 +365,14 @@ async fn t1_rebuild_from_scratch_reproduces_every_canned_answer() {
     }
     handle.shutdown().await;
 
-    // §21's diagram, literally: delete the file, restart, rebuild.
-    let db = duckdb_path(data.path());
+    // §21's diagram, literally: delete the file, restart, rebuild. What the
+    // file is has changed (S5 W1c: `ops` is a schema in `atlas.duckdb`), what
+    // this measures has not — every `ops` row comes back identical from the
+    // journal. See the module doc for what deleting it now *also* costs.
+    let db = atlas_db_path(data.path());
     assert!(db.exists(), "the daemon must have created {}", db.display());
     std::fs::remove_file(&db).expect("delete the projection");
+    let _ = std::fs::remove_file(db.with_extension("duckdb.wal"));
 
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     assert!(db.exists(), "restart must rebuild {}", db.display());
@@ -384,7 +409,11 @@ async fn t1_rebuild_from_scratch_reproduces_every_canned_answer() {
 #[tokio::test]
 async fn a_fresh_daemon_answers_from_the_journal_alone() {
     let (data, estate, work_id) = completed_run().await;
-    std::fs::remove_dir_all(data.path().join(PROJECTIONS_DIR)).expect("delete projections");
+    let _ = std::fs::remove_dir_all(data.path().join(PROJECTIONS_DIR));
+    // And the database itself: since W1c the two are separate deletions, and
+    // "from the journal alone" is only true if neither survives.
+    let _ = std::fs::remove_file(atlas_db_path(data.path()));
+    let _ = std::fs::remove_file(atlas_db_path(data.path()).with_extension("duckdb.wal"));
 
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let answer = get(&handle, "/v1/analytics/execution_touched").await;
@@ -413,7 +442,7 @@ async fn a_fresh_daemon_answers_from_the_journal_alone() {
 async fn a_restart_over_the_existing_projection_file_rebuilds_it() {
     let (data, estate, work_id) = completed_run().await;
     assert!(
-        duckdb_path(data.path()).exists(),
+        atlas_db_path(data.path()).exists(),
         "the first daemon left its projection behind"
     );
 
@@ -640,72 +669,29 @@ fn journal_segment(data_dir: &Path) -> PathBuf {
 }
 
 // ------------------------------------------------------ 2. one owner
-
-/// Acceptance 2. Only the daemon's own projection module opens DuckDB.
-///
-/// Enforced structurally and checked mechanically: the `duckdb` crate is
-/// named in exactly one source file, that file hands out no connection, and
-/// the dependency is a normal one (a client binary that wanted its own copy
-/// would have to change this test first).
-#[test]
-fn t2_the_duckdb_file_has_exactly_one_owner() {
-    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
-    // A token scan, not a fixed-pattern grep: however the import is spelled
-    // (`use duckdb::...`, `duckdb::Connection`, `extern crate duckdb`, a
-    // re-export), the crate's own lowercase name has to appear somewhere in
-    // the file. Prose that mentions the product ("DuckDB") is capitalized
-    // and does not collide with the identifier.
-    let names_the_crate = |text: &str| {
-        text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .any(|token| token == "duckdb")
-    };
-    for file in rust_sources(&src) {
-        if file.ends_with("runtime/analytics.rs") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&file).expect("read source");
-        assert!(
-            !names_the_crate(&text),
-            "{} names the duckdb crate; it must be reachable from one module only",
-            file.strip_prefix(&src).expect("under src").display()
-        );
-    }
-
-    // The positive half of "exactly one owner". Without it the loop above is
-    // satisfied by a build that stopped using the crate altogether — and R5
-    // named the embedded Rust client specifically, so a silent swap for some
-    // other store is exactly the drift this acceptance test exists to catch.
-    let analytics = std::fs::read_to_string(src.join("runtime/analytics.rs")).expect("read");
-    assert!(
-        names_the_crate(&analytics),
-        "runtime/analytics.rs must be the one module that uses the duckdb crate"
-    );
-
-    // And that module must not leak the connection: everything crossing its
-    // boundary is plain data (`QueryResult`, `GraphView`, counts).
-    //
-    // Private-by-default does not cover this on its own. `Analytics` is a
-    // public struct in a public module, so `pub conn: Connection` compiles
-    // and is reachable from anywhere in the estate — and a consumer
-    // written against it (`analytics.conn.execute(..)`) names the lowercase
-    // crate token nowhere, so the scan above would not see it either. The
-    // field declaration is therefore pinned directly.
-    assert!(
-        analytics.contains("\n    conn: Connection,"),
-        "the connection must stay a private field"
-    );
-    assert!(
-        !analytics.contains("pub fn conn") && !analytics.contains("-> &Connection"),
-        "no accessor may hand a live DuckDB connection outside the projection"
-    );
-
-    // The CLI reaches analytics only through the daemon's HTTP surface.
-    let cli = std::fs::read_to_string(src.join("cli.rs")).expect("read cli");
-    assert!(
-        cli.contains("/v1/analytics") && !names_the_crate(&cli),
-        "clients ask the daemon; they do not open the file"
-    );
-}
+//
+// `t2_the_duckdb_file_has_exactly_one_owner` was deleted in S5 W1c, and this
+// note is what replaced it. Deleting a boundary test is normally forbidden;
+// this is the case where the test's *premise* stopped existing.
+//
+// The premise was two databases. `t2` asserted that exactly one file
+// (`src/runtime/analytics.rs`) may open `sergeant.duckdb`, and skipped
+// `src/runtime/atlas/` because that tree held a second, independent database
+// with its own single owner, pinned by its own test. Both suites said in
+// terms that the pair must never be merged into a union rule — "either of
+// these two files may open a database" passes just as happily once one owner
+// has quietly grown into the other's territory.
+//
+// A1 §5 declares ONE physical database (`atlas.duckdb`, five logical schemas)
+// and A1-02's rationale is "schemas provide separation without more
+// databases". The owner correction of 2026-08-29 settled that the code
+// converges to that, so `sergeant.duckdb` no longer exists and `ops` is a
+// schema in `atlas.duckdb`. One database has one owner and therefore one
+// assertion: `tests/x1_atlas_substrate.rs`'s
+// `atlas_database_has_exactly_one_owner`, which now scans the whole of
+// `src/` — no skipped tree, no allowed-owners list — plus the CLI half `t2`
+// used to carry. Keeping a second test here would have re-created exactly
+// the union rule both suites forbade, this time over one file.
 
 fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -1303,9 +1289,20 @@ async fn t4_deleting_the_projections_directory_loses_nothing() {
     let graph_before = get(&handle, &format!("/v1/graph/work/{work_id}")).await;
     handle.shutdown().await;
 
+    // Both disposable stores, in one go. Since S5 W1c `projections/` holds
+    // only the FloorState startup cache — which a start may legitimately not
+    // have written — and the operations tables live in the Atlas database,
+    // which is disposable *for `ops`* and nothing else.
     let projections = data.path().join(PROJECTIONS_DIR);
-    assert!(projections.join(DUCKDB_FILE).exists());
-    std::fs::remove_dir_all(&projections).expect("delete the whole projections dir");
+    let _ = std::fs::remove_dir_all(&projections);
+    assert!(
+        !projections.exists(),
+        "the projections directory must be gone before the restart below"
+    );
+    let db = atlas_db_path(data.path());
+    assert!(db.is_file(), "the daemon left its projection behind");
+    std::fs::remove_file(&db).expect("delete the atlas database");
+    let _ = std::fs::remove_file(db.with_extension("duckdb.wal"));
 
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
     let work_after = get(&handle, &format!("/v1/work/{work_id}")).await;
@@ -1365,7 +1362,6 @@ async fn t5_enabled_export_emits_the_span_tree_and_metrics() {
             // §5.1, spelled out here rather than through `start_fake`: this
             // rig needs its own `telemetry` field, and an unbound daemon
             // would export a `work` span with no stages under it.
-            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -1562,6 +1558,14 @@ async fn t5_disabled_export_runs_no_exporter_machinery() {
     // address such a regression would actually dial. An ephemeral port whose
     // number is never handed to anything makes "zero connections" true under
     // every possible implementation, which is not a test at all.
+    // #305: this binds the daemon's literal DEFAULT_OTLP_ENDPOINT port, not a
+    // per-process one — the whole test is a stand-in for the address a
+    // regression would really dial, so it can't be made per-process-unique
+    // without testing nothing. A cross-process lock serializes only this one
+    // section (bind..hits checked), so two concurrent copies of this suite
+    // no longer race for the port; every other test in the suite runs
+    // unserialized.
+    let _otlp_port_lock = support::CrossProcessLock::acquire("otlp-4318");
     let collector_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let default_port = DEFAULT_OTLP_ENDPOINT
         .rsplit(':')
@@ -2028,7 +2032,7 @@ fn stub_claude(dir: &Path) -> PathBuf {
 /// adapter itself, so nothing here is a fake wearing the adapter's name.
 async fn start_claude(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     telemetry: Option<Arc<Telemetry>>,
 ) -> DaemonHandle {
     let mut claude = ClaudeConfig::new(data_dir);
@@ -2040,7 +2044,6 @@ async fn start_claude(
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
             telemetry,
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -2076,7 +2079,7 @@ async fn real_adapter_events_populate_the_conversation_tables_and_tool_spans() {
     .await;
     let work_id = created["work"]["id"].as_str().expect("work id").to_string();
 
-    let events = wait_for_kinds(
+    let mut events = wait_for_kinds(
         data.path(),
         &[
             "conversation.user",
@@ -2084,7 +2087,29 @@ async fn real_adapter_events_populate_the_conversation_tables_and_tool_spans() {
             "tool.completed",
             "usage.updated",
         ],
-    );
+    )
+    .await;
+    // `tiny` is a *two*-stage workflow, so this run is two turns of the same
+    // recording and the journal keeps growing while the assertions below read
+    // it. Every one of them is a claim about **one** turn — one tool call, one
+    // usage row, the recording's own token totals read back as a per-work
+    // aggregate — so the fold gets exactly the first turn's prefix rather than
+    // whatever had landed by the moment `wait_for_kinds` was satisfied.
+    // `usage.updated` is the reader's last event for the turn it belongs to
+    // and the journal is totally ordered, so cutting there can neither clip
+    // turn one nor admit any of turn two.
+    //
+    // Not hypothetical, and not a pre-existing accident either: while
+    // `wait_for_kinds` parked the runtime it also froze the daemon it was
+    // polling, so stage `10-second` had no chance to run inside the wait. With
+    // the wait yielding properly it does, and a snapshot spanning both turns
+    // folds to `tool_calls` of 2 with doubled token totals — measured on a
+    // loaded two-core cpuset (journal seqs 12-24 stage one, 25-33 stage two).
+    let first_turn_end = events
+        .iter()
+        .position(|event| event.kind == "usage.updated")
+        .expect("wait_for_kinds only returns once a usage.updated is journaled");
+    events.truncate(first_turn_end + 1);
     let execution_id = events
         .iter()
         .find(|e| e.kind == "execution.started")
@@ -2266,7 +2291,8 @@ async fn rebuilding_reproduces_the_conversation_tables_a_real_adapter_fills() {
             "tool.completed",
             "usage.updated",
         ],
-    );
+    )
+    .await;
     wait_for_a_quiet_journal(data.path()).await;
 
     let (live, high_water) = api_projection(&handle).await;
@@ -2391,9 +2417,42 @@ async fn wait_for_a_quiet_journal(data_dir: &Path) {
     }
 }
 
-/// Block until every kind in `kinds` has been journaled (the adapter's reader
-/// thread and the sink's committer are both asynchronous).
-fn wait_for_kinds(data_dir: &Path, kinds: &[&str]) -> Vec<Event> {
+/// Block until every kind in `kinds` has been journaled — the adapter's
+/// reader thread and the sink's committer both land their events well after
+/// the submission that started them has returned.
+///
+/// `async`, with a `tokio::time::sleep`, for the same reason
+/// [`wait_for_a_quiet_journal`] is, and the reason bites harder here. This
+/// helper used to be a plain `fn` around `std::thread::sleep`, on the
+/// reasoning that the two producers it waits for are OS threads and so owe
+/// the runtime nothing. They are OS threads — and the reasoning is still
+/// wrong, because it stops one link short of the journal:
+///
+/// - the daemon this waits on runs on *this test's* runtime, and
+///   `#[tokio::test]` is a **current-thread** runtime: its only worker is the
+///   test's own thread. A synchronous poll loop parks that thread for the
+///   whole 30 s deadline, so no task of that daemon is ever polled again;
+/// - the committer reaches the journal through `CoreGuard::acquire_blocking`,
+///   and `tokio::sync::Mutex` is **fair**. When `api::drive_completions` (a
+///   task, ticking every 200 ms) queues for the core lock while the committer
+///   holds it, the release hands the permit to that task. A parked runtime
+///   never polls it, so the permit is never returned and the committer's
+///   *next* `blocking_lock` waits out the whole deadline;
+/// - the observable result was exactly one sink event per run —
+///   `conversation.user`, the first one — and then nothing, which is precisely
+///   the intermittent this shape produced: `tool.requested`, `tool.completed`
+///   and `usage.updated` all landed the instant the 30 s assertion unwound the
+///   blocking loop and let the runtime turn again (measured on a two-core
+///   cpuset under load: 29.997 s from the committer's `blocking_lock` to its
+///   grant, the grant printing *after* the panic message).
+///
+/// Nothing about the contract changed: the same kinds, the same 30 s budget,
+/// which is generous for a scripted stub's events and stays that way. What
+/// changed is that the loop yields to the runtime it is waiting on, so the
+/// daemon can actually reach the state being asserted. Production was never
+/// exposed — `cli::main` builds a multi-thread runtime, where a woken task
+/// always has a worker to run on.
+async fn wait_for_kinds(data_dir: &Path, kinds: &[&str]) -> Vec<Event> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let events = journal_events(data_dir);
@@ -2405,7 +2464,7 @@ fn wait_for_kinds(data_dir: &Path, kinds: &[&str]) -> Vec<Event> {
             Instant::now() < deadline,
             "only saw {seen:?}, waiting for {kinds:?}"
         );
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

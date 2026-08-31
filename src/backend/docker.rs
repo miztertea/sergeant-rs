@@ -332,16 +332,27 @@ impl DockerBackend {
     /// journaled, separately, as evidence (`emit_image_resolved`); this file
     /// is what retry actually reads.
     fn pin_path(&self, work_id: &str, stage_id: &str) -> PathBuf {
-        // Stage ids are already constrained to plain directory names
-        // (`domain::is_plain_name`, enforced at workflow load); work ids are
-        // ULIDs. Neither can carry a path separator, so joining them with
-        // `__` cannot collide across different (work, stage) pairs and
-        // cannot escape the pins directory.
+        // E12: the stage id is interpolated *inside* one filename, and
+        // `PathBuf::join` splits an embedded `/` into path components — so a
+        // hierarchical stage id (W1 §3, `10-investigate/00-lead`) would send
+        // this pin into a directory nothing creates, and image-pin caching
+        // would silently fall back to unpinned resolution for every nested
+        // leaf. Each *component* of a stage id is still a plain directory
+        // name (`domain::is_plain_name`, enforced at workflow load) and a
+        // work id is a ULID, so `/` is the only character that has to be
+        // encoded here; `%` is encoded with it to keep the encoding
+        // injective, so two distinct stage ids can never land on one pin.
+        //
+        // The encoded name is bound to its own variable rather than
+        // interpolated from `stage_id` directly so the guard test below —
+        // which reads this source text — stays a decisive scan for the raw
+        // shape, with no allowlisted exception to keep in sync.
+        let encoded = stage_id.replace('%', "%25").replace('/', "%2F");
         self.config
             .data_dir
             .join("docker-adapter")
             .join("image-pins")
-            .join(format!("{work_id}__{stage_id}.json"))
+            .join(format!("{work_id}__{encoded}.json"))
     }
 
     fn read_pin(&self, work_id: &str, stage_id: &str) -> Option<ResolvedImage> {
@@ -597,6 +608,27 @@ impl DockerBackend {
             args.push(user);
         }
         for (key, value) in &spec.env {
+            args.push("--env".into());
+            args.push(format!("{key}={value}"));
+        }
+        // S2 E5/E6/E7: the causation triple crosses the container boundary
+        // the same way every other environment variable does — Docker's own
+        // `--env`, not a `Command::env` on a child this process spawns and
+        // inherits from. Uniform with the four native adapters (one helper,
+        // five call sites) and, unlike them, deliberately *not* a child-Work
+        // channel: **child Work originating inside an execute container is a
+        // named S2 deferral** (E7) — the `sgt` binary does not exist in any
+        // measured probe image, the executor runs a fixed
+        // `ExecuteSpec.command` argv rather than an agentic actor that could
+        // decide to run `sgt`, and the isolation posture (§16.7: no
+        // privilege, no host namespaces, the Docker socket never mounted in)
+        // is not being widened to make one possible. What these three values
+        // buy here is what the container *labels* beside them already buy —
+        // forensic and journal-correlation value, now also readable from
+        // inside the container rather than only via `docker inspect`.
+        // Injected after `spec.env` for the same last-writer-wins reason the
+        // native adapters merge last.
+        for (key, value) in crate::backend::causation_env(request) {
             args.push("--env".into());
             args.push(format!("{key}={value}"));
         }
@@ -898,6 +930,20 @@ impl Backend for DockerBackend {
     /// every submission that touches an execute stage, so it stays a single
     /// `docker version` round trip rather than the full lifecycle probe
     /// `sgt doctor` runs (`lifecycle_probe`).
+    ///
+    /// **Audited for #310 and deliberately left alone.** The other four
+    /// adapters' probes now go through `backend::child::harden_probe_child`,
+    /// which puts a probe child in its own process group and arms
+    /// `PR_SET_PDEATHSIG`. This one does not, for two reasons. It spawns
+    /// nothing persistent: `docker version` is a bounded client round trip
+    /// against a daemon that owns every container, so there is no long-lived
+    /// child to orphan and an orphaned client exits by itself. And the only
+    /// seam it could be applied at is [`DockerBackend::cmd`], which every
+    /// *execution* verb in this adapter shares — including `capture`'s
+    /// `docker logs`, whose output is read on threads that outlive the
+    /// spawning one. Hardening there would be applying a probe-shaped
+    /// lifetime to execution-shaped children, which is exactly the mistake
+    /// `ChildLifetime` exists to keep visible.
     fn probe(&self) -> ProbeReport {
         match self.run(&["version", "--format", "{{.Server.Version}}"]) {
             Ok(version) => ProbeReport {
@@ -1326,6 +1372,104 @@ mod tests {
         );
     }
 
+    /// A `docker` that answers `image inspect` with a fixed identity and
+    /// records every other invocation's argv, one word per line. Enough to
+    /// drive `create_container` without a Docker Engine — the argv it builds
+    /// is the whole contract this test is about.
+    fn scripted_docker(dir: &std::path::Path) -> (String, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let record = dir.join("docker-argv.txt");
+        let path = dir.join("docker-stub");
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = image ] && [ \"$2\" = inspect ]; then\n                 echo '[{{\"Id\":\"sha256:deadbeef\",\"RepoDigests\":[],\"Os\":\"linux\",\"Architecture\":\"amd64\"}}]'\n                 exit 0\n\
+             fi\n\
+             for arg in \"$@\"; do printf '%s\\n' \"$arg\"; done >> \"{record}\"\n\
+             if [ \"$1\" = inspect ]; then\n                 echo '[{{\"Image\":\"sha256:deadbeef\",\"State\":{{\"Status\":\"created\",\"Running\":false,\"ExitCode\":0}}}}]'\n\
+             fi\n\
+             exit 0\n",
+            record = record.display(),
+        );
+        std::fs::write(&path, script).expect("write docker stub");
+        let mut permissions = std::fs::metadata(&path).expect("stat stub").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("chmod stub");
+        (path.display().to_string(), record)
+    }
+
+    /// S2 E5/E6/E7: the causation triple crosses the container boundary as
+    /// Docker's own `--env`, uniformly with the four native adapters, and is
+    /// pushed **after** `ExecuteSpec.env` so a stage-authored value cannot
+    /// shadow it. E7 is what this does *not* buy: child Work originating
+    /// inside an execute container stays a named deferral — no `sgt` exists
+    /// in any measured probe image, and nothing here widens §16.7's
+    /// isolation posture to make one possible.
+    #[test]
+    fn s2_the_causation_triple_crosses_the_container_boundary_as_env() {
+        let (dir, mut config) = config();
+        let (docker_bin, record) = scripted_docker(dir.path());
+        config.docker_bin = docker_bin;
+        let backend = DockerBackend::new(config).expect("backend");
+        let spec = ExecuteSpec {
+            image: "alpine:3.24".into(),
+            command: vec!["true".into()],
+            workdir: "/estate".into(),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            network: NetworkPolicy::None,
+            env: BTreeMap::from([("SERGEANT_WORK_ID".to_string(), "01FORGED".to_string())]),
+        };
+        let request = StartRequest {
+            work_id: "01PARENTWORK".into(),
+            execution_id: "01EXEC".into(),
+            stage_id: "10-validate".into(),
+            attempt: 1,
+            cwd: dir.path().to_path_buf(),
+            intent: "check it".into(),
+            context: String::new(),
+            model: None,
+            profile: None,
+            execute: Some(spec.clone()),
+            instruction_policy: InstructionPolicy::default(),
+            bindings: Vec::new(),
+            estate_root: Some(PathBuf::from("/home/dev/estate")),
+        };
+        backend
+            .create_container("sgt-01EXEC", &request, &spec)
+            .expect("create");
+
+        let argv: Vec<String> = std::fs::read_to_string(&record)
+            .expect("the stub recorded a create")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let envs: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && argv[i - 1] == "--env")
+            .map(|(_, v)| v)
+            .collect();
+        assert!(
+            envs.contains(&&"SERGEANT_ESTATE_ROOT=/home/dev/estate".to_string()),
+            "the estate root crosses the boundary: {envs:?}"
+        );
+        assert!(
+            envs.contains(&&"SERGEANT_EXECUTION_ID=01EXEC".to_string()),
+            "the execution id crosses the boundary: {envs:?}"
+        );
+        // The spec's own forged value is pushed first and the injected one
+        // last; Docker's `--env` is last-wins, so the container sees the real
+        // parent.
+        let work_ids: Vec<&&String> = envs
+            .iter()
+            .filter(|v| v.starts_with("SERGEANT_WORK_ID="))
+            .collect();
+        assert_eq!(
+            work_ids.last().map(|v| v.as_str()),
+            Some("SERGEANT_WORK_ID=01PARENTWORK"),
+            "the injected value is the last `--env` for that name, so it wins: {envs:?}"
+        );
+    }
+
     #[test]
     fn container_name_is_deterministic_from_execution_id() {
         let (_dir, config) = config();
@@ -1364,6 +1508,7 @@ mod tests {
             }),
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         };
         let prepared = backend
             .prepare(&request)
@@ -1478,6 +1623,7 @@ mod tests {
                 execute: None,
                 instruction_policy: InstructionPolicy::default(),
                 bindings: Vec::new(),
+                estate_root: None,
             };
             let spec = ExecuteSpec {
                 image: "alpine:3.24".into(),
@@ -1515,6 +1661,7 @@ mod tests {
             execute: None,
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         };
         let err = backend.prepare(&request).expect_err("must refuse");
         assert!(matches!(err, BackendError::Failed { .. }));
@@ -1538,6 +1685,268 @@ mod tests {
         assert_eq!(read_back, image);
         // A different stage of the same work never sees this pin.
         assert!(backend.read_pin("w1", "s2").is_none());
+    }
+
+    /// E12: a hierarchical stage id (W1 §3) must not turn one pin *filename*
+    /// into a path. `format!("{work_id}__{stage_id}.json")` interpolates the
+    /// stage id **inside** the filename, and `PathBuf::join` then splits an
+    /// embedded `/` into two components — so a nested leaf's pin would have
+    /// been written under a directory that never exists, image-pin caching
+    /// silently falling back to unpinned resolution for every nested stage
+    /// with no loud failure. The encoding is injective, so two distinct
+    /// stage ids can never share a pin.
+    #[test]
+    fn a_hierarchical_stage_id_pins_to_one_filename_not_a_path() {
+        let (_dir, config) = config();
+        let pins = config.data_dir.join("docker-adapter").join("image-pins");
+        let backend = DockerBackend::new(config).expect("backend");
+
+        let path = backend.pin_path("w1", "10-investigate/00-lead");
+        assert_eq!(
+            path.parent(),
+            Some(pins.as_path()),
+            "the pin must stay directly in the pins directory: {path:?}"
+        );
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("pin file name");
+        assert!(
+            !file_name.contains('/'),
+            "the stage id must be encoded, not interpolated raw: {file_name}"
+        );
+
+        let image = ResolvedImage {
+            image_requested: "alpine:3.24".into(),
+            image_id: "sha256:deadbeef".into(),
+            repo_digests: vec![],
+            platform: "linux/amd64".into(),
+        };
+        backend.write_pin("w1", "10-investigate/00-lead", &image);
+        assert_eq!(
+            backend
+                .read_pin("w1", "10-investigate/00-lead")
+                .expect("a nested leaf's pin must round-trip"),
+            image
+        );
+        // Injective: a sibling leaf has its own pin, and the encoding of `/`
+        // never collides with a stage id that literally contains it.
+        assert!(backend.read_pin("w1", "10-investigate/10-code").is_none());
+        assert_ne!(
+            backend.pin_path("w1", "a/b"),
+            backend.pin_path("w1", "a%2Fb"),
+            "distinct stage ids must never share a pin file"
+        );
+    }
+
+    /// The index in `bytes` of the `)` that closes the `(` at `open_idx`,
+    /// tracking paren depth and skipping parens inside `"` string literals
+    /// (so a stray `)` in an interpolated string can't close the call
+    /// early). Shared by [`e12_scan`] and its own regression test.
+    fn e12_matching_paren(bytes: &[u8], open_idx: usize) -> Option<usize> {
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut i = open_idx;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Whether `word` appears in `haystack` as a whole identifier, not
+    /// merely as a substring of a longer one.
+    fn e12_contains_word(haystack: &str, word: &str) -> bool {
+        haystack
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|token| token == word)
+    }
+
+    /// E12's standing guard, factored out so both
+    /// [`no_source_file_interpolates_a_stage_id_into_a_joined_filename`] (run
+    /// against `src/`) and
+    /// [`the_e12_scanner_catches_the_ampersand_and_multiline_forms`] (run
+    /// against throwaway fixtures) share one implementation: recurse into
+    /// `dir`, and in every `.rs` file scan for `stage_id` reaching a
+    /// filesystem path un-encoded — interpolated *into* a string that is
+    /// then joined, which lets `PathBuf::join` split the embedded `/` into
+    /// path components the author never meant (`pin_path` was the one
+    /// instance the recon found; this keeps it at zero).
+    ///
+    /// Plainly joining a stage id (`dir.join(stage_id)`) is a different
+    /// thing and stays legal: there the split into components is exactly the
+    /// intent — a composed id resolves its own nested directory (W1 §3).
+    ///
+    /// A same-line, exact-substring scan misses the idiomatic forms of this
+    /// exact bug: `.join(&format!(...))` (a `&` between the two literals)
+    /// and a `format!(` call whose args wrap onto their own line. So this
+    /// scans each file as one whitespace-collapsed token stream — every
+    /// `.join(` call, optionally followed by `&`, whose very next token is
+    /// `format!(` — and inspects that `format!` call's *whole* (possibly
+    /// multi-line) argument list for a `stage_id` token, rather than
+    /// requiring both literals adjacent on one physical line.
+    fn e12_scan(dir: &Path, offenders: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                e12_scan(&path, offenders);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            // Drop whole-line comments, then collapse every run of
+            // whitespace (including the newlines a wrapped `format!` call
+            // introduces) to a single space, so `.join(`, an optional `&`,
+            // `format!(` and its args line up as one contiguous token
+            // stream regardless of the source's own line breaks.
+            let stripped = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let flat = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+            let bytes = flat.as_bytes();
+
+            let mut search_from = 0;
+            while let Some(rel) = flat[search_from..].find(".join(") {
+                let join_paren = search_from + rel + ".join(".len() - 1;
+                let mut cursor = join_paren + 1;
+                // Skip an optional `&` (whitespace collapsing may have left
+                // a space on either side) between `.join(` and the
+                // `format!(` it wraps.
+                if bytes.get(cursor) == Some(&b' ') {
+                    cursor += 1;
+                }
+                let had_ampersand = bytes.get(cursor) == Some(&b'&');
+                if had_ampersand {
+                    cursor += 1;
+                    if bytes.get(cursor) == Some(&b' ') {
+                        cursor += 1;
+                    }
+                }
+                if flat[cursor..].starts_with("format!(") {
+                    let fmt_paren = cursor + "format!(".len() - 1;
+                    if let Some(close) = e12_matching_paren(bytes, fmt_paren)
+                        && e12_contains_word(&flat[fmt_paren + 1..close], "stage_id")
+                    {
+                        offenders.push(format!(
+                            "{}: .join({}format!({})",
+                            path.display(),
+                            if had_ampersand { "&" } else { "" },
+                            flat[fmt_paren + 1..close].trim()
+                        ));
+                    }
+                }
+                search_from = join_paren + 1;
+            }
+        }
+    }
+
+    /// E12's standing guard, run against this crate's own `src/`: proves a
+    /// future raw `stage_id`-into-a-joined-filename path stays at zero. See
+    /// [`e12_scan`] for the detection rule, and
+    /// [`the_e12_scanner_catches_the_ampersand_and_multiline_forms`] for
+    /// proof the scanner itself actually catches the shapes it claims to.
+    #[test]
+    fn no_source_file_interpolates_a_stage_id_into_a_joined_filename() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        e12_scan(&src, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "E12: a stage id interpolated into a filename that is then joined splits on `/` \
+             into path components — encode it (see DockerBackend::pin_path):\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// [`e12_scan`] must actually catch the shapes E12 names as missed by a
+    /// same-line, exact-substring detector: `&format!(` between the
+    /// literals, and a `format!` call whose interpolated args wrap onto
+    /// their own line. Exercised against throwaway fixture files rather
+    /// than `src/`, so this stays a regression test for the scanner itself
+    /// and never depends on — or is defeated by — whatever `src/` happens
+    /// to contain.
+    #[test]
+    fn the_e12_scanner_catches_the_ampersand_and_multiline_forms() {
+        // `FORMAT_BANG_OPEN` exists only so the fixture bodies below, when
+        // assembled, do not themselves leave the literal contiguous text
+        // `format!(` sitting in *this* file's own source next to a
+        // `.join(` — which would make `no_source_file_interpolates_a_
+        // stage_id_into_a_joined_filename`'s scan of `src/` flag this very
+        // test file. `concat!` joins it at compile time; no source line
+        // here ever contains the two pieces adjacent.
+        const FORMAT_BANG_OPEN: &str = concat!("format", "!(");
+
+        fn offenders_for(source: &str) -> Vec<String> {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            std::fs::write(dir.path().join("fixture.rs"), source).expect("fixture file");
+            let mut offenders = Vec::new();
+            e12_scan(dir.path(), &mut offenders);
+            offenders
+        }
+
+        let ampersand = format!(
+            "fn pin_path(work_id: &str, stage_id: &str) -> PathBuf {{\n\
+                 self.pins_dir().join(&{FORMAT_BANG_OPEN}\"{{work_id}}__{{stage_id}}.json\"))\n\
+             }}"
+        );
+        assert_eq!(
+            offenders_for(&ampersand).len(),
+            1,
+            "an `&format!(` between `.join(` and the stage id must still be caught"
+        );
+
+        let multiline = format!(
+            "fn pin_path(work_id: &str, stage_id: &str) -> PathBuf {{\n\
+                 self.pins_dir().join({FORMAT_BANG_OPEN}\n\
+                     \"{{work_id}}__{{stage_id}}.json\"\n\
+                 ))\n\
+             }}"
+        );
+        assert_eq!(
+            offenders_for(&multiline).len(),
+            1,
+            "a `format!(` call whose args wrap onto their own line must still be caught"
+        );
+
+        let benign = r#"
+            fn pin_path(&self, work_id: &str, stage_id: &str) -> PathBuf {
+                self.pins_dir().join(encode(stage_id))
+            }
+        "#;
+        assert!(
+            offenders_for(benign).is_empty(),
+            "a stage id that never reaches a `.join(format!(...))` must not be flagged"
+        );
     }
 
     /// `sgt doctor`'s disk-pressure measurement over a store that actually

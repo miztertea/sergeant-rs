@@ -1,11 +1,18 @@
 [package]
 name = "sergeant-rs"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 # Keep in sync with the `msrv` job's `env.MSRV` in .github/workflows/ci.yml
 # (W1 spec §E) — cargo has no way to read this field back into that job's
 # `run:` steps without added machinery, so the two are hand-synced.
-rust-version = "1.89.0"
+#
+# S3 X3b (F5d / A1-27): 1.89.0 -> 1.98.0. This is paperwork the A1 plan routed
+# onto the first A1-dependency PR, not a new constraint discovered here: the
+# pinned dev compiler in rust-toolchain.toml has been 1.98.0, and 1.89.0 was a
+# floor nothing had re-verified. The two fields cannot move independently —
+# `cargo +1.89 check` refuses outright once this says 1.98.0 — so ci.yml's
+# `env.MSRV` moves in the same commit.
+rust-version = "1.98.0"
 license = "MIT"
 repository = "https://github.com/miztertea/sergeant-rs"
 description = "Local execution surface for coding agents: durable work, isolated git worktrees, and a complete evidence trail behind one daemon"
@@ -14,12 +21,126 @@ description = "Local execution surface for coding agents: durable work, isolated
 name = "sgt"
 path = "src/main.rs"
 
+# S4 Y1 (G2): the supervised parse-worker's own binary. `worker.rs`'s
+# transport spawns this — never `sgt` itself — as a child, over a
+# `program: PathBuf` the caller names explicitly (`std::env::current_exe()`
+# in the daemon, `env!("CARGO_BIN_EXE_sgt-atlas-worker")` in tests), so
+# neither surface has to guess the other's path. Y1 ships the transport plus
+# a trivial, honestly-labeled body (one Document unit for UTF-8 input) and
+# the test-only `--fault` fixture modes the supervision acceptance needs;
+# Y2 replaces the body with the real Anydoc adapter behind the same CLI
+# contract, which is why this is a real `[[bin]]` rather than a
+# `tests/`-only helper.
+[[bin]]
+name = "sgt-atlas-worker"
+path = "src/bin/atlas_worker.rs"
+
 [dependencies]
+# S4 Y2 (G3, gate a — SETTLED by owner ruling, J4): Office/document
+# normalization. `anydoc` is the recon's leading candidate
+# (recon-anydoc-office.md §2.1) and the only one satisfying A1 §6.3's
+# breadth requirement without hand-rolling per-format parsers (R2/R3/R4/R5
+# all fail for the same reasons the spike recorded — no existing crate in
+# this graph reads Office containers, and the OS/stdlib do not either).
+# The deny gate's first run FAILED on this addition: `anydoc` pulls
+# `pdf-inspector` -> `lopdf` -> `ttf-parser` 0.25.1 unconditionally (no
+# feature flag drops it), and `ttf-parser` is unmaintained
+# (RUSTSEC-2026-0192, no safe upgrade). Full record:
+# tests/fixtures/anydoc_corpus/SPIKE-G3.md.
+#
+# The owner ruled ADOPT anydoc anyway
+# (knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md, J4):
+# per-format composition defeats the "any doc" capability itself, and the
+# advisory is accepted risk in a pre-alpha MIT harness, conditioned on (1)
+# a scoped/dated/narrow deny.toml exception — see the `[advisories.ignore]`
+# entry for RUSTSEC-2026-0192 in deny.toml, which does NOT broaden past
+# this one advisory — and (2) a replaceability boundary (this wave's
+# adapter module, not yet implemented as of this line landing).
+anydoc = "0.2.4"
 axum = "0.8"
 blake3 = "1.8.6"
 clap = { version = "4.6.6", features = ["derive"] }
-duckdb = { version = "1", features = ["bundled"] }
+# S3 X4 (F4): `json` + `parquet` join `bundled`. Both are DuckDB's *own*
+# built-in readers compiled into the bundled library — no new crate joins the
+# graph (the `Cargo.lock` package count is unchanged by this line) and nothing
+# is downloaded at runtime. CSV was already in DuckDB's core, which is why no
+# `csv` feature exists to ask for. Rungs, in order: R2 fails (nothing here
+# reads Parquet or JSON-as-a-table), R3/R4 fail (neither std nor the OS reads
+# columnar files), R5 is exactly this rung — the reader already lives inside a
+# dependency this crate builds, and asking for it costs a feature flag rather
+# than a crate. The alternative R5 displaces is the one F4 forbids: leaving
+# the features off and letting DuckDB *autoload* `json`/`parquet` at query
+# time, which is a network install on first use. `AtlasDb` pins autoloading
+# and autoinstalling off (`runtime/atlas/db`'s `HARDENING_DDL`), so these
+# readers are compiled in or they are absent — and absent is not something a
+# tabular dataset source can live with. Footprint measured, not asserted: see
+# this wave's commit body and `target/f4-footprint.txt`.
+duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
+# S3 X2 (F10): the scanner needs glob matching for two things a manifest and a
+# constant both spell in glob syntax — the built-in secrets deny set and each
+# `[[knowledge]] ignore` entry. Rungs, in order: R2 fails (nothing in this
+# crate matches globs; `is_plain_name` answers a different question), R3 fails
+# (std has no glob matcher and `Path` comparison cannot express `**/*.pem`),
+# R4 fails (the OS offers no portable one — shell globbing would mean spawning
+# a shell over operator-supplied patterns, which is worse than a dependency in
+# every respect), R5 fails (nothing already in the graph exposes glob
+# matching; `regex` is present but making operators write regexes for an
+# `ignore` list is a worse contract, and translating globs to regexes by hand
+# is the very R7 this rung exists to avoid), R6 fails (a correct `**`
+# implementation with alternates and character classes is not one line — it is
+# the bug farm every hand-rolled matcher becomes). R5-as-new-edge → declare
+# globset: ripgrep's own matcher, `default-features = false` because the only
+# default feature is `log`, which buys nothing here. Its own graph is
+# aho-corasick + regex-automata/regex-syntax, all already resolved for this
+# build, plus `bstr` and `fnv`.
+globset = { version = "0.4.20", default-features = false }
 include_dir = { version = "0.7.4", default-features = false }
+# S5 W3b (F5 gate 1 — SETTLED by owner ruling, J4): A2 §6's local static
+# embedding model, and decision A2-06's own named candidate ("Spike Model2Vec
+# Rust for optional local semantic retrieval", [EXT-MODEL2VEC]). W3's spike
+# recorded the full rung check (tests/fixtures/model2vec_corpus/SPIKE-F5.md);
+# it is not re-derived here.
+#
+# `default-features = false, features = ["local-only"]` is LOAD-BEARING, not
+# tidiness. The crate's defaults are `["onig", "hf-hub"]`, and
+# `hf-hub = ["dep:hf-hub", "dep:ureq"]` — an HTTP client and a HuggingFace
+# downloader. Turning them off and turning `local-only` on is what makes
+# A2-12 ("Explicitly install/pin semantic assets; no stage-time surprise
+# download") true by ABSENCE OF A CODE PATH: every download item in the crate
+# is `#[cfg(all(feature = "hf-hub", not(feature = "local-only")))]`, so the
+# fetcher is not compiled and cannot be called. Pinned by
+# `tests/w3b_model2vec_manifest_pin.rs`, which reads THIS manifest.
+#
+# The `paste` advisory (RUSTSEC-2024-0436) reaching the graph through
+# `tokenizers` is unavoidable and is a scoped, dated `deny.toml` exception
+# naming that one ID — owner ruling
+# knowledge/rulings/owner-rulings/model2vec-paste-advisory-2026-08-30.md.
+model2vec-rs = { version = "0.2.1", default-features = false, features = ["local-only"] }
+# S4 Y2 (G3): the office adapter's own recovery watch
+# (`runtime/atlas/office.rs`) needs the `log` facade directly — anydoc's own
+# module doc names it as the sanctioned signal ("Recovery and skipped-content
+# events are reported through the log facade (debug/warn level)"), and the
+# adapter installs a tiny in-process `log::Log` that notices whether anydoc
+# had to *recover* from a well-formedness problem (a mismatched/unclosed
+# element) rather than trusting its lenient default of returning `Ok` with
+# partially-repaired content — see that module for why gate (b)'s fixture 05
+# requires this. Rungs: R2 fails (nothing in this crate already watches a log
+# facade for this), R3/R4 fail (no such signal exists outside the crate that
+# emits it), R5 rather than R7 — `log` is already resolved in this graph
+# (anydoc's own dependency), so declaring it directly adds a line here and
+# ZERO packages to `Cargo.lock` (verified: package count unchanged). Pinned to
+# the same `0.4` line anydoc itself resolves to, so there is one `log` in the
+# graph, not a second one Cargo could resolve differently.
+log = "0.4"
+# S4 Y4 (G4 — ADOPTED, all three gates passed): `.eml` message parsing.
+# `mail-parser` was the contract's named candidate (brief-y4-mail.md;
+# sprint-plan-2026-08-27.md's G4), not pre-ratified (A1-16) — evaluated,
+# not assumed. `full_encoding` pulls `encoding_rs` so non-UTF-8 charsets
+# (gate (b)'s encoding-zoo fixture) decode rather than lossy-replace;
+# `default` alone has no charset fallback beyond UTF-8/ASCII per the
+# crate's own feature table (`cargo info mail-parser`). Adapter:
+# src/runtime/atlas/mail.rs. Record: tests/fixtures/mail_corpus/SPIKE-G4.md.
+mail-parser = { version = "0.11.8", features = ["full_encoding"] }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
@@ -46,11 +167,108 @@ serde_json = "1.0.151"
 thiserror = "2.0.19"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
+# S5 W3b: NOT a second parser — the SAME `tokenizers` `model2vec-rs` already
+# pulls (its own edge is `default-features = false` on the same `0.21` line,
+# so Cargo unifies them into one package). Declared directly for ONE reason:
+# `tokenizers` refuses to build with no regex backend (`compile_error!("One
+# of the `onig`, or `fancy-regex` features must be enabled")`,
+# tokenizers-0.21.4/src/utils/mod.rs:15), and `model2vec-rs`'s own way of
+# supplying one — its `fancy-regex` feature — bundles
+# `tokenizers/progressbar` with it, which drags in `indicatif` ->
+# `number_prefix` and RUSTSEC-2025-0119. Selecting the backend here selects
+# it WITHOUT the progress bar, and `indicatif`/`number_prefix` leave
+# `Cargo.lock` entirely.
+#
+# That is avoidance by configuration, not suppression: RUSTSEC-2025-0119 has
+# NO `deny.toml` entry and must never get one (owner ruling
+# model2vec-paste-advisory-2026-08-30.md, decision 3: "The second advisory
+# stays avoided, not excepted"). `tests/w3b_model2vec_manifest_pin.rs` fails
+# if this line loses `fancy-regex` or gains `progressbar`, and if
+# `indicatif`/`number_prefix` reappear in `Cargo.lock`.
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 toml = "1.1.4"
 toml_edit = { version = "0.25", features = ["parse", "display"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3"
+# S3 X3b (F5): language-aware symbol/import extraction. Rungs, in order: R2
+# fails (nothing in this crate parses source code; X2's `text.rs` splits
+# Markdown on heading bytes and answers a different question), R3 fails (std
+# has no parser for any of these languages), R4 fails (the OS offers none
+# either), R5 fails (nothing already in the graph parses source — `toml`/
+# `toml_edit` cover exactly one of the six languages and only as values, not
+# as a syntax tree with byte ranges, which is what `source.occurrences` is
+# keyed on), R6 fails (six hand-written parsers is the largest bug farm this
+# repo could adopt, and a regex "symbol finder" is precisely the silent
+# partial parse F5's exact-match criterion exists to forbid). R5-as-new-edge →
+# tree-sitter plus one grammar per language actually indexed.
+#
+# The grammar set is the LEAN one, not `tree-sitter-language-pack` (TSLP): the
+# pack resolves 143 crates for 371 languages and, at its default features
+# (`download` + `dynamic-loading`), FAILS this repo's `cargo deny` on MPL-2.0
+# (`option-ext` via `dirs`/`dirs-sys`) — recorded verbatim in
+# tests/fixtures/tslp_corpus/SPIKE-F5.md. Its `download` feature also fetches
+# parsers over the network at runtime, which is the same posture F4 forbids
+# for DuckDB extension autoload. Eight direct crates / ten new lock entries
+# buy the six languages F5 names and nothing else (R1 on the other 365).
+tree-sitter = "0.26.13"
+tree-sitter-bash = "0.25.1"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-md = "0.5.3"
+tree-sitter-python = "0.25.0"
+tree-sitter-rust = "0.24.2"
+tree-sitter-toml-ng = "0.7.0"
+tree-sitter-typescript = "0.23.2"
 ulid = "3.0.0"
+# S4 Y3 (G5): a justified normalisation rule for archive-entry name
+# collisions, not a hand-rolled `to_lowercase()`. Rungs: R2 fails (nothing in
+# this crate does Unicode canonical normalisation — `content_hash`/`local_key`
+# hash bytes, they never compare text identity); R3/R4 fail (`std` has no NFC
+# implementation, and no OS API does either); R5 rather than R7 —
+# `unicode-normalization` is already resolved in this graph (transitively,
+# via `anydoc` -> `pdf-inspector` and via `stringprep`), so declaring it
+# directly adds a line here and ZERO packages to `Cargo.lock` (same footprint
+# argument `log`'s own comment above makes). See `runtime/atlas/archive.rs`'s
+# module doc for why NFC alone is not the whole rule (case-folding rides on
+# top of it) and why that combination, not a bare `to_lowercase()`, is what
+# the wave brief asked to be "justified".
+unicode-normalization = "0.1.25"
+
+# S4 Y3 (G5): bounded ZIP container expansion. Published under the crate name
+# `zip` (the maintained `zip-rs/zip2` fork "the zip crate" now means in
+# practice — `y3-zip-bounds-research.md` §"Crate identity" confirms no `zip`
+# dependency existed before this wave and that Context7/crates.io both
+# resolve "zip"/"zip2" to this one fork). Rungs: R2/R3/R4 fail (nothing in
+# this crate reads the ZIP central-directory format, and neither the
+# standard library nor the OS exposes one); R5 fails (two `zip` versions sit
+# in `Cargo.lock` already, but as ORPHANED entries nothing depends on — `grep
+# -c '"zip",' Cargo.lock` was empty before this wave, so there is no existing
+# edge to reuse, only a stale resolver artifact); R6 fails (a hand-rolled ZIP
+# central-directory parser is exactly the bug farm R7 exists to avoid, for a
+# format with real structural hazards — see `archive.rs`'s own module doc).
+# R7: minimum feature surface, not the crate's default one. `default-features
+# = false` plus exactly `deflate` — the one compression method this crate's
+# own fixtures and every realistic knowledge-source ZIP (docx-style OOXML
+# packages included) actually use — deliberately excludes `bzip2`/`lzma`/
+# `xz`/`zstd`/`ppmd`: the research note's own flag is that a codec with a
+# steeper worst-case compression ratio than deflate's would make
+# `MAX_COMPRESSION_RATIO`'s pre-filter (tuned for deflate) too generous, so
+# not enabling those codecs at all is the honest way to keep that ceiling
+# meaning what it claims rather than widening it defensively per codec this
+# wave never measured. Also excludes `aes-crypto` — an encrypted entry is
+# refused as unsupported (§NeedsOcr's sibling: content this build declines
+# to open), never decrypted.
+zip = { version = "8", default-features = false, features = ["deflate"] }
+
+# #310: `prctl(PR_SET_PDEATHSIG, SIGKILL)` on a probe child, and nothing else.
+# R3/R4 fail — neither the standard library nor any process API this crate
+# already uses can couple a child's death to its parent's; only the kernel can,
+# and only through this call. R5 rather than R7: libc is already in this
+# crate's dependency graph (transitively, via tokio/reqwest/duckdb), so
+# declaring it directly adds a line here and no crate to the build. `nix` was
+# the alternative and would be a genuinely new graph edge for one constant and
+# one call. Unix-gated because that is the only place it is referenced.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # M5 Unknown #1 — "the duckdb crate's bundled-build cost in this container
 # (compile time and disk) — measure first". Measured here, dev profile, before
@@ -68,6 +286,17 @@ ulid = "3.0.0"
 [profile.dev.package.libduckdb-sys]
 debug = false
 
+# #299 (owner-ratified 2026-08-26): generalize the same trade to every
+# dependency — nobody in this project steps through dependency code, and
+# the per-suite test binaries each carry the whole dep graph's DWARF.
+# The workspace crate itself keeps full debug info (a specific package
+# entry and the crate's own artifacts are unaffected by this wildcard),
+# so panic backtraces through sergeant code stay symbolized. Measured on
+# Cerberus at adoption: fresh `cargo build --tests` target 20 GB -> see
+# the qualification PR for the after numbers.
+[profile.dev.package."*"]
+debug = false
+
 [dev-dependencies]
 # Synchronously decoding an axum `Response` body in `tests/i9_floor_pinning.rs`
 # (spec §6.3 compensating assertion (c): calling the real `below_floor_refusal`
@@ -75,7 +304,33 @@ debug = false
 # axum 0.8's own `http-body-util` dependency.
 http-body-util = "0.1"
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "testing"] }
+# S3 X3b: `tests/x3b_tslp_corpus.rs` reads its hand-verified expectations from
+# `tests/fixtures/tslp_corpus/manifest.toml`. Both crates are already direct
+# `[dependencies]` of this crate at these exact versions — an integration test
+# links the library plus dev-dependencies, not the library's own dependencies,
+# so naming them here adds two lines and ZERO packages to the resolved graph
+# (R5, verified: `Cargo.lock` package count is unchanged by these two entries).
+# The alternative, a hand-rolled parser for the manifest, is the R6/R7 bug farm
+# the rung order exists to prevent.
+serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3"
+toml = "1.1.4"
+# S5 W3b (F-SI-01 fix): `tests/w3b_model2vec_manifest_pin.rs` checks a
+# committed digest against `PROVENANCE.md`. `sha2` is already resolved into
+# this exact build's `Cargo.lock` transitively (`lopdf -> pdf-inspector ->
+# anydoc -> sergeant-rs`), so naming it here is R5 (installed dependency),
+# not a new edge in the graph — `blake3` is the crate's own hash and is not
+# SHA-256, so it cannot stand in for this check.
+sha2 = "0.10.9"
+# S3 X4 (F4): `tests/x4_tabular_map.rs` writes a real `.parquet` fixture, so
+# the Parquet reader is proven end-to-end on actual Parquet bytes rather than
+# inferred from a linked symbol. Same rung and same arithmetic as the two
+# entries above — `duckdb` is already a direct `[dependencies]` entry at this
+# exact version, so this line adds ZERO packages to the resolved graph (R5,
+# verified: the `Cargo.lock` package count is unchanged by it). It is a
+# *fixture writer* and nothing else: no test opens Atlas's own store with it,
+# which is what `tests/x1_atlas_substrate.rs`'s one-owner assertion is about.
+duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
 
 # Packaging mechanics for release.yml (proposal §10: "`dist` may own packaging
 # mechanics. Sergeant owns release authority."). `ci = "github"` still selects
@@ -101,6 +356,25 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 # 2026-08-18) measured this exact generated installer's mechanics against a
 # real archive and found them correct.
 installers = ["shell"]
+
+# S5 W3b (owner ruling model2vec-paste-advisory-2026-08-30.md, J4 — "ship the
+# weights, do not build a fetch mechanism"). `include` *"copies additional
+# files or directories into the root of all archives and installers"*
+# (cargo-dist's own config reference, read via `ctx7 docs
+# /axodotdev/cargo-dist`; globs are NOT supported, which is why this names the
+# directory rather than a pattern). So `assets/semantic-model/` arrives as
+# `semantic-model/` beside `sgt`, which is the second place
+# `runtime::atlas::semantic::model_dir` looks.
+#
+# Files on disk, NOT `include_bytes!`: `model2vec-rs`'s `local-only` loader
+# takes a DIRECTORY PATH, so embedding the weights would mean 33.5 MB of
+# binary growth *and* unpacking them to a temp directory at load time to end
+# up exactly where `include` puts them for free.
+#
+# Accepted, recorded rather than discovered later: **release size grows
+# ~33.5 MB per target**. Provenance, digests and license:
+# assets/semantic-model/PROVENANCE.md.
+include = ["assets/semantic-model/"]
 
 # dist's expected release-build profile name. Inherits release rather than
 # adding new optimization flags of its own (R1: no new tuning surface until

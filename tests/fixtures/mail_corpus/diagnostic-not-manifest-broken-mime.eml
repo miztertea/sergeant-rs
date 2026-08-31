@@ -1,0 +1,12 @@
+From: Test Sender <test@example.com>
+To: Test Receiver <recv@example.com>
+Subject: Unterminated boundary probe
+Date: Sat, 17 Jan 2026 00:00:00 +0000
+Message-ID: <diagnostic-only@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BROKEN"
+
+--BROKEN
+Content-Type: text/plain; charset=us-ascii
+
+This part never gets a closing boundary at all.

@@ -29,8 +29,8 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::backend::Deferred;
 use crate::backend::codex::KIND_TURN_HARNESS_ERROR;
+use crate::backend::{BackendSignal, Deferred};
 use crate::cli::doctor;
 use crate::daemon::{
     KIND_ADMISSION_PAUSED, KIND_ADMISSION_RESUMED, KIND_BACKEND_PROBED, KIND_DAEMON_STARTED,
@@ -43,22 +43,38 @@ use crate::domain::execution::{
     KIND_EXECUTION_STARTED, KIND_EXECUTION_STOPPED,
 };
 use crate::domain::manifest::{self, ManifestError};
+use crate::domain::source::SourceKind;
 use crate::domain::work::{
-    EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED,
-    KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED, KIND_WORK_NEEDS_INPUT,
-    KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, ScopeRequest,
-    Work, WorkState,
+    CausationClaim, EnvelopeRequest, IntentDetail, KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED,
+    KIND_WORK_BLOCKED, KIND_WORK_CANCELED, KIND_WORK_COMPLETED, KIND_WORK_FAILED,
+    KIND_WORK_NEEDS_INPUT, KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_SUBMITTED,
+    KIND_WORK_WAITING, ScopeRequest, Work, WorkState,
 };
 use crate::domain::workflow::{
-    self, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED,
-    KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
+    self, KIND_CONTEXT_COMPILED, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
+    KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
     KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
     WorkflowDefinition,
 };
-use crate::runtime::analytics::{Analytics, AnalyticsError, CANNED_QUERIES};
+use crate::runtime::atlas::db::{self as atlas_db, AtlasDb, AtlasError, SourceStatus};
+use crate::runtime::atlas::db::{Analytics, AnalyticsError, CANNED_QUERIES};
+use crate::runtime::atlas::external_git::ExternalGitSource;
+use crate::runtime::atlas::fusion as atlas_fusion;
+use crate::runtime::atlas::git::EstateGitSource;
+use crate::runtime::atlas::lane::{
+    acquire_external_git_on_lane, scan_estate_git_on_lane, scan_local_knowledge_on_lane,
+    scan_work_overlay_on_lane,
+};
+use crate::runtime::atlas::lexical as atlas_lexical;
+use crate::runtime::atlas::locator;
+use crate::runtime::atlas::overlay::{WorkOverlay, overlay_source_name};
+use crate::runtime::atlas::record::{ScanRecord, record_external_git_scan, record_scan};
+use crate::runtime::atlas::scan::KnowledgeSource;
+use crate::runtime::atlas::semantic as atlas_semantic;
+use crate::runtime::atlas::trace as atlas_trace;
 use crate::runtime::engine::{
     Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
-    Next as EngineNext, Step, SubmitContext,
+    Next as EngineNext, Step, SubmitContext, SurfaceOutcome,
 };
 use crate::runtime::graph::{
     KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
@@ -73,7 +89,7 @@ use crate::runtime::projection::{
 use crate::runtime::startup::{FloorCommandClass, FloorCommandRow};
 use crate::runtime::surface::{
     BindingDisposition, KIND_SURFACE_MATERIALIZED, KIND_SURFACE_MATERIALIZING,
-    KIND_SURFACE_TORN_DOWN, reap, retained_bindings,
+    KIND_SURFACE_TORN_DOWN, WorkSurface, reap, retained_bindings,
 };
 use crate::runtime::sweep::{self, SweepTarget};
 
@@ -251,6 +267,36 @@ impl Core {
         for event in group {
             // No live subscriber is not an error.
             let _ = self.events_tx.send(event);
+        }
+        Ok(())
+    }
+
+    /// Fold events this hold appended through a writer that owns the
+    /// journal **directly**, so the registry cannot fall behind it.
+    ///
+    /// [`Self::commit`] is the only mutation path that appends *and* folds.
+    /// Atlas's [`crate::runtime::atlas::record::record_scan`] cannot use it:
+    /// F1's crash-window coupling puts the `source.scanned` append strictly
+    /// between staging and confirming a generation, so it takes
+    /// `&mut Journal`. That leaves [`Self::registry`] one or more seqs
+    /// behind the journal, and the NEXT `commit` fails
+    /// [`Projection::apply`]'s contiguity check — surfacing as
+    /// `projection seq mismatch: expected N, got N+1` on whatever Work
+    /// command happened to come next.
+    ///
+    /// This is the catch-up that closes that: everything past the
+    /// registry's own seq, folded in order, and pushed onto the open group
+    /// so the hold's [`Self::flush`] publishes it exactly like any other
+    /// event. Idempotent and free when nothing was appended behind the
+    /// registry's back ([`Self::events_after`]'s first branch does no I/O).
+    ///
+    /// Every direct-journal writer must call this before releasing the
+    /// hold. In this file that is the Atlas scan trigger and S5 W1b's
+    /// Work-overlay lifecycle hook.
+    pub fn absorb_journaled(&mut self) -> Result<(), CoreError> {
+        for event in self.events_after(self.registry.last_seq())? {
+            self.registry.apply(&event)?;
+            self.open_group.push(event);
         }
         Ok(())
     }
@@ -443,7 +489,16 @@ pub struct ApiState {
     /// and finish, because graceful shutdown waits for in-flight responses.
     pub closing: watch::Receiver<bool>,
     /// The workflow engine: backends, routing defaults, and the surfaces dir.
+    ///
+    /// D10: it carries **no** estate. Every handler that needs topology
+    /// admits the estate its request addressed (below) and hands the root to
+    /// `Engine::plan` per call.
     pub engine: Arc<Engine>,
+    /// H1 §4: the admitted-estate registry — this daemon's observational
+    /// record of every estate it has validated, keyed by canonical root and
+    /// rebuilt from requests. Nothing is served for an estate that is not in
+    /// here, and nothing gets in here without passing admission.
+    pub estates: Arc<crate::runtime::estates::EstateRegistry>,
     /// The disposable DuckDB analytical + graph projection (§21–§23).
     ///
     /// Behind its own lock, not the core's: an analytics query is a read of a
@@ -451,10 +506,42 @@ pub struct ApiState {
     /// up from the journal at query time (see [`with_analytics`]), so a
     /// failure anywhere in here costs an answer, never a fact.
     pub analytics: Arc<tokio::sync::Mutex<Analytics>>,
+    /// S3 X4: Atlas's durable store, derived lazily and kept for the process.
+    ///
+    /// `None` until something asks. The read-side helpers still refuse to
+    /// bring a store into existence for a mere read — but since S5 W1c the
+    /// file is A1 §5's one database and the projection's own start created
+    /// it, so that refusal now protects the *answer* ("this host has indexed
+    /// nothing", said from zero confirmed generations) rather than the file.
+    ///
+    /// **Derived from [`Self::analytics`], never `AtlasDb::open`.** One file
+    /// is one DuckDB instance: a second `open` against the same path is a
+    /// second instance that neither sees nor is seen by the projection's, and
+    /// whose close silently overwrites it (`Analytics::atlas`). Lock order is
+    /// therefore this mutex, then the analytics mutex, and only in that
+    /// direction — nothing takes the analytics lock and then reaches for this
+    /// one.
+    ///
+    /// Behind its own lock, not the core's, for the same reason
+    /// [`Self::analytics`] is: a `map` query is a read of derived evidence and
+    /// must never be able to stall a mutation. Unlike analytics it is **not**
+    /// caught up from the journal — no replay reproduces it (F1) — so a read
+    /// here answers from what the scanner wrote and never rebuilds anything.
+    pub atlas: Arc<tokio::sync::Mutex<Option<crate::runtime::atlas::db::AtlasDb>>>,
     /// W3: the retention policy this daemon resolved once at start, pinned
     /// for its whole life (§1.2) — read by [`drive_completions`]'s rotation
     /// trigger (§10.4).
     pub prune_policy: crate::runtime::prune::PrunePolicy,
+    /// W5 brief deliverable 1(a): how often [`maybe_run_periodic_sweep`]
+    /// re-walks every admitted estate's mounts. A sweep is a real git walk
+    /// per mount (`for-each-ref` + one `merge-base` per ref), so unlike the
+    /// prune trigger's in-memory checks this cannot run every completion-poll
+    /// tick without cost; production uses the default, a test can hold it at
+    /// zero to make a tick always due.
+    pub sweep_interval: Duration,
+    /// Last time [`maybe_run_periodic_sweep`] actually ran, so the interval
+    /// above throttles across ticks rather than per-request.
+    pub last_swept: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 /// Build the axum router for the full v1 surface.
@@ -484,11 +571,37 @@ pub fn router(state: ApiState) -> Router {
             get(estate_list_groups).post(estate_add_group),
         )
         .route("/estate/groups/{name}", delete(estate_remove_group))
+        .route("/estates", get(list_estates))
         .route("/doctor", get(doctor_report))
         .route("/admission/pause", post(pause_admission))
         .route("/graph/work/{id}", get(work_graph))
         .route("/analytics", get(analytics_index))
         .route("/analytics/{name}", get(analytics_query))
+        // S3 X4, F11's minimum honest set. Canned and parameterized, both:
+        // every one of these reads rows Atlas already holds, and none of them
+        // takes SQL, a path, or a pattern from the caller. `map neighbors`
+        // and `map changed` are deliberately absent — S5 and S6 own them,
+        // where their consumers exist (F11's named deferral).
+        .route("/intelligence/status", get(intelligence_status))
+        // S4 Y5, G8/G6: the scan trigger, and item 10's acquisition surface.
+        .route("/intelligence/scan", post(intelligence_scan))
+        .route(
+            "/intelligence/sources",
+            get(intelligence_sources).post(intelligence_add_source),
+        )
+        .route("/map/repos", get(map_repos))
+        .route("/map/stats", get(map_stats))
+        .route("/map/outline", get(map_outline))
+        .route("/map/children", get(map_children))
+        .route("/map/facts", get(map_facts))
+        .route("/map/symbol", get(map_symbol))
+        .route("/map/references", get(map_references))
+        // S5 W5, A2 §14's minimum useful surface — BOTH verbs. Canned and
+        // parameterized like every other Atlas read here: no SQL, no path,
+        // no pattern, and `related`'s query text is the anchor unit's own
+        // stored text rather than anything a client sends.
+        .route("/search", get(search_query))
+        .route("/related", get(related_query))
         .route("/events", get(event_history))
         .route("/events/stream", get(event_stream))
         .route("/system", get(system_info))
@@ -562,7 +675,21 @@ fn blocking_sync<T>(f: impl FnOnce() -> T) -> T {
 /// completion wait, which are the only places §22.6 cares about — in one place
 /// each, so there is no arm that can be missed and no arm whose drop is
 /// decoration.
-async fn crank(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
+fn crank(
+    state: &ApiState,
+    step: Step,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<CoreGuard<'_>>> + Send + '_>> {
+    Box::pin(crank_inner(state, step))
+}
+
+/// [`crank`]'s actual body, split out only so `crank` itself can box the
+/// future: the H1-15 lane-full path below (`EngineNext::Launch`) hands an
+/// admitted-later launch to a detached task that drives it the rest of the
+/// way by calling `crank` again, and a directly-recursive `async fn` cannot
+/// prove its own future `Send` (the auto-trait solver has nothing closed to
+/// check against) — `tokio::spawn` then refuses it outright. Boxing the
+/// *outer* call breaks that cycle; nothing about the loop below changes.
+async fn crank_inner(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
     let mut step = step;
     let mut held: Option<CoreGuard<'_>> = None;
     loop {
@@ -591,54 +718,163 @@ async fn crank(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
         let settled = match next {
             EngineNext::Parked => unreachable!("returned above"),
             EngineNext::Launch(pending) => {
+                // H1-15's execution lane: admitted strictly between the
+                // reservation (already committed under the lock, in
+                // `reserve_stage`) and the launch below — outside the core
+                // lock, never under it (recon's §22.6 hazard). A lane at
+                // capacity does not stall this task silently: the wait is
+                // journaled first (distinct from turn-cap exhaustion — see
+                // `Engine::park_on_execution_lane`) so a concurrent
+                // `sgt work show` can see why this Work is parked.
+                let launch_work_id = pending.work_id().to_string();
+                if !state.engine.try_admit_execution(&launch_work_id) {
+                    {
+                        let mut core = CoreGuard::acquire(&state.core).await;
+                        if let Err(e) = state
+                            .engine
+                            .park_on_execution_lane(&mut core, &launch_work_id)
+                        {
+                            tracing::error!(
+                                work_id = %launch_work_id,
+                                error = %e,
+                                "journaling the execution-lane wait failed"
+                            );
+                        }
+                    }
+                    // The Work is now durably `waiting` on the lane, visible
+                    // to any concurrent `work show` — the client's own
+                    // command has been accepted, same as every other
+                    // two-phase effect in this file. Waiting for a slot to
+                    // free is not part of that acceptance and must not block
+                    // the request that triggered it (a request into a full
+                    // lane would otherwise hang for however long another
+                    // Work takes to vacate a slot, with no client-visible
+                    // signal but the connection simply not returning). So
+                    // the rest of this launch — admit, resume, perform,
+                    // settle, and drive on — is handed to a detached task,
+                    // and this crank call returns now with nothing held,
+                    // exactly as it would for `Next::Parked`.
+                    let bg_state = state.clone();
+                    tokio::spawn(async move {
+                        bg_state.engine.admit_execution(&launch_work_id).await;
+                        {
+                            let mut core = CoreGuard::acquire(&bg_state.core).await;
+                            if let Err(e) = bg_state
+                                .engine
+                                .resume_after_execution_lane(&mut core, &launch_work_id)
+                            {
+                                // A concurrent transition (e.g. a cancel
+                                // while this Work sat parked on the lane)
+                                // can make this an illegal edge — logged,
+                                // not fatal: `settle_launch`'s own staleness
+                                // check (§14.5) is what actually adjudicates
+                                // a launch whose reservation the wait
+                                // outlived, exactly as it does for every
+                                // other cause of the same race.
+                                tracing::error!(
+                                    work_id = %launch_work_id,
+                                    error = %e,
+                                    "resuming after the execution-lane wait failed"
+                                );
+                            }
+                        }
+                        let outcome = blocking(|| pending.perform()).await;
+                        let work_id = pending.work_id().to_string();
+                        let ended_a_turn = is_turn_boundary(outcome.signal());
+                        let (work_id, settled, core) =
+                            settle_turn(&bg_state, work_id, ended_a_turn, |core| {
+                                bg_state.engine.settle_launch(core, pending, outcome)
+                            })
+                            .await;
+                        match settled {
+                            Ok(next_step) => {
+                                drop(core);
+                                crank(&bg_state, next_step).await;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    work_id = %work_id,
+                                    error = %e,
+                                    "settling an external effect failed"
+                                );
+                            }
+                        }
+                    });
+                    return held;
+                }
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_launch(&mut core, pending, outcome),
-                    core,
-                )
+                // S5 W1d: a launch observes the turn it just started, the
+                // same way SEND-settle below does.
+                let ended_a_turn = is_turn_boundary(outcome.signal());
+                settle_turn(state, work_id, ended_a_turn, |core| {
+                    state.engine.settle_launch(core, pending, outcome)
+                })
+                .await
             }
             EngineNext::Send(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_send(&mut core, pending, outcome),
-                    core,
-                )
+                // S5 W1d: a delivery observes the turn it just started, so
+                // SEND-settle is one of the three places a turn boundary is
+                // adjudicated. Read before the settle consumes the outcome.
+                let ended_a_turn = is_turn_boundary(outcome.signal());
+                settle_turn(state, work_id, ended_a_turn, |core| {
+                    state.engine.settle_send(core, pending, outcome)
+                })
+                .await
             }
             EngineNext::Surface(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
+                // S5 W1b: H13.2's Work-overlay lifecycle hook. Read off the
+                // outcome BEFORE `settle_surface` consumes it — this arm is
+                // the one funnel every surface lifecycle moment passes
+                // through (materialize, rematerialize, teardown), which is
+                // why the hook lives here and not in three call sites.
+                let overlay_hook = work_overlay_hook_for(&outcome);
                 let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_surface(&mut core, pending, outcome),
-                    core,
-                )
+                let settled = state.engine.settle_surface(&mut core, pending, outcome);
+                // Only once the daemon has actually journaled the lifecycle
+                // transition: an overlay generation for a surface whose
+                // materialization the engine refused would be evidence about
+                // a Work that never bound one.
+                if settled.is_ok()
+                    && let Some(hook) = overlay_hook
+                {
+                    spawn_work_overlay_hook(state, work_id.clone(), hook);
+                }
+                (work_id, settled, core)
             }
             EngineNext::Observe(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
-                let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_observe(&mut core, pending, outcome),
-                    core,
-                )
+                // S5 W1d: read the backend's signal off the outcome BEFORE
+                // `settle_observe` consumes it — the same order the surface
+                // arm above reads a `SurfaceOutcome` in. A turn boundary is
+                // W1d's overlay-refresh moment; see `is_turn_boundary`.
+                let ended_a_turn = is_turn_boundary(outcome.signal());
+                settle_turn(state, work_id, ended_a_turn, |core| {
+                    state.engine.settle_observe(core, pending, outcome)
+                })
+                .await
             }
             EngineNext::Interrupt(pending) => {
                 let outcome = blocking(|| pending.perform()).await;
                 let work_id = pending.work_id().to_string();
+                // S5 W1d (F-SF-01 fix): an interrupt always ends the turn it
+                // cuts short — `settle_interrupt` unconditionally commits
+                // KIND_TURN_CEILING_INTERRUPTED and, when the Work is still
+                // Active, blocks it — so this is a fourth turn-boundary site,
+                // not a signal-conditioned one like Launch/Send/Observe: there
+                // is no `BackendSignal` on `InterruptOutcome` to read.
+                // Without this, a Work interrupted for a live ceiling
+                // crossing sits Blocked — often for a long time — with the
+                // overlay left stale from before the interrupted turn.
                 let mut core = CoreGuard::acquire(&state.core).await;
-                (
-                    work_id,
-                    state.engine.settle_interrupt(&mut core, *pending, outcome),
-                    core,
-                )
+                let settled = state.engine.settle_interrupt(&mut core, *pending, outcome);
+                refresh_overlay_after_turn(state, &core, &work_id, settled.is_ok());
+                (work_id, settled, core)
             }
         };
         let (work_id, outcome, core) = settled;
@@ -666,6 +902,12 @@ async fn crank(state: &ApiState, step: Step) -> Option<CoreGuard<'_>> {
 /// starved), plus one core-lock hold to enumerate them. A run with no
 /// execution in flight costs the enumeration and nothing else.
 pub const COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// W5 brief deliverable 1(a): default cadence for
+/// [`maybe_run_periodic_sweep`]'s multi-estate walk — real git subprocesses
+/// per mount, unlike [`COMPLETION_POLL_INTERVAL`]'s in-memory checks, so it
+/// runs far less often than every completion-poll tick.
+pub const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Settle turns that finish with nobody watching (issue #46).
 ///
@@ -796,6 +1038,7 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
             return;
         }
         maybe_run_rotation_triggered_prune(&state).await;
+        maybe_run_periodic_sweep(&state).await;
     }
 }
 
@@ -805,14 +1048,25 @@ pub async fn drive_completions(state: ApiState, interval: Duration) {
 /// serving; [`crate::runtime::prune::stall_report`] is how that becomes
 /// visible, not a blocked tick.
 ///
-/// Phase A ([`crate::runtime::prune::candidate_horizon`]) and the cheap
-/// `take_rotation_signal`/`segment_bounds` reads run under the guard (they
-/// are in-memory and fast); Phase B
-/// ([`crate::runtime::prune::plan`], the mark scan) runs on a blocking
-/// thread with the guard released, since it is the unbounded part (§10.1's
-/// own split); [`crate::runtime::prune::run`] re-acquires the guard to
-/// re-validate and commit.
+/// Phase A ([`crate::runtime::prune::candidate_horizon_multi_estate`]) and
+/// the cheap `take_rotation_signal`/`segment_bounds` reads run under the
+/// guard (they are in-memory and fast); Phase B
+/// ([`crate::runtime::prune::plan_multi_estate`], the mark scan) runs on a
+/// blocking thread with the guard released, since it is the unbounded part
+/// (§10.1's own split); [`crate::runtime::prune::run`] re-acquires the guard
+/// to re-validate and commit.
+///
+/// H1 brief deliverable 1: `state.prune_policy` is no longer applied
+/// uniformly to every retained Work — it is the fallback
+/// [`crate::runtime::prune::EstatePolicies::from_registry`] resolves for a
+/// Work whose estate is unknown or no longer admitted. Each admitted
+/// estate's own `[estate] retention` is read fresh every tick (the same
+/// "re-read, never cache" discipline `Engine::plan` already has, now applied
+/// to this policy map too), from `state.estates` — the registry the
+/// estate-scoped HTTP surface already populates.
 async fn maybe_run_rotation_triggered_prune(state: &ApiState) {
+    let policies =
+        crate::runtime::prune::EstatePolicies::from_registry(&state.estates, state.prune_policy);
     let snapshot = {
         let mut core = CoreGuard::acquire(&state.core).await;
         let rotated = core.journal.take_rotation_signal();
@@ -826,11 +1080,11 @@ async fn maybe_run_rotation_triggered_prune(state: &ApiState) {
                 return;
             }
         };
-        let (candidate, _stall) = crate::runtime::prune::candidate_horizon(
+        let (candidate, _stall) = crate::runtime::prune::candidate_horizon_multi_estate(
             &bounds,
             core.registry.state(),
             &core.first_seq_by_work,
-            &state.prune_policy,
+            &policies,
         );
         let eligible_segments = bounds.iter().filter(|b| b.last_seq <= candidate).count();
         if candidate == 0 || eligible_segments < crate::runtime::prune::PRUNE_BATCH_MIN_SEGMENTS {
@@ -846,15 +1100,14 @@ async fn maybe_run_rotation_triggered_prune(state: &ApiState) {
     let (bounds, candidate, registry_snapshot, first_seq_snapshot) = snapshot;
 
     let data_dir = state.data_dir.clone();
-    let policy = state.prune_policy;
     let planned = tokio::task::spawn_blocking(move || {
-        crate::runtime::prune::plan(
+        crate::runtime::prune::plan_multi_estate(
             &data_dir,
             &bounds,
             candidate,
             &registry_snapshot,
             &first_seq_snapshot,
-            &policy,
+            &policies,
         )
     })
     .await;
@@ -876,6 +1129,89 @@ async fn maybe_run_rotation_triggered_prune(state: &ApiState) {
         Err(join_err) => {
             tracing::error!(error = %join_err, "rotation-triggered prune planning task panicked");
         }
+    }
+}
+
+/// The estates a periodic sweep pass classifies this tick.
+///
+/// W5 brief deliverable 1(a) — the caller `runtime::sweep::classify`'s own
+/// `// W4a seam:` comment names as owed: every *available* admitted estate
+/// (an unavailable one already failed re-validation; walking its mount would
+/// only reproduce the same git-level error the registry already recorded,
+/// never new information a sweep could add). Pure and synchronous so a test
+/// can assert the selection without paying for a real git walk.
+fn periodic_sweep_targets(estates: &crate::runtime::estates::EstateRegistry) -> Vec<PathBuf> {
+    estates
+        .entries()
+        .into_iter()
+        .filter(|entry| entry.available)
+        .map(|entry| entry.estate.root)
+        .collect()
+}
+
+/// W5 brief deliverable 1(a): the periodic multi-estate sweep caller
+/// `runtime::sweep`'s own seam comment names as not yet built. Runs on the
+/// same crank-loop tick as [`maybe_run_rotation_triggered_prune`], throttled
+/// by `state.sweep_interval` — a sweep's per-mount `for-each-ref`/
+/// `merge-base` walk is not cheap enough to repeat every completion-poll
+/// tick the way the prune trigger's in-memory checks are.
+///
+/// Classification only, exactly like `GET /v1/sweep`: this never deletes
+/// anything ([`sweep::classify`]'s own doc — "mutates nothing"), so a
+/// failure or an empty registry costs nothing but a skipped log line, and
+/// the deliberate two-step confirm before any `branch -D` (`POST
+/// /v1/sweep`) stays the operator's own explicit call.
+async fn maybe_run_periodic_sweep(state: &ApiState) {
+    {
+        let mut last = state.last_swept.lock().expect("last_swept lock poisoned");
+        let now = Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < state.sweep_interval) {
+            return;
+        }
+        *last = Some(now);
+    }
+    let roots = periodic_sweep_targets(&state.estates);
+    if roots.is_empty() {
+        return;
+    }
+    let works = {
+        let core = CoreGuard::acquire(&state.core).await;
+        journaled_work_states(&core)
+    };
+    for root in roots {
+        let estate = match Estate::resolve(&root) {
+            Ok(estate) => estate,
+            Err(e) => {
+                tracing::warn!(
+                    estate = %root.display(),
+                    error = %e,
+                    "periodic sweep: estate no longer resolves"
+                );
+                continue;
+            }
+        };
+        let works = works.clone();
+        let report = blocking(move || sweep::classify(&estate, &works)).await;
+        let mut redundant = 0usize;
+        let mut orphan = 0usize;
+        let mut retained = 0usize;
+        for repo in &report.repositories {
+            for branch in &repo.branches {
+                match branch.classification {
+                    sweep::Classification::Redundant => redundant += 1,
+                    sweep::Classification::Orphan => orphan += 1,
+                    sweep::Classification::Retained => retained += 1,
+                    sweep::Classification::Active => {}
+                }
+            }
+        }
+        tracing::info!(
+            estate = %root.display(),
+            redundant,
+            orphan,
+            retained,
+            "periodic sweep"
+        );
     }
 }
 
@@ -1110,6 +1446,14 @@ async fn healthz() -> Json<Value> {
 /// every live client needs it and none of them may read the journal to find
 /// it: it is the resume point an SSE subscriber passes as `from` so that
 /// attaching to the tail does not replay all of history first.
+///
+/// **H1 keeps it a single number, deliberately** (brief deliverable 5): a
+/// host daemon owns exactly one journal, shared by every admitted estate,
+/// so there is one head and one resume point — the estate coordinate lives
+/// on each event (D1), not on the stream. `data_dir` likewise still names
+/// one directory; what changed is *which* — the host runtime root (D2),
+/// no longer any estate's. Which estates this daemon serves is a different
+/// question, and it has its own route: `GET /v1/estates`.
 fn system_body(state: &ApiState, journal_head: u64, admission_paused: bool) -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -1311,6 +1655,24 @@ fn internal_error(e: impl std::fmt::Display) -> Response {
 struct SubmitRequest {
     command_id: String,
     intent: String,
+    /// D4: the estate this submission addresses — the canonical exact root
+    /// (D1/H1-06: no UUID), validated by admission and never by trust.
+    ///
+    /// §7.4 removed `workspace` because the daemon was bound to exactly one
+    /// estate and a wire field would have been a second, conflicting
+    /// authority. A host daemon is bound to none, so the field is back — but
+    /// as an *address*, not a binding: what it names is re-admitted per
+    /// submission ([`crate::runtime::estates::EstateRegistry::admit`]), and
+    /// a root that does not validate is refused rather than served.
+    ///
+    /// Absent keeps the meaning "no repository context offered": the Work is
+    /// accepted and stays `pending`, exactly as a submission to an
+    /// estate-less daemon always did. That is not a hole in H1 §11.3 — the
+    /// client-side gate is what refuses `sgt run` outside an estate, before
+    /// a request is ever built — it is the existing, journaled,
+    /// non-error meaning of "I have no estate to offer".
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
     /// estate-root proposal §7/§13.3's structured scope request
     /// (`--repo`/`--group`/`--all`). §7.4: `estate` no longer exists as
     /// a wire field at all — the daemon is bound to exactly one estate, and
@@ -1351,6 +1713,25 @@ struct SubmitRequest {
     /// this `true`.
     #[serde(default)]
     override_git_preflight: bool,
+    /// W1 §6 (S2 E8 as amended): the parent Work this submission **claims**
+    /// to have come from, as `sgt run` read it out of `SERGEANT_WORK_ID`.
+    ///
+    /// Named `claimed_` on the wire on purpose. W1 §6: "environment
+    /// variables are a transport hint, not trusted lineage." Nothing about
+    /// this field is believed — [`validate_claimed_causation`] checks it
+    /// against this daemon's own journal before any relation is recorded on
+    /// the Work, and a claim that fails is journaled as a
+    /// `causation_unverified` marker while the submission proceeds
+    /// causation-less. `#[serde(default)]`: a client that claims nothing is
+    /// the ordinary top-level submission, not an error.
+    #[serde(default)]
+    claimed_parent_work_id: Option<String>,
+    /// The parent *execution* claimed, from `SERGEANT_EXECUTION_ID`. Same
+    /// "claimed, never believed" contract as the field above; an execution
+    /// claim without a Work claim cannot be validated against anything and
+    /// is recorded as unverified.
+    #[serde(default)]
+    claimed_parent_execution_id: Option<String>,
 }
 
 /// R-MVP1-7's envelope override, sanity-checked at submit: a turn cap of 0
@@ -1375,6 +1756,95 @@ fn envelope_out_of_range(req: &SubmitRequest) -> Option<String> {
         );
     }
     None
+}
+
+/// The validated parent coordinates for a submission, or the marker saying
+/// why the claim was not recorded (S2 E8 **as amended**, W1 §6/W1-08).
+///
+/// `Ok(None)` — nothing was claimed, the ordinary top-level submission.
+/// `Ok(Some(..))` — the claim checks out against this daemon's own journal.
+/// `Err(reason)` — it does not, and the reason is the marker's text.
+///
+/// **This never refuses a submission**, and the return type is shaped to make
+/// that hard to get wrong: `Err` here is the *marker's* content, not an
+/// error path, and the one caller journals it beside an accepted Work. The
+/// ratification's own clause is that W1 §5's substance is preserved "by
+/// ordinary admission, explicit addressing, and journal-validated causation
+/// **rather than by refusal**"; the sprint plan's E8 amendment names the
+/// concrete reason a refusal would be wrong rather than merely strict — no
+/// adapter `env_clear`s, so a long-lived actor session can genuinely outlive
+/// the execution whose `SERGEANT_*` coordinates it inherited, and refusing
+/// that submission would turn a stale environment into a broken command.
+///
+/// Three checks, in order, each answerable from the journal alone:
+///
+/// 1. the claimed Work exists in this daemon's journal (`work_index` is
+///    never evicted, so a miss is conclusive without a replay);
+/// 2. it belongs to the **addressed** estate — W1 §8: "a child Work belongs
+///    to exactly one explicitly addressed estate", and a parent in some
+///    other estate is precisely the cross-estate relation W1 does not add;
+/// 3. the claimed execution, when one is claimed, is that Work's own — its
+///    current execution or the one it has reserved. An execution claimed
+///    without a Work has nothing to be checked against and is unverifiable
+///    by construction.
+///
+/// Check 3 is deliberately "current or reserved" rather than "any execution
+/// this Work ever had": a `WorkRun` retains the execution it last started,
+/// which is exactly the execution whose environment a child submission can
+/// have been launched with, because the claim is validated synchronously
+/// while that execution is the one running. A claim naming an execution the
+/// parent has since moved past is stale — and stale is the case this
+/// amendment exists to handle gracefully, not to punish.
+fn validate_claimed_causation(
+    core: &Core,
+    addressed: Option<&std::path::Path>,
+    req: &SubmitRequest,
+) -> Result<Option<(String, Option<String>)>, String> {
+    let claimed_work = req.claimed_parent_work_id.as_deref();
+    let claimed_execution = req.claimed_parent_execution_id.as_deref();
+    let Some(parent_work_id) = claimed_work else {
+        return match claimed_execution {
+            None => Ok(None),
+            Some(execution) => Err(format!(
+                "claimed parent execution {execution:?} names no parent Work, so there is \
+                 nothing to validate it against"
+            )),
+        };
+    };
+    let registry = core.registry.state();
+    let Some(row) = registry.work_index.get(parent_work_id) else {
+        return Err(format!(
+            "claimed parent Work {parent_work_id:?} is not in this daemon's journal"
+        ));
+    };
+    let addressed = addressed.map(|root| root.to_string_lossy().into_owned());
+    if row.estate_root != addressed {
+        return Err(format!(
+            "claimed parent Work {parent_work_id:?} belongs to estate {:?}, not the addressed \
+             {:?}; W1 adds no cross-estate causation",
+            row.estate_root.as_deref().unwrap_or("(none recorded)"),
+            addressed.as_deref().unwrap_or("(none addressed)"),
+        ));
+    }
+    let Some(execution_id) = claimed_execution else {
+        // A Work claim alone validates; the relation is recorded one
+        // coordinate coarser rather than rejected for what it did not say.
+        return Ok(Some((parent_work_id.to_string(), None)));
+    };
+    let run = registry.run_view(parent_work_id);
+    let current = run.and_then(|run| run.execution.as_ref().map(|e| e.execution_id.as_str()));
+    let reserved = run.and_then(|run| run.reservation.as_ref().map(|r| r.execution_id.as_str()));
+    if current != Some(execution_id) && reserved != Some(execution_id) {
+        return Err(format!(
+            "claimed parent execution {execution_id:?} is not {parent_work_id:?}'s current \
+             execution ({}); the claim is stale or forged",
+            current.unwrap_or("none"),
+        ));
+    }
+    Ok(Some((
+        parent_work_id.to_string(),
+        Some(execution_id.to_string()),
+    )))
 }
 
 /// R-MVP1-6's submit-time agreement check: a structured elaboration that
@@ -1479,10 +1949,63 @@ async fn submit_work(
     // does not reach that append (a preflight refusal, a replayed
     // `command_id`, an empty intent) simply discards it.
     let work_id_candidate = ulid::Ulid::generate().to_string();
+    // D4: admit the addressed estate **before** planning. A root that does
+    // not validate is this submission's refusal (journaled under its
+    // `command_id` like every other semantic rejection, so a retry replays
+    // it), never a plan against topology nobody checked — and never a reason
+    // to refuse some *other* estate's request.
+    let addressed = match req.estate_root.as_deref() {
+        None => None,
+        Some(root) => match state.estates.admit(root) {
+            Ok(estate) => Some(estate.root),
+            Err(e) => {
+                let result = error_body(e.code(), e.to_string());
+                let mut core = CoreGuard::acquire(&state.core).await;
+                // §26 first, exactly as the accepting path does it below: a
+                // `command_id` whose outcome is already recorded replays
+                // that outcome, and one caught in the `work.submitted`/
+                // `command.accepted` crash window re-records its real
+                // outcome from the replayed state. An estate that broke
+                // *after* a submission was accepted must not turn a retry
+                // of that submission into a refusal — the Work exists, and
+                // §26's promise is about what already happened, not about
+                // whether it could happen again now.
+                if let Some(resp) = replay_command(&core, &req.command_id) {
+                    return resp;
+                }
+                if let Some(work_id) = core
+                    .registry
+                    .state()
+                    .command_works
+                    .get(&req.command_id)
+                    .cloned()
+                {
+                    let replayed = work_view(&core, &state.engine, &work_id);
+                    return record_and_respond(
+                        &mut core,
+                        &req.command_id,
+                        "work.submit",
+                        Some(&work_id),
+                        StatusCode::CREATED,
+                        replayed,
+                    );
+                }
+                return record_and_respond(
+                    &mut core,
+                    &req.command_id,
+                    "work.submit",
+                    None,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    result,
+                );
+            }
+        },
+    };
     let planned = if req.intent.trim().is_empty() {
         None
     } else {
         let engine = state.engine.clone();
+        let estate_root = addressed.clone();
         let backend = req.backend.clone();
         let workflow = req.workflow.clone();
         let profile = req.profile.clone();
@@ -1493,18 +2016,21 @@ async fn submit_work(
         let override_git_preflight = req.override_git_preflight;
         Some(
             blocking(move || {
-                engine.plan(&SubmitContext {
-                    cwd: origin_cwd.as_deref(),
-                    origin_client: origin_client.as_deref(),
-                    backend: backend.as_deref(),
-                    workflow: workflow.as_deref(),
-                    profile: profile.as_deref(),
-                    repos: &scope.repos,
-                    group: scope.group.as_deref(),
-                    all: scope.all,
-                    work_id: Some(&candidate),
-                    override_git_preflight,
-                })
+                engine.plan(
+                    estate_root.as_deref(),
+                    &SubmitContext {
+                        cwd: origin_cwd.as_deref(),
+                        origin_client: origin_client.as_deref(),
+                        backend: backend.as_deref(),
+                        workflow: workflow.as_deref(),
+                        profile: profile.as_deref(),
+                        repos: &scope.repos,
+                        group: scope.group.as_deref(),
+                        all: scope.all,
+                        work_id: Some(&candidate),
+                        override_git_preflight,
+                    },
+                )
             })
             .await,
         )
@@ -1624,6 +2150,25 @@ async fn submit_work(
         }
     };
 
+    // S2 E8 as amended (W1 §6/W1-08): the claimed lineage is checked against
+    // this daemon's own journal here, under the guard, against the estate
+    // this submission actually addressed. Never a refusal — a failed claim
+    // becomes a marker on the accepted Work, one field over.
+    let (parent_work_id, parent_execution_id, causation_unverified) =
+        match validate_claimed_causation(&core, addressed.as_deref(), &req) {
+            Ok(None) => (None, None, None),
+            Ok(Some((work, execution))) => (Some(work), execution, None),
+            Err(reason) => (
+                None,
+                None,
+                Some(CausationClaim {
+                    parent_work_id: req.claimed_parent_work_id.clone(),
+                    parent_execution_id: req.claimed_parent_execution_id.clone(),
+                    reason,
+                }),
+            ),
+        };
+
     // §7.3: journaled twice — `scope_request` is exactly what was submitted;
     // `repositories` is what `plan` (when there was a estate to resolve
     // against at all) actually resolved it to. When there was no estate
@@ -1662,6 +2207,14 @@ async fn submit_work(
         envelope: req.envelope.filter(|e| !e.is_empty()),
         // §8.3: the authorization the operator gave for this one submission.
         git_preflight_override: req.override_git_preflight,
+        // W1-09 / L6: the validated relation and the unverified marker both
+        // ride inside the *one* `work.submitted` payload below, rather than a
+        // second event. A crash between the two would otherwise leave either
+        // a Work whose lineage is unexplained or a marker for a Work that
+        // does not exist; one compound append has no such window.
+        parent_work_id,
+        parent_execution_id,
+        causation_unverified,
         state: WorkState::Pending,
         created_by: req.created_by.unwrap_or_else(|| "api".to_string()),
         created_at: rfc3339_utc_now(),
@@ -1669,6 +2222,15 @@ async fn submit_work(
     let work_id = work.id.clone();
     let mut draft = EventDraft::new(api_source(), KIND_WORK_SUBMITTED, json!({"work": work}))
         .with_work_id(&work_id);
+    // H1 touch point #4: `work.submitted` is the other emission point
+    // outside `Engine::commit` (`begin_start`'s later events go through
+    // that chokepoint and pick it up there). `plan` carries the estate this
+    // submission actually resolved against — `None` (no repository
+    // context offered) leaves the field absent, same as a Work that never
+    // reaches an estate at all.
+    if let Some(plan) = &plan {
+        draft = draft.with_workspace_id(plan.estate.root.to_string_lossy().into_owned());
+    }
     draft.correlation_id = Some(req.command_id.clone());
     if let Err(e) = core.commit(draft) {
         return internal_error(e);
@@ -2076,12 +2638,13 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
         .work_index
         .keys()
         .map(|id| {
+            let index_row = &registry.work_index[id];
             let Some(work) = registry
                 .works
                 .get(id)
                 .or_else(|| registry.terminal_works.get(id))
             else {
-                return evicted_fleet_row(&registry.work_index[id]);
+                return evicted_fleet_row(index_row);
             };
             // `registry.run_view` alone only reaches the bounded
             // in-memory cache (`TERMINAL_RUN_CACHE_CAPACITY`); once a
@@ -2138,6 +2701,23 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
                         "turn_ceiling_secs": engine.effective_turn_ceiling(Some(work)).as_secs_f64(),
                     }),
                 );
+                // W4d deliverable 1 (H1): the per-Work estate *identity* —
+                // `Work::workspace` (the old display-name field) has been
+                // dead since estate-root Phase C (`Work`'s own doc comment:
+                // "deprecated, never written"); `WorkIndexRow::estate_root`
+                // is the live coordinate H1 actually folds per Work (D1: a
+                // canonical root, never a name — two estates may share a
+                // display name). Surfacing it here is what lets the TUI's
+                // Fleet filter (§10, this wave) narrow by estate at all
+                // against a real daemon; `null` for any Work journaled
+                // before the envelope carried it, or with no estate context.
+                object.insert(
+                    "estate_root".to_string(),
+                    index_row
+                        .estate_root
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                );
             }
             row
         })
@@ -2155,7 +2735,11 @@ fn fleet_body(core: &Core, engine: &Engine) -> Value {
 /// the slim row), and the two timestamps. No `stage`/`resolved_backend`/
 /// `envelope`/`output` — those need the run, which a Work this old no
 /// longer has cached, and re-deriving it here would be the very per-row
-/// journal replay this cache exists to avoid. `"evicted": true` names the
+/// journal replay this cache exists to avoid. No causation either (S2 E8):
+/// `parent_work_id`/`causation_unverified` live on the full [`Work`], and the
+/// slim row keeps neither — a Work this old reads as causation-less to the
+/// TUI's grouping, which is the same bounded-cost tradeoff every other
+/// narrowed field here already is. `"evicted": true` names the
 /// narrowing explicitly rather than leaving a client to infer it from
 /// absent keys.
 ///
@@ -2182,6 +2766,7 @@ fn evicted_fleet_row(row: &WorkIndexRow) -> Value {
         "created_at": row.created_at,
         "updated_at": row.updated_at,
         "evicted": true,
+        "estate_root": row.estate_root,
     })
 }
 
@@ -2255,11 +2840,13 @@ async fn list_work(State(state): State<ApiState>) -> Response {
 
 #[derive(Debug, Deserialize)]
 struct WorkflowsQuery {
-    /// The client's working directory — estate discovery (§9) starts
-    /// here, exactly as [`Origin::cwd`] does for `POST /v1/work`, so what
-    /// this route shows as available matches what submission would actually
-    /// resolve (§19.4's "cwd discovery matches submission").
+    /// The client's working directory — evidence only since §5.2 removed
+    /// its authority over topology; still validated so an obviously-broken
+    /// client hears about it.
     cwd: String,
+    /// D4: the estate whose local catalog half this request addresses.
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
 }
 
 /// One `CatalogEntry.stages[]` element (§11.2's StageEntry): order, kind,
@@ -2358,7 +2945,15 @@ async fn list_workflows(
             "cwd must be an absolute path",
         );
     }
-    let estate_root = state.engine.estate_root.clone();
+    // D4: the catalog's estate-local half is the *addressed* estate's, and
+    // only once admitted. Unaddressed (or unadmitted) answers the embedded
+    // catalog alone — an honest "no estate in play here", never another
+    // estate's forks.
+    let estate_root = req
+        .estate_root
+        .as_deref()
+        .and_then(|root| state.estates.admit(root).ok())
+        .map(|estate| estate.root);
     let workflows = blocking(move || workflow_catalog_entries(estate_root.as_deref())).await;
     Json(json!({"workflows": workflows})).into_response()
 }
@@ -2421,6 +3016,12 @@ fn pruned_work_view(
         "last_seq": row.last_seq,
         "pruned_at": row.pruned_at,
         "policy": {"retention": policy.retention, "source": policy.source},
+        // H1 brief deliverable 3: the report names estates. `policy` above
+        // stays the daemon-wide fallback the caller passed in (unchanged
+        // shape); `estate_root` is this specific residue row's own recorded
+        // coordinate, `None` for a Work pruned before H1 or submitted with
+        // no estate context at all.
+        "estate_root": row.estate_root,
     })
 }
 
@@ -3207,8 +3808,11 @@ async fn list_retained(State(state): State<ApiState>) -> Response {
 /// estate's own ordinary checkout — §6.1's derived mount, no symlink, no
 /// linked worktree, no other estate's clone. A declared-but-unresolvable
 /// repository fails the whole pass by name rather than being swept past.
-fn sweep_topology(state: &ApiState) -> Result<Estate, (StatusCode, Value)> {
-    let root = estate_root_or_error(state)?;
+fn sweep_topology(
+    state: &ApiState,
+    requested: Option<&std::path::Path>,
+) -> Result<Estate, (StatusCode, Value)> {
+    let root = estate_root_or_error(state, requested, "sweeping")?;
     Estate::resolve(&root).map_err(|e| {
         (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3252,8 +3856,8 @@ fn journaled_work_states(core: &Core) -> std::collections::BTreeMap<String, Work
 /// mid-walk is therefore classified against the snapshot; that is safe
 /// because nothing here acts on the answer, and the deletion half re-derives
 /// its own classification from scratch anyway.
-async fn sweep_estate(State(state): State<ApiState>) -> Response {
-    let estate = match sweep_topology(&state) {
+async fn sweep_estate(State(state): State<ApiState>, Query(query): Query<EstateQuery>) -> Response {
+    let estate = match sweep_topology(&state, query.estate_root.as_deref()) {
         Ok(estate) => estate,
         Err((status, body)) => return (status, Json(body)).into_response(),
     };
@@ -3268,6 +3872,9 @@ async fn sweep_estate(State(state): State<ApiState>) -> Response {
 #[derive(Debug, Deserialize)]
 struct SweepRequest {
     command_id: String,
+    /// D4: the estate whose `sergeant/*` refs this sweep addresses.
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
     /// Must be `true`, or the request is refused — sweep deletes branches
     /// and git's reflog is the only undo.
     #[serde(default)]
@@ -3329,7 +3936,7 @@ async fn sweep_delete(
             result,
         );
     }
-    let estate = match sweep_topology(&state) {
+    let estate = match sweep_topology(&state, req.estate_root.as_deref()) {
         Ok(estate) => estate,
         Err((status, body)) => {
             return record_and_respond(
@@ -3365,20 +3972,30 @@ async fn sweep_delete(
 // state (R-NS-4, `src/domain/manifest.rs`'s own module doc), so unlike every
 // other mutation in this file there is no `command_id`/replay pair.
 
-/// The estate root these routes edit: an upward walk from this daemon's own
-/// `data_dir`, unscoped — correct for the default `<estate_root>/.sergeant/
-/// data` layout `sgt init` always produces, deterministic, and dependent on
-/// nothing but the one fact [`ApiState`] already carries.
+/// D4: the estate root these routes operate on comes from the **request**,
+/// and is served only after this daemon's registry admits it.
 ///
-/// The process's own working directory is deliberately **not** consulted —
-/// a long-running daemon's cwd is not reliably the estate root in every real
-/// deployment, and unlike a walk that simply finds nothing, a cwd that
-/// happens to sit inside a *different* estate (an unrelated git checkout
-/// that is itself one, `sgt`'s own self-hosting shape among them) would
-/// silently resolve to the wrong manifest rather than failing closed — the
-/// one outcome R-NS-4's discipline exists to prevent.
-fn resolve_estate_root(state: &ApiState) -> Result<PathBuf, Box<Response>> {
-    estate_root_or_error(state)
+/// It used to come from `state.engine.estate_root` — the one estate the
+/// process was bound to. A host daemon has none, so every estate-scoped
+/// route now carries an explicit `estate_root` (a canonical exact root per
+/// D1/H1-06: no UUID), and the daemon validates it *by admission*, never by
+/// trust. The refusal taxonomy is
+/// [`crate::runtime::estates::EstateAdmissionError`]'s, unchanged between
+/// this and the client-side gate.
+///
+/// The process's own working directory is still deliberately **not**
+/// consulted, for exactly the reason it never was: a long-running daemon's
+/// cwd is not reliably anything, and a cwd that happens to sit inside a
+/// *different* estate would silently resolve to the wrong manifest rather
+/// than failing closed — the one outcome R-NS-4's discipline exists to
+/// prevent. H1 removes the daemon's binding; it does not give the daemon a
+/// new way to guess.
+fn resolve_estate_root(
+    state: &ApiState,
+    requested: Option<&std::path::Path>,
+    operation: &str,
+) -> Result<PathBuf, Box<Response>> {
+    estate_root_or_error(state, requested, operation)
         .map_err(|(status, body)| Box::new((status, Json(body)).into_response()))
 }
 
@@ -3386,18 +4003,75 @@ fn resolve_estate_root(state: &ApiState) -> Result<PathBuf, Box<Response>> {
 /// finished response — the shape a *command* handler needs, because its
 /// refusal has to be journaled under a `command_id` before it is answered
 /// with, and `record_and_respond` takes the body.
-fn estate_root_or_error(state: &ApiState) -> Result<PathBuf, (StatusCode, Value)> {
-    match state.engine.estate_root.clone() {
-        Some(root) => Ok(root),
-        None => Err((
+fn estate_root_or_error(
+    state: &ApiState,
+    requested: Option<&std::path::Path>,
+    operation: &str,
+) -> Result<PathBuf, (StatusCode, Value)> {
+    admit_addressed_estate(state, requested, operation).map(|estate| estate.root)
+}
+
+/// Admit the estate a request addressed, or turn the refusal into this
+/// file's one `{"error": {"code", "message"}}` shape.
+///
+/// `NOT_FOUND` for "no estate addressed" (the operation has no object) and
+/// `UNPROCESSABLE_ENTITY` for a root that will not admit (the request named
+/// something, and it is wrong) — the same split every other refusal in this
+/// file already draws between an absent thing and an invalid one.
+fn admit_addressed_estate(
+    state: &ApiState,
+    requested: Option<&std::path::Path>,
+    operation: &str,
+) -> Result<crate::runtime::estates::AdmittedEstate, (StatusCode, Value)> {
+    let Some(requested) = requested else {
+        return Err((
             StatusCode::NOT_FOUND,
             error_body(
                 "no_estate",
-                "this daemon is bound to no estate — start it from an estate root (`sgt daemon` \
-                 from the root, or `sgt -C <estate-root> daemon`)",
+                format!(
+                    "{operation} is estate-scoped, but this request addressed no estate — send \
+                     `estate_root` (the exact estate root, canonical)"
+                ),
             ),
-        )),
-    }
+        ));
+    };
+    state.estates.admit(requested).map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            error_body(e.code(), e.to_string()),
+        )
+    })
+}
+
+/// `GET /v1/estates` (H1 §4, brief deliverable 6) — the admitted-estate
+/// registry as this process holds it right now.
+///
+/// Observational, and says so: a row exists because some request addressed
+/// that root and admission succeeded, never because the daemon went looking.
+/// `available` is the last re-validation's verdict, so an estate whose
+/// manifest has since been deleted is still *listed* — its Work is still in
+/// the journal — and reported unavailable with the reason, rather than
+/// vanishing as though it had never been served.
+async fn list_estates(State(state): State<ApiState>) -> Response {
+    let estates: Vec<Value> = state
+        .estates
+        .entries()
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "root": entry.estate.root,
+                "name": entry.estate.name,
+                "manifest_path": entry.estate.manifest_path,
+                "admitted_at": entry.estate.admitted_at,
+                "available": entry.available,
+                "unavailable_reason": entry.unavailable_reason,
+                "last_touched_at": entry.last_touched_at,
+                "retention": entry.estate.retention,
+                "surfaces_dir": entry.estate.surfaces_dir,
+            })
+        })
+        .collect();
+    Json(json!({"estates": estates})).into_response()
 }
 
 /// Stable per-variant code for a [`ManifestError`], for the same
@@ -3411,6 +4085,7 @@ fn manifest_error_code(e: &ManifestError) -> &'static str {
         ManifestError::NoEstate { .. } => "no_estate",
         ManifestError::InvalidName { .. } => "invalid_name",
         ManifestError::RepoAlreadyDeclared { .. } => "repo_already_declared",
+        ManifestError::KnowledgeAlreadyDeclared { .. } => "knowledge_already_declared",
         ManifestError::RepoNotDeclared { .. } => "repo_not_declared",
         ManifestError::RepoInUseByGroups { .. } => "repo_in_use_by_groups",
         ManifestError::GroupNotDeclared { .. } => "group_not_declared",
@@ -3434,9 +4109,9 @@ fn manifest_error_status(e: &ManifestError) -> StatusCode {
         | ManifestError::Invalid { .. }
         | ManifestError::ExistingPathNotAGitRepository { .. }
         | ManifestError::MalformedSection { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-        ManifestError::Locked { .. } | ManifestError::RepoAlreadyDeclared { .. } => {
-            StatusCode::CONFLICT
-        }
+        ManifestError::Locked { .. }
+        | ManifestError::RepoAlreadyDeclared { .. }
+        | ManifestError::KnowledgeAlreadyDeclared { .. } => StatusCode::CONFLICT,
         ManifestError::NoEstate { .. }
         | ManifestError::RepoNotDeclared { .. }
         | ManifestError::GroupNotDeclared { .. }
@@ -3463,6 +4138,18 @@ fn manifest_error_response(e: &ManifestError) -> Response {
     )
 }
 
+/// D4: how an estate-addressed **query** names its estate.
+///
+/// `GET`/`DELETE` routes have no body to carry `estate_root` in, so it rides
+/// the query string — the canonical exact root, percent-encoded by the
+/// client. Absent is refusal (c): the operation has no object, and the
+/// daemon does not pick one.
+#[derive(Debug, Deserialize, Default)]
+struct EstateQuery {
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
+}
+
 /// The declared repositories, read the same way `sgt repo list --json` does.
 fn workspace_read(estate_root: &std::path::Path) -> Result<Estate, Box<Response>> {
     Estate::from_config_allow_empty(&estate_root.join(crate::domain::estate::MANIFEST_FILE))
@@ -3477,11 +4164,15 @@ fn workspace_read(estate_root: &std::path::Path) -> Result<Estate, Box<Response>
 
 /// `GET /v1/estate/repos` (§16.2) — the same read `sgt repo list --json`
 /// already performs, over the daemon's own estate.
-async fn estate_list_repos(State(state): State<ApiState>) -> Response {
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+async fn estate_list_repos(
+    State(state): State<ApiState>,
+    Query(query): Query<EstateQuery>,
+) -> Response {
+    let estate_root =
+        match resolve_estate_root(&state, query.estate_root.as_deref(), "listing repositories") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     let estate = match workspace_read(&estate_root) {
         Ok(w) => w,
         Err(resp) => return *resp,
@@ -3503,6 +4194,9 @@ async fn estate_list_repos(State(state): State<ApiState>) -> Response {
 
 #[derive(Debug, Deserialize)]
 struct AddRepoRequest {
+    /// D4: the estate this edit addresses (canonical exact root).
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
     name: String,
     #[serde(default)]
     origin: Option<String>,
@@ -3541,10 +4235,11 @@ async fn estate_add_repo(
             );
         }
     };
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+    let estate_root =
+        match resolve_estate_root(&state, req.estate_root.as_deref(), "adding a repository") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     let name = req.name.clone();
     let origin = req.origin.clone();
     let upstream = req.upstream.clone();
@@ -3576,8 +4271,16 @@ async fn estate_add_repo(
 /// `DELETE /v1/estate/repos/{name}` (§16.2) — `manifest::remove_repo`
 /// exactly; the group-reference refusal it returns reaches the caller
 /// structured, not reworded.
-async fn estate_remove_repo(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
-    let estate_root = match resolve_estate_root(&state) {
+async fn estate_remove_repo(
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+    Query(query): Query<EstateQuery>,
+) -> Response {
+    let estate_root = match resolve_estate_root(
+        &state,
+        query.estate_root.as_deref(),
+        "removing a repository",
+    ) {
         Ok(root) => root,
         Err(resp) => return *resp,
     };
@@ -3589,11 +4292,15 @@ async fn estate_remove_repo(State(state): State<ApiState>, Path(name): Path<Stri
 
 /// `GET /v1/estate/groups` (§16.2) — the same read `sgt group list --json`
 /// already performs.
-async fn estate_list_groups(State(state): State<ApiState>) -> Response {
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+async fn estate_list_groups(
+    State(state): State<ApiState>,
+    Query(query): Query<EstateQuery>,
+) -> Response {
+    let estate_root =
+        match resolve_estate_root(&state, query.estate_root.as_deref(), "listing groups") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     let estate = match workspace_read(&estate_root) {
         Ok(w) => w,
         Err(resp) => return *resp,
@@ -3608,6 +4315,9 @@ async fn estate_list_groups(State(state): State<ApiState>) -> Response {
 
 #[derive(Debug, Deserialize)]
 struct AddGroupRequest {
+    /// D4: the estate this edit addresses (canonical exact root).
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
     name: String,
     #[serde(default)]
     repos: Vec<String>,
@@ -3626,10 +4336,11 @@ async fn estate_add_group(
         Ok(r) => r,
         Err(resp) => return *resp,
     };
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+    let estate_root =
+        match resolve_estate_root(&state, req.estate_root.as_deref(), "adding a group") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     let name = req.name.clone();
     let repos = req.repos.clone();
     let brief = req.brief.clone();
@@ -3663,6 +4374,7 @@ struct RemoveGroupRequest {
 async fn estate_remove_group(
     State(state): State<ApiState>,
     Path(name): Path<String>,
+    Query(query): Query<EstateQuery>,
     body: axum::body::Bytes,
 ) -> Response {
     let repos = if body.is_empty() {
@@ -3679,27 +4391,31 @@ async fn estate_remove_group(
             }
         }
     };
-    let estate_root = match resolve_estate_root(&state) {
-        Ok(root) => root,
-        Err(resp) => return *resp,
-    };
+    let estate_root =
+        match resolve_estate_root(&state, query.estate_root.as_deref(), "removing a group") {
+            Ok(root) => root,
+            Err(resp) => return *resp,
+        };
     match blocking_sync(|| manifest::remove_group(&estate_root, &name, &repos)) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => manifest_error_response(&e),
     }
 }
 
-/// The directory `GET /v1/doctor` reports the estate rows against: this
-/// daemon's own bound estate root (§5.1), never the daemon process's cwd —
-/// a long-running daemon's cwd is not reliably anything. With no bound
-/// estate the data dir stands in, and the estate-root row correctly fails
-/// there, which is exactly what a daemon started outside an estate should
-/// report.
-fn doctor_root(state: &ApiState) -> PathBuf {
-    state
-        .engine
-        .estate_root
-        .clone()
+/// The directory `GET /v1/doctor` reports the estate rows against: the
+/// estate **this request addressed** (D4), never the daemon process's cwd —
+/// a long-running daemon's cwd is not reliably anything, and a host daemon
+/// no longer has a bound root to fall back on either.
+///
+/// An unaddressed or unadmitted estate falls back to the host runtime root,
+/// where the estate-root row correctly fails — which is exactly what
+/// `sgt doctor` asking a host daemon about no estate in particular should
+/// report, and is the same answer a daemon started outside an estate has
+/// always given.
+fn doctor_root(state: &ApiState, requested: Option<&std::path::Path>) -> PathBuf {
+    requested
+        .and_then(|root| state.estates.admit(root).ok())
+        .map(|estate| estate.root)
         .unwrap_or_else(|| state.data_dir.clone())
 }
 
@@ -3711,8 +4427,12 @@ fn doctor_root(state: &ApiState) -> PathBuf {
 /// CLI invocation resolved `state.data_dir` before spawning or attaching to
 /// this daemon — that resolution, and its winning rung, do not survive
 /// across the process boundary to this handler.
-async fn doctor_report(State(state): State<ApiState>) -> Response {
-    let report = doctor::run(&state.data_dir, &doctor_root(&state), false).await;
+async fn doctor_report(
+    State(state): State<ApiState>,
+    Query(query): Query<EstateQuery>,
+) -> Response {
+    let root = doctor_root(&state, query.estate_root.as_deref());
+    let report = doctor::run(&state.data_dir, &root, false).await;
     Json(report.to_json()).into_response()
 }
 
@@ -3726,8 +4446,9 @@ async fn doctor_report(State(state): State<ApiState>) -> Response {
 ///   structural rather than promised;
 /// - an answer is always as fresh as the journal, because the catch-up runs
 ///   *before* the query, not on a timer;
-/// - rebuild and catch-up run the identical fold, so "delete the file and
-///   restart" and "keep it current" cannot produce different tables.
+/// - rebuild and catch-up run the identical fold, so a start-of-day rebuild
+///   (which drops the `ops` schema and re-folds it) and "keep it current"
+///   cannot produce different tables.
 ///
 /// A catch-up failure is answered as a 503 against the projection, never as a
 /// failure of the work it describes: the journal is untouched and a restart
@@ -3828,6 +4549,2006 @@ async fn work_graph(State(state): State<ApiState>, Path(id): Path<String>) -> Re
     }
 }
 
+// ---------------------------------------------------- S3 X4: intelligence
+
+/// Run one read against Atlas's store (F11).
+///
+/// Opens the store on first use and keeps it, and — unlike
+/// [`with_analytics`] — never catches anything up: `source.*` and
+/// `meta.coverage` are derived from source bytes plus extractor identity, and
+/// no journal replay reproduces them (F1). A read here answers with what the
+/// scanner wrote, or says honestly that nothing has been scanned.
+///
+/// "This host has indexed nothing" is an *answer*, handed to the caller as
+/// `None` ([`atlas_absent`]), never a failure.
+///
+/// **What that answer is read off changed in S5 W1c, and the answer did
+/// not.** It used to be the absence of the Atlas file: a host that had never
+/// scanned had none, and creating one to answer a read would have left a
+/// database behind on every `sgt intelligence status`. A1 §5 puts `ops` in
+/// that same file, so the daemon's own start now creates it on every host —
+/// the file stopped being able to carry the distinction, and the evidence
+/// took over. `None` now means "no source has a confirmed generation," which
+/// is the question the response's own `detail` was always answering.
+async fn with_atlas<T>(
+    state: &ApiState,
+    f: impl FnOnce(&AtlasDb) -> Result<T, AtlasError>,
+) -> Result<Option<T>, MapRefusal> {
+    let mut guard = state.atlas.lock().await;
+    if guard.is_none() {
+        if !crate::runtime::atlas::db::atlas_db_path(&state.data_dir).exists() {
+            return Ok(None);
+        }
+        match state.analytics.lock().await.atlas() {
+            Ok(atlas) => *guard = Some(atlas),
+            Err(e) => {
+                return Err(Box::new(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "atlas_unavailable",
+                    format!("atlas could not be opened: {e}"),
+                )));
+            }
+        }
+    }
+    let atlas = guard.as_ref().expect("opened above");
+    // The evidence check the file's existence used to stand in for.
+    match atlas.indexed_sources() {
+        Ok(sources) if sources.is_empty() => return Ok(None),
+        Ok(_) => {}
+        Err(e) => {
+            return Err(Box::new(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "atlas_unavailable",
+                format!("atlas read failed: {e}"),
+            )));
+        }
+    }
+    match f(atlas) {
+        Ok(value) => Ok(Some(value)),
+        Err(e) => Err(Box::new(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "atlas_unavailable",
+            format!("atlas read failed: {e}"),
+        ))),
+    }
+}
+
+/// A refused map read, boxed.
+///
+/// An axum [`Response`] is a large value, and a `Result` whose error is larger
+/// than its success case makes every caller pay for the failure path — which
+/// is what `clippy::result_large_err` is about. Boxing costs one allocation on
+/// a path that is already an error.
+type MapRefusal = Box<Response>;
+
+/// The `?limit=` every map read accepts, and the `?source=`/`?name=` the ones
+/// that address something accept.
+///
+/// `limit` is advisory in one direction only: the store caps it at
+/// `MAX_ROWS` whatever is asked for, so a client cannot widen a bound (F12).
+#[derive(Debug, Default, Deserialize)]
+struct MapQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl MapQuery {
+    fn limit(&self) -> usize {
+        self.limit
+            .unwrap_or(atlas_db::MAX_ROWS)
+            .min(atlas_db::MAX_ROWS)
+    }
+
+    /// The `?source=` a source-addressed read needs, or a 400 naming it.
+    fn source(&self) -> Result<&str, MapRefusal> {
+        self.source
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "source_required",
+                    "this map read addresses one source: pass ?source=<name>",
+                ))
+            })
+    }
+
+    /// The `?name=` a symbol-addressed read needs, or a 400 naming it.
+    fn name(&self) -> Result<&str, MapRefusal> {
+        self.name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "name_required",
+                    "this map read addresses one symbol: pass ?name=<symbol>",
+                ))
+            })
+    }
+}
+
+/// What every map/intelligence response says when nothing has been scanned.
+///
+/// An explicit shape rather than an empty list, because "no source has been
+/// indexed on this host" and "this source has nothing in it" are different
+/// answers and a client that could not tell them apart would report the wrong
+/// one.
+///
+/// `present: false` says this host holds no Atlas evidence. Since S5 W1c that
+/// is no longer the same sentence as "the file does not exist" — A1 §5's one
+/// database also carries `ops`, so it exists wherever a daemon has started —
+/// and [`with_atlas`] reads the claim off confirmed generations instead. The
+/// wording did not change because the question did not.
+fn atlas_absent() -> Response {
+    Json(json!({
+        "atlas": {"present": false},
+        "sources": [],
+        "detail": "no source has been indexed on this host yet",
+    }))
+    .into_response()
+}
+
+/// One source's status, as `sgt intelligence status` renders it (F8).
+///
+/// `provenance` is present only for an `external_git` source (A1 §9, S4 Y5)
+/// — every other kind's row omits the key entirely rather than carrying an
+/// explicit `null`, the same "absence over a false null" rule
+/// [`intelligence_status`]'s own sibling handlers already follow for
+/// `revision`.
+fn source_status_json(status: &SourceStatus) -> Value {
+    let mut value = json!({
+        "source": status.source_name,
+        "kind": status.kind.as_str(),
+        "authority": status.authority.as_str(),
+        "generation": status.generation_id,
+        "content_key": status.content_key,
+        "observed_at": status.observed_at,
+        "extractors": status.extractors,
+        "files": status.files,
+        "units": status.units,
+        "symbols": status.symbols,
+        "occurrences": status.occurrences,
+        "edges": status.edges,
+        "datasets": status.datasets,
+        "row_units": status.row_units,
+        "coverage": status.coverage,
+    });
+    if let Some(provenance) = &status.provenance
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "provenance".to_string(),
+            json!({
+                "origin": provenance.origin,
+                "requested_ref": provenance.requested_ref,
+                "resolved_commit": provenance.resolved_commit,
+                "retrieved_at": provenance.retrieved_at,
+            }),
+        );
+    }
+    value
+}
+
+/// `GET /v1/intelligence/status` — F8's coverage, per indexed source.
+async fn intelligence_status(State(state): State<ApiState>) -> Response {
+    match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sources)) => Json(json!({
+            "atlas": {"present": true},
+            "sources": sources.iter().map(source_status_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ScanRequest {
+    command_id: String,
+    /// D4: the estate this scan addresses — every declared `[[repo]]`
+    /// repository, every declared `[[knowledge]]` source, and every
+    /// external-Git source already recorded on this host (S4 Y6, G8
+    /// correction: widened from `[[knowledge]]` alone — see
+    /// [`intelligence_scan`]'s own doc).
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
+}
+
+/// Open (creating if absent) the mutable Atlas handle under `state.atlas`'s
+/// lock, run `f`, and turn a store failure into this file's one error shape.
+/// The write-side twin of [`with_atlas`] — that function refuses to create
+/// the file for a mere read; a scan is the one call site allowed to bring
+/// the store into existence, because writing to it is the entire point of
+/// calling this.
+async fn with_atlas_write<T>(
+    state: &ApiState,
+    f: impl FnOnce(&mut AtlasDb) -> T,
+) -> Result<T, AtlasError> {
+    let mut guard = state.atlas.lock().await;
+    if guard.is_none() {
+        *guard = Some(state.analytics.lock().await.atlas()?);
+    }
+    Ok(f(guard.as_mut().expect("opened above")))
+}
+
+/// [`with_atlas_write`] for a hook that must stay invisible on an
+/// installation that indexes nothing — `Ok(None)` there, having written
+/// nothing.
+///
+/// Same posture as the read-only [`with_atlas`], and the same S5 W1c
+/// restatement of what it is read off: the guard used to be the absence of
+/// the Atlas file (R1 — a daemon-side hook that fires on every Work must not
+/// give a fresh install a database as a side effect), and A1 §5's one
+/// database exists on every host from the daemon's first start. So the guard
+/// became the evidence: a hook fires only where some source already has a
+/// confirmed generation. An estate that has indexed nothing gets no overlay
+/// generation, exactly as before — what it no longer gets is a *file* that
+/// was never really the subject of the promise.
+async fn with_existing_atlas_write<T>(
+    state: &ApiState,
+    f: impl FnOnce(&mut AtlasDb) -> T,
+) -> Result<Option<T>, AtlasError> {
+    let mut guard = state.atlas.lock().await;
+    if guard.is_none() {
+        if !crate::runtime::atlas::db::atlas_db_path(&state.data_dir).exists() {
+            return Ok(None);
+        }
+        *guard = Some(state.analytics.lock().await.atlas()?);
+    }
+    let atlas = guard.as_mut().expect("opened above");
+    if atlas.indexed_sources()?.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(f(atlas)))
+}
+
+/// S5 W1b/W1d — which Work-overlay action one settled engine step implies.
+///
+/// [`Self::Bind`] and [`Self::Evict`] are the two ends of the lifetime
+/// [`crate::runtime::atlas::overlay`]'s module doc already claims for an
+/// overlay ("scoped to one Work, and evicted with it") and which was, until
+/// W1b, prose with nothing enforcing it. [`Self::Refresh`] is W1d's
+/// addition and is the only one of the three that fires **while the Work is
+/// still running** — which is what A2 §2's "current Work's world, including
+/// overlay" actually asks for: a freshly cut worktree is byte-identical to
+/// its base, so a bind-only trigger records an empty overlay and `--work`
+/// never reflects anything the Work did.
+#[derive(Debug)]
+enum WorkOverlayHook {
+    /// The surface exists and is bound — materialized for the first time,
+    /// or re-materialized for a retry. Scan it as an overlay over its
+    /// admission-pinned base.
+    Bind(Box<WorkSurface>),
+    /// A **turn boundary** passed and the surface is still bound: the actor
+    /// stopped producing, so whatever it changed is now on disk and settled.
+    /// Scan it again, exactly as [`Self::Bind`] does.
+    ///
+    /// Distinguished from `Bind` only so that
+    /// [`spawn_work_overlay_hook`] can **coalesce** it: a refresh is by
+    /// construction superseded by the next one, whereas a bind and an
+    /// eviction are lifecycle facts that must each be applied.
+    Refresh(Box<WorkSurface>),
+    /// The surface is gone. Evict this Work's overlay generations with it.
+    Evict,
+}
+
+impl WorkOverlayHook {
+    /// Whether a hook of this kind may be dropped when one is already
+    /// queued for the same Work — see [`WorkOverlayHook::Refresh`].
+    fn coalesces(&self) -> bool {
+        matches!(self, Self::Refresh(_))
+    }
+}
+
+/// Whether a settled observation ended a **turn**.
+///
+/// [`BackendSignal::Running`] is the poll that found the actor still
+/// producing: its surface is mid-write and scanning it would index a
+/// half-written tree at an arbitrary instant. Every other signal is the
+/// actor having stopped — completed the stage, asked a question, parked on
+/// a wait, blocked, or failed — which is the moment the surface is as
+/// settled as it will get without the Work ending.
+///
+/// **This is why W1d needed no scan interval.** A rescan *loop* would need
+/// a period, and a period is a number with no measurement behind it; a turn
+/// boundary is the actor's own rhythm, self-limiting at exactly one scan
+/// per turn, and it is the moment at which the thing being described has
+/// stopped moving.
+fn is_turn_boundary(signal: Option<&BackendSignal>) -> bool {
+    !matches!(signal, None | Some(BackendSignal::Running))
+}
+
+/// S5 W1d's refresh moment, applied to one settled step.
+///
+/// A turn boundary is adjudicated in three places, not one — the engine's
+/// own doc on [`crate::runtime::engine::PendingObserve`] lists them:
+/// launch-settle and SEND-settle each carry the observation of the turn
+/// they themselves started, and the completion driver's OBSERVE covers the
+/// turn nothing else was watching. All three route here so that a Work
+/// which never goes through the poller (a scripted, fast-answering actor)
+/// is refreshed exactly as one that does.
+///
+/// The surface is read from the journal-backed registry — the same
+/// [`WorkSurface`] the bind hook was handed, never a path reconstructed
+/// here. A run with no materialized surface has nothing to scan and is
+/// skipped, exactly as a failed materialization is.
+/// Acquire the core, settle one performed effect against it, and refresh the
+/// Work-overlay if that settle both ended a turn and actually landed
+/// (F-SI-02): the shape shared by Launch-settle, SEND-settle, OBSERVE-settle,
+/// and the execution-lane background launch, which otherwise repeated this
+/// acquire/settle/refresh/return sequence almost verbatim, differing only in
+/// which `settle_*` method the caller closes over.
+async fn settle_turn<'a, F>(
+    state: &'a ApiState,
+    work_id: String,
+    ended_a_turn: bool,
+    settle: F,
+) -> (String, Result<Step, EngineError>, CoreGuard<'a>)
+where
+    F: FnOnce(&mut Core) -> Result<Step, EngineError>,
+{
+    let mut core = CoreGuard::acquire(&state.core).await;
+    let settled = settle(&mut core);
+    refresh_overlay_after_turn(state, &core, &work_id, ended_a_turn && settled.is_ok());
+    (work_id, settled, core)
+}
+
+fn refresh_overlay_after_turn(
+    state: &ApiState,
+    core: &CoreGuard<'_>,
+    work_id: &str,
+    ended_a_turn: bool,
+) {
+    if !ended_a_turn {
+        return;
+    }
+    let Some(surface) = core
+        .registry
+        .state()
+        .runs
+        .get(work_id)
+        .and_then(|run| run.surface.clone())
+    else {
+        return;
+    };
+    spawn_work_overlay_hook(
+        state,
+        work_id.to_string(),
+        WorkOverlayHook::Refresh(Box::new(surface)),
+    );
+}
+
+/// Read the lifecycle action off a settled [`SurfaceOutcome`].
+///
+/// A *failed* materialization is deliberately no action: there is no bound
+/// surface to scan, and nothing was written that needs evicting. A
+/// re-materialization that found every worktree already on disk
+/// (`Rematerialized(Ok(None))`) is also no action — the surface was never
+/// unbound, so the overlay standing from its last scan is still the answer
+/// this Work's own lifecycle produced, and the next turn boundary
+/// ([`is_turn_boundary`], S5 W1d) refreshes it without a second bind hook
+/// here.
+fn work_overlay_hook_for(outcome: &SurfaceOutcome) -> Option<WorkOverlayHook> {
+    match outcome {
+        SurfaceOutcome::Materialized(Ok(surface)) => {
+            Some(WorkOverlayHook::Bind(Box::new(surface.clone())))
+        }
+        SurfaceOutcome::Rematerialized(Ok(Some(surface))) => {
+            Some(WorkOverlayHook::Bind(Box::new(surface.clone())))
+        }
+        SurfaceOutcome::TornDown(..) => Some(WorkOverlayHook::Evict),
+        _ => None,
+    }
+}
+
+/// The most recent overlay hook task per Work, so the next one can wait for
+/// it (S5 W1b).
+///
+/// **This is an ordering invariant, not an optimization.** A Work's bind
+/// hook runs a whole repository extraction; its teardown hook evicts. Both
+/// are detached, so without this chain a short-lived Work could tear down
+/// while its bind scan was still walking — the eviction would find nothing,
+/// the scan would then write an overlay generation for a surface that no
+/// longer exists, and `--work` would answer about it forever. Registration
+/// is synchronous at spawn time, so the chain is in true lifecycle order
+/// rather than in whatever order the runtime happens to poll two tasks.
+///
+/// Bounded rather than unbounded: every spawn drops the handles that have
+/// already finished, so the map holds at most one entry per Work with a
+/// hook still in flight, plus recently-finished ones until the next spawn
+/// sweeps them.
+///
+/// The bool beside each handle is "the hook this entry belongs to is a
+/// coalescing one" ([`WorkOverlayHook::coalesces`]) — W1d's bound on the
+/// chain's own length. Without it a Work whose turns end faster than its
+/// overlay scans complete would grow the chain without limit, and, worse,
+/// would queue its own teardown eviction behind every stale scan ahead of
+/// it. A refresh that is already waiting is by construction superseded by
+/// the one that would follow it, so the newer one is dropped rather than
+/// appended; a bind and an eviction never are.
+static WORK_OVERLAY_HOOKS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, QueuedHook>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
+
+/// One Work's most recently spawned overlay hook — see [`WORK_OVERLAY_HOOKS`].
+struct QueuedHook {
+    /// The task itself; the next hook for this Work awaits it before
+    /// running, which is the ordering invariant the chain exists for.
+    handle: tokio::task::JoinHandle<()>,
+    /// Whether the hook this entry belongs to may be superseded
+    /// ([`WorkOverlayHook::coalesces`]).
+    coalescing: bool,
+    /// Flipped to `true` by the hook itself the instant it actually begins
+    /// reading the surface (F-IN-01), never by `spawn_work_overlay_hook`.
+    ///
+    /// `coalescing` alone is a static property of the hook *variant* and
+    /// stays `true` for the entry's whole life, so it cannot tell "still
+    /// waiting on the chain, hasn't started scanning yet" (safe to drop a
+    /// newer refresh — the survivor will read the surface no earlier than
+    /// the dropped one would have) from "already mid-scan" (NOT safe: the
+    /// survivor may already be reading the tree when the newer turn's edit
+    /// lands, and dropping the newer refresh loses the only scan that would
+    /// have caught it). The coalescing guard below checks this flag, not
+    /// just `coalescing`.
+    started: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Run the hook detached, never on the crank's own thread of control.
+///
+/// The crank holds the core lock when it calls this, and an overlay scan is
+/// a full extraction of a repository tree. Doing it inline would put a
+/// repository walk under the daemon's core guard — the exact hazard
+/// [`crate::runtime::engine::PendingSurface`]'s own doc exists about — so
+/// the hook is spawned and the crank returns. The Work's own progress never
+/// waits on its overlay.
+///
+/// Detached, but **ordered per Work**: see [`WORK_OVERLAY_HOOKS`].
+fn spawn_work_overlay_hook(state: &ApiState, work_id: String, hook: WorkOverlayHook) {
+    let state = state.clone();
+    let mut chain = WORK_OVERLAY_HOOKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    chain.retain(|_, queued| !queued.handle.is_finished());
+    let coalescing = hook.coalesces();
+    // F-IN-01: only a survivor that has **not yet started reading the
+    // surface** makes dropping this one safe — see `QueuedHook::started`'s
+    // doc for why `coalescing` alone cannot tell the two cases apart.
+    if coalescing
+        && chain.get(&work_id).is_some_and(|queued| {
+            queued.coalescing && !queued.started.load(std::sync::atomic::Ordering::Relaxed)
+        })
+    {
+        // Superseded before it started: the refresh already queued (and
+        // confirmed not yet mid-scan) will read the surface no earlier than
+        // this one would have, and the next turn boundary schedules
+        // another. Dropped, never appended — see [`WORK_OVERLAY_HOOKS`].
+        tracing::debug!(
+            work_id = %work_id,
+            "an overlay refresh is already queued for this Work; coalescing this one into it"
+        );
+        return;
+    }
+    let previous = chain.remove(&work_id).map(|queued| queued.handle);
+    let key = work_id.clone();
+    let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_started = started.clone();
+    let handle = tokio::spawn(async move {
+        if let Some(previous) = previous {
+            // A panicked predecessor is still a completed predecessor for
+            // ordering purposes; its own failure is reported where it
+            // happened, not swallowed here.
+            let _ = previous.await;
+        }
+        run_work_overlay_hook(state, work_id, hook, hook_started).await;
+    });
+    chain.insert(
+        key,
+        QueuedHook {
+            handle,
+            coalescing,
+            started,
+        },
+    );
+}
+
+/// **The production trigger for Work-overlay evidence** (S5 W1b, closing
+/// §17 item 2's `met-with-deviation` gap and its tripwire).
+///
+/// H13.2 chose the daemon-side lifecycle hook over query-time scanning
+/// precisely so that `sgt search` stays a pure reader: the daemon remains
+/// the sole writer, and nothing on any query path touches a Work surface.
+/// This is that hook.
+///
+/// ```text
+/// surface bound (materialize / rematerialize)   [W1b]
+///     -> scan_work_overlay_on_lane      one intelligence-lane permit, blocking pool (F6)
+///        -> record_scan                 the ordinary staged/journaled/confirmed write
+/// a turn ended and the surface is still bound   [W1d]
+///     -> the same two steps again       coalescing (see `WORK_OVERLAY_HOOKS`)
+/// surface torn down                             [W1b]
+///     -> AtlasDb::evict_work_overlays   a `generation_evicted` coverage row per generation
+/// ```
+///
+/// # Freshness: this is where the snapshot semantic comes from
+///
+/// **W1b bound this to the surface lifecycle alone, and that was not
+/// enough.** A worktree is cut byte-identical to its base, so the only
+/// overlay a bind can ever record is an *empty* one: `--work` answered with
+/// the base generation and an honestly-labelled snapshot of nothing, while
+/// A2 §2 names `--work` as the "current Work's world, **including
+/// overlay**". W1d added the [`WorkOverlayHook::Refresh`] moment above so
+/// the sentence is true of the code.
+///
+/// The overlay half is therefore *as of the end of the Work's last
+/// completed turn* — not "live". A Work is mutating its surface throughout
+/// a turn, and scanning mid-turn would index a half-written tree; the
+/// boundary is where the actor has stopped. That instant is still carried
+/// on the answer by
+/// [`crate::runtime::atlas::db::WorkScope::BaseAndOverlaySnapshot`] rather
+/// than left for a reader to assume, exactly as W1b left it — a fresher
+/// moment moves the instant, it does not turn the marker into a claim of
+/// currency.
+///
+/// # Cost, measured rather than asserted
+///
+/// One scan is a repository extraction (base tree listing, one `git diff`,
+/// a batched blob read of the unchanged half). Measured 2026-08-29 against
+/// this estate's own `sergeant-rs` mount — 400 tracked files, 178 indexed —
+/// at **~0.72 s release / ~1.93 s debug per scan, flat in the number of
+/// changed paths** (`tests/w1d_overlay_scan_measurement.rs`, figures in the
+/// estate's `knowledge/evidence/perf/`). A turn boundary is minutes apart,
+/// the scan is detached from the crank and bounded by the intelligence
+/// lane's own permit, and the chain coalesces refreshes — so per-turn was
+/// affordable at that corpus and no narrower incremental scan was built
+/// (R1). The measurement is of one corpus on one host and says nothing
+/// about a repository two orders of magnitude larger; the coalescing bound
+/// is what keeps *that* case from queueing scans behind a teardown rather
+/// than an unmeasured interval knob.
+///
+/// # Nothing is created for an installation that indexes nothing
+///
+/// Both halves go through [`with_existing_atlas_write`]: no Atlas store file,
+/// no scan and no store (R1). An estate that has never run `sgt
+/// intelligence scan` holds no base generation for `--work` to compose an
+/// overlay against, and gains neither a database nor a repository walk from
+/// running a Work. **Stated, not silent**: the consequence is that an
+/// estate which starts indexing *after* a Work is already bound sees that
+/// Work's overlay only at its next turn boundary or bind, and `--work` reports
+/// [`WorkScope::BaseOnly`](crate::runtime::atlas::db::WorkScope::BaseOnly)
+/// until then — which is exactly true, and is the whole point of carrying
+/// the scope on the answer.
+async fn run_work_overlay_hook(
+    state: ApiState,
+    work_id: String,
+    hook: WorkOverlayHook,
+    started: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let surface = match hook {
+        WorkOverlayHook::Evict => {
+            match with_existing_atlas_write(&state, |atlas| atlas.evict_work_overlays(&work_id))
+                .await
+            {
+                Ok(Some(Ok(evicted))) if !evicted.is_empty() => {
+                    tracing::info!(
+                        work_id = %work_id,
+                        generations = evicted.len(),
+                        "evicted this Work's overlay generations with its surface"
+                    );
+                }
+                Ok(Some(Err(e))) => tracing::error!(
+                    work_id = %work_id, error = %e,
+                    "evicting this Work's overlay generations failed"
+                ),
+                Err(e) => tracing::error!(
+                    work_id = %work_id, error = %e,
+                    "opening atlas to evict this Work's overlay generations failed"
+                ),
+                Ok(None) | Ok(Some(Ok(_))) => {}
+            }
+            return;
+        }
+        WorkOverlayHook::Bind(surface) | WorkOverlayHook::Refresh(surface) => surface,
+    };
+
+    // Read, not create: an installation with no Atlas store indexes nothing,
+    // so a Work binding a surface must not conjure one (see this function's
+    // own doc).
+    match with_existing_atlas_write(&state, |_| ()).await {
+        Ok(Some(())) => {}
+        Ok(None) => return,
+        Err(e) => {
+            tracing::error!(work_id = %work_id, error = %e, "opening atlas for the Work-overlay hook failed");
+            return;
+        }
+    }
+
+    // F-IN-01: from here on this task is actually reading the surface (a
+    // git tree listing, diff, and blob read per binding, next), so a newer
+    // coalescing hook queued for this Work must no longer be dropped on the
+    // assumption that this scan hasn't started yet.
+    started.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    for binding in &surface.bindings {
+        let overlay = WorkOverlay {
+            work_id: work_id.clone(),
+            repository: binding.repository.clone(),
+            surface: binding.worktree_path.clone(),
+            base_sha: binding.base_sha.clone(),
+            // Per-source ignore globs are an estate-git source's own
+            // declaration; the estate-scoped scan trigger above passes none
+            // either, and inventing a different deny set for the overlay
+            // half would make an overlay and a base scan of the same tree
+            // disagree about what was acquired.
+            ignore: Vec::new(),
+        };
+        let scanned = match scan_work_overlay_on_lane(&state.engine, overlay).await {
+            Ok(scanned) => scanned,
+            Err(e) => {
+                // Degrade to base-only, reported — never a failed query and
+                // never a silent full result. The coverage row lands on the
+                // overlay generation that survived the attempt; when there
+                // is none, there is no generation to attach one to and
+                // `--work` correctly reports `BaseOnly` (see
+                // `AtlasDb::record_overlay_unavailable`).
+                let source_name = overlay_source_name(&work_id, &binding.repository);
+                let detail = format!("the Work surface could not be read as an overlay: {e}");
+                tracing::error!(
+                    work_id = %work_id, repository = %binding.repository, error = %e,
+                    "scanning this Work's surface as an overlay failed; --work stays base-only \
+                     for this repository"
+                );
+                let recorded = with_existing_atlas_write(&state, |atlas| {
+                    atlas.record_overlay_unavailable(&source_name, &detail)
+                })
+                .await;
+                if let Err(e) | Ok(Some(Err(e))) = recorded {
+                    tracing::error!(
+                        work_id = %work_id, error = %e,
+                        "recording the overlay scan failure as coverage also failed"
+                    );
+                }
+                continue;
+            }
+        };
+        let mut core = CoreGuard::acquire(&state.core).await;
+        // **S6 D1 — whose world is this overlay?** A Work's surface belongs to
+        // exactly one estate, and `WorkIndexRow::estate_root` is where that
+        // coordinate already lives (H1 touch point #6: folded once from the
+        // `work.submitted` envelope's `workspace_id`). Read it rather than
+        // inventing one — and read it under the `CoreGuard` this arm was
+        // already taking, never a second one of its own. An extra acquire on
+        // this path is an extra acquire on the *surface-bind* path, which is
+        // the submission burst path: `tests/m2_daemon_api.rs::
+        // t12_submission_throughput_has_an_automated_floor` measured exactly
+        // that regression when this read had its own guard (14-15 units
+        // against a 12.0 ceiling on an idle host, base 4.6 s → 8.2 s), and
+        // passes with the read folded in here.
+        //
+        // A Work with **no** recorded estate root — a pre-Phase-C line still
+        // in the journal — gets no overlay generation at all, and `--work`
+        // reports `BaseOnly` for it, which is exactly true. There is no
+        // estate an overlay of unknown provenance could honestly be admitted
+        // from, and an unbound generation is inadmissible everywhere anyway,
+        // so writing one would only be a lie with rows behind it.
+        let estate_root = core
+            .registry
+            .state()
+            .work_index
+            .get(&work_id)
+            .and_then(|row| row.estate_root.clone());
+        let Some(estate_root) = estate_root else {
+            tracing::error!(
+                work_id = %work_id,
+                "this Work records no estate root, so its surface cannot be bound to an \
+                 estate; no overlay generation is written and `--work` stays base-only"
+            );
+            continue;
+        };
+        let estate_binding = crate::domain::source::EstateBinding::Estate(estate_root);
+        let recorded = with_existing_atlas_write(&state, |atlas| {
+            record_scan(
+                atlas,
+                &mut core.journal,
+                &scanned.scan,
+                None,
+                &estate_binding,
+            )
+        })
+        .await;
+        // The scan appended `source.scanned` straight to the journal;
+        // the registry has to be caught up before this hold ends or the
+        // next `Core::commit` fails on contiguity.
+        if let Err(e) = core.absorb_journaled() {
+            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+        }
+        drop(core);
+        match recorded {
+            Ok(Some(Ok(record))) => tracing::info!(
+                work_id = %work_id, repository = %binding.repository,
+                changed = scanned.changed.len(), record = ?record,
+                "recorded this Work's surface as an overlay over its admission-pinned base"
+            ),
+            Ok(Some(Err(e))) => tracing::error!(
+                work_id = %work_id, repository = %binding.repository, error = %e,
+                "recording this Work's overlay scan failed"
+            ),
+            Err(e) => tracing::error!(
+                work_id = %work_id, error = %e,
+                "opening atlas to record this Work's overlay scan failed"
+            ),
+            Ok(None) => {}
+        }
+    }
+}
+
+/// `POST /v1/intelligence/scan` — **estate-scoped** (S4 Y6, G8 correction of
+/// S4 Y5's own G8): a full scan of everything the addressed estate
+/// declares, across all three A1 §2 source kinds, on the intelligence lane,
+/// bounded by the lane's own concurrency (each source's walk acquires its
+/// own permit). Reports what was indexed and what was not **from each
+/// source's own coverage counts**, never a guess.
+///
+/// ```text
+/// estate_git       every [[repo]] repository, through the Git path
+///                  (scan_estate_git_on_lane) at its mount's own committed
+///                  HEAD — never the folder walker. Repository bytes losing
+///                  blob-OID keys, the pinned SHA, Work overlays and drift
+///                  observation by being routed through a directory walk is
+///                  the bug this correction exists to close (the owner
+///                  ruling this wave carries: `estate-intelligence-is-the-
+///                  feature-2026-08-28.md`), not an accepted alternative.
+/// local_knowledge  every [[knowledge]] source, through the folder walker
+///                  (scan_local_knowledge_on_lane) — S4 Y5's own G8,
+///                  unchanged.
+/// external_git     every external-Git source already recorded on this
+///                  host, refreshed through Y5's acquisition
+///                  (acquire_external_git_on_lane). Host-scoped, not
+///                  estate-scoped (A1 §9: intelligence_add_source's own
+///                  doc) — Atlas has no per-estate association for these
+///                  yet, so an estate-scoped scan refreshes every one this
+///                  host holds. Named here rather than silently assumed: a
+///                  finer per-estate binding is unbuilt scope.
+/// ```
+///
+/// **A missing or invalid `[[repo]]` mount fails the whole request before
+/// any of this runs** — `Estate::from_config_allow_empty` already refuses a
+/// declared repository whose mount does not validate (§6.1's
+/// `validate_mount`, called at estate-parse time, above), the same
+/// `422 invalid_estate` every other estate-scoped route gives that failure.
+/// The per-source error row below is for what estate parsing cannot catch:
+/// a validated mount with no commits yet (`git rev-parse HEAD` on a
+/// freshly-`init`'d repository has nothing to resolve), or a mount removed
+/// in the window between that validation and this scan actually reading it
+/// — reported as its own row rather than failing the whole scan, the same
+/// one-bad-source-does-not-block-the-rest posture the knowledge path
+/// already had.
+///
+/// Scheduling and cadence are deliberately not here (G10): one call, one
+/// scan, one report — a recurring trigger is a later wave's, when retrieval
+/// needs one.
+async fn intelligence_scan(
+    State(state): State<ApiState>,
+    body: Result<Json<ScanRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let root = match estate_root_or_error(&state, req.estate_root.as_deref(), "scanning") {
+        Ok(root) => root,
+        Err((status, body)) => return (status, Json(body)).into_response(),
+    };
+    // **S6 D1 — A2 §2 stage 1's estate coordinate.** `root` is the canonical
+    // exact estate root this request addressed (`admit_addressed_estate`), and
+    // it is the same string `SearchQuery::admissibility` binds at query time —
+    // one resolver, one spelling, so a recorded binding and a queried
+    // admission cannot drift apart.
+    let estate_binding =
+        crate::domain::source::EstateBinding::Estate(root.to_string_lossy().into_owned());
+    let estate =
+        match Estate::from_config_allow_empty(&root.join(crate::domain::estate::MANIFEST_FILE)) {
+            Ok(estate) => estate,
+            Err(e) => {
+                return error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "invalid_estate",
+                    e.to_string(),
+                );
+            }
+        };
+
+    // Read, not create (R1): a fresh install with nothing scanned yet must
+    // not gain an Atlas store file merely to learn there is nothing to
+    // refresh.
+    let external_sources: Vec<SourceStatus> =
+        match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+            Ok(Some(sources)) => sources
+                .into_iter()
+                .filter(|s| s.kind == SourceKind::ExternalGit)
+                .collect(),
+            Ok(None) => Vec::new(),
+            Err(resp) => return *resp,
+        };
+
+    if estate.repositories.is_empty() && estate.knowledge.is_empty() && external_sources.is_empty()
+    {
+        return Json(json!({
+            "scanned": [],
+            "detail": "no [[repo]] repositories, [[knowledge]] sources, or external Git \
+                       sources are declared for this estate",
+        }))
+        .into_response();
+    }
+
+    let mut report = Vec::new();
+
+    // ---- estate_git: registered repos, through the Git path at the
+    // mount's own committed HEAD (X3a's plumbing) — never the folder
+    // walker. `git rev-parse HEAD` is plain plumbing, not extraction, so it
+    // runs on a blocking-safe worker (`blocking`) rather than under the
+    // intelligence lane's permit; the lane still bounds the extraction
+    // itself via `scan_estate_git_on_lane`.
+    let mut repo_walks = tokio::task::JoinSet::new();
+    for spec in &estate.repositories {
+        let engine = state.engine.clone();
+        let name = spec.name.clone();
+        let mount = spec.path.clone();
+        repo_walks.spawn(async move {
+            let pin_mount = mount.clone();
+            let pinned =
+                blocking(move || crate::runtime::git::git(&pin_mount, &["rev-parse", "HEAD"]))
+                    .await;
+            let pinned_sha = match pinned {
+                Ok(sha) => sha,
+                Err(e) => {
+                    return (
+                        name,
+                        Err(format!("cannot resolve the mount's pinned HEAD: {e}")),
+                    );
+                }
+            };
+            let source = EstateGitSource {
+                name: name.clone(),
+                mount,
+                pinned_sha,
+                ignore: Vec::new(),
+            };
+            let outcome = scan_estate_git_on_lane(&engine, source)
+                .await
+                .map_err(|e| e.to_string());
+            (name, outcome)
+        });
+    }
+    while let Some(joined) = repo_walks.join_next().await {
+        let (name, outcome) = match joined {
+            Ok(pair) => pair,
+            Err(e) => {
+                report.push(json!({
+                    "source": "?", "kind": "estate_git",
+                    "error": format!("scan task panicked: {e}"),
+                }));
+                continue;
+            }
+        };
+        let scanned = match outcome {
+            Ok(scanned) => scanned,
+            Err(e) => {
+                report.push(json!({"source": name, "kind": "estate_git", "error": e}));
+                continue;
+            }
+        };
+        let counts = scanned.scan.counts();
+        let mut core = CoreGuard::acquire(&state.core).await;
+        let outcome = with_atlas_write(&state, |atlas| {
+            record_scan(
+                atlas,
+                &mut core.journal,
+                &scanned.scan,
+                None,
+                &estate_binding,
+            )
+        })
+        .await;
+        // The scan appended `source.scanned` straight to the journal;
+        // the registry has to be caught up before this hold ends or the
+        // next `Core::commit` fails on contiguity.
+        if let Err(e) = core.absorb_journaled() {
+            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+        }
+        drop(core);
+        match outcome {
+            Ok(Ok(record)) => report.push(scan_record_json(
+                "estate_git",
+                &name,
+                &record,
+                &counts,
+                scanned.drift.as_ref(),
+            )),
+            Ok(Err(e)) => {
+                report.push(json!({"source": name, "kind": "estate_git", "error": e.to_string()}))
+            }
+            Err(e) => report.push(json!({
+                "source": name, "kind": "estate_git", "error": format!("atlas unavailable: {e}"),
+            })),
+        }
+    }
+
+    // ---- local_knowledge: declared [[knowledge]] sources, through the
+    // folder walker (S4 Y5, G8 — unchanged). Bounded concurrency: one task
+    // per source, each queueing on the intelligence lane's own semaphore —
+    // the lane's existing promise (F6), not a second concurrency cap
+    // invented here.
+    let mut knowledge_walks = tokio::task::JoinSet::new();
+    for spec in &estate.knowledge {
+        let engine = state.engine.clone();
+        let source = KnowledgeSource::from(spec);
+        let name = source.name.clone();
+        knowledge_walks.spawn(async move {
+            (
+                name,
+                scan_local_knowledge_on_lane(&engine, source)
+                    .await
+                    .map_err(|e| e.to_string()),
+            )
+        });
+    }
+    while let Some(joined) = knowledge_walks.join_next().await {
+        let (name, outcome) = match joined {
+            Ok(pair) => pair,
+            Err(e) => {
+                report.push(json!({
+                    "source": "?", "kind": "local_knowledge",
+                    "error": format!("scan task panicked: {e}"),
+                }));
+                continue;
+            }
+        };
+        let scan = match outcome {
+            Ok(scan) => scan,
+            Err(e) => {
+                report.push(json!({"source": name, "kind": "local_knowledge", "error": e}));
+                continue;
+            }
+        };
+        let counts = scan.counts();
+        // One `CoreGuard` acquire covers the whole of `record_scan`'s three
+        // steps (stage, journal, confirm — R2, not re-derived here): the
+        // journal's own summary write needs `&mut core.journal`, and the
+        // guard's `Drop` is what fsyncs it durable before this loop moves to
+        // the next source.
+        let mut core = CoreGuard::acquire(&state.core).await;
+        let outcome = with_atlas_write(&state, |atlas| {
+            record_scan(atlas, &mut core.journal, &scan, None, &estate_binding)
+        })
+        .await;
+        // The scan appended `source.scanned` straight to the journal;
+        // the registry has to be caught up before this hold ends or the
+        // next `Core::commit` fails on contiguity.
+        if let Err(e) = core.absorb_journaled() {
+            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+        }
+        drop(core);
+        match outcome {
+            Ok(Ok(record)) => report.push(scan_record_json(
+                "local_knowledge",
+                &name,
+                &record,
+                &counts,
+                None,
+            )),
+            Ok(Err(e)) => report
+                .push(json!({"source": name, "kind": "local_knowledge", "error": e.to_string()})),
+            Err(e) => report.push(json!({
+                "source": name, "kind": "local_knowledge",
+                "error": format!("atlas unavailable: {e}"),
+            })),
+        }
+    }
+
+    // ---- external_git: sources already recorded on this host (A1 §9),
+    // refreshed through Y5's own acquisition.
+    let mut external_walks = tokio::task::JoinSet::new();
+    for status in &external_sources {
+        let name = status.source_name.clone();
+        let Some(provenance) = status.provenance.clone() else {
+            // Cannot happen today: filtered to `ExternalGit` above, and
+            // `stage_external_git_scan` writes `git.provenance` in the same
+            // transaction as the generation it belongs to (db.rs's own
+            // atomic-write guarantee) — so every confirmed `external_git`
+            // generation has one. Surfaced rather than silently skipped in
+            // case that guarantee is ever weakened by a future migration.
+            report.push(json!({
+                "source": name, "kind": "external_git",
+                "error": "an external_git generation has no provenance row to refresh from",
+            }));
+            continue;
+        };
+        let locator = match locator::validate(&provenance.origin) {
+            Ok(locator) => locator,
+            Err(e) => {
+                report
+                    .push(json!({"source": name, "kind": "external_git", "error": e.to_string()}));
+                continue;
+            }
+        };
+        // `"HEAD"` is `intelligence_add_source`'s own sentinel for "nothing
+        // was requested" (A1-24's `ExternalGitProvenance::requested_ref`
+        // doc) — resolved back to `None` so a refresh asks for the remote's
+        // own default branch again, exactly as the original request did.
+        let requested_ref =
+            (provenance.requested_ref != "HEAD").then_some(provenance.requested_ref.clone());
+        let engine = state.engine.clone();
+        let source = ExternalGitSource {
+            name: name.clone(),
+            locator,
+            requested_ref,
+            cache_root: crate::runtime::atlas::external_git::default_cache_root(&state.data_dir),
+            ignore: Vec::new(),
+        };
+        external_walks.spawn(async move {
+            (
+                name,
+                acquire_external_git_on_lane(&engine, source)
+                    .await
+                    .map_err(|e| e.to_string()),
+            )
+        });
+    }
+    while let Some(joined) = external_walks.join_next().await {
+        let (name, outcome) = match joined {
+            Ok(pair) => pair,
+            Err(e) => {
+                report.push(json!({
+                    "source": "?", "kind": "external_git",
+                    "error": format!("scan task panicked: {e}"),
+                }));
+                continue;
+            }
+        };
+        let acquired = match outcome {
+            Ok(acquired) => acquired,
+            Err(e) => {
+                report.push(json!({"source": name, "kind": "external_git", "error": e}));
+                continue;
+            }
+        };
+        let counts = acquired.scan.counts();
+        let mut core = CoreGuard::acquire(&state.core).await;
+        let outcome = with_atlas_write(&state, |atlas| {
+            record_external_git_scan(atlas, &mut core.journal, &acquired, None)
+        })
+        .await;
+        // The scan appended `source.scanned` straight to the journal;
+        // the registry has to be caught up before this hold ends or the
+        // next `Core::commit` fails on contiguity.
+        if let Err(e) = core.absorb_journaled() {
+            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+        }
+        drop(core);
+        match outcome {
+            Ok(Ok(record)) => report.push(scan_record_json(
+                "external_git",
+                &name,
+                &record,
+                &counts,
+                None,
+            )),
+            Ok(Err(e)) => {
+                report.push(json!({"source": name, "kind": "external_git", "error": e.to_string()}))
+            }
+            Err(e) => report.push(json!({
+                "source": name, "kind": "external_git",
+                "error": format!("atlas unavailable: {e}"),
+            })),
+        }
+    }
+
+    Json(json!({"scanned": report})).into_response()
+}
+
+/// One [`ScanRecord`] rendered for `POST /v1/intelligence/scan`'s report —
+/// the outcome plus the coverage counts the report is required to answer
+/// from (G8), never a guess. `kind` is supplied by the caller rather than
+/// re-derived from `record` (`ScanRecord::Unchanged`/`RootUnavailable`
+/// carry no kind of their own), and `drift` rides beside the row exactly as
+/// it rides beside the scan (`EstateGitScan`'s own doc) — a fact about the
+/// mount, never folded into the generation.
+fn scan_record_json(
+    kind: &str,
+    source: &str,
+    record: &ScanRecord,
+    coverage: &BTreeMap<&'static str, u64>,
+    drift: Option<&crate::runtime::integrity::EstateDriftObservation>,
+) -> Value {
+    let coverage: BTreeMap<&str, u64> = coverage.clone();
+    let mut row = match record {
+        ScanRecord::Unchanged {
+            generation_id,
+            content_key,
+        } => json!({
+            "source": source, "kind": kind, "outcome": "unchanged",
+            "generation": generation_id, "content_key": content_key, "coverage": coverage,
+        }),
+        ScanRecord::RootUnavailable {
+            generation_id,
+            content_key,
+            detail,
+        } => json!({
+            "source": source, "kind": kind, "outcome": "root_unavailable",
+            "generation": generation_id, "content_key": content_key, "detail": detail,
+            "coverage": coverage,
+        }),
+        ScanRecord::Recorded {
+            generation_id,
+            content_key,
+            evicted,
+            ..
+        } => json!({
+            "source": source, "kind": kind, "outcome": "recorded",
+            "generation": generation_id, "content_key": content_key,
+            "evicted": evicted, "coverage": coverage,
+        }),
+    };
+    if let Some(drift) = drift
+        && let Some(object) = row.as_object_mut()
+    {
+        object.insert(
+            "drift".to_string(),
+            serde_json::to_value(drift).unwrap_or(Value::Null),
+        );
+    }
+    row
+}
+
+#[derive(Debug, Deserialize)]
+struct AddExternalGitRequest {
+    command_id: String,
+    url: String,
+    #[serde(rename = "ref", default)]
+    git_ref: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A safe default source name derived from a locator's final path segment
+/// (`.git` stripped), when that segment is itself
+/// [`crate::domain::is_plain_name`]. `None` when it is not — an operator
+/// whose locator's last segment is not a safe name must name the source
+/// explicitly rather than have one guessed at.
+fn default_source_name(locator: &str) -> Option<String> {
+    let last = locator.rsplit(['/', ':']).next().unwrap_or("");
+    let trimmed = last.strip_suffix(".git").unwrap_or(last);
+    if crate::domain::is_plain_name(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+/// `POST /v1/intelligence/sources` — S4 Y5's G6, item 10's acquisition
+/// surface: validate the locator, fetch it into this host's own bare cache
+/// under the intelligence lane's permit
+/// ([`acquire_external_git_on_lane`]) — which is where
+/// [`crate::runtime::git::git_fetch_restricted`]'s own #310 supervision
+/// runs — then record it exactly as any other source kind (A1 §9's
+/// provenance, staged atomically).
+///
+/// Host-scoped, not estate-scoped (Atlas itself is host-scoped —
+/// [`ApiState::data_dir`]'s own doc): no `estate_root` is read from the
+/// request at all.
+async fn intelligence_add_source(
+    State(state): State<ApiState>,
+    body: Result<Json<AddExternalGitRequest>, JsonRejection>,
+) -> Response {
+    let req = match parse_body(body) {
+        Ok(r) => r,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = parse_command_id(&req.command_id) {
+        return *resp;
+    }
+    let locator = match locator::validate(&req.url) {
+        Ok(locator) => locator,
+        Err(e) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_locator",
+                e.to_string(),
+            );
+        }
+    };
+    let name = match req.name.clone().or_else(|| default_source_name(&req.url)) {
+        Some(name) if crate::domain::is_plain_name(&name) => name,
+        Some(name) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_name",
+                format!("{name:?} is not a plain name"),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_name",
+                "no --name was given and the locator's own last segment is not a safe name",
+            );
+        }
+    };
+    let source = ExternalGitSource {
+        name,
+        locator,
+        requested_ref: req.git_ref.clone(),
+        cache_root: crate::runtime::atlas::external_git::default_cache_root(&state.data_dir),
+        ignore: Vec::new(),
+    };
+    let acquired = match acquire_external_git_on_lane(&state.engine, source).await {
+        Ok(acquired) => acquired,
+        Err(e) => {
+            return error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "acquisition_failed",
+                e.to_string(),
+            );
+        }
+    };
+    let coverage = acquired.scan.counts();
+    let mut core = CoreGuard::acquire(&state.core).await;
+    let recorded = with_atlas_write(&state, |atlas| {
+        record_external_git_scan(atlas, &mut core.journal, &acquired, None)
+    })
+    .await;
+    match recorded {
+        Ok(Ok(record)) => Json(scan_record_json(
+            "external_git",
+            &acquired.scan.source_name,
+            &record,
+            &coverage,
+            None,
+        ))
+        .into_response(),
+        Ok(Err(e)) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "atlas_unavailable",
+            e.to_string(),
+        ),
+        Err(e) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "atlas_unavailable",
+            e.to_string(),
+        ),
+    }
+}
+
+/// `GET /v1/intelligence/sources` — every declared external Git source,
+/// with its provenance (A1 §9): [`intelligence_status`]'s own list, filtered
+/// to `external_git`, the identical shape [`map_repos`] already gives
+/// `estate_git`.
+async fn intelligence_sources(State(state): State<ApiState>) -> Response {
+    match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sources)) => Json(json!({
+            "atlas": {"present": true},
+            "sources": sources
+                .iter()
+                .filter(|s| s.kind == SourceKind::ExternalGit)
+                .map(source_status_json)
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/repos` — the repository sources Atlas has indexed.
+///
+/// Repository sources only: a knowledge source is evidence about a directory,
+/// not a repository, and folding the two into one list would make the verb's
+/// name a lie. `sgt intelligence status` is the list of everything.
+async fn map_repos(State(state): State<ApiState>) -> Response {
+    match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sources)) => Json(json!({
+            "atlas": {"present": true},
+            "repos": sources
+                .iter()
+                .filter(|s| s.kind == SourceKind::EstateGit)
+                .map(source_status_json)
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/stats` — what the map actually holds, per source.
+async fn map_stats(State(state): State<ApiState>) -> Response {
+    match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sources)) => Json(json!({
+            "atlas": {"present": true},
+            "sources": sources.iter().map(source_status_json).collect::<Vec<_>>(),
+            "totals": {
+                "sources": sources.len(),
+                "files": sources.iter().map(|s| s.files).sum::<u64>(),
+                "units": sources.iter().map(|s| s.units).sum::<u64>(),
+                "symbols": sources.iter().map(|s| s.symbols).sum::<u64>(),
+                "occurrences": sources.iter().map(|s| s.occurrences).sum::<u64>(),
+                "edges": sources.iter().map(|s| s.edges).sum::<u64>(),
+                "datasets": sources.iter().map(|s| s.datasets).sum::<u64>(),
+                "row_units": sources.iter().map(|s| s.row_units).sum::<u64>(),
+            },
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/outline?source=<name>` — one source's titled structure units.
+async fn map_outline(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let source = match query.source() {
+        Ok(source) => source.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.outline(&source, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(units)) => Json(json!({
+            "atlas": {"present": true},
+            "source": source,
+            "limit": limit,
+            "outline": units.iter().map(|u| json!({
+                "path": u.relative_path,
+                "ordinal": u.ordinal,
+                "kind": u.kind.as_str(),
+                "level": u.heading_level,
+                "title": u.title,
+                "byte_start": u.byte_start,
+                "byte_end": u.byte_end,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/children?source=<name>` — one source's container children,
+/// with A1 §6.6's four preserved fields (S5 W7 F-SF-03).
+///
+/// The read path `source.child_resources` did not have. The parent
+/// coordinate is written per landed child and the entry content hash and
+/// entry adapter are deliberately not duplicated beside it — they live on
+/// the resource's own row and are joined back here — which is a design only
+/// as long as some bounded surface actually performs that join. A1-15 keeps
+/// arbitrary client SQL off the public surface, so a canned read is the only
+/// way those fields can be reached at all.
+async fn map_children(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let source = match query.source() {
+        Ok(source) => source.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.child_resources(&source, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(children)) => Json(json!({
+            "atlas": {"present": true},
+            "source": source,
+            "limit": limit,
+            "children": children.iter().map(|c| json!({
+                "path": c.relative_path,
+                "key": c.key,
+                "parent": c.parent_relative_path,
+                "parent_key": c.parent_key,
+                "entry_path": c.entry_path,
+                "content_hash": c.content_hash,
+                "extractor": c.extractor,
+                "lane": c.lane,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/facts?source=<name>` — the derived relational evidence one
+/// source's confirmed generation holds: every canned dataset query's stored
+/// answer, with the identity and output hash that make it checkable
+/// (A1 §6.4).
+///
+/// This is A2 §17 item 3's **relational** read, and it exists because that
+/// item asks for two things that must both be reachable from outside the
+/// process: a relational answer available *independently of text retrieval*,
+/// and one that *joins to retrieved row evidence*. The join key is
+/// `dataset_key`, which `sgt search --content row-text` already prints on
+/// every row hit; without this route the aggregate half of that join had no
+/// caller outside the test suite (S5 closeout F-AC-03).
+///
+/// It reads rows the store already holds — never a path a client named. The
+/// producer that opens a dataset file, `AtlasDb::dataset_probe`, is
+/// deliberately NOT routed here and its own doc says why.
+async fn map_facts(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let source = match query.source() {
+        Ok(source) => source.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.dataset_facts(&source, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(facts)) => Json(json!({
+            "atlas": {"present": true},
+            "source": source,
+            "limit": limit,
+            "facts": facts.iter().map(|f| json!({
+                "path": f.relative_path,
+                "dataset_key": f.dataset_key,
+                "query": f.query,
+                "query_identity": f.query_identity,
+                "row_limit": f.row_limit,
+                "truncated": f.truncated,
+                "columns": f.columns,
+                "rows": f.rows,
+                "output_hash": f.output_hash,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/symbol?name=<symbol>` — the symbol index, by exact name.
+async fn map_symbol(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let name = match query.name() {
+        Ok(name) => name.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.symbol_lookup(&name, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(hits)) => Json(json!({
+            "atlas": {"present": true},
+            "name": name,
+            "limit": limit,
+            "symbols": hits.iter().map(|h| json!({
+                "source": h.source_name,
+                "language": h.symbol.language,
+                "label": h.symbol.label,
+                "name": h.symbol.name,
+                "occurrences": h.symbol.occurrences,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/map/references?name=<symbol>` — every recorded site of one exact
+/// symbol name.
+///
+/// The `derivation` field is not decoration: these are **definition sites**,
+/// which is what a grammar can state without resolving anything (A1-09). A
+/// client that assumed "references" meant resolved call sites would be wrong,
+/// so the answer says what it is.
+async fn map_references(State(state): State<ApiState>, Query(query): Query<MapQuery>) -> Response {
+    let name = match query.name() {
+        Ok(name) => name.to_string(),
+        Err(response) => return *response,
+    };
+    let limit = query.limit();
+    match with_atlas(&state, |atlas| atlas.references(&name, limit)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(sites)) => Json(json!({
+            "atlas": {"present": true},
+            "name": name,
+            "limit": limit,
+            "derivation": "syntax-derived definition sites; unresolved (A1-09)",
+            "references": sites.iter().map(|r| json!({
+                "source": r.source_name,
+                "path": r.relative_path,
+                "language": r.language,
+                "label": r.label,
+                "name": r.name,
+                "ordinal": r.ordinal,
+                "byte_start": r.byte_start,
+                "byte_end": r.byte_end,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(response) => *response,
+    }
+}
+
+// ------------------------------------------------------------------
+// S5 W5 — A2 §14's CLI/API surface: `sgt search` and `sgt related`.
+// ------------------------------------------------------------------
+
+/// A2 §14's selectors, as query parameters.
+///
+/// Every one is a **deterministic selector** in A2 §2's sense — a value the
+/// admissibility filter binds and compares for equality. None of them is a
+/// retrieval weight: A2 §14's *"Do not expose raw retrieval weight tuning"*
+/// is met by there being no knob here to expose (`RRF_K` and BM25's `k1`/`b`
+/// are `const`s no request can reach).
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    /// **A2 §2 stage 1's estate coordinate** — the exact canonical estate
+    /// root this search is asked *from*, the same `?estate_root=` every
+    /// other estate-scoped GET carries.
+    ///
+    /// Not one of A2 §14's flags, and not a selector a user types: it is the
+    /// address of the world the question is asked in. Atlas is host-scoped
+    /// (one daemon, one store, every estate ever addressed on this host), so
+    /// without it a search has no way to tell whose evidence it is reading —
+    /// which is exactly how S6 D1's cross-estate leak worked. Absent, the
+    /// request is refused rather than answered widely; see
+    /// [`SearchQuery::admissibility`].
+    #[serde(default)]
+    estate_root: Option<PathBuf>,
+    /// The query text (`sgt search <query>`).
+    #[serde(default)]
+    q: Option<String>,
+    /// `sgt related <coordinate>` — `<source>/<family>:<path>#<ordinal>`.
+    #[serde(default)]
+    coordinate: Option<String>,
+    /// A2 §14's `--source <name>`, optionally `<name>@<content-key>`.
+    #[serde(default)]
+    source: Option<String>,
+    /// A2 §14's `--work <id>`.
+    #[serde(default)]
+    work: Option<String>,
+    /// Which of a multi-repository Work's repositories `--work` addresses.
+    /// Not in §14's list; added because `SourceSelector::WorkBase` names
+    /// exactly one repository and guessing which would be an invented
+    /// answer (**J0 avoided by refusing**, not by picking).
+    #[serde(default)]
+    repo: Option<String>,
+    /// A2 §14's `--content code|document|email|config|all` (plus
+    /// `row-text`, this build's fourth A2 §17 item 2 family).
+    #[serde(default)]
+    content: Option<String>,
+    /// A2 §14's `--type knowledge` (also `repo`, `external`).
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    /// A2 §14's `--external`.
+    #[serde(default)]
+    external: Option<bool>,
+    /// A2 §14's `--top <n>`.
+    #[serde(default)]
+    top: Option<usize>,
+    /// Decision **H4**'s request side: `off` suppresses A2 §6's half, and
+    /// the answer reports `semantic: disabled` rather than looking like a
+    /// host with no model installed.
+    #[serde(default)]
+    semantic: Option<String>,
+}
+
+/// The refusal `--content config` gets, verbatim on the CLI and in the API.
+///
+/// **This is the H13.1 correction carried forward honestly.** A2 §14 lists
+/// `config` among `--content`'s values, and W1 recorded it as a gap: no
+/// stored value distinguishes a `.toml` read through the `text/v1` fallback
+/// unit from a real text document, so a `config` lane would return *some*
+/// config files as though it had returned all of them. The brief's rule is
+/// *"either the value resolves to a lane and SAYS so, or it is not offered —
+/// never a value that returns partial results as though complete"*, so the
+/// value is accepted, named, and refused with its reason rather than
+/// silently answered or reported as a typo.
+pub const CONTENT_CONFIG_GAP: &str = "`--content config` is not available in this build: Atlas \
+     stores no value that distinguishes a config file read through the \
+     text/v1 fallback extractor from an ordinary text document, so a \
+     `config` lane would return some config files as though it had returned \
+     all of them. Use `--content document` or `--source <name>` and read the \
+     coordinates. (A2 §14 lists the value; A1 does not yet store the fact it \
+     needs.)";
+
+/// A2 §14's `--content`, resolved to a lexical family — or the refusal it
+/// earns. `None` (or `all`) searches every family; `config` is named by
+/// A2 §14 but refused with [`CONTENT_CONFIG_GAP`] rather than answered
+/// partially (see that constant's own doc).
+///
+/// `SearchQuery::family` is the only caller inside this crate; the function
+/// stands on its own — rather than staying an inherent method on the private
+/// `SearchQuery` — so a test can drive the actual `config` refusal arm
+/// directly instead of only asserting static properties of its message.
+pub fn content_family(
+    content: Option<&str>,
+) -> Result<Option<atlas_lexical::LexicalFamily>, Box<Response>> {
+    match content {
+        None | Some("all") => Ok(None),
+        // §14 spells the mail family `email`; A1's own row spelling is
+        // `mail`. Both are accepted so neither document is wrong.
+        Some("email") | Some("mail") => Ok(Some(atlas_lexical::LexicalFamily::Mail)),
+        Some("config") => Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            "content_config_unavailable",
+            CONTENT_CONFIG_GAP,
+        ))),
+        Some(other) => match atlas_lexical::LexicalFamily::parse(other) {
+            Some(family) => Ok(Some(family)),
+            None => Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "unknown_content",
+                format!("unknown --content `{other}`: code, document, email, row-text or all"),
+            ))),
+        },
+    }
+}
+
+impl SearchQuery {
+    /// A2 §2's admissibility filter from the selectors, or a 400 naming what
+    /// was wrong with them.
+    ///
+    /// The `work_id` half of the answer is A2 §13 field 2's attribution.
+    async fn admissibility(
+        &self,
+        state: &ApiState,
+    ) -> Result<(atlas_db::Admissibility, atlas_trace::Attribution), MapRefusal> {
+        let kind = match (self.kind.as_deref(), self.external) {
+            (Some("knowledge"), _) => Some(SourceKind::LocalKnowledge),
+            (Some("repo"), _) => Some(SourceKind::EstateGit),
+            (Some("external"), _) | (None, Some(true)) => Some(SourceKind::ExternalGit),
+            (None, _) => None,
+            (Some(other), _) => {
+                return Err(Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "unknown_type",
+                    format!("unknown --type `{other}`: repo, knowledge or external"),
+                )));
+            }
+        };
+        // `--external` alongside a disagreeing `--type` is refused rather
+        // than resolved by precedence: two selectors that name different
+        // worlds are a caller error, and silently preferring one is the
+        // invented answer A2 §2's "never approximate" forbids.
+        if self.external == Some(true) && kind != Some(SourceKind::ExternalGit) {
+            return Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "conflicting_selectors",
+                "--external and --type name different worlds; pass one",
+            )));
+        }
+        let (source, attribution) = match (&self.source, &self.work) {
+            (Some(_), Some(_)) => {
+                return Err(Box::new(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "conflicting_selectors",
+                    "--source and --work are two stage-1 selectors; pass one",
+                )));
+            }
+            (Some(spec), None) => (
+                parse_source_selector(spec),
+                atlas_trace::Attribution::Unmanaged,
+            ),
+            (None, Some(work_id)) => {
+                let repository = self.work_repository(state, work_id).await?;
+                (
+                    atlas_db::SourceSelector::WorkBase {
+                        work_id: work_id.clone(),
+                        repository: repository.clone(),
+                    },
+                    atlas_trace::Attribution::Work {
+                        work_id: work_id.clone(),
+                        repository,
+                    },
+                )
+            }
+            (None, None) => (
+                atlas_db::SourceSelector::Any,
+                atlas_trace::Attribution::Unmanaged,
+            ),
+        };
+        // **A2 §2 stage 1, and the one axis that denies by default.**
+        // `admit_addressed_estate` is the same admission gate every other
+        // estate-scoped route runs, so a root that does not admit is refused
+        // here rather than silently widening the world; a request that named
+        // no estate at all is refused too (`NOT_FOUND`, "the operation has
+        // no object"). Falling back to "every estate" is the defect this
+        // exists to close, not an available fallback.
+        let estate = match admit_addressed_estate(state, self.estate_root.as_deref(), "searching") {
+            Ok(estate) => atlas_db::EstateAdmission::of(&estate.root),
+            Err((status, body)) => return Err(Box::new((status, Json(body)).into_response())),
+        };
+        Ok((
+            atlas_db::Admissibility {
+                estate,
+                source,
+                kind,
+                // A2 §2's stage 2. `None` narrows nothing, and no selector
+                // sets it, because in this build `authority_class` is a
+                // total function of `source_kind` — every producer pairs
+                // LocalKnowledge/EstateReadonly, EstateGit/EstateMutable and
+                // ExternalGit/External — so `--type` above already names
+                // every world an authority selector could name, and A2 §14's
+                // selector list carries no authority flag. That is a
+                // property of today's producers, not of the design, so it is
+                // pinned rather than assumed:
+                // `w1_deterministic_filter::the_authority_axis_earns_no_\
+                // selector_only_while_it_is_a_function_of_source_kind` fails
+                // the moment a producer breaks the pairing, which is when
+                // this field needs a caller.
+                authority: None,
+            },
+            attribution,
+        ))
+    }
+
+    /// Which repository a `--work <id>` search is scoped to.
+    ///
+    /// `SourceSelector::WorkBase` names exactly one repository — deliberately,
+    /// so one Work's overlay over one repository cannot over-claim a sibling
+    /// (see that variant's own doc). A Work targeting several repositories
+    /// therefore has to be told which, and a Work targeting exactly one does
+    /// not: the single-repository case is *resolved from the Work record*,
+    /// never guessed, and the ambiguous case is refused with the flag that
+    /// resolves it.
+    async fn work_repository(&self, state: &ApiState, work_id: &str) -> Result<String, MapRefusal> {
+        let core = CoreGuard::acquire(&state.core).await;
+        let Some(work) = resolve_work(&core, work_id) else {
+            return Err(Box::new(error_response(
+                StatusCode::NOT_FOUND,
+                "work_not_found",
+                format!("no work with id {work_id}"),
+            )));
+        };
+        match (&self.repo, work.repositories.as_slice()) {
+            (Some(repo), repositories) if repositories.iter().any(|r| r == repo) => {
+                Ok(repo.clone())
+            }
+            (Some(repo), _) => Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "repo_not_in_work",
+                format!("work {work_id} does not target repository `{repo}`"),
+            ))),
+            (None, [only]) => Ok(only.clone()),
+            (None, []) => Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "work_has_no_repository",
+                format!("work {work_id} targets no repository, so --work selects nothing"),
+            ))),
+            (None, many) => Err(Box::new(error_response(
+                StatusCode::BAD_REQUEST,
+                "repo_required",
+                format!(
+                    "work {work_id} targets {} repositories ({}); name one with --repo",
+                    many.len(),
+                    many.join(", ")
+                ),
+            ))),
+        }
+    }
+
+    /// A2 §14's `--content`, as a family narrowing. `None` (or `all`)
+    /// searches every family.
+    fn family(&self) -> Result<Option<atlas_lexical::LexicalFamily>, MapRefusal> {
+        content_family(self.content.as_deref())
+    }
+
+    /// A2 §14's `--top <n>`, capped by the store regardless (F12).
+    ///
+    /// Purely a display parameter: both retrieval halves run at
+    /// `MAX_ROWS` whatever this says, so it cannot change the order of what
+    /// it returns (`tests/w4_rrf_fusion.rs::
+    /// the_fused_order_does_not_depend_on_the_callers_limit`).
+    fn top(&self) -> usize {
+        self.top
+            .unwrap_or(SEARCH_TOP_DEFAULT)
+            .min(atlas_db::MAX_ROWS)
+    }
+
+    /// Decision **H4**'s request side.
+    fn semantic(&self) -> atlas_semantic::SemanticRequest {
+        match self.semantic.as_deref() {
+            Some("off") => atlas_semantic::SemanticRequest::Suppressed,
+            _ => atlas_semantic::SemanticRequest::Requested,
+        }
+    }
+}
+
+/// How many hits `sgt search` prints when `--top` says nothing.
+///
+/// A **display** default, and provably only that: both retrieval halves run
+/// at `MAX_ROWS` regardless, so this number changes the length of the answer
+/// and never its order. Ten because a terminal page holds it; there is no
+/// measurement behind it and none is claimed.
+pub const SEARCH_TOP_DEFAULT: usize = 10;
+
+/// `--source <name>` or `--source <name>@<content-key>` (A2 §2's exact
+/// generation pin), as a stage-1 selector.
+fn parse_source_selector(spec: &str) -> atlas_db::SourceSelector {
+    match spec.split_once('@') {
+        Some((name, content_key)) if !name.is_empty() && !content_key.is_empty() => {
+            atlas_db::SourceSelector::Exact {
+                source_name: name.to_string(),
+                content_key: content_key.to_string(),
+            }
+        }
+        _ => atlas_db::SourceSelector::Named(spec.to_string()),
+    }
+}
+
+/// One answered hit, with **everything A2 §3 and §17 item 8 require it to
+/// cite**: source, generation, unit, family-shaped coordinate, and the two
+/// values that make an external hit visibly external.
+fn hit_json(hit: &atlas_fusion::FusedHit) -> Value {
+    json!({
+        "coordinate": atlas_lexical::UnitAddress::render(&hit.source_name, &hit.unit_key),
+        "source": hit.source_name,
+        "source_kind": hit.source_kind.as_str(),
+        "authority_class": hit.authority_class.as_str(),
+        "generation_id": hit.generation_id,
+        "content_key": hit.content_key,
+        "unit_key": hit.unit_key,
+        "unit": atlas_trace::coordinate_json(&hit.coordinate),
+        "rrf": hit.rrf,
+        "ranks": {"lexical": hit.origins.lexical, "semantic": hit.origins.semantic},
+        "signals_fired": hit.signals.fired(),
+    })
+}
+
+/// The four disclosure fields every retrieval answer carries, rendered once.
+fn answer_disclosure(answer: &atlas_db::FusedAnswer) -> Value {
+    json!({
+        "semantic": answer.semantic.as_str(),
+        "truncated": answer.truncated,
+        "work_scope": match &answer.scope {
+            atlas_db::WorkScope::NotWorkScoped => json!({"kind": "not_work_scoped"}),
+            atlas_db::WorkScope::BaseOnly => json!({"kind": "base_only"}),
+            atlas_db::WorkScope::BaseAndOverlaySnapshot { overlay_observed_at } => json!({
+                "kind": "base_and_overlay_snapshot",
+                "overlay_observed_at": overlay_observed_at,
+            }),
+        },
+    })
+}
+
+/// `GET /v1/search?q=<text>` — A2 §14's first verb.
+///
+/// A **pure read**. Nothing here indexes, scans, warms or writes: H13.2
+/// rejected query-time scanning precisely so this verb could be one, and
+/// `tests/w1b_overlay_lifecycle_trigger.rs::
+/// the_admissibility_filter_cannot_write_and_neither_can_anything_it_calls`
+/// is the structural pin. It reaches Atlas through the read-only
+/// [`with_atlas`], which hands `&AtlasDb`, never `&mut`.
+async fn search_query(State(state): State<ApiState>, Query(query): Query<SearchQuery>) -> Response {
+    let text = match query.q.as_deref().filter(|q| !q.trim().is_empty()) {
+        Some(text) => text.to_string(),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "query_required",
+                "sgt search takes a query: pass ?q=<text>",
+            );
+        }
+    };
+    let (filter, attribution) = match query.admissibility(&state).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let family = match query.family() {
+        Ok(family) => family,
+        Err(response) => return *response,
+    };
+    let lexical = atlas_db::LexicalQuery {
+        text: &text,
+        filter: &filter,
+        family,
+        limit: query.top(),
+        semantic: query.semantic(),
+    };
+    match with_atlas(&state, |atlas| atlas.traced_search(&lexical, attribution)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some((answer, trace))) => {
+            let mut body = json!({
+                "atlas": {"present": true},
+                "query": text,
+                "top": query.top(),
+                "hits": answer.hits.iter().map(hit_json).collect::<Vec<_>>(),
+                "trace": trace.json(),
+            });
+            merge_object(&mut body, answer_disclosure(&answer));
+            Json(body).into_response()
+        }
+        Err(response) => *response,
+    }
+}
+
+/// `GET /v1/related?coordinate=<source>/<family>:<path>#<ordinal>` — A2
+/// §14's second verb.
+///
+/// Also a pure read, and also bounded: the query text is the **anchor unit's
+/// own stored text**, read out of Atlas, never anything the client sends —
+/// so there is no client-supplied pattern here any more than in `search`.
+async fn related_query(
+    State(state): State<ApiState>,
+    Query(query): Query<SearchQuery>,
+) -> Response {
+    let Some(raw) = query.coordinate.as_deref().filter(|c| !c.trim().is_empty()) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "coordinate_required",
+            "sgt related takes a coordinate: pass ?coordinate=<source>/<family>:<path>#<ordinal>",
+        );
+    };
+    let Some(address) = atlas_lexical::UnitAddress::parse(raw) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "coordinate_unparseable",
+            format!(
+                "`{raw}` is not a unit coordinate: expected \
+                 <source>/<family>:<path>#<ordinal>, as `sgt search` prints it"
+            ),
+        );
+    };
+    let (filter, attribution) = match query.admissibility(&state).await {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let family = match query.family() {
+        Ok(family) => family,
+        Err(response) => return *response,
+    };
+    let request = atlas_db::RelatedRequest {
+        source_name: &address.source_name,
+        unit_key: &address.unit_key,
+        filter: &filter,
+        family,
+        limit: query.top(),
+        semantic: query.semantic(),
+        attribution,
+    };
+    match with_atlas(&state, |atlas| atlas.related(&request)).await {
+        Ok(None) => atlas_absent(),
+        Ok(Some(None)) => error_response(
+            StatusCode::NOT_FOUND,
+            "coordinate_not_found",
+            format!(
+                "no admissible unit at `{raw}`: the source may not be indexed, \
+                 or the current filter may not admit it"
+            ),
+        ),
+        Ok(Some(Some(related))) => {
+            let mut body = json!({
+                "atlas": {"present": true},
+                "anchor": {
+                    "coordinate": atlas_lexical::UnitAddress::render(
+                        &related.anchor.source_name,
+                        &related.anchor.unit_key,
+                    ),
+                    "source": related.anchor.source_name,
+                    "source_kind": related.anchor.source_kind.as_str(),
+                    "authority_class": related.anchor.authority_class.as_str(),
+                    "generation_id": related.anchor.generation_id,
+                    "content_key": related.anchor.content_key,
+                    "unit_key": related.anchor.unit_key,
+                    "unit": atlas_trace::coordinate_json(&related.anchor.coordinate),
+                },
+                "top": query.top(),
+                "hits": related.answer.hits.iter().map(hit_json).collect::<Vec<_>>(),
+                "trace": related.trace.json(),
+            });
+            merge_object(&mut body, answer_disclosure(&related.answer));
+            Json(body).into_response()
+        }
+        Err(response) => *response,
+    }
+}
+
+/// Fold one flat JSON object's keys into another. Used so the four
+/// disclosure fields are written once (`answer_disclosure`) and appear at the
+/// top level of both answers, rather than being spelled twice and drifting.
+fn merge_object(target: &mut Value, extra: Value) {
+    if let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
 /// `GET /v1/analytics` — the canned §22 questions this daemon can answer.
 async fn analytics_index(State(state): State<ApiState>) -> Response {
     match with_analytics(&state, |analytics| analytics.table_counts()).await {
@@ -3870,6 +6591,21 @@ struct EventsQuery {
     /// Keep only the newest `limit` matching events. Absent = all of them.
     #[serde(default)]
     limit: Option<usize>,
+    /// D4/D6: restrict to one estate's events, by canonical exact root,
+    /// matched against each event's own `workspace_id` coordinate (D1).
+    ///
+    /// Optional, and **server-side on purpose**: without it, "estate-wide
+    /// watch" would silently become "host-wide watch" for every existing
+    /// `sgt watch` invocation the moment a daemon starts serving a second
+    /// estate — a behavior change nobody asked for. The filter is not
+    /// validated by admission: this is a read, it creates nothing, and a
+    /// root that matches no event is an empty answer rather than a refusal.
+    ///
+    /// This wave lands the wire field and the filter. Routing the *client*
+    /// onto it — what `sgt watch` inside an estate defaults to, and how a
+    /// host-wide watch is asked for — is W3's, per this wave's brief.
+    #[serde(default)]
+    estate_root: Option<String>,
 }
 
 /// The `GET /v1/events` body for an already-fetched slice.
@@ -3883,13 +6619,10 @@ struct EventsQuery {
 /// asked for is gone under retention policy" — without it those two cases
 /// are wire-identical.
 fn events_body(events: Vec<Event>, query: &EventsQuery, floor_seq: u64) -> Value {
-    let mut events: Vec<Event> = match &query.work_id {
-        Some(work_id) => events
-            .into_iter()
-            .filter(|e| e.work_id.as_deref() == Some(work_id.as_str()))
-            .collect(),
-        None => events,
-    };
+    let mut events: Vec<Event> = events
+        .into_iter()
+        .filter(|e| matches_query(e, query))
+        .collect();
     if let Some(limit) = query.limit
         && events.len() > limit
     {
@@ -3898,7 +6631,33 @@ fn events_body(events: Vec<Event>, query: &EventsQuery, floor_seq: u64) -> Value
     json!({"events": events, "floor_seq": floor_seq})
 }
 
-/// `GET /v1/events?from=N&work_id=X&limit=K` — journaled history after seq N.
+/// Does this event pass the query's filters?
+///
+/// One predicate, shared by the history route and the SSE pump, so a client
+/// that asks the same question of both cannot get two different answers —
+/// which is the whole point of `watch`'s attach-then-replay ordering.
+///
+/// D4/D6: `estate_root` matches the envelope's own coordinate (D1). An event
+/// with no coordinate — every pre-envelope journal line, and everything not
+/// bound to an estate at all — is filtered *out* when an estate is asked
+/// for, because "I do not know which estate this belongs to" is not
+/// evidence that it belongs to the one asked about.
+fn matches_query(event: &Event, query: &EventsQuery) -> bool {
+    if let Some(work_id) = &query.work_id
+        && event.work_id.as_deref() != Some(work_id.as_str())
+    {
+        return false;
+    }
+    if let Some(estate_root) = &query.estate_root
+        && event.workspace_id.as_deref() != Some(estate_root.as_str())
+    {
+        return false;
+    }
+    true
+}
+
+/// `GET /v1/events?from=N&work_id=X&limit=K&estate_root=R` — journaled
+/// history after seq N.
 ///
 /// `from` is the only bound on how much journal is read; `work_id` and `limit`
 /// shape the answer, not the scan. A client that wants a cheap tail should
@@ -3952,7 +6711,7 @@ async fn event_stream(
         None => query.from,
     };
     let (tx, rx) = mpsc::channel::<Result<SseEvent, std::convert::Infallible>>(64);
-    tokio::spawn(pump_until_closing(state, from, tx));
+    tokio::spawn(pump_until_closing(state, from, query, tx));
     Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::new().interval(SSE_KEEP_ALIVE))
         .into_response()
@@ -3970,11 +6729,12 @@ async fn event_stream(
 async fn pump_until_closing(
     state: ApiState,
     from: u64,
+    query: EventsQuery,
     tx: mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
 ) {
     let mut closing = state.closing.clone();
     tokio::select! {
-        () = forward_events(state, from, tx) => {}
+        () = forward_events(state, from, query, tx) => {}
         () = daemon_closing(&mut closing) => {}
     }
 }
@@ -3995,6 +6755,7 @@ async fn daemon_closing(closing: &mut watch::Receiver<bool>) {
 async fn forward_events(
     state: ApiState,
     from: u64,
+    query: EventsQuery,
     tx: mpsc::Sender<Result<SseEvent, std::convert::Infallible>>,
 ) {
     // Subscribe before reading history so nothing can fall in the gap.
@@ -4014,7 +6775,10 @@ async fn forward_events(
     match history {
         Ok(events) => {
             for event in events {
-                if send_sse(&tx, &event).await.is_err() {
+                // `last_sent` advances past a filtered-out event too: it is
+                // the resume point, not a delivery count, and a client that
+                // reconnects must not be handed the same skipped seqs again.
+                if matches_query(&event, &query) && send_sse(&tx, &event).await.is_err() {
                     return;
                 }
                 last_sent = event.seq;
@@ -4032,7 +6796,7 @@ async fn forward_events(
                 if event.seq <= last_sent {
                     continue; // already delivered from history
                 }
-                if send_sse(&tx, &event).await.is_err() {
+                if matches_query(&event, &query) && send_sse(&tx, &event).await.is_err() {
                     return;
                 }
                 last_sent = event.seq;
@@ -4086,59 +6850,88 @@ async fn forward_events(
 /// that wants "every journaled kind" still gets exactly this list; a client
 /// that wants "everything this stream can ever frame" also has to handle
 /// the two names in [`SSE_CONTROL_FRAMES`] below.
-pub const SSE_EVENT_KINDS: &[&str] = &[
-    KIND_WORK_SUBMITTED,
-    KIND_WORK_STARTED,
-    KIND_WORK_RESUMED,
-    KIND_WORK_WAITING,
-    KIND_WORK_NEEDS_INPUT,
-    KIND_WORK_BLOCKED,
-    KIND_WORK_COMPLETED,
-    KIND_WORK_FAILED,
-    KIND_WORK_CANCELED,
-    KIND_WORKFLOW_BOUND,
-    KIND_STAGE_ENTERED,
-    KIND_STAGE_COMPLETED,
-    KIND_STAGE_WAITING,
-    KIND_STAGE_NEEDS_INPUT,
-    KIND_STAGE_INPUT_RECEIVED,
-    KIND_STAGE_RESUMED,
-    KIND_STAGE_BLOCKED,
-    KIND_STAGE_FAILED,
-    KIND_STAGE_CANCELED,
-    KIND_STAGE_OUTPUT_MISSING,
-    KIND_EXECUTION_RESERVED,
-    KIND_EXECUTION_STARTED,
-    KIND_EXECUTION_STOPPED,
-    KIND_EXECUTION_ABANDONED,
-    KIND_EXECUTION_RECONCILED,
-    KIND_TURN_CEILING_INTERRUPTED,
-    KIND_TURN_ENVELOPE_EXTENDED,
-    KIND_SURFACE_MATERIALIZING,
-    KIND_SURFACE_MATERIALIZED,
-    KIND_SURFACE_TORN_DOWN,
-    KIND_CONVERSATION_USER,
-    KIND_CONVERSATION_ASSISTANT_COMPLETED,
-    KIND_CONVERSATION_ASK,
-    KIND_CONVERSATION_TURN_ENDED,
-    KIND_TOOL_REQUESTED,
-    KIND_TOOL_COMPLETED,
-    KIND_USAGE_UPDATED,
-    // W1: the codex adapter's one module-local kind (§1.2 of the spec) — a
-    // `pub const KIND_*`, unlike claude.rs's bare string-literal
-    // "conversation.turn.grammar_unmeasured", so it is journaled and must be
-    // named here for t6's bidirectional check to hold.
-    KIND_TURN_HARNESS_ERROR,
-    KIND_COMMAND_ACCEPTED,
-    KIND_COMMAND_REJECTED,
-    KIND_DAEMON_STARTED,
-    KIND_DAEMON_STOPPED,
-    KIND_BACKEND_PROBED,
-    KIND_ADMISSION_PAUSED,
-    KIND_ADMISSION_RESUMED,
-    crate::runtime::prune::KIND_PRUNE_INTENT,
-    crate::runtime::prune::KIND_PRUNE_COMPLETED,
-];
+pub static SSE_EVENT_KINDS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        let mut kinds: Vec<&'static str> = vec![
+            KIND_WORK_SUBMITTED,
+            KIND_WORK_STARTED,
+            KIND_WORK_RESUMED,
+            KIND_WORK_WAITING,
+            KIND_WORK_NEEDS_INPUT,
+            KIND_WORK_BLOCKED,
+            KIND_WORK_COMPLETED,
+            KIND_WORK_FAILED,
+            KIND_WORK_CANCELED,
+            KIND_WORKFLOW_BOUND,
+            KIND_STAGE_ENTERED,
+            KIND_STAGE_COMPLETED,
+            KIND_STAGE_WAITING,
+            KIND_STAGE_NEEDS_INPUT,
+            KIND_STAGE_INPUT_RECEIVED,
+            KIND_STAGE_RESUMED,
+            KIND_STAGE_BLOCKED,
+            KIND_STAGE_FAILED,
+            KIND_STAGE_CANCELED,
+            KIND_STAGE_OUTPUT_MISSING,
+            // C1 §15: the compiled-context snapshot, journaled at stage
+            // entry. One kind per fresh execution, never one per evidence
+            // unit — the same affordability argument `source.scanned` makes
+            // below.
+            KIND_CONTEXT_COMPILED,
+        ];
+        // C1 §16's seven audit kinds, in §16's own order — reused from
+        // `workflow::CONTEXT_AUDIT_KINDS` rather than retyped here, so a
+        // future reorder or addition to that array cannot silently drift
+        // from this list (R2, F-SI-01). Three of them are
+        // declared-but-unemitted in this build (see each constant's doc);
+        // they are listed here anyway, because this list is the
+        // *vocabulary* an enumerating client subscribes to, and a client
+        // that learns a frame name only once something first emits it is a
+        // client that drops the first one.
+        kinds.extend_from_slice(&workflow::CONTEXT_AUDIT_KINDS);
+        kinds.extend([
+            KIND_EXECUTION_RESERVED,
+            KIND_EXECUTION_STARTED,
+            KIND_EXECUTION_STOPPED,
+            KIND_EXECUTION_ABANDONED,
+            KIND_EXECUTION_RECONCILED,
+            KIND_TURN_CEILING_INTERRUPTED,
+            KIND_TURN_ENVELOPE_EXTENDED,
+            KIND_SURFACE_MATERIALIZING,
+            KIND_SURFACE_MATERIALIZED,
+            KIND_SURFACE_TORN_DOWN,
+            KIND_CONVERSATION_USER,
+            KIND_CONVERSATION_ASSISTANT_COMPLETED,
+            KIND_CONVERSATION_ASK,
+            KIND_CONVERSATION_TURN_ENDED,
+            KIND_TOOL_REQUESTED,
+            KIND_TOOL_COMPLETED,
+            KIND_USAGE_UPDATED,
+            // W1: the codex adapter's one module-local kind (§1.2 of the
+            // spec) — a `pub const KIND_*`, unlike claude.rs's bare
+            // string-literal "conversation.turn.grammar_unmeasured", so it
+            // is journaled and must be named here for t6's bidirectional
+            // check to hold.
+            KIND_TURN_HARNESS_ERROR,
+            KIND_COMMAND_ACCEPTED,
+            KIND_COMMAND_REJECTED,
+            KIND_DAEMON_STARTED,
+            KIND_DAEMON_STOPPED,
+            KIND_BACKEND_PROBED,
+            KIND_ADMISSION_PAUSED,
+            KIND_ADMISSION_RESUMED,
+            crate::runtime::prune::KIND_PRUNE_INTENT,
+            crate::runtime::prune::KIND_PRUNE_COMPLETED,
+            // S3 X2: the one compact summary a completed source scan
+            // journals. Named here for the same reason as every kind above
+            // — a journaled kind absent from this list is a frame every
+            // enumerating client silently drops — and it is *one* kind per
+            // completed scan, never one per file, which is what makes
+            // putting it on the live stream affordable at all.
+            crate::domain::source::KIND_SOURCE_SCANNED,
+        ]);
+        kinds
+    });
 
 /// Frame names this stream sends that are **not** journaled `KIND_*` events
 /// — deliberately outside [`SSE_EVENT_KINDS`]'s contract (see its doc
@@ -4346,10 +7139,17 @@ pub struct ApiClient {
     http: reqwest::Client,
     endpoint: String,
     token: String,
+    estate_root: Option<PathBuf>,
 }
 
 impl ApiClient {
     /// Build a client for a daemon endpoint and its bearer token.
+    ///
+    /// D4: the client addresses **no** estate until one is named with
+    /// [`Self::with_estate_root`]. That is the honest default under H1 — the
+    /// daemon is host-scoped, so a client that has not said which estate it
+    /// means has not said it — and it is what lets the host-scoped verb
+    /// bucket W3 lands connect with no estate at all.
     pub fn new(endpoint: &str, token: &str) -> Result<Self, ClientError> {
         Ok(Self {
             http: reqwest::Client::builder()
@@ -4357,7 +7157,46 @@ impl ApiClient {
                 .build()?,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.to_string(),
+            estate_root: None,
         })
+    }
+
+    /// Address every estate-scoped request from this client at `root` — the
+    /// exact estate root the caller already admitted (§4.3 admits before a
+    /// descriptor is even read, so this is never a fresh guess).
+    pub fn with_estate_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.estate_root = Some(root.into());
+        self
+    }
+
+    /// The estate this client addresses, if any.
+    pub fn estate_root(&self) -> Option<&std::path::Path> {
+        self.estate_root.as_deref()
+    }
+
+    /// `?estate_root=<root>` for the GET/DELETE routes that have no body to
+    /// carry it in. Empty when `root` is `None`, so the daemon answers with
+    /// refusal (c) rather than being handed a blank.
+    fn estate_query_for(root: Option<&std::path::Path>) -> String {
+        match root {
+            Some(root) => format!("?estate_root={}", urlencode(&root.to_string_lossy())),
+            None => String::new(),
+        }
+    }
+
+    /// [`Self::estate_query_for`] over this client's own bound
+    /// [`Self::estate_root`] — the ordinary case every estate-scoped GET/
+    /// DELETE method below still uses by default.
+    fn estate_query(&self) -> String {
+        Self::estate_query_for(self.estate_root.as_deref())
+    }
+
+    /// Add this client's estate address to a request body, if it has one.
+    fn addressed(&self, mut body: Value) -> Value {
+        if let (Some(root), Some(map)) = (&self.estate_root, body.as_object_mut()) {
+            map.insert("estate_root".to_string(), json!(root));
+        }
+        body
     }
 
     /// The daemon endpoint this client talks to.
@@ -4484,8 +7323,12 @@ impl ApiClient {
     /// bind now.
     pub async fn workflows(&self, cwd: &std::path::Path) -> Result<Value, ClientError> {
         self.get(&format!(
-            "/v1/workflows?cwd={}",
-            urlencode(&cwd.display().to_string())
+            "/v1/workflows?cwd={}{}",
+            urlencode(&cwd.display().to_string()),
+            match &self.estate_root {
+                Some(root) => format!("&estate_root={}", urlencode(&root.to_string_lossy())),
+                None => String::new(),
+            }
         ))
         .await
     }
@@ -4507,7 +7350,7 @@ impl ApiClient {
     /// `GET /v1/sweep` — §12.3's deliberate sweep, classification half
     /// (#159). Mutates nothing.
     pub async fn sweep(&self) -> Result<Value, ClientError> {
-        self.get("/v1/sweep").await
+        self.get(&format!("/v1/sweep{}", self.estate_query())).await
     }
 
     /// `POST /v1/sweep` with a fresh command id (§26) — the deletion half.
@@ -4520,18 +7363,34 @@ impl ApiClient {
     ) -> Result<Value, ClientError> {
         self.post(
             "/v1/sweep",
-            &json!({
+            &self.addressed(json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "confirm": confirm,
                 "branches": branches,
-            }),
+            })),
         )
         .await
     }
 
     /// `GET /v1/estate/repos` (§16.2/§20.4) — declared repositories.
     pub async fn repos(&self) -> Result<Value, ClientError> {
-        self.get("/v1/estate/repos").await
+        self.repos_for(self.estate_root.as_deref()).await
+    }
+
+    /// [`Self::repos`], addressed at an explicit estate root rather than
+    /// this client's own bound one (W4d deliverable 3: the Estate screen's
+    /// picker reads whichever estate is picked, which under host mode is
+    /// independent of whatever this client otherwise addresses — a host-
+    /// scoped client addresses none at all).
+    pub async fn repos_for(
+        &self,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/estate/repos{}",
+            Self::estate_query_for(estate_root)
+        ))
+        .await
     }
 
     /// `POST /v1/estate/repos` (§16.2/§20.4) — `manifest::add_repo`.
@@ -4544,25 +7403,45 @@ impl ApiClient {
     ) -> Result<Value, ClientError> {
         self.post(
             "/v1/estate/repos",
-            &json!({
+            &self.addressed(json!({
                 "name": name,
                 "origin": origin,
                 "upstream": upstream,
                 "instructions": instructions,
-            }),
+            })),
         )
         .await
     }
 
     /// `DELETE /v1/estate/repos/{name}` (§16.2/§20.4) — `manifest::remove_repo`.
     pub async fn remove_repo(&self, name: &str) -> Result<Value, ClientError> {
-        self.delete(&format!("/v1/estate/repos/{}", urlencode(name)), &json!({}))
-            .await
+        self.delete(
+            &format!(
+                "/v1/estate/repos/{}{}",
+                urlencode(name),
+                self.estate_query()
+            ),
+            &json!({}),
+        )
+        .await
     }
 
     /// `GET /v1/estate/groups` (§16.2/§20.4) — declared groups.
     pub async fn groups(&self) -> Result<Value, ClientError> {
-        self.get("/v1/estate/groups").await
+        self.groups_for(self.estate_root.as_deref()).await
+    }
+
+    /// [`Self::groups`], addressed at an explicit estate root — see
+    /// [`Self::repos_for`]'s doc comment for why this exists.
+    pub async fn groups_for(
+        &self,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/estate/groups{}",
+            Self::estate_query_for(estate_root)
+        ))
+        .await
     }
 
     /// `POST /v1/estate/groups` (§16.2/§20.4) — `manifest::add_group`'s
@@ -4575,7 +7454,7 @@ impl ApiClient {
     ) -> Result<Value, ClientError> {
         self.post(
             "/v1/estate/groups",
-            &json!({"name": name, "repos": repos, "brief": brief}),
+            &self.addressed(json!({"name": name, "repos": repos, "brief": brief})),
         )
         .await
     }
@@ -4584,7 +7463,11 @@ impl ApiClient {
     /// empty `repos` removes the whole group, otherwise just those members.
     pub async fn remove_group(&self, name: &str, repos: &[String]) -> Result<Value, ClientError> {
         self.delete(
-            &format!("/v1/estate/groups/{}", urlencode(name)),
+            &format!(
+                "/v1/estate/groups/{}{}",
+                urlencode(name),
+                self.estate_query()
+            ),
             &json!({"repos": repos}),
         )
         .await
@@ -4593,21 +7476,57 @@ impl ApiClient {
     /// `GET /v1/doctor` (§16.3/§20.4) — the same `doctor::Report` `sgt doctor
     /// --json` prints.
     pub async fn doctor(&self) -> Result<Value, ClientError> {
-        self.get("/v1/doctor").await
+        self.doctor_for(self.estate_root.as_deref()).await
     }
 
-    /// Open the SSE live tail at `GET /v1/events/stream?from=N`.
+    /// [`Self::doctor`], addressed at an explicit estate root — see
+    /// [`Self::repos_for`]'s doc comment for why this exists.
+    pub async fn doctor_for(
+        &self,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<Value, ClientError> {
+        self.get(&format!(
+            "/v1/doctor{}",
+            Self::estate_query_for(estate_root)
+        ))
+        .await
+    }
+
+    /// `GET /v1/estates` (H1 §4) — every estate this daemon has admitted.
+    /// Host-scoped: it addresses no estate, because the answer *is* the set.
+    pub async fn estates(&self) -> Result<Value, ClientError> {
+        self.get("/v1/estates").await
+    }
+
+    /// Open the SSE live tail at
+    /// `GET /v1/events/stream?from=N[&estate_root=R]`.
+    ///
+    /// `estate_root` (H1 sprint-plan D4/D6) is a parameter of this call, not
+    /// of the client itself: `sgt watch`'s filter (`WatchOptions`,
+    /// `src/watch.rs`) is a separate decision from what estate this client
+    /// otherwise addresses (`Self::with_estate_root`) — `--all` must be able
+    /// to ask for every estate's events even from a client that *does*
+    /// address one for its other requests. `None` is host-wide: every
+    /// admitted estate's events, unfiltered.
     ///
     /// A separate reqwest client is built with no total timeout: the response
     /// body of a live tail is *supposed* to stay open, and the per-request
     /// timeout that keeps a stuck command honest would kill it on schedule.
-    pub async fn stream_events(&self, from: u64) -> Result<EventStream, ClientError> {
+    pub async fn stream_events(
+        &self,
+        from: u64,
+        estate_root: Option<&std::path::Path>,
+    ) -> Result<EventStream, ClientError> {
         let http = reqwest::Client::builder().build()?;
-        let response = http
-            .get(format!("{}/v1/events/stream?from={from}", self.endpoint))
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
+        let url = match estate_root {
+            Some(root) => format!(
+                "{}/v1/events/stream?from={from}&estate_root={}",
+                self.endpoint,
+                urlencode(&root.to_string_lossy())
+            ),
+            None => format!("{}/v1/events/stream?from={from}", self.endpoint),
+        };
+        let response = http.get(url).bearer_auth(&self.token).send().await?;
         let status = response.status();
         if !status.is_success() {
             let body: Value = response.json().await.unwrap_or(Value::Null);
@@ -4645,9 +7564,9 @@ impl ApiClient {
 }
 
 /// Minimal percent-encoding for the few values this crate puts in a URL
-/// (work ids, today). Anything outside the unreserved set is escaped rather
-/// than trusted.
-fn urlencode(value: &str) -> String {
+/// (work ids, and X4's `map` arguments). Anything outside the unreserved set
+/// is escaped rather than trusted.
+pub fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -4787,6 +7706,48 @@ mod tests {
     use crate::backend::BackendRegistry;
     use crate::domain::event::EVENT_SCHEMA;
     use crate::runtime::projection::work_registry_projection;
+
+    fn scaffold_estate_manifest(root: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(root.join("repos").join("solo")).expect("mount dir");
+        std::fs::write(
+            root.join("sergeant.toml"),
+            format!("[estate]\nname = {name:?}\n"),
+        )
+        .expect("manifest");
+    }
+
+    /// W5 brief deliverable 1(a): `periodic_sweep_targets` names every
+    /// *available* admitted estate and skips one that failed
+    /// re-validation — the same selection `EstatePolicies::from_registry`
+    /// makes for retention, applied to what a periodic sweep pass walks.
+    #[test]
+    fn periodic_sweep_targets_includes_only_available_admitted_estates() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let healthy = dir.path().join("healthy");
+        let broken = dir.path().join("broken");
+        scaffold_estate_manifest(&healthy, "healthy");
+        scaffold_estate_manifest(&broken, "broken");
+
+        let registry = crate::runtime::estates::EstateRegistry::new();
+        assert!(
+            periodic_sweep_targets(&registry).is_empty(),
+            "nothing admitted yet"
+        );
+
+        registry.admit(&healthy).expect("admit healthy");
+        registry.admit(&broken).expect("admit broken");
+        std::fs::remove_file(broken.join("sergeant.toml")).expect("break the manifest");
+        registry
+            .admit(&broken)
+            .expect_err("re-validation must fail");
+
+        let targets = periodic_sweep_targets(&registry);
+        assert_eq!(
+            targets,
+            vec![std::fs::canonicalize(&healthy).expect("canonical")],
+            "only the still-available estate is a sweep target: {targets:?}"
+        );
+    }
 
     // ------------------------------------------------------------------
     // §26 refuse-by-name (Q8) — `below_floor_refusal`'s own wire shape
@@ -5119,7 +8080,7 @@ mod tests {
 
         let client = ApiClient::new(&format!("http://{addr}"), "unused-token").expect("client");
         let mut stream = client
-            .stream_events(0)
+            .stream_events(0, None)
             .await
             .expect("connect to the stand-in server");
         let outcome = stream.next_event().await;
@@ -5159,6 +8120,328 @@ mod tests {
         );
     }
 
+    /// S2 W1 / decision E10: a nested leaf's composed hierarchical id is an
+    /// ordinary string to this helper, and the position arithmetic is the
+    /// flat one it always was — `index + 1` of `of`, counting **leaves**,
+    /// because a container never occupies a stage slot (W1-02).
+    ///
+    /// The point of pinning it is that no change was needed. A coordinate
+    /// that had started parsing `/` — to show only the leaf name, say, or to
+    /// count containers as positions — would have silently disagreed with the
+    /// engine's own flat indices, which are what retry, recovery and the
+    /// analytics rows all key on.
+    #[test]
+    fn stage_label_reads_a_composed_hierarchical_id_as_one_flat_position() {
+        let nested = json!({
+            "stage_id": "10-investigate/00-lead", "index": 1, "of": 4, "status": "active",
+        });
+        assert_eq!(stage_label(&nested), "10-investigate/00-lead 2/4 · active");
+
+        let deeper = json!({
+            "stage_id": "10-investigate/10-deep/00-inner", "index": 2, "of": 4,
+            "status": "needs_input",
+        });
+        assert_eq!(
+            stage_label(&deeper),
+            "10-investigate/10-deep/00-inner 3/4 · needs_input",
+            "depth changes the id, never the position arithmetic"
+        );
+    }
+
+    // ------------------------------------------- S3 X4: the map surface
+
+    /// One handler response, decoded.
+    async fn body_json(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(json!(null)),
+        )
+    }
+
+    /// Record one knowledge scan into a data dir through the ordinary path,
+    /// and return the state that will read it back.
+    async fn state_with_a_scanned_source(
+        data_dir: &std::path::Path,
+    ) -> (ApiState, tempfile::TempDir) {
+        let source_root = tempfile::TempDir::new().expect("source root");
+        std::fs::write(
+            source_root.path().join("guide.md"),
+            "# Guide\n\ntext\n\n## Details\n\nmore\n",
+        )
+        .expect("write md");
+        std::fs::write(
+            source_root.path().join("lib.py"),
+            "def only():\n    return 1\n",
+        )
+        .expect("write py");
+        std::fs::write(
+            source_root.path().join("rows.csv"),
+            "title,email\nalpha,a@example.com\n",
+        )
+        .expect("write csv");
+
+        // The scan is recorded *before* the state opens its own journal: the
+        // journal is exclusively locked, and two holders is a test artefact,
+        // not a property under test.
+        {
+            let mut journal = Journal::open(data_dir).expect("journal");
+            let mut atlas = crate::runtime::atlas::db::AtlasDb::open(data_dir).expect("atlas");
+            crate::runtime::atlas::record::scan_and_record(
+                &mut atlas,
+                &mut journal,
+                &crate::runtime::atlas::scan::KnowledgeSource {
+                    name: "notes".to_string(),
+                    root: source_root.path().to_path_buf(),
+                    ignore: Vec::new(),
+                    context_fields: crate::runtime::atlas::tabular::ContextFields::none(),
+                },
+                None,
+                &crate::domain::source::EstateBinding::Estate(
+                    data_dir.to_string_lossy().into_owned(),
+                ),
+            )
+            .expect("scan and record");
+        }
+        let state = test_state(data_dir).await;
+        (state, source_root)
+    }
+
+    /// F11: `intelligence status` and every `map` verb answer from Atlas's
+    /// own rows, and the answers carry F8's coverage rather than a bare
+    /// indexed count.
+    #[tokio::test]
+    async fn the_map_surface_answers_from_atlas() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (state, _source) = state_with_a_scanned_source(dir.path()).await;
+
+        let (status, body) = body_json(intelligence_status(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["atlas"]["present"], json!(true));
+        let source = &body["sources"][0];
+        assert_eq!(source["source"], "notes");
+        assert_eq!(source["kind"], "local_knowledge");
+        assert_eq!(source["datasets"], json!(1));
+        assert_eq!(
+            source["row_units"],
+            json!(0),
+            "F10a: no declared context_fields means no exposed row text"
+        );
+        assert!(
+            source["coverage"]["indexed"].as_u64().unwrap_or(0) >= 3,
+            "coverage must be reported per status, not as one total: {source}"
+        );
+
+        // The outline is the titled units and nothing else.
+        let (status, body) = body_json(
+            map_outline(
+                State(state.clone()),
+                Query(MapQuery {
+                    source: Some("notes".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let titles: Vec<&str> = body["outline"]
+            .as_array()
+            .expect("outline")
+            .iter()
+            .filter_map(|u| u["title"].as_str())
+            .collect();
+        assert!(titles.contains(&"Guide"), "outline was {titles:?}");
+        assert!(titles.contains(&"Details"), "outline was {titles:?}");
+
+        // A symbol, by exact name, and its recorded sites.
+        let (status, body) = body_json(
+            map_symbol(
+                State(state.clone()),
+                Query(MapQuery {
+                    name: Some("only".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["symbols"][0]["source"], "notes");
+        assert_eq!(body["symbols"][0]["language"], "python");
+
+        let (status, body) = body_json(
+            map_references(
+                State(state.clone()),
+                Query(MapQuery {
+                    name: Some("only".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["references"][0]["path"], "lib.py");
+        assert!(
+            body["derivation"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("definition sites"),
+            "the answer must say what it actually is (A1-09): {body}"
+        );
+
+        // `map children` is the READ side of `source.child_resources`
+        // (S5 W7 F-SF-03) — wired to a real reader, and answering with the
+        // `children` envelope even when this particular source has no
+        // container child. What the rows carry is pinned end to end by
+        // `tests/w7_container_children.rs::the_parent_coordinate_is_readable_
+        // through_the_daemons_own_bounded_reader`, which scans a real
+        // archive.
+        let (status, body) = body_json(
+            map_children(
+                State(state.clone()),
+                Query(MapQuery {
+                    source: Some("notes".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["children"].is_array(), "{body}");
+
+        // `map facts` is the READ side of `source.dataset_facts` — A2 §17
+        // item 3's relational half, which had no production caller at all
+        // before the S5 closeout (F-AC-03). The scanned source holds one
+        // dataset, so this is a real answer, not an empty envelope.
+        let (status, body) = body_json(
+            map_facts(
+                State(state.clone()),
+                Query(MapQuery {
+                    source: Some("notes".to_string()),
+                    ..MapQuery::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let facts = body["facts"].as_array().expect("facts");
+        assert!(
+            !facts.is_empty(),
+            "the scanned dataset's stored answers: {body}"
+        );
+        assert!(
+            facts.iter().all(
+                |f| !f["dataset_key"].as_str().unwrap_or_default().is_empty()
+                    && !f["output_hash"].as_str().unwrap_or_default().is_empty()
+            ),
+            "every fact carries the join key and the hash that makes it checkable: {body}"
+        );
+
+        // `map repos` is repository sources; a knowledge source is not one.
+        let (status, body) = body_json(map_repos(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["repos"].as_array().expect("repos").len(), 0);
+
+        // `map stats` totals what the map holds.
+        let (status, body) = body_json(map_stats(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["totals"]["sources"], json!(1));
+        assert_eq!(body["totals"]["datasets"], json!(1));
+    }
+
+    /// A source-addressed or symbol-addressed map read with nothing to
+    /// address is a named 400, not an empty list.
+    #[tokio::test]
+    async fn a_map_read_with_nothing_to_address_is_refused_by_name() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (state, _source) = state_with_a_scanned_source(dir.path()).await;
+
+        let (status, body) =
+            body_json(map_outline(State(state.clone()), Query(MapQuery::default())).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "source_required");
+
+        let (status, body) =
+            body_json(map_facts(State(state.clone()), Query(MapQuery::default())).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "source_required");
+
+        let (status, body) =
+            body_json(map_symbol(State(state.clone()), Query(MapQuery::default())).await).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "name_required");
+    }
+
+    /// A host that has never scanned anything answers "nothing indexed", and
+    /// **writes no evidence to do it**.
+    ///
+    /// The R1 limit this pins is that a read must not manufacture the thing
+    /// it reports on. Until S5 W1c that was measurable as file absence:
+    /// opening Atlas created its file, so a status read on a fresh install
+    /// would have left a store behind for a feature nobody used. A1 §5
+    /// declares ONE database and puts the journal-derived `ops` schema in it,
+    /// so the projection's own start creates that file on every host — the
+    /// file stopped being able to carry the claim, and the claim moved to
+    /// what it was always about: after the read, no source has a confirmed
+    /// generation, and the answer says so.
+    #[tokio::test]
+    async fn an_unscanned_host_answers_without_writing_evidence() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+
+        let (status, body) = body_json(intelligence_status(State(state.clone())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["atlas"]["present"], json!(false));
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no source has been indexed"),
+            "the absent answer must say what is absent: {body}"
+        );
+        // The store the answer reports on: still holding nothing, having been
+        // read. `test_state` folded `ops` into it, which is what created the
+        // file; a read that had scanned something to answer would show up
+        // here as a confirmed generation.
+        let atlas = state
+            .analytics
+            .lock()
+            .await
+            .atlas()
+            .expect("the one database the projection opened");
+        assert!(
+            atlas.indexed_sources().expect("indexed sources").is_empty(),
+            "a read must not manufacture the evidence it reports on"
+        );
+    }
+
+    /// F12 at the wire: a client cannot widen the store's row cap.
+    #[tokio::test]
+    async fn a_client_cannot_ask_for_more_rows_than_the_cap() {
+        let query = MapQuery {
+            limit: Some(usize::MAX),
+            ..MapQuery::default()
+        };
+        assert_eq!(query.limit(), atlas_db::MAX_ROWS);
+        assert_eq!(MapQuery::default().limit(), atlas_db::MAX_ROWS);
+        assert_eq!(
+            MapQuery {
+                limit: Some(5),
+                ..MapQuery::default()
+            }
+            .limit(),
+            5
+        );
+    }
+
     async fn test_state(data_dir: &std::path::Path) -> ApiState {
         let journal = Journal::open(data_dir).expect("open journal");
         let mut registry = work_registry_projection();
@@ -5180,11 +8463,15 @@ mod tests {
                 None,
                 data_dir,
             )),
+            estates: Arc::new(crate::runtime::estates::EstateRegistry::new()),
             analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
+            atlas: Arc::new(tokio::sync::Mutex::new(None)),
             prune_policy: crate::runtime::prune::PrunePolicy {
                 retention: crate::domain::estate::DEFAULT_RETENTION,
                 source: crate::runtime::prune::PolicySource::Default,
             },
+            sweep_interval: SWEEP_INTERVAL,
+            last_swept: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -5357,7 +8644,7 @@ mod tests {
         }
 
         let (tx, mut rx) = mpsc::channel(1);
-        let pump = tokio::spawn(forward_events(state.clone(), 0, tx));
+        let pump = tokio::spawn(forward_events(state.clone(), 0, EventsQuery::default(), tx));
 
         // W4 §1.1.2: the very first frame on any connection is the floor
         // control frame, sent before history — consumed here, separately,
@@ -5446,7 +8733,7 @@ mod tests {
         }
 
         let (tx, mut rx) = mpsc::channel(1);
-        let pump = tokio::spawn(forward_events(state.clone(), 0, tx));
+        let pump = tokio::spawn(forward_events(state.clone(), 0, EventsQuery::default(), tx));
 
         let floor = rx
             .recv()
@@ -5651,6 +8938,10 @@ mod tests {
             id: format!("evt-{seq}"),
             timestamp: rfc3339_utc_now(),
             source: EventSource::new("backend", "test"),
+            // Audited (H1 touch point #4): this fixture exercises
+            // `transcript_turns`, which reads only `work_id`/`kind`/
+            // `payload` — never estate-bound, so there is nothing to
+            // populate here.
             workspace_id: None,
             work_id: Some(work_id.to_string()),
             execution_id: execution_id.map(str::to_string),
@@ -6071,6 +9362,12 @@ mod tests {
                     id: format!("evt-{seq}"),
                     timestamp: rfc3339_utc_now(),
                     source: draft.source,
+                    // Audited (H1 touch point #4): mirrors whatever the
+                    // backend's own draft carried rather than hardcoding
+                    // `None` — backend-emitted conversation events are
+                    // outside this chokepoint's scope (`Engine::commit`),
+                    // so nothing here should invent a value the adapter
+                    // never set.
                     workspace_id: draft.workspace_id,
                     work_id: draft.work_id,
                     execution_id: draft.execution_id,
@@ -6095,6 +9392,7 @@ mod tests {
             execute: None,
             instruction_policy: crate::domain::estate::InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         };
         let handle = {
             use crate::backend::Backend;
@@ -6952,6 +10250,85 @@ mod tests {
             view["work"]["state"], "completed_dirty",
             "a dirty completion reports the §11.5 compact label even without \
              ADR 0007(b)'s stranded inference"
+        );
+    }
+
+    /// S5 W1d, structural: **`Running` is the only signal that is not a
+    /// refresh moment**, and the match is exhaustive so a new
+    /// [`BackendSignal`] variant cannot be added without deciding whether
+    /// the Work's surface has settled at it.
+    ///
+    /// The distinction is the whole cost argument. A poll that finds the
+    /// actor still producing has found a tree mid-write; scanning it would
+    /// index a world that never settled, and would do so at whatever rate
+    /// the completion driver happens to poll — which is exactly the
+    /// unmeasured rescan interval W1d did not introduce.
+    #[test]
+    fn only_a_still_running_turn_is_not_an_overlay_refresh_moment() {
+        assert!(
+            !is_turn_boundary(None),
+            "a poll that never reached the backend says nothing about the turn"
+        );
+        for signal in [
+            BackendSignal::Running,
+            BackendSignal::StageCompleted { summary: None },
+            BackendSignal::NeedsInput {
+                prompt: "q".to_string(),
+                asked_by: Default::default(),
+            },
+            BackendSignal::Waiting {
+                reason: "w".to_string(),
+            },
+            BackendSignal::Blocked {
+                reason: "b".to_string(),
+            },
+            BackendSignal::Failed {
+                reason: "f".to_string(),
+            },
+        ] {
+            // Exhaustive on purpose: adding a variant breaks this match,
+            // not this test's assertion.
+            let settled = match signal {
+                BackendSignal::Running => false,
+                BackendSignal::StageCompleted { .. }
+                | BackendSignal::NeedsInput { .. }
+                | BackendSignal::Waiting { .. }
+                | BackendSignal::Blocked { .. }
+                | BackendSignal::Failed { .. } => true,
+            };
+            assert_eq!(
+                is_turn_boundary(Some(&signal)),
+                settled,
+                "{signal:?} is {} a moment at which the Work's surface has stopped moving",
+                if settled { "" } else { "not" }
+            );
+        }
+    }
+
+    /// S5 W1d, structural: **only a refresh may be dropped.** The chain in
+    /// [`WORK_OVERLAY_HOOKS`] coalesces on this predicate, and a bind or an
+    /// eviction silently coalesced away would be a lost lifecycle fact —
+    /// an overlay never recorded, or worse, one never evicted from a Work
+    /// that has retired.
+    #[test]
+    fn a_bind_or_an_eviction_is_never_coalesced_away() {
+        let surface = WorkSurface {
+            work_id: "01W1D".to_string(),
+            root: std::path::PathBuf::from("/nowhere"),
+            bindings: Vec::new(),
+        };
+        assert!(
+            WorkOverlayHook::Refresh(Box::new(surface.clone())).coalesces(),
+            "a refresh is superseded by the next turn boundary and may be dropped"
+        );
+        assert!(
+            !WorkOverlayHook::Bind(Box::new(surface)).coalesces(),
+            "a bind records the overlay a Work's whole lifetime hangs on"
+        );
+        assert!(
+            !WorkOverlayHook::Evict.coalesces(),
+            "an eviction is the lifetime rule itself; dropping one leaves evidence about a \
+             surface that no longer exists"
         );
     }
 }

@@ -1,0 +1,21 @@
+From: =?ISO-8859-1?Q?Ren=E9_Dupont?= <rene@example.com>
+To: Alice Adams <alice@example.com>
+Subject: =?UTF-8?B?Q2Fmw6kgdXBkYXRlIOKYlQ==?=
+Date: Fri, 16 Jan 2026 12:00:00 +0000
+Message-ID: <fixture05-zoo@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="ZOO-BOUNDARY-05"
+
+--ZOO-BOUNDARY-05
+Content-Type: text/plain; charset=windows-1252
+Content-Transfer-Encoding: quoted-printable
+
+Prix unitaire: 12=80 le caf=E9.
+Total: 24=80.
+--ZOO-BOUNDARY-05
+Content-Type: application/octet-stream; name="blob.bin"
+Content-Disposition: attachment; filename="blob.bin"
+Content-Transfer-Encoding: base64
+
+AAEC//4QIDA=
+--ZOO-BOUNDARY-05--

@@ -229,6 +229,20 @@ pub struct DeletedBranch {
 /// never evicted), so callers hand it straight over rather than replaying the
 /// journal a second time for the same fact.
 pub fn classify(estate: &Estate, works: &BTreeMap<String, WorkState>) -> SweepReport {
+    // W4a seam: this function is already correctly single-estate per call
+    // (recon-engine-journal touch point 8 names it "correct as-is") and
+    // needs no change here. What H1 owed was the *caller* — closed by W5
+    // brief deliverable 1(a): `api::maybe_run_periodic_sweep` is now the
+    // periodic daemon-side loop this comment used to say did not exist yet.
+    // It iterates `estates::EstateRegistry::entries()` (via
+    // `api::periodic_sweep_targets`) and calls `classify` once per admitted,
+    // available estate, on the same crank tick
+    // `maybe_run_rotation_triggered_prune`'s rotation-triggered prune runs
+    // on (throttled separately — see `ApiState::sweep_interval` — because a
+    // sweep's git walk is not cheap enough to repeat every completion-poll
+    // tick). The per-request estate-scoped HTTP surface (`GET`/`POST
+    // /v1/sweep`, below) is unchanged; the periodic pass is classification
+    // only and never deletes, exactly like the read half of that pair.
     SweepReport {
         repositories: estate
             .repositories
@@ -533,6 +547,7 @@ mod tests {
             name: "sweep-fixture".to_string(),
             root: root.to_path_buf(),
             repositories,
+            knowledge: Vec::new(),
             default_backend: None,
             default_workflow: None,
             profiles: Vec::new(),

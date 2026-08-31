@@ -25,10 +25,9 @@ every Work its own git worktree and a declared mutation surface —
 authorization, not a seal — and runs submitted intents to completion
 against it, journaling what it can prove happened outside that surface
 as dirty evidence at retirement rather than silently absorbing it
-(the North Star ruling's amended destination text, #180). The full
-destination and the rulings behind it are the North Star ruling, now kept
-kept in this project's private development record — read it before changing
-anything here.
+(the North Star ruling's amended destination text, #180). This public
+constitution is the complete operating contract; historical rationale may
+live elsewhere, but no private record is required to apply it.
 
 Sergeant is designed for one developer per installation: adoption by a
 larger organization means each developer clones and installs
@@ -38,8 +37,8 @@ service.
 Documentation is layered by ownership: this file owns always-on operating
 policy for any harness acting in an estate; `.sergeant/workflows/*/index.md`
 and `SKILL.md` files own trigger-specific procedure; `CONTRIBUTING.md`
-owns the rules for changing sergeant-rs's own code; `README.md` owns
-install/quickstart. When two sources disagree about a behavior, the one
+owns the rules for changing sergeant-rs's own code; `README.md` owns the
+product front door; `docs/` owns the human product manual. When two sources disagree about a behavior, the one
 that owns that topic wins.
 
 ## Session start
@@ -51,8 +50,15 @@ Sergeant does not search parent directories for an estate and does not
 fall back to a plain Git checkout; every estate-scoped command refuses
 outright anywhere else, before daemon contact, naming the same remedy:
 `cd` to the estate root, `sgt -C <estate-root>` to name it without moving,
-or `sgt init` if this directory should become one. Only `sgt --help`,
-`--version`, `sgt init`, and `sgt doctor` work outside an estate at all.
+or `sgt init` if this directory should become one. `sgt --help`,
+`--version`, `sgt init`, `sgt doctor`, and the host-scoped bucket — `sgt
+tui`, `sgt status`, `sgt work show`/`list`/`transcript`, `sgt watch`, and
+every `sgt daemon` verb — all work outside an estate too: the daemon they
+reach is host-scoped (one process serving every estate ever admitted to
+it), so none of them needs a root to find it. `sgt watch` still consults
+`-C`/cwd opportunistically — inside a valid estate root it defaults to
+that estate's events, `--all` or a non-estate cwd watches every admitted
+estate. Nothing else works outside an estate at all.
 
 ## Estate and Git model
 
@@ -290,9 +296,27 @@ does not:
 - create a replacement branch;
 - navigate into another Work's surface;
 - expand its own repository scope;
-- invoke an estate-scoped `sgt` command from its own surface — no
-  `sergeant.toml` lives there, and Session start's refusal applies even
-  from inside it.
+- invoke an estate-scoped `sgt` command from its own surface — Session
+  start's exact-root refusal still applies to any bare invocation from a
+  surface: no `sergeant.toml` lives there, and that refusal is not
+  repealed. **The one sanctioned path** proceeds only via explicit `-C`
+  addressing, never by ambient discovery: a managed execution carrying
+  the causation triple the ENGINE itself injected
+  (`SERGEANT_ESTATE_ROOT`/`SERGEANT_WORK_ID`/`SERGEANT_EXECUTION_ID`) may
+  run `sgt -C "$SERGEANT_ESTATE_ROOT" run` to create child Work, and the
+  daemon validates the claimed parent Work/execution against its own
+  journal before the relation is recorded — a failed claim never refuses
+  the child Work itself, only the relation. The sanction covers a
+  managed execution acting on the identity the engine injected, never a
+  self-fabricated one: a self-fabricated triple is not sanctioned, and
+  its claim lands as journaled `causation_unverified` evidence — reported
+  and adjudicable, never silently honored. This narrows the prohibition;
+  it does not remove it: a worker must still never silently become a
+  nested Captain, which is now preserved by ordinary admission, explicit
+  `-C` addressing, and journal-validated causation rather than by refusal
+  (host-atlas r3 ratification, ruling 2) — that phrase describes how the
+  daemon treats the sanctioned path's claims, not a repeal of Session
+  start's root gate.
 
 A violation is reported dirty (the integrity disposition riding beside
 `sgt work show`'s terminal state), never silently treated as ordinary
@@ -411,7 +435,13 @@ gap between them is where judgment (the ladders above) does its work.
   its exact SHA; `sgt` never fetches, pulls, switches branches, or infers
   a remote default to get there — a dirty or detached mount is refused
   unless the operator types the one bounded `--override-git-preflight`
-  for that submission.
+  for that submission. **Scoped to admission** (ADR 0023): the Atlas
+  intelligence store's own external-Git acquisition (`sgt intelligence
+  add`) does fetch, deliberately — into a bare, no-working-tree host
+  cache outside every estate, at an allowlisted locator, never touching
+  a Work surface, a repository mount, or admission's own preflight. The
+  two are different subjects sharing a word, not an exception to this
+  rule.
 - A Work's output branch (`sergeant/<work-id>`) is retained after every
   terminal outcome; nothing here deletes it automatically.
 - A manifest edit that would leave `sergeant.toml` invalid, or a start

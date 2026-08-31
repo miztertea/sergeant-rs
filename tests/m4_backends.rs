@@ -55,7 +55,7 @@
 //! derived `<estate-root>/repos/<name>`, and the *daemon* — not the request
 //! — names which estate is in play. So the fixture here is
 //! [`support::scaffold_solo_estate`]'s root, the engine carries
-//! [`Engine::with_estate_root`], and every `daemon::start_with` that expects
+//! `Engine::plan`'s per-call estate (D10), and every `daemon::start_with` that expects
 //! its submission to reach a surface passes `estate_root`. A daemon bound to
 //! nothing plans against nothing and leaves work `pending` (§5.2), which is
 //! the shape an unmigrated fixture now fails as. `origin.cwd` is still
@@ -104,6 +104,7 @@ use sergeant_rs::runtime::engine::{
     DEFAULT_TURN_CAP, Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, Next, PendingLaunch,
     Step, SubmitContext,
 };
+use sergeant_rs::runtime::estates::EstateRegistry;
 use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::projection::{WorkRun, rederive_run, work_registry_projection};
 use sergeant_rs::runtime::recovery;
@@ -540,7 +541,21 @@ impl Launch {
 
 /// Environment variables the stub reports back, chosen because the adapter
 /// makes a claim about each one.
-const RECORDED_ENV: &[&str] = &["CLAUDE_CODE_SESSION_ID", "CLAUDE_CONFIG_DIR", "IS_SANDBOX"];
+const RECORDED_ENV: &[&str] = &[
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CONFIG_DIR",
+    "IS_SANDBOX",
+    // S2 E5: the causation triple. Recorded here rather than asserted from
+    // the adapter's own computed map, because "the daemon computed them" and
+    // "the actor process received them" are different claims and only the
+    // second one is what a child `sgt -C … run` can spend.
+    "SERGEANT_ESTATE_ROOT",
+    "SERGEANT_WORK_ID",
+    "SERGEANT_EXECUTION_ID",
+    // The harness's own variable, recorded so the distinction is asserted
+    // rather than assumed: injecting causation must not set it.
+    "SGT_ESTATE_ROOT",
+];
 
 impl StubClaude {
     fn new(dir: &Path, version: &str, help_flags: &[&str]) -> Self {
@@ -834,6 +849,7 @@ fn start_request(
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::new(),
+        estate_root: None,
     }
 }
 
@@ -1081,7 +1097,6 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
             // really spawned, and a daemon bound to no estate never plans one
             // — the submission would stop at `pending` with the adapter never
             // reached.
-            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -1095,6 +1110,8 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
         .json(&json!({
             "command_id": ulid(),
             "intent": "drive the real adapter",
+            // D4: `cwd` is the mount; the addressed estate is its root.
+            "estate_root": estate.path(),
             "origin": {"client": "cli", "cwd": repo},
         }))
         .send()
@@ -1244,7 +1261,7 @@ async fn start_with_stub(
 /// `pending` and no window ever opens.
 async fn start_with_stub_polling(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     stub: &StubClaude,
     completion_poll: Duration,
 ) -> daemon::DaemonHandle {
@@ -1257,7 +1274,6 @@ async fn start_with_stub_polling(
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
             completion_poll,
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -1276,10 +1292,11 @@ async fn start_with_stub_polling(
 async fn submit_over_api(
     http: &reqwest::Client,
     handle: &daemon::DaemonHandle,
+    estate_root: &Path,
     cwd: &Path,
     intent: &str,
 ) -> Value {
-    submit_scoped_over_api(http, handle, cwd, intent, &[]).await
+    submit_scoped_over_api(http, handle, estate_root, cwd, intent, &[]).await
 }
 
 /// [`submit_over_api`] naming an explicit `scope.repos` (§7.1's first scope
@@ -1288,6 +1305,7 @@ async fn submit_over_api(
 async fn submit_scoped_over_api(
     http: &reqwest::Client,
     handle: &daemon::DaemonHandle,
+    estate_root: &Path,
     cwd: &Path,
     intent: &str,
     repos: &[&str],
@@ -1297,6 +1315,10 @@ async fn submit_scoped_over_api(
         .json(&json!({
             "command_id": ulid(),
             "intent": intent,
+            // D4: two separate parameters on purpose — every call site here
+            // passes a *mount* as `cwd`, which is exactly the thing §5.2
+            // forbids being read as topology.
+            "estate_root": estate_root,
             "origin": {"client": "cli", "cwd": cwd},
             "scope": {"repos": repos},
         }))
@@ -1430,7 +1452,14 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
 
     let handle = start_with_stub(data.path(), estate.path(), &stub).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, &repo, "settle me by yourself").await;
+    let submitted = submit_over_api(
+        &http,
+        &handle,
+        estate.path(),
+        &repo,
+        "settle me by yourself",
+    )
+    .await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -1579,7 +1608,14 @@ async fn a_turn_that_dies_without_an_envelope_blocks_the_stage_with_its_stderr()
 
     let handle = start_with_stub(data.path(), estate.path(), &stub).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, &repo, "refuse me by yourself").await;
+    let submitted = submit_over_api(
+        &http,
+        &handle,
+        estate.path(),
+        &repo,
+        "refuse me by yourself",
+    )
+    .await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -1671,7 +1707,7 @@ async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
     let handle =
         start_with_stub_polling(data.path(), estate.path(), &stub, Duration::from_secs(3600)).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, &repo, "crash on me").await;
+    let submitted = submit_over_api(&http, &handle, estate.path(), &repo, "crash on me").await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -1736,7 +1772,6 @@ async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
             // journal, not the manifest — but a restart that quietly dropped
             // the binding would be a different daemon, not this one coming
             // back.
-            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -1799,7 +1834,7 @@ async fn a_turn_that_ends_after_a_respond_settles_and_cascades_with_no_client_cr
 
     let handle = start_with_stub(data.path(), estate.path(), &stub).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, &repo, "ask me first").await;
+    let submitted = submit_over_api(&http, &handle, estate.path(), &repo, "ask me first").await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -1960,7 +1995,14 @@ async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
 
     let handle = start_with_stub(data.path(), estate.path(), &stub).await;
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, &repo, "crash me during a respond").await;
+    let submitted = submit_over_api(
+        &http,
+        &handle,
+        estate.path(),
+        &repo,
+        "crash me during a respond",
+    )
+    .await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -2029,7 +2071,6 @@ async fn a_crash_during_a_resumed_turn_is_re_derived_at_restart() {
             default_backend: Some(CLAUDE_BACKEND_NAME.to_string()),
             claude: Some(claude),
             // Same §5.1 restart binding as the launch-path sibling above.
-            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -2399,6 +2440,123 @@ fn d2_the_launch_grammar_is_session_pinned_then_resumed() {
     assert_eq!(second.stdin, "second turn");
 }
 
+/// S2 E5/E6 (W1 §6): the causation triple reaches the *actor process* — read
+/// back out of the spawned stub's own environment, not out of the adapter's
+/// computed map — on the first turn and on every later turn of the same
+/// execution, since the launch config is pinned once and replayed.
+///
+/// The fourth assertion is the one both recon seats asked for: the harness's
+/// `SGT_ESTATE_ROOT` is a different mechanism and injecting causation must
+/// not set it. An implementation that wired the harness variable and believed
+/// W1-07 satisfied fails here.
+#[test]
+fn s2_the_causation_triple_reaches_the_actor_process_on_every_turn() {
+    let dir = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-causation", cwd.path(), "the intent", None);
+    request.work_id = "01PARENTWORK".to_string();
+    request.estate_root = Some(PathBuf::from("/home/dev/estate"));
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+    backend.send(&handle, "second turn").expect("send");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(2);
+    for (turn, launch) in launches.iter().enumerate() {
+        assert_eq!(
+            launch.env["SERGEANT_ESTATE_ROOT"], "/home/dev/estate",
+            "turn {turn}: the estate a child `sgt -C … run` must address"
+        );
+        assert_eq!(
+            launch.env["SERGEANT_WORK_ID"], "01PARENTWORK",
+            "turn {turn}: the parent Work"
+        );
+        assert_eq!(
+            launch.env["SERGEANT_EXECUTION_ID"], "e-causation",
+            "turn {turn}: the parent execution"
+        );
+        assert_ne!(
+            launch.env["SGT_ESTATE_ROOT"], "/home/dev/estate",
+            "turn {turn}: the harness's SGT_ESTATE_ROOT is a different \
+             mechanism — causation injection must never write it (asserted as \
+             \"not the injected value\" rather than \"unset\", because a test \
+             run from inside a real harness session legitimately inherits one)"
+        );
+    }
+}
+
+/// E6's merge order, tested rather than asserted: the triple is merged
+/// *after* `Profile.env`, so a workflow-authored profile cannot shadow what
+/// sergeant itself intended to send. This is hygiene, not security — W1 §6
+/// makes the daemon's journal the only authority on lineage, which is what
+/// the E8 validation tests in `m12_child_work.rs` pin.
+#[test]
+fn s2_a_profile_cannot_shadow_the_causation_triple() {
+    let dir = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let mut request = start_request("e-shadow", cwd.path(), "the intent", None);
+    request.work_id = "01REALWORK".to_string();
+    request.estate_root = Some(PathBuf::from("/home/dev/estate"));
+    request.profile = Some(Profile {
+        name: "forger".to_string(),
+        backend: CLAUDE_BACKEND_NAME.to_string(),
+        executable: Some(stub.path.clone()),
+        config_home: None,
+        env: [
+            ("SERGEANT_WORK_ID".to_string(), "01FORGED".to_string()),
+            (
+                "SERGEANT_ESTATE_ROOT".to_string(),
+                "/somewhere/else".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        default_model: None,
+        options: BTreeMap::new(),
+    });
+    let handle = backend.start(&request).expect("start");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let first = &stub.wait_for_launches(1)[0];
+    assert_eq!(
+        first.env["SERGEANT_WORK_ID"], "01REALWORK",
+        "the profile's own value must not win over the injected one"
+    );
+    assert_eq!(first.env["SERGEANT_ESTATE_ROOT"], "/home/dev/estate");
+}
+
+/// E6's other half: a **probe** is not a `StartRequest`-bound execution and
+/// never receives the triple. `causation_env` takes the request precisely so
+/// there is nothing to pass at a probe call site — this pins the behaviour
+/// from outside, by reading the probe invocation's own environment.
+#[test]
+fn s2_a_probe_invocation_never_receives_the_causation_triple() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubClaude::passing(dir.path());
+    let mut config = ClaudeConfig::new(dir.path());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let report = backend.probe();
+    assert!(report.available, "the stub probes clean: {report:?}");
+    assert!(
+        stub.launches().is_empty(),
+        "a probe spawns only --version/--help, which record no environment \
+         at all — so there is no launch record for the triple to be in: {:?}",
+        stub.launches()
+    );
+}
+
 /// ADR 0007(a): whatever composes an actor's context states what wakes it.
 /// A headless turn is one process that runs to completion and exits — there
 /// is no callback when a backgrounded command finishes after the turn ends
@@ -2712,6 +2870,7 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
                 }),
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect("re-adopt");
@@ -2762,6 +2921,85 @@ fn resume_launches_later_turns_under_the_re_supplied_configuration() {
             .all(|e| e.work_id.as_deref() == Some("01M4READOPT")),
         "post-restart events carry the work they serve: {events:?}"
     );
+}
+
+/// S2 E6 fix regression: the causation triple must not be a one-shot
+/// reconciliation courtesy. Before this fix, `resume()` passed an empty map
+/// to `launch_config`, which pins the *cached* env for the rest of the
+/// execution's life (§14: launch config is resolved once and replayed) — so
+/// the triple was silently dropped not only for the turn that reattaches,
+/// but for every turn after it, defeating causation for any conversation
+/// that outlives a daemon restart.
+///
+/// Two turns are sent after `resume()` re-adopts the execution, and both
+/// must still carry all three `SERGEANT_*` values — proving the fix threads
+/// `ResumeRequest::estate_root` and the handle's `execution_id` into the
+/// cached env, not only into a value read once and discarded.
+#[test]
+fn resume_re_supplies_the_causation_triple_for_every_turn_after_restart() {
+    let data = TempDir::new().expect("tempdir");
+    let home = TempDir::new().expect("tempdir");
+    let cwd = TempDir::new().expect("tempdir");
+    let session_id = "5a4b3c2d-1e0f-4a1b-8c2d-3e4f5a6b7c8e";
+    let project = home.path().join("projects").join("-work-surface");
+    std::fs::create_dir_all(&project).expect("project dir");
+    std::fs::write(project.join(format!("{session_id}.jsonl")), "{}\n").expect("transcript");
+
+    let stub = StubClaude::passing(data.path());
+    stub.replays(&recorded_turn());
+    let mut config = ClaudeConfig::new(data.path());
+    config.claude_home = Some(home.path().to_path_buf());
+    config.executable = stub.path.clone();
+    let backend = ClaudeBackend::new(config);
+
+    let handle = ExecutionHandle {
+        execution_id: "e-causation-resumed".to_string(),
+        native_id: Some(session_id.to_string()),
+    };
+    backend
+        .resume(
+            &handle,
+            &ResumeRequest {
+                work_id: "01PARENTWORK".to_string(),
+                cwd: cwd.path().to_path_buf(),
+                model: None,
+                profile: None,
+                instruction_policy: Some(InstructionPolicy::default()),
+                bindings: Vec::new(),
+                // S2 E6: re-supplied from the journal exactly as
+                // `Engine::resume_request` does — this is the coordinate the
+                // fix threads through to `resume_causation_env`.
+                estate_root: Some(PathBuf::from("/home/dev/estate")),
+            },
+        )
+        .expect("re-adopt");
+
+    backend
+        .send(&handle, "first turn after restart")
+        .expect("send");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+    backend
+        .send(&handle, "second turn after restart")
+        .expect("send");
+    wait_settled(&backend, &handle, Duration::from_secs(10));
+
+    let launches = stub.wait_for_launches(2);
+    for (turn, launch) in launches.iter().enumerate() {
+        assert_eq!(
+            launch.env["SERGEANT_ESTATE_ROOT"], "/home/dev/estate",
+            "turn {turn} after resume: the estate coordinate must survive, \
+             not just the reconciliation snapshot"
+        );
+        assert_eq!(
+            launch.env["SERGEANT_WORK_ID"], "01PARENTWORK",
+            "turn {turn} after resume: the parent Work"
+        );
+        assert_eq!(
+            launch.env["SERGEANT_EXECUTION_ID"], "e-causation-resumed",
+            "turn {turn} after resume: the parent execution — from the \
+             handle, since ResumeRequest carries no execution id of its own"
+        );
+    }
 }
 
 // -------------------------------- §20 raw archive and §27 normalization
@@ -3313,6 +3551,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect_err("a provider-qualified pin is refused pre-flight at RESUME too");
@@ -3334,6 +3573,7 @@ fn resume_refuses_a_pin_that_could_never_be_honored() {
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect("re-adopt");
@@ -3527,7 +3767,8 @@ fn a4_restart_reattaches_a_surviving_session_and_blocks_with_resumable_evidence(
     journal_active_run(&mut core, work_id, CLAUDE_BACKEND_NAME, &session_id);
     journal_surface(&mut core, work_id, data.path());
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(
         report.resumed,
         vec![work_id.to_string()],
@@ -3594,6 +3835,7 @@ fn a4_restart_reattaches_a_surviving_session_and_blocks_with_resumable_evidence(
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect("re-adopt is idempotent");
@@ -3601,7 +3843,8 @@ fn a4_restart_reattaches_a_surviving_session_and_blocks_with_resumable_evidence(
     // ...and reconciliation is idempotent: the work is no longer active,
     // so a second restart re-derives nothing (L6: every append window in
     // reconcile re-runs safely).
-    let again = recovery::reconcile(&engine, &mut core).expect("second reconcile");
+    let again =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("second reconcile");
     assert!(again.resumed.is_empty() && again.blocked.is_empty());
 }
 
@@ -3642,7 +3885,8 @@ fn a4_reconcile_reattaches_a_resumable_execution_before_it_classifies() {
     // While the daemon was down the stage finished and the context exited.
     fake.complete_live_executions();
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.resumed, vec![work_id.to_string()]);
     assert_eq!(
         work_of(&core, work_id).state,
@@ -3691,7 +3935,8 @@ fn a4_reconcile_that_cannot_reattach_stays_fail_closed() {
     journal_active_run(&mut core, work_id, FAKE_BACKEND_NAME, "fake-session-gone");
     journal_surface(&mut core, work_id, data.path());
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let reconciled = events_of(&core, work_id, KIND_EXECUTION_RECONCILED);
@@ -3748,7 +3993,8 @@ fn a4_reconcile_does_not_ask_a_backend_that_cannot_resume() {
     );
     fake.complete_live_executions();
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.resumed, vec![work_id.to_string()]);
     assert!(
         fake.resume_requests().is_empty(),
@@ -3779,7 +4025,8 @@ fn a4_restart_with_vanished_session_retires_the_execution_and_blocks() {
     let work_id = "01M4RECOVERB";
     journal_active_run(&mut core, work_id, CLAUDE_BACKEND_NAME, session_id);
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
 
@@ -3864,7 +4111,8 @@ fn a4_a_crash_inside_the_reconcile_append_window_rederives_on_restart() {
         }),
     );
 
-    let report = recovery::reconcile(&engine, &mut core).expect("re-run reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("re-run reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let stopped = events_of(&core, work_id, KIND_EXECUTION_STOPPED);
@@ -3950,7 +4198,8 @@ fn a4_a_crash_between_completion_and_teardown_is_swept_on_restart() {
         "the stranded worktree is still there"
     );
 
-    let report = recovery::reconcile(&engine, &mut core).expect("recovery must not abort");
+    let report = recovery::reconcile(&engine, &EstateRegistry::new(), &mut core)
+        .expect("recovery must not abort");
     assert_eq!(
         report.surfaces_retired,
         vec![stranded.to_string(), recorded.to_string()],
@@ -4016,7 +4265,8 @@ fn a4_a_crash_between_completion_and_teardown_is_swept_on_restart() {
     ));
 
     // And it converges: the next restart finds nothing left to do.
-    let again = recovery::reconcile(&engine, &mut core).expect("second restart");
+    let again =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("second restart");
     assert!(
         again.surfaces_retired.is_empty(),
         "a swept surface is not swept twice: {again:?}"
@@ -4089,7 +4339,8 @@ fn a4_a_swept_surface_that_cannot_be_removed_is_retained_named_and_not_re_swept(
     std::fs::write(worktree.join("half-done.txt"), "not committed anywhere\n")
         .expect("dirty the worktree");
 
-    let report = recovery::reconcile(&engine, &mut core).expect("recovery must not abort");
+    let report = recovery::reconcile(&engine, &EstateRegistry::new(), &mut core)
+        .expect("recovery must not abort");
     assert_eq!(
         report.surfaces_retired,
         vec![work_id.to_string()],
@@ -4142,7 +4393,8 @@ fn a4_a_swept_surface_that_cannot_be_removed_is_retained_named_and_not_re_swept(
 
     // The convergence property this branch does not share with the removed
     // one: the surface is still there, and it must still not be swept twice.
-    let again = recovery::reconcile(&engine, &mut core).expect("second restart");
+    let again =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("second restart");
     assert!(
         again.surfaces_retired.is_empty(),
         "a retained surface is recorded once, not once per restart: {again:?}"
@@ -4424,7 +4676,8 @@ fn a4_a_crash_between_spawn_and_execution_started_blocks_the_work() {
     // …and the daemon died here: the turn is running, `execution.started`
     // never landed.
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let reconciled = events_of(&core, work_id, KIND_EXECUTION_RECONCILED);
@@ -4662,7 +4915,8 @@ fn r2_daemon_dies_during_delivery_fails_closed_with_the_input_preserved() {
         json!({"reason": "input_received"}),
     );
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let inputs = events_of(&core, work_id, KIND_STAGE_INPUT_RECEIVED);
@@ -4705,7 +4959,8 @@ fn r3_native_dies_after_work_preserved_is_not_a_failure() {
     // While the daemon was down: the stage finished and the context exited.
     fake.complete_live_executions();
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.resumed, vec![work_id.to_string()]);
     assert_eq!(
         work_of(&core, work_id).state,
@@ -4785,7 +5040,8 @@ fn r5_stale_execution_identity_is_refused_not_adopted() {
         "stale-session-identity",
     );
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     let reconciled = events_of(&core, work_id, KIND_EXECUTION_RECONCILED);
     assert_eq!(reconciled[0]["disposition"], "ambiguous");
@@ -4815,7 +5071,6 @@ async fn r6_client_disconnect_mid_run_has_no_consequence() {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             claude: None,
-            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -4839,6 +5094,8 @@ async fn r6_client_disconnect_mid_run_has_no_consequence() {
         .json(&json!({
             "command_id": ulid(),
             "intent": "outlive your client",
+            // D4: `cwd` is the mount; the addressed estate is its root.
+            "estate_root": estate.path(),
             "origin": {"client": "cli", "cwd": repo},
         }))
         .send()
@@ -4912,7 +5169,8 @@ fn r7_work_waiting_for_input_is_never_timed_out_or_reclassified() {
 
     // However many restarts later — hours of them — the parked state holds.
     for _ in 0..3 {
-        let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+        let report =
+            recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
         assert!(report.resumed.is_empty() && report.blocked.is_empty());
     }
     assert_eq!(work_of(&core, work_id).state, WorkState::NeedsInput);
@@ -4936,13 +5194,18 @@ fn r7_work_waiting_for_input_is_never_timed_out_or_reclassified() {
 // is now an estate root with its one mount at `repos/solo`, and the engine
 // carries the binding a daemon would have given it.
 
-/// The plan a submission into this engine's bound estate resolves to (§5.2:
-/// there is no other estate a submission could name, so this takes no path).
-fn plan_for(engine: &Engine) -> sergeant_rs::runtime::engine::StartPlan {
+/// The plan a submission addressed at `estate_root` resolves to. D10: the
+/// engine holds no estate, so the root is the caller's to name — §5.2 is
+/// unchanged, it is just kept by the caller (an *addressed* root) rather
+/// than by a field.
+fn plan_for(
+    engine: &Engine,
+    estate_root: &std::path::Path,
+) -> sergeant_rs::runtime::engine::StartPlan {
     engine
-        .plan(&SubmitContext::default())
+        .plan(Some(estate_root), &SubmitContext::default())
         .expect("plan")
-        .expect("the engine's bound estate")
+        .expect("the addressed estate")
 }
 
 /// §14.2 phase 1 for a surface: `begin_start` journals the *intent* to
@@ -4959,13 +5222,12 @@ fn n19_materializing_a_surface_is_an_effect_the_caller_performs() {
         Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    )
-    .with_estate_root(estate.path().to_path_buf());
+    );
     let mut core = core(data.path());
     let work_id = "01N3SURFACE1";
     submit_work(&mut core, work_id, "materialize me");
     let work = work_of(&core, work_id);
-    let plan = plan_for(&engine);
+    let plan = plan_for(&engine, estate.path());
 
     let step = engine
         .begin_start(&mut core, &work, &plan)
@@ -5025,13 +5287,12 @@ fn n20_tearing_a_surface_down_is_an_effect_the_caller_performs() {
         Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    )
-    .with_estate_root(estate.path().to_path_buf());
+    );
     let mut core = core(data.path());
     let work_id = "01N3SURFACE2";
     submit_work(&mut core, work_id, "cancel me");
     let work = work_of(&core, work_id);
-    let plan = plan_for(&engine);
+    let plan = plan_for(&engine, estate.path());
     engine.start(&mut core, &work, &plan).expect("start");
     let worktree = core.registry.state().runs[work_id]
         .surface
@@ -5082,13 +5343,12 @@ fn n21_a_cancel_during_materialization_records_the_surface_and_tears_it_down() {
         Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    )
-    .with_estate_root(estate.path().to_path_buf());
+    );
     let mut core = core(data.path());
     let work_id = "01N3SURFACE3";
     submit_work(&mut core, work_id, "cancel me mid-git");
     let work = work_of(&core, work_id);
-    let plan = plan_for(&engine);
+    let plan = plan_for(&engine, estate.path());
 
     let step = engine
         .begin_start(&mut core, &work, &plan)
@@ -5391,6 +5651,7 @@ fn a1_real_claude_session_identity_survives_turns_and_restart() {
                 profile: None,
                 instruction_policy: Some(InstructionPolicy::default()),
                 bindings: Vec::new(),
+                estate_root: None,
             },
         )
         .expect("re-adopt from session evidence");
@@ -5978,7 +6239,8 @@ fn n4_a_reservation_whose_launch_never_reported_fails_closed_at_restart() {
     );
     commit(&mut core, work_id, KIND_WORK_STARTED, json!({}));
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     let blocked = events_of(&core, work_id, KIND_WORK_BLOCKED);
@@ -6015,7 +6277,8 @@ fn n4_a_reservation_whose_launch_never_reported_fails_closed_at_restart() {
 
     // Idempotent: the work is no longer `active`, so a second restart leaves
     // it exactly where the first one put it.
-    let again = recovery::reconcile(&engine, &mut core).expect("reconcile again");
+    let again =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile again");
     assert!(again.blocked.is_empty() && again.resumed.is_empty());
     assert_eq!(
         events_of(&core, work_id, KIND_EXECUTION_ABANDONED).len(),
@@ -6237,6 +6500,7 @@ fn n9_the_ask_capability_is_paired_with_what_the_backend_can_actually_report() {
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::new(),
+        estate_root: None,
     };
     let handle = fake.start(&request).expect("start");
     assert_eq!(
@@ -6312,7 +6576,7 @@ fn n17_an_actor_ask_survives_a_daemon_restart_and_the_answer_still_lands() {
     let engine = Engine::new(registry, None, data.path());
     let mut restarted = reopen(data.path());
     let core = &mut restarted;
-    let report = recovery::reconcile(&engine, core).expect("reconcile");
+    let report = recovery::reconcile(&engine, &EstateRegistry::new(), core).expect("reconcile");
     assert!(
         report.resumed.is_empty() && report.blocked.is_empty(),
         "a parked work is a decision; recovery must not re-decide it: {report:?}"
@@ -6553,6 +6817,7 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::new(),
+        estate_root: None,
     };
     let handle = backend.start(&request).expect("start");
 
@@ -6694,6 +6959,7 @@ fn bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mo
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::new(),
+        estate_root: None,
     };
     let handle = backend.start(&request).expect("start");
     let observation = wait_settled(&backend, &handle, Duration::from_secs(180));
@@ -6867,7 +7133,8 @@ fn n10_window1_before_the_reservation_append() {
     let work_id = "01N3W1";
     journal_two_stage_prefix(&mut core, work_id, data.path());
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     assert_eq!(work_of(&core, work_id).state, WorkState::Blocked);
     assert_eq!(
@@ -6901,7 +7168,8 @@ fn n11_window2_after_the_reservation_append() {
         reservation_payload("01N3W2EXEC"),
     );
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     let evidence = events_of(&core, work_id, KIND_WORK_BLOCKED)
         .last()
@@ -6985,12 +7253,14 @@ fn n12_windows3_and_4_identity_created_and_process_started_are_one_window() {
                 execute: None,
                 instruction_policy: InstructionPolicy::default(),
                 bindings: Vec::new(),
+                estate_root: None,
             })
             .expect("prepare");
         fake.launch(&prepared).expect("launch");
         let launched_before = fake.starts().len();
 
-        let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+        let report =
+            recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
         assert_eq!(report.blocked, vec![work_id.to_string()], "{label}");
         assert_eq!(
             fake.starts().len(),
@@ -7080,11 +7350,13 @@ fn n13_window5_result_observed_before_the_result_append() {
             execute: None,
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.resumed, vec![work_id.to_string()]);
     let completed: Vec<Value> = events_of(&core, work_id, "stage.completed")
         .into_iter()
@@ -7166,11 +7438,12 @@ fn n14_window6_result_appended_before_the_transition() {
             execute: None,
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         })
         .expect("prepare");
     fake.launch(&prepared).expect("launch");
 
-    recovery::reconcile(&engine, &mut core).expect("reconcile");
+    recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(
         stage_coordinate(&core, work_id),
         ("10-second".to_string(), 1),
@@ -7227,7 +7500,8 @@ fn n15_window7_terminal_before_the_cleanup_request() {
         json!({"stages": 2}),
     );
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
     assert_eq!(
         work_of(&core, work_id).state,
@@ -7239,7 +7513,8 @@ fn n15_window7_terminal_before_the_cleanup_request() {
 
     // Idempotent: a second restart finds the teardown recorded and does
     // nothing at all.
-    let again = recovery::reconcile(&engine, &mut core).expect("reconcile again");
+    let again =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile again");
     assert!(again.surfaces_retired.is_empty());
     assert_eq!(events_of(&core, work_id, KIND_SURFACE_TORN_DOWN).len(), 1);
 }
@@ -7266,7 +7541,8 @@ fn n16_window8_cleanup_done_before_the_cleanup_append() {
         json!({"stages": 2}),
     );
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.surfaces_retired, vec![work_id.to_string()]);
     let torn = events_of(&core, work_id, KIND_SURFACE_TORN_DOWN);
     assert_eq!(torn.len(), 1);
@@ -7335,7 +7611,8 @@ fn n22_window7b_a_cancel_that_landed_during_a_launch_closes_its_reservation() {
         "the window this test is about must actually be open"
     );
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(
         report.reservations_retired,
         vec![work_id.to_string()],
@@ -7376,7 +7653,8 @@ fn n22_window7b_a_cancel_that_landed_during_a_launch_closes_its_reservation() {
     );
 
     // Convergent: a second restart finds nothing left to do.
-    let again = recovery::reconcile(&engine, &mut core).expect("reconcile twice");
+    let again =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile twice");
     assert!(again.reservations_retired.is_empty(), "{again:?}");
     assert_eq!(
         events_of(&core, work_id, KIND_EXECUTION_ABANDONED).len(),
@@ -8075,7 +8353,8 @@ fn n25_window2_over_a_producer_derived_prefix() {
     drop(pending);
     assert!(fake.starts().is_empty(), "the launch never happened");
 
-    let report = recovery::reconcile(&engine, &mut core).expect("reconcile");
+    let report =
+        recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     assert_eq!(report.blocked, vec![work_id.to_string()]);
     let abandoned = events_of(&core, work_id, KIND_EXECUTION_ABANDONED);
     assert_eq!(abandoned.len(), 1, "{abandoned:?}");
@@ -8354,7 +8633,7 @@ fn n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_han
 
         // And the daemon that comes back up must converge, fail-closed, on
         // every one of them.
-        let report = recovery::reconcile(&engine, &mut core)
+        let report = recovery::reconcile(&engine, &EstateRegistry::new(), &mut core)
             .expect("reconcile must converge on every reachable prefix");
         let state = core.registry.state().works.get(work_id).map(|w| w.state);
         match complete {
@@ -8389,7 +8668,7 @@ fn n32_every_prefix_a_grouped_lock_hold_can_crash_at_is_one_recovery_already_han
     std::fs::create_dir_all(dir.join("journal")).expect("journal dir");
     std::fs::write(dir.join("journal").join("00000001.ndjson"), &bytes).expect("write");
     let mut core = core(&dir);
-    recovery::reconcile(&engine, &mut core).expect("reconcile");
+    recovery::reconcile(&engine, &EstateRegistry::new(), &mut core).expect("reconcile");
     let evidence = events_of(&core, work_id, KIND_WORK_BLOCKED)
         .last()
         .and_then(|b| b["evidence"].as_str())
@@ -8526,14 +8805,16 @@ fn r_mvp1_7_a_scripted_run_exceeding_the_cap_blocks_at_exactly_n_spawned_turns()
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
     )
-    .with_turn_cap(2)
-    .with_estate_root(estate.path().to_path_buf());
+    .with_turn_cap(2);
     let mut core = core(data.path());
     let plan = engine
-        .plan(&SubmitContext {
-            workflow: Some("capped"),
-            ..SubmitContext::default()
-        })
+        .plan(
+            Some(estate.path()),
+            &SubmitContext {
+                workflow: Some("capped"),
+                ..SubmitContext::default()
+            },
+        )
         .expect("plan")
         .expect("the engine's bound estate");
 
@@ -8700,14 +8981,16 @@ fn r_mvp1_11_a_stage_requiring_ask_refuses_against_a_backend_that_cannot_ask() {
         Arc::new(BackendRegistry::new().with(Arc::new(no_ask))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    )
-    .with_estate_root(estate.path().to_path_buf());
+    );
 
     let err = engine
-        .plan(&SubmitContext {
-            workflow: Some("asks"),
-            ..SubmitContext::default()
-        })
+        .plan(
+            Some(estate.path()),
+            &SubmitContext {
+                workflow: Some("asks"),
+                ..SubmitContext::default()
+            },
+        )
         .expect_err("must refuse before a Work or worktree exists");
     match &err {
         EngineError::AskCapabilityUnavailable {
@@ -8748,13 +9031,15 @@ fn r_mvp1_11_the_same_workflow_submits_against_a_backend_that_can_ask() {
         Arc::new(BackendRegistry::new().with(Arc::new(can_ask))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    )
-    .with_estate_root(estate.path().to_path_buf());
+    );
     let plan = engine
-        .plan(&SubmitContext {
-            workflow: Some("asks"),
-            ..SubmitContext::default()
-        })
+        .plan(
+            Some(estate.path()),
+            &SubmitContext {
+                workflow: Some("asks"),
+                ..SubmitContext::default()
+            },
+        )
         .expect("plan")
         .expect("the engine's bound estate");
     assert_eq!(plan.workflow.name, "asks");
@@ -8779,10 +9064,9 @@ fn r_mvp1_11_an_undeclared_workflow_is_unaffected_by_a_backend_that_cannot_ask()
         Arc::new(BackendRegistry::new().with(Arc::new(no_ask))),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    )
-    .with_estate_root(estate.path().to_path_buf());
+    );
     let plan = engine
-        .plan(&SubmitContext::default())
+        .plan(Some(estate.path()), &SubmitContext::default())
         .expect("plan")
         .expect("the engine's bound estate");
     assert!(!plan.workflow.stages.is_empty());
@@ -8853,14 +9137,13 @@ async fn r_mvp1_7_a_hang_turn_is_interrupted_within_ceiling_plus_one_interval() 
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll: poll,
             turn_ceiling: ceiling,
-            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
     .await
     .expect("daemon start");
     let http = reqwest::Client::new();
-    let submitted = submit_over_api(&http, &handle, &repo, "hang forever").await;
+    let submitted = submit_over_api(&http, &handle, estate.path(), &repo, "hang forever").await;
     let work_id = submitted["work"]["id"]
         .as_str()
         .expect("work id")
@@ -8952,15 +9235,30 @@ async fn r_mvp1_7_two_simultaneously_overdue_hangs_are_both_interrupted() {
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll: poll,
             turn_ceiling: ceiling,
-            estate_root: Some(estate.path().to_path_buf()),
             ..DaemonConfig::default()
         },
     )
     .await
     .expect("daemon start");
     let http = reqwest::Client::new();
-    let a = submit_scoped_over_api(&http, &handle, &mount("repo-a"), "hang a", &["repo-a"]).await;
-    let b = submit_scoped_over_api(&http, &handle, &mount("repo-b"), "hang b", &["repo-b"]).await;
+    let a = submit_scoped_over_api(
+        &http,
+        &handle,
+        estate.path(),
+        &mount("repo-a"),
+        "hang a",
+        &["repo-a"],
+    )
+    .await;
+    let b = submit_scoped_over_api(
+        &http,
+        &handle,
+        estate.path(),
+        &mount("repo-b"),
+        "hang b",
+        &["repo-b"],
+    )
+    .await;
     let work_a = a["work"]["id"].as_str().expect("work id").to_string();
     let work_b = b["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(a["work"]["state"], "active");
@@ -9022,14 +9320,16 @@ fn r_mvp1_7_a_consumed_crossing_whose_turn_ended_is_journaled_stale_not_delivere
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
     )
-    .with_turn_ceiling(Duration::ZERO)
-    .with_estate_root(estate.path().to_path_buf());
+    .with_turn_ceiling(Duration::ZERO);
     let mut core = core(data.path());
     let plan = engine
-        .plan(&SubmitContext {
-            workflow: Some("hangs"),
-            ..SubmitContext::default()
-        })
+        .plan(
+            Some(estate.path()),
+            &SubmitContext {
+                workflow: Some("hangs"),
+                ..SubmitContext::default()
+            },
+        )
         .expect("plan")
         .expect("the engine's bound estate");
     let work_id = "01MVP17STALE";

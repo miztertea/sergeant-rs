@@ -1194,9 +1194,26 @@ fn init_reports_and_creates_the_estate_local_data_dir_not_the_pre_estate_fallbac
         "init must leave the estate-local data dir created on disk, matching the \
          .gitignore rule it scaffolds for .sergeant/data"
     );
+    // W4c re-audit (recon-doctor-init-service.md's own warning: a host
+    // runtime root as a fourth resolution target needs every one of these
+    // precedence tests re-examined, not just left passing): `sgt init`'s
+    // *estate* data dir resolution above still never touches `$XDG_DATA_HOME`
+    // — the assertion above already pins that. But `sgt init` now also runs
+    // a *separate*, deliberate host-bootstrap step (H1 §3/recon risk 2) that
+    // creates the host runtime root when absent, and with no `--data-dir`/
+    // `SGT_DATA_DIR` override that root resolves to this exact
+    // `$XDG_DATA_HOME/sergeant` path by design — the same pre-estate
+    // fallback tail, now serving a second, legitimate purpose (one host
+    // daemon's root, decoupled from any one estate) rather than being a
+    // wrong answer for *this* estate's own data. So this directory existing
+    // now is correct, not the #164 regression this test was written to
+    // catch; only the doctor-report identity assertion above is that
+    // regression's guard.
     assert!(
-        !xdg.exists(),
-        "init must not touch the pre-estate XDG fallback once an estate is being created"
+        xdg.is_dir(),
+        "sgt init's host-bootstrap step (H1 §3) must create the host runtime root — with no \
+         override it resolves to the same $XDG_DATA_HOME/sergeant path this test's HOME/XDG \
+         env points at"
     );
 }
 

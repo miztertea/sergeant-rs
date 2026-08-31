@@ -1,0 +1,2269 @@
+//! S3 X5 — the **A1a acceptance battery**: contract §17 walked literally.
+//!
+//! `A1-ATLAS-WORLD-INTELLIGENCE.md` §17 lists fourteen acceptance items. This
+//! file is the walk: one register row per item, each carrying a verdict and
+//! the **named decisive check** that produces it — an earlier wave's test
+//! where one already pins the exact claim, a test written here where none did,
+//! or an explicit deferral with the citation that moved it.
+//!
+//! Three rules this file exists to enforce, none of which a prose checklist
+//! could:
+//!
+//! 1. **No silent pass.** An item that cannot be proven is recorded as a gap
+//!    with a destination sprint, never as "met". Item 4 was such a row from
+//!    S3 close through S4 Y5: its tripwire,
+//!    `a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped`, failed
+//!    the day someone shipped the heuristic without updating the walk, so
+//!    the gap could not quietly close or quietly widen. S4 Y6 shipped it —
+//!    see [`a1a_item_4_the_coverage_vocabulary_now_names_online_only`] for
+//!    the update that landed in the tripwire's place.
+//! 2. **No dangling citation.** [`every_named_check_exists_in_the_suite_it_names`]
+//!    reads every referenced file and fails if a named test was renamed or
+//!    deleted. A green suite that no longer contains the test the walk cites
+//!    proves nothing, and this is what notices.
+//! 3. **No drifting table.** The register below is the source of truth and
+//!    [`the_documented_walk_table_matches_the_register`] holds this doc
+//!    comment to it, so the PR-ready table and the executable one cannot
+//!    disagree.
+//!
+//! Running this file alone does not re-prove the claims it cites — that is
+//! what the wave's own full `cargo nextest run` is for, and item 14's decisive
+//! check *is* that run. What this file proves is that every one of the
+//! fourteen items has a named, existing, non-fictional answer.
+//!
+//! ## The walk
+//!
+//! | # | Contract claim (§17) | Verdict | Decisive check |
+//! |---|---|---|---|
+//! | 1 | one daemon-owned `atlas.duckdb` holds independently rebuildable `ops/source/git/context/meta` families | met | `x1_atlas_substrate::opening_atlas_declares_the_five_schema_namespaces` |
+//! | 2 | estate Git indexing pins exact repo/base generations and Work overlays without changing Work authority | met | `x3a_git_plumbing::a_scan_stays_on_its_pinned_sha_while_head_advances` |
+//! | 3 | a declared read-only local knowledge Source indexes a cloud-synced ordinary directory without becoming `[[repo]]` or receiving a worktree | met | `x5_a1a_acceptance::a1a_item_3_a_knowledge_source_is_indexed_without_becoming_a_repo_or_getting_a_worktree` |
+//! | 4 | online-only/unreadable local resources are reported as coverage gaps, not silently indexed as empty | met | `y6b_online_only::an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_trigger` |
+//! | 5 | Markdown/text and at least one Office format normalize into document units with provenance | met | `y2_office_adapter::a_docx_worker_returns_document_and_section_units_with_provenance` |
+//! | 6 | CSV/JSON/Parquet stay relational, with a deterministic aggregate and selected text-field context units sharing row identity | met | `x4_tabular_map::datasets_are_registered_and_read_in_place_as_derived_evidence` |
+//! | 7 | a bounded ZIP exposes child resources while rejecting unsafe paths and enforcing ceilings | met | `w7_container_children::an_admitted_zip_entry_lands_as_its_own_resource_with_all_four_preserved_fields` |
+//! | 8 | `.eml` or the chosen first mail format produces structured message evidence | met | `w7_container_children::a_docx_inside_a_zip_inside_an_eml_reaches_the_office_adapter_by_the_same_route` |
+//! | 9 | image/scanned evidence enters the OCR fallback with page/region/engine provenance | deferred-post-s4 | — |
+//! | 10 | external Git acquisition resolves an exact commit in a no-Work-checkout cache | met | `src/runtime/atlas/external_git::a_refresh_resolves_the_origins_new_tip_over_the_same_cache` |
+//! | 11 | source parsing uses content/extractor identity so unchanged resources reuse cached facts | met | `x2_knowledge_sources::a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one` |
+//! | 12 | daemon remains sole Atlas writer and worker failure cannot corrupt journal authority | met | `x5_a1a_acceptance::a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli` |
+//! | 13 | `sgt map`/status surfaces expose source/generation/coverage rather than arbitrary SQL | met | `x5_a1a_acceptance::a1a_item_13_no_client_sql_reaches_the_store` |
+//! | 14 | all existing exact-root, Work-surface, distro-route/edition and split-hardening output-contract tests remain green | met | `x5_a1a_acceptance::a1a_item_14_the_inherited_contract_pins_still_exist` |
+//!
+//! The `Decisive check` column names **one** check per row so the table stays
+//! readable; every row's full check list — several rows carry four — is in
+//! [`WALK`] below, and each one is verified to exist.
+//!
+//! ## One cross-cutting gap, closed (S4 Y5, G8)
+//!
+//! S3 shipped Atlas's writers and Atlas's readers with no operator-reachable
+//! *trigger* between them: no CLI verb, no route, and no daemon job called a
+//! scan, so on a real installation Atlas stayed empty until a test invoked
+//! it — a fact this file used to pin with a tripwire
+//! (`a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan`) precisely so
+//! it could not close silently. **It has closed.** `sgt intelligence scan`
+//! (`POST /v1/intelligence/scan`) drives a full scan of an estate's declared
+//! `[[knowledge]]` sources through the daemon, on the intelligence lane,
+//! reporting from each source's own coverage counts; `sgt intelligence
+//! add`/`list` (`POST`/`GET /v1/intelligence/sources`) is item 10's own
+//! acquisition surface. This supersedes the settled J3 record the tripwire
+//! encoded and the concept page's "no way to start a scan" sentence — both
+//! edited in this same wave, per the authority chain S4's plan (G8) states
+//! rather than merely asserts: the owner's explicit ordering delegation plus
+//! S4's own acceptance being unprovable without a trigger. `sgt intelligence`
+//! is no longer a read-only verb set — see
+//! [`the_intelligence_verb_set_now_includes_the_trigger_and_the_acquisition_surface`]
+//! for the replacement pin. Scheduling and cadence remain deliberately
+//! unbuilt (G10): this is one call, one scan, one report — a recurring
+//! trigger is S5+'s, when retrieval needs one.
+//!
+//! **S4 Y6 widened the trigger to the whole estate** (the owner correction
+//! `estate-intelligence-is-the-feature-2026-08-28.md`, carried as G8's own
+//! completion rather than new scope): the identical endpoint now also
+//! scans every declared `[[repo]]` repository through the Git path at its
+//! pinned SHA, and refreshes every external-Git source already recorded on
+//! this host — see [`intelligence_scan`](../src/api.rs)'s own doc for the
+//! full per-kind shape, and `tests/y6a_estate_scoped_scan.rs` for the
+//! end-to-end proof this file's own item-2/item-4 checks do not attempt.
+//! `sgt intelligence scan` is the verb's primary spelling now (argued in
+//! [`the_intelligence_verb_set_now_includes_the_trigger_and_the_acquisition_surface`]'s
+//! own update); `sgt knowledge scan` still runs the same widened scan
+//! rather than being narrowed to match its own name.
+//!
+//! **S4 Y8 closed a second, sibling gap this trigger did not by itself
+//! touch.** The trigger existing (Y5/Y6) is not the same claim as every
+//! adapter it walks past actually running — `scan.rs`'s and `git.rs`'s own
+//! routing tables never claimed `.docx`/`.zip`/`.eml` until Y8 wired
+//! [`worker_extractor_for`](../src/runtime/atlas/scan.rs) into both walks,
+//! so a real `sgt intelligence scan` on a real installation reported all
+//! three `unsupported` through every wave from Y2 to Y7 despite the
+//! adapters existing and the trigger existing simultaneously. Items 5/7/8
+//! below now cite `tests/y8_adapter_dispatch.rs` as part of their own
+//! decisive check for exactly this reason — this file's item-4 lesson
+//! ("no silent pass") applies to the DISPATCH half of a capability just as
+//! much as to the capability's own existence.
+
+/// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
+/// single-estate: every generation it records is bound to this one root and
+/// every filter it builds is admitted from it. The cross-estate case — two
+/// estates on one host daemon, which is where the axis actually earns its
+/// keep — is `tests/d1_estate_isolation.rs`, deliberately not folded in
+/// here, because a suite that never crosses estates cannot notice an estate
+/// filter that does nothing (that is exactly how the leak survived: this
+/// file's ancestors all passed).
+#[allow(dead_code)]
+const D1_ESTATE: &str = "/estates/x5_a1a_acceptance";
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use tempfile::TempDir;
+
+use sergeant_rs::domain::source::Coverage;
+use sergeant_rs::runtime::atlas::db::AtlasDb;
+use sergeant_rs::runtime::atlas::record::{ScanRecord, scan_and_record};
+use sergeant_rs::runtime::atlas::scan::KnowledgeSource;
+use sergeant_rs::runtime::journal::Journal;
+
+const SGT: &str = env!("CARGO_BIN_EXE_sgt");
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn read(relative: &str) -> String {
+    let path = repo_root().join(relative);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+// ------------------------------------------------------------------ register
+
+/// What the walk concluded about one §17 item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Shipped and proven by the named checks.
+    Met,
+    /// Shipped and proven, but not in the shape §17's wording assumes — the
+    /// deviation is named in the row's `note` with the decision that took it.
+    ///
+    /// **No row carries this as of S5 W7** (items 7 and 8, the last two, moved
+    /// to [`Self::Met`] when container children became real resources). It is
+    /// kept rather than deleted because it is this register's VOCABULARY, not
+    /// a row: a future wave that has to record "shipped, but not in §17's
+    /// shape" must reach for the same word with the same meaning, and
+    /// [`Verdict::as_str`]'s mapping is what the walk table is held to. The
+    /// allow is therefore about an empty *census*, never about an unused
+    /// concept.
+    #[allow(dead_code)]
+    MetWithDeviation,
+    /// Not fully provable today. The `note` names what is missing and the
+    /// sprint that owns it. Never a pass.
+    Gap,
+    /// Out of A1a's scope by a ratified re-cut, cited in the `note`.
+    DeferredS4,
+    /// Out of A1a's scope AND out of S4's own scope, cited in the `note` —
+    /// distinct from [`Self::DeferredS4`] because "lands in S4" and "lands
+    /// after S4" are different destinations and a reader must not have to
+    /// infer which one a row means (S4 Y5's register correction, item 9:
+    /// the register's earlier "S4's" was a mis-citation — owner ruling 3 and
+    /// the ratified re-cut place OCR after S4).
+    DeferredPostS4,
+}
+
+impl Verdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Met => "met",
+            Self::MetWithDeviation => "met-with-deviation",
+            Self::Gap => "gap",
+            Self::DeferredS4 => "deferred-s4",
+            Self::DeferredPostS4 => "deferred-post-s4",
+        }
+    }
+}
+
+/// One named check: the suite file it lives in, and the test function's name.
+///
+/// A `(file, test)` pair rather than a free-text citation precisely so
+/// [`every_named_check_exists_in_the_suite_it_names`] can go and look.
+struct Check {
+    file: &'static str,
+    test: &'static str,
+}
+
+const fn at(file: &'static str, test: &'static str) -> Check {
+    Check { file, test }
+}
+
+/// One row of the §17 walk.
+struct Item {
+    number: u8,
+    verdict: Verdict,
+    checks: &'static [Check],
+    /// Why this verdict, in the words a reviewer needs — the deviation taken,
+    /// the gap left, or the citation that deferred the item.
+    note: &'static str,
+}
+
+/// This file's whole claim, in one place.
+const WALK: &[Item] = &[
+    Item {
+        number: 1,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/x1_atlas_substrate.rs",
+                "opening_atlas_declares_the_five_schema_namespaces",
+            ),
+            at(
+                "tests/x1_atlas_substrate.rs",
+                "atlas_database_has_exactly_one_owner",
+            ),
+            at(
+                "tests/w1c_one_atlas_database.rs",
+                "one_statement_joins_ops_work_identity_to_source_generations",
+            ),
+            at(
+                "tests/x2_knowledge_sources.rs",
+                "source_facts_survive_a_real_daemon_restart",
+            ),
+        ],
+        note: "ONE daemon-owned database, A1 §5's five schemas: meta/ops/source/git/context in \
+               one file, declared on every open and read back out of DuckDB's own catalog. S3 \
+               shipped two files and this row recorded that as a ratified deviation; no owner \
+               ruling ever ratified it, and the owner correction of 2026-08-29 converged the \
+               code (S5 W1c) — the second file and its path constant are deleted, and the pair \
+               of one-owner tests became the single assertion one database implies. The join \
+               A1 §5 gives as its reason for one database is proven, not inferred from \
+               colocation. `git.*` carries no table of its own: repository-derived facts land \
+               in `source.*` with the source kind as a column (see `runtime/atlas/mod.rs`) — a \
+               separate register question, untouched by W1c. 'Independently rebuildable' is \
+               proven as the two rebuild disciplines F1 names, which survived the merge as \
+               scope rather than as separate files: `DROP SCHEMA ops CASCADE` + refold on every \
+               start while source facts persist, by the restart test.",
+    },
+    Item {
+        number: 2,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/x3a_git_plumbing.rs",
+                "a_scan_stays_on_its_pinned_sha_while_head_advances",
+            ),
+            at(
+                "tests/x3a_git_plumbing.rs",
+                "a_new_commit_with_an_identical_tree_is_the_same_generation",
+            ),
+            at(
+                "tests/x3a_git_plumbing.rs",
+                "a_work_overlay_is_scoped_to_its_work_and_evicted_with_it",
+            ),
+            at(
+                "tests/x3a_scan_uses_only_local_reads.rs",
+                "an_atlas_scan_runs_only_read_only_git_and_changes_nothing",
+            ),
+            at(
+                "tests/y6a_estate_scoped_scan.rs",
+                "a_registered_repository_is_scanned_through_the_git_path_and_map_symbol_resolves_a_real_function",
+            ),
+            at(
+                "tests/x5_a1a_acceptance.rs",
+                "a1a_item_2_work_overlay_scan_has_a_production_lifecycle_trigger",
+            ),
+            at(
+                "tests/w1b_overlay_lifecycle_trigger.rs",
+                "a_bound_work_surface_is_scanned_as_an_overlay_and_evicted_when_it_retires",
+            ),
+        ],
+        note: "'Without changing Work authority' is the read-only half: the scan runs only \
+               read-only git plumbing, touches no branch, no index and no worktree, and an \
+               overlay's lifetime is its Work's. THE BASE-REPO HALF was closed by S4 Y6's G8 \
+               correction: `scan_estate_git_on_lane` has a real production caller — \
+               `POST /v1/intelligence/scan`/`sgt intelligence scan` — proven end to end in \
+               `tests/y6a_estate_scoped_scan.rs`. THE SIBLING HALF — 'Work overlays' — IS NOW \
+               CLOSED TOO (S5 W1b), which is why this row moved from `met-with-deviation` back \
+               to `met`. `scan_work_overlay_on_lane` has the production caller H13.2 chose: the \
+               daemon-side surface-lifecycle hook `api::run_work_overlay_hook`, which scans a \
+               Work surface as an overlay when it is BOUND (materialize/rematerialize) and calls \
+               `AtlasDb::evict_work_overlays` when it is TORN DOWN — making the lifetime rule \
+               `overlay.rs`'s module doc always claimed something enforced rather than prose. \
+               `sgt search` stays a pure reader; nothing on a query path writes. NAMED LIMITS, \
+               not silent ones: (a) the overlay is a SNAPSHOT as of the last bind, never a live \
+               read of a surface the Work is still mutating, and `--work` says so in its answer \
+               (`WorkScope::BaseAndOverlaySnapshot` carries the instant); (b) the hook never \
+               CREATES an Atlas store, so an installation that indexes nothing gains neither a \
+               database nor a repository walk from running a Work, and `--work` reports \
+               `WorkScope::BaseOnly` there — true, and declared. TRIPWIRE, repointed rather than \
+               deleted: `a1a_item_2_work_overlay_scan_has_a_production_lifecycle_trigger` now \
+               fails if that production caller is ever removed, so this note's claim stays \
+               checked rather than merely asserted.",
+    },
+    Item {
+        number: 3,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/x5_a1a_acceptance.rs",
+                "a1a_item_3_a_knowledge_source_is_indexed_without_becoming_a_repo_or_getting_a_worktree",
+            ),
+            at(
+                "tests/x2_knowledge_sources.rs",
+                "knowledge_add_declares_a_source_and_list_reads_it_back",
+            ),
+            at(
+                "tests/x2_knowledge_sources.rs",
+                "a_declared_source_scans_exactly_what_the_manifest_says",
+            ),
+            at(
+                "tests/x2_knowledge_sources.rs",
+                "knowledge_add_refuses_a_path_inside_the_estates_own_territory",
+            ),
+        ],
+        note: "X2 proved the positive half (declared, scanned, read back). The NEGATIVE half — \
+               not a repository, no worktree, not one byte written into the source tree — had no \
+               decisive check, so this wave wrote one. 'Cloud-synced' is exercised as what it \
+               is: an ordinary directory, because A1-05 leaves transport and auth to the sync \
+               client and Sergeant reads the local bytes; no provider integration is claimed. \
+               CROSS-CUTTING GAP applies: 'can index' is met as a capability, invoked here \
+               through the real writer, but no shipped surface triggers that scan for an \
+               operator yet.",
+    },
+    Item {
+        number: 4,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/y6b_online_only.rs",
+                "an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_trigger",
+            ),
+            at(
+                "tests/y6b_online_only.rs",
+                "a_genuinely_empty_file_is_not_misreported_as_a_placeholder_through_the_real_scan_trigger",
+            ),
+            at(
+                "tests/x5_a1a_acceptance.rs",
+                "a1a_item_4_the_coverage_vocabulary_now_names_online_only",
+            ),
+            at(
+                "src/runtime/atlas/scan.rs",
+                "a_suspected_placeholder_is_never_indexed_as_empty",
+            ),
+            at(
+                "src/runtime/atlas/scan.rs",
+                "a_suspected_placeholder_dataset_is_never_registered",
+            ),
+            at(
+                "tests/x2_knowledge_sources.rs",
+                "an_unreachable_root_keeps_the_generation_it_cannot_rescan",
+            ),
+            at(
+                "tests/x4_tabular_map.rs",
+                "an_unreadable_dataset_is_a_coverage_fact_not_a_scan_failure",
+            ),
+            at(
+                "tests/x3b_syntax_wiring.rs",
+                "a_file_a_grammar_cannot_parse_is_an_error_row_with_no_partial_symbols",
+            ),
+        ],
+        note: "UPDATED S4 Y6 (G7/A1-06): this row was a named GAP at S3/S4-Y5 close (see this \
+               file's own git history for the retired verdict and note) — the tripwire that \
+               pinned it, `a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped`, is \
+               retired per its own assertion message's instruction ('update ... rather than \
+               deleting'): the register row below is the update, and the vocabulary/behavior it \
+               used to forbid now has its own positive checks, cited above. \
+               THE UNREADABLE HALF stays met, unchanged: unreadable roots, unreadable datasets, \
+               unparseable files and excluded paths all leave a named coverage row. \
+               THE ONLINE-ONLY HALF NOW SHIPS, as a best-effort heuristic honestly labelled — \
+               which is the acceptance item's own literal wording, not a stronger claim than it \
+               makes. SIGNAL: `st_blocks == 0` with `st_size > 0`, read from the \
+               `symlink_metadata` call the walker already makes per entry (no added syscall). \
+               PERMITTED SYSCALL SET: exactly `lstat`/`stat` — `open()`/`read()` are never \
+               attempted on a path this check flags, checked strictly before the byte-read \
+               boundary in both `Walk::file` and `Walk::dataset` \
+               (`src/runtime/atlas/scan.rs`), because A1 §7 forbids auto-hydrating a library and \
+               `open()` is the documented hydration trigger on several cloud filesystems. \
+               `listxattr`/`getxattr` were investigated and NOT adopted: no single \
+               verifiable-via-documentation xattr convention for a cloud placeholder covers this \
+               build's Linux/macOS targets, and guessing one would repeat the `enclosed_name` \
+               mistake S4's own record already made once. HONEST LIMITS, named in the coverage \
+               row's own `detail` text every time, not just here: a legitimate sparse file (a \
+               disk image, a punched-out log) reads identically and is a FALSE POSITIVE; a \
+               placeholder a sync client reports with full block allocation before the byte is \
+               fetched is not caught at all and is a FALSE NEGATIVE. A genuinely empty file \
+               (`st_size == 0`) is never flagged — flagging it would be the opposite dishonesty. \
+               PROVEN END TO END through the real trigger \
+               (`tests/y6b_online_only.rs`), not only at the pure-function level.",
+    },
+    Item {
+        number: 5,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/y2_office_adapter.rs",
+                "a_docx_worker_returns_document_and_section_units_with_provenance",
+            ),
+            at(
+                "tests/y2_office_adapter.rs",
+                "a_real_parser_failure_leaves_the_daemon_up_the_permit_freed_and_a_named_coverage_row",
+            ),
+            at(
+                "tests/y2_office_boundary.rs",
+                "anydoc_is_named_nowhere_but_the_office_adapter",
+            ),
+            at(
+                "tests/y8_adapter_dispatch.rs",
+                "a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_generation_carries_the_proof",
+            ),
+        ],
+        note: "S4 Y2, closing the deferral the S3 sprint plan's panel adjudication finding 1 \
+               recorded here. The Markdown/text half shipped in S3 (see item 3's checks). The \
+               Office half ships now: `.docx` via a third-party document-conversion crate \
+               (owner ruling J4, dated 2026-08-27 — see the owner-rulings knowledge library), \
+               run inside Y1's supervised worker, proven through the real subprocess and the \
+               real parser — not a synthetic fixture. Provenance is A1 §6.3's own shape: \
+               normalizer identity + version (`office::DOCX_EXTRACTOR`), citation of the \
+               ORIGINAL resource (never a temp path), and a unit coordinate where recoverable \
+               — a structural `block:<n>` coordinate for an Office section rather than a byte \
+               offset, because the original bytes are a compressed container the normalizer \
+               has already unpacked by the time a unit is visible (see `runtime/atlas/office.rs`'s \
+               own module doc and `domain::source::UnitKind`'s doc for the full argument). Output is \
+               derived, never canonical (A1-12). NARROWING CLOSED (S6): this note used to read \
+               '`.docx` is this wave's one adopted format (G3's gate order), so \
+               `office::extractor_for` claims nothing else yet' — true of G3's spike, and a \
+               NARROWING once that spike ended, which is what the owner ruled \
+               (`twelve-formats-is-0.3.0-criteria-2026-08-30`, J4: '1/12 is a failure of 0.3.0 \
+               completion criteria for estate intelligence'). `office::OFFICE_EXTENSIONS` now \
+               routes eleven formats — doc, docx, epub, odp, ods, odt, pdf, ppt, pptx, rtf, \
+               xlsx — each with its own extractor identity and its own hand-verified fixture; \
+               the twelfth, csv, stays in the relational lane by A1 §6.4/A1-13 \
+               (`office::CSV_IS_NOT_A_DOCUMENT`). §17 item 5 asks for 'at least one' Office \
+               format and always got one; it now gets eleven. CROSS-CUTTING GAP, CLOSED (S4 Y8): this note used to read 'the \
+               adapter is invoked here through its own writer (the worker binary) and by tests, \
+               not yet by a shipped scan trigger' — true through Y2-Y7, and corrected here. \
+               `scan.rs`'s `Walk::file` and `git.rs`'s `extract_blobs` now dispatch a claimed \
+               `.docx` through the real worker from a real scan; the newly-added check above \
+               proves it against real bytes end to end, through `record_scan`'s own three-step \
+               discipline, not only against the worker binary in isolation. Unlike items 7/8, \
+               Office has no container-child concept, so this item carries no residual deviation.",
+    },
+    Item {
+        number: 6,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/x4_tabular_map.rs",
+                "datasets_are_registered_and_read_in_place_as_derived_evidence",
+            ),
+            at(
+                "tests/x4_tabular_map.rs",
+                "f12_a_stored_fact_describes_the_query_that_actually_ran",
+            ),
+            at(
+                "tests/x4_tabular_map.rs",
+                "f10a_a_declared_allowlist_exposes_only_its_columns_with_stable_row_identity",
+            ),
+            at(
+                "tests/x4_tabular_map.rs",
+                "f10a_rows_the_allowlist_cannot_distinguish_are_honestly_re_keyed",
+            ),
+        ],
+        note: "NARROWING, ratified: 'selected text-field context units' are gated by F10a's \
+               operator-declared column allowlist, whose default is NONE. A dataset with no \
+               declared allowlist is still registered, counted and profiled; it publishes no \
+               row text at all. That is a deliberate narrowing of the item toward the secrets \
+               posture, decided at X4 on panel finding 7 — not an omission. CROSS-CUTTING GAP \
+               applies: the dataset walk is invoked by its own writer and by tests, not by a \
+               shipped trigger.",
+    },
+    Item {
+        number: 7,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/w7_container_children.rs",
+                "an_admitted_zip_entry_lands_as_its_own_resource_with_all_four_preserved_fields",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_child_with_no_claiming_extractor_is_a_named_coverage_gap",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_csv_inside_a_zip_reaches_the_relational_lane_a_loose_csv_reaches",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_grandchilds_persisted_parent_is_its_immediate_container_not_the_root",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "the_parent_coordinate_is_readable_through_the_daemons_own_bounded_reader",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_nested_container_cannot_escape_the_shared_depth_ceiling_by_recursing",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "container_children_share_one_depth_counter_and_one_budget_not_a_second_pair",
+            ),
+            at(
+                "tests/y3_zip_adapter.rs",
+                "a_zip_worker_declares_admitted_children_through_the_real_subprocess",
+            ),
+            at(
+                "tests/y3_zip_adapter.rs",
+                "an_archive_level_refusal_fails_its_own_worker_alone",
+            ),
+            at(
+                "src/runtime/atlas/archive.rs",
+                "overlapping_files_refuse_the_whole_archive_before_any_entry_opens",
+            ),
+            at(
+                "src/domain/source.rs",
+                "a_grandchild_key_chains_through_its_own_parent_not_the_root",
+            ),
+            at(
+                "tests/y8_adapter_dispatch.rs",
+                "a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_generation_carries_the_proof",
+            ),
+        ],
+        note: "S4 Y3 (G5 as AMENDED 2026-08-28). `enclosed_name` is a path-STRING validator only \
+               (research note beside the sprint plan, VERIFIED against zip2's source); this wave \
+               adds explicit checks on top with their own named coverage rows: entry TYPE \
+               (symlink refused via `is_symlink`, checked first and unconditionally of the \
+               entry's name; every other non-regular type — FIFO, char/block device, socket — \
+               refused by masking the entry's own Unix mode bits (`S_IFMT`) directly rather than \
+               trusting `zip`'s `is_file()`, which is `!is_dir() && !is_symlink()` and does not \
+               check `S_IFREG` at all, VERIFIED against `zip` 8.6.0's own `src/read.rs`), \
+               non-empty name, name uniqueness, and a Unicode \
+               NFC-then-case-fold normalisation rule (not a bare `to_lowercase()`) for \
+               case-insensitive/NFC-NFD-folding collisions. Two size bounds — per-entry \
+               uncompressed size (reused from `scan::MAX_RESOURCE_BYTES`, R2) and total expanded \
+               size — are ENFORCED BY COUNTING STREAMED BYTES (`Read::take`), never by trusting \
+               the attacker-controlled `size()`/`compressed_size()` header fields. The other two \
+               named bounds are honestly different, not folded into that same claim: entry count \
+               is checked against the central directory's own real record count, not an \
+               attacker-inflatable declared integer; the compression-ratio bound is an ADVISORY \
+               pre-filter computed from those same declared header fields BEFORE any byte \
+               streams — cheap triage in front of the streamed per-entry check that actually \
+               holds under a header that lies about the ratio too. Nesting depth caps recursion, \
+               not bytes. Every ceiling but the reused per-entry one is named PROVISIONAL and \
+               named PROVISIONAL and unmeasured (Y1's memory-cap precedent, #325). CLOSES THE \
+               RESEARCH'S OPEN ITEM: `zip` 8.6.0 does NOT reject overlapping/self-referential \
+               (quine-shaped) constructions on its own — its own `has_overlapping_files` doc says \
+               so verbatim ('this doesn't make the archive invalid') — so this wave calls it \
+               itself, before opening any entry, and refuses the whole archive when it fires \
+               (VERIFIED against a hand-crafted overlapping fixture, sanity-checked against the \
+               crate's own diagnostic before asserting anything about this wave's own defence). \
+               A SECOND correction to the research note, found while building this wave's own \
+               fixtures rather than merely read from source: two central-directory records with \
+               BYTE-IDENTICAL raw names do not both survive to be visited at all — the crate's \
+               own `IndexMap`-keyed construction collapses them to one entry, silently, \
+               last-write-wins, before `len()`/`by_index` are ever called, which is a stronger \
+               (and different) claim than the research's 'hidden from by_name, visible by index'. \
+               Child resources keep parent provenance (G9): every admitted child carries a \
+               content hash and a COMPOSED F7 key (`domain::source::child_key`) built from its \
+               IMMEDIATE parent's own key — chained, not resolved to the root archive, so a \
+               grandchild's key encodes its whole ancestry without a stored chain. No entry is \
+               ever executed and nothing is written to a real path (deliverable d): the adapter \
+               is pure bytes-in/structs-out, never touches a filesystem. DISPATCH CLOSED (S4 Y8): a \
+               claimed `.zip` reaches the worker from a real scan — `scan.rs`'s `Walk::file` and \
+               `git.rs`'s `extract_blobs` route it through `run_worker` and daemon-side \
+               `validate_batch`. CHILD CONTENT CLOSED (S5 W7), which is what moved this row from \
+               `met-with-deviation` to `met`: `DeclaredChild` now carries the child's BYTES, the \
+               worker's own hash of them and its downstream adapter claim, the worker flattens \
+               the whole expansion tree onto one batch, and each admitted entry lands as its OWN \
+               resource — its own composed path (`bundle.zip!/notes/a.md`), its own units from \
+               the adapter its own extension routes to, and a `source.child_resources` row \
+               carrying A1 §6.6's parent coordinate (parent resource path + parent key + entry \
+               path) beside the entry content hash and entry adapter its `source.files` row \
+               already holds. All four §6.6 fields are preserved, and the first check above \
+               asserts each one. A child claimed by the TABULAR routing table takes the \
+               relational lane instead (S5 W7 F-SF-01): it is registered in `source.datasets` \
+               and read in place, never prose-flattened (A1-13), and writes the same \
+               `source.child_resources` parent-coordinate row keyed by its `dataset_key` — \
+               because DuckDB reads a dataset from a path and a child's bytes exist only in \
+               memory, the daemon materialises those bytes into a per-read scratch directory \
+               under its OWN data dir, named by its own content hash rather than the entry's \
+               name, and removes it when the read ends. Nothing executes it and no container is \
+               unpacked to disk. SCOPED HONESTLY: that registration happens on a FILESYSTEM \
+               source walk. An estate-git walk registers no dataset row for a LOOSE file of \
+               those extensions either (`DATASET_NO_ROOT`), so its container children answer \
+               with their own `DATASET_CHILD_NOT_REGISTERED` detail naming that equivalence \
+               rather than borrowing a reason that is no longer true of a child; an overlay \
+               scan produces no container child at all. Route equivalence is the claim, per \
+               walk, and it holds on every walk — not 'every walk registers datasets'. THE COORDINATE IS READ, NOT ONLY WRITTEN (S5 W7 F-SF-03): \
+               `AtlasDb::child_resources` is the canned read behind `GET /v1/map/children` and \
+               `sgt map children`, answering with all four §6.6 fields for both lanes in one \
+               list — the parent coordinate from `source.child_resources`, the entry content \
+               hash and entry adapter JOINED BACK from the resource's own row. That join is why \
+               those two fields are not duplicated beside the coordinate (F-SI-01), and until \
+               this reader existed the non-duplication was a hole rather than a design: every \
+               occurrence of the table in `src/` was DDL, INSERT or DELETE, and A1-15 keeps \
+               arbitrary client SQL off the public surface, so two of the four preserved fields \
+               were reachable only by opening the database file directly. AND THE PARENT IS THE \
+               IMMEDIATE ONE (S5 W7 F-SF-02): the daemon composes each child's coordinate from \
+               the container its own flattened path names, not from the dispatched resource, so \
+               a grandchild records the intermediate archive and chains its key through that \
+               archive's own key — `validate_batch` refuses a child naming a container the \
+               batch never declared (`OrphanedChildPath`), which is what makes that composition \
+               well-founded rather than a best effort. H15, the wave's named J0-shaped question, was answered as its \
+               brief recommended and the code states honestly: the worker returns child bytes \
+               and the DAEMON hashes what it receives, on receipt, before storing (option (b)), \
+               because option (a) — the daemon re-opening the container — would have moved ZIP \
+               and MIME parsing into the sole writer, defeating the supervised-worker boundary \
+               PDEATHSIG/RLIMIT_AS/the own process group exist to hold. The honest claim, made \
+               in `DeclaredChild`'s own doc rather than glossed: a child's content hash \
+               identifies THE BYTES THAT REACHED THE STORE, not 'what is really inside the \
+               archive' — the daemon cannot vouch for a correspondence it never observed. What \
+               it does vouch for is checked: per-child ceiling (an alias of \
+               `scan::MAX_RESOURCE_BYTES`, refused from the ENCODED length before the decoded \
+               buffer is allocated), the daemon's own hash against the worker's claim, and the \
+               adapter claim against this build's own routing table — each its own \
+               `BatchRefusal`, each refusing the WHOLE batch rather than landing part of it. \
+               BOUNDS UNCHANGED, which the brief required: child bytes count against the \
+               EXISTING whole-tree byte budget and the EXISTING depth counter, because the \
+               worker flattens a tree `archive::expand` already walked under both — \
+               `container_children_share_one_depth_counter_and_one_budget_not_a_second_pair` \
+               reads the source and fails if a second constant of either kind is ever defined. \
+               ONE NARROWER GAP REMAINS AND IS NOT CLAIMED CLOSED: `WorkerBatch` still has no \
+               `CoverageRow` field, so an ENTRY-level refusal (a symlink, a duplicate name, the \
+               depth ceiling) is proven in `archive.rs`'s own tests but does not reach the \
+               daemon — `src/bin/atlas_worker.rs`'s own module doc, 'A named gap', states it, and \
+               W7 deliberately did not widen it. That gap is about a coverage row's transport, \
+               not about whether a bounded ZIP exposes child resources, which is what this item \
+               asks and what the checks above now prove end to end.",
+    },
+    Item {
+        number: 8,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/w7_container_children.rs",
+                "a_docx_inside_a_zip_inside_an_eml_reaches_the_office_adapter_by_the_same_route",
+            ),
+            at(
+                "tests/w7_container_children.rs",
+                "a_child_whose_received_bytes_do_not_match_its_declared_hash_is_refused_rather_than_stored",
+            ),
+            at(
+                "tests/y4_mail_adapter.rs",
+                "a_mail_worker_returns_message_shape_and_attachment_with_provenance",
+            ),
+            at(
+                "tests/y4_mail_adapter.rs",
+                "a_real_parser_failure_leaves_the_daemon_up_the_permit_freed_and_a_named_coverage_row",
+            ),
+            at(
+                "tests/y4_mail_adapter.rs",
+                "a_genuine_html_body_reaches_the_wire_and_a_synthesized_one_does_not",
+            ),
+            at(
+                "src/domain/source.rs",
+                "a_grandchild_key_chains_through_its_own_parent_not_the_root",
+            ),
+            at(
+                "tests/y8_adapter_dispatch.rs",
+                "a_real_scan_dispatches_docx_zip_and_eml_through_the_worker_and_the_recorded_generation_carries_the_proof",
+            ),
+        ],
+        note: "S4 Y4 (G4 — ADOPT, tests/fixtures/mail_corpus/SPIKE-G4.md). `mail-parser` 0.11.8 \
+               (`full_encoding` feature) via the same gate order G3/G5 used: deny gate FIRST \
+               (zero new advisory/license/ban/source failure, diffed against the pre-existing \
+               yanked-chacha20 baseline, #328, untouched), a hand-verified 6-fixture corpus \
+               cross-checked independently with Python's stdlib `email` package BEFORE \
+               mail-parser ever ran, footprint (+2 packages, +0.89 MiB linked binary once linker \
+               nondeterminism is corrected out). Message shape is A1 §6.5 verbatim: from/to/cc, \
+               sent timestamp (RFC3339), subject, text AND html bodies, message id, thread \
+               (References + In-Reply-To folded, deduplicated), attachments — provenance carries \
+               parser identity + version (`mail::MAIL_EXTRACTOR`). TWO caveats the spike found \
+               empirically are CLOSED, not merely named as downstream work: (1) a synthesized \
+               text or HTML body (`mail-parser` aliases the SAME MessagePartId into both \
+               `text_body` and `html_body` when no genuine alternative exists — VERIFIED against \
+               `mail-parser`'s own source, `parsers/message.rs`, not merely observed) is detected \
+               by inspecting the aliased part's own physical PartType (not index equality alone \
+               — an index-only version shipped a direction bug, caught in review, that discarded \
+               a genuinely HTML-only message's real HTML and reported mail-parser's own \
+               html_to_text-converted rendering as a genuine text body) and reports whichever \
+               side is the synthesized alias absent, matching `manifest.json`'s own \
+               wire-bytes-only definition of `body_html_present`/`body_text_present`; (2) a \
+               message-shaped-but-broken \
+               input (an unterminated MIME boundary) that `mail-parser` silently downgrades into \
+               a nameless attachment (SPIKE-G4.md's own diagnostic finding) is detected — any \
+               leaf, non-message attachment with no recoverable name — and refuses the WHOLE \
+               message, no partial units (F8). A structurally encrypted/S-MIME message \
+               (`multipart/encrypted`, `application/pkcs7-mime`) gets its own honest \
+               `MailError::Sealed` status, never a garbage-body silent success — `mail-parser` \
+               has zero PKCS#7/S-MIME awareness of its own (VERIFIED: no match anywhere in its \
+               source for pkcs7/smime/encrypted), so this is detected structurally from the \
+               message's own declared Content-Type, never by decrypting or verifying anything. \
+               Attachments recurse through Y3's container machinery exactly as the brief \
+               requires: a `message/rfc822` attachment recurses via THIS module's own \
+               `build_mail_message` using mail-parser's OWN already-parsed embedded value (a \
+               design correction made while building this wave's own tests: re-serializing to \
+               raw bytes and re-parsing picked up a boundary-adjacent CRLF a second parse read \
+               as body content, disagreeing with the hand-verified, stdlib-cross-checked \
+               manifest — corrected in manifest.json with the full argument, not silently \
+               patched around); an attachment that is itself a ZIP recurses via \
+               `archive::expand_at_depth` — the SAME function `archive.rs` calls on itself, \
+               widened to `pub(crate)` (R2) so mail and archive nesting share ONE depth counter \
+               and ONE whole-tree cumulative-bytes budget, never two independently-sized ones. \
+               THE REVERSE DIRECTION CHAINS TOO (a review finding, closed here, not merely \
+               documented): `archive::classify` now routes a `.eml`-named ZIP entry back into \
+               THIS module's own `parse_at_depth`, through the same shared depth/budget — a \
+               `.eml` entry inside a ZIP previously fell through to `unsupported` despite this \
+               module's own doc already claiming the chain worked whichever container kind each \
+               level happens to be. THE SAME ADMISSION DISCIPLINE AS Y3 (brief item 3): empty-name refusal, \
+               path-safety per `/`-component via `domain::is_plain_name`, name uniqueness, and \
+               the identical Unicode NFC-then-case-fold collision rule via \
+               `archive::collision_key` — reused outright (R2), not a second copy. BOUNDS \
+               reused wholesale from `archive.rs` (R2) rather than three new independently-tuned \
+               numbers: `MAX_ENTRY_UNCOMPRESSED_BYTES` per attachment, \
+               `MAX_TOTAL_EXPANDED_BYTES` cumulative, `MAX_ZIP_ENTRIES` reused as an \
+               attachment-count ceiling — all PROVISIONAL, same footing as Y1's memory cap \
+               (#325). HONEST GAP, STATED not glossed: unlike ZIP's `Read::take` streaming, \
+               `mail-parser` decodes every part eagerly before this adapter's own bounds ever \
+               run, so these are POST-decode admission checks, not pre-allocation stream bounds \
+               — the worker's own `RLIMIT_AS` (Y1) is the real backstop against a single \
+               oversized decode, named plainly rather than implied as equivalent to the ZIP \
+               case; separately, MIME transfer encodings have no ZIP-class decompression-bomb \
+               ratio (base64 ~4:3, quoted-printable at most ~3:1), so the gap is materially \
+               smaller than it would be for a compressed container. NO REPLACEABILITY BOUNDARY \
+               for `mail_parser` (J1, stated per the brief's own instruction): Office's boundary \
+               exists to discharge a specific owner ruling over a RUSTSEC advisory G4's own deny \
+               gate did not find; Y3's `archive.rs` (a second real container adapter) already set \
+               the precedent of no dedicated one-owner test, which this wave follows rather than \
+               diverging from unprompted. DISPATCH CLOSED (S4 Y8): a claimed `.eml` \
+               reaches the worker from a real scan. ATTACHMENT CONTENT CLOSED (S5 W7), which is \
+               what moved this row to `met`: mail reuses `archive.rs`'s container machinery, so \
+               it inherited the identical wire limit item 7's note describes, and it inherits \
+               the identical fix. An attachment now lands as its OWN resource carrying the \
+               PARENT-MESSAGE COORDINATE A1 §6.5 requires ('attachments recurse through the same \
+               content adapters and retain a parent-message coordinate') — and both halves of \
+               that sentence are now literally true, not one of them: the first check above \
+               drives a real `.docx` inside a real `.zip` inside a real `.eml` and asserts the \
+               grandchild's extractor is the OFFICE adapter's own identity, reached through \
+               `scan::child_extractor_for` — which is `format_for` unioned with \
+               `worker_extractor_for` unioned with `claims_for`, the same THREE tables in the \
+               same order a loose file on disk goes through, so there is one dispatcher in this \
+               build and not a second one for children (R2). That third table was missing until \
+               S5 W7's F-SF-01 fix, and its absence was exactly A1 §1's own motivating payload \
+               ('100k ServiceNow tickets in CSV/JSON/Parquet inside an archive') not working: a \
+               `.csv` child answered `None` and landed as a gap whose detail said 'nothing in \
+               this build claims its extension' while `tabular.rs` claims csv/tsv/json/jsonl/ \
+               ndjson/parquet. It now takes the relational lane a loose one takes — registered, not \
+               prose-flattened (A1-13) — with the daemon materialising the child's bytes into \
+               its own scratch directory under the data dir, named by its own content hash and \
+               removed when the read ends, because DuckDB reads a dataset from a path and a \
+               child's bytes exist only in memory. A child dataset carries the same A1 §6.6 \
+               parent coordinate a child file does, into the same `source.child_resources` \
+               table. The message's own body units are unchanged. H15's trust model, the \
+               per-child ceiling, the hash and adapter cross-checks, and the single shared \
+               depth/byte budget are item 7's note in full and are not restated here; the one \
+               narrower gap named there (no `CoverageRow` field on `WorkerBatch`) applies to \
+               mail identically and is likewise not claimed closed.",
+    },
+    Item {
+        number: 9,
+        verdict: Verdict::DeferredPostS4,
+        checks: &[],
+        // S4 Y5's correction: the previous note here read "S4's, same
+        // citation as item 7" — a mis-citation. Owner ruling 3 and the
+        // ratified S4/S5+ re-cut both place OCR/layout evaluation AFTER S4
+        // (feature-gate vs. worker-binary, ONNX excluded), not inside it; S4
+        // ships items 4/5/7/8/10 + §10 package identity and item 9 is not
+        // among them (G1). Corrected in-sprint per J5 (governing ruling)
+        // over J3 (an unmoved register note) rather than left standing.
+        note: "OCR/layout evidence enters post-S4, not S4 — owner ruling 3 plus the ratified S4 \
+               re-cut (G1) name the destination explicitly; the earlier \"S4's, same citation as \
+               item 7\" note was a mis-citation, corrected here (S4 Y5).",
+    },
+    Item {
+        number: 10,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "src/runtime/atlas/external_git.rs",
+                "a_refresh_resolves_the_origins_new_tip_over_the_same_cache",
+            ),
+            at(
+                "src/runtime/atlas/external_git.rs",
+                "the_cache_is_bare_and_never_grows_a_working_tree",
+            ),
+            at(
+                "src/runtime/atlas/external_git.rs",
+                "an_external_agents_md_becomes_ordinary_indexed_text_never_instructions",
+            ),
+            at(
+                "src/runtime/atlas/locator.rs",
+                "ext_remote_helper_is_refused",
+            ),
+            at(
+                "tests/y5_external_git_triggers.rs",
+                "an_unallowlisted_locator_is_refused_by_the_api_before_git_runs",
+            ),
+        ],
+        note: "S4 Y5 (G6): locator allowlist BEFORE Git sees the string, bare no-working-tree \
+               host cache outside every estate, exact-commit resolution over the identical \
+               ls-tree/cat-file plumbing X3a already reads estate-git through, full A1 §9 \
+               provenance (origin/requested_ref/resolved_commit/retrieved_at) in a new \
+               git.provenance table, `sgt intelligence add/list` as the CLI surface. A live \
+               `https://`/`ssh://` acquisition end to end needs network access this suite's \
+               sandbox does not have; the acquisition mechanism itself is proven against a \
+               local origin with the protocol allowlist deliberately widened for the test only \
+               (never in production code — a separate test proves the production entry point \
+               never does this), and the allowlist decision itself is proven exhaustively, \
+               separately, in `locator.rs`.",
+    },
+    Item {
+        number: 11,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/x2_knowledge_sources.rs",
+                "a_scan_records_once_reuses_an_unchanged_generation_and_evicts_a_changed_one",
+            ),
+            at(
+                "tests/x3a_git_plumbing.rs",
+                "stored_estate_git_keys_are_blob_oids_and_a_rescan_evicts_nothing",
+            ),
+            at(
+                "tests/x3b_syntax_wiring.rs",
+                "the_syntax_extraction_is_keyed_on_the_blob_oid_and_the_grammar",
+            ),
+            at(
+                "tests/x4_tabular_map.rs",
+                "f10a_narrowing_an_allowlist_retracts_the_units_it_exposed",
+            ),
+        ],
+        note: "Both halves of F7's key are pinned: content identity (blob OID for repository \
+               bytes, BLAKE3 for local knowledge) AND extractor identity — the fourth check is \
+               the staleness direction, where unchanged bytes read by a changed extractor \
+               supersede rather than serve the previous parser's rows.",
+    },
+    Item {
+        number: 12,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/x5_a1a_acceptance.rs",
+                "a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli",
+            ),
+            at(
+                "src/runtime/atlas/db.rs",
+                "open_read_only_refuses_a_store_that_does_not_exist_and_creates_nothing",
+            ),
+            at(
+                "src/runtime/atlas/db.rs",
+                "open_read_only_reads_confirmed_rows_and_cannot_write",
+            ),
+            at(
+                "tests/x1_atlas_substrate.rs",
+                "atlas_database_has_exactly_one_owner",
+            ),
+            at(
+                "tests/x3a_git_plumbing.rs",
+                "a_panicking_intelligence_job_is_reported_and_frees_its_permit",
+            ),
+            at(
+                "tests/x2_knowledge_sources.rs",
+                "a_crash_between_the_rows_and_the_summary_reports_neither",
+            ),
+            at(
+                "tests/x2_knowledge_sources.rs",
+                "a_crash_after_the_summary_but_before_confirmation_completes_the_scan",
+            ),
+            at(
+                "tests/y1_worker_transport.rs",
+                "a_fault_worker_leaves_the_daemon_up_the_permit_freed_and_a_named_coverage_row",
+            ),
+        ],
+        note: "RESIDUAL CLOSED (S4 Y1, G2): the row-1 residual read 'DESTINATION: S4, as a \
+               read-only open' — `sgt doctor`'s atlas coverage row now opens the store through \
+               `AtlasDb::open_read_only`, which asks DuckDB itself for `AccessMode::ReadOnly` and \
+               runs no `CREATE SCHEMA`/`CREATE TABLE` DDL at all, idempotent or not. The two new \
+               db.rs checks pin both halves: a store that does not exist is refused rather than \
+               materialized, and a store that does exist is read but genuinely cannot be written \
+               through this connection (DuckDB refuses the write, not merely this crate declining \
+               to attempt one). G2 also widens what 'daemon remains sole Atlas writer' has to \
+               survive: a worker's returned batch is now itself untrusted input, validated \
+               daemon-side (identity, `enclosed_name` path safety, F10 deny-set membership on \
+               declared child names) before anything is written — the fault-injection check cited \
+               here is the SUPERVISION proof for that (Y2 carries the real-parser malformed-input \
+               proof); nothing here claims a third-party parser exists yet.",
+    },
+    Item {
+        number: 13,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/x5_a1a_acceptance.rs",
+                "a1a_item_13_no_client_sql_reaches_the_store",
+            ),
+            at(
+                "tests/x4_tabular_map.rs",
+                "map_ships_only_the_verbs_whose_rows_exist_and_defers_neighbors_and_changed",
+            ),
+            at(
+                "tests/x4_tabular_map.rs",
+                "f11_the_map_surface_answers_over_http_and_through_the_verb",
+            ),
+            at(
+                "tests/x4_tabular_map.rs",
+                "f10_a_dataset_path_a_reader_would_glob_is_refused",
+            ),
+        ],
+        note: "X4 pinned the verbs and the wire shape. What had no check was the negative claim \
+               — that no surface accepts SQL and the store exposes no way to run any — so this \
+               wave wrote one. `map neighbors`/`changed` are absent by declared deferral (F11), \
+               which the verb-set check holds them to. CORRECTED (S4 Y8 panel fix (c)): this note \
+               used to read '...and nothing shipped triggers a scan, so on a fresh installation \
+               they honestly answer empty' — false since S4 Y5/Y6 shipped `sgt intelligence \
+               scan` (see 'One cross-cutting gap, closed', this file's own module doc), and \
+               unnoticed here through two more waves. The true, current gap is narrower: these \
+               surfaces expose exactly what the most recent scan wrote, so a fresh installation \
+               answers empty only until an operator actually RUNS the shipped trigger, not \
+               because no trigger exists.",
+    },
+    Item {
+        number: 14,
+        verdict: Verdict::Met,
+        checks: &[
+            at(
+                "tests/x5_a1a_acceptance.rs",
+                "a1a_item_14_the_inherited_contract_pins_still_exist",
+            ),
+            at(
+                "tests/m8_estate_cli.rs",
+                "a_descendant_of_the_estate_root_finds_no_estate_and_spawns_nothing",
+            ),
+            at(
+                "tests/m12_child_work.rs",
+                "a_bare_sgt_run_from_a_work_surface_still_refuses_while_dash_c_works",
+            ),
+            at(
+                "tests/m11_nested_workflow.rs",
+                "a_nested_leafs_own_output_contract_is_enforced_exactly_as_a_flat_ones_is",
+            ),
+        ],
+        note: "The decisive check for 'remain green' is the wave's own full suite run, recorded \
+               in the closeout commit — a test cannot assert its siblings passed. What IS \
+               assertable, and what the first check does, is that those inherited pins still \
+               EXIST: a suite stays trivially green if the tests are deleted, and that is the \
+               failure mode this item is really about.",
+    },
+];
+
+// ------------------------------------------------- the register's own guards
+
+#[test]
+fn every_contract_item_is_accounted_for() {
+    let numbers: Vec<u8> = WALK.iter().map(|item| item.number).collect();
+    assert_eq!(
+        numbers,
+        (1..=14).collect::<Vec<u8>>(),
+        "§17 has fourteen items; the walk must carry each exactly once, in order"
+    );
+
+    for item in WALK {
+        assert!(
+            !item.note.is_empty(),
+            "item {} has no note: a verdict without a reason is not a walk",
+            item.number
+        );
+        match item.verdict {
+            Verdict::DeferredS4 | Verdict::DeferredPostS4 => assert!(
+                item.checks.is_empty(),
+                "item {} is deferred; it must not claim a check",
+                item.number
+            ),
+            _ => assert!(
+                !item.checks.is_empty(),
+                "item {} claims a verdict with no decisive check — the one thing this \
+                 battery exists to prevent",
+                item.number
+            ),
+        }
+    }
+
+    // The re-cut's own boundary, pinned so a later edit cannot quietly pull an
+    // S4 item back into A1a's "accepted" column (or push an S3 one out).
+    // Item 9 (OCR) moved from `DeferredS4` to `DeferredPostS4` in S4 Y5's own
+    // register correction (the earlier "S4's" note was a mis-citation —
+    // owner ruling 3 places it after S4); item 10 (external Git) closed in
+    // Y5 itself, exactly as items 5/7/8 closed in Y2/Y3/Y4.
+    let deferred_s4: BTreeSet<u8> = WALK
+        .iter()
+        .filter(|item| item.verdict == Verdict::DeferredS4)
+        .map(|item| item.number)
+        .collect();
+    assert_eq!(
+        deferred_s4,
+        BTreeSet::new(),
+        "S4 has no remaining `deferred-s4` items: item 5 closed in Y2, item 7 in Y3, item 8 in \
+         Y4, item 10 in Y5 (register row edits each time); item 9 moved to deferred-post-s4 \
+         (S4 Y5's own correction), never simply dropped"
+    );
+    let deferred_post_s4: BTreeSet<u8> = WALK
+        .iter()
+        .filter(|item| item.verdict == Verdict::DeferredPostS4)
+        .map(|item| item.number)
+        .collect();
+    assert_eq!(
+        deferred_post_s4,
+        BTreeSet::from([9]),
+        "item 9 (OCR) is the sole post-S4 deferral, corrected here from its earlier mis-citation"
+    );
+
+    // And every deferral has to say so in words a reader can check, not just
+    // by its enum.
+    for item in WALK
+        .iter()
+        .filter(|i| i.verdict == Verdict::DeferredS4 || i.verdict == Verdict::DeferredPostS4)
+    {
+        assert!(
+            item.note.contains("S4"),
+            "item {}'s deferral must cite where it went",
+            item.number
+        );
+    }
+
+    // A gap must name where it is going, or it is a silent pass wearing a
+    // different label.
+    for item in WALK.iter().filter(|i| i.verdict == Verdict::Gap) {
+        assert!(
+            item.note.contains("DESTINATION"),
+            "item {}'s gap must name a destination sprint",
+            item.number
+        );
+    }
+}
+
+#[test]
+fn every_named_check_exists_in_the_suite_it_names() {
+    for item in WALK {
+        for check in item.checks {
+            let text = read(check.file);
+            assert!(
+                text.contains(&format!("fn {}(", check.test)),
+                "item {}: {} names no `{}` — a citation that does not resolve proves nothing",
+                item.number,
+                check.file,
+                check.test
+            );
+        }
+    }
+}
+
+/// The doc table at the top of this file and [`WALK`] must agree.
+///
+/// The table is what a reviewer reads in the pull request; the register is
+/// what runs. Two copies of one claim drift, so one is checked against the
+/// other rather than trusted.
+#[test]
+fn the_documented_walk_table_matches_the_register() {
+    let text = read("tests/x5_a1a_acceptance.rs");
+    let rows: Vec<&str> = text
+        .lines()
+        // The separator row (`//! |---|`) has no space after the bar, so this
+        // filter already excludes it; only the header needs skipping.
+        .filter(|line| line.starts_with("//! | "))
+        .skip(1)
+        .collect();
+    assert_eq!(
+        rows.len(),
+        WALK.len(),
+        "the doc table must carry every item"
+    );
+
+    for (row, item) in rows.iter().zip(WALK) {
+        let cells: Vec<&str> = row
+            .trim_start_matches("//! |")
+            .split('|')
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            cells[0],
+            item.number.to_string(),
+            "doc table row order must match the register"
+        );
+        assert_eq!(
+            cells[2],
+            item.verdict.as_str(),
+            "doc table verdict for item {} disagrees with the register",
+            item.number
+        );
+        match item.verdict {
+            Verdict::DeferredS4 | Verdict::DeferredPostS4 => assert_eq!(
+                cells[3], "—",
+                "a deferred item names no check in the table either"
+            ),
+            _ => {
+                let first = &item.checks[0];
+                let suite = first
+                    .file
+                    .trim_start_matches("tests/")
+                    .trim_end_matches(".rs");
+                assert_eq!(
+                    cells[3],
+                    format!("`{suite}::{}`", first.test),
+                    "doc table check for item {} must be the register's first check",
+                    item.number
+                );
+            }
+        }
+    }
+}
+
+// ------------------------------------------------- item 2: the overlay tripwire
+
+/// §17.2's tripwire, **repointed** (S5 W1b): "Work overlays" now HAS a
+/// production caller, and this is what keeps it that way.
+///
+/// Until S5 W1b, [`sergeant_rs::runtime::atlas::overlay::scan_work_overlay`],
+/// [`sergeant_rs::runtime::atlas::lane::scan_work_overlay_on_lane`] and
+/// [`sergeant_rs::runtime::atlas::record::scan_and_record_overlay`] were
+/// exercised only from test files — never from `src/api.rs`'s router or
+/// `src/cli.rs`'s command dispatch, which is where every other shipped scan
+/// path (`scan_estate_git_on_lane`, `scan_local_knowledge_on_lane`,
+/// `acquire_external_git_on_lane`) is actually called from. That is the
+/// "built, tested and unreachable" shape this program has now closed three
+/// times, and this test was its guard while it stood open.
+///
+/// It is not deleted now that it is closed — it is INVERTED, per this
+/// file's own no-silent-pass rule (item 4's history is the precedent). The
+/// production caller is H13.2's daemon-side surface-lifecycle hook, and
+/// both of its halves are asserted structurally:
+///
+/// 1. `src/api.rs` calls `scan_work_overlay_on_lane` — the SCAN half, on
+///    the intelligence lane the hook was chosen to reuse.
+/// 2. `src/api.rs` calls `evict_work_overlays` — the LIFETIME half.
+///    `overlay.rs`'s module doc says an overlay's lifetime is its Work's;
+///    without a real caller that sentence is prose, and `--work` answers
+///    about surfaces that no longer exist.
+/// 3. Neither half appears on a query path: `src/api.rs` still routes
+///    search reads through `admissible_*` only, and the hook is reached
+///    from the surface-lifecycle arm of `crank`. The
+///    daemon-is-sole-writer and no-client-SQL suites own that boundary
+///    directly; this check owns the caller's existence.
+///
+/// **If this test fails**, someone removed the production trigger for
+/// Work-overlay scanning or eviction. §17 item 2's register row would then
+/// be claiming a capability the binary no longer reaches — revert the
+/// removal, or move the row back to `met-with-deviation` with a note
+/// saying so. Do not delete this test to make it pass.
+#[test]
+fn a1a_item_2_work_overlay_scan_has_a_production_lifecycle_trigger() {
+    let api = read("src/api.rs");
+    for needle in [
+        "scan_work_overlay_on_lane",
+        "evict_work_overlays",
+        // The hook itself, named so a rename has to come here and think
+        // about the register row rather than silently orphaning it.
+        "run_work_overlay_hook",
+    ] {
+        assert!(
+            api.contains(needle),
+            "src/api.rs no longer calls `{needle}` — the production trigger for Work-overlay \
+             scanning/eviction appears to have been removed. §17 item 2's register row 2 claims \
+             it exists (verdict `met`); see this test's own doc comment for what to do."
+        );
+    }
+}
+
+// --------------------------------------------------- item 3: the negative half
+
+/// §17.3 — a declared knowledge Source is indexed **as evidence**: it never
+/// becomes a repository, never receives a worktree, and never has a byte
+/// written into it.
+///
+/// X2 proved every positive half of this item. The negative half is what
+/// distinguishes a Source from a `[[repo]]` at all (A1-03), and it had no
+/// decisive check, so this is it: declare through the real CLI, scan through
+/// the real writer, then look for the three things that must not have
+/// happened.
+#[test]
+fn a1a_item_3_a_knowledge_source_is_indexed_without_becoming_a_repo_or_getting_a_worktree() {
+    let estate = TempDir::new().expect("estate");
+    let data = TempDir::new().expect("data dir");
+    let synced = TempDir::new().expect("synced dir");
+
+    // An ordinary directory of the shape a sync client leaves behind — which
+    // is the whole of what A1-05 asks Sergeant to read.
+    fs::create_dir_all(synced.path().join("Team Notes")).expect("mkdir");
+    fs::write(
+        synced.path().join("Team Notes/onboarding.md"),
+        "# Onboarding\n\nStep one.\n\n## Access\n\nAsk the estate owner.\n",
+    )
+    .expect("write note");
+    let before = tree_snapshot(synced.path());
+
+    fs::write(
+        estate.path().join("sergeant.toml"),
+        "[estate]\nname = \"x5-acceptance\"\n",
+    )
+    .expect("write manifest");
+
+    let declared = Command::new(SGT)
+        .current_dir(estate.path())
+        .args(["--data-dir", &data.path().display().to_string()])
+        .args(["knowledge", "add", "notes"])
+        .arg(synced.path())
+        .output()
+        .expect("sgt knowledge add");
+    assert!(
+        declared.status.success(),
+        "knowledge add must succeed: {}",
+        String::from_utf8_lossy(&declared.stderr)
+    );
+
+    // 1. It is not a repository. `sgt repo list` is the surface that would say
+    //    so, and the manifest is the record it reads.
+    let repos = Command::new(SGT)
+        .current_dir(estate.path())
+        .args(["--data-dir", &data.path().display().to_string()])
+        .args(["--json", "repo", "list"])
+        .output()
+        .expect("sgt repo list");
+    assert!(repos.status.success(), "repo list must succeed");
+    let listed = String::from_utf8_lossy(&repos.stdout);
+    assert!(
+        !listed.contains("notes"),
+        "a knowledge source must not appear as a repository: {listed}"
+    );
+    let manifest = fs::read_to_string(estate.path().join("sergeant.toml")).expect("manifest");
+    assert!(
+        manifest.contains("[[knowledge]]") && !manifest.contains("[[repo]]"),
+        "the declaration must land as `[[knowledge]]`, never as `[[repo]]`: {manifest}"
+    );
+
+    // 2. Indexing it produces real evidence.
+    let mut db = AtlasDb::open(data.path()).expect("open atlas");
+    let mut journal = Journal::open(data.path()).expect("open journal");
+    let source = KnowledgeSource {
+        name: "notes".to_string(),
+        root: synced.path().to_path_buf(),
+        ignore: Vec::new(),
+        context_fields: Default::default(),
+    };
+    let record = scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("scan");
+    let generation = match record {
+        ScanRecord::Recorded { generation_id, .. } => generation_id,
+        other => panic!("a readable source must record a generation, got {other:?}"),
+    };
+    let counts = db.coverage_counts("notes").expect("coverage");
+    assert_eq!(
+        counts.get(Coverage::Indexed.as_str()).copied(),
+        Some(1),
+        "the one note must be indexed: {counts:?}"
+    );
+    let units = db.units("notes", 50).expect("units");
+    assert!(
+        !units.is_empty(),
+        "an indexed Markdown file must produce units (generation {generation})"
+    );
+
+    // 3. Nothing was cut from it and nothing was written into it. A worktree
+    //    would leave a `.git` file or directory at the root; a mount would
+    //    leave a copy under the estate; a writer would change the bytes.
+    assert!(
+        !synced.path().join(".git").exists(),
+        "no worktree may be cut from a knowledge source"
+    );
+    assert_eq!(
+        tree_snapshot(synced.path()),
+        before,
+        "a knowledge source is read-only evidence: the scan must not change one byte"
+    );
+    assert!(
+        !estate.path().join("repos").exists(),
+        "declaring a knowledge source must not create a repository mount"
+    );
+    let surfaces = data.path().join("surfaces");
+    let cut = fs::read_dir(&surfaces).map(Iterator::count).unwrap_or(0);
+    assert_eq!(
+        cut, 0,
+        "declaring and indexing a knowledge source must cut no Work surface"
+    );
+}
+
+/// Every file under `root`, as `(relative path, bytes)`, so "unchanged" means
+/// unchanged content and unchanged membership — not merely an unchanged count.
+fn tree_snapshot(root: &Path) -> BTreeSet<(String, Vec<u8>)> {
+    let mut out = BTreeSet::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("under root")
+                    .display()
+                    .to_string();
+                out.insert((relative, fs::read(&path).expect("read file")));
+            }
+        }
+    }
+    out
+}
+
+// ------------------------------------ item 4: the online-only heuristic, now shipped
+
+/// §17.4's **named gap, now closed** (S4 Y6, G7/A1-06).
+///
+/// This replaces `a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped`,
+/// which pinned the gap as a negative tripwire: it failed the day Atlas
+/// started reasoning about cloud placeholders at all, by name, so its own
+/// assertion message said what to do next — "update this file's register
+/// row 4 — verdict, note and decisive check — instead of deleting this
+/// tripwire". This is that update, following the identical pattern the
+/// cross-cutting-gap tripwire below it already set: the old function is
+/// retired rather than left to assert a claim that stopped being true, and
+/// its replacement proves the positive the old one only ever forbade the
+/// negative of.
+///
+/// Proves the vocabulary grew the named state (not a re-proof of the
+/// heuristic's own behavior — [`src/runtime/atlas/scan.rs`]'s own unit tests
+/// and `tests/y6b_online_only.rs`'s end-to-end trigger test own that; this
+/// is the acceptance-register-level pin that the wire spelling exists and
+/// stays exactly what F8 always promised, no more and no fewer states).
+#[test]
+fn a1a_item_4_the_coverage_vocabulary_now_names_online_only() {
+    let vocabulary: BTreeSet<&str> = Coverage::ALL.iter().map(|c| c.as_str()).collect();
+    assert_eq!(
+        vocabulary,
+        BTreeSet::from([
+            "discovered",
+            "indexed",
+            "excluded",
+            "unavailable",
+            "unsupported",
+            "error",
+            "online_only",
+            "generation_evicted",
+        ]),
+        "F8's coverage vocabulary is what makes an unreadable OR unmaterialized resource a \
+         reported gap — `online_only` is S4 Y6's own addition, and nothing else in the \
+         vocabulary should have moved"
+    );
+}
+
+// -------------------------------------- the cross-cutting gap, now closed
+
+/// S4 Y5 (G8): the trigger this file's former tripwire
+/// (`a1a_cross_cutting_gap_no_shipped_surface_triggers_a_scan`) said did not
+/// exist now does — the retired test's exact handshake, completed rather
+/// than routed around.
+///
+/// Proves the positive this time: `record_scan`/`record_external_git_scan`
+/// (the Atlas writer entry points) really are reachable from production
+/// code in `src/api.rs` — a scan trigger that only ever called them from a
+/// test module would be the same false claim the old tripwire existed to
+/// catch, inverted. Item 12's own boundary (the CLI process itself never
+/// writes; only the daemon does) is unweakened — see
+/// [`a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli`], which this
+/// test does not relax.
+#[test]
+fn the_trigger_is_reachable_from_production_code_not_only_a_test_module() {
+    let api = read("src/api.rs");
+    // The real test module boundary — not the first `#[cfg(test)]` in the
+    // file, which (as of this wave) also gates a standalone test-only helper
+    // function well before this module and would wrongly mark production
+    // code between the two as "test-only".
+    let test_module = api
+        .find("\nmod tests {")
+        .expect("api.rs must have a test module for this check to mean anything");
+    let mut production_callers = 0;
+    for name in ["record_scan(", "record_external_git_scan("] {
+        for (index, _) in api.match_indices(name) {
+            if index < test_module {
+                production_callers += 1;
+            }
+        }
+    }
+    assert!(
+        production_callers >= 2,
+        "src/api.rs must call the Atlas writer entry points from production code (one for \
+         `sgt knowledge scan`, one for `sgt intelligence add`), not only from its own test \
+         module"
+    );
+}
+
+/// `sgt intelligence` now offers `status`, `add` and `list` — the read
+/// surface S3 shipped plus item 10's acquisition surface (G6, G8). The
+/// retired tripwire asserted the verb set was exactly `{status}`; this is
+/// its direct successor, asserting the earned superset rather than merely
+/// "more than one verb".
+#[test]
+fn the_intelligence_verb_set_now_includes_the_trigger_and_the_acquisition_surface() {
+    let help = Command::new(SGT)
+        .args(["intelligence", "--help"])
+        .output()
+        .expect("sgt intelligence --help");
+    let text = String::from_utf8_lossy(&help.stdout);
+    let verbs: BTreeSet<&str> = text
+        .split("Commands:")
+        .nth(1)
+        .unwrap_or("")
+        .split("Options:")
+        .next()
+        .unwrap_or("")
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|verb| *verb != "help")
+        .collect();
+    assert_eq!(
+        verbs,
+        BTreeSet::from(["status", "add", "list", "scan"]),
+        "`sgt intelligence` must ship exactly status/add/list/scan: {text}"
+    );
+
+    // And `sgt knowledge` kept its own scan spelling working (S4 Y6, G8
+    // correction: the trigger is now estate-scoped, not
+    // declared-local-sources-only, so `sgt intelligence scan` — beside
+    // `status`/`add`/`list`, the verb group that already covers every
+    // source kind — is the primary name; `sgt knowledge scan` still runs
+    // the identical scan rather than being narrowed or removed).
+    let help = Command::new(SGT)
+        .args(["knowledge", "--help"])
+        .output()
+        .expect("sgt knowledge --help");
+    let text = String::from_utf8_lossy(&help.stdout);
+    let verbs: BTreeSet<&str> = text
+        .split("Commands:")
+        .nth(1)
+        .unwrap_or("")
+        .split("Options:")
+        .next()
+        .unwrap_or("")
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|verb| *verb != "help")
+        .collect();
+    assert_eq!(
+        verbs,
+        BTreeSet::from(["add", "list", "scan"]),
+        "`sgt knowledge` must ship exactly add/list/scan: {text}"
+    );
+}
+
+// ------------------------------------------------ item 12: the writer boundary
+
+/// §17.12 — no Atlas **write** path is reachable from the CLI process.
+///
+/// The one-owner test already holds the database driver to a single file. This
+/// is the other half: that file's mutating API — staging a scan, confirming
+/// one, evicting a generation or a Work's overlays — must be called only from
+/// the daemon and its API surface, never from a `sgt` subcommand running in
+/// the user's own process.
+///
+/// Structural rather than behavioural on purpose. The behaviour of a CLI that
+/// *did* write is unbounded, so the assertion worth making is that the call
+/// does not exist to be made.
+#[test]
+fn a1a_item_12_no_atlas_write_path_is_reachable_from_the_cli() {
+    const WRITE_PATHS: &[&str] = &[
+        "stage_scan",
+        "confirm_scan",
+        "evict_provisional",
+        "evict_work_overlays",
+    ];
+
+    let db = read("src/runtime/atlas/db.rs");
+    for path in WRITE_PATHS {
+        assert!(
+            db.contains(&format!("pub fn {path}(")),
+            "`{path}` must still be Atlas's write API for this check to mean anything"
+        );
+    }
+
+    let cli = read("src/cli.rs");
+    for path in WRITE_PATHS {
+        assert!(
+            !cli.contains(&format!(".{path}(")),
+            "src/cli.rs calls Atlas's `{path}` — the daemon is the sole Atlas writer"
+        );
+    }
+
+    // The read the CLI *is* allowed is `sgt doctor`'s coverage row, and it is
+    // deliberately the only Atlas call in the binary's own surface. Pinning
+    // the exhaustive list here is what makes a second one visible in review.
+    let opens: Vec<&str> = cli
+        .lines()
+        .filter(|line| line.contains("AtlasDb::"))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        opens,
+        vec![
+            "let sources = match AtlasDb::open_read_only(data_dir).and_then(|db| db.indexed_sources()) {"
+        ],
+        "the CLI's only Atlas call is doctor's coverage read; a new one is a writer-boundary \
+         decision, not a refactor"
+    );
+
+    // And the daemon really is the writer, so the boundary is a boundary and
+    // not merely an absence.
+    let daemon = read("src/daemon.rs");
+    let api = read("src/api.rs");
+    assert!(
+        daemon.contains("AtlasDb::open") || api.contains("AtlasDb::open"),
+        "the daemon side must hold the store it is sole writer of"
+    );
+}
+
+// ------------------------------------------------------- item 13: no client SQL
+
+/// One string literal lifted out of a Rust source file, with the lines it
+/// spans — the unit [`sql_literal_holes`] reasons over.
+struct Literal {
+    start_line: usize,
+    end_line: usize,
+    text: String,
+}
+
+/// Every string literal in `source`, in file order, line comments skipped.
+///
+/// A character scan rather than a line scan, and that is the point: a Rust
+/// string literal may span lines (rustfmt's trailing `\` continuation), so a
+/// per-line reader cannot tell a literal's interior from the code around it.
+/// Line comments are skipped because db.rs's own doc comments quote SQL in
+/// prose, and prose is not a statement.
+///
+/// `src/runtime/atlas/db.rs` carries no raw strings, no block comments and no
+/// character literal holding a quote; the two `assert!`s in
+/// [`sql_literal_holes`] fail loudly if that ever stops being true, rather
+/// than letting the scan silently see nothing.
+fn string_literals(source: &str) -> Vec<Literal> {
+    let chars: Vec<char> = source.chars().collect();
+    let mut out = Vec::new();
+    let mut line = 1usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        match chars[i] {
+            '\n' => {
+                line += 1;
+                i += 1;
+            }
+            '/' if chars.get(i + 1) == Some(&'/') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '"' => {
+                let start_line = line;
+                let mut text = String::new();
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' {
+                        if chars.get(i + 1) == Some(&'\n') {
+                            line += 1;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if chars[i] == '\n' {
+                        line += 1;
+                    }
+                    text.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+                out.push(Literal {
+                    start_line,
+                    end_line: line,
+                    text,
+                });
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+/// The parameter names an SQL-taking entry point plausibly uses.
+///
+/// A list of spellings is a weak check on its own — that is exactly why the
+/// old one-spelling version of item 13's API check was evadable — so it is
+/// the *cheap* half here, standing beside [`statement_arguments`], which
+/// does not care what anything is called.
+const SQL_PARAMETER_SPELLINGS: [&str; 10] = [
+    "sql",
+    "stmt",
+    "statement",
+    "query",
+    "raw",
+    "expr",
+    "expression",
+    "command",
+    "ddl",
+    "dml",
+];
+
+/// Every string-typed parameter of one whole `pub fn` signature, by name.
+///
+/// String-typed is the filter that matters: `lexical_search(&self, query:
+/// &LexicalQuery)` takes a name from the list above and is not a query
+/// surface, because a typed request is not a statement.
+fn string_parameters(signature: &str) -> Vec<String> {
+    let Some(open) = signature.find('(') else {
+        return Vec::new();
+    };
+    let mut depth = 0i32;
+    let mut close = signature.len();
+    for (at, c) in signature[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = open + at;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut names = Vec::new();
+    let mut depth = 0i32;
+    for part in signature[open + 1..close].split(|c| {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            _ => {}
+        }
+        c == ',' && depth == 0
+    }) {
+        let Some((name, typing)) = part.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || name == "&self" || name == "self" {
+            continue;
+        }
+        if typing.contains("str") || typing.contains("String") {
+            names.push(name.trim_start_matches("mut ").to_string());
+        }
+    }
+    names
+}
+
+/// Whether `text` names `parameter` as an identifier rather than as part of
+/// a longer one — `sql` must not match `sql_for_table`.
+fn mentions(text: &str, parameter: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(at) = text[from..].find(parameter) {
+        let at = from + at;
+        let before = at.checked_sub(1).map(|i| bytes[i] as char);
+        let after = text[at + parameter.len()..].chars().next();
+        let boundary = |c: Option<char>| !matches!(c, Some(c) if c == '_' || c.is_alphanumeric());
+        if boundary(before) && boundary(after) {
+            return true;
+        }
+        from = at + parameter.len();
+    }
+    false
+}
+
+/// The first argument of every statement-running call in the function that
+/// starts at `index` — the SQL each one hands to duckdb.
+///
+/// The body ends at the closing brace on the function's own indentation:
+/// brace counting would trip over the `{}` in this file's many `format!`s.
+fn statement_arguments(lines: &[&str], index: usize) -> Vec<(String, String)> {
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let closing = format!("{}}}", " ".repeat(indent_of(lines[index])));
+    let mut body = String::new();
+    for line in lines.iter().skip(index + 1) {
+        if *line == closing {
+            break;
+        }
+        if !line.trim_start().starts_with("//") {
+            body.push_str(line.trim());
+            body.push(' ');
+        }
+    }
+    let mut found = Vec::new();
+    // Only the calls whose FIRST argument is the statement. A
+    // `Statement::execute`/`query`/`query_row` takes bound parameters there,
+    // and binding a caller's value is the shape item 13 wants, not the one
+    // it forbids — `conn`/`tx` name the `Connection`/`Transaction` receivers
+    // whose `execute` really does take SQL first.
+    for call in [
+        "prepare(",
+        "prepare_cached(",
+        "execute_batch(",
+        "conn.execute(",
+        "tx.execute(",
+    ] {
+        let mut from = 0;
+        while let Some(at) = body[from..].find(call) {
+            let at = from + at;
+            let start = at + call.len();
+            // String-literal aware, and the SQL text itself is then dropped
+            // from what gets compared. Before the S5 closeout this loop
+            // counted brackets over the raw bytes, so an argument that was a
+            // bare SQL literal got truncated at the first comma *inside* the
+            // statement — which hid the rest of the argument from the check
+            // AND, once every literal moved inside a `sql!(..)`, started
+            // reporting SQL column names as Rust parameters. Both directions
+            // of that bug are the same missing rule: a name written inside a
+            // statement's text is not a value being passed to it.
+            let mut depth = 0i32;
+            let mut end = body.len();
+            let mut argument = String::new();
+            let mut chars = body[start..].char_indices();
+            while let Some((offset, c)) = chars.next() {
+                if c == '"' {
+                    while let Some((_, inner)) = chars.next() {
+                        if inner == '\\' {
+                            chars.next();
+                            continue;
+                        }
+                        if inner == '"' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                match c {
+                    '(' | '[' | '<' => depth += 1,
+                    ')' | ']' | '>' => {
+                        if depth == 0 {
+                            end = start + offset;
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    ',' if depth == 0 => {
+                        end = start + offset;
+                        break;
+                    }
+                    _ => {}
+                }
+                argument.push(c);
+            }
+            let _ = end;
+            found.push((call.to_string(), argument));
+            from = start;
+        }
+    }
+    found
+}
+
+/// Every interpolation hole in every SQL-carrying string literal in `source`,
+/// rendered as `<enclosing fn>: <hole> <- <filler>` in file order.
+///
+/// A hole is any `{` that is not the `{{` escape, and it is reported with the
+/// text up to its `}` — so a named hole (`{table}`) is reported as `{table}`
+/// and shows up as a new, unpinned entry rather than being skipped the way a
+/// "leading `{}` only" test would skip it.
+fn sql_literal_holes(source: &str, lines: &[&str]) -> Vec<String> {
+    const KEYWORDS: [&str; 5] = ["SELECT", "INSERT", "UPDATE", "DELETE", "FROM"];
+
+    let literals = string_literals(source);
+    assert!(
+        literals.len() > 40,
+        "the literal scanner must actually be reading db.rs, saw {} literals",
+        literals.len()
+    );
+    let sql: Vec<&Literal> = literals
+        .iter()
+        .filter(|literal| KEYWORDS.iter().any(|word| literal.text.contains(word)))
+        .collect();
+    assert!(
+        sql.len() > 10,
+        "the scanner must actually be finding Atlas's SQL, saw {} statements",
+        sql.len()
+    );
+
+    let mut out = Vec::new();
+    for literal in sql {
+        // The enclosing function: the nearest `fn` declaration at or above the
+        // literal's first line.
+        let function = lines[..literal.start_line]
+            .iter()
+            .rev()
+            .find_map(|line| {
+                let trimmed = line.trim_start();
+                let rest = trimmed
+                    .strip_prefix("pub fn ")
+                    .or_else(|| trimmed.strip_prefix("fn "))?;
+                Some(rest.split(['(', '<', ' ']).next().unwrap_or(rest))
+            })
+            .unwrap_or("<no enclosing fn>");
+        // The filler: the first non-blank line after the literal closes.
+        let filler = lines[literal.end_line..]
+            .iter()
+            .map(|line| line.trim())
+            .find(|line| !line.is_empty())
+            .unwrap_or("<nothing>");
+
+        let text: Vec<char> = literal.text.chars().collect();
+        let mut i = 0usize;
+        while i < text.len() {
+            if text[i] != '{' {
+                i += 1;
+                continue;
+            }
+            if text.get(i + 1) == Some(&'{') {
+                i += 2; // `{{` is an escaped brace, not a hole.
+                continue;
+            }
+            let close = text[i..]
+                .iter()
+                .position(|c| *c == '}')
+                .map_or(text.len() - 1, |offset| i + offset);
+            let hole: String = text[i..=close].iter().collect();
+            out.push(format!("{function}: {hole} <- {filler}"));
+            i = close + 1;
+        }
+    }
+    out
+}
+
+/// §17.13 — the map and status surfaces answer in source/generation/coverage
+/// terms, and there is no way to hand the store a query.
+///
+/// # The load-bearing half is the compiler
+///
+/// Read part 0 first. `db.rs` runs every statement through a `Store`/`StoreTx`
+/// whose methods take `impl Into<Sql>`, and a `Sql` can only be built by
+/// `Sql::of::<T: SqlText>()` — which takes **no string at all**. The text
+/// arrives as `T`'s associated `const`, so it is produced by const
+/// evaluation: no heap, no caller, no running program to read data out of.
+///
+/// # Two rounds of this claim were wrong, and the second is why `&'static str`
+/// # is not the rule
+///
+/// * **Round one** looked for a write call whose *literal first-argument
+///   text* named one of the enclosing function's own string parameters.
+///   `let renamed = user_text; self.conn.execute_batch(renamed)` left it
+///   green. One local rebinding was the whole evasion.
+/// * **Round two** made `Sql` a newtype constructible only from
+///   `&'static str` and claimed "that absence is the whole guarantee". It is
+///   not. `&'static str` means *lives for the program's lifetime*, **not**
+///   *written as a literal in this crate*, and
+///   `execute_batch(Box::leak(user_text.to_string().into_boxed_str()))`
+///   compiled clean and took `source.generations` from one row to zero.
+///
+/// Round three moves the barrier to const evaluation, which does not care
+/// where the code is written or what its lifetime says. Re-attempted against
+/// this build, with the exact compiler error each one now produces:
+///
+/// | attempt | result |
+/// |---|---|
+/// | `execute_batch(Box::leak(user.to_string().into_boxed_str()))` | `Sql: From<&str> is not satisfied` |
+/// | `execute_batch(sql!(leaked))` | E0435 `attempt to use a non-constant value in a constant` |
+/// | `impl SqlText for E { const TEXT = Box::leak(..) }` | E0015 `cannot call non-const associated function Box::<str>::leak` |
+/// | `String::leak` in place of `Box::leak` | E0435, as above |
+/// | `store::Sql(user_text.to_string())` — the struct literal, from `db.rs` | E0603 `tuple struct constructor Sql is private` |
+/// | `name!(leaked)` into the appender | E0435 |
+/// | `const TEXT = unsafe { transmute(..) }` | E0080 at build; a const cannot obtain a runtime address at all |
+/// | `const TEXT = ONCE_LOCK.get()...` | E0015 `cannot call non-const method OnceLock::get` |
+///
+/// Two attempts **compiled**, and both are named in `db.rs`'s own blind-spot
+/// list rather than left for a later round to find:
+/// `const TEXT = include_str!(..)` (build-time text, not runtime text), and a
+/// second raw `Connection::open` inside `db.rs` — which part 4 below is the
+/// net for.
+///
+/// # What the remaining scans are, and are not
+///
+/// Parts 1–3 stay, as second nets over what a type does not see, and their
+/// limits are named rather than implied:
+///
+/// * (1a) is a name-based scan of public signatures. It sees a
+///   string-typed parameter under a *plausible* SQL name. It cannot see one
+///   under an implausible one — and it no longer has to, because such a
+///   parameter cannot reach a statement.
+/// * (1b) follows no dataflow. One local rebinding hides a parameter from
+///   it; so does a struct field, a closure capture, or a helper call. It is
+///   kept because it is nearly free, not because it is sound.
+/// * (2) pins every interpolation hole in every SQL literal. It reads
+///   literals character by character and is the strongest of the three, but
+///   it still only sees this one file.
+/// * (3) pins the shipped verb set, which is a contract about the API
+///   surface rather than about SQL.
+#[test]
+fn a1a_item_13_no_client_sql_reaches_the_store() {
+    let db = read("src/runtime/atlas/db.rs");
+    let lines: Vec<&str> = db.lines().collect();
+
+    // 0. **The guarantee.** `Sql` is the only thing the store will run, and
+    //    it cannot be built out of a caller's string.
+    //
+    //    Each assertion here is load-bearing. Removing any one of them is
+    //    removing item 13's enforcement, not tidying a test — which is the
+    //    whole reason they are spelled out rather than left to "the code
+    //    compiles".
+    assert!(
+        db.contains("    pub struct Sql(String);"),
+        "`Sql`'s field must stay private to the `store` child module — a `pub` field, or a \
+         move to a sibling module, hands the rest of db.rs a String-to-Sql conversion"
+    );
+    let store = block_after(&db, "pub(crate) mod store {");
+
+    //    The mechanism itself: text as an associated `const`. This is the one
+    //    assertion that carries the claim — if `TEXT` stops being a const,
+    //    every attempt in the table above starts compiling again.
+    assert!(
+        store.contains("    pub trait SqlText {\n        const TEXT: &'static str;\n    }"),
+        "`SqlText::TEXT` must be an associated `const`: const evaluation is what a runtime \
+         string cannot survive, and a `fn text() -> &'static str` in its place would take \
+         `Box::leak` output happily"
+    );
+
+    //    Every `pub fn` on `Sql`, exhaustively — not a list of *expected*
+    //    names, which is how the guard this replaces was evaded: a
+    //    constructor spelled `from_owned(text: String)` matches no
+    //    "plausible SQL name" and would have slipped past a filtered scan.
+    //    The whole set is pinned, so a new constructor of ANY name fails
+    //    here and has to be argued for.
+    let sql_impl = block_after(&db, "    impl Sql {");
+    let sql_methods: Vec<&str> = sql_impl
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub fn ") || line.starts_with("pub const fn "))
+        .collect();
+    assert_eq!(
+        sql_methods,
+        vec![
+            "pub fn of<T: SqlText>() -> Self {",
+            "pub fn extend(&mut self, more: &Sql) {",
+            "pub fn text(&self) -> &str {",
+        ],
+        "`Sql` may gain no method that takes a string of any kind — `&str`, `String`, and \
+         `&'static str` alike. The last of those is the round-two hole, not a stricter \
+         spelling of the rule"
+    );
+
+    //    And the conversions, which are constructors by another name.
+    let sql_conversions: Vec<&str> = store
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with("for Sql {"))
+        .collect();
+    assert_eq!(
+        sql_conversions,
+        vec!["impl From<&Sql> for Sql {"],
+        "`Sql` converts from an already-vetted `Sql` and from nothing else. An \
+         `impl From<&'static str> for Sql` is exactly what round two shipped, and \
+         `Box::leak` walks through it"
+    );
+
+    //    `ReadSql` — the read-only handle's own statement type — the same way.
+    let read_sql_impl = block_after(&db, "    impl ReadSql {");
+    let read_sql_methods: Vec<&str> = read_sql_impl
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub fn ") || line.starts_with("pub const fn "))
+        .collect();
+    assert_eq!(
+        read_sql_methods,
+        vec!["pub fn of<T: SqlText>() -> Self {"],
+        "`ReadSql` has one constructor and it takes no string, the same as `Sql::of`"
+    );
+
+    //    `Name` too — a table name is not a statement, but a leaked one still
+    //    chooses which table DuckDB's appender writes to.
+    let name_impl = block_after(&db, "    impl Name {");
+    let name_methods: Vec<&str> = name_impl
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub fn ") || line.starts_with("pub const fn "))
+        .collect();
+    assert_eq!(
+        name_methods,
+        vec![
+            "pub fn of<T: SqlText>() -> Self {",
+            "pub fn text(&self) -> &'static str {",
+        ],
+        "`Name` is constructed the same way as `Sql`; a `&'static str` constructor here \
+         re-opens the appender to a leaked table name"
+    );
+
+    //    And the three macros are the only way any of that is reached, each
+    //    putting its argument into a `const`. A macro that passed `$text`
+    //    along as a value instead would be the round-two hole again, with the
+    //    call sites unchanged.
+    for macro_name in ["sql", "name", "read_sql"] {
+        let body = block_after(&db, &format!("macro_rules! {macro_name} {{"));
+        assert!(
+            body.contains("const TEXT: &'static str = $text;"),
+            "`{macro_name}!` must bind `$text` to an associated `const`; that binding is \
+             the check, not the type it produces"
+        );
+    }
+
+    for surface in [
+        "fn prepare<S: Into<Sql>>",
+        "fn prepare_cached<S: Into<Sql>>",
+        "fn execute<S: Into<Sql>>",
+        "fn execute_batch<S: Into<Sql>>",
+    ] {
+        assert!(
+            store.contains(surface),
+            "every statement surface must take `impl Into<Sql>`: {surface}"
+        );
+    }
+    // And nothing outside that module holds the driver's own connection, so
+    // there is no second route to a `&str` statement.
+    assert_eq!(
+        db.matches("\n    conn: Store,").count(),
+        2,
+        "`AtlasDb` and `Analytics` must both hold the wrapper, never a raw `Connection`"
+    );
+
+    // 0b. The one hop that compiled. A second `Connection::open` inside this
+    //     file bypasses `Store` entirely, and DuckDB does NOT stop it — a
+    //     second open on the same file from the same process succeeded in the
+    //     closeout, and its `DELETE` returned `Ok`. So every `Connection::`
+    //     construction in this file must be wrapped in `Store::new(..)` on
+    //     the spot. This is a text scan and therefore a second net, but it is
+    //     the only net there is for this hop.
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim_start().starts_with("//") || line.trim_start().starts_with("///") {
+            continue;
+        }
+        for at in line.match_indices("Connection::open").map(|(at, _)| at) {
+            assert!(
+                line[..at].ends_with("Store::new("),
+                "db.rs:{} opens a raw duckdb Connection that is not immediately wrapped in \
+                 `Store::new(..)` — an unwrapped one takes a `&str` statement and answers \
+                 to nothing in the store module: {line}",
+                index + 1
+            );
+        }
+    }
+
+    // 1. No public API takes SQL. The scan walks whole `pub fn` *signatures* —
+    //    accumulating lines until the parameter list's parentheses close —
+    //    rather than single lines, because rustfmt splits a long signature
+    //    across lines and a per-line scan would wave through an `sql: &str`
+    //    parameter that landed on its own line. `query_identity` takes the SQL
+    //    that ran, to hash it into provenance — it executes nothing — so it is
+    //    named as the single allowed exception rather than matched around.
+    assert!(
+        db.contains("pub fn query_identity("),
+        "the one named exception must still exist, or this check is excusing nothing"
+    );
+    let mut signatures = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        if !line.trim_start().starts_with("pub fn ") {
+            continue;
+        }
+        let mut signature = String::new();
+        let mut depth = 0i32;
+        for candidate in &lines[index..] {
+            signature.push_str(candidate.trim());
+            signature.push(' ');
+            depth += candidate.matches('(').count() as i32;
+            depth -= candidate.matches(')').count() as i32;
+            if depth <= 0 {
+                break;
+            }
+        }
+        signatures += 1;
+        if signature.contains("pub fn query_identity(") {
+            continue;
+        }
+        // The predicate is what item 13 MEANS, not one parameter spelling.
+        // Until the S5 closeout this was `!signature.contains("sql:")`, so a
+        // `pub fn run(&self, stmt: &str)` — or `query:`, or `raw:` — was an
+        // SQL-taking entry point that compiled and passed. Two checks now
+        // stand in its place, and neither depends on a name being chosen
+        // honestly:
+        //
+        //   a. no public signature takes a string-typed parameter under any
+        //      of the names an SQL-taking one plausibly uses, and
+        //   b. no public function hands one of its OWN string parameters to
+        //      the store as a statement — the flow item 13 actually forbids,
+        //      whatever the parameter is called.
+        //
+        // (b) is a SECOND NET and is documented as one at the top of this
+        // test: it compares literal argument text and follows no dataflow, so
+        // one local rebinding hides a parameter from it. It caught nothing
+        // the type system does not already refuse; it is kept because it is
+        // free, and because it fails loudly if someone widens `Sql`.
+        for spelling in SQL_PARAMETER_SPELLINGS {
+            for typing in [": &str", ": String", ": &String", ": Option<&str>"] {
+                assert!(
+                    !signature.contains(&format!("{spelling}{typing}")),
+                    "Atlas exposes an SQL-taking entry point, which item 13 forbids: \
+                     {signature}"
+                );
+            }
+        }
+        for (call, argument) in statement_arguments(&lines, index) {
+            for parameter in string_parameters(&signature) {
+                assert!(
+                    !mentions(&argument, &parameter),
+                    "a public Atlas function hands its own `{parameter}` parameter to \
+                     {call} as the statement to run — that is client SQL reaching the \
+                     store, which item 13 forbids, and no parameter name makes it not \
+                     one: {signature}"
+                );
+            }
+        }
+    }
+    assert!(
+        signatures > 20,
+        "the signature scan must actually be walking Atlas's public API, saw {signatures}"
+    );
+
+    // 2. Every statement is a literal. The only interpolation any SQL-building
+    //    format string performs is `reader_call(format)`, a compile-time
+    //    constant chosen by a three-variant enum — the operator's own path is
+    //    bound as a `?` parameter, never pasted in.
+    //
+    //    This walks db.rs's string literals character by character, because a
+    //    line-based scan is evadable three ways: a literal rustfmt split
+    //    across lines, a *named* hole (`{table}`) rather than a positional
+    //    one, and a hole sitting on a continuation line that carries no SQL
+    //    keyword of its own. Every hole in every SQL literal is collected
+    //    wherever it sits, and the resulting list is pinned exhaustively — the
+    //    same discipline item 12 applies to the CLI's `AtlasDb::` call list.
+    //
+    //    **The list is empty, and that is the closeout's doing.** Every
+    //    fragment that used to be interpolated into a SQL literal at runtime
+    //    — `reader_call(format)` in the three dataset statements, `ops(table)`
+    //    in the projection's own DELETE/COUNT/SELECT — is now a vetted `Sql`
+    //    concatenated onto another with `Sql::extend`, and each piece is its
+    //    own `sql!(..)` over compile-time text. So there is no interpolation
+    //    in any SQL literal in this file to pin: the shape this check existed
+    //    to bound cannot occur, rather than occurring in a list someone keeps
+    //    up to date. A new hole appearing here is a regression to be argued
+    //    for, not a line to append.
+    let holes = sql_literal_holes(&db, &lines);
+    assert_eq!(
+        holes,
+        Vec::<String>::new(),
+        "no SQL literal in db.rs may interpolate anything; assemble the statement from \
+         vetted `sql!(..)` pieces with `Sql::extend` instead"
+    );
+
+    // 3. The verb set is closed, and the two deferred verbs stay deferred. The
+    //    verb list itself, not the prose around it — `map --help`'s own text
+    //    explains why `neighbors` and `changed` are absent, and naming them is
+    //    the honest thing for it to do.
+    let help = Command::new(SGT)
+        .args(["map", "--help"])
+        .output()
+        .expect("sgt map --help");
+    let text = String::from_utf8_lossy(&help.stdout);
+    let verbs: BTreeSet<&str> = text
+        .split("Commands:")
+        .nth(1)
+        .unwrap_or("")
+        .split("Options:")
+        .next()
+        .unwrap_or("")
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|verb| *verb != "help")
+        .collect();
+    assert_eq!(
+        verbs,
+        BTreeSet::from([
+            "repos",
+            "stats",
+            "outline",
+            "children",
+            "facts",
+            "symbol",
+            "references",
+        ]),
+        "`sgt map` ships F11's five verbs plus `children` (S5 W7 F-SF-03, the canned read \
+         `source.child_resources` had no consumer for) and `facts` (S5 closeout F-AC-03, \
+         the same for `source.dataset_facts`, which A2 §17 item 3 was claimed met on) and \
+         no others — `neighbors` and `changed` land with the waves whose consumers need \
+         them: {text}"
+    );
+    for forbidden in ["--sql", "--query", "--where"] {
+        assert!(
+            !text.contains(forbidden),
+            "`sgt map` must expose no query surface, found {forbidden}: {text}"
+        );
+    }
+}
+
+// --------------------------------------------------- item 14: the inherited pins
+
+/// §17.14 — the inherited contract tests are still *there*.
+///
+/// "Remain green" is proven by running them, and this wave's closeout commit
+/// records that run. What a test can add is the half a green run cannot show:
+/// that the pins still exist. A deleted test never fails.
+#[test]
+fn a1a_item_14_the_inherited_contract_pins_still_exist() {
+    // One representative, load-bearing pin from each family §17.14 names.
+    const PINS: &[(&str, &str, &str)] = &[
+        (
+            "exact-root",
+            "tests/m8_estate_cli.rs",
+            "a_descendant_of_the_estate_root_finds_no_estate_and_spawns_nothing",
+        ),
+        (
+            "Work-surface",
+            "tests/m12_child_work.rs",
+            "a_bare_sgt_run_from_a_work_surface_still_refuses_while_dash_c_works",
+        ),
+        (
+            "distro-route/edition",
+            "tests/m8_estate_cli.rs",
+            "init_written_templates_carry_the_binary_edition",
+        ),
+        (
+            "distro-route/edition",
+            "tests/m8_estate_cli.rs",
+            "init_writes_the_embedded_distro",
+        ),
+        (
+            "split-hardening output contract",
+            "tests/m11_nested_workflow.rs",
+            "a_nested_leafs_own_output_contract_is_enforced_exactly_as_a_flat_ones_is",
+        ),
+        (
+            "split-hardening output contract",
+            "tests/m3_execution.rs",
+            "t10_a_stage_completed_without_its_declared_output_is_reprompted_then_needs_input",
+        ),
+    ];
+
+    for (family, file, test) in PINS {
+        let text = read(file);
+        assert!(
+            text.contains(&format!("fn {test}(")),
+            "the {family} pin `{test}` is gone from {file}; §17.14 is about these surviving"
+        );
+    }
+}
+
+/// The text of the `{ .. }` block opened by the line `header`, up to the
+/// closing brace at that line's own indentation.
+fn block_after(source: &str, header: &str) -> String {
+    let at = source
+        .find(header)
+        .unwrap_or_else(|| panic!("db.rs must still contain `{header}`"));
+    let indent = header.len() - header.trim_start().len();
+    let closing = format!("\n{}}}", " ".repeat(indent));
+    let rest = &source[at + header.len()..];
+    let end = rest
+        .find(&closing)
+        .unwrap_or_else(|| panic!("`{header}` must close at its own indentation"));
+    rest[..end].to_string()
+}

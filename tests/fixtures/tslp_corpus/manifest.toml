@@ -1,0 +1,183 @@
+# F5 corpus manifest — HAND-VERIFIED expectations, not recorded output.
+#
+# Every number and every name below was counted by reading the fixture, before
+# the extractor was run against it, against the symbol/import definitions
+# stated in `src/runtime/atlas/syntax.rs` (`symbol_kinds` / `import_kinds` —
+# those tables ARE the definition of "symbol" and "import" here). If a fixture
+# and this manifest ever disagree, exactly one of them is wrong and the suite
+# fails; it never reconciles by re-recording what the extractor said.
+#
+# The gate (`tests/x3b_tslp_corpus.rs`) is EXACT match per fixture — counts,
+# ordered names, ordered labels, ordered import targets. A parse error on any
+# fixture below is a FAIL, never a skip.
+#
+# Deliberate non-symbols, chosen to make the definitions bite:
+#   * javascript/sample.js `export const double = (x) => x * 2` — a lexical
+#     binding, not a function declaration.
+#   * typescript/sample.ts `private hits = 0` — a class field.
+#   * rust/sample.rs `impl` blocks — no name to be a symbol of (their
+#     contained functions are counted).
+#   * python/sample.py `LIMIT = 8` — a module-level assignment.
+#   * markdown/sample.md `# not a heading` inside a fenced code block.
+#   * shell/sample.sh `set -euo pipefail` and `main "$@"` — commands that are
+#     not `source`/`.`, so not imports.
+#
+# Shapes the corpus deliberately includes because the extractor was once wrong
+# about them, and a corpus of only comfortable inputs makes "EXACT match" a
+# narrower guarantee than it reads:
+#   * python/multi_import.py — a comma list is ONE `import_statement` naming
+#     several modules; each name is its own edge.
+#   * typescript/import_require.ts — `import x = require("...")` is an
+#     `import_statement` whose source hides in an `import_require_clause`.
+#   * markdown/setext.md — `setext_heading` is a claimed kind, so it needs an
+#     instance.
+#   * rust/unicode.rs — multi-byte characters before AND inside extracted
+#     names, so the byte-offset provenance test slices non-trivial UTF-8.
+
+[[fixture]]
+path = "rust/sample.rs"
+language = "rust"
+symbols = 16
+imports = 2
+symbol_names = [
+  "LIMIT", "NAME", "Pairs", "Counter", "Outcome", "Countable", "count",
+  "new", "bump", "count", "fmt", "nested", "helper", "Inner", "twice",
+  "main_like",
+]
+symbol_labels = [
+  "const", "static", "type", "struct", "enum", "trait", "function",
+  "function", "function", "function", "function", "module", "function",
+  "struct", "macro", "function",
+]
+import_targets = ["std::collections::HashMap", "std::fmt::{self, Display}"]
+
+# Multi-byte characters ahead of and inside every name here. A byte offset
+# mistaken for a character count lands mid-character and the slice fails.
+[[fixture]]
+path = "rust/unicode.rs"
+language = "rust"
+symbols = 3
+imports = 0
+symbol_names = ["Zähler", "café_fn", "GRÜSSE"]
+symbol_labels = ["struct", "function", "const"]
+import_targets = []
+
+[[fixture]]
+path = "toml/sample.toml"
+language = "toml"
+symbols = 11
+imports = 0
+symbol_names = [
+  "schema", "name", "server", "host", "port", "server.tls", "enabled",
+  "repo", "name", "repo", "name",
+]
+symbol_labels = [
+  "key", "key", "table", "key", "key", "table", "key", "table_array", "key",
+  "table_array", "key",
+]
+import_targets = []
+
+[[fixture]]
+path = "markdown/sample.md"
+language = "markdown"
+symbols = 4
+imports = 0
+symbol_names = [
+  "Fixture corpus", "Counting rules", "Nested detail", "Second section",
+]
+symbol_labels = ["heading", "heading", "heading", "heading"]
+import_targets = []
+
+# Two setext headings and one ATX heading. `setext_heading` is claimed by the
+# symbol table; without this fixture nothing exercised it.
+[[fixture]]
+path = "markdown/setext.md"
+language = "markdown"
+symbols = 3
+imports = 0
+symbol_names = [
+  "Setext Title", "Setext Subsection", "An ATX heading, for contrast",
+]
+symbol_labels = ["heading", "heading", "heading"]
+import_targets = []
+
+[[fixture]]
+path = "python/sample.py"
+language = "python"
+symbols = 8
+imports = 4
+symbol_names = [
+  "top_level", "inner", "Counter", "__init__", "bump", "Nested", "deep",
+  "fetch",
+]
+symbol_labels = [
+  "function", "function", "class", "function", "function", "class",
+  "function", "function",
+]
+import_targets = ["os", "sys", "collections", "typing"]
+
+# Five imports written across three statements: two comma lists (two names
+# each) and one `from` import (whose module is one name however many symbols it
+# binds). An extractor that answers once per statement records three.
+[[fixture]]
+path = "python/multi_import.py"
+language = "python"
+symbols = 1
+imports = 5
+symbol_names = ["uses"]
+symbol_labels = ["function"]
+import_targets = ["os", "sys", "json", "csv", "collections"]
+
+[[fixture]]
+path = "javascript/sample.js"
+language = "javascript"
+symbols = 6
+imports = 2
+symbol_names = ["topLevel", "inner", "Counter", "constructor", "bump", "main"]
+symbol_labels = ["function", "function", "class", "method", "method", "function"]
+import_targets = ["node:fs", "node:path"]
+
+[[fixture]]
+path = "typescript/sample.ts"
+language = "typescript"
+symbols = 8
+imports = 2
+symbol_names = [
+  "Pair", "Countable", "count", "Outcome", "Counter", "count", "bump",
+  "build",
+]
+symbol_labels = [
+  "type", "interface", "method", "enum", "class", "method", "method",
+  "function",
+]
+import_targets = ["node:stream", "node:events"]
+
+# The CommonJS-interop import form beside an ordinary one, so the fixture
+# proves the two are both edges rather than proving only that the file parses.
+[[fixture]]
+path = "typescript/import_require.ts"
+language = "typescript"
+symbols = 1
+imports = 2
+symbol_names = ["reader"]
+symbol_labels = ["function"]
+import_targets = ["node:fs/promises", "node:events"]
+
+[[fixture]]
+path = "shell/sample.sh"
+language = "bash"
+symbols = 3
+imports = 2
+symbol_names = ["greet", "farewell", "main"]
+symbol_labels = ["function", "function", "function"]
+import_targets = ["./lib/common.sh", "./lib/extra.sh"]
+
+# The red side. Without these, "no fixture produced a parse error" is a claim
+# nothing could ever falsify.
+[[malformed]]
+path = "malformed/broken.rs"
+language = "rust"
+
+[[malformed]]
+path = "malformed/broken.py"
+language = "python"

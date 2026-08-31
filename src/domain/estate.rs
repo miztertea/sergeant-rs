@@ -158,6 +158,53 @@ impl std::fmt::Display for InstructionPolicy {
     }
 }
 
+/// One `[[knowledge]]` source: a local path the estate declares as
+/// **read-only evidence** (A1 §2/§3, F9).
+///
+/// Mirrors [`RepositorySpec`] deliberately — a plain name, a resolved
+/// absolute path — and differs in exactly the two ways that matter:
+///
+/// * **The path is declared, not derived.** A repository mount is always
+///   `<estate-root>/repos/<name>` (§6.1) precisely because it is a mutation
+///   surface the estate owns. A knowledge source is somewhere else on the
+///   machine by definition; deriving it would defeat the point.
+/// * **It is never a mount** (A1-03). Nothing cuts a worktree from it,
+///   nothing branches it, nothing writes to it. Declaring a path here grants
+///   read access to Atlas's scanner and no authority whatsoever — which is
+///   why [`EstateError::KnowledgePathInsideEstate`] refuses a declaration
+///   that would alias a location the estate already owns and mutates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeSpec {
+    /// Name used in coverage rows, `sgt knowledge list`, and source
+    /// coordinates. Plain-name rules, exactly like a repository's.
+    pub name: String,
+    /// Absolute path to the source root. A relative declaration joins onto
+    /// the estate root, the same resolution `surfaces_dir`/`data_dir` use.
+    pub path: PathBuf,
+    /// Per-source ignore globs, extending the scanner's built-in deny set
+    /// (F10). Never *narrowing* it: a source cannot opt back into the
+    /// defaults it was protected by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
+    /// **F10a**: the columns of this source's tabular datasets whose text may
+    /// become retrievable context units. **Absent means none**, and that
+    /// default is the whole control.
+    ///
+    /// A separate axis from [`Self::ignore`] rather than an extension of it,
+    /// because the two govern different boundaries. `ignore` extends F10's
+    /// *acquisition* deny set — which bytes are read at all — and speaks in
+    /// paths. This governs *exposure* — which values may leave a dataset as
+    /// text — and speaks in columns, because a CSV of support tickets is an
+    /// ordinary knowledge source whose `email` column is not, and no path
+    /// pattern can express that.
+    ///
+    /// Registration is not exposure. A dataset with no allowlist is still
+    /// discovered, counted, and profiled in aggregate; what it does not do is
+    /// turn a row's text into something retrievable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_fields: Vec<String>,
+}
+
 /// A group of repositories declared under `[group.<name>]` (R-MVP1-3).
 ///
 /// Membership gets **no new engine surface** (R-MVP1-5(b)): this is manifest
@@ -267,6 +314,12 @@ pub struct Estate {
     /// derives a forge, host or CLI from it — the URL is opaque.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub repository_upstream: BTreeMap<String, String>,
+    /// `[[knowledge]]` declarations (F9, A1 §2): local paths this estate
+    /// reads as evidence, in declaration order. Read-only by construction —
+    /// nothing in execution consults this list, and nothing ever will: a
+    /// knowledge source is not a mount (A1-03).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub knowledge: Vec<KnowledgeSpec>,
     /// `[estate] retention` (Q3/A2, W3): the declared Work-retention cap, or
     /// `None` for the built-in [`DEFAULT_RETENTION`]. Read once by
     /// `daemon::start_with` and pinned into the prune policy for the life of
@@ -678,6 +731,81 @@ pub enum EstateError {
         /// The offending name.
         name: String,
     },
+    /// A declared knowledge name is not usable as a plain path component.
+    /// Mirrors [`Self::InvalidRepositoryName`]: the name is joined onto
+    /// coverage coordinates and reported back in CLI output, so anything but
+    /// a plain name is refused where it is cheap to refuse.
+    #[error("{file} declares knowledge source name {name:?}, which is not a plain directory name")]
+    InvalidKnowledgeName {
+        /// Config file that declared it.
+        file: String,
+        /// The offending name.
+        name: String,
+    },
+    /// Two knowledge sources share a name; coverage and source coordinates
+    /// are keyed by name, so this would silently merge two sources into one.
+    #[error("{file} declares knowledge source name {name:?} twice")]
+    DuplicateKnowledge {
+        /// Config file that declared it.
+        file: String,
+        /// The repeated name.
+        name: String,
+    },
+    /// Panel fix (S4 Y6 review): a `[[knowledge]]` source declares the same
+    /// name as a `[[repo]]` repository. Atlas's `source.generations` table
+    /// keys a source's confirmed generation by `source_name` alone, with no
+    /// column for which of the three A1 §2 source kinds produced it — so a
+    /// same-named repo and knowledge source would silently contend for one
+    /// generation lineage, each scan evicting the other kind's evidence
+    /// rather than recording either durably. Refused here, at manifest-parse
+    /// station, the same way [`Self::DuplicateRepository`] and
+    /// [`Self::DuplicateKnowledge`] already refuse a same-kind collision —
+    /// this is the cross-kind twin of both.
+    #[error(
+        "{file} declares knowledge source name {name:?}, which is already a repository name; \
+         Atlas indexes both kinds under one source-name table, so a repository and a knowledge \
+         source may not share a name — rename one"
+    )]
+    KnowledgeNameCollidesWithRepository {
+        /// Config file that declared it.
+        file: String,
+        /// The name shared with a `[[repo]]` entry.
+        name: String,
+    },
+    /// F9's path-containment refusal (panel finding 6): a `[[knowledge]]`
+    /// path that canonicalizes to a location inside a declared repository
+    /// mount, inside `surfaces_dir`, or inside `data_dir`.
+    ///
+    /// Refused at the same station as [`Self::RepositoryPathDeclared`] — the
+    /// manifest parse, before any daemon, scan or Work exists — and for a
+    /// closely related reason. That variant refuses a *mount* being
+    /// redirected somewhere the estate does not own; this one refuses
+    /// *read-only evidence* being pointed at somewhere the estate does own
+    /// and actively mutates. A knowledge source is evidence about a stable
+    /// world (A1-03); a Work surface, a repository mount, and the daemon's
+    /// own data dir are the three places whose bytes change underneath a
+    /// scan by design, and indexing them would attribute mutations the
+    /// estate itself made to an outside world it was supposed to be
+    /// observing.
+    #[error(
+        "{file} declares knowledge source {name:?} at {path}, which resolves inside {what} \
+         ({inside}). A knowledge source is read-only evidence, never a mount (A1-03): it must \
+         not name a location this estate already owns and mutates. Point it at a path outside \
+         {inside}, or remove the entry."
+    )]
+    KnowledgePathInsideEstate {
+        /// Config file that declared it.
+        file: String,
+        /// The knowledge source name.
+        name: String,
+        /// The declared path, as resolved.
+        path: String,
+        /// What owns the containing location, in words — `repository mount
+        /// "api"`, `the surfaces directory`, `the data directory`.
+        what: String,
+        /// The containing path itself.
+        inside: String,
+    },
     /// Two profiles share a name.
     #[error("{file} declares profile name {name:?} twice")]
     DuplicateProfile {
@@ -786,6 +914,8 @@ struct EstateFile {
     #[serde(default)]
     repo: Vec<RepositoryEntry>,
     #[serde(default)]
+    knowledge: Vec<KnowledgeEntry>,
+    #[serde(default)]
     profile: Vec<Profile>,
     #[serde(default)]
     group: BTreeMap<String, GroupEntry>,
@@ -837,6 +967,28 @@ struct RepositoryEntry {
     /// clone-or-verify); this module never touches a remote.
     #[serde(default)]
     upstream: Option<String>,
+}
+
+/// One `[[knowledge]]` entry (F9), mirroring [`RepositoryEntry`]'s shape and
+/// its `deny_unknown_fields` discipline: a checked-in manifest is an
+/// instruction, and a misspelled key that silently means nothing is worse
+/// than a refusal naming the line.
+///
+/// Unlike `[[repo]]`, `path` is a real key here and is *required* — see
+/// [`KnowledgeSpec`] for why the derived-mount rule does not and must not
+/// apply to read-only evidence.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeEntry {
+    name: String,
+    path: PathBuf,
+    #[serde(default)]
+    ignore: Vec<String>,
+    /// F10a. `#[serde(default)]` is the refusal: an operator who writes no
+    /// `context_fields` key has declared the empty allowlist, and the empty
+    /// allowlist exposes nothing.
+    #[serde(default)]
+    context_fields: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -984,6 +1136,146 @@ pub fn validate_mount(file: &str, name: &str, mount: &Path) -> Result<PathBuf, E
         });
     }
     Ok(canonical_mount)
+}
+
+/// `path` with as much of it canonicalized as actually exists on disk, the
+/// non-existent tail re-appended verbatim.
+///
+/// Plain [`std::fs::canonicalize`] answers nothing at all for a path that is
+/// not there yet, and a declared knowledge path legitimately may not be
+/// (the same "declared but not on disk" tolerance `[[repo]]` entries get from
+/// [`Estate::from_config_structural`]). Resolving the existing prefix is what
+/// makes the containment check symlink-proof: `knowledge/link -> repos/api`
+/// and a literal `repos/api` compare equal here, so the refusal cannot be
+/// walked around with a symlink.
+fn canonical_best_effort(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), leaf) if parent != path => match leaf {
+            Some(leaf) => canonical_best_effort(parent).join(leaf),
+            None => canonical_best_effort(parent),
+        },
+        _ => path.to_path_buf(),
+    }
+}
+
+/// F9's `[[knowledge]]` resolution and validation, shared by the strict and
+/// structural parsers so the two can never disagree about what a knowledge
+/// declaration means.
+///
+/// Four checks, all at manifest-parse station:
+///
+/// 1. plain-name (mirrors [`EstateError::InvalidRepositoryName`]),
+/// 2. no duplicate names (mirrors [`EstateError::DuplicateRepository`]),
+/// 3. no name shared with a `[[repo]]` entry —
+///    [`EstateError::KnowledgeNameCollidesWithRepository`], the cross-kind
+///    twin of check 2 (S4 Y6 review panel fix),
+/// 4. **path containment** — [`EstateError::KnowledgePathInsideEstate`],
+///    panel finding 6.
+///
+/// Existence is deliberately *not* checked: a knowledge path that is not
+/// mounted right now is a coverage fact (the scanner reports it
+/// `unavailable`), not a manifest defect, exactly as a not-yet-cloned
+/// `[[repo]]` is a repository problem rather than an estate-identity one.
+fn resolve_knowledge(
+    file: &str,
+    root: &Path,
+    entries: Vec<KnowledgeEntry>,
+    repositories: &[RepositorySpec],
+    surfaces_dir: Option<&Path>,
+    data_dir: Option<&Path>,
+) -> Result<Vec<KnowledgeSpec>, EstateError> {
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The three families of estate-owned, estate-mutated location. Built
+    // once, canonicalized the same way the candidate is, so the comparison
+    // below is between two resolved paths and never between one of each.
+    let mut owned: Vec<(String, PathBuf)> = Vec::new();
+    for repo in repositories {
+        owned.push((
+            format!("repository mount {:?}", repo.name),
+            canonical_best_effort(&mount_path(root, &repo.name)),
+        ));
+    }
+    owned.push((
+        "the surfaces directory".to_string(),
+        canonical_best_effort(&match surfaces_dir {
+            Some(dir) => dir.to_path_buf(),
+            // The daemon's own default when the manifest declares none.
+            None => data_dir
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR))
+                .join("surfaces"),
+        }),
+    ));
+    owned.push((
+        "the data directory".to_string(),
+        canonical_best_effort(&match data_dir {
+            Some(dir) => dir.to_path_buf(),
+            None => root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR),
+        }),
+    ));
+
+    // Panel fix (S4 Y6 review): a knowledge entry is checked against
+    // `repositories`' own names *before* the knowledge-only duplicate check
+    // below, so a knowledge source sharing a repository's name is refused as
+    // plainly as two knowledge sources sharing a name — see
+    // [`EstateError::KnowledgeNameCollidesWithRepository`]'s own doc for why
+    // silently allowing it would be a real, live data-loss hazard rather
+    // than a cosmetic one: Atlas keys a confirmed generation by
+    // `source_name` alone, with no column for source kind.
+    let mut seen = BTreeSet::new();
+    let mut resolved = Vec::with_capacity(entries.len());
+    for entry in entries {
+        if !is_plain_name(&entry.name) {
+            return Err(EstateError::InvalidKnowledgeName {
+                file: file.to_string(),
+                name: entry.name,
+            });
+        }
+        if repositories.iter().any(|r| r.name == entry.name) {
+            return Err(EstateError::KnowledgeNameCollidesWithRepository {
+                file: file.to_string(),
+                name: entry.name,
+            });
+        }
+        if !seen.insert(entry.name.clone()) {
+            return Err(EstateError::DuplicateKnowledge {
+                file: file.to_string(),
+                name: entry.name,
+            });
+        }
+        // Relative declarations join onto the estate root — the same rule
+        // `surfaces_dir` and `data_dir` already follow, so one manifest has
+        // one relative-path convention rather than two.
+        let joined = if entry.path.is_absolute() {
+            entry.path.clone()
+        } else {
+            root.join(&entry.path)
+        };
+        let candidate = canonical_best_effort(&joined);
+        for (what, owner) in &owned {
+            if candidate.starts_with(owner) {
+                return Err(EstateError::KnowledgePathInsideEstate {
+                    file: file.to_string(),
+                    name: entry.name,
+                    path: candidate.display().to_string(),
+                    what: what.clone(),
+                    inside: owner.display().to_string(),
+                });
+            }
+        }
+        resolved.push(KnowledgeSpec {
+            name: entry.name,
+            path: candidate,
+            ignore: entry.ignore,
+            context_fields: entry.context_fields,
+        });
+    }
+    Ok(resolved)
 }
 
 /// Probe raw TOML for the pre-estate vocabulary **before** the real parse
@@ -1344,11 +1636,23 @@ impl Estate {
                 None => (repo_name(&root), None, None, None, None, None),
             };
         validate_retention(retention, &file)?;
+        // F9: resolved last, because containment is stated against the
+        // repository mounts and the two directory overrides this parse has
+        // only just finished computing.
+        let knowledge = resolve_knowledge(
+            &file,
+            &root,
+            parsed.knowledge,
+            &repositories,
+            surfaces_dir.as_deref(),
+            data_dir.as_deref(),
+        )?;
 
         Ok(Self {
             name,
             root,
             repositories,
+            knowledge,
             default_backend,
             default_workflow,
             profiles: parsed.profile,
@@ -1488,11 +1792,23 @@ impl Estate {
                 None => (repo_name(&root), None, None, None, None, None),
             };
         validate_retention(retention, &file)?;
+        // F9: resolved last, because containment is stated against the
+        // repository mounts and the two directory overrides this parse has
+        // only just finished computing.
+        let knowledge = resolve_knowledge(
+            &file,
+            &root,
+            parsed.knowledge,
+            &repositories,
+            surfaces_dir.as_deref(),
+            data_dir.as_deref(),
+        )?;
 
         Ok(Self {
             name,
             root,
             repositories,
+            knowledge,
             default_backend,
             default_workflow,
             profiles: parsed.profile,
@@ -1926,6 +2242,150 @@ mod tests {
         ));
     }
 
+    /// F9 (panel finding 6), mirroring the test above: a `[[knowledge]]` path
+    /// that resolves inside a location the estate owns and mutates is refused
+    /// **at the same station** — the manifest parse — by a named variant that
+    /// says which location and why.
+    ///
+    /// Three owned families, and each is a different way to get the same
+    /// wrong answer: a repository mount's bytes change every time a Work
+    /// merges, a surface's change every time a Work runs, and the data
+    /// directory is the daemon's own state. Indexing any of them would file
+    /// the estate's own mutations as evidence about an outside world.
+    #[test]
+    fn a_knowledge_path_inside_an_estate_owned_location_is_refused_by_name() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(&mount_path(root, "api"));
+        std::fs::create_dir_all(root.join("repos/api/docs")).expect("docs");
+        std::fs::create_dir_all(root.join(".sergeant/data/surfaces/w1")).expect("surfaces");
+        std::fs::create_dir_all(root.join("outside")).expect("outside");
+
+        // 1. Inside a declared repository mount.
+        let err = parse_without_mounting(
+            root,
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\n\n\
+             [[knowledge]]\nname = \"docs\"\npath = \"repos/api/docs\"\n",
+        )
+        .expect_err("a mount-contained knowledge path must be refused");
+        let EstateError::KnowledgePathInsideEstate { name, what, .. } = &err else {
+            panic!("expected the named containment refusal, got {err}");
+        };
+        assert_eq!(name, "docs");
+        assert!(
+            what.contains("api"),
+            "the refusal must name the mount: {what}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("read-only evidence") && message.contains("A1-03"),
+            "the refusal must say why, not just that: {message}"
+        );
+
+        // 2. Inside the default data dir, which no manifest had to declare —
+        //    the case a check written against declared values alone misses.
+        let err = parse_without_mounting(
+            root,
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\n\n\
+             [[knowledge]]\nname = \"state\"\npath = \".sergeant/data\"\n",
+        )
+        .expect_err("a data-dir-contained knowledge path must be refused");
+        assert!(matches!(err, EstateError::KnowledgePathInsideEstate { .. }));
+
+        // 3. Inside a surfaces directory, reached through a *symlink* — the
+        //    containment check resolves before comparing, so a link is not a
+        //    way around it.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                root.join(".sergeant/data/surfaces/w1"),
+                root.join("linked-surface"),
+            )
+            .expect("symlink");
+            let err = parse_without_mounting(
+                root,
+                "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\n\n\
+                 [[knowledge]]\nname = \"live\"\npath = \"linked-surface\"\n",
+            )
+            .expect_err("a symlink into a surface must be refused");
+            assert!(matches!(err, EstateError::KnowledgePathInsideEstate { .. }));
+        }
+
+        // The negative control, and it matters as much as the refusals: an
+        // ordinary directory under the estate root that the estate does *not*
+        // own is a perfectly good knowledge source. This rule refuses three
+        // named locations, not "anywhere near the estate".
+        let estate = parse_without_mounting(
+            root,
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\n\n\
+             [[knowledge]]\nname = \"outside\"\npath = \"outside\"\nignore = [\"*.log\"]\n",
+        )
+        .expect("a path the estate does not own is accepted");
+        assert_eq!(estate.knowledge.len(), 1);
+        assert_eq!(estate.knowledge[0].name, "outside");
+        assert!(estate.knowledge[0].path.is_absolute());
+        assert_eq!(estate.knowledge[0].ignore, vec!["*.log".to_string()]);
+
+        // Every read path refuses it, not just the strict one — and `admit`
+        // refuses the estate outright, exactly as it does for a declared
+        // `[[repo]] path`.
+        std::fs::write(
+            root.join(MANIFEST_FILE),
+            "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\n\n\
+             [[knowledge]]\nname = \"docs\"\npath = \"repos/api/docs\"\n",
+        )
+        .expect("write");
+        assert!(matches!(
+            Estate::from_config_structural(&root.join(MANIFEST_FILE)),
+            Err(EstateError::KnowledgePathInsideEstate { .. })
+        ));
+        assert!(matches!(
+            Estate::admit(root),
+            Err(EstateRootError::Invalid { .. })
+        ));
+    }
+
+    /// The rest of F9's schema-level rules, mirroring `[[repo]]`'s: a plain
+    /// name, no duplicates, `deny_unknown_fields` on the entry, and a `path`
+    /// that is required because a knowledge root is declared, never derived.
+    #[test]
+    fn knowledge_entries_follow_the_same_schema_discipline_as_repo_entries() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(&mount_path(root, "api"));
+        let head = "[estate]\nname = \"w\"\n\n[[repo]]\nname = \"api\"\n\n";
+
+        assert!(matches!(
+            parse_without_mounting(
+                root,
+                &format!("{head}[[knowledge]]\nname = \"../escape\"\npath = \"/tmp\"\n")
+            ),
+            Err(EstateError::InvalidKnowledgeName { .. })
+        ));
+        assert!(matches!(
+            parse_without_mounting(
+                root,
+                &format!(
+                    "{head}[[knowledge]]\nname = \"n\"\npath = \"/tmp/a\"\n\n\
+                     [[knowledge]]\nname = \"n\"\npath = \"/tmp/b\"\n"
+                )
+            ),
+            Err(EstateError::DuplicateKnowledge { .. })
+        ));
+        // A typo'd key is a refusal naming the line, not a silently ignored
+        // instruction — the same fail-closed reading every other table gets.
+        let err = parse_without_mounting(
+            root,
+            &format!("{head}[[knowledge]]\nname = \"n\"\npath = \"/tmp/a\"\nignores = []\n"),
+        )
+        .expect_err("unknown field must be refused");
+        assert!(matches!(err, EstateError::Malformed { .. }), "{err}");
+        assert!(matches!(
+            parse_without_mounting(root, &format!("{head}[[knowledge]]\nname = \"n\"\n")),
+            Err(EstateError::Malformed { .. })
+        ));
+    }
+
     /// #112: `[[repo]] upstream` parses, stays opaque, and reaches every
     /// reader — the strict loader's `repository_upstream` map and the
     /// diagnostic loader's [`DeclaredRepo`] alike. An entry that declares
@@ -1987,6 +2447,40 @@ mod tests {
         );
     }
 
+    /// Panel fix (S4 Y6 review): a `[[knowledge]]` source may not declare
+    /// the same name as a `[[repo]]` repository, either. Atlas keys a
+    /// confirmed generation by `source_name` alone with no source-kind
+    /// column, so a same-named repo and knowledge source would silently
+    /// contend for one generation lineage — each scan of one evicting the
+    /// other's evidence — exactly the cross-kind twin of
+    /// [`two_repositories_may_not_share_a_name`].
+    #[test]
+    fn a_knowledge_source_may_not_share_a_name_with_a_repository() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let root = dir.path();
+        init_repo(&mount_path(root, "same"));
+        let notes = root.join("notes");
+        std::fs::create_dir_all(&notes).expect("notes dir");
+
+        let err = parse(
+            root,
+            &format!(
+                "[estate]\nname = \"w\"\n\n\
+                 [[repo]]\nname = \"same\"\n\n\
+                 [[knowledge]]\nname = \"same\"\npath = {:?}\n",
+                notes.display()
+            ),
+        )
+        .expect_err("a knowledge source named after a repository must be refused");
+        assert!(
+            matches!(
+                &err,
+                EstateError::KnowledgeNameCollidesWithRepository { name, .. } if name == "same"
+            ),
+            "got {err}"
+        );
+    }
+
     /// The submit request's `repositories` selection is user input too, and a
     /// name repeated there produces two identical bindings — the same
     /// same-path collision, arriving through the API instead of the file.
@@ -2005,6 +2499,7 @@ mod tests {
                     path: PathBuf::from("/nowhere/web"),
                 },
             ],
+            knowledge: Vec::new(),
             default_backend: None,
             default_workflow: None,
             profiles: Vec::new(),
@@ -2059,6 +2554,7 @@ mod tests {
                     path: PathBuf::from("/nowhere/web"),
                 },
             ],
+            knowledge: Vec::new(),
             default_backend: None,
             default_workflow: None,
             profiles: Vec::new(),

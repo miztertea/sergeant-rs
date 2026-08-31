@@ -12,14 +12,68 @@
 //! 2. open the journal (which holds its own exclusive lock — belt and
 //!    braces) and rebuild the Work registry by full replay;
 //! 3. bind `127.0.0.1` on an ephemeral port;
-//! 4. journal `daemon.started`;
+//! 4. journal `daemon.started`, register the backend adapters, reconcile work
+//!    believed in flight (§25) and clear a stale admission pause (L6) — no
+//!    request may observe a Work whose prior ownership has not been settled,
+//!    so those stay ahead of the descriptor;
 //! 5. write the runtime descriptor (endpoint, PID, API revision, random
 //!    bearer token) atomically with owner-only permissions — the descriptor
-//!    only ever points at a live, already-listening daemon.
+//!    only ever points at a live, already-listening daemon;
+//! 6. **then** walk the backend probes, concurrently, journaling
+//!    `backend.probed` per backend as each completes.
 //!
 //! Clean shutdown journals `daemon.stopped` and removes the descriptor; a
 //! crash leaves a stale descriptor, which clients detect (dead PID + refused
 //! endpoint) and replace.
+//!
+//! ## Publish, then probe (#293)
+//!
+//! Step 6 used to be step 4b-ii — the whole probe walk, serially, *before*
+//! the bind and the descriptor. The argument for that ordering was that a
+//! daemon should not be reachable before it knows what it can route to. The
+//! measurement retires it: on a fully-provisioned host (all five adapters
+//! installed) the descriptor appeared **~6.4s after exec across five cold
+//! starts** on Cerberus, 2026-08-25, every millisecond of it serial probing —
+//! agy ~2.3s, opencode ~3.2s over four invocations, codex ~0.4s, claude
+//! ~0.2s — against a client auto-spawn budget of 10s (`SPAWN_WAIT`,
+//! `src/cli.rs`). The ~3.6s of headroom left meant any concurrent load,
+//! including a test suite's own parallel daemon spawns, pushed the first
+//! `sgt run` past the budget; #293's A/B evidence showed that one defect
+//! explaining every real-spawn failure across the m2/m3/m6/m8/m9 suites at
+//! once. A daemon is healthy when it can accept and route requests, not when
+//! every third-party CLI has printed `--help`.
+//!
+//! **After, measured the same way on the same host** (five cold starts each,
+//! fresh estate and data dir per start, polled at 10ms from `exec`; Cerberus,
+//! 2026-08-25): the descriptor lands at **0.06-0.10s**, and the whole probe
+//! walk is durable — the sixth `backend.probed` flushed — at **3.22-3.27s**.
+//! The same instrument re-run against the pre-#293 build measures **6.03-6.32s
+//! for both**, which is what "both" meant back then: the descriptor could not
+//! precede the walk it was waiting on. So the client-visible number falls by
+//! ~85x and stops being the walk's hostage, while the walk itself roughly
+//! halves — its floor is now its slowest single adapter (opencode ~3.2s)
+//! rather than the sum of all six, exactly as `probe_walk`'s own doc predicts.
+//!
+//! **The capability-pending contract**, which is what makes the reordering
+//! safe rather than merely faster. Between serving and a backend's probe
+//! completing:
+//!
+//! - a caller whose preflight needs capability evidence **waits** for it —
+//!   [`crate::backend::ProbeGate`], waited on by the router's tier walk at the
+//!   one point where a backend name becomes decisive. The wait is per backend
+//!   and bounded by that backend's own probe completing, so a Work bound for a
+//!   fast adapter is never held up by a slow one it will never touch;
+//! - no capability is ever fabricated, defaulted, or inferred to fill the
+//!   window, and no submission is refused that the old ordering would have
+//!   accepted. The only difference observable to a client is *when* the
+//!   answer arrives;
+//! - the journal's evidence order per backend is unchanged: `backend.probed`
+//!   is durable before any Work routed to that backend is.
+//!
+//! What did *not* move is everything ahead of the descriptor in the list
+//! above. Restart reconciliation and the L6 pause clear stay before it,
+//! because those are claims about state a request could act on; a probe is a
+//! claim about an adapter, and the request that needs it can wait for it.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -36,16 +90,16 @@ use crate::api::{
     drive_completions, router,
 };
 use crate::backend::agy::{AGY_BACKEND_NAME, AgyBackend, AgyConfig};
+use crate::backend::child::{self, ProbeChildren};
 use crate::backend::claude::{CLAUDE_BACKEND_NAME, ClaudeBackend, ClaudeConfig};
 use crate::backend::codex::{CODEX_BACKEND_NAME, CodexBackend, CodexConfig};
 use crate::backend::docker::{DOCKER_BACKEND_NAME, DockerBackend, DockerConfig};
 use crate::backend::fake::FAKE_BACKEND_NAME;
 use crate::backend::opencode::{OPENCODE_BACKEND_NAME, OpencodeBackend, OpencodeConfig};
-use crate::backend::{BackendRegistry, EventSink};
-use crate::domain::estate::Estate;
+use crate::backend::{BackendRegistry, EventSink, ProbeGate};
 use crate::domain::event::{EventDraft, EventSource};
 use crate::platform::fs_locking::{self, Reliability};
-use crate::runtime::analytics::{Analytics, AnalyticsError};
+use crate::runtime::atlas::db::{Analytics, AnalyticsError};
 use crate::runtime::engine::{Engine, EngineError};
 use crate::runtime::fsutil::{create_dir_all_durable, take_exclusive_lock, write_atomic_secret};
 use crate::runtime::journal::{DEFAULT_SEGMENT_MAX_BYTES, Journal, JournalError};
@@ -59,7 +113,18 @@ pub const DESCRIPTOR_FILE: &str = "runtime.json";
 /// Exclusive daemon lock file name inside the data dir.
 pub const DAEMON_LOCK_FILE: &str = "daemon.lock";
 /// Schema identifier for the runtime descriptor.
-pub const DESCRIPTOR_SCHEMA: &str = "sergeant.runtime/v2";
+///
+/// **v3 (H1, sprint-plan D3):** no estate fields. v2 published the one
+/// estate root the process was bound to, because that binding *was* the
+/// client-side safety check; a host daemon has no such binding, and the
+/// admitted-estate set is dynamic state served live by `GET /v1/estates`
+/// rather than something a file written once, atomically, at startup could
+/// honestly describe. A v2 descriptor therefore fails closed through
+/// [`DaemonError::UnknownDescriptorSchema`] like any other unknown schema —
+/// no shim, deliberately: "the daemon you are talking to is from another
+/// build" is exactly the fact a client must not paper over, and here it also
+/// means "that daemon believes it owns one estate."
+pub const DESCRIPTOR_SCHEMA: &str = "sergeant.runtime/v3";
 
 /// Event kind: the daemon came up and owns the journal.
 pub const KIND_DAEMON_STARTED: &str = "daemon.started";
@@ -97,17 +162,23 @@ pub const KIND_ADMISSION_PAUSED: &str = "admission.paused";
 /// recovery (§25), there is no ambiguous case here to fail closed on.
 pub const KIND_ADMISSION_RESUMED: &str = "admission.resumed";
 
-/// The runtime descriptor published for clients (proposal §6, estate-root
-/// §5.1): endpoint, PID, API revision, the bearer token, and — since
-/// `sergeant.runtime/v2` — **the estate this daemon is bound to**, protected
-/// by owner-only file permissions.
+/// The runtime descriptor published for clients (proposal §6, H1 §3):
+/// endpoint, PID, API revision, and the bearer token, protected by
+/// owner-only file permissions. Five fields, and — since
+/// [`DESCRIPTOR_SCHEMA`]'s v3 bump — **nothing about estates** (D3).
 ///
-/// §5.1: "A client validates that the descriptor's root matches its exact
-/// current root before using the endpoint. A live daemon bound to another
-/// estate is a named refusal, never a reusable global service." That check
-/// is [`RuntimeDescriptor::check_estate_root`], and every client path
-/// (`ensure_daemon`, `observe_connect`) runs it before the endpoint is used
-/// for anything.
+/// **What the retired v2 fields did, and what replaced them.** v2 carried
+/// `estate_root`/`manifest_path`, and §5.1's client gate compared the
+/// caller's exact root against them: "a live daemon bound to another estate
+/// is a named refusal, never a reusable global service." H1 makes one daemon
+/// serving many estates the normal case, so that comparison has no object.
+/// The property it protected — nothing is ever served for an estate nobody
+/// validated — is now kept where the validation actually happens: the
+/// admitted-estate registry ([`crate::runtime::estates::EstateRegistry`]),
+/// re-checked per request, with
+/// [`crate::runtime::estates::check_estate_root`] as its client-side half.
+/// The set is dynamic, so it is answered live by `GET /v1/estates` rather
+/// than frozen into a file written once at startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeDescriptor {
     /// Descriptor schema identifier.
@@ -119,76 +190,11 @@ pub struct RuntimeDescriptor {
     /// API revision the daemon serves.
     pub api_revision: String,
     /// Random bearer token required on all `/v1/*` routes.
-    pub token: String,
-    /// §5.1: the canonical estate root this daemon was started against.
-    /// `None` only for a daemon bound to no estate at all — a test rig, or
-    /// `sgt daemon` run somewhere that is not an estate root.
-    #[serde(default)]
-    pub estate_root: Option<PathBuf>,
-    /// §5.1: `<estate_root>/sergeant.toml`, recorded alongside the root so a
-    /// reader never has to reconstruct it.
-    #[serde(default)]
-    pub manifest_path: Option<PathBuf>,
-}
-
-/// A live daemon bound to a different estate than the client's own exact
-/// root (§5.1, §15): named refusal, never a connection, and never a second
-/// daemon over the same data dir.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "the daemon running for {data_dir} is bound to a different estate\n\n\
-     This estate root:\n  {wanted}\n\n\
-     Daemon's estate root:\n  {found}\n\n\
-     Refusing to connect, and refusing to start a second daemon over the same data dir.\n\
-     Stop the running daemon and retry, or point this estate at its own data dir:\n  \
-     sgt -C {found} daemon stop\n  \
-     sgt --data-dir <dir> <command>"
-)]
-pub struct EstateBindingMismatch {
-    /// Data dir both would own.
-    pub data_dir: String,
-    /// The root the client resolved.
-    pub wanted: String,
-    /// The root the running daemon is bound to, or the fact that it has
-    /// none.
-    pub found: String,
-}
-
-impl RuntimeDescriptor {
-    /// §5.1's client-side gate: does this descriptor's estate root match the
-    /// caller's own exact root?
     ///
-    /// Both directions are refusals, deliberately: a daemon bound to estate
-    /// A cannot serve a client standing in estate B, **and** a daemon bound
-    /// to no estate cannot serve a client that has one (its engine would
-    /// plan against nothing, so every submission would silently land
-    /// `pending`). A client with no estate root of its own — no such client
-    /// exists on the estate-scoped paths, since §4.3 admits the root first —
-    /// is the only case that passes without comparison.
-    pub fn check_estate_root(
-        &self,
-        data_dir: &Path,
-        wanted: Option<&Path>,
-    ) -> Result<(), EstateBindingMismatch> {
-        let Some(wanted) = wanted else {
-            return Ok(());
-        };
-        let matches = self
-            .estate_root
-            .as_deref()
-            .is_some_and(|bound| bound == wanted);
-        if matches {
-            return Ok(());
-        }
-        Err(EstateBindingMismatch {
-            data_dir: data_dir.display().to_string(),
-            wanted: wanted.display().to_string(),
-            found: match &self.estate_root {
-                Some(root) => root.display().to_string(),
-                None => "(none — this daemon was started outside any estate)".to_string(),
-            },
-        })
-    }
+    /// D8: one token spans every admitted estate — the ratified single-user
+    /// trust model. The widened blast radius of a leaked token is stated,
+    /// not silently inherited.
+    pub token: String,
 }
 
 /// Errors from daemon startup and shutdown.
@@ -257,13 +263,17 @@ pub enum DaemonError {
     /// mean something else entirely, and acting on them could mean talking
     /// to the wrong process — or spawning a second daemon.
     ///
-    /// **0.1.0, estate-root Phase D:** `sergeant.runtime/v1` descriptors are
-    /// exactly this case. A v1 descriptor carries no `estate_root`, so a
-    /// client could not verify §5.1's binding against it at all — it fails
-    /// closed here rather than being read half-way, and the remedy is to
-    /// stop the old daemon and let a v2 one publish. There is deliberately no
-    /// compatibility shim: at 0.1.0, "the daemon you are talking to is from
-    /// another build" is exactly the fact a client must not paper over.
+    /// **Every superseded schema is exactly this case, in both directions.**
+    /// A `sergeant.runtime/v1` descriptor carried no estate binding at all;
+    /// a `sergeant.runtime/v2` one carried a binding to exactly one estate,
+    /// which a host daemon does not have (D3). Neither can be read half-way
+    /// — the v2 case is the sharper of the two, because its fields still
+    /// *parse*, and acting on them would mean addressing a daemon that
+    /// believes it owns one estate as though it served many. There is
+    /// deliberately no compatibility shim in either direction; the remedy is
+    /// H1 §6's cutover, and this refusal is its backstop: stop the old
+    /// daemon and let a restarted one republish in the schema this build
+    /// reads.
     #[error(
         "runtime descriptor {path} declares unknown schema {found:?} (this build understands {expected:?}); \
          refusing to use it. If a daemon from an older build is still running, stop it \
@@ -289,6 +299,50 @@ pub enum DaemonError {
 /// checkout still exits on its own rather than being escalated to SIGKILL.
 const DRIVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// How long shutdown waits for the backend probe walk to finish before
+/// journaling `daemon.stopped` and going.
+///
+/// The walk is joined at all — rather than dropped — for the same reason the
+/// completion driver is: it commits events, and `daemon.stopped` should be
+/// the last one this daemon writes. It gets the same grace for the same
+/// reason too, and makes the same trade past it, stated rather than hidden: a
+/// probe still inside a child process when the grace runs out may journal its
+/// `backend.probed` after `daemon.stopped`. That is tolerable exactly where
+/// the driver's version is — the journal is append-only and crash-tolerant
+/// per append, `daemon.stopped` is a lifecycle record nothing reconciles
+/// against, and `backend.probed` is on `prune::NON_WORK_ALLOWLIST` as a kind
+/// with *no registry effect at all*, so a replay cannot tell the two orders
+/// apart.
+///
+/// Why it is bounded at all, measured (#293, Cerberus 2026-08-25): a probe is
+/// a real CLI invocation, and under `m6`'s own parallel load the walk ran past
+/// ten seconds — long enough that a rig SIGTERMing a fresh daemon escalated to
+/// SIGKILL, which flushes nothing at exit. Waiting that out unbounded would
+/// put "how loaded is this box" on the shutdown path, and a daemon that will
+/// not die is a lock nobody can take.
+const PROBE_WALK_SHUTDOWN_GRACE: Duration = DRIVER_SHUTDOWN_GRACE;
+
+/// How many backend probes the startup walk runs at once.
+///
+/// **Bounded rather than "all of them", and the number has provenance.**
+/// Measured on Cerberus, 2026-08-25, with all five adapters installed: one
+/// cold daemon alone completes its walk in ~2.5s, and **twenty cold daemons
+/// started simultaneously take 13.8-14.7s each** — 20 × 6 unbounded lanes is
+/// 120 concurrent third-party CLI startups on a 20-core box, and every one of
+/// them gets slower. That is not a hypothetical: it is `m6`'s own suite at
+/// default parallelism, where a daemon SIGTERMed the instant its descriptor
+/// appeared could not finish its walk inside the rig's ten-second grace and
+/// was escalated to SIGKILL, flushing nothing at exit.
+///
+/// Two lanes, not more, because the walk's floor is its slowest single
+/// adapter either way: opencode alone is +3.24s of a ~2.5s-to-3.3s walk, and
+/// the four fast adapters together are +0.74s, so two lanes finish in the
+/// same time one unbounded fan-out does while forking a third as many
+/// children. Raise it only against a measurement showing the *fast* adapters'
+/// sum has overtaken the slowest one's time — that is the condition under
+/// which a lane cap starts costing something, and nothing else is.
+const PROBE_WALK_LANES: usize = 2;
+
 /// Handle to a running in-process daemon. Dropping it does NOT stop the
 /// daemon; call [`DaemonHandle::shutdown`] for a clean stop (journals
 /// `daemon.stopped`, removes the descriptor).
@@ -300,6 +354,11 @@ pub struct DaemonHandle {
     pub token: String,
     shutdown_tx: Option<oneshot::Sender<()>>,
     served: tokio::task::JoinHandle<()>,
+    /// The probe children *this* daemon's walk has live (#310). Per-daemon,
+    /// never global: `cargo test` runs many in-process daemons at once, and a
+    /// global set would let one daemon's `kill` take a sibling's live probe
+    /// child down and turn its probe into a spurious refusal.
+    probe_children: Arc<ProbeChildren>,
 }
 
 impl DaemonHandle {
@@ -309,6 +368,36 @@ impl DaemonHandle {
             let _ = tx.send(());
         }
         let _ = (&mut self.served).await;
+    }
+
+    /// Abruptly terminate the daemon without giving it a chance to run its
+    /// own cooperative shutdown path — the in-process rig's analogue of
+    /// SIGKILL. m6's out-of-process rig signals a real child process; this
+    /// in-process one has no separate process to signal, so it aborts the
+    /// serving task instead. The shutdown channel is dropped unsent —
+    /// nothing here asks the daemon to stop, it is simply cut off
+    /// mid-flight. Awaiting the aborted task still lets the runtime finish
+    /// unwinding it (releasing the exclusive `daemon.lock`, closing the
+    /// listener) before a fresh daemon can bind the same data dir.
+    pub async fn kill(mut self) {
+        self.shutdown_tx.take();
+        self.served.abort();
+        let _ = (&mut self.served).await;
+        // #310: aborting the serve task does not reach the probe walk, and a
+        // probe child is a *process* — a real `opencode serve` at ~265 MB —
+        // that nothing in this process's memory owns once the handle is
+        // gone. Reaped by recorded pgid, so the kill reaches whatever the
+        // probe child itself spawned and nothing that belongs to anyone
+        // else. This is the in-process analogue of the `PR_SET_PDEATHSIG`
+        // that covers the out-of-process daemon; both exist because
+        // destructors do not run for a killed process.
+        let killed = self.probe_children.kill_all();
+        if !killed.is_empty() {
+            tracing::debug!(
+                ?killed,
+                "killed probe children still live when the daemon was killed"
+            );
+        }
     }
 }
 
@@ -388,6 +477,28 @@ pub struct DaemonConfig {
     /// replay, and write a fresh one. `false` — the default and every
     /// auto-spawn — uses the cache when it verifies.
     pub rebuild_cache: bool,
+    /// W2fix (#293): whether [`start_with`] returns only after the backend
+    /// probe walk has finished.
+    ///
+    /// The descriptor is published before the walk either way — that is the
+    /// fix, and it is not negotiable by this flag. What the flag decides is
+    /// what the *caller* of `start_with` is waiting for, and the two callers
+    /// genuinely want different things:
+    ///
+    /// - `true`, the default, for an in-process embedder. Every rig in
+    ///   `tests/` holds a [`DaemonHandle`] and reads it as "this daemon has
+    ///   started"; one that snapshots the journal on the next line must not
+    ///   race a startup append.
+    /// - `false`, set by [`run_until_signal`], for the daemon binary. Its
+    ///   caller is a signal loop, and a process that cannot answer SIGTERM
+    ///   until its slowest adapter has finished printing `--help` is exactly
+    ///   the "daemon that will not die is a lock nobody can take" this file
+    ///   already refuses elsewhere. Measured on Cerberus 2026-08-25: with the
+    ///   wait in place, a SIGTERM arriving the instant the descriptor
+    ///   appeared took 3.27s to be answered on an idle host, and over ten
+    ///   seconds under `m6`'s own parallel load — long enough that the rig
+    ///   escalated to SIGKILL and the daemon flushed nothing at exit.
+    pub await_probe_walk: bool,
     /// Segment rotation threshold for this daemon's journal. `None` is
     /// [`DEFAULT_SEGMENT_MAX_BYTES`] (8 MiB) — production, always.
     ///
@@ -398,23 +509,19 @@ pub struct DaemonConfig {
     /// alternative — shrinking the window instead — would mean the tests
     /// prove a window nothing ships.
     pub segment_max_bytes: Option<u64>,
-    /// §5.1: the estate root this daemon is bound to, for its whole life.
-    ///
-    /// [`start_with`] admits it (§4.1's exact-root check —
-    /// [`Estate::admit`]) before the data dir is created, the journal
-    /// opened, or the descriptor published, so a daemon can never come up
-    /// bound to something that is not an estate. The canonical form is
-    /// pinned into the engine and published in the runtime descriptor, where
-    /// every client verifies it against its own root before use.
-    ///
-    /// `None` is a daemon bound to no estate: `Engine::plan` answers "no
-    /// repository context" and every submission stays `pending`. That is the
-    /// test rigs' shape — never a silent fallback to discovery, of which
-    /// there is none left.
-    pub estate_root: Option<PathBuf>,
     /// W3: retention cap for this daemon's journal, overriding `[estate]
-    /// retention`. `None` — production, always — takes the manifest's value
-    /// or [`crate::domain::estate::DEFAULT_RETENTION`].
+    /// retention`. `None` — production, always — takes
+    /// [`crate::domain::estate::DEFAULT_RETENTION`].
+    ///
+    /// **H1:** a host daemon has no one estate whose manifest could supply
+    /// this, so the `Manifest` rung is gone from the *process-wide* policy.
+    /// Each admitted estate's own `[estate] retention` is read at admission
+    /// ([`crate::runtime::estates::AdmittedEstate::retention`]); partitioning
+    /// the retention *decision* by estate is W4a's deliverable (D7 keeps the
+    /// blob-reference scan journal-wide either way). Until then the
+    /// process-wide policy is the explicit override or the built-in default,
+    /// which is a widening — never a silent narrowing — of what any one
+    /// estate declared.
     ///
     /// Configurable for the same reason `segment_max_bytes`/`completion_poll`
     /// are: a prune test has to stand on the far side of the cap, and
@@ -424,6 +531,26 @@ pub struct DaemonConfig {
     /// from a typo in a file, not a runtime bound; a test rig setting
     /// `Some(4)` has not typed anything into a manifest.
     pub retention: Option<u32>,
+    /// H1-15 (W4b) execution lane: daemon-wide cap on native adapter
+    /// processes admitted between PREPARE and LAUNCH concurrently
+    /// (`SGT_EXECUTION_LANE_CAP`). `None` keeps [`Engine::new`]'s default
+    /// ([`crate::runtime::engine::default_execution_lane_cap`]). `Some` is
+    /// wired via [`Engine::with_execution_lane_cap`] in [`start_with`], the
+    /// same way `turn_cap` above is.
+    pub execution_lane_cap: Option<usize>,
+    /// H1-15's second lane: config-only capacity for A1/S3's future
+    /// intelligence workers (`SGT_INTELLIGENCE_LANE_CAP`). `None` keeps
+    /// [`crate::runtime::engine::default_intelligence_lane_cap`]. Nothing
+    /// in this build acquires from it yet (deliverable 3 — config surface,
+    /// no scheduling behavior); it exists so the two lanes' independence is
+    /// provable now rather than retrofitted later.
+    pub intelligence_lane_cap: Option<usize>,
+    /// W5 brief deliverable 1(a): how often the periodic multi-estate sweep
+    /// caller ([`crate::api::maybe_run_periodic_sweep`]) re-walks every
+    /// admitted estate's mounts. Configurable for the same reason
+    /// `completion_poll` is: a test that needs a tick to always be due holds
+    /// this at zero rather than racing the production default.
+    pub sweep_interval: Duration,
 }
 
 impl Default for DaemonConfig {
@@ -442,9 +569,12 @@ impl Default for DaemonConfig {
             surfaces_root: None,
             turn_cap: None,
             rebuild_cache: false,
+            await_probe_walk: true,
             segment_max_bytes: None,
-            estate_root: None,
             retention: None,
+            execution_lane_cap: None,
+            intelligence_lane_cap: None,
+            sweep_interval: crate::api::SWEEP_INTERVAL,
         }
     }
 }
@@ -471,21 +601,57 @@ fn refuse_if_unreliable(data_dir: &Path, reliability: Reliability) -> Result<(),
     }
 }
 
-/// Start the daemon on `data_dir`. Returns once it is serving and the
-/// runtime descriptor is published.
+/// S5 W1b: retry one Work's overlay eviction as an idempotent startup
+/// catch-up, logging the outcome. Shared by both halves of the sweep — the
+/// terminal-cache pass right after Atlas opens, and the
+/// `surfaces_retired`-keyed pass right after `recovery::reconcile` finishes
+/// a crash-interrupted teardown — so there is exactly one place that decides
+/// what "swept" and "failed to sweep" mean.
+fn sweep_one_overlay_eviction(atlas: &mut crate::runtime::atlas::db::AtlasDb, work_id: &str) {
+    match atlas.evict_work_overlays(work_id) {
+        Ok(evicted) if !evicted.is_empty() => tracing::info!(
+            target: "sergeant::atlas",
+            work_id,
+            generations = evicted.len(),
+            "startup swept an overlay eviction a prior process's crash left unfinished"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            target: "sergeant::atlas",
+            work_id,
+            error = %e,
+            "could not sweep this Work's overlay eviction at startup; it stays queryable \
+             until a later restart retries"
+        ),
+    }
+}
+
+/// Start the daemon on `data_dir`. Returns once startup is complete: serving,
+/// runtime descriptor published, and the backend probe walk finished.
+///
+/// Those three do not happen at the same moment any more (#293). The
+/// descriptor is published — and the daemon starts accepting — *before* the
+/// probe walk runs; this call returns after the walk, because an in-process
+/// handle is read as "started" and a rig that takes a journal snapshot right
+/// after it must not race a startup append. A client waiting on the
+/// descriptor file is unblocked at the earlier moment, which is the whole
+/// point of the reordering; see this module's `Publish, then probe` doc.
 pub async fn start_with(
     data_dir: &Path,
     config: DaemonConfig,
 ) -> Result<DaemonHandle, DaemonError> {
-    // 0a. §4.1/§5.1: admit the estate root **first**, before the data dir is
-    // even created. A daemon that cannot name its estate must not come up at
-    // all — §4.3's ordering applies to the daemon's own startup exactly as
-    // it does to a client's dispatch, and the canonical root admitted here
-    // is what the descriptor publishes and every client verifies against.
-    let estate = match &config.estate_root {
-        Some(root) => Some(Estate::admit(root)?),
-        None => None,
-    };
+    // 0a. **Estate admission is no longer a startup step.** It used to be the
+    // first thing this function did — `Estate::admit(config.estate_root)`,
+    // before the data dir was even created, refusing the whole start when it
+    // failed. H1 moves it out: a host daemon starts bound to **zero** estates
+    // (the normal state, not a rig edge case) and admits each one lazily on
+    // the first request that addresses it
+    // ([`crate::runtime::estates::EstateRegistry`]). Keeping the old step
+    // would mean one estate's broken `sergeant.toml` refusing to start the
+    // daemon every *other* estate's Work depends on — which is precisely why
+    // admission failure is now an estate-specific refusal to the caller that
+    // asked for it, and never process death.
+    let estates = Arc::new(crate::runtime::estates::EstateRegistry::new());
 
     create_dir_all_durable(data_dir)?;
 
@@ -495,6 +661,12 @@ pub async fn start_with(
     // two daemons are racing the same data dir. An inconclusive probe (e.g.
     // today's always-Unknown macOS arm) does not refuse — see
     // `refuse_if_unreliable`.
+    //
+    // H1: `data_dir` is now the **host runtime root**, so this is the host
+    // half of a check that has become two. The estate half runs per estate
+    // root at admission (`estates::admit_root`), because an estate on a
+    // network share and a host root on local disk is a real shape, and one
+    // probe at one path can no longer answer for both.
     refuse_if_unreliable(data_dir, fs_locking::detect_for_path(data_dir))?;
 
     // 1. Exclusive daemon lock: a second daemon on the same data dir fails
@@ -546,6 +718,13 @@ pub async fn start_with(
     // The disposable analytical projection (§21–§23, §40): rebuilt from the
     // journal on every start (windowed exactly like every other sink), so
     // deleting it and restarting is indistinguishable from restarting.
+    //
+    // Since S5 W1c this opens Atlas's database file under `atlas/` and drops its `ops`
+    // schema; it no longer deletes a file, because four other schemas in that
+    // file must survive (A1 §5, F1). One consequence is visible three
+    // paragraphs down: this call *creates* the Atlas database if it is
+    // absent, so by the time the reconciliation below runs, the file always
+    // exists.
     let mut analytics = Analytics::begin_rebuild(data_dir)?;
     let mut capability_sink = startup::CapabilitySink::seeded(plan.capability_seed());
     // Loaded once, never mutated by the pass (§26 Q8's below-window ledger) —
@@ -611,6 +790,137 @@ pub async fn start_with(
         &first_seq_by_work,
     )?;
     startup::persist_or_remove(floor_state.as_ref(), data_dir)?;
+
+    // 2e (S3 X2, F1): Atlas's startup reconciliation.
+    //
+    // The two rebuild disciplines meet here, a few lines apart, over the same
+    // file, and the difference between them is the whole of F1.
+    // `Analytics::begin_rebuild` above dropped the `ops` *schema* and refolded
+    // it from the journal, because the operations tables are a pure fold of
+    // it. Everything else in that file is opened and **kept**:
+    // its `source.*` and `meta.coverage` rows are derived from source bytes
+    // plus extractor identity, and no journal replay reproduces them.
+    // `record::reconcile_sources` is what closes the crash window, and it
+    // needs both halves of the evidence — which is why it takes the journal
+    // as well as the store. A generation a crash left `provisional` is
+    // promoted when its `source.scanned` summary is in the journal (the scan
+    // completed; only the confirming transaction was lost) and evicted, with
+    // an explicit `generation_evicted` coverage row, when it is not. The
+    // database's `state` column alone cannot tell those two apart, and they
+    // have opposite correct answers.
+    //
+    // Opened and dropped rather than held: nothing in this build reads Atlas
+    // while the daemon runs (`sgt intelligence status` and the `map` surface
+    // land with their own wave), so keeping a second connection open for the
+    // process lifetime would buy nothing. What must happen at startup is the
+    // reconciliation, and that is what this does.
+    //
+    // The existence check is kept, and is now a cheap guard rather than the
+    // cost-avoidance it was. It used to be load-bearing: opening creates the
+    // file, and creating it here would have meant every host that never
+    // declared a knowledge source paying a database creation on every start
+    // for a feature it never used (R1). `Analytics::begin_rebuild` above now
+    // creates that same file unconditionally, because `ops` lives in it — so
+    // the cost is paid either way and the branch is no longer avoiding it.
+    // What it still buys is honesty about the one case that could ever reach
+    // it: a file that does not exist has, by definition, no crash-window
+    // generation to reconcile, and a reconciliation that had to create its
+    // own store to find nothing in it would be reporting on state it made up.
+    if crate::runtime::atlas::db::atlas_db_path(data_dir).exists() {
+        match analytics.atlas() {
+            Ok(mut atlas) => {
+                match crate::runtime::atlas::record::reconcile_sources(&mut atlas, &journal) {
+                    Ok(resolved) => tracing::debug!(
+                        target: "sergeant::atlas",
+                        path = %atlas.path().display(),
+                        promoted = resolved.promoted.len(),
+                        evicted = resolved.evicted.len(),
+                        "atlas opened and reconciled at startup"
+                    ),
+                    // Same reasoning as an unopenable store, one line down:
+                    // derived evidence never costs the estate its daemon.
+                    Err(e) => tracing::warn!(
+                        target: "sergeant::atlas",
+                        error = %e,
+                        "atlas could not be reconciled at startup; a crash-window \
+                         generation may remain unresolved (it stays unreadable)"
+                    ),
+                }
+                // S5 W2 (F-SF-01): the lexical-index upgrade path. A store
+                // written before W2 has confirmed generations with rows but
+                // no postings — `reindex_lexical`'s own doc names this exact
+                // condition, but nothing invoked it. `lexical_index_needs_rebuild`
+                // is a cheap anti-join, so it is safe to check every startup
+                // rather than only once at a version boundary this crate has
+                // no other way to detect; the rebuild itself runs only when
+                // that check finds something to do.
+                match atlas.lexical_index_needs_rebuild() {
+                    Ok(true) => match atlas.reindex_lexical() {
+                        Ok(outcome) => tracing::debug!(
+                            target: "sergeant::atlas",
+                            indexed = outcome.indexed,
+                            truncated = outcome.truncated,
+                            "lexical index rebuilt at startup (S5 W2 upgrade path)"
+                        ),
+                        // Same reasoning as an unopenable store above:
+                        // derived evidence never costs the estate its daemon.
+                        Err(e) => tracing::warn!(
+                            target: "sergeant::atlas",
+                            error = %e,
+                            "lexical index could not be rebuilt at startup; \
+                             lexical_search may return empty for pre-existing \
+                             generations this run"
+                        ),
+                    },
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(
+                        target: "sergeant::atlas",
+                        error = %e,
+                        "could not check whether the lexical index needs a rebuild"
+                    ),
+                }
+                // S5 W1b: the Work-overlay eviction reconciliation sweep,
+                // first half — a terminal Work whose surface was ALREADY
+                // torn down before this restart.
+                //
+                // Ordinary eviction runs as a detached task off the crank
+                // (`api::run_work_overlay_hook`'s `Evict` arm), racing a
+                // Work's teardown against nothing — a daemon killed between
+                // `surface.torn_down` landing and that task finishing loses
+                // the eviction permanently under that mechanism alone. This
+                // closes it the same way `record::reconcile_sources` above
+                // closes the analogous scan-side gap: one pass, right here,
+                // before anything is served. See
+                // `recovery::terminal_work_ids_with_a_torn_down_surface`'s
+                // own doc for exactly which Works this selects (and why the
+                // crash-before-teardown case is deliberately NOT this list —
+                // it is closed below instead, once `recovery::reconcile` has
+                // actually finished that teardown).
+                //
+                // `evict_work_overlays` is naturally idempotent (it only
+                // ever touches generations not already `evicted`), so
+                // retrying it for the overwhelming majority already cleanly
+                // evicted is a safe no-op; only the rare one a crash caught
+                // mid-flight changes. One-time pass at this restart, not a
+                // periodic loop (out of this wave's scope).
+                for work_id in crate::runtime::recovery::terminal_work_ids_with_a_torn_down_surface(
+                    registry.state(),
+                ) {
+                    sweep_one_overlay_eviction(&mut atlas, &work_id);
+                }
+            }
+            // Never fatal. Atlas is derived evidence; a daemon that refused
+            // to start because a derived store was unreadable would trade
+            // every Work in the estate for an index (A1-01: the journal, Git
+            // and the original bytes are authority — Atlas is not).
+            Err(e) => tracing::warn!(
+                target: "sergeant::atlas",
+                error = %e,
+                "atlas could not be opened at startup; source intelligence is unavailable this run"
+            ),
+        }
+    }
+
     let rebuild_ms = u64::try_from(rebuild_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let startup_cache = plan.startup_cache_tag();
     // The oldest surviving seq (1 on every W2 production path — the floor
@@ -622,48 +932,41 @@ pub async fn start_with(
         .with_floor_ledger(Arc::new(floor_ledger))
         .with_first_seq_index(first_seq_by_work);
 
-    // W3 §1.2: resolve the retention policy once, for this process's whole
-    // life — `config.retention` (test rigs only) -> `[estate] retention` ->
-    // the built-in default. Journaled on every prune event so the record
-    // names the authorization, not just the number (A1).
+    // W3 §1.2, as H1 leaves it: resolve the *process-wide* retention policy
+    // once — `config.retention` (test rigs only) -> the built-in default.
+    // Journaled on every prune event so the record names the authorization,
+    // not just the number (A1).
     //
-    // `estate` above is only an `EstateRoot` (path + manifest_path admitted
-    // by §4.1's exact-root check) — it never parsed `[estate] retention`, so
-    // it is re-read here through the *structural* parser: schema-level
-    // checks in full, no per-repository git validation (`Estate::admit`
-    // never did that either, so this cannot newly refuse a daemon start that
-    // used to succeed). A failure here — unreachable in practice, since
-    // `admit` already parsed the same file successfully — falls back to the
-    // default rather than turning a policy-resolution nicety into a new
-    // startup failure mode.
-    let estate_retention = estate.as_ref().and_then(|estate_root| {
-        match Estate::from_config_structural(&estate_root.manifest_path) {
-            Ok(full) => full.retention,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "could not re-read the estate manifest for [estate] retention; using the default"
-                );
-                None
-            }
-        }
-    });
+    // The `[estate] retention` rung is gone from **this** resolution, and
+    // that is a deliberate, named change rather than an omission. It used to
+    // re-read the one bound estate's manifest here; a host journal holds
+    // many estates' Works, so "the manifest" has no referent at startup.
+    // Each admitted estate's own declaration is read at admission
+    // (`estates::admit_root` -> `AdmittedEstate::retention`) and W4a owns
+    // partitioning the retention *decision* by estate — D7 keeps the
+    // blob-reference scan journal-wide regardless, precisely so a per-estate
+    // decision can never condemn another estate's live blobs. Until W4a
+    // lands, the process-wide number is the explicit override or the
+    // default: a widening of what any one estate declared, never a silent
+    // narrowing.
     let prune_policy = match config.retention {
         Some(retention) => crate::runtime::prune::PrunePolicy {
             retention,
             source: crate::runtime::prune::PolicySource::Config,
         },
-        None => match estate_retention {
-            Some(retention) => crate::runtime::prune::PrunePolicy {
-                retention,
-                source: crate::runtime::prune::PolicySource::Manifest,
-            },
-            None => crate::runtime::prune::PrunePolicy {
-                retention: crate::domain::estate::DEFAULT_RETENTION,
-                source: crate::runtime::prune::PolicySource::Default,
-            },
+        None => crate::runtime::prune::PrunePolicy {
+            retention: crate::domain::estate::DEFAULT_RETENTION,
+            source: crate::runtime::prune::PolicySource::Default,
         },
     };
+    // W5 brief deliverable 1(b): the startup trigger now partitions by
+    // estate exactly like the rotation tick (`maybe_run_rotation_triggered_
+    // prune`) does — built from the same, still-empty-at-this-instant
+    // `estates` registry (admission is lazy; see step 0a above), so a
+    // restart with no request yet answered falls fully back to
+    // `prune_policy` above, and widens correctly once estates re-admit.
+    let startup_prune_policies =
+        crate::runtime::prune::EstatePolicies::from_registry(&estates, prune_policy);
 
     // 2e-2g (W3 §10.3, §6.6): Q9's crash completion — evidence-based, exactly
     // as `recovery::reconcile_terminal_surface` is: the intent is a durable,
@@ -686,7 +989,7 @@ pub async fn start_with(
     let prune_outcome = match crate::runtime::prune::run_startup(
         &mut core,
         data_dir,
-        &prune_policy,
+        &startup_prune_policies,
         &first_seq_snapshot,
     ) {
         Ok(outcome) => outcome,
@@ -703,11 +1006,11 @@ pub async fn start_with(
         format!("pruned:{}", prune_outcome.segments_unlinked)
     } else {
         let stalled = core.journal.segment_bounds().ok().map(|bounds| {
-            crate::runtime::prune::candidate_horizon(
+            crate::runtime::prune::candidate_horizon_multi_estate(
                 &bounds,
                 core.registry.state(),
                 &core.first_seq_by_work,
-                &prune_policy,
+                &startup_prune_policies,
             )
             .1
         });
@@ -866,38 +1169,17 @@ pub async fn start_with(
     } else {
         None
     };
-    let backends = Arc::new(backends);
-
-    // 4b-ii. The capability/version probe, recorded at registration (M4
-    // contract). Probing is offline and token-free (`--version`, `--help`),
-    // and journaling the answer is the point: a version and flag set that
-    // only ever appear inside a later refusal's message are not a record.
-    // An unavailable backend is registered anyway and refuses work with this
-    // same evidence — routing must be able to say *why*, not pretend the
-    // backend does not exist.
-    for name in backends.names() {
-        let Some(backend) = backends.get(&name) else {
-            continue;
-        };
-        let report = backend.probe();
-        core.commit(EventDraft::new(
-            EventSource::new("daemon", "sergeant"),
-            KIND_BACKEND_PROBED,
-            json!({
-                "backend": name,
-                "available": report.available,
-                "detail": report.detail,
-                "capabilities": backend.capabilities(),
-                // §17: the adapter's declared runtime scope, recorded with
-                // the probe because it is a claim about the adapter, and the
-                // core is forbidden from assuming one.
-                "runtime_scope": backend.runtime_scope(),
-            }),
-        ))?;
-    }
-    // Same reasoning as the daemon.started flush above: durable before
-    // recovery starts acting on it (INV-R2-01).
-    core.flush()?;
+    // 4b-ii. The capability/version probe is *scheduled* here and runs at
+    // step 6, after the descriptor is published — see this module's
+    // startup-order doc and [`ProbeGate`] for why (#293). What happens here is
+    // only that the registry gains the readiness gate its routing path will
+    // wait on; not one subprocess is forked, and the gate is still **unarmed**,
+    // which is load-bearing: restart reconciliation two steps below reads
+    // capabilities, and a gate armed this early would make it wait for a walk
+    // that has not started.
+    let probe_gate = Arc::new(ProbeGate::new());
+    let backends = Arc::new(backends.with_probe_gate(probe_gate.clone()));
+    let probe_backends = backends.clone();
 
     // 4c. Reconcile work believed in flight *before* serving (§25): no
     // request may observe — or act on — a work whose prior ownership has not
@@ -906,19 +1188,53 @@ pub async fn start_with(
     // harness) are never left unsynced while unbounded — see its doc.
     let mut engine = Engine::new(backends, config.default_backend.clone(), data_dir)
         .with_turn_ceiling(config.turn_ceiling);
-    // §5.2: the engine's one topology authority for the life of this
-    // process. Nothing downstream ever re-derives it from a request cwd.
-    if let Some(estate) = &estate {
-        engine = engine.with_estate_root(estate.path.clone());
-    }
+    // D10: no `with_estate_root` here any more. The engine holds no estate;
+    // each `plan` call is handed the one its request addressed, after the
+    // registry admitted it.
     if let Some(surfaces_root) = config.surfaces_root.clone() {
         engine = engine.with_surfaces_root(surfaces_root);
     }
     if let Some(turn_cap) = config.turn_cap {
         engine = engine.with_turn_cap(turn_cap);
     }
+    if let Some(cap) = config.execution_lane_cap {
+        engine = engine.with_execution_lane_cap(cap);
+    }
+    if let Some(cap) = config.intelligence_lane_cap {
+        engine = engine.with_intelligence_lane_cap(cap);
+    }
+    // C1 §3: install the compilation step, so a stage launch actually
+    // compiles a world instead of the capability shipping green and
+    // unreachable.
+    //
+    // Derived from `analytics`, never `AtlasDb::open` — one file is one
+    // DuckDB instance, and a second `open` is a second instance whose writes
+    // and the projection's silently overwrite each other (`Analytics::atlas`,
+    // and this module's own Atlas startup-reconciliation doc). This is the
+    // same `Connection::try_clone` handle `ApiState::atlas` is derived from,
+    // taken once and held for the process because a compilation happens on
+    // every stage entry.
+    //
+    // A host that cannot produce a handle installs no compiler and therefore
+    // keeps §18's first rung: the existing stage launch path, unchanged
+    // (§21 item 13). That is reported, not silent.
+    if crate::runtime::atlas::db::atlas_db_path(data_dir).exists() {
+        match analytics.atlas() {
+            Ok(atlas) => {
+                engine = engine.with_context_compiler(Arc::new(
+                    crate::runtime::context::AtlasContextCompiler::new(atlas),
+                ));
+            }
+            Err(e) => tracing::warn!(
+                target: "sergeant::atlas",
+                error = %e,
+                "atlas could not be opened for C1 context compilation; stages launch on the \
+                 existing context path with no compiled snapshot"
+            ),
+        }
+    }
     let engine = Arc::new(engine);
-    let reconciled = recovery::reconcile(&engine, &mut core)?;
+    let reconciled = recovery::reconcile(&engine, &estates, &mut core)?;
     // Backstop, not load-bearing: `reconcile` already leaves nothing open on
     // its own account, but a future edit there that forgets a flush must not
     // be able to publish the descriptor over an unsynced group. Free when
@@ -936,6 +1252,41 @@ pub async fn start_with(
             reservations_retired = ?reconciled.reservations_retired,
             "reconciled in-flight work after restart"
         );
+    }
+
+    // S5 W1b: the Work-overlay eviction sweep's second half — a terminal
+    // Work whose surface teardown itself never finished before the crash
+    // (`recovery::reconcile_terminal_surface` bypassed the ordinary
+    // lifecycle hook entirely, because it runs the crash-recovery path
+    // directly rather than through the crank arm that hook is wired to).
+    // `reconciled.surfaces_retired` names exactly the Works whose teardown
+    // `reconcile` just finished above — this is that teardown's own overlay
+    // eviction, run once it is actually true that a torn-down surface
+    // stands to evict.
+    //
+    // Derived again rather than held from the block above: that block runs
+    // before `reconcile`, and an Atlas handle is deliberately taken and
+    // dropped rather than kept for the process lifetime (see this module's
+    // Atlas startup-reconciliation doc). Derived from `analytics`, never
+    // `AtlasDb::open` — one file is one DuckDB instance, and a second
+    // `open` would be a second instance whose writes and the projection's
+    // silently overwrite each other (`Analytics::atlas`).
+    if !reconciled.surfaces_retired.is_empty()
+        && crate::runtime::atlas::db::atlas_db_path(data_dir).exists()
+    {
+        match analytics.atlas() {
+            Ok(mut atlas) => {
+                for work_id in &reconciled.surfaces_retired {
+                    sweep_one_overlay_eviction(&mut atlas, work_id);
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "sergeant::atlas",
+                error = %e,
+                "atlas could not be opened to sweep a crash-recovered teardown's overlay \
+                 eviction; it stays queryable until a later restart retries"
+            ),
+        }
     }
 
     // 4c-ii. Clear a stale admission pause (L6, `KIND_ADMISSION_RESUMED`'s
@@ -965,8 +1316,6 @@ pub async fn start_with(
         pid: std::process::id(),
         api_revision: API_REVISION.to_string(),
         token: token.clone(),
-        estate_root: estate.as_ref().map(|e| e.path.clone()),
-        manifest_path: estate.as_ref().map(|e| e.manifest_path.clone()),
     };
     let descriptor_path = data_dir.join(DESCRIPTOR_FILE);
     write_atomic_secret(&descriptor_path, &serde_json::to_vec_pretty(&descriptor)?)?;
@@ -981,8 +1330,14 @@ pub async fn start_with(
         data_dir: data_dir.to_path_buf(),
         closing: closing_rx,
         engine,
+        estates,
         analytics: Arc::new(tokio::sync::Mutex::new(analytics)),
+        // S3 X4: opened lazily by the first `map`/`intelligence` read that
+        // finds a file to open — see `ApiState::atlas`.
+        atlas: Arc::new(tokio::sync::Mutex::new(None)),
         prune_policy,
+        sweep_interval: config.sweep_interval,
+        last_swept: Arc::new(std::sync::Mutex::new(None)),
     };
     // §28's export is a fold over the event stream, subscribed here and
     // nowhere else. With export off this task does not exist.
@@ -1017,6 +1372,31 @@ pub async fn start_with(
     if let Some(agy) = agy {
         agy.set_event_sink(journaling_sink(state.core.clone()));
     }
+
+    // 6. The capability/version probe walk (#293), started the moment the
+    // daemon is reachable and run concurrently across backends. Spawned after
+    // the adapter sinks are wired above so a probe can never race an adapter
+    // that has no sink yet, and joined at shutdown below so `daemon.stopped`
+    // stays the last event this daemon writes.
+    //
+    // Arming the gate is the line before the spawn, and both are ahead of the
+    // serve task: the listener is bound, so a client that read the descriptor
+    // a moment ago has its connection sitting in the accept backlog, and the
+    // first request axum takes off it is therefore handled by a routing path
+    // that already knows what evidence is outstanding.
+    probe_gate.expect(probe_backends.names());
+    let probe_lanes = Arc::new(tokio::sync::Semaphore::new(PROBE_WALK_LANES));
+    // #310: the set every probe child this walk spawns records itself into,
+    // and the set `DaemonHandle::kill` reaps. Created here, one per daemon.
+    let probe_children = ProbeChildren::new();
+    let probes = tokio::spawn(probe_walk(
+        state.core.clone(),
+        probe_backends,
+        probe_gate.clone(),
+        probe_lanes.clone(),
+        probe_children.clone(),
+    ));
+
     let app = router(state.clone());
 
     // The one writer that is not a request (issue #46): a turn that ends on
@@ -1058,15 +1438,43 @@ pub async fn start_with(
         // crash-tolerant per append, and `daemon.stopped` is a lifecycle
         // record that nothing reconciles against — whereas a daemon that will
         // not die is a lock nobody can take.
-        match tokio::time::timeout(DRIVER_SHUTDOWN_GRACE, completions).await {
-            Ok(Err(e)) => tracing::warn!(error = %e, "the completion driver panicked"),
-            Err(_) => tracing::warn!(
-                grace = ?DRIVER_SHUTDOWN_GRACE,
-                "the completion driver was still inside an external effect at shutdown; \
-                 stopping anyway"
-            ),
-            Ok(Ok(())) => {}
-        }
+        //
+        // The probe walk (#293) is the other non-request writer and the same
+        // rule binds it, so it is joined here too — **concurrently, not after**.
+        // Two graces run one after the other add up, and their sum was
+        // measured to be the whole budget a rig gives a SIGTERMed daemon: with
+        // the joins sequential, `m6`'s
+        // `the_dropped_spawned_daemon_leaves_the_evidence_of_a_clean_shutdown`
+        // still escalated to SIGKILL under its own parallel load (Cerberus,
+        // 2026-08-25). Neither wait needs the other's answer, so neither
+        // should wait for it.
+        let driver = async {
+            match tokio::time::timeout(DRIVER_SHUTDOWN_GRACE, completions).await {
+                Ok(Err(e)) => tracing::warn!(error = %e, "the completion driver panicked"),
+                Err(_) => tracing::warn!(
+                    grace = ?DRIVER_SHUTDOWN_GRACE,
+                    "the completion driver was still inside an external effect at shutdown; \
+                     stopping anyway"
+                ),
+                Ok(Ok(())) => {}
+            }
+        };
+        // A stopping daemon starts no probe it has not already started: the
+        // in-flight ones are uninterruptible child processes it must wait out,
+        // but the queued ones are free to drop, and `PROBE_WALK_LANES` is what
+        // bounds how many can be in the first category.
+        probe_lanes.close();
+        let walk = async {
+            match tokio::time::timeout(PROBE_WALK_SHUTDOWN_GRACE, probes).await {
+                Ok(Err(e)) => tracing::warn!(error = %e, "the backend probe walk panicked"),
+                Err(_) => tracing::warn!(
+                    grace = ?PROBE_WALK_SHUTDOWN_GRACE,
+                    "the backend probe walk was still running at shutdown; stopping anyway"
+                ),
+                Ok(Ok(())) => {}
+            }
+        };
+        tokio::join!(driver, walk);
         // Clean shutdown: journal the stop, then retire the descriptor.
         let mut core = CoreGuard::acquire(&state.core).await;
         if let Err(e) = core.commit(EventDraft::new(
@@ -1087,12 +1495,162 @@ pub async fn start_with(
         }
     });
 
+    // Whether the handle is handed back mid-walk or after it is the one
+    // question `await_probe_walk` answers — see its doc for why the two
+    // callers want different things. What a *client* waits on is settled
+    // either way and much earlier: the descriptor was published above, before
+    // this walk was even armed.
+    //
+    // Waiting on the gate rather than on the `probes` join handle is what
+    // lets the serve task keep that handle and join it at shutdown. The gate
+    // is a `Condvar`, so the wait goes on the blocking pool, where blocking
+    // waits belong.
+    if config.await_probe_walk {
+        let settled = probe_gate.clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || settled.wait_all()).await {
+            tracing::warn!(error = %e, "waiting for the backend probe walk failed");
+        }
+    }
+
     Ok(DaemonHandle {
         endpoint,
         token,
         shutdown_tx: Some(shutdown_tx),
         served,
+        probe_children,
     })
+}
+
+/// The capability/version probe walk, recorded at registration (M4 contract):
+/// one `backend.probed` event per registered backend, carrying what the probe
+/// found — a version and flag set that only ever appear inside a later
+/// refusal's message are not a record. An unavailable backend is probed and
+/// journaled anyway and refuses work with this same evidence; routing must be
+/// able to say *why*, not pretend the backend does not exist.
+///
+/// **Concurrent, and on the blocking pool, both deliberately (#293).** A
+/// probe is one or more real CLI invocations — measured per backend on
+/// Cerberus 2026-08-25, from `daemon.started` to each `backend.probed`:
+/// fake +0.03s, docker +0.05s, claude +0.27s, codex +0.39s, agy +2.40s,
+/// opencode +3.24s — and they are independent of one another, so running them
+/// one at a time bought nothing but their sum. They are also *blocking*
+/// (`std::process::Command::output`), which the old serial walk ran straight
+/// on the async runtime; `spawn_blocking` is where blocking work belongs, and
+/// it is what makes the concurrency real rather than five futures taking
+/// turns on one worker thread.
+///
+/// **Within-adapter invocation parallelism: measured, then declined (R1).**
+/// The obvious next step is to fan out the invocations *inside* the two slow
+/// adapters, and the same measurement says not to. Opencode's three probe
+/// invocations are genuinely independent, but timed individually on this host
+/// they are 0.354s / 0.359s / 0.362s — about 1.1s of its 3.24s. The rest is
+/// `serve_gates`' probe child (`opencode serve --port 0` plus the
+/// authenticated `/doc` fetch), and agy's 2.40s is almost entirely
+/// `read_config_probe`'s `agy -p /config` child, neither of which is a
+/// `--help` that fanning out helps. Parallelising opencode's helps would move
+/// it to roughly agy's number and the walk's completion barely at all — while
+/// costing a real behaviour change, since `run_probe` short-circuits today
+/// and a fan-out would fork two more doomed children on every host with no
+/// opencode installed (which is every CI runner). Revisit if a future
+/// adapter's cost is actually in its help invocations; the walk is off the
+/// startup critical path either way, and the per-backend gate means a Work
+/// waits only on the adapter it routes to.
+///
+/// Each result is journaled and flushed as it lands, then marked on the gate
+/// — in that order, so a caller released by the gate is released over durable
+/// evidence, never over an append still in a group.
+async fn probe_walk(
+    core: Arc<tokio::sync::Mutex<Core>>,
+    backends: Arc<BackendRegistry>,
+    gate: Arc<ProbeGate>,
+    lanes: Arc<tokio::sync::Semaphore>,
+    probe_children: Arc<ProbeChildren>,
+) {
+    let mut walking = tokio::task::JoinSet::new();
+    for name in backends.names() {
+        let backends = backends.clone();
+        let lanes = lanes.clone();
+        let probe_children = probe_children.clone();
+        walking.spawn(async move {
+            // The lane permit is held across the blocking probe and released
+            // when it returns — see `PROBE_WALK_LANES` for why the fan-out is
+            // bounded at all. A closed semaphore means shutdown began before
+            // this probe ever started one: skip it rather than fork a child
+            // the stopping daemon would then have to wait out.
+            let Ok(_lane) = lanes.acquire_owned().await else {
+                return Ok((name, None));
+            };
+            tokio::task::spawn_blocking(move || {
+                let Some(backend) = backends.get(&name) else {
+                    return (name, None);
+                };
+                // #310: everything a probe spawns is recorded against this
+                // walk for as long as this closure runs, which is exactly the
+                // window in which a probe child is live. The owner is
+                // installed around `capabilities()` too, because for the
+                // opencode and agy adapters that call *is* a subprocess gate.
+                let (report, capabilities) = child::owned_by(probe_children, || {
+                    let report = backend.probe();
+                    (report, backend.capabilities())
+                });
+                // `capabilities()` is read here, inside the blocking task,
+                // and not on the runtime: for the opencode and agy adapters
+                // it resolves the transport, which is itself a subprocess
+                // gate, and for Claude it reads a claim the probe may have
+                // withdrawn.
+                let payload = json!({
+                    "backend": name,
+                    "available": report.available,
+                    "detail": report.detail,
+                    "capabilities": capabilities,
+                    // §17: the adapter's declared runtime scope, recorded
+                    // with the probe because it is a claim about the adapter,
+                    // and the core is forbidden from assuming one.
+                    "runtime_scope": backend.runtime_scope(),
+                });
+                (name, Some(payload))
+            })
+            .await
+        });
+    }
+    while let Some(joined) = walking.join_next().await {
+        let (name, payload) = match joined.and_then(|probed| probed) {
+            Ok(probed) => probed,
+            Err(e) => {
+                // A panicked probe takes its own name with it, so nothing
+                // can be marked here; `settle` below is what keeps that from
+                // stranding a waiter.
+                tracing::error!(error = %e, "a backend probe panicked");
+                continue;
+            }
+        };
+        let Some(payload) = payload else {
+            // Either shutdown closed the lanes before this probe started, or
+            // the backend left the registry between scheduling and running
+            // (which nothing does today). Both leave a name owed a record it
+            // will never get, and neither may wedge a submission waiting on
+            // it — so the gate is released without one.
+            tracing::debug!(backend = %name, "backend probe skipped; no evidence recorded");
+            gate.mark(&name);
+            continue;
+        };
+        {
+            let mut core = CoreGuard::acquire(&core).await;
+            let committed = core
+                .commit(EventDraft::new(
+                    EventSource::new("daemon", "sergeant"),
+                    KIND_BACKEND_PROBED,
+                    payload,
+                ))
+                .and_then(|_| core.flush());
+            if let Err(e) = committed {
+                tracing::error!(error = %e, backend = %name, "failed to journal backend.probed");
+            }
+        }
+        gate.mark(&name);
+    }
+    // Unconditional: see `ProbeGate::settle`.
+    gate.settle();
 }
 
 /// Build the [`EventSink`] that journals an adapter's normalized events.
@@ -1242,13 +1800,16 @@ async fn export_events(
 /// Run the daemon in the foreground until SIGINT/SIGTERM, then shut down
 /// cleanly. This is what `sgt daemon` (and therefore auto-spawn) executes.
 ///
+/// `data_dir` is the **host runtime root** (D2): journal, projections, blob
+/// store, `daemon.lock` and the descriptor all live beneath it, and it is
+/// resolved from `--data-dir` / `SGT_DATA_DIR` / the platform convention —
+/// never from an estate. There is deliberately no estate parameter any more
+/// (deliverable 8): `-C` on a `daemon` verb names the estate the invocation
+/// is *addressing*, not one this process binds itself to for life.
+///
 /// This is the one place §28 export is configured from the environment, and
 /// [`TelemetryConfig::from_env`] answers "off" unless explicitly switched on.
-pub async fn run_until_signal(
-    data_dir: &Path,
-    estate_root: Option<&Path>,
-    rebuild_cache: bool,
-) -> Result<(), DaemonError> {
+pub async fn run_until_signal(data_dir: &Path, rebuild_cache: bool) -> Result<(), DaemonError> {
     // **Handlers first, before anything makes this daemon reachable.**
     //
     // Publishing the runtime descriptor is what tells the world "there is a
@@ -1308,17 +1869,52 @@ pub async fn run_until_signal(
                 None
             }
         });
+    // H1-15's execution/intelligence lane overrides: same fail-open
+    // discipline as `SGT_TURN_CAP` above — unset or unparseable both mean
+    // "keep the built-in, host-parallelism-derived default", and 0 (which
+    // parses) is honored with a warning rather than silently ignored.
+    let execution_lane_cap = std::env::var("SGT_EXECUTION_LANE_CAP")
+        .ok()
+        .and_then(|v| match v.parse::<usize>() {
+            Ok(0) => {
+                tracing::warn!(
+                    "SGT_EXECUTION_LANE_CAP=0 blocks every Work at LAUNCH; honoring it"
+                );
+                Some(0)
+            }
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "SGT_EXECUTION_LANE_CAP is not a whole number of permits — keeping the built-in default"
+                );
+                None
+            }
+        });
+    let intelligence_lane_cap = std::env::var("SGT_INTELLIGENCE_LANE_CAP")
+        .ok()
+        .and_then(|v| match v.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                tracing::warn!(
+                    value = %v,
+                    "SGT_INTELLIGENCE_LANE_CAP is not a whole number of permits — keeping the built-in default"
+                );
+                None
+            }
+        });
     let handle = start_with(
         data_dir,
         DaemonConfig {
             telemetry: telemetry.clone(),
             surfaces_root,
             turn_cap,
-            // §5.1: the estate this daemon is bound to for its whole life,
-            // handed down from the invocation that already admitted it
-            // (`sgt -C <root> daemon`, or `sgt daemon` from the root).
-            estate_root: estate_root.map(Path::to_path_buf),
+            execution_lane_cap,
+            intelligence_lane_cap,
             rebuild_cache,
+            // The signal loop below must be able to answer SIGTERM while the
+            // probe walk is still running — see the field's own doc (#293).
+            await_probe_walk: false,
             ..DaemonConfig::default()
         },
     )
@@ -1470,97 +2066,103 @@ mod tests {
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use std::time::Duration;
 
-    /// A `sergeant.runtime/v2` descriptor bound to `estate_root`.
-    fn descriptor_bound_to(estate_root: Option<&str>) -> RuntimeDescriptor {
-        RuntimeDescriptor {
+    /// **Re-scoped, not deleted** (brief deliverable 4): this test used to be
+    /// `a_descriptor_is_usable_only_from_the_estate_it_is_bound_to`, proving
+    /// the strict-equality binding gate in both directions. That refusal
+    /// class is retired with H1, so the negative it protected is re-pointed
+    /// rather than dropped: a descriptor no longer *says* anything about
+    /// estates, and what refuses an unvalidated estate is the admission
+    /// check that replaced it.
+    #[test]
+    fn a_v3_descriptor_says_nothing_about_estates_and_admission_is_what_refuses() {
+        let descriptor = RuntimeDescriptor {
             schema: DESCRIPTOR_SCHEMA.to_string(),
             endpoint: "http://127.0.0.1:1".to_string(),
             pid: 1,
             api_revision: API_REVISION.to_string(),
             token: "t".to_string(),
-            estate_root: estate_root.map(PathBuf::from),
-            manifest_path: estate_root.map(|r| PathBuf::from(r).join("sergeant.toml")),
-        }
-    }
-
-    /// §5.1: a descriptor whose estate root matches the client's own exact
-    /// root is usable; one bound elsewhere is a refusal naming **both**
-    /// roots, in both directions.
-    #[test]
-    fn a_descriptor_is_usable_only_from_the_estate_it_is_bound_to() {
-        let data_dir = Path::new("/data");
-        let here = descriptor_bound_to(Some("/estates/payments"));
-
-        here.check_estate_root(data_dir, Some(Path::new("/estates/payments")))
-            .expect("the daemon's own estate may use it");
-
-        let err = here
-            .check_estate_root(data_dir, Some(Path::new("/estates/billing")))
-            .expect_err("another estate must be refused");
-        let message = err.to_string();
-        assert!(
-            message.contains("/estates/billing") && message.contains("/estates/payments"),
-            "§15: the refusal names both roots: {message}"
-        );
-        assert!(
-            message.contains("refusing to start a second daemon"),
-            "§5.1: never a second daemon over the same data dir: {message}"
+        };
+        let serialized = serde_json::to_value(&descriptor).expect("descriptor json");
+        let mut keys: Vec<&str> = serialized
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["api_revision", "endpoint", "pid", "schema", "token"],
+            "D3: a v3 descriptor carries no estate binding to compare against"
         );
 
-        // The other direction: a daemon bound to nothing cannot serve a
-        // client that has an estate — its engine would plan against nothing.
-        let unbound = descriptor_bound_to(None);
-        let err = unbound
-            .check_estate_root(data_dir, Some(Path::new("/estates/payments")))
-            .expect_err("an unbound daemon must be refused too");
-        assert!(
-            err.to_string().contains("started outside any estate"),
-            "got {err}"
-        );
+        // What refuses instead: the admission check, per estate, on its own
+        // evidence rather than on what some file said at startup.
+        let err = crate::runtime::estates::check_estate_root(
+            Some(Path::new("/estates/definitely-not-one")),
+            "sgt run",
+        )
+        .expect_err("an unvalidated root must still be refused");
+        assert_eq!(err.code(), "invalid_estate", "got {err}");
     }
 
     /// The v1→v2 bump has no compatibility shim: a descriptor written by an
     /// older build fails closed as an unknown schema, and the diagnostic
     /// names the stop/restart remedy rather than leaving an operator staring
     /// at a schema string.
+    ///
+    /// **v2 joins v1 here at the D3 bump** — and it is the case that actually
+    /// happens at cutover, since a v2 daemon is what every developer has
+    /// running the moment before they install a host-mode build. Its fields
+    /// still parse, which is precisely why it must be refused rather than
+    /// read: they describe a process that believes it owns exactly one
+    /// estate.
     #[test]
-    fn a_v1_descriptor_fails_closed_with_a_restart_remedy() {
-        let dir = tempfile::TempDir::new().expect("tempdir");
-        std::fs::write(
-            dir.path().join(DESCRIPTOR_FILE),
-            serde_json::json!({
-                "schema": "sergeant.runtime/v1",
-                "endpoint": "http://127.0.0.1:1",
-                "pid": 1,
-                "api_revision": API_REVISION,
-                "token": "t",
-            })
-            .to_string(),
-        )
-        .expect("write v1 descriptor");
+    fn a_superseded_descriptor_fails_closed_with_a_restart_remedy() {
+        for superseded in ["sergeant.runtime/v1", "sergeant.runtime/v2"] {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            std::fs::write(
+                dir.path().join(DESCRIPTOR_FILE),
+                serde_json::json!({
+                    "schema": superseded,
+                    "endpoint": "http://127.0.0.1:1",
+                    "pid": 1,
+                    "api_revision": API_REVISION,
+                    "token": "t",
+                    "estate_root": "/estates/payments",
+                })
+                .to_string(),
+            )
+            .expect("write superseded descriptor");
 
-        let err = read_descriptor(dir.path()).expect_err("v1 must fail closed");
-        let message = err.to_string();
-        assert!(
-            matches!(err, DaemonError::UnknownDescriptorSchema { .. }),
-            "got {message}"
-        );
-        assert!(
-            message.contains("sergeant.runtime/v1") && message.contains("sergeant.runtime/v2"),
-            "both schemas must be named: {message}"
-        );
-        assert!(
-            message.contains("sgt daemon stop"),
-            "the remedy must tell the operator to restart the daemon: {message}"
-        );
+            let err =
+                read_descriptor(dir.path()).expect_err("a superseded schema must fail closed");
+            let message = err.to_string();
+            assert!(
+                matches!(err, DaemonError::UnknownDescriptorSchema { .. }),
+                "got {message}"
+            );
+            assert!(
+                message.contains(superseded) && message.contains(DESCRIPTOR_SCHEMA),
+                "both schemas must be named: {message}"
+            );
+            assert!(
+                message.contains("sgt daemon stop"),
+                "the remedy must tell the operator to restart the daemon: {message}"
+            );
+        }
     }
 
-    /// Complements `a_v1_descriptor_fails_closed_with_a_restart_remedy` above:
+    /// Complements `a_superseded_descriptor_fails_closed_with_a_restart_remedy`:
     /// the positive case for the *current* schema, going through the same
-    /// on-disk file-write → `read_descriptor` path (not the in-memory
-    /// `descriptor_bound_to()` helper, which never touches disk).
+    /// on-disk file-write → `read_descriptor` path.
+    ///
+    /// It also pins the half of D3 a struct definition cannot: a v3
+    /// descriptor that someone has *added* estate fields to still reads back
+    /// as the five fields this build knows, so no code path can start
+    /// depending on an out-of-band estate binding smuggled through the file.
     #[test]
-    fn a_v2_descriptor_round_trips_through_read_descriptor() {
+    fn a_v3_descriptor_round_trips_through_read_descriptor_ignoring_estate_fields() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         std::fs::write(
             dir.path().join(DESCRIPTOR_FILE),
@@ -1575,7 +2177,7 @@ mod tests {
             })
             .to_string(),
         )
-        .expect("write v2 descriptor");
+        .expect("write v3 descriptor");
 
         let descriptor = read_descriptor(dir.path())
             .expect("read must succeed")
@@ -1585,13 +2187,11 @@ mod tests {
         assert_eq!(descriptor.pid, 1);
         assert_eq!(descriptor.api_revision, API_REVISION);
         assert_eq!(descriptor.token, "t");
-        assert_eq!(
-            descriptor.estate_root.as_deref(),
-            Some(Path::new("/estates/payments"))
-        );
-        assert_eq!(
-            descriptor.manifest_path.as_deref(),
-            Some(Path::new("/estates/payments/sergeant.toml"))
+        let round_tripped = serde_json::to_value(&descriptor).expect("descriptor json");
+        assert!(
+            round_tripped.get("estate_root").is_none()
+                && round_tripped.get("manifest_path").is_none(),
+            "D3: nothing in this build carries an estate on the descriptor, got {round_tripped}"
         );
     }
 

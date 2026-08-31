@@ -1,0 +1,124 @@
+{
+  "_comment": "Y4/G4 hand-verified .eml fixture corpus. Every count below was fixed BEFORE mail-parser was invoked against any of these files, by (1) hand-authoring the raw RFC 5322/MIME bytes (build_mail_fixtures.py, referenced from SPIKE-G4.md) so the author already knows the answer, and (2) independently cross-checking with Python's stdlib `email` package (verify_with_stdlib_email.py) -- a different implementation from both the author's own arithmetic and from mail-parser. Only after both agreed was mail-parser run once, diagnostically, to compare (transcript in SPIKE-G4.md gate (b)). counting_rules defines what each field counts, precisely enough that a human can open a fixture in a text editor and reach the same number without knowing anything about mail-parser's own vocabulary.",
+  "counting_rules": {
+    "header_count": "Number of distinct top-level RFC 5322 header field LINES at the outermost message envelope (the block above the first blank line), counted by eye as one line = one field; no field in this corpus is folded across multiple lines or repeated, so line count and field count are identical. Sub-headers inside a MIME part (e.g. a part's own Content-Type) are NOT counted here -- see mime_leaf_part_count for those.",
+    "to_address_count": "Number of individual mailbox addresses in the To: header, counting each comma-separated mailbox once (a display-name + angle-addr pair is one address).",
+    "cc_address_count": "Same rule as to_address_count, applied to Cc:. 0 when there is no Cc: header.",
+    "mime_leaf_part_count": "Number of MIME body parts with no further sub-parts (a multipart/* container itself is not counted, only its leaves). A message with no explicit multipart structure (a bare Content-Type: text/plain message) counts as 1.",
+    "attachment_count": "Number of leaf MIME parts carrying Content-Disposition: attachment (with a filename parameter). A nested message/rfc822 part is counted here too when it also carries Content-Disposition: attachment, per the wave brief's own framing (\"an attachment that is a message/rfc822 is a nested message\") -- nested_message_count below identifies which attachment(s), if any, are that case.",
+    "nested_message_count": "Number of leaf MIME parts whose Content-Type is exactly message/rfc822.",
+    "body_text_present": "true iff at least one leaf part has Content-Type text/plain and non-empty decoded content.",
+    "body_html_present": "true iff at least one leaf part has Content-Type text/html and non-empty decoded content in the SOURCE bytes (see SPIKE-G4.md gate (b) note: mail-parser synthesizes an HTML alternative from a plain-text body when none exists in the source -- this field describes the wire bytes, not mail-parser's post-parse output).",
+    "attachment_decoded_byte_len": "The exact length, in bytes, of an attachment's DECODED content (after undoing its Content-Transfer-Encoding), not the length of the encoded (e.g. base64) text in the wire bytes.",
+    "subject_decoded": "The Subject header's value after RFC 2047 encoded-word decoding, exactly as the author's original plaintext (used as the encoder's input, per the wave brief's requirement that a human reading the fixture can reach the same answer -- here, by decoding the encoded-word by hand or checking build_mail_fixtures.py's recorded plaintext).",
+    "from_display_decoded": "The From header's display-name after RFC 2047 decoding, same rule as subject_decoded.",
+    "body_charset_declared": "The charset= parameter on the relevant text/plain part's Content-Type header, as written in the wire bytes (not mail-parser's interpretation of it).",
+    "valid": "false means: the ONLY passing outcome for a parser is refusal to produce a Message (mail-parser: parse() returns None) -- any Message at all, partial or otherwise, is a failure of this fixture, per the wave brief's malformed-message requirement."
+  },
+  "fixtures": [
+    {
+      "file": "01-plain-text.eml",
+      "covers": "Plain text message, no MIME multipart structure",
+      "valid": true,
+      "header_count": 7,
+      "header_names": ["From", "To", "Subject", "Date", "Message-ID", "Content-Type", "Content-Transfer-Encoding"],
+      "to_address_count": 1,
+      "cc_address_count": 0,
+      "mime_leaf_part_count": 1,
+      "attachment_count": 0,
+      "nested_message_count": 0,
+      "body_text_present": true,
+      "body_html_present": false,
+      "subject_decoded": "Plain text status update"
+    },
+    {
+      "file": "02-multipart-alternative.eml",
+      "covers": "multipart/alternative with both text and HTML bodies",
+      "valid": true,
+      "header_count": 8,
+      "header_names": ["From", "To", "Cc", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"],
+      "to_address_count": 2,
+      "cc_address_count": 1,
+      "mime_leaf_part_count": 2,
+      "attachment_count": 0,
+      "nested_message_count": 0,
+      "body_text_present": true,
+      "body_html_present": true,
+      "subject_decoded": "Alternative body demo"
+    },
+    {
+      "file": "03-with-attachment.eml",
+      "covers": "Message with one attachment (base64-encoded)",
+      "valid": true,
+      "header_count": 7,
+      "header_names": ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"],
+      "to_address_count": 1,
+      "cc_address_count": 0,
+      "mime_leaf_part_count": 2,
+      "attachment_count": 1,
+      "nested_message_count": 0,
+      "body_text_present": true,
+      "body_html_present": false,
+      "subject_decoded": "Report attached",
+      "attachments": [
+        {"filename": "report.txt", "attachment_decoded_byte_len": 43, "decoded_content": "Report body line one.\nReport body line two."}
+      ]
+    },
+    {
+      "file": "04-nested-rfc822.eml",
+      "covers": "Nested message/rfc822 (a mail inside a mail)",
+      "valid": true,
+      "header_count": 7,
+      "header_names": ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"],
+      "to_address_count": 1,
+      "cc_address_count": 0,
+      "mime_leaf_part_count": 2,
+      "attachment_count": 1,
+      "nested_message_count": 1,
+      "body_text_present": true,
+      "body_html_present": false,
+      "subject_decoded": "Forwarded thread",
+      "nested_message": {
+        "attachment_filename": "original.eml",
+        "header_count": 7,
+        "header_names": ["From", "To", "Subject", "Date", "Message-ID", "Content-Type", "Content-Transfer-Encoding"],
+        "subject_decoded": "Original note",
+        "body_text_present": true,
+        "body_text_decoded": "This is the original message text, now nested one level deep.\r\n",
+        "body_text_decoded_correction_note": "Y4 (G4 adoption, not the spike): the fixture's own bytes carry TWO CRLFs before --NEST-BOUNDARY-04-- (one blank line), and RFC 2046 5.1.1 consumes only the LAST CRLF as the boundary delimiter -- the other is the body's own final line terminator and is real content, not a spike or adapter artifact. VERIFIED two ways, independent of mail-parser: a direct hex read of the fixture bytes, and Python's stdlib `email` package (the SAME independent cross-check tool build_mail_fixtures.py/verify_with_stdlib_email.py already use) decoding this exact nested payload -- both agree the trailing \\r\\n belongs. The original value here (no trailing \\r\\n) was this field's own hand-verification miss, corrected in the wave that first exercises this fixture programmatically (src/runtime/atlas/mail.rs's own test suite), per this codebase's own precedent for a correction found while building real code against a research note or fixture (see archive.rs's module doc for the same shape of correction). No other field on this fixture, and no other fixture's fields, are affected."
+      }
+    },
+    {
+      "file": "05-encoding-zoo.eml",
+      "covers": "Encoding zoo: quoted-printable body, base64 attachment, RFC 2047 encoded Subject (UTF-8 B-encoding) and From display-name (ISO-8859-1 Q-encoding), non-UTF-8 body charset (windows-1252)",
+      "valid": true,
+      "header_count": 7,
+      "header_names": ["From", "To", "Subject", "Date", "Message-ID", "MIME-Version", "Content-Type"],
+      "to_address_count": 1,
+      "cc_address_count": 0,
+      "mime_leaf_part_count": 2,
+      "attachment_count": 1,
+      "nested_message_count": 0,
+      "body_text_present": true,
+      "body_html_present": false,
+      "subject_decoded": "Café update ☕",
+      "from_display_decoded": "René Dupont",
+      "body_charset_declared": "windows-1252",
+      "body_transfer_encoding": "quoted-printable",
+      "body_text_decoded": "Prix unitaire: 12€ le café.\nTotal: 24€.",
+      "attachments": [
+        {"filename": "blob.bin", "content_type": "application/octet-stream", "attachment_decoded_byte_len": 8}
+      ]
+    },
+    {
+      "file": "06-malformed-no-headers.eml",
+      "covers": "Deliberately malformed message that MUST fail rather than parse partially -- no RFC 5322 header field line anywhere in the file, so a conformant parser has zero headers to recover",
+      "valid": false,
+      "required_outcome": "Parser refuses to produce a Message (mail-parser: MessageParser::parse() returns None, per its own documented contract -- \"a best-effort is made to parse the message, and if no headers are found, None is returned\", docs.rs/mail-parser/0.11.8). Any Message at all -- including one with zero body units -- is a failure of this fixture."
+    }
+  ],
+  "diagnostic_not_in_manifest": {
+    "file": "diagnostic-not-manifest-broken-mime.eml",
+    "purpose": "NOT part of the exact-match corpus above and asserts nothing (same status as Y2's fixture 06 hostile-expansion file). A well-formed RFC 5322 envelope (valid From/To/Subject/Date/Message-ID/MIME-Version/Content-Type, 7 headers) whose declared multipart boundary is never closed (no --BROKEN-- terminator, no second --BROKEN). Recorded because it produced a materially different mail-parser outcome than fixture 06 -- see SPIKE-G4.md gate (b), 'A caveat found empirically' -- and that finding needed a byte record, not just prose."
+  }
+}

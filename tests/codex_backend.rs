@@ -279,6 +279,7 @@ exit \"$(cat \"$script_file.exit_code\")\"; fi\n        \
              fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n\
              printf 'env CODEX_HOME=%s\\n' \"${{CODEX_HOME:-<unset>}}\";\n\
+             env | grep -E '^SERGEANT_[A-Z_]*=' | sed 's/^/env /' | tr -d '\\r';\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
              printf 'stdin %s\\n' \"$(cat | tr '\\n' '|')\";\n\
              printf 'end\\n'; }} >> \"{record}\"\n\
@@ -592,6 +593,10 @@ fn start_request(cwd: &Path) -> StartRequest {
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::<BindingSummary>::new(),
+        // S2 E5: a real estate coordinate on every request this suite builds,
+        // so the causation-triple test reads the value the engine would
+        // actually have threaded rather than a hole.
+        estate_root: Some(PathBuf::from("/home/dev/estate")),
     }
 }
 
@@ -1746,20 +1751,37 @@ fn the_group_kill_never_depends_on_a_kill_executable_being_installed() {
     // `kill_process_group` names the very construct being banned, in order to
     // explain why it is banned, and a check that cannot tell code from the
     // comment documenting it would forbid saying so.
-    let source: String = include_str!("../src/backend/codex.rs")
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    let strip = |source: &str| -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // #310 moved the one implementation to `backend/child.rs` — three
+    // adapters carried a byte-identical private copy and the probe path
+    // needed a fourth. The ban still binds this adapter (it must not grow a
+    // local copy that spawns `kill`), and the positive assertion now names
+    // the file the behaviour actually lives in.
+    let adapter = strip(include_str!("../src/backend/codex.rs"));
+    let shared = strip(include_str!("../src/backend/child.rs"));
+    for (file, source) in [("codex.rs", &adapter), ("child.rs", &shared)] {
+        assert!(
+            !source.contains("Command::new(\"kill\")"),
+            "{file}: the process-group kill must not spawn a bare `kill` executable: it is a \
+             package a host need not install, and `Command` reports its absence as an ENOENT \
+             that a dropped result silently turns into 'INTERRUPT killed nothing'. Go through \
+             a shell builtin."
+        );
+    }
     assert!(
-        !source.contains("Command::new(\"kill\")"),
-        "the process-group kill must not spawn a bare `kill` executable: it is a package a \
-         host need not install, and `Command` reports its absence as an ENOENT that a dropped \
-         result silently turns into 'INTERRUPT killed nothing'. Go through a shell builtin."
+        shared.contains("kill -KILL -{pgid}"),
+        "the process-group kill must still SIGKILL the negated group id (§5.5)"
     );
     assert!(
-        source.contains("kill -KILL -{pgid}"),
-        "the process-group kill must still SIGKILL the negated group id (§5.5)"
+        adapter.contains("crate::backend::child::kill_process_group"),
+        "this adapter must reach the group kill through the one shared implementation, not a \
+         reinstated local copy"
     );
 }
 
@@ -2068,6 +2090,87 @@ fn a_profile_config_home_sets_codex_home_on_every_turn() {
         Some(profile_home.to_str().unwrap()),
         "the profile's CODEX_HOME must re-apply on the resume turn too, not just turn 1"
     );
+}
+
+/// S2 E5/E6 (W1 §6): the causation triple reaches the actor process on turn
+/// 1 and on the resume-grammar turn alike — the same axis `CODEX_HOME` is
+/// pinned on just above, for the same reason: a value that lapses on turn 2
+/// is a launch decision the adapter silently dropped. A profile cannot
+/// shadow it; the triple merges after `Profile.env`.
+#[test]
+fn s2_the_causation_triple_reaches_every_turn_including_the_resume_turn() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    stub.replays(AGENT_MESSAGE_TURN);
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("default-home"),
+    ));
+    let mut request = start_request(dir.path());
+    request.work_id = "01PARENTWORK".to_string();
+    request.profile = Some(sergeant_rs::domain::profile::Profile {
+        name: "forger".to_string(),
+        backend: CODEX_BACKEND_NAME.to_string(),
+        executable: None,
+        config_home: None,
+        env: BTreeMap::from([("SERGEANT_WORK_ID".to_string(), "01FORGED".to_string())]),
+        default_model: None,
+        options: BTreeMap::new(),
+    });
+    let execution_id = request.execution_id.clone();
+    let prepared = backend.prepare(&request).expect("prepare");
+    let handle = backend.launch(&prepared).expect("launch");
+    let thread_id = handle.native_id.clone().expect("thread id from turn 1");
+    wait_for_settled(&backend, &handle);
+    stub.replays(&plain_turn_naming(&thread_id));
+    backend.send(&handle, "turn two").expect("send");
+
+    for launch in &stub.wait_for_launches(2) {
+        assert_eq!(
+            launch.env.get("SERGEANT_ESTATE_ROOT").map(String::as_str),
+            Some("/home/dev/estate")
+        );
+        assert_eq!(
+            launch.env.get("SERGEANT_WORK_ID").map(String::as_str),
+            Some("01PARENTWORK"),
+            "the profile's own SERGEANT_WORK_ID must not win: {:?}",
+            launch.env
+        );
+        assert_eq!(
+            launch.env.get("SERGEANT_EXECUTION_ID").map(String::as_str),
+            Some(execution_id.as_str())
+        );
+    }
+}
+
+/// E6: a probe has no work, no execution and no estate, so it carries none of
+/// the three. `causation_env` takes a `StartRequest` precisely so there is
+/// nothing to pass at a probe call site.
+#[test]
+fn s2_a_probe_invocation_never_receives_the_causation_triple() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubCodex::passing(dir.path());
+    let backend = CodexBackend::new(config_for(
+        &stub,
+        dir.path(),
+        &dir.path().join("default-home"),
+    ));
+    let report = backend.probe();
+    assert!(report.available, "the stub probes clean: {report:?}");
+    for launch in stub.launches() {
+        for name in [
+            "SERGEANT_ESTATE_ROOT",
+            "SERGEANT_WORK_ID",
+            "SERGEANT_EXECUTION_ID",
+        ] {
+            assert!(
+                !launch.env.contains_key(name),
+                "a probe invocation must not carry {name}: {:?}",
+                launch.env
+            );
+        }
+    }
 }
 
 #[test]

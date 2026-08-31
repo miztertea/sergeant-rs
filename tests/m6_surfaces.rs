@@ -151,16 +151,21 @@ fn write_solo_workflow(root: &Path) {
     std::fs::write(dir.join("00-only").join("CONTEXT.md"), "context").expect("CONTEXT.md");
 }
 
-/// Start an in-process daemon **bound** to `estate_root` (estate-root §5.1).
+/// Start an in-process host daemon over `data_dir`.
 ///
-/// The binding is not optional decoration: `Engine::plan` reads the estate the
-/// daemon was started against, never the request's `origin.cwd` (§13.3), so a
-/// daemon left with `estate_root: None` plans against nothing and every
-/// submission below would sit on `pending` forever — no surface, no stage, no
-/// backend, and every content assertion in this file reading a blank row.
+/// **H1: no estate binding.** The daemon comes up serving zero estates and
+/// admits `estate_root` the first time a request addresses it — which is why
+/// [`submit`] below sends `estate_root` explicitly. A submission that names
+/// no estate still plans against nothing and sits on `pending` forever, so
+/// the addressing is exactly as load-bearing as the old binding was; it just
+/// lives on the request now.
+///
+/// `estate_root` is kept as a parameter — unused by the start itself — so
+/// every call site still reads as "this rig's estate is that one", and the
+/// helper stays the one place a multi-estate variant would grow from.
 async fn start_fake(
     data_dir: &Path,
-    estate_root: &Path,
+    _estate_root: &Path,
     script: impl IntoIterator<Item = FakeStep>,
 ) -> (DaemonHandle, FakeBackend) {
     let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
@@ -170,7 +175,6 @@ async fn start_fake(
         DaemonConfig {
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -179,11 +183,50 @@ async fn start_fake(
     (handle, fake)
 }
 
-async fn submit(handle: &DaemonHandle, cwd: &Path, intent: &str, workflow: &str) -> String {
+/// D4: a submission names the estate it addresses and, separately, the cwd
+/// it came from. Keeping them two parameters is the point — every call site
+/// here passes a *mount* as `cwd`, which is exactly the thing §5.2 forbids
+/// being read as topology, and a rig that conflated them would stop proving
+/// that.
+/// **The two-estate sibling of [`start_fake`]** (brief deliverable 10):
+/// one in-process host daemon, no estates bound, ready to admit whichever
+/// roots its requests address.
+///
+/// Additive — [`start_fake`] and every test on it are untouched, because
+/// single-estate is a special case of host mode rather than a removed one.
+/// The only difference is what the rig *says*: this one takes no estate at
+/// all, which is what a host daemon actually is.
+async fn start_fake_host(
+    data_dir: &Path,
+    script: impl IntoIterator<Item = FakeStep>,
+) -> (DaemonHandle, FakeBackend) {
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, script);
+    let registry = BackendRegistry::new().with(Arc::new(fake.clone()));
+    let handle = daemon::start_with(
+        data_dir,
+        DaemonConfig {
+            backends: Arc::new(registry),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+    (handle, fake)
+}
+
+async fn submit(
+    handle: &DaemonHandle,
+    estate_root: &Path,
+    cwd: &Path,
+    intent: &str,
+    workflow: &str,
+) -> String {
     let body = json!({
         "command_id": ulid(),
         "intent": intent,
         "workflow": workflow,
+        "estate_root": estate_root,
         "origin": {"client": "cli", "cwd": cwd},
     });
     let response = http()
@@ -198,8 +241,13 @@ async fn submit(handle: &DaemonHandle, cwd: &Path, intent: &str, workflow: &str)
     value["work"]["id"].as_str().expect("work id").to_string()
 }
 
-fn client_for(handle: &DaemonHandle) -> ApiClient {
-    ApiClient::new(&handle.endpoint, &handle.token).expect("client")
+/// D4: a client addresses the estate its estate-scoped requests mean. The
+/// daemon binds none, so a client that named none would be refused by name
+/// on every estate-scoped route — which is the contract, not a rig quirk.
+fn client_for(handle: &DaemonHandle, estate_root: &Path) -> ApiClient {
+    ApiClient::new(&handle.endpoint, &handle.token)
+        .expect("client")
+        .with_estate_root(estate_root)
 }
 
 /// The `TestBackend` buffer as plain text lines — the content assertions in
@@ -275,10 +323,10 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         ],
     )
     .await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, estate.path());
 
-    let done = submit(&handle, &mount, "finish this one", "tiny").await;
-    let asking = submit(&handle, &mount, "ask me something", "tiny").await;
+    let done = submit(&handle, estate.path(), &mount, "finish this one", "tiny").await;
+    let asking = submit(&handle, estate.path(), &mount, "ask me something", "tiny").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -376,10 +424,17 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
 
     // --- an SSE event drives a re-render ------------------------------------
     let mut stream = client
-        .stream_events(app.last_seq)
+        .stream_events(app.last_seq, None)
         .await
         .expect("live tail attaches");
-    let fresh = submit(&handle, &mount, "arrived while watching", "tiny").await;
+    let fresh = submit(
+        &handle,
+        estate.path(),
+        &mount,
+        "arrived while watching",
+        "tiny",
+    )
+    .await;
     assert!(
         !screen_text(&render(&app)).contains(&fresh),
         "the new work must not be on screen before the TUI hears about it"
@@ -499,8 +554,8 @@ async fn t1c_respond_reaches_the_real_api_through_the_answer_composer() {
         ],
     )
     .await;
-    let client = client_for(&handle);
-    let id = submit(&handle, &mount, "ask a question", "solo").await;
+    let client = client_for(&handle, estate.path());
+    let id = submit(&handle, estate.path(), &mount, "ask a question", "solo").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -568,8 +623,8 @@ async fn t1c_cancel_reaches_the_real_api_through_the_confirmation() {
         [FakeStep::waiting("queued upstream")],
     )
     .await;
-    let client = client_for(&handle);
-    let id = submit(&handle, &mount, "wait around", "solo").await;
+    let client = client_for(&handle, estate.path());
+    let id = submit(&handle, estate.path(), &mount, "wait around", "solo").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -612,8 +667,8 @@ async fn t1c_retry_reaches_the_real_api_through_the_confirmation() {
         [FakeStep::fail("boom"), FakeStep::complete()],
     )
     .await;
-    let client = client_for(&handle);
-    let id = submit(&handle, &mount, "fail then retry", "solo").await;
+    let client = client_for(&handle, estate.path());
+    let id = submit(&handle, estate.path(), &mount, "fail then retry", "solo").await;
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -653,8 +708,8 @@ async fn t1c_extend_reaches_the_real_api_with_the_typed_turn_count() {
         [FakeStep::blocked("envelope exhausted")],
     )
     .await;
-    let client = client_for(&handle);
-    let id = submit(&handle, &mount, "run out of turns", "solo").await;
+    let client = client_for(&handle, estate.path());
+    let id = submit(&handle, estate.path(), &mount, "run out of turns", "solo").await;
 
     let before = client.work(&id).await.expect("read back");
     assert_eq!(before["work"]["state"], "blocked");
@@ -695,6 +750,123 @@ async fn t1c_extend_reaches_the_real_api_with_the_typed_turn_count() {
     handle.shutdown().await;
 }
 
+/// A two-level nested workflow package (S2 W1 / decision E1) in the estate:
+/// `10-investigate` is a stage directory that holds its own `workflow.toml`,
+/// so it is a container and its leaves flatten to composed ids.
+fn write_nested_workflow(root: &Path) {
+    let dir = root.join(".sergeant/workflows/nested");
+    std::fs::create_dir_all(&dir).expect("workflow dir");
+    std::fs::write(
+        dir.join("workflow.toml"),
+        "[workflow]\nname = \"nested\"\nversion = \"1\"\n\
+         stages = [\"00-orient\", \"10-investigate\", \"20-implement\"]\n",
+    )
+    .expect("workflow.toml");
+    for stage in ["00-orient", "20-implement"] {
+        std::fs::create_dir_all(dir.join(stage)).expect("stage dir");
+        std::fs::write(dir.join(stage).join("CONTEXT.md"), "context").expect("CONTEXT.md");
+    }
+    let investigate = dir.join("10-investigate");
+    std::fs::create_dir_all(&investigate).expect("container dir");
+    std::fs::write(
+        investigate.join("workflow.toml"),
+        "[workflow]\nname = \"10-investigate\"\nversion = \"1\"\n\
+         stages = [\"00-lead\", \"10-code\"]\n",
+    )
+    .expect("nested workflow.toml");
+    for stage in ["00-lead", "10-code"] {
+        std::fs::create_dir_all(investigate.join(stage)).expect("nested stage dir");
+        std::fs::write(investigate.join(stage).join("CONTEXT.md"), "context").expect("CONTEXT.md");
+    }
+}
+
+/// S2 W1 / decision E10, end to end against a live daemon: a Work bound to a
+/// nested workflow renders its rail as a **tree** — one indented header per
+/// container, leaves under it — while the header's stage coordinate names
+/// the current leaf by its full composed id.
+///
+/// Both halves are deliberately asserted here rather than only in
+/// `work_view.rs`'s own unit tests. The wire shape stayed flat
+/// (`workflow.stages` is still one array of leaf ids, and `stage_label`
+/// still does `index + 1` of `of`), so the tree exists only in the render —
+/// which means a rig that unit-tested `workflow_lines` alone could not tell
+/// whether the API actually serves ids with `/` in them at all.
+#[tokio::test]
+async fn t1e_a_nested_workflow_renders_as_an_indented_tree_over_the_live_api() {
+    let data = TempDir::new().expect("tempdir");
+    let (estate, mount) = solo_estate("svc");
+    write_nested_workflow(estate.path());
+
+    let (handle, _fake) = start_fake(
+        data.path(),
+        estate.path(),
+        [
+            FakeStep::complete(),                 // 00-orient
+            FakeStep::needs_input("which lead?"), // 10-investigate/00-lead parks here
+        ],
+    )
+    .await;
+    let client = client_for(&handle, estate.path());
+    let work = submit(
+        &handle,
+        estate.path(),
+        &mount,
+        "investigate deeply",
+        "nested",
+    )
+    .await;
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    let action = Action::OpenWork(work.clone());
+    assert_eq!(app.execute(&client, action).await, Action::None);
+
+    // The header coordinate: `stage_label` renders a composed id as-is,
+    // with the flat position arithmetic E10 preserved.
+    let terminal = render(&app);
+    assert_shows(
+        &terminal,
+        "10-investigate/00-lead",
+        "the current stage's composed id",
+    );
+
+    // The Workflow tab (§13.4's rail), now a tree. `Tab` rather than `2`,
+    // the same way t1 above reaches it: Home's own form still owns the digit
+    // keys here, and leaving it would close the open Work.
+    app.on_key(ratatui::crossterm::event::KeyCode::Tab);
+    let terminal = render(&app);
+    // Asserted as whole-line substrings (the rail's rows sit inside a
+    // bordered pane, so a row never *begins* at column 0): the container
+    // header carries its own glyph and a plain done/total over the leaves it
+    // owns, each of those leaves is indented one level under it, and the
+    // container's sibling stays at the top level.
+    for row in [
+        "✓ 00-orient",
+        "⠹ 10-investigate/  0/2",
+        "  ⠹ 00-lead",
+        "  · 10-code",
+        "· 20-implement",
+    ] {
+        assert_shows(&terminal, row, "a row of the nested rail");
+    }
+    let lines = screen_lines(&terminal);
+    let leaf = lines
+        .iter()
+        .find(|line| line.contains("⠹ 00-lead"))
+        .expect("the current leaf's row");
+    assert!(
+        !leaf.contains("10-investigate/00-lead"),
+        "a nested leaf shows its own name under its container header, not the composed id \
+         again: {leaf:?}"
+    );
+    assert!(
+        !screen_text(&terminal).contains('%'),
+        "never a percent bar, containers included (Decision T2-50)"
+    );
+
+    handle.shutdown().await;
+}
+
 /// §12.1 end to end: the Add-repo form's real `POST /v1/estate/repos` —
 /// kicked off the render loop rather than awaited inline (the spinner/
 /// elapsed rule), per T3's own routes over `crate::domain::manifest::
@@ -719,7 +891,7 @@ async fn t3_estate_add_repo_reaches_the_real_api_off_the_render_loop() {
     support::init_repo(source.path());
 
     let (handle, _fake) = start_fake(&data_dir, estate_root.path(), []).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, estate_root.path());
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -804,7 +976,7 @@ async fn t3_estate_health_renders_the_real_doctor_report() {
     let estate = TempDir::new().expect("tempdir");
     empty_estate(estate.path(), "t3-health-estate");
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
-    let client = client_for(&handle);
+    let client = client_for(&handle, estate.path());
 
     let mut app = App::new();
     app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus first
@@ -1281,6 +1453,312 @@ fn pid_alive(pid: u32) -> bool {
 /// The API extension the detail screens needed, tested where it lives: this
 /// milestone added `work_id` and `limit` to `/v1/events` rather than letting
 /// a client read the journal (§30's rule, applied).
+/// H1 §11 criterion 1, in process: **two exact-root estates submit Work to
+/// one daemon**, and each Work materializes its surface under its *own*
+/// estate's mount.
+///
+/// This is the fact the whole wave turns on, and the in-process shape is
+/// what makes it checkable at the surface level rather than only over the
+/// CLI: if `Engine::plan` were still reading one pinned estate, one of these
+/// two Works would have been planned against the other's manifest — the same
+/// mount name, `solo`, in a different estate, which is exactly the silent
+/// confusion a pinned field produces (and exactly why D1 makes the estate
+/// coordinate a canonical *root*, never a display name).
+#[tokio::test]
+async fn h1_two_estates_submit_work_to_one_daemon_and_keep_their_own_surfaces() {
+    let data = TempDir::new().expect("tempdir");
+    let (payments, payments_mount) = solo_estate("solo");
+    let (billing, billing_mount) = solo_estate("solo");
+    write_workflow(payments.path());
+    write_workflow(billing.path());
+    assert_ne!(
+        payments.path(),
+        billing.path(),
+        "the fixture must really be two estates"
+    );
+
+    let (handle, _fake) = start_fake_host(
+        data.path(),
+        [FakeStep::complete_with("done"), FakeStep::complete()],
+    )
+    .await;
+
+    let first = submit(
+        &handle,
+        payments.path(),
+        &payments_mount,
+        "payments work",
+        "tiny",
+    )
+    .await;
+    let second = submit(
+        &handle,
+        billing.path(),
+        &billing_mount,
+        "billing work",
+        "tiny",
+    )
+    .await;
+    assert_ne!(first, second);
+
+    let client = client_for(&handle, payments.path());
+    // Each Work's surface must be **cut from its own estate's mount**. Both
+    // estates declare a repository called `solo`, deliberately: a name is not
+    // an identity (D1), and a pinned engine field would have cut both Works
+    // from whichever estate it happened to hold.
+    let mut sources = Vec::new();
+    for (work_id, estate) in [(&first, payments.path()), (&second, billing.path())] {
+        let shown = client
+            .work(work_id)
+            .await
+            .unwrap_or_else(|e| panic!("show {work_id}: {e}"));
+        let source = shown["surface"]["bindings"][0]["canonical_top_level"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{work_id} has no surface: {shown}"))
+            .to_string();
+        let expected = std::fs::canonicalize(estate.join("repos").join("solo"))
+            .expect("canonical mount")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            source, expected,
+            "{work_id} must be cut from its own estate's mount"
+        );
+        sources.push(source);
+    }
+    assert_ne!(
+        sources[0], sources[1],
+        "the two estates' identically-named mounts must not collapse into one"
+    );
+
+    // H1 §4: the registry observed exactly the two roots that were addressed
+    // — no more (nothing was discovered) and no fewer (both were admitted).
+    let listed = client.estates().await.expect("GET /v1/estates");
+    let mut roots: Vec<String> = listed["estates"]
+        .as_array()
+        .expect("estates array")
+        .iter()
+        .map(|e| e["root"].as_str().expect("root").to_string())
+        .collect();
+    roots.sort();
+    let mut expected = vec![
+        std::fs::canonicalize(payments.path())
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned(),
+        std::fs::canonicalize(billing.path())
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    expected.sort();
+    assert_eq!(roots, expected, "{listed}");
+
+    // H1 §11 criterion 5: one journal, and a replay tells the two estates
+    // apart by their own coordinates.
+    let mut by_estate: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for event in sergeant_rs::runtime::journal::Journal::replay_data_dir(data.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+    {
+        if let (Some(root), Some(work_id)) = (&event.workspace_id, &event.work_id) {
+            let works = by_estate.entry(root.clone()).or_default();
+            if !works.contains(work_id) {
+                works.push(work_id.clone());
+            }
+        }
+    }
+    assert_eq!(
+        by_estate.len(),
+        2,
+        "one journal, two estates: {by_estate:?}"
+    );
+    for (root, works) in &by_estate {
+        assert_eq!(
+            works.len(),
+            1,
+            "{root} owns exactly its own Work: {works:?}"
+        );
+    }
+
+    // D4/D6: `GET /v1/events?estate_root=` narrows the shared stream to one
+    // estate, server-side. Without it, "estate-wide watch" would silently
+    // become "host-wide watch" for every existing `sgt watch` the moment a
+    // second estate is admitted — this field is the wire half of keeping
+    // that from happening; routing the client onto it is W3's.
+    let payments_root = std::fs::canonicalize(payments.path())
+        .expect("canonical")
+        .to_string_lossy()
+        .into_owned();
+    let scoped = client
+        .get(&format!(
+            "/v1/events?estate_root={}",
+            payments_root.replace('/', "%2F")
+        ))
+        .await
+        .expect("filtered history");
+    let scoped = scoped["events"].as_array().expect("events").clone();
+    assert!(!scoped.is_empty(), "the filter must not empty the stream");
+    for event in &scoped {
+        assert_eq!(
+            event["workspace_id"], payments_root,
+            "an estate filter must return only that estate's events: {event}"
+        );
+    }
+    let whole = client.get("/v1/events").await.expect("whole history");
+    assert!(
+        whole["events"].as_array().expect("events").len() > scoped.len(),
+        "and it must actually remove events from the shared stream"
+    );
+
+    handle.shutdown().await;
+}
+
+/// W4d deliverable 4: a host-scoped client — one that addresses **no**
+/// fixed estate at all, `ApiClient::new` with no `.with_estate_root` — sees
+/// both estates' Work in Fleet, the estate filter cycles all/payments/
+/// billing correctly, and the Estate screen's picker lists both. Reuses
+/// [`start_fake_host`] (already landed for the daemon/journal seat's own
+/// acceptance test above) rather than adding a second multi-estate daemon
+/// fixture — the brief's "start_fake_host-style sibling" already exists.
+#[tokio::test]
+async fn t5_fleet_and_estate_screen_span_two_estates() {
+    let data = TempDir::new().expect("tempdir");
+    let (payments, payments_mount) = solo_estate("payments");
+    let (billing, billing_mount) = solo_estate("billing");
+    write_workflow(payments.path());
+    write_workflow(billing.path());
+
+    let (handle, _fake) =
+        start_fake_host(data.path(), [FakeStep::complete(), FakeStep::complete()]).await;
+
+    submit(
+        &handle,
+        payments.path(),
+        &payments_mount,
+        "payments work",
+        "tiny",
+    )
+    .await;
+    submit(
+        &handle,
+        billing.path(),
+        &billing_mount,
+        "billing work",
+        "tiny",
+    )
+    .await;
+
+    // Host-scoped: addresses no estate at all — the exact shape `sgt tui`
+    // builds under H1 (`ApiClient::new` with no `.with_estate_root`).
+    let client = ApiClient::new(&handle.endpoint, &handle.token).expect("client");
+
+    // D1: the estate filter's own identity is the canonical root the daemon
+    // folds per Work (`estate_root`), never the manifest's display name —
+    // two estates could share one.
+    let payments_root = std::fs::canonicalize(payments.path())
+        .expect("canonical")
+        .to_string_lossy()
+        .into_owned();
+    let billing_root = std::fs::canonicalize(billing.path())
+        .expect("canonical")
+        .to_string_lossy()
+        .into_owned();
+
+    let mut app = App::new();
+    app.refresh(&client).await.expect("first read");
+    app.on_key(ratatui::crossterm::event::KeyCode::Esc); // leave Home's form focus
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('2')); // Fleet
+    assert_eq!(app.destination, Destination::Fleet);
+    // The Attention drawer is a global, unfiltered cross-cut (both Works
+    // are non-terminal-free/`completed`... it lists recently-finished ones
+    // regardless of Fleet's own local filter) — closed here so this test's
+    // "must actually narrow" assertions read Fleet's own table alone,
+    // the same `drawer_open = false` every other Fleet geometry fixture
+    // already sets.
+    app.drawer_open = false;
+
+    // --- Fleet shows both estates' Work -------------------------------
+    let terminal = render(&app);
+    assert_shows(&terminal, "payments work", "payments estate's work");
+    assert_shows(&terminal, "billing work", "billing estate's work");
+    assert_shows(
+        &terminal,
+        "estate all",
+        "the header's default all-estates filter",
+    );
+
+    // --- the estate filter cycles all -> <one> -> <other> -> all ------
+    // `next_estate_filter` sorts distinct estate roots, and each estate's
+    // root is an independent fresh tempdir (`solo_estate` per estate), so
+    // which one sorts first is not fixed across runs — compare directly
+    // rather than asserting a specific order.
+    let (first_root, first_intent, second_root, second_intent) = if billing_root < payments_root {
+        (
+            &billing_root,
+            "billing work",
+            &payments_root,
+            "payments work",
+        )
+    } else {
+        (
+            &payments_root,
+            "payments work",
+            &billing_root,
+            "billing work",
+        )
+    };
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('e'));
+    assert_eq!(
+        app.fleet.filters.estate.as_deref(),
+        Some(first_root.as_str())
+    );
+    let terminal = render(&app);
+    assert_shows(&terminal, first_intent, "the filtered-in row");
+    assert!(
+        !screen_text(&terminal).contains(second_intent),
+        "the filter must actually narrow the fleet: {}",
+        screen_text(&terminal)
+    );
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('e'));
+    assert_eq!(
+        app.fleet.filters.estate.as_deref(),
+        Some(second_root.as_str())
+    );
+    let terminal = render(&app);
+    assert_shows(&terminal, second_intent, "the filtered-in row");
+    assert!(!screen_text(&terminal).contains(first_intent));
+
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('e'));
+    assert_eq!(app.fleet.filters.estate, None, "cycles back to all-estates");
+
+    // --- the Estate screen's picker lists both --------------------------
+    app.on_key(ratatui::crossterm::event::KeyCode::Char('4')); // Estate
+    assert_eq!(app.destination, Destination::Estate);
+    app.refresh(&client).await.expect("estate refresh");
+    assert!(
+        app.estate.picked.is_none(),
+        "a host-scoped client must not silently address either estate on its own"
+    );
+    let terminal = render(&app);
+    assert_shows(&terminal, "payments", "the picker's payments entry");
+    assert_shows(&terminal, "billing", "the picker's billing entry");
+
+    // Picking one addresses that estate's own repos/groups/doctor below.
+    app.on_key(ratatui::crossterm::event::KeyCode::Enter);
+    assert!(
+        app.estate.picked.is_some(),
+        "Enter picks the highlighted entry"
+    );
+    app.refresh(&client).await.expect("post-pick refresh");
+    let terminal = render(&app);
+    assert_shows(&terminal, "Repositories", "sub-tabs appear once picked");
+
+    handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn t1_the_events_endpoint_filters_and_tails_by_work() {
     let data = TempDir::new().expect("tempdir");
@@ -1288,9 +1766,9 @@ async fn t1_the_events_endpoint_filters_and_tails_by_work() {
     write_workflow(estate.path());
 
     let (handle, _fake) = start_fake(data.path(), estate.path(), []).await;
-    let client = client_for(&handle);
-    let first = submit(&handle, &mount, "first work", "tiny").await;
-    let second = submit(&handle, &mount, "second work", "tiny").await;
+    let client = client_for(&handle, estate.path());
+    let first = submit(&handle, estate.path(), &mount, "first work", "tiny").await;
+    let second = submit(&handle, estate.path(), &mount, "second work", "tiny").await;
 
     let all = client.get("/v1/events").await.expect("history");
     let all = all["events"].as_array().expect("events").len();
@@ -1349,8 +1827,8 @@ async fn a_work_view_whose_work_vanished_falls_back_to_fleet() {
         [FakeStep::needs_input("which budget?")],
     )
     .await;
-    let work_id = submit(&handle, &mount, "still here", "tiny").await;
-    let client = client_for(&handle);
+    let work_id = submit(&handle, estate.path(), &mount, "still here", "tiny").await;
+    let client = client_for(&handle, estate.path());
 
     let mut app = App::new();
     app.refresh(&client).await.expect("first read");
@@ -1403,6 +1881,10 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
     // have a reachable Docker Engine (N4.md's own probe-gating rule for
     // Docker facts on the GH runner / cloud container).
     let docker = stub_docker(bin.path());
+    // W4c: same treatment for `host_service_manager` — this test's "every
+    // check must be ok" assertion must not depend on whether *this host*
+    // happens to have a reachable native service manager either.
+    let service_manager = stub_service_manager(bin.path());
     // Same treatment for the `environment` check's own `$HOME`: a fixture
     // dir with neither `.cargo/bin` nor `.local/bin` on disk, so it reads a
     // deterministic "ok" regardless of what toolchain directories the
@@ -1435,6 +1917,8 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         &[
             ("SGT_CLAUDE_BIN", &claude),
             ("SGT_DOCKER_BIN", &docker),
+            ("SGT_SYSTEMCTL_BIN", &service_manager),
+            ("SGT_LAUNCHCTL_BIN", &service_manager),
             ("HOME", &home),
         ],
         false,
@@ -1446,6 +1930,8 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
         &[
             ("SGT_CLAUDE_BIN", &claude),
             ("SGT_DOCKER_BIN", &docker),
+            ("SGT_SYSTEMCTL_BIN", &service_manager),
+            ("SGT_LAUNCHCTL_BIN", &service_manager),
             ("HOME", &home),
         ],
         true,
@@ -1480,7 +1966,15 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             "docker",
             "journal",
             "projection",
+            // S3 X4 (F8): Atlas's coverage row, beside the projection row it
+            // is deliberately unlike — one is disposable and refolded, the
+            // other persists and is re-derived only by re-reading sources.
+            "atlas",
             "daemon",
+            // H1 §2/#276, W4c: is a native per-user service manager
+            // reachable at all — a distinct question from `daemon`'s own
+            // per-data-dir descriptor health above.
+            "host_service_manager",
             // Estate-root §4.2/§4.4: is the directory this `sgt doctor` was
             // run from an estate root at all? It is the row the three
             // beneath it read their answer from — a single admission,
@@ -1488,6 +1982,12 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // three independent searches — which is also why it sits
             // immediately above them rather than beside `estate`.
             "estate_root",
+            // H1 §6, W4c: the cutover gate — daemon.lock/runtime.json/
+            // journal/ still present under this estate's own
+            // `.sergeant/data` from before a host runtime root existed.
+            // Threaded off `estate_root` the same way `permission_mode`
+            // below it is.
+            "legacy_estate_runtime",
             "permission_mode",
             // #262: the per-profile `network_access` override, right beside
             // `permission_mode` — same estate-root threading, same
@@ -1503,6 +2003,11 @@ fn t3_doctor_names_every_fault_and_its_remedy() {
             // here because the fixture estate declares one; an estate with
             // none reads `warn`, which is `t3f`'s subject.
             "workflows",
+            // S2 V4 (owner-directed 2026-08-27): a directory inside a
+            // workflow package that looks like a stage but isn't declared
+            // in that package's `stages` list. Green here because the
+            // fixture estate's one package declares everything it has.
+            "workflow_stage_declarations",
             // #261: the installed corpus (AGENTS.md, skills/*/SKILL.md,
             // .sergeant/workflows/**, .sergeant/common/contexts/*.md)
             // cites only routes that resolve inside this estate.
@@ -3438,7 +3943,7 @@ fn t6_the_sse_vocabulary_is_stated_once_and_stays_complete() {
         );
     }
     let names: Vec<&str> = declared.iter().map(|(kind, _)| kind.as_str()).collect();
-    for kind in sergeant_rs::api::SSE_EVENT_KINDS {
+    for kind in sergeant_rs::api::SSE_EVENT_KINDS.iter() {
         assert!(
             names.contains(kind),
             "api::SSE_EVENT_KINDS lists {kind:?}, which no KIND_* constant declares"
@@ -4911,6 +5416,17 @@ fn stub_claude(dir: &Path) -> String {
              --help) echo '{flags}';;\n  *) cat >/dev/null;;\nesac\n"
         ),
     )
+}
+
+/// A stand-in `systemctl`/`launchctl` that always reports success — same
+/// reasoning as `stub_docker`/`stub_claude`: `host_service_manager`'s
+/// "every check must be green on a healthy install" assertion below must
+/// not depend on whether *this host* happens to have a reachable native
+/// service manager (W4c, following TH-02's own probe-gating precedent).
+/// Wired in through `SGT_SYSTEMCTL_BIN`/`SGT_LAUNCHCTL_BIN`
+/// (`platform::service`'s injection points, the `SGT_GIT_BIN` precedent).
+fn stub_service_manager(dir: &Path) -> String {
+    write_script(dir, "service-manager-stub", "#!/bin/sh\nexit 0\n")
 }
 
 /// A stand-in `docker` that passes both `DockerBackend::probe`'s cheap

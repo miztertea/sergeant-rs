@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::api::{Core, CoreError};
 use crate::backend::docker::DOCKER_BACKEND_NAME;
@@ -47,12 +48,12 @@ use crate::domain::work::{
     KIND_WORK_RESUMED, KIND_WORK_STARTED, KIND_WORK_WAITING, Work, WorkState,
 };
 use crate::domain::workflow::{
-    DEFAULT_WORKFLOW, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED, KIND_STAGE_COMPLETED,
-    KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED, KIND_STAGE_NEEDS_INPUT,
-    KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING, KIND_WORKFLOW_BOUND,
-    REASON_STAGE_OUTPUT_MISSING, SOURCE_EMBEDDED, StageBinding, StageDefinition, StageKind,
-    StageRecord, StageStatus, WorkflowDefinition, WorkflowError, declared_output_artifact,
-    declared_required_columns, has_required_table_columns,
+    DEFAULT_WORKFLOW, KIND_CONTEXT_COMPILED, KIND_STAGE_BLOCKED, KIND_STAGE_CANCELED,
+    KIND_STAGE_COMPLETED, KIND_STAGE_ENTERED, KIND_STAGE_FAILED, KIND_STAGE_INPUT_RECEIVED,
+    KIND_STAGE_NEEDS_INPUT, KIND_STAGE_OUTPUT_MISSING, KIND_STAGE_RESUMED, KIND_STAGE_WAITING,
+    KIND_WORKFLOW_BOUND, REASON_STAGE_OUTPUT_MISSING, SOURCE_EMBEDDED, StageBinding,
+    StageDefinition, StageKind, StageRecord, StageStatus, WorkflowDefinition, WorkflowError,
+    declared_output_artifact, declared_required_columns, has_required_table_columns,
 };
 use crate::runtime::preflight::{self, GitPreflight, PreflightRefusal};
 use crate::runtime::projection::{WorkRegistry, WorkRun, is_absorbing};
@@ -364,6 +365,26 @@ pub struct LaunchOutcome {
     observed: Option<Result<Observation, BackendError>>,
 }
 
+/// The backend's own signal off an optional, possibly-failed observation —
+/// shared by [`LaunchOutcome::signal`] and [`SendOutcome::signal`] (F-SI-01),
+/// which carry an identically-shaped `Option<Result<Observation,
+/// BackendError>>` for the same reason: each may or may not have carried an
+/// observation, and that observation may have failed.
+fn signal_of_optional_observation(
+    observed: &Option<Result<Observation, BackendError>>,
+) -> Option<&BackendSignal> {
+    observed.as_ref()?.as_ref().ok().map(|o| &o.signal)
+}
+
+impl LaunchOutcome {
+    /// The backend's own signal, when a launch carried an observation that
+    /// actually reached it. See [`ObserveOutcome::signal`] for why this is
+    /// borrowed rather than taken.
+    pub fn signal(&self) -> Option<&BackendSignal> {
+        signal_of_optional_observation(&self.observed)
+    }
+}
+
 impl From<Result<ExecutionHandle, BackendError>> for LaunchOutcome {
     /// A launch result with no observation attached, for a caller that drove
     /// [`PendingLaunch::launch`] by hand. `settle_launch` records the start
@@ -469,6 +490,15 @@ pub struct SendOutcome {
     observed: Option<Result<Observation, BackendError>>,
 }
 
+impl SendOutcome {
+    /// The backend's own signal, when the delivery carried an observation
+    /// that actually reached it. See [`ObserveOutcome::signal`] for why
+    /// this is borrowed rather than taken.
+    pub fn signal(&self) -> Option<&BackendSignal> {
+        signal_of_optional_observation(&self.observed)
+    }
+}
+
 /// An observation of a live execution the engine has decided to take **with
 /// the core lock released** (§14.2's middle phase, applied to OBSERVE alone).
 ///
@@ -530,6 +560,24 @@ impl PendingObserve {
 #[derive(Debug)]
 pub struct ObserveOutcome {
     observed: Result<Observation, BackendError>,
+}
+
+impl ObserveOutcome {
+    /// The backend's own signal, when the poll actually reached it.
+    ///
+    /// Read-only, and deliberately borrowed rather than taken: S5 W1d's
+    /// Work-overlay refresh reads the signal off the outcome *before*
+    /// [`Engine::settle_observe`] consumes it — the same order
+    /// `api::crank`'s surface arm already reads a [`SurfaceOutcome`] in
+    /// (S5 W1b) — so that a **turn boundary** (any signal other than
+    /// [`BackendSignal::Running`]) can be recognized without the API layer
+    /// re-deriving it from the journal afterwards.
+    ///
+    /// `None` for a poll that failed: a backend error is not a statement
+    /// about the turn, and [`Engine::drive`] is what adjudicates it.
+    pub fn signal(&self) -> Option<&BackendSignal> {
+        self.observed.as_ref().ok().map(|o| &o.signal)
+    }
 }
 
 /// A turn's INTERRUPT the engine has decided to issue (R-MVP1-7's per-turn
@@ -1126,6 +1174,62 @@ pub const DEFAULT_TURN_CAP: u32 = 12;
 /// override with [`Engine::with_turn_ceiling`].
 pub const DEFAULT_TURN_CEILING: Duration = Duration::from_secs(15 * 60);
 
+/// H1-15 (W4b) execution lane: the default bounded number of native adapter
+/// processes this daemon admits to LAUNCH concurrently.
+///
+/// Recon evidence (`recon-workers-capacity-release.md`): nothing in
+/// `engine.rs`/`api.rs`/`daemon.rs` throttled concurrent native processes
+/// before this — the turn cap bounds one Work's own lifetime, never a
+/// fleet-wide process count. Numbers-need-provenance: this is grounded in
+/// the one thing "how many can genuinely run at once" is actually about —
+/// the host's own hardware parallelism
+/// ([`std::thread::available_parallelism`]), not an arbitrary round number.
+/// A native adapter process is CPU/IO-bound work this host schedules like
+/// any other; oversubscribing it past the core count buys nothing but
+/// context-switch overhead and degrades every process's own turnaround.
+/// Falls back to `4` only when the platform cannot answer the question at
+/// all (containers with no cgroup cpu info, `wasm32` — never routine on a
+/// host this daemon actually runs on). Override with
+/// [`Engine::with_execution_lane_cap`] (`DaemonConfig::execution_lane_cap` /
+/// `SGT_EXECUTION_LANE_CAP`, wired the same way `SGT_TURN_CAP` is).
+pub fn default_execution_lane_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4)
+}
+
+/// H1-15's second lane, and **as of S3/X3a a lane with a real consumer**:
+/// Atlas's source extraction acquires it ([`Engine::run_intelligence`], via
+/// [`crate::runtime::atlas::lane`]). Host-runtime batch/analysis work,
+/// deliberately distinct from execution's per-Work native processes, and
+/// bounded separately from them so a repository scan can never spend a Work's
+/// launch capacity.
+///
+/// Same host-parallelism grounding as [`default_execution_lane_cap`] (R2:
+/// reusing the one number this build can trace to something real, rather than
+/// inventing a second unrelated rationale). Override with
+/// [`Engine::with_intelligence_lane_cap`]
+/// (`DaemonConfig::intelligence_lane_cap` / `SGT_INTELLIGENCE_LANE_CAP`).
+pub fn default_intelligence_lane_cap() -> usize {
+    default_execution_lane_cap()
+}
+
+/// Why an intelligence-lane job did not produce an answer.
+///
+/// Neither variant is reachable in ordinary operation, and both are returned
+/// rather than panicked for the same reason: Atlas is derived evidence, and no
+/// failure of a derived index may cost the estate its daemon (A1-01).
+#[derive(Debug, thiserror::Error)]
+pub enum IntelligenceError {
+    /// The lane's semaphore was closed — only reachable during shutdown.
+    #[error("the intelligence lane is closed")]
+    LaneClosed,
+    /// The blocking job panicked or was cancelled; the join error's own text
+    /// is carried rather than summarized.
+    #[error("an intelligence job did not complete: {0}")]
+    Job(String),
+}
+
 /// The workflow engine: backends, defaults, and the data dir surfaces live in.
 #[derive(Debug, Clone)]
 pub struct Engine {
@@ -1150,20 +1254,6 @@ pub struct Engine {
     /// completion driver alongside [`Self::due_observations`] (see
     /// [`Self::due_interrupts`]).
     pub turn_ceiling: Duration,
-    /// §5.1/§5.2: the one estate this daemon is bound to, admitted at
-    /// startup ([`crate::domain::estate::Estate::admit`]) and pinned
-    /// here for the process's whole life.
-    ///
-    /// **This is the only topology authority.** [`Self::plan`] reads the
-    /// manifest at *this* root; a submission's `origin.cwd` is recorded
-    /// evidence only (§13.3) and can never move it. That is what removes the
-    /// recursion hazard §5.2 names — a child command launched from a Work
-    /// surface rediscovering that linked worktree as a new estate.
-    ///
-    /// `None` only for a daemon started with no estate at all (test rigs and
-    /// the intent-capture path): [`Self::plan`] answers `Ok(None)` there,
-    /// exactly as "no repository context" always has.
-    pub estate_root: Option<PathBuf>,
     /// When each Work's current turn was last (re-)spawned, for the ceiling
     /// sweep. Deliberately **not** journaled or durable: a restart forgets
     /// it, which is acceptable for a soak-test hang bound (never an
@@ -1172,6 +1262,84 @@ pub struct Engine {
     /// half, and the two are independent by design. Keyed by work id, one
     /// entry per Work with a turn currently in flight.
     turn_started: Arc<Mutex<BTreeMap<String, Instant>>>,
+    /// H1-15's execution lane: bounded fleet-wide admission between PREPARE
+    /// and LAUNCH ([`Self::try_admit_execution`]/[`Self::admit_execution`]),
+    /// acquired **outside the core lock** (recon: acquiring under the guard
+    /// reintroduces the §22.6 hazard the PREPARE/LAUNCH split exists to
+    /// prevent — see `crank`'s `Launch` arm in `api.rs`, the one caller).
+    pub execution_lane: Arc<Semaphore>,
+    /// The cap [`Self::execution_lane`] was built with — kept alongside it
+    /// (a `Semaphore` cannot report the total it started with, only what is
+    /// currently free) so waiting evidence and API views can name the bound
+    /// a Work is actually parked against.
+    pub execution_lane_cap: usize,
+    /// Permits currently held, keyed by work id — one execution in flight
+    /// per Work at a time (the turn model's own invariant; mirrors
+    /// [`Self::turn_started`]'s per-work keying). Inserted the moment a
+    /// permit is admitted, in `api::crank`'s `Launch` arm, and removed
+    /// exactly where an execution is *confirmed* no longer in flight:
+    /// [`Self::stop_execution`] releases immediately only when there is
+    /// nothing left to confirm (an immediate completion, a `stop()` error,
+    /// or no registered backend); when `backend.stop()` returns a pending
+    /// completion, the removal is folded into that completion's own tail
+    /// work and happens only once `Deferred::wait` actually joins it,
+    /// outside the core lock — never at stop-request time, so a
+    /// cancel/interrupt never transiently frees a lane slot for a native
+    /// process that may still be alive. [`Self::settle_launch`]'s two
+    /// no-live-execution branches (a daemon-side launch error, a superseded
+    /// reservation) remove immediately, since there is no native process to
+    /// wait for in either. Never durable — a restart starts with an empty
+    /// lane and every Work re-admits on its next launch, which is correct:
+    /// nothing native survived the restart either.
+    execution_permits: Arc<Mutex<BTreeMap<String, OwnedSemaphorePermit>>>,
+    /// H1-15's intelligence lane: config-only stub (deliverable 3). A
+    /// separate `Arc<Semaphore>` from [`Self::execution_lane`] by
+    /// construction — nothing here ever acquires from it, so it cannot draw
+    /// down the execution lane's budget no matter how many intelligence
+    /// workers a later sprint adds.
+    pub intelligence_lane: Arc<Semaphore>,
+    /// The cap [`Self::intelligence_lane`] was built with.
+    pub intelligence_lane_cap: usize,
+    /// **C1 §3's compilation step**, installed or not.
+    ///
+    /// `None` is §18's first rung — *"intelligence disabled → existing stage
+    /// CONTEXT + Work bindings"* — and it is `None` by construction for every
+    /// engine nobody installed one on, which is what makes §21 item 13 a
+    /// property of the type rather than a branch someone has to remember to
+    /// write: with no compiler there is no compilation, no journaled
+    /// snapshot, and a `StartRequest` byte-identical to the one this engine
+    /// built before C1 existed.
+    ///
+    /// A port rather than an `AtlasDb`, so the engine keeps knowing nothing
+    /// about Atlas — see [`crate::runtime::context::ContextCompiler`].
+    context_compiler: Option<Arc<dyn crate::runtime::context::ContextCompiler>>,
+}
+
+/// Whose declared output contract one [`Engine::check_output_contract`] pass
+/// is about (E4): the leaf that just completed, or a container that leaf
+/// just closed.
+///
+/// Two variants rather than a bare id, because the difference is not only
+/// which `output/` directory to read — it is what the operator is told. A
+/// container's unmet contract must not read as a complaint about the leaf,
+/// which finished cleanly.
+#[derive(Clone, Copy)]
+enum OutputContract<'a> {
+    /// The completing leaf's own contract — the only case before W1.
+    Leaf,
+    /// A container's own contract, named by its composed hierarchical id.
+    Container(&'a str),
+}
+
+impl<'a> OutputContract<'a> {
+    /// The id whose `output/` directory this contract lives in — under the
+    /// package root and under a worktree alike.
+    fn id(self, stage: &'a StageRecord) -> &'a str {
+        match self {
+            OutputContract::Leaf => &stage.stage_id,
+            OutputContract::Container(id) => id,
+        }
+    }
 }
 
 impl Engine {
@@ -1190,17 +1358,14 @@ impl Engine {
             data_dir: data_dir.to_path_buf(),
             turn_cap: DEFAULT_TURN_CAP,
             turn_ceiling: DEFAULT_TURN_CEILING,
-            estate_root: None,
             turn_started: Arc::new(Mutex::new(BTreeMap::new())),
+            execution_lane: Arc::new(Semaphore::new(default_execution_lane_cap())),
+            execution_lane_cap: default_execution_lane_cap(),
+            execution_permits: Arc::new(Mutex::new(BTreeMap::new())),
+            intelligence_lane: Arc::new(Semaphore::new(default_intelligence_lane_cap())),
+            intelligence_lane_cap: default_intelligence_lane_cap(),
+            context_compiler: None,
         }
-    }
-
-    /// Bind this engine to one estate root (§5.1). The daemon calls this
-    /// once at startup with the canonical root it was started against; every
-    /// later [`Self::plan`] reads that estate and no other.
-    pub fn with_estate_root(mut self, estate_root: PathBuf) -> Self {
-        self.estate_root = Some(estate_root);
-        self
     }
 
     /// Override the daemon-wide turn cap (R-MVP1-7). Wired from
@@ -1222,6 +1387,216 @@ impl Engine {
     pub fn with_turn_ceiling(mut self, turn_ceiling: Duration) -> Self {
         self.turn_ceiling = turn_ceiling;
         self
+    }
+
+    /// Override the daemon-wide execution-lane cap (H1-15). Wired from
+    /// `DaemonConfig::execution_lane_cap` / `SGT_EXECUTION_LANE_CAP`
+    /// (`daemon::run_until_signal`), the same way [`Self::with_turn_cap`]
+    /// is. Rebuilds the semaphore fresh — called only at daemon startup,
+    /// before any Work has admitted a permit.
+    pub fn with_execution_lane_cap(mut self, cap: usize) -> Self {
+        self.execution_lane = Arc::new(Semaphore::new(cap));
+        self.execution_lane_cap = cap;
+        self
+    }
+
+    /// Override the daemon-wide intelligence-lane cap (H1-15, deliverable 3).
+    /// Wired from `DaemonConfig::intelligence_lane_cap` /
+    /// `SGT_INTELLIGENCE_LANE_CAP`.
+    pub fn with_intelligence_lane_cap(mut self, cap: usize) -> Self {
+        self.intelligence_lane = Arc::new(Semaphore::new(cap));
+        self.intelligence_lane_cap = cap;
+        self
+    }
+
+    /// Install C1 §3's compilation step (`daemon::run_until_signal`).
+    ///
+    /// A builder rather than a `new` parameter for the reason every other
+    /// builder here is one: an engine nobody installs one on keeps exactly
+    /// the behaviour it had, which is §21 item 13's requirement and every
+    /// existing test's assumption at once.
+    pub fn with_context_compiler(
+        mut self,
+        compiler: Arc<dyn crate::runtime::context::ContextCompiler>,
+    ) -> Self {
+        self.context_compiler = Some(compiler);
+        self
+    }
+
+    /// Take an intelligence-lane permit without waiting, or `None` when the
+    /// lane is at [`Self::intelligence_lane_cap`].
+    ///
+    /// The permit is **handed to the caller**, not stored in a map the way an
+    /// execution permit is, and the difference is deliberate. An execution
+    /// permit belongs to a Work — it outlives the call that took it, it has to
+    /// be findable by work id, and releasing it is a decision about whether a
+    /// native process is still alive. An intelligence permit belongs to a
+    /// *job*: taken, held for the job's duration, dropped when it returns.
+    /// Handing the caller the guard makes "released when the work finishes" a
+    /// property of ownership rather than of remembering to call a release
+    /// function on every path out.
+    pub fn try_admit_intelligence(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.intelligence_lane).try_acquire_owned().ok()
+    }
+
+    /// Wait for an intelligence-lane permit.
+    ///
+    /// **Never the execution lane** (F6, and H1-15's whole point): the two are
+    /// separate `Arc<Semaphore>`s, so however much extraction queues here, a
+    /// Work's launch capacity is exactly what it was. The reverse holds too,
+    /// and both directions are pinned by tests.
+    pub async fn admit_intelligence(&self) -> Result<OwnedSemaphorePermit, IntelligenceError> {
+        Arc::clone(&self.intelligence_lane)
+            .acquire_owned()
+            .await
+            .map_err(|_| IntelligenceError::LaneClosed)
+    }
+
+    /// **F6's execution shape**: run one blocking intelligence job under an
+    /// intelligence-lane permit, on the blocking pool.
+    ///
+    /// Two properties, and both are the point:
+    ///
+    /// * **Bounded.** The permit is acquired before the job is spawned and
+    ///   dropped when it returns, so at most [`Self::intelligence_lane_cap`]
+    ///   extractions are ever in flight — not "usually", and not "unless a
+    ///   burst arrives".
+    /// * **Off the async runtime.** Extraction is CPU and IO work measured in
+    ///   whole files: parsing, hashing, waiting on a Git subprocess. Run
+    ///   directly in an async task it would hold a runtime worker thread for
+    ///   its whole duration and stall every unrelated future sharing it.
+    ///   `spawn_blocking` is the runtime's own answer, already in this build's
+    ///   `tokio` (R5).
+    ///
+    /// A job that panics surfaces as [`IntelligenceError::Job`] rather than
+    /// unwinding into the caller: one bad file must not take a daemon down,
+    /// and Atlas is derived evidence, never authority (A1-01).
+    pub async fn run_intelligence<F, T>(&self, job: F) -> Result<T, IntelligenceError>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let permit = self.admit_intelligence().await?;
+        tokio::task::spawn_blocking(move || {
+            let result = job();
+            // Held across the whole job and released here by the guard's own
+            // `Drop` — on the panicking path exactly as on the ordinary one.
+            drop(permit);
+            result
+        })
+        .await
+        .map_err(|e| IntelligenceError::Job(e.to_string()))
+    }
+
+    /// Try to admit `work_id` to the execution lane without waiting. `true`
+    /// stores a held permit for `work_id` and admits it; `false` means the
+    /// lane is at [`Self::execution_lane_cap`] and nothing was taken.
+    ///
+    /// **R7 for the lane primitive.** `tokio::sync::Semaphore` is a bounded,
+    /// async-aware admission counter built for exactly this shape; R1–R6 do
+    /// not supply one — the recon evidence's own grep found no existing cap
+    /// or lane concept anywhere in this tree (R2), the standard library has
+    /// no async-aware semaphore (R3), no OS primitive substitutes for an
+    /// in-process cooperative admission gate shared across `tokio` tasks
+    /// (R4), and a hand-rolled counter+waker would re-implement — worse,
+    /// and untested — exactly what R5's already-installed `tokio::sync`
+    /// gives in one line.
+    pub(crate) fn try_admit_execution(&self, work_id: &str) -> bool {
+        match Arc::clone(&self.execution_lane).try_acquire_owned() {
+            Ok(permit) => {
+                self.execution_permits
+                    .lock()
+                    .expect("execution permit map poisoned")
+                    .insert(work_id.to_string(), permit);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Block until `work_id` is admitted to the execution lane.
+    ///
+    /// **Never call this while holding the core lock.** Mirrors every
+    /// `Pending*::perform`'s own discipline (§22.6): a slow or fully-loaded
+    /// lane must never stall another core-lock holder, which is exactly the
+    /// hazard the recon evidence names for a permit taken under the guard —
+    /// this is why the lane is acquired in `api::crank`'s `Launch` arm,
+    /// strictly between the reservation (`reserve_stage`, under the lock)
+    /// and the launch (`PendingLaunch::perform`, without it).
+    pub(crate) async fn admit_execution(&self, work_id: &str) {
+        let permit = Arc::clone(&self.execution_lane)
+            .acquire_owned()
+            .await
+            .expect("execution lane semaphore is never closed for the daemon's life");
+        self.execution_permits
+            .lock()
+            .expect("execution permit map poisoned")
+            .insert(work_id.to_string(), permit);
+    }
+
+    /// Release `work_id`'s held execution-lane permit, if it holds one.
+    /// Idempotent (a work with nothing held is a no-op) — see
+    /// [`Self::execution_permits`]'s own doc for exactly which call sites
+    /// make this call and why those are the complete set (deliverable 4's
+    /// "no leak — hunt the drop path": every one of them is a plain
+    /// `BTreeMap::remove`, so the guard's own `Drop` releases the permit;
+    /// there is no path that could forget it without also forgetting to
+    /// call this).
+    pub(crate) fn release_execution_permit(&self, work_id: &str) {
+        self.execution_permits
+            .lock()
+            .expect("execution permit map poisoned")
+            .remove(work_id);
+    }
+
+    /// Journal the execution lane's own "no capacity" park — deliverable 2's
+    /// observability requirement. Reuses the existing `Active -> Waiting`
+    /// edge [`Self::drive`]'s `BackendSignal::Waiting` arm already commits
+    /// through (R2: no new event kind, no new terminal state — "waiting" is
+    /// already legal and already nonterminal), with a lane-specific reason
+    /// so it can never be confused with turn-cap exhaustion
+    /// ([`Self::check_turn_envelope`]'s `KIND_WORK_BLOCKED`, a different
+    /// event kind *and* a different [`WorkState`] — `Blocked`, not
+    /// `Waiting`). Called from `api::crank`'s `Launch` arm, under the core
+    /// lock it briefly reacquires to journal this before awaiting the lane
+    /// (never while performing the external wait itself).
+    pub(crate) fn park_on_execution_lane(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+    ) -> Result<(), EngineError> {
+        self.transition(
+            core,
+            work_id,
+            KIND_WORK_WAITING,
+            json!({
+                "reason": "execution lane at capacity",
+                "cap": self.execution_lane_cap,
+            }),
+        )
+    }
+
+    /// The lane admitted `work_id`: resume it exactly as any other
+    /// `Waiting -> Active` recovery does ([`Self::begin_input`],
+    /// [`Self::reenter_stage`] — same edge, same `KIND_WORK_RESUMED` event
+    /// kind), with a reason naming what actually happened. A Work that left
+    /// `Waiting` for some other reason while parked here (e.g. a concurrent
+    /// cancel) makes this an illegal transition; the caller logs and
+    /// proceeds regardless — [`Self::settle_launch`]'s own staleness check
+    /// (§14.5) is what actually adjudicates a launch that outlived the
+    /// state it was reserved against, exactly as it already does for every
+    /// other cause of the same race.
+    pub(crate) fn resume_after_execution_lane(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+    ) -> Result<(), EngineError> {
+        self.transition(
+            core,
+            work_id,
+            KIND_WORK_RESUMED,
+            json!({"reason": "execution_lane_admitted"}),
+        )
     }
 
     /// R-MVP1-7's effective turn cap for one specific Work: MVP-3's
@@ -1263,16 +1638,31 @@ impl Engine {
 
     /// Resolve everything a run needs, without touching anything.
     ///
-    /// **§5.2: the request's cwd has no authority here.** Topology comes from
-    /// [`Self::estate_root`] — the one estate this daemon was started
-    /// against — and from nowhere else. `context.cwd` survives only as
-    /// `origin.cwd`, recorded evidence for diagnostics (§13.3).
+    /// **D10: the estate is a per-call parameter, not a field.** The engine
+    /// held one `estate_root` pinned for the process's whole life while a
+    /// daemon served exactly one estate. A host daemon serves many, so the
+    /// estate this submission resolved against is handed in per call — by
+    /// the handler, from the *request*, after the admitted-estate registry
+    /// validated it ([`crate::runtime::estates::EstateRegistry::admit`]).
+    /// The field and `with_estate_root` are removed rather than left
+    /// vestigially in place: a second, stale topology authority sitting
+    /// beside the real one is exactly how estate B's Work gets planned
+    /// against estate A's manifest.
     ///
-    /// `Ok(None)` means "this daemon is bound to no estate": the intent is
-    /// accepted and stays `pending` rather than being rejected, exactly as
-    /// "no repository context" always has. Every *other* failure (a
-    /// `sergeant.toml` that no longer resolves, an unroutable backend, a
-    /// missing workflow) is a real error and is returned as one.
+    /// **§5.2 still holds, and is now the caller's to keep.** The request's
+    /// cwd has no authority here: `context.cwd` survives only as
+    /// `origin.cwd`, recorded evidence for diagnostics (§13.3). What may
+    /// name `estate_root` is an *addressed* root the daemon then validates
+    /// by admission — never a cwd it infers one from, and never a parent
+    /// search. That is what keeps §5.2's recursion hazard closed (a child
+    /// command launched from a Work surface rediscovering that linked
+    /// worktree as a new estate).
+    ///
+    /// `None` means the submission offered no repository context at all: the
+    /// intent is accepted and stays `pending` rather than being rejected,
+    /// exactly as it always has. Every *other* failure (a `sergeant.toml`
+    /// that no longer resolves, an unroutable backend, a missing workflow)
+    /// is a real error and is returned as one.
     ///
     /// "No surface" does not mean "no §13". A submission that *names* a
     /// backend has asked for something, and §13's terminal state for a
@@ -1282,11 +1672,16 @@ impl Engine {
     /// tolerated here, because a captured intent with no repository has
     /// nothing to route yet and no default to disappoint.
     ///
-    /// The manifest is re-read from the pinned root on every plan rather
-    /// than cached from startup, so `sgt repo add` reaches a running daemon
-    /// — the *root* is what startup fixes, and the root is what §5 binds.
-    pub fn plan(&self, context: &SubmitContext<'_>) -> Result<Option<StartPlan>, EngineError> {
-        let estate = match &self.estate_root {
+    /// The manifest is re-read from the addressed root on every plan rather
+    /// than cached, so `sgt repo add` reaches a running daemon — that
+    /// discipline is untouched by D10; only *which* root is re-read changes,
+    /// and it changes per call rather than never.
+    pub fn plan(
+        &self,
+        estate_root: Option<&Path>,
+        context: &SubmitContext<'_>,
+    ) -> Result<Option<StartPlan>, EngineError> {
+        let estate = match estate_root {
             None => None,
             Some(root) => Some(Estate::resolve(root)?),
         };
@@ -2185,7 +2580,7 @@ impl Engine {
                 execution,
                 backend,
                 input: input.to_string(),
-                resume: self.resume_request(&run, work_id),
+                resume: self.resume_request(core, &run, work_id),
             })),
             deferred: Deferred::new(),
         })
@@ -2695,6 +3090,19 @@ impl Engine {
                 {
                     return Ok(gated);
                 }
+                // E3/E4: the one thing nesting adds to this arm. Every leaf
+                // signal above is handled exactly as it was — nesting only
+                // asks whether completing *this* leaf also closes a
+                // container that declared its own output contract, before
+                // the run is allowed to walk past it. Checked here, ahead of
+                // `stage.completed` and `stop_execution`, for the same
+                // reason the leaf gate is: the bounded re-prompt goes to the
+                // still-live execution of the leaf that just completed.
+                if let Some(gated) =
+                    self.check_closed_container_gates(core, work_id, &run, &workflow, &stage)?
+                {
+                    return Ok(gated);
+                }
                 let mut payload = json!({"stage_id": stage.stage_id, "index": stage.index});
                 if let Some(summary) = summary {
                     payload["detail"] = Value::String(summary);
@@ -2758,10 +3166,85 @@ impl Engine {
         workflow: &WorkflowDefinition,
         stage: &StageRecord,
     ) -> Result<Option<Next>, EngineError> {
+        self.check_output_contract(core, work_id, run, workflow, OutputContract::Leaf, stage)
+    }
+
+    /// E4, the container half of the same gate: a leaf's completion may also
+    /// *close* one or more containers (W1 §4 — "the container can still
+    /// assert a mechanical aggregate/summary artifact"), and a container
+    /// that declared its own `output/README.md` must have produced it before
+    /// the run walks past the last leaf under it.
+    ///
+    /// Innermost first ([`WorkflowDefinition::containers_closing_at`]), and
+    /// the first unmet contract short-circuits — a leaf that ends three
+    /// nested packages at once produces one re-prompt/park, not three at
+    /// the same instant, and the outer contracts are re-checked on the next
+    /// `StageCompleted` for the same leaf.
+    ///
+    /// No new mechanism (E3: W1 adds no terminal vocabulary): this is
+    /// [`Self::check_output_contract`] called with the container's id
+    /// instead of the leaf's, so the bounded re-prompt, the
+    /// `stage_output_missing` reason code, and the recovery path are the
+    /// existing ones verbatim.
+    fn check_closed_container_gates(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        run: &WorkRun,
+        workflow: &WorkflowDefinition,
+        stage: &StageRecord,
+    ) -> Result<Option<Next>, EngineError> {
+        let closing: Vec<String> = workflow
+            .containers_closing_at(stage.index)
+            .into_iter()
+            .map(|boundary| boundary.container_id.clone())
+            .collect();
+        for container_id in closing {
+            if let Some(gated) = self.check_output_contract(
+                core,
+                work_id,
+                run,
+                workflow,
+                OutputContract::Container(&container_id),
+                stage,
+            )? {
+                return Ok(Some(gated));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The gate body both halves share, parameterized on *whose* declared
+    /// output contract is being checked (the engine recon's touch point 5).
+    ///
+    /// `stage` is always the leaf that just signalled `StageCompleted`, in
+    /// both cases: it owns the live execution a re-prompt is sent to, and
+    /// its attempt owns the one bounded re-prompt this gate is allowed to
+    /// spend. That budget is per leaf attempt, not per contract — a leaf
+    /// that already spent its re-prompt on its own missing artifact parks
+    /// on the next unmet contract rather than re-prompting again, and a
+    /// `retry` (a fresh attempt, a fresh `StageRecord`) restores it. Bounded
+    /// is bounded: at most one SEND per attempt, whatever it was for.
+    fn check_output_contract(
+        &self,
+        core: &mut Core,
+        work_id: &str,
+        run: &WorkRun,
+        workflow: &WorkflowDefinition,
+        contract: OutputContract<'_>,
+        stage: &StageRecord,
+    ) -> Result<Option<Next>, EngineError> {
         if workflow.source == SOURCE_EMBEDDED {
             return Ok(None);
         }
-        let Some(expected) = declared_output_artifact(Path::new(&workflow.source), &stage.stage_id)
+        // One string for the declaration lookup and the worktree lookup
+        // alike, so the two halves of this check can never disagree about
+        // which `output/` directory they mean. For a container it is the
+        // composed hierarchical id (`10-investigate`, `10-investigate/
+        // 10-deep`), which `Path::join` splits into real components exactly
+        // as it does for a nested leaf's id.
+        let contract_id = contract.id(stage);
+        let Some(expected) = declared_output_artifact(Path::new(&workflow.source), contract_id)
         else {
             return Ok(None);
         };
@@ -2775,12 +3258,11 @@ impl Engine {
         // an altogether-absent one get the identical bounded-re-prompt/
         // needs_input treatment below, per Amendment 10d's own text
         // ("malformed = stage_output_missing-class refusal").
-        let required_columns =
-            declared_required_columns(Path::new(&workflow.source), &stage.stage_id);
+        let required_columns = declared_required_columns(Path::new(&workflow.source), contract_id);
         let produced = surface.bindings.iter().any(|binding| {
             let path = binding
                 .worktree_path
-                .join(&stage.stage_id)
+                .join(contract_id)
                 .join("output")
                 .join(&expected);
             let Ok(text) = std::fs::read_to_string(&path) else {
@@ -2797,22 +3279,34 @@ impl Engine {
                 // own reason; nothing more for the gate to say.
                 return Ok(Some(Next::Parked));
             }
-            self.commit(
-                core,
-                work_id,
-                KIND_STAGE_OUTPUT_MISSING,
-                json!({
-                    "stage_id": stage.stage_id,
-                    "path": expected,
-                    "attempt": stage.attempt,
-                }),
-            )?;
+            // `stage_id` is the *leaf's* throughout, in both the leaf and
+            // the container case: a container has no `StageRecord` (E3), and
+            // this is the event the reducer folds the re-prompt count onto.
+            // `container_id` rides beside it when the unmet contract is a
+            // container's, so the journal says which one without inventing a
+            // record for it.
+            let mut payload = json!({
+                "stage_id": stage.stage_id,
+                "path": expected,
+                "attempt": stage.attempt,
+            });
+            if let OutputContract::Container(container_id) = contract {
+                payload["container_id"] = Value::String(container_id.to_string());
+            }
+            self.commit(core, work_id, KIND_STAGE_OUTPUT_MISSING, payload)?;
             let execution = run.execution.clone().ok_or_else(|| EngineError::NoRun {
                 work_id: work_id.to_string(),
             })?;
             let backend = self.backend_for(work_id, &execution.backend)?;
-            let prompt =
-                format!("declared output {expected} missing — produce it or state what you need");
+            let prompt = match contract {
+                OutputContract::Leaf => format!(
+                    "declared output {expected} missing — produce it or state what you need"
+                ),
+                OutputContract::Container(container_id) => format!(
+                    "declared output {expected} for container {container_id} missing — produce it \
+                     or state what you need"
+                ),
+            };
             return Ok(Some(Next::Send(Box::new(PendingSend {
                 work_id: work_id.to_string(),
                 stage_id: stage.stage_id.clone(),
@@ -2821,36 +3315,42 @@ impl Engine {
                 execution,
                 backend,
                 input: prompt,
-                resume: self.resume_request(run, work_id),
+                resume: self.resume_request(core, run, work_id),
             }))));
         }
-        let detail = format!(
-            "stage {} completed without producing its declared output {expected}, even after \
-             one re-prompt",
-            stage.stage_id
-        );
-        self.commit(
-            core,
-            work_id,
-            KIND_STAGE_NEEDS_INPUT,
-            json!({
-                "stage_id": stage.stage_id,
-                "detail": detail,
-                "reason_code": REASON_STAGE_OUTPUT_MISSING,
-                "path": expected,
-            }),
-        )?;
-        self.transition(
-            core,
-            work_id,
-            KIND_WORK_NEEDS_INPUT,
-            json!({
-                "prompt": detail,
-                "stage_id": stage.stage_id,
-                "reason_code": REASON_STAGE_OUTPUT_MISSING,
-                "path": expected,
-            }),
-        )?;
+        // E4: the park names the CONTAINER when a container's contract is the
+        // unmet one — "container 10-investigate never produced its declared
+        // aggregate", not a confusing leaf-level message about a leaf that
+        // itself finished cleanly.
+        let detail = match contract {
+            OutputContract::Leaf => format!(
+                "stage {} completed without producing its declared output {expected}, even after \
+                 one re-prompt",
+                stage.stage_id
+            ),
+            OutputContract::Container(container_id) => format!(
+                "container {container_id} closed without producing its declared output \
+                 {expected}, even after one re-prompt"
+            ),
+        };
+        let mut stage_payload = json!({
+            "stage_id": stage.stage_id,
+            "detail": detail,
+            "reason_code": REASON_STAGE_OUTPUT_MISSING,
+            "path": expected,
+        });
+        let mut work_payload = json!({
+            "prompt": detail,
+            "stage_id": stage.stage_id,
+            "reason_code": REASON_STAGE_OUTPUT_MISSING,
+            "path": expected,
+        });
+        if let OutputContract::Container(container_id) = contract {
+            stage_payload["container_id"] = Value::String(container_id.to_string());
+            work_payload["container_id"] = Value::String(container_id.to_string());
+        }
+        self.commit(core, work_id, KIND_STAGE_NEEDS_INPUT, stage_payload)?;
+        self.transition(core, work_id, KIND_WORK_NEEDS_INPUT, work_payload)?;
         Ok(Some(Next::Parked))
     }
 
@@ -2931,7 +3431,7 @@ impl Engine {
                     "backend {:?} is not registered in this daemon",
                     execution.backend
                 )),
-                Some(backend) => match self.reattach(backend, &run, work_id, &execution) {
+                Some(backend) => match self.reattach(core, backend, &run, work_id, &execution) {
                     Err(detail) => ambiguous(detail),
                     Ok(did) => {
                         reattached = did;
@@ -3192,6 +3692,7 @@ impl Engine {
     /// journals `surface.materialized` before the first stage is entered.
     fn reattach(
         &self,
+        core: &Core,
         backend: &Arc<dyn Backend>,
         run: &WorkRun,
         work_id: &str,
@@ -3200,7 +3701,7 @@ impl Engine {
         if !backend.capabilities().resume {
             return Ok(false);
         }
-        let Some(request) = self.resume_request(run, work_id) else {
+        let Some(request) = self.resume_request(core, run, work_id) else {
             return Ok(false);
         };
         backend
@@ -3220,7 +3721,14 @@ impl Engine {
     /// and, since N3, the *stage's* decisions (§12.5). Re-adopting a stage 10
     /// execution under stage 00's profile would be the same fabrication, one
     /// field further in.
-    fn resume_request(&self, run: &WorkRun, work_id: &str) -> Option<ResumeRequest> {
+    ///
+    /// `estate_root` is read the same way `Engine::execute` reads it before
+    /// building a `StartRequest` — `Self::work_estate_root(core, work_id)`,
+    /// the Work's own journaled coordinate — so a resumed execution's
+    /// `causation_env` is built from the same root every turn before the
+    /// restart carried, not silently dropped (S2 E6, causation-after-resume
+    /// fix).
+    fn resume_request(&self, core: &Core, run: &WorkRun, work_id: &str) -> Option<ResumeRequest> {
         let surface = run.surface.as_ref()?;
         let stage_profile = run.current_stage_profile();
         Some(ResumeRequest {
@@ -3234,6 +3742,7 @@ impl Engine {
             // lost whatever it derived from it, and the Work's mutation
             // surface is not something it may re-invent from a bare cwd.
             bindings: surface.binding_summary(),
+            estate_root: Self::work_estate_root(core, work_id),
         })
     }
 
@@ -3399,6 +3908,13 @@ impl Engine {
             .get(work_id)
             .map(|w| w.intent.clone())
             .unwrap_or_default();
+        // S2 E5: the causation triple's estate coordinate, read from exactly
+        // the source `commit` below stamps `workspace_id` from — the Work's
+        // own `WorkIndexRow::estate_root`, folded once at `work.submitted`
+        // and immutable for its life. Read here, before the stage's own
+        // events are committed, so the value pinned into the launch config is
+        // the same one every event of this execution carries.
+        let estate_root = Self::work_estate_root(core, work_id);
 
         self.commit(
             core,
@@ -3446,6 +3962,58 @@ impl Engine {
         };
 
         let execution_id = ulid::Ulid::generate().to_string();
+        // §12: procedure is data. The stage's own `CONTEXT.md`, plus the one
+        // opt-in fact #260 mechanism 3 already appends (see below).
+        let authored = if stage.receives_branch_status {
+            branch_status_context(&stage.context, &surface)
+        } else {
+            stage.context.clone()
+        };
+        // ---------------------------------------------------------------
+        // C1 §3's compilation step — here, and nowhere else.
+        //
+        //   stage about to enter → resolve Work/estate/source generations →
+        //   run deterministic research plan → compile Bound + Referenced +
+        //   Reachable snapshot → launch ordinary fresh execution
+        //
+        // *"C1 is not a second execution pipeline"* (§3, decision C1-01,
+        // **R2**): this is one call, inserted between the execution id being
+        // allocated and the adapter being asked to PREPARE, on the launch
+        // path that already existed. Nothing below it changed — the same
+        // `StartRequest`, the same `prepare`, the same reservation, the same
+        // `Next::Launch`.
+        //
+        // With no compiler installed it is `(authored, None)` and the rest of
+        // this function cannot tell C1 exists (§21 item 13).
+        //
+        // Scoped to `StageKind::Actor` (§3: "The existing engine already
+        // binds a workflow/stage and launches a fresh actor... C1 inserts a
+        // deterministic compilation step before the actor start"; §21 item
+        // 1: "fresh ordinary actor stage launches"). An `Execute` stage
+        // launches a Docker container, never an actor, and the backend never
+        // reads `StartRequest.context` for it — compiling a snapshot it
+        // cannot see would be unasked-for scope doing unread work.
+        // ---------------------------------------------------------------
+        let (context, context_events) = if stage.kind == StageKind::Actor {
+            self.compile_stage_context(
+                core,
+                work_id,
+                &stage,
+                index,
+                attempt,
+                &execution_id,
+                &intent,
+                &surface,
+                &run,
+                stage_profile.as_ref().map(|p| p.name.as_str()),
+                &authored,
+            )
+        } else {
+            (authored.clone(), Vec::new())
+        };
+        for (kind, payload) in context_events {
+            self.commit(core, work_id, kind, payload)?;
+        }
         let request = StartRequest {
             work_id: work_id.to_string(),
             execution_id: execution_id.clone(),
@@ -3457,15 +4025,12 @@ impl Engine {
             // the actor verbatim; sergeant never interprets it — except for
             // Amendment 9 Q5 / #260 mechanism 3's opt-in wire, where a stage
             // that declared `receives_branch_status = true` gets the
-            // engine's own commits-on-branch-since-base fact appended. The
-            // engine still shares no output vocabulary: this is a fact it
-            // already computes ([`WorkSurface::commits_since_base`]), not an
-            // interpretation of the stage's procedure.
-            context: if stage.receives_branch_status {
-                branch_status_context(&stage.context, &surface)
-            } else {
-                stage.context.clone()
-            },
+            // engine's own commits-on-branch-since-base fact appended, and
+            // C1 §3's compiled-context section, appended by exactly the same
+            // rule and for exactly the same reason: the authored content is
+            // untouched and a reader can tell which part sergeant added.
+            // Both are computed just above.
+            context,
             // §24.8: the profile carries the model, so the stage's profile
             // carries the stage's model. There is no per-stage model field.
             model: stage_profile.as_ref().and_then(|p| p.default_model.clone()),
@@ -3484,6 +4049,8 @@ impl Engine {
             // and refs an adapter states are the ones sergeant journaled —
             // never re-derived from the manifest or from the filesystem.
             bindings: surface.binding_summary(),
+            // W1 §6 / S2 E5: the estate a child `sgt -C … run` addresses.
+            estate_root,
         };
         let prepared = match backend.prepare(&request) {
             Ok(prepared) => prepared,
@@ -3554,6 +4121,13 @@ impl Engine {
         let work_id = pending.work_id.clone();
         let reservation = &pending.reservation;
         if let Some(why) = self.reservation_is_stale(core, &pending) {
+            // H1-15: superseded before or after the launch actually
+            // happened, this reservation's execution-lane permit is never
+            // going to be released by `stop_execution` — no `run.execution`
+            // is ever recorded for it (that only happens below, past this
+            // branch). Release it here or it leaks for the lane's whole
+            // remaining life.
+            self.release_execution_permit(&work_id);
             let stop = match &outcome {
                 Ok(handle) => match pending.backend.stop(handle) {
                     Ok(completion) => {
@@ -3591,6 +4165,12 @@ impl Engine {
         let handle = match outcome {
             Ok(handle) => handle,
             Err(e) => {
+                // H1-15: a daemon-side launch error — nothing was ever
+                // launched, so `stop_execution` will never see a
+                // `run.execution` to release this permit through. Release
+                // it here (deliverable 4's explicit test: no leak on a
+                // launch error).
+                self.release_execution_permit(&work_id);
                 // The reservation named an identity nothing ever created.
                 // Saying so explicitly is what keeps the window closed:
                 // without this event the journal would show a reservation
@@ -4339,6 +4919,20 @@ impl Engine {
     /// goes into `deferred` rather than being joined here (issue #14/B3):
     /// this runs under the daemon's core lock, and §22.6 forbids a thread
     /// join under it.
+    ///
+    /// H1-15: the execution-lane permit is released on *confirmed* stop, not
+    /// on request. `backend.stop()` returning a pending [`Completion`] means
+    /// the native process's actual teardown is still outstanding — freeing
+    /// the lane slot here would let a new Work admit and launch its own
+    /// native process while the one being canceled/interrupted may still be
+    /// alive, transiently oversubscribing `execution_lane_cap` in exactly
+    /// the cancel/interrupt scenario the lane exists to bound. So the permit
+    /// is folded into the deferred completion's own tail work and released
+    /// only once that tail actually runs (in `Deferred::wait`, outside the
+    /// core lock — never here). Only when there is no tail to defer to (an
+    /// immediate completion, a `stop()` error, or no registered backend —
+    /// nothing left to confirm) is the permit released immediately, since
+    /// no further observation of native teardown is coming.
     fn stop_execution(
         &self,
         core: &mut Core,
@@ -4358,12 +4952,37 @@ impl Engine {
         let outcome = match self.backends.get(&execution.backend) {
             Some(backend) => match backend.stop(&handle_of(&execution)) {
                 Ok(completion) => {
-                    deferred.push(completion);
+                    if completion.is_pending() {
+                        // Confirmed-stop release: fold the permit drop into
+                        // the tail work itself, so it only happens once the
+                        // native process's teardown has actually been
+                        // joined — never at request time.
+                        let permits = Arc::clone(&self.execution_permits);
+                        let permit_work_id = work_id.to_string();
+                        deferred.push(Completion::deferred(move || {
+                            completion.wait();
+                            permits
+                                .lock()
+                                .expect("execution permit map poisoned")
+                                .remove(&permit_work_id);
+                        }));
+                    } else {
+                        // Nothing outstanding to confirm — release now.
+                        self.release_execution_permit(work_id);
+                    }
                     json!({"requested": true})
                 }
-                Err(e) => json!({"requested": true, "error": e.to_string()}),
+                Err(e) => {
+                    // `stop()` itself failed: no tail to defer to, so there
+                    // is nothing further to observe before releasing.
+                    self.release_execution_permit(work_id);
+                    json!({"requested": true, "error": e.to_string()})
+                }
             },
-            None => json!({"requested": false, "error": "backend not registered"}),
+            None => {
+                self.release_execution_permit(work_id);
+                json!({"requested": false, "error": "backend not registered"})
+            }
         };
         self.commit(
             core,
@@ -4551,11 +5170,43 @@ impl Engine {
         kind: &str,
         payload: Value,
     ) -> Result<(), EngineError> {
-        core.commit(
-            EventDraft::new(EventSource::new("daemon", "engine"), kind, payload)
-                .with_work_id(work_id),
-        )?;
+        let mut draft = EventDraft::new(EventSource::new("daemon", "engine"), kind, payload)
+            .with_work_id(work_id);
+        // H1 touch point #4, now per Work rather than per process (D10).
+        //
+        // W1a stamped this from the engine's own pinned `estate_root`, which
+        // was correct while a daemon had exactly one. A host daemon has
+        // none, and reading "the engine's estate" for a Work belonging to
+        // some *other* estate is precisely the silent mis-stamping D10
+        // exists to remove — so the coordinate comes from the Work itself:
+        // the canonical root its `work.submitted` envelope recorded
+        // (`WorkIndexRow::estate_root`), folded from the journal and
+        // therefore identical across a restart and a replay.
+        //
+        // Absent (a Work submitted with no repository context, or a journal
+        // line older than the envelope field) leaves the field absent,
+        // exactly as before — never a guess, and never the display name.
+        if let Some(root) = Self::work_estate_root(core, work_id) {
+            draft = draft.with_workspace_id(root.to_string_lossy().into_owned());
+        }
+        core.commit(draft)?;
         Ok(())
+    }
+
+    /// The canonical estate root a Work was submitted against, or `None` when
+    /// the journal never recorded one.
+    ///
+    /// One reader for the two places that need it — the `workspace_id` stamp
+    /// above and S2 E5's `StartRequest::estate_root` — so the coordinate an
+    /// actor is handed and the coordinate its events are stamped with cannot
+    /// drift apart.
+    fn work_estate_root(core: &Core, work_id: &str) -> Option<PathBuf> {
+        core.registry
+            .state()
+            .work_index
+            .get(work_id)
+            .and_then(|row| row.estate_root.as_deref())
+            .map(PathBuf::from)
     }
 
     fn work_state(&self, core: &Core, work_id: &str) -> Result<WorkState, EngineError> {
@@ -4601,6 +5252,155 @@ fn handle_of(execution: &ExecutionRecord) -> ExecutionHandle {
     ExecutionHandle {
         execution_id: execution.execution_id.clone(),
         native_id: execution.native_id.clone(),
+    }
+}
+
+impl Engine {
+    /// **C1 §3's compilation step**: compile the world for the fresh
+    /// execution about to start, and return the context the actor will
+    /// actually receive plus the §15 snapshot to journal.
+    ///
+    /// `(authored.to_string(), None)` when no compiler is installed — §18's
+    /// first rung and §21 item 13, decided by whether the field is `Some`
+    /// and by nothing else. There is deliberately no second condition here: a
+    /// condition is a thing that can be got wrong, and "no compiler ⇒ nothing
+    /// added" must be the one case nobody can get wrong.
+    ///
+    /// A **degraded** snapshot (intelligence installed but this world has no
+    /// confirmed generation, or an Atlas read failed) is still journaled and
+    /// still renders nothing: §18's degradation is *"visible, not fatal or
+    /// fabricated"*, and `ContextSnapshot::render_onto` returns the authored
+    /// context byte-for-byte when there is nothing compiled.
+    ///
+    /// # Why this runs under the core lock, said rather than assumed
+    ///
+    /// §22.6's budget keeps *external effects* out from under the guard — a
+    /// process spawn, a container create, a repository walk (see
+    /// [`crate::api`]'s `spawn_work_overlay_hook`, which exists for exactly
+    /// that reason). This is none of those: it is a bounded set of reads of
+    /// already-derived local tables, every one of them capped at
+    /// [`crate::runtime::context::STEP_ROW_CAP`] or Atlas's own `MAX_ROWS`,
+    /// touching no filesystem the Work owns and spawning nothing (**J3** —
+    /// §22.6 names the effects it governs and a bounded local read is not
+    /// among them). It has to run here regardless: the compiled world must be
+    /// in the `StartRequest` before the adapter is asked to PREPARE, and
+    /// PREPARE is *"identity only — no process, no I/O"*, so there is no
+    /// later point at which the context could still be composed.
+    #[allow(clippy::too_many_arguments)]
+    fn compile_stage_context(
+        &self,
+        core: &Core,
+        work_id: &str,
+        stage: &StageDefinition,
+        index: usize,
+        attempt: u32,
+        execution_id: &str,
+        intent: &str,
+        surface: &WorkSurface,
+        run: &WorkRun,
+        profile: Option<&str>,
+        authored: &str,
+    ) -> (String, Vec<(&'static str, Value)>) {
+        let Some(compiler) = self.context_compiler.as_ref() else {
+            return (authored.to_string(), Vec::new());
+        };
+        let estate_root = Self::work_estate_root(core, work_id);
+        let bindings = surface.binding_summary();
+        // **C1 §17's fifth rule**: *"parent causation/output may be
+        // Referenced when needed"*. Read off the journal-folded Work record
+        // — `Work::parent_work_id`/`parent_execution_id` are W1 §6's
+        // *validated* relation, so a claim the daemon refused
+        // (`causation_unverified`) can never become a coordinate. The
+        // parent's state comes from `state_view`, which answers from the
+        // slim index and is never evicted, so a child compiled after its
+        // parent went terminal still gets the real state rather than a
+        // missing one.
+        //
+        // Coordinates only. Nothing here reads the parent's intent, prompt,
+        // context or transcript — §17's fourth rule and §20's
+        // *parent-prompt inheritance for child Work* forbid it, and
+        // `ParentCausation` has no field one could travel in.
+        let parent_state = {
+            let registry = core.registry.state();
+            registry
+                .works
+                .get(work_id)
+                .and_then(|work| {
+                    work.parent_work_id
+                        .clone()
+                        .map(|parent| (parent, work.parent_execution_id.clone()))
+                })
+                .map(|(parent_work_id, parent_execution_id)| {
+                    let state = registry
+                        .state_view(&parent_work_id)
+                        .map(|state| state.as_str().to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    (parent_work_id, parent_execution_id, state)
+                })
+        };
+        let parent = parent_state.as_ref().map(|(work, execution, state)| {
+            crate::runtime::context::ParentCausation {
+                work_id: work.as_str(),
+                execution_id: execution.as_deref(),
+                state: state.as_str(),
+            }
+        });
+        let request = crate::runtime::context::CompileRequest {
+            estate_root: estate_root.as_deref(),
+            work_id,
+            intent,
+            stage,
+            stage_index: index,
+            attempt,
+            execution_id,
+            // §15's *"journal watermark"*: the next sequence this journal
+            // will write, read before the compilation, so the snapshot names
+            // the exact prefix of the journal its world could have reflected.
+            journal_watermark: core.journal.next_seq(),
+            bindings: &bindings,
+            prior_stages: &run.stages,
+            profile,
+            parent,
+            // §14's hard automatic-render budget. One value, written by a
+            // human and measured against this repository's own shipped stage
+            // procedures — see `RenderBudget`'s own doc. Nothing tunes it at
+            // runtime (§20: no learned context policy).
+            budget: crate::runtime::context::RenderBudget::DEFAULT,
+        };
+        let mut snapshot = compiler.compile(&request);
+        let context = snapshot.render_onto(authored);
+        snapshot.rendered_bytes = context.len().saturating_sub(authored.len()) as u64;
+        // §15's snapshot first, then §16's audit record for the same
+        // compilation. Two contracts, two kinds, one ordered list the caller
+        // commits in order: `context.compiled` is *what world was presented*
+        // and C1 §16's kinds are *what the managed calls that built it did*,
+        // attributed to this execution (§21 item 11). A degraded compilation
+        // journals the snapshot and no audit events — see
+        // `ContextSnapshot::audit_events`.
+        let audit_events = snapshot.audit_events();
+        // F-IN-01: the caller below commits `context.compiled` and each
+        // audit event as separate, non-transactional journal writes — a
+        // mid-sequence commit failure can leave fewer audit rows for this
+        // `execution_id` than this compilation actually produced, and that
+        // truncation is otherwise indistinguishable from a compilation that
+        // legitimately bound/referenced/queried nothing (§16's own
+        // documented degraded case). Naming the count this compilation
+        // produced, on the one event committed first and always (degraded
+        // or not), lets a reader compare it against the audit rows actually
+        // observed for the execution and tell the two apart — a raw fact
+        // recorded alongside the rest of §15's snapshot, not a policy
+        // change to how or whether anything commits.
+        let mut compiled_payload = snapshot.json();
+        if let Value::Object(ref mut map) = compiled_payload {
+            map.insert(
+                "audit_event_count".to_string(),
+                Value::from(audit_events.len()),
+            );
+        }
+        let mut events: Vec<(&'static str, Value)> =
+            vec![(KIND_CONTEXT_COMPILED, compiled_payload)];
+        events.extend(audit_events);
+        (context, events)
     }
 }
 
@@ -4686,6 +5486,145 @@ mod tests {
         );
     }
 
+    /// Numbers-need-provenance: the execution lane's built-in default must
+    /// trace to the one thing this repo actually measured it against — the
+    /// host's own hardware parallelism — not an arbitrary round number.
+    #[test]
+    fn default_execution_lane_cap_is_grounded_in_host_parallelism() {
+        let expected = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4);
+        assert_eq!(default_execution_lane_cap(), expected);
+        assert_eq!(
+            default_intelligence_lane_cap(),
+            expected,
+            "the intelligence lane's stub default reuses the same grounding (R2)"
+        );
+    }
+
+    /// D4's structural admission test: a lane of `cap` admits exactly `cap`
+    /// concurrent work ids without blocking, and the `cap + 1`th is refused
+    /// — never blocked internally, never silently oversubscribed.
+    #[test]
+    fn try_admit_execution_is_bounded_by_the_configured_cap() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let engine = engine(dir.path()).with_execution_lane_cap(2);
+
+        assert!(engine.try_admit_execution("w1"));
+        assert!(engine.try_admit_execution("w2"));
+        assert!(
+            !engine.try_admit_execution("w3"),
+            "a third admission must be refused once the cap-2 lane is full"
+        );
+
+        engine.release_execution_permit("w1");
+        assert!(
+            engine.try_admit_execution("w3"),
+            "releasing a held permit must free exactly one slot"
+        );
+    }
+
+    /// Releasing a work id that holds no permit is a documented no-op
+    /// (idempotent), not a panic — the same posture as `block`'s repeat call
+    /// (above) and every other release-on-a-path-that-may-not-apply engine
+    /// helper.
+    #[test]
+    fn release_execution_permit_is_idempotent_for_a_work_holding_none() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let engine = engine(dir.path()).with_execution_lane_cap(1);
+        engine.release_execution_permit("never-admitted");
+        engine.release_execution_permit("never-admitted");
+        assert!(engine.try_admit_execution("w1"), "the lane is still whole");
+    }
+
+    /// D3's structural proof: draining every execution-lane permit must
+    /// leave the intelligence lane's own capacity completely untouched —
+    /// they are two separate `Arc<Semaphore>`s, not one budget split two
+    /// ways. Revert-sensitive: a shared-semaphore implementation would fail
+    /// this by starving the intelligence lane's `available_permits` too.
+    #[test]
+    fn execution_lane_exhaustion_never_touches_the_intelligence_lane() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let engine = engine(dir.path())
+            .with_execution_lane_cap(1)
+            .with_intelligence_lane_cap(3);
+
+        assert_eq!(engine.intelligence_lane.available_permits(), 3);
+        assert!(engine.try_admit_execution("w1"));
+        assert!(!engine.try_admit_execution("w2"), "execution lane is full");
+        assert_eq!(
+            engine.intelligence_lane.available_permits(),
+            3,
+            "the intelligence lane's own capacity must be untouched by execution-lane pressure"
+        );
+    }
+
+    /// H1 touch point #4 as D10 leaves it: `Engine::commit` is still the one
+    /// chokepoint every engine-emitted event goes through, but the
+    /// coordinate it stamps is now the **Work's own**, not the engine's.
+    ///
+    /// This is W1a's test evolved, not reverted. W1a proved the stamping
+    /// happens at the chokepoint against an engine pinned to one estate;
+    /// there is no pinned estate any more, and the fact that matters is
+    /// sharper: **one engine, two Works, two different estates, each event
+    /// stamped with its own Work's root.** Under the pinned field this could
+    /// not even be expressed — every event would have carried the same root,
+    /// which is exactly the silent mis-stamping D10 removes. The `None` half
+    /// is kept in the same test, so a revert of the stamping still fails.
+    #[test]
+    fn engine_committed_events_stamp_each_works_own_estate_root() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut core = testing::core(dir.path());
+        let payments = dir.path().join("estates/payments");
+        let billing = dir.path().join("estates/billing");
+        // One engine — a host daemon has exactly one, serving every estate.
+        let engine = engine(dir.path());
+
+        testing::submit_in(
+            &mut core,
+            "01PAYMENTS",
+            "carry payments' root",
+            Some(payments.to_string_lossy().as_ref()),
+        );
+        testing::submit_in(
+            &mut core,
+            "01BILLING",
+            "carry billing's root",
+            Some(billing.to_string_lossy().as_ref()),
+        );
+        testing::submit(&mut core, "01NOESTATE", "no repository context at all");
+        for work_id in ["01PAYMENTS", "01BILLING", "01NOESTATE"] {
+            engine
+                .block(&mut core, work_id, "prove workspace_id travels", None)
+                .expect("block");
+        }
+
+        let blocked: Vec<_> = core
+            .journal
+            .replay()
+            .expect("replay")
+            .map(|e| e.expect("event"))
+            .filter(|e| e.kind == KIND_WORK_BLOCKED)
+            .collect();
+        let by_work = |id: &str| {
+            blocked
+                .iter()
+                .find(|e| e.work_id.as_deref() == Some(id))
+                .expect("work.blocked journaled")
+        };
+        assert_eq!(
+            by_work("01PAYMENTS").workspace_id.as_deref(),
+            Some(payments.to_string_lossy().as_ref()),
+            "each event carries its own Work's estate, not the engine's"
+        );
+        assert_eq!(
+            by_work("01BILLING").workspace_id.as_deref(),
+            Some(billing.to_string_lossy().as_ref()),
+            "the second estate is not the first estate"
+        );
+        assert_eq!(by_work("01NOESTATE").workspace_id, None);
+    }
+
     // ------------------------- estate-root Phase C: Engine::resolve_scope
 
     /// A estate fixture for exercising [`Engine::resolve_scope`] directly
@@ -4702,6 +5641,7 @@ mod tests {
                     path: PathBuf::from(format!("/nowhere/{name}")),
                 })
                 .collect(),
+            knowledge: Vec::new(),
             default_backend: None,
             default_workflow: None,
             profiles: Vec::new(),
@@ -5119,6 +6059,7 @@ mod tests {
                 name: "solo".to_string(),
                 root: dir.path().to_path_buf(),
                 repositories: Vec::new(),
+                knowledge: Vec::new(),
                 default_backend: None,
                 default_workflow: None,
                 profiles: Vec::new(),
@@ -5138,6 +6079,7 @@ mod tests {
                 version: "1".to_string(),
                 source: "test".to_string(),
                 stages: Vec::new(),
+                containers: Vec::new(),
                 content_hash: String::new(),
             },
             route: Route {
@@ -5641,6 +6583,7 @@ mod tests {
             execute: None,
             instruction_policy: InstructionPolicy::default(),
             bindings: Vec::new(),
+            estate_root: None,
         };
         let handle = fake.start(&start_request).expect("fake backend start");
         testing::commit(
@@ -5752,6 +6695,9 @@ mod tests {
                 intent_detail: None,
                 envelope: None,
                 git_preflight_override: false,
+                parent_work_id: None,
+                parent_execution_id: None,
+                causation_unverified: None,
                 state,
                 created_by: "test".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -6014,6 +6960,7 @@ mod tests {
                     created_at: "2026-01-01T00:00:00Z".to_string(),
                     updated_at: "2026-01-01T00:00:00Z".to_string(),
                     last_seq: 1,
+                    estate_root: None,
                 },
             );
             registry.terminal_runs.insert(

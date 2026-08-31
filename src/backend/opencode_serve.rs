@@ -30,6 +30,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::backend::child::{self, ChildLifetime};
+
 // ------------------------------------------------------------------- consts
 
 /// `OPENCODE_SERVER_PASSWORD`'s required username (§3.4, C6): the *literal*
@@ -549,6 +551,10 @@ pub(super) struct ServeChild {
     exit_status: Arc<Mutex<Option<ExitStatus>>>,
     stderr_tail: Arc<Mutex<Vec<u8>>>,
     pgid: u32,
+    /// `Some` only for a [`ChildLifetime::Probe`] child (#310): deregisters
+    /// this pgid from the owning probe walk's live set when this handle
+    /// drops. Held, never read.
+    _registration: Option<child::ProbeChildRegistration>,
 }
 
 impl ServeChild {
@@ -564,6 +570,14 @@ impl ServeChild {
     /// not a correctness hazard because the port is *learned*, never
     /// assumed, from this stdout line — but a reader must not conclude "port
     /// 0 means never 4096".
+    ///
+    /// `lifetime` is #310's fix and must be stated by every caller: a
+    /// [`ChildLifetime::Probe`] child is additionally hardened
+    /// ([`child::harden_probe_child`]) so a `SIGKILL`ed daemon takes it with
+    /// it, and recorded against the probe walk that owns the calling thread.
+    /// The `ServeOnly`/`Auto` gate is that caller; `launch_serve`'s child is
+    /// [`ChildLifetime::Execution`] and must never be hardened — see that
+    /// enum's own doc for why.
     pub(super) fn spawn(
         executable: &Path,
         cwd: &Path,
@@ -571,6 +585,7 @@ impl ServeChild {
         config_content: Option<&str>,
         password: &str,
         port_budget: Duration,
+        lifetime: ChildLifetime,
     ) -> Result<(Self, String), String> {
         let mut command = Command::new(executable);
         command
@@ -589,21 +604,39 @@ impl ServeChild {
         // §3.7: a serve child's tool subprocesses are its grandchildren, so
         // the identical probe-11 orphaning hazard applies — process_group(0)
         // is what makes the recorded-pgid kill (never by name/pattern) reach
-        // the whole tree.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
+        // the whole tree. A probe child gets that from `harden_probe_child`
+        // (plus `PR_SET_PDEATHSIG`, #310); an execution child gets the group
+        // and nothing else.
+        match lifetime {
+            ChildLifetime::Probe => child::harden_probe_child(&mut command),
+            ChildLifetime::Execution => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    command.process_group(0);
+                }
+            }
         }
 
         let mut child = command
             .spawn()
             .map_err(|e| format!("cannot spawn {executable:?} serve: {e}"))?;
         let pgid = child.id();
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "serve child stdout was not piped".to_string())?;
+        // Recorded before anything below can fail: from here on this pgid is
+        // reachable by `ProbeChildren::kill_all`, so an early return that
+        // kills the group leaves nothing behind either way.
+        let registration =
+            matches!(lifetime, ChildLifetime::Probe).then(|| child::register_probe_child(pgid));
+        // #310: an early return here used to drop `child` without signalling
+        // it, leaving a live `opencode serve` with nothing holding it. The arm
+        // is "cannot happen" — stdout was piped a dozen lines above — which is
+        // precisely the kind of path this issue is about.
+        let Some(stdout) = child.stdout.take() else {
+            super::kill_process_group(Some(pgid));
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("serve child stdout was not piped".to_string());
+        };
 
         let stderr_tail = Arc::new(Mutex::new(Vec::<u8>::new()));
         if let Some(mut stderr) = child.stderr.take() {
@@ -647,11 +680,20 @@ impl ServeChild {
 
         let base_url = match rx.recv_timeout(port_budget) {
             Ok(Some(url)) => url,
+            // #310: both failure arms below kill *and reap*. Killing alone
+            // leaves a zombie — the pid is still in the process table, still
+            // answers `kill(pid, 0)` as alive, and still shows up under
+            // `pgrep -x opencode`, so an orphan check cannot tell it from a
+            // live 265 MB server. Measured: this is the arm that fired when
+            // `DaemonHandle::kill` reaped a live gate child out from under a
+            // spawn still waiting for its listening line.
             Ok(None) => {
                 let tail =
                     String::from_utf8_lossy(&stderr_tail.lock().expect("serve stderr tail lock"))
                         .into_owned();
+                super::kill_process_group(Some(pgid));
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(format!(
                     "serve child's stdout reached EOF before a listening line arrived; stderr: {tail}"
                 ));
@@ -662,6 +704,7 @@ impl ServeChild {
                         .into_owned();
                 super::kill_process_group(Some(pgid));
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(format!(
                     "serve child emitted no listening line within {port_budget:?}; stderr: {tail}"
                 ));
@@ -674,6 +717,7 @@ impl ServeChild {
                 exit_status: Arc::new(Mutex::new(None)),
                 stderr_tail,
                 pgid,
+                _registration: registration,
             },
             base_url,
         ))
@@ -728,9 +772,15 @@ impl ServeChild {
 impl Drop for ServeChild {
     /// Best-effort (§3.7, mirrors `AppServerChild::drop`): adapter state
     /// dropping is not a supported lifecycle path, but it must not orphan a
-    /// process.
+    /// process — nor leave a zombie, which is #310's addition here. A killed
+    /// child nobody reaps stays in the process table answering `kill(pid, 0)`
+    /// as alive and matching `pgrep -x opencode`, which is exactly the shape
+    /// an orphan check cannot distinguish from the leak.
     fn drop(&mut self) {
         super::kill_process_group(Some(self.pgid));
+        let mut child = self.child.lock().expect("serve child lock");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
