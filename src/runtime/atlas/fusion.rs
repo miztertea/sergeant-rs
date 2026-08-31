@@ -230,10 +230,27 @@ pub const BOOST_DEFINITION: f64 = 1.5;
 /// Signal 4, *"Work-changed unit"*. See [`BOOST_EXACT_MATCH`].
 pub const BOOST_WORK_CHANGED: f64 = 1.5;
 
-/// Signals 5 and 6, *"same module/package/document section"* and
-/// *"inbound/outbound structural relationship"* — both adjacency to the
-/// anchor. See [`BOOST_EXACT_MATCH`].
+/// Signal 6, *"inbound/outbound structural relationship"* with the anchor.
+/// See [`BOOST_EXACT_MATCH`].
+///
+/// **Signal 5 deliberately does not use this, or any factor.** It is
+/// *"same module/package/document section"* measured against the anchor, and
+/// `same_section` is reflexive, so as a multiplier it pays the top-RRF
+/// candidate for being where RRF already put it — the measured `BM25_K1`
+/// inversion. Suppressing it on the anchor alone only moves the distortion
+/// to its neighbours. The file-level preference A2 §8 asks for is supplied
+/// instead by [`FILE_COHERENCE_BOOST_FRAC`], which is anchor-free and
+/// computed identically for every file. Signal 6 has no such problem: a unit
+/// has no `source.edges` relationship with itself.
 pub const BOOST_ADJACENCY: f64 = 1.2;
+
+/// semble's `_FILE_COHERENCE_BOOST_FRAC` — *"fraction of max_score added to
+/// each file's top chunk, scaled by its aggregate candidate score"*
+/// (`boosting.py::boost_multi_chunk_files`). A file several of whose chunks
+/// are candidates is more likely to be what the query is about; its single
+/// best chunk gets the boost, and [`FILE_SATURATION_DECAY`] holds the rest
+/// down. See [`BOOST_EXACT_MATCH`] for the provenance rule.
+pub const FILE_COHERENCE_BOOST_FRAC: f64 = 0.2;
 
 /// Signal 7's negative half: a test/example/legacy path multiplies its score
 /// by this. semble's `_STRONG_PENALTY`. See [`BOOST_EXACT_MATCH`].
@@ -409,6 +426,13 @@ impl RerankSignals {
     /// constant factor on every candidate cannot reorder anything, and
     /// pretending otherwise would be a weight with no effect.
     ///
+    /// **Signal 5 carries no factor either**, for a different reason: it is
+    /// measured against the anchor and `same_section` is reflexive, so a
+    /// factor on it pays the top-RRF candidate for being itself. See
+    /// [`BOOST_ADJACENCY`]'s own doc and
+    /// [`FILE_COHERENCE_BOOST_FRAC`], which supplies that preference without
+    /// an anchor.
+    ///
     /// Signal 7 is spelled as its negative: a canonical path is the norm and
     /// scores 1.0; a test/example/legacy path multiplies by
     /// [`PENALTY_NON_CANONICAL`], which is semble's shape
@@ -424,9 +448,6 @@ impl RerankSignals {
         }
         if self.work_changed_unit {
             factor *= BOOST_WORK_CHANGED;
-        }
-        if self.same_section_as_anchor {
-            factor *= BOOST_ADJACENCY;
         }
         if self.structural_relationship {
             factor *= BOOST_ADJACENCY;
@@ -700,6 +721,7 @@ pub fn rerank(hits: &mut [FusedHit]) {
     for hit in hits.iter_mut() {
         hit.adjusted = hit.rrf * hit.signals.multiplier();
     }
+    boost_multi_chunk_files(hits);
     hits.sort_by(rerank_order);
 
     let mut seen_per_file: BTreeMap<String, u32> = BTreeMap::new();
@@ -712,6 +734,56 @@ pub fn rerank(hits: &mut [FusedHit]) {
         *already += 1;
     }
     hits.sort_by(rerank_order);
+}
+
+/// semble's `boosting.py::boost_multi_chunk_files`: a file whose candidate
+/// chunks score well collectively has its **single best chunk** multiplied by
+/// `1 + FILE_COHERENCE_BOOST_FRAC * (this file's total / the largest file
+/// total)`.
+///
+/// semble adds `boost_unit * file_sum / max_file_sum` where `boost_unit =
+/// max_score * 0.2`; the multiplicative spelling here is the same shape
+/// against each candidate's own score rather than the answer's maximum, which
+/// keeps every adjustment in this module scale-free. Deterministic: a
+/// [`BTreeMap`] keyed by path, and ties for "best chunk" broken by the same
+/// stated key everything else uses.
+fn boost_multi_chunk_files(hits: &mut [FusedHit]) {
+    let mut file_total: BTreeMap<String, f64> = BTreeMap::new();
+    for hit in hits.iter() {
+        *file_total
+            .entry(hit.coordinate.relative_path().to_string())
+            .or_insert(0.0) += hit.adjusted;
+    }
+    let Some(max_total) = file_total
+        .values()
+        .copied()
+        .max_by(|a, b| a.total_cmp(b))
+        .filter(|total| *total > 0.0)
+    else {
+        return;
+    };
+
+    // The best chunk of each file, by adjusted score then the stated key.
+    let mut best: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, hit) in hits.iter().enumerate() {
+        let path = hit.coordinate.relative_path().to_string();
+        let better = match best.get(&path) {
+            Some(current) => {
+                hit.adjusted
+                    .total_cmp(&hits[*current].adjusted)
+                    .then_with(|| hits[*current].tie_break_key().cmp(&hit.tie_break_key()))
+                    == std::cmp::Ordering::Greater
+            }
+            None => true,
+        };
+        if better {
+            best.insert(path, index);
+        }
+    }
+    for (path, index) in best {
+        let share = file_total[&path] / max_total;
+        hits[index].adjusted *= 1.0 + FILE_COHERENCE_BOOST_FRAC * share;
+    }
 }
 
 // ---------------------------------------------------------------------------

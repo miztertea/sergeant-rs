@@ -65,7 +65,8 @@ use sergeant_rs::runtime::atlas::db::{
 };
 use sergeant_rs::runtime::atlas::fusion::{
     ALPHA_NATURAL, ALPHA_SYMBOL, BOOST_ADJACENCY, BOOST_DEFINITION, BOOST_EXACT_MATCH,
-    BOOST_WORK_CHANGED, FILE_SATURATION_DECAY, FusedHit, PENALTY_NON_CANONICAL, RRF_K, RankOrigins, RerankSignals, fuse, is_symbol_query,
+    BOOST_WORK_CHANGED, FILE_COHERENCE_BOOST_FRAC, FILE_SATURATION_DECAY, FusedHit,
+    PENALTY_NON_CANONICAL, RRF_K, RankOrigins, RerankSignals, fuse, is_symbol_query,
     rerank, resolve_alpha, rrf_contribution, rrf_order,
 };
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, LexicalHit, UnitCoordinate};
@@ -439,7 +440,10 @@ fn the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment() {
         (1, |s| s.definition_over_reference = true, BOOST_DEFINITION),
         (2, |s| s.caller_selected_source = true, 1.0),
         (3, |s| s.work_changed_unit = true, BOOST_WORK_CHANGED),
-        (4, |s| s.same_section_as_anchor = true, BOOST_ADJACENCY),
+        // Signal 5 is anchor-relative and reflexive; a multiplier on it is a
+        // self-boost. Computed and traced, worth nothing to the order — see
+        // `the_anchor_does_not_boost_itself_for_being_in_its_own_section`.
+        (4, |s| s.same_section_as_anchor = true, 1.0),
         (5, |s| s.structural_relationship = true, BOOST_ADJACENCY),
         (6, |s| s.canonical_path = false, PENALTY_NON_CANONICAL),
         (7, |s| s.knowledge_source_requested = true, 1.0),
@@ -462,12 +466,14 @@ fn the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment() {
         );
     }
 
-    // The three uniform signals are worth exactly nothing, together or apart.
+    // The three uniform signals — and signal 5 — are worth exactly nothing,
+    // together or apart.
     let all_uniform = RerankSignals {
         canonical_path: true,
         caller_selected_source: true,
         knowledge_source_requested: true,
         current_generation: true,
+        same_section_as_anchor: true,
         ..Default::default()
     };
     assert_eq!(all_uniform.multiplier(), 1.0);
@@ -1319,10 +1325,14 @@ fn a_test_path_is_penalised_multiplicatively_not_ranked_after_a_later_signal() {
     );
     // Its own signal 5 still boosts it by BOOST_ADJACENCY; the penalty then
     // multiplies that. Both factors are visible in the number.
-    let expected = hits[1].rrf * BOOST_ADJACENCY * PENALTY_NON_CANONICAL;
+    // Bracketed rather than exact: the file-coherence boost also touches
+    // this candidate (it is the only chunk of its file), so the penalised
+    // score sits between 0.3x and 0.3 x 1.2x of the fused score.
+    let floor = hits[1].rrf * PENALTY_NON_CANONICAL;
+    let ceiling = floor * (1.0 + FILE_COHERENCE_BOOST_FRAC);
     assert!(
-        (hits[1].adjusted - expected).abs() < 1e-12,
-        "the test path's score was not actually penalised: {} from {} (expected {expected})",
+        hits[1].adjusted >= floor && hits[1].adjusted <= ceiling,
+        "the test path's score was not actually penalised: {} from {} (expected {floor}..={ceiling})",
         hits[1].adjusted,
         hits[1].rrf
     );
@@ -1387,6 +1397,126 @@ fn a_second_chunk_of_the_same_file_is_decayed_so_one_file_cannot_take_every_slot
         "second chunk of a file was not decayed by {FILE_SATURATION_DECAY}: {} from {}",
         second_busy.adjusted,
         second_busy.rrf
+    );
+}
+
+/// **The anchor must not boost itself, and A2 §8's signal 5 cannot stop it
+/// from doing so.**
+///
+/// Signal 5 is *"same module/package/document section"* measured against the
+/// top-RRF candidate — the *anchor* — and `same_section` is reflexive. Under
+/// the old lexicographic key that was harmless: slot 5 sat below
+/// `exact_match` in slot 1, so the anchor's self-satisfaction never beat a
+/// real signal. As a **multiplier** it is a self-fulfilling boost: whatever
+/// RRF put first is multiplied for being where it already is.
+///
+/// Measured: `sgt search "BM25_K1"` put a markdown heading
+/// (`rrf = 0.013818547`) above `rust const BM25_K1` (`rrf = 0.005154200`),
+/// which carries the ×3 exact-match boost — because `0.013819 × 1.2` beats
+/// `0.005154 × 3.0`, and the heading's only 1.2 was for being the anchor.
+///
+/// **Suppressing it on the anchor alone is worse, and was tried and
+/// rejected**: every *other* candidate in the anchor's section then keeps a
+/// ×1.2 the anchor does not, which inverted
+/// `w5_search_surface::a_relational_aggregate_and_a_retrieved_row_join_on_
+/// one_shared_row_identity` — two rows of one CSV, the queried row demoted
+/// below its neighbour.
+///
+/// So signal 5 carries **no multiplier at all**. It stays computed and stays
+/// in A2 §13's trace; the file-level preference A2 §8 asks for is supplied
+/// instead by semble's own anchor-free mechanism, `boosting.py::
+/// boost_multi_chunk_files` — see
+/// [`a_file_whose_chunks_collectively_score_well_has_its_best_chunk_boosted`].
+///
+/// **Non-vacuous:** with signal 5 worth `BOOST_ADJACENCY` this asserts the
+/// opposite of what the code does.
+#[test]
+fn the_anchor_does_not_boost_itself_for_being_in_its_own_section() {
+    let anchor_heading = scored(
+        "evidence/reference-corpus/synthesis.md",
+        "u-heading",
+        0.013_818_547,
+        RerankSignals {
+            canonical_path: true,
+            same_section_as_anchor: true,
+            ..Default::default()
+        },
+    );
+    let the_definition = scored(
+        "src/runtime/atlas/lexical.rs",
+        "u-const",
+        0.005_154_200,
+        RerankSignals {
+            canonical_path: true,
+            exact_match: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        anchor_heading.rrf > the_definition.rrf,
+        "the fixture must keep the heading the better-fused candidate"
+    );
+
+    let mut hits = vec![anchor_heading, the_definition];
+    rerank(&mut hits);
+    assert_eq!(
+        hits[0].unit_key, "u-const",
+        "the anchor kept first place on a boost it gave itself"
+    );
+
+    // Said directly: signal 5 changes no score.
+    let base = RerankSignals {
+        canonical_path: true,
+        ..Default::default()
+    };
+    let in_section = RerankSignals {
+        same_section_as_anchor: true,
+        ..base
+    };
+    assert_eq!(base.multiplier(), in_section.multiplier());
+}
+
+/// **semble's own file-level preference, which needs no anchor.**
+/// `boosting.py::boost_multi_chunk_files`: a file whose candidate chunks
+/// score well *collectively* has its single best chunk boosted by
+/// `_FILE_COHERENCE_BOOST_FRAC = 0.2` of the maximum, scaled by that file's
+/// share of the largest file total.
+///
+/// This is what replaces signal 5's multiplier: it expresses the same "this
+/// file is what the query is about" preference, it is computed identically
+/// for every file, and no candidate can earn it for being where RRF already
+/// put it.
+///
+/// **Non-vacuous:** without the boost `y.md` out-scores every `x.md` chunk
+/// and comes first.
+#[test]
+fn a_file_whose_chunks_collectively_score_well_has_its_best_chunk_boosted() {
+    let canonical = RerankSignals {
+        canonical_path: true,
+        ..Default::default()
+    };
+    let mut hits = vec![
+        scored("docs/x.md", "u-x1", 0.011_0, canonical),
+        scored("docs/x.md", "u-x2", 0.011_0, canonical),
+        scored("docs/y.md", "u-y1", 0.011_5, canonical),
+    ];
+    assert!(
+        hits[2].rrf > hits[0].rrf,
+        "the fixture only discriminates if the lone chunk wins on raw score"
+    );
+
+    rerank(&mut hits);
+    assert_eq!(
+        hits[0].unit_key, "u-x1",
+        "the coherent file's best chunk was not boosted: {:?}",
+        hits.iter().map(|h| (&h.unit_key, h.adjusted)).collect::<Vec<_>>()
+    );
+    // x.md's total is the largest, so its share is 1.0 and its best chunk
+    // takes the full 0.2 — semble's constant, exactly.
+    assert!(
+        (hits[0].adjusted - 0.011_0 * (1.0 + FILE_COHERENCE_BOOST_FRAC)).abs() < 1e-12,
+        "boost was not 1 + {FILE_COHERENCE_BOOST_FRAC}: {}",
+        hits[0].adjusted
     );
 }
 
