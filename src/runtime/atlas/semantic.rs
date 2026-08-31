@@ -148,11 +148,31 @@ pub enum SemanticStatus {
     /// entirely different reason, and a consumer that must not confuse a
     /// host-configuration fact with a caller's choice can tell them apart.
     Disabled,
+    /// The model is installed and the caller wanted it, but at least one
+    /// admissible generation carries **no stored vectors for this model** —
+    /// so the semantic ranking this answer could offer is incomplete, or
+    /// absent entirely.
+    ///
+    /// The state a store scanned before its vectors existed is in, and the
+    /// state a store scanned under a *different* model is in: vectors are
+    /// keyed by [`SemanticModel`], so a model swap invalidates rather than
+    /// silently reusing (by analogy with A1 §8's extractor-identity cache
+    /// discipline).
+    ///
+    /// **This variant exists because none of the other three can say it.**
+    /// [`Self::Applied`] would claim a ranking the store cannot produce,
+    /// which is A1 §15's *"missing capability … represented as successful
+    /// empty evidence"*; [`Self::NotInstalled`] would blame the host for a
+    /// model that is in fact loaded and send an operator to install it
+    /// again; [`Self::Disabled`] would blame the caller. The remedy is a
+    /// re-scan, and only a word of its own points at it.
+    NotIndexed,
 }
 
 impl SemanticStatus {
     /// H4's own three spellings — `applied` | `not_installed` | `disabled`
-    /// — as the stable wire word every surface renders.
+    /// — plus S6's `not_indexed`, as the stable wire word every surface
+    /// renders.
     ///
     /// One function rather than a `match` at each render site: A2 §15's
     /// honesty is only mechanical if every consumer reads the same three
@@ -162,6 +182,7 @@ impl SemanticStatus {
             Self::Applied => "applied",
             Self::NotInstalled => "not_installed",
             Self::Disabled => "disabled",
+            Self::NotIndexed => "not_indexed",
         }
     }
 }
