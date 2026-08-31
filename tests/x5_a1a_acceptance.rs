@@ -17,10 +17,15 @@
 //!    the gap could not quietly close or quietly widen. S4 Y6 shipped it —
 //!    see [`a1a_item_4_the_coverage_vocabulary_now_names_online_only`] for
 //!    the update that landed in the tripwire's place.
-//! 2. **No dangling citation.** [`every_named_check_exists_in_the_suite_it_names`]
-//!    reads every referenced file and fails if a named test was renamed or
-//!    deleted. A green suite that no longer contains the test the walk cites
-//!    proves nothing, and this is what notices.
+//! 2. **No dangling citation, and no dead one.**
+//!    [`every_named_check_exists_in_the_suite_it_names`] reads every
+//!    referenced file and fails if a named test was renamed or deleted. A
+//!    green suite that no longer contains the test the walk cites proves
+//!    nothing, and this is what notices. Since S6 P0 it also fails if the
+//!    cited test is `#[ignore]`d or contains no assertion — both of which
+//!    used to satisfy it completely, reproduced against this file at
+//!    `afed0aa9`. A citation that resolves to a check which never runs is
+//!    the same lie as a citation that resolves to nothing.
 //! 3. **No drifting table.** The register below is the source of truth and
 //!    [`the_documented_walk_table_matches_the_register`] holds this doc
 //!    comment to it, so the PR-ready table and the executable one cannot
@@ -1042,6 +1047,54 @@ fn every_contract_item_is_accounted_for() {
     }
 }
 
+/// One cited function, sliced the way the citation guard needs to read it:
+/// the attributes written above its signature, and its body.
+///
+/// Line-based on purpose. The body ends at the first line that is this
+/// signature's own indentation followed by a lone `}` — rustfmt guarantees
+/// that line, and brace counting does not survive the `{{` inside a
+/// `format!` string that several of the cited tests contain.
+fn cited_function<'a>(text: &'a str, name: &str) -> Option<(Vec<&'a str>, String)> {
+    let needle = format!("fn {name}(");
+    let lines: Vec<&str> = text.lines().collect();
+    let signature = lines.iter().position(|line| line.contains(&needle))?;
+
+    let mut attributes = Vec::new();
+    for index in (0..signature).rev() {
+        let line = lines[index].trim();
+        if line.starts_with("#[") {
+            attributes.push(line);
+        } else if !line.starts_with("//") {
+            break;
+        }
+    }
+
+    let indent = &lines[signature][..lines[signature].len() - lines[signature].trim_start().len()];
+    let closing = format!("{indent}}}");
+    let mut body = String::new();
+    for line in &lines[signature + 1..] {
+        if *line == closing {
+            break;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    Some((attributes, body))
+}
+
+/// Every citation resolves — and resolves to a check that actually runs and
+/// actually asserts something.
+///
+/// The first of those three was all this guard did until S6 P0. It matched
+/// the string `fn <name>(` and nothing else, so a cited test carrying
+/// `#[ignore]`, or one whose body had been emptied, satisfied it in full: the
+/// register would keep reporting `met` while the check behind the verdict ran
+/// no code. Both cases were reproduced against this file at `afed0aa9` and
+/// both passed. A register that cannot tell a live check from a disabled one
+/// is not evidence, so the two conditions are checked here rather than left
+/// to a reader's inspection (owner standing instruction: keep the contracts
+/// enforced; the same three conditions are enforced by `a2_acceptance.rs` and
+/// `c1_acceptance.rs`).
 #[test]
 fn every_named_check_exists_in_the_suite_it_names() {
     for item in WALK {
@@ -1050,6 +1103,26 @@ fn every_named_check_exists_in_the_suite_it_names() {
             assert!(
                 text.contains(&format!("fn {}(", check.test)),
                 "item {}: {} names no `{}` — a citation that does not resolve proves nothing",
+                item.number,
+                check.file,
+                check.test
+            );
+
+            let (attributes, body) = cited_function(&text, check.test)
+                .unwrap_or_else(|| panic!("item {}: cannot slice {}", item.number, check.test));
+
+            assert!(
+                !attributes.iter().any(|line| line.contains("ignore")),
+                "item {}: {}::{} is `#[ignore]`d — a citation to a check that does not run \
+                 is a verdict with nothing behind it",
+                item.number,
+                check.file,
+                check.test
+            );
+            assert!(
+                body.contains("assert"),
+                "item {}: {}::{} contains no assertion — a citation to a check that proves \
+                 nothing is a verdict with nothing behind it",
                 item.number,
                 check.file,
                 check.test
