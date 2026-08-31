@@ -170,6 +170,81 @@ pub fn resolve_alpha(query: &str) -> f64 {
     }
 }
 
+/// The A2 §8 signal multipliers, and the path/saturation penalties — **the
+/// rerank as a score adjustment rather than an ordering key**.
+///
+/// # Why the ordering key had to go
+///
+/// [`RerankSignals::priority`]'s `[bool; 9]`, compared lexicographically
+/// before the fused score was consulted at all, meant **one fired boolean
+/// outranked any score gap**. Measured on the real estate: `sgt search
+/// "bounded judgment ladder"` returned `scripts/probe-env.sh#2`
+/// (`rrf = 0.006269652`, lexical rank 1404) above a candidate at
+/// `rrf = 0.022043160` — 28% of the score, first place. And because signal 5
+/// (`same_section_as_anchor`) is compared before signal 7 (`canonical_path`),
+/// four `tests/*.rs` helpers named `source` outranked `src/domain/source.rs`,
+/// which was the best-fused candidate of the six.
+///
+/// semble adjusts the score and sorts once by the adjusted value
+/// (`semble/ranking/penalties.py::rerank_topk`,
+/// `semble/ranking/boosting.py`). That is what this does.
+///
+/// # Provenance of every number here (R5, with one R7 mapping stated)
+///
+/// **Every constant below is a value semble ships**, in an installed
+/// dependency A2 §5/§7 already cite as prior art ([EXT-SEMBLE]). None of them
+/// was fitted to any Sergeant corpus — fitting them to our own bench would be
+/// the *live self-tuning from Work outcomes* A2 §16 forbids, and is
+/// deliberately not done.
+///
+/// | Here | semble | semble's own name |
+/// |---|---|---|
+/// | [`BOOST_EXACT_MATCH`] `3.0` | `boosting.py` | `_DEFINITION_BOOST_MULTIPLIER` |
+/// | [`BOOST_DEFINITION`] `1.5` | `boosting.py::_definition_tier` | the stem-match tier bump |
+/// | [`BOOST_WORK_CHANGED`] `1.5` | same | same |
+/// | [`BOOST_ADJACENCY`] `1.2` | `boosting.py` | `1 + _FILE_COHERENCE_BOOST_FRAC` |
+/// | [`PENALTY_NON_CANONICAL`] `0.3` | `penalties.py` | `_STRONG_PENALTY` |
+/// | [`FILE_SATURATION_DECAY`] `0.5` | `penalties.py` | `_FILE_SATURATION_DECAY` |
+///
+/// **What is R7 and not R5: which semble constant each A2 §8 signal maps
+/// to.** semble has no *Work-changed* or *structural-relationship* notion, so
+/// signals 4, 5 and 6 are mapped by stated analogy — 4 to the definition-tier
+/// bump (a provenance-strength signal), 5 and 6 to the file-coherence factor
+/// (both are adjacency signals). The numbers are adopted; the mapping is this
+/// module's judgement and is written down here so a reader can dispute it.
+///
+/// # A2 §14 and §16 are still met
+///
+/// None of these is a field, a flag or a config key — A2 §14's *"do not
+/// expose raw retrieval weight tuning in workflow files"* is met the way
+/// [`RRF_K`] meets it, by there being nothing to expose. Nothing here learns:
+/// the multipliers are constants in the binary, identical for every query and
+/// every estate, which is what separates an adopted configuration from A2
+/// §16's forbidden *trained/learned reranker*.
+pub const BOOST_EXACT_MATCH: f64 = 3.0;
+
+/// Signal 2, *"definition over reference when query is identifier-like"* —
+/// see [`BOOST_EXACT_MATCH`] for the provenance of every multiplier.
+pub const BOOST_DEFINITION: f64 = 1.5;
+
+/// Signal 4, *"Work-changed unit"*. See [`BOOST_EXACT_MATCH`].
+pub const BOOST_WORK_CHANGED: f64 = 1.5;
+
+/// Signals 5 and 6, *"same module/package/document section"* and
+/// *"inbound/outbound structural relationship"* — both adjacency to the
+/// anchor. See [`BOOST_EXACT_MATCH`].
+pub const BOOST_ADJACENCY: f64 = 1.2;
+
+/// Signal 7's negative half: a test/example/legacy path multiplies its score
+/// by this. semble's `_STRONG_PENALTY`. See [`BOOST_EXACT_MATCH`].
+pub const PENALTY_NON_CANONICAL: f64 = 0.3;
+
+/// Each chunk of a file after the first is decayed by this, per excess chunk
+/// — semble's `_FILE_SATURATION_DECAY` at `_FILE_SATURATION_THRESHOLD = 1`.
+/// Without it one file takes the whole answer: nine of ten slots, measured.
+/// See [`BOOST_EXACT_MATCH`].
+pub const FILE_SATURATION_DECAY: f64 = 0.5;
+
 /// Which of A2 §7's two rank lists a candidate appeared in, and at what rank.
 ///
 /// Kept on every [`FusedHit`] because A2 §13's trace records *"result
@@ -281,24 +356,27 @@ pub struct RerankSignals {
 }
 
 impl RerankSignals {
-    /// The rerank key: the nine signals as an array, **in A2 §8's own listing
-    /// order**, compared descending (a fired signal outranks an unfired one).
+    /// The nine signals as an array, in A2 §8's own listing order — **A2
+    /// §13's trace enumeration, no longer the ordering key.**
     ///
-    /// # Why a lexicographic array and not a score
+    /// # This used to be the order, and that was the defect
     ///
-    /// A score would need nine numbers, and A2 §14 forbids exposing raw
-    /// retrieval weight tuning while A2 §16 forbids anything learned or
-    /// self-tuning. There is no coefficient here to expose or to tune:
-    /// comparison is `bool` against `bool`, in a fixed order.
+    /// Until the semble-parity port this array was compared
+    /// *lexicographically* and the fused score only broke exact ties, so one
+    /// fired boolean outranked any score gap. Measured on the real estate:
+    /// a candidate at `rrf = 0.006269652` (lexical rank 1404) took first
+    /// place from one at `rrf = 0.022043160`; and because slot 5 is compared
+    /// before slot 7, four `tests/*.rs` helpers outranked the implementation
+    /// file that had out-fused all of them.
     ///
-    /// # Why *this* order
-    ///
-    /// Because it is the contract's, and the contract supplies no other. A2
-    /// §8 prints the nine on nine lines; any precedence among them that is
-    /// not that order would be invented here, and inventing one silently is
-    /// the failure this program keeps producing. `tests/w4_rrf_fusion.rs::
-    /// the_rerank_key_is_a2_section_8s_nine_signals_in_the_contracts_own_order`
-    /// pins the array against the contract text.
+    /// The order was never the contract's instruction. A2 §8 says *"Useful
+    /// signals include:"* and then prints nine lines; the precedence was this
+    /// module's inference from the printing order, and it is the inference
+    /// that has been replaced — by [`Self::multiplier`], whose factors are an
+    /// installed dependency's shipped constants rather than any number fitted
+    /// here. `tests/w4_rrf_fusion.rs::
+    /// the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment`
+    /// pins both halves.
     pub fn priority(&self) -> [bool; 9] {
         [
             self.exact_match,
@@ -314,10 +392,49 @@ impl RerankSignals {
     }
 
     /// How many of the nine fired — for a trace to render, never for
-    /// ordering. [`Self::priority`] is the order; a count would be a weight
-    /// system with every weight silently set to 1.
+    /// ordering. [`Self::multiplier`] is the order.
     pub fn fired(&self) -> usize {
         self.priority().iter().filter(|fired| **fired).count()
+    }
+
+    /// **A2 §8's nine signals as one multiplicative adjustment** — the
+    /// product of the multipliers of the signals that fired.
+    ///
+    /// Every signal still participates; none of them can outrank an
+    /// arbitrary score gap any more, because each is worth exactly its
+    /// factor. The three signals A2-01 turned into a boundary
+    /// ([`Self::caller_selected_source`],
+    /// [`Self::knowledge_source_requested`], [`Self::current_generation`])
+    /// are uniform across any one answer and are given no factor at all — a
+    /// constant factor on every candidate cannot reorder anything, and
+    /// pretending otherwise would be a weight with no effect.
+    ///
+    /// Signal 7 is spelled as its negative: a canonical path is the norm and
+    /// scores 1.0; a test/example/legacy path multiplies by
+    /// [`PENALTY_NON_CANONICAL`], which is semble's shape
+    /// (`penalties.py::_file_path_penalty`) and A2 §8's preference *for* the
+    /// canonical one either way.
+    pub fn multiplier(&self) -> f64 {
+        let mut factor = 1.0;
+        if self.exact_match {
+            factor *= BOOST_EXACT_MATCH;
+        }
+        if self.definition_over_reference {
+            factor *= BOOST_DEFINITION;
+        }
+        if self.work_changed_unit {
+            factor *= BOOST_WORK_CHANGED;
+        }
+        if self.same_section_as_anchor {
+            factor *= BOOST_ADJACENCY;
+        }
+        if self.structural_relationship {
+            factor *= BOOST_ADJACENCY;
+        }
+        if !self.canonical_path {
+            factor *= PENALTY_NON_CANONICAL;
+        }
+        factor
     }
 }
 
@@ -328,6 +445,12 @@ impl RerankSignals {
 pub struct FusedHit {
     /// `Σ 1/(k + rank_i(d))` over the lists this candidate appeared in.
     pub rrf: f64,
+    /// The **reranked** score: [`Self::rrf`] times A2 §8's signal
+    /// multipliers, times the path penalty, times the file-saturation decay.
+    /// `0.0` until [`rerank`] runs — [`fuse`] produces A2 §7's answer and
+    /// nothing more, which is what keeps the two steps separable and
+    /// separately testable.
+    pub adjusted: f64,
     /// Which lists it appeared in, and where — A2 §13's *"result evidence IDs
     /// + ranks"*.
     pub origins: RankOrigins,
@@ -390,20 +513,19 @@ pub fn rrf_order(left: &FusedHit, right: &FusedHit) -> std::cmp::Ordering {
         .then_with(|| left.tie_break_key().cmp(&right.tie_break_key()))
 }
 
-/// A2 §8's order: **signals first (descending, [`RerankSignals::priority`]),
-/// then the fused score, then the stated tie-break key.**
+/// A2 §8's order: **[`FusedHit::adjusted`] descending, then the stated
+/// tie-break key** — one sort over one number, exactly as semble's
+/// `rerank_topk` sorts over its penalised scores.
 ///
-/// The RRF score is not discarded — it decides every pair whose signals are
-/// identical, which is the overwhelming majority of pairs, and RRF produces
-/// exact ties constantly (a candidate at rank 5 of one list and one at rank 5
-/// of the other score identically to the last bit), which is exactly what
-/// A2 §8's second step is for.
+/// Only meaningful after [`rerank`] has filled `adjusted`; on a list fresh
+/// from [`fuse`] every `adjusted` is `0.0` and this degenerates to the
+/// tie-break key, which is why [`rerank`] computes and sorts in one call
+/// rather than exposing a comparator a caller could apply too early.
 pub fn rerank_order(left: &FusedHit, right: &FusedHit) -> std::cmp::Ordering {
     right
-        .signals
-        .priority()
-        .cmp(&left.signals.priority())
-        .then_with(|| rrf_order(left, right))
+        .adjusted
+        .total_cmp(&left.adjusted)
+        .then_with(|| left.tie_break_key().cmp(&right.tie_break_key()))
 }
 
 /// A candidate under accumulation. Two `Option`s rather than a `Vec` of
@@ -435,6 +557,7 @@ impl Accumulator {
         Accumulator {
             hit: FusedHit {
                 rrf: 0.0,
+                adjusted: 0.0,
                 origins: RankOrigins::default(),
                 signals: RerankSignals::default(),
                 source_name: source_name.to_string(),
@@ -553,8 +676,41 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit], alpha: f64) -> Vec
 }
 
 /// A2 §8's second step, applied to a list [`fuse`] produced and a caller
-/// filled the signals of. Sorts by [`rerank_order`].
+/// filled the signals of: **adjust every score, then sort by it once.**
+///
+/// semble's `penalties.py::rerank_topk`, in its order:
+///
+/// 1. each candidate's score is multiplied by its signal factor
+///    ([`RerankSignals::multiplier`], which already carries signal 7's path
+///    penalty);
+/// 2. candidates are put in that order;
+/// 3. a greedy pass decays each chunk after the first from an
+///    already-seen file by [`FILE_SATURATION_DECAY`] per excess chunk —
+///    without this one file took nine of ten slots on the real estate;
+/// 4. one final sort by the decayed score.
+///
+/// **Limit-independent by construction.** semble's `rerank_topk` takes
+/// `top_k` and exits the greedy pass early once the remaining scores cannot
+/// beat the k-th best; that early exit is an optimization whose result would
+/// still be a prefix, but it makes the adjusted scores a function of `k`.
+/// This walks every candidate instead, so `adjusted` is a function of the
+/// answer alone and `tests/w4_rrf_fusion.rs::
+/// the_fused_order_does_not_depend_on_the_callers_limit` stays true.
 pub fn rerank(hits: &mut [FusedHit]) {
+    for hit in hits.iter_mut() {
+        hit.adjusted = hit.rrf * hit.signals.multiplier();
+    }
+    hits.sort_by(rerank_order);
+
+    let mut seen_per_file: BTreeMap<String, u32> = BTreeMap::new();
+    for hit in hits.iter_mut() {
+        let path = hit.coordinate.relative_path().to_string();
+        let already = seen_per_file.entry(path).or_insert(0);
+        if *already > 0 {
+            hit.adjusted *= FILE_SATURATION_DECAY.powi(*already as i32);
+        }
+        *already += 1;
+    }
     hits.sort_by(rerank_order);
 }
 

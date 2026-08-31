@@ -64,7 +64,8 @@ use sergeant_rs::runtime::atlas::db::{
     Admissibility, AtlasDb, FusedAnswer, LexicalQuery, SourceSelector,
 };
 use sergeant_rs::runtime::atlas::fusion::{
-    ALPHA_NATURAL, ALPHA_SYMBOL, FusedHit, RRF_K, RankOrigins, RerankSignals, fuse, is_symbol_query,
+    ALPHA_NATURAL, ALPHA_SYMBOL, BOOST_ADJACENCY, BOOST_DEFINITION, BOOST_EXACT_MATCH,
+    BOOST_WORK_CHANGED, FILE_SATURATION_DECAY, FusedHit, PENALTY_NON_CANONICAL, RRF_K, RankOrigins, RerankSignals, fuse, is_symbol_query,
     rerank, resolve_alpha, rrf_contribution, rrf_order,
 };
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, LexicalHit, UnitCoordinate};
@@ -387,134 +388,114 @@ fn no_hash_map_or_hash_set_reaches_the_fusion_module() {
 
 // ------------------------------------------------- the nine, in order
 
-/// A2 §8's nine signals, **in the contract's own listing order**, is
-/// [`RerankSignals::priority`]'s array order. Setting one field at a time and
-/// asserting which slot lights up is what makes the order a pinned fact
-/// rather than a comment above a struct.
+/// **A2 §8's nine signals, now as one multiplicative score adjustment.**
 ///
-/// > exact symbol / heading / filename match
-/// > definition over reference when query is identifier-like
-/// > source explicitly selected by caller
-/// > Work-changed unit
-/// > same module/package/document section
-/// > inbound/outbound structural relationship
-/// > canonical implementation vs test/example/legacy path
-/// > knowledge source when `--type knowledge` requested
-/// > current exact generation over stale generation unless caller pinned stale
+/// *Renamed from `..._in_the_contracts_own_order` by the semble-parity wave,
+/// and rewritten rather than deleted.* The previous body asserted that the
+/// nine were compared **lexicographically in A2 §8's listing order** — that a
+/// candidate carrying signal 1 outranks one carrying every later signal,
+/// whatever the fused scores were. That is the behaviour the wave removed,
+/// and the reason is measured, not aesthetic
+/// ([`a_boolean_signal_no_longer_outranks_an_arbitrary_score_gap`],
+/// [`a_test_path_is_penalised_multiplicatively_not_ranked_after_a_later_signal`]).
+///
+/// **A2 §8 never stated an order.** Verbatim, at
+/// `A2-RETRIEVAL-INTELLIGENCE.md:151`: *"Useful signals include:"* followed by
+/// nine lines. The precedence was this module's own inference from the
+/// printing order — `fusion.rs` said so itself: *"Because it is the
+/// contract's, and the contract supplies no other."* The port replaces that
+/// **inference**, not a contract sentence. The contract's own words that do
+/// bind here — *"After RRF, reuse A1 structure/provenance rather than
+/// training another ranker"* — are still met: all nine are still computed
+/// from A1 facts, and nothing learns.
+///
+/// What this test now pins:
+///
+/// * all nine are still distinct fields, each landing in its own slot of
+///   [`RerankSignals::priority`] — which survives as A2 §13's trace
+///   enumeration, no longer as the ordering key;
+/// * each non-uniform signal moves [`RerankSignals::multiplier`] by exactly
+///   its stated factor;
+/// * the three signals A2-01 turned into a boundary contribute exactly
+///   `1.0`, because a constant factor on every candidate cannot reorder
+///   anything;
+/// * **the order is no longer lexicographic**: signal 1 promotes a candidate
+///   when its boost covers the score gap and does not when it cannot.
 #[test]
-fn the_rerank_key_is_a2_section_8s_nine_signals_in_the_contracts_own_order() {
-    let mut set: Vec<(usize, RerankSignals)> = Vec::new();
-    let mut push = |index: usize, signals: RerankSignals| set.push((index, signals));
-    push(
-        0,
-        RerankSignals {
-            exact_match: true,
-            ..Default::default()
-        },
-    );
-    push(
-        1,
-        RerankSignals {
-            definition_over_reference: true,
-            ..Default::default()
-        },
-    );
-    push(
-        2,
-        RerankSignals {
-            caller_selected_source: true,
-            ..Default::default()
-        },
-    );
-    push(
-        3,
-        RerankSignals {
-            work_changed_unit: true,
-            ..Default::default()
-        },
-    );
-    push(
-        4,
-        RerankSignals {
-            same_section_as_anchor: true,
-            ..Default::default()
-        },
-    );
-    push(
-        5,
-        RerankSignals {
-            structural_relationship: true,
-            ..Default::default()
-        },
-    );
-    push(
-        6,
-        RerankSignals {
-            canonical_path: true,
-            ..Default::default()
-        },
-    );
-    push(
-        7,
-        RerankSignals {
-            knowledge_source_requested: true,
-            ..Default::default()
-        },
-    );
-    push(
-        8,
-        RerankSignals {
-            current_generation: true,
-            ..Default::default()
-        },
-    );
-    assert_eq!(set.len(), 9, "A2 §8 lists nine signals");
-    for (index, signals) in &set {
+fn the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment() {
+    let one = |set: fn(&mut RerankSignals)| {
+        let mut signals = RerankSignals::default();
+        // Signal 7 fires *positively* for a canonical path, so the neutral
+        // baseline has it set; every other signal is off.
+        signals.canonical_path = true;
+        set(&mut signals);
+        signals
+    };
+    let neutral = one(|_| {});
+    assert_eq!(neutral.multiplier(), 1.0, "the neutral baseline is 1.0");
+
+    let cases: [(usize, fn(&mut RerankSignals), f64); 9] = [
+        (0, |s| s.exact_match = true, BOOST_EXACT_MATCH),
+        (1, |s| s.definition_over_reference = true, BOOST_DEFINITION),
+        (2, |s| s.caller_selected_source = true, 1.0),
+        (3, |s| s.work_changed_unit = true, BOOST_WORK_CHANGED),
+        (4, |s| s.same_section_as_anchor = true, BOOST_ADJACENCY),
+        (5, |s| s.structural_relationship = true, BOOST_ADJACENCY),
+        (6, |s| s.canonical_path = false, PENALTY_NON_CANONICAL),
+        (7, |s| s.knowledge_source_requested = true, 1.0),
+        (8, |s| s.current_generation = true, 1.0),
+    ];
+    assert_eq!(cases.len(), 9, "A2 §8 lists nine signals");
+    for (index, set, factor) in cases {
+        let signals = one(set);
         let key = signals.priority();
         assert_eq!(key.len(), 9);
-        assert_eq!(signals.fired(), 1);
-        assert!(key[*index], "signal {index} did not land in slot {index}");
         assert_eq!(
-            key.iter().filter(|fired| **fired).count(),
-            1,
-            "signal {index} lit more than one slot"
+            key[index],
+            index != 6,
+            "signal {index} did not land in slot {index}"
+        );
+        assert!(
+            (signals.multiplier() - factor).abs() < 1e-12,
+            "signal {index} is worth {} not {factor}",
+            signals.multiplier()
         );
     }
-    // And the earlier signal wins: a candidate with signal 1 outranks one
-    // with every later signal, which is the contract's order doing the work.
-    let first = FusedHit {
-        rrf: 0.0,
-        origins: RankOrigins::default(),
-        signals: set[0].1,
-        source_name: "s".to_string(),
-        source_kind: SourceKind::EstateGit,
-        authority_class: AuthorityClass::EstateMutable,
-        generation_id: "g".to_string(),
-        content_key: "c".to_string(),
-        unit_key: "u1".to_string(),
-        coordinate: coordinate("a.rs", "a"),
+
+    // The three uniform signals are worth exactly nothing, together or apart.
+    let all_uniform = RerankSignals {
+        canonical_path: true,
+        caller_selected_source: true,
+        knowledge_source_requested: true,
+        current_generation: true,
+        ..Default::default()
     };
-    let later = FusedHit {
-        signals: RerankSignals {
-            exact_match: false,
-            definition_over_reference: true,
-            caller_selected_source: true,
-            work_changed_unit: true,
-            same_section_as_anchor: true,
-            structural_relationship: true,
-            canonical_path: true,
-            knowledge_source_requested: true,
-            current_generation: true,
-        },
-        rrf: 1.0,
-        unit_key: "u2".to_string(),
-        ..first.clone()
+    assert_eq!(all_uniform.multiplier(), 1.0);
+
+    // And the order is a score, not a precedence: signal 1 promotes when its
+    // boost covers the gap, and does not when it cannot. Under the previous
+    // lexicographic key the second case would still have promoted `u1`.
+    let gap_covered = {
+        let mut hits = vec![
+            scored("b.rs", "u2", 0.010, neutral),
+            scored("a.rs", "u1", 0.005, one(|s| s.exact_match = true)),
+        ];
+        rerank(&mut hits);
+        hits[0].unit_key.clone()
     };
-    let mut hits = vec![later, first];
-    rerank(&mut hits);
+    assert_eq!(gap_covered, "u1", "0.005 x 3.0 = 0.015 must beat 0.010");
+
+    let gap_too_wide = {
+        let mut hits = vec![
+            scored("b.rs", "u2", 0.100, neutral),
+            scored("a.rs", "u1", 0.005, one(|s| s.exact_match = true)),
+        ];
+        rerank(&mut hits);
+        hits[0].unit_key.clone()
+    };
     assert_eq!(
-        hits[0].unit_key, "u1",
-        "A2 §8's first signal must outrank every later one"
+        gap_too_wide, "u2",
+        "0.005 x 3.0 = 0.015 must NOT beat 0.100 — this is the whole change"
     );
 }
 
@@ -1218,6 +1199,194 @@ fn an_exact_name_match_is_promoted_over_a_better_fused_score() {
         paths(&hits),
         vec!["a.rs", "b.rs"],
         "A2 §8's exact-match signal must be able to reorder A2 §7's output"
+    );
+}
+
+
+// ------------------------------- step (d): the rerank adjusts, it does not outrank
+
+/// A bare [`FusedHit`] at a stated score, for the score-arithmetic tests.
+fn scored(path: &str, unit: &str, rrf: f64, signals: RerankSignals) -> FusedHit {
+    FusedHit {
+        rrf,
+        adjusted: 0.0,
+        origins: RankOrigins::default(),
+        signals,
+        source_name: "s".to_string(),
+        source_kind: SourceKind::EstateGit,
+        authority_class: AuthorityClass::EstateMutable,
+        generation_id: "g".to_string(),
+        content_key: "c".to_string(),
+        unit_key: unit.to_string(),
+        coordinate: coordinate(path, "sym"),
+    }
+}
+
+/// **The measured inversion, in a unit test.** `sgt search "bounded judgment
+/// ladder"` put `scripts/probe-env.sh#2` (`rrf = 0.006269652`, lexical rank
+/// 1404) *above* `.../40-classify/CONTEXT.md#4` (`rrf = 0.022043160`, lexical
+/// rank 1) — 28% of the score, first place — because the old
+/// [`rerank`] compared `signals.priority()`, a `[bool; 9]`,
+/// **lexicographically before it looked at the score at all**. One boolean
+/// outranked a 3.5× score gap.
+///
+/// semble instead *adjusts* the score and sorts by the adjusted value
+/// (`semble/ranking/penalties.py::rerank_topk`). A signal can still promote a
+/// candidate — [`an_exact_name_match_is_promoted_when_its_boost_covers_the_gap`]
+/// shows it doing exactly that — but only by as much as its multiplier is
+/// worth.
+///
+/// **Non-vacuous:** under the previous lexicographic key this asserts the
+/// opposite of what the code did, which is the captured red for this commit.
+#[test]
+fn a_boolean_signal_no_longer_outranks_an_arbitrary_score_gap() {
+    let weak_but_flagged = scored(
+        "scripts/probe-env.sh",
+        "u-probe",
+        0.006_269_652,
+        RerankSignals {
+            exact_match: true,
+            ..Default::default()
+        },
+    );
+    let strong_and_plain = scored(
+        "docs/40-classify/CONTEXT.md",
+        "u-context",
+        0.022_043_160,
+        RerankSignals::default(),
+    );
+    // The boost is real and bounded: 3× the weak score still does not reach
+    // the strong one, which is the whole claim.
+    assert!(
+        weak_but_flagged.rrf * BOOST_EXACT_MATCH < strong_and_plain.rrf,
+        "the fixture only discriminates if the boost cannot cover the gap"
+    );
+
+    let mut hits = vec![weak_but_flagged, strong_and_plain];
+    rerank(&mut hits);
+    assert_eq!(
+        hits[0].unit_key, "u-context",
+        "a single fired boolean outranked a 3.5x better fused score"
+    );
+}
+
+/// **The other measured inversion.** `sgt search "knowledge source offline
+/// only"` put four `tests/*.rs` helpers named `source` above
+/// `src/domain/source.rs`, which was the *best-fused* candidate of the six,
+/// because A2 §8's signal 5 (`same_section_as_anchor`) is compared **before**
+/// signal 7 (`canonical_path`) in a lexicographic key — so being in the
+/// anchor's directory beat being the implementation.
+///
+/// semble has no such ordering: a test path is a **multiplicative penalty**
+/// on the score (`penalties.py::_file_path_penalty`, `_STRONG_PENALTY = 0.3`
+/// for test files, test dirs, compat dirs and example dirs), applied to
+/// every candidate before the single sort.
+///
+/// **Non-vacuous:** the flagged candidate carries signal 5 and the plain one
+/// does not, so under the old lexicographic key the test path wins — which
+/// is what it did on the real estate.
+#[test]
+fn a_test_path_is_penalised_multiplicatively_not_ranked_after_a_later_signal() {
+    let test_helper = scored(
+        "tests/x2_knowledge_sources.rs",
+        "u-test",
+        0.013_333,
+        RerankSignals {
+            same_section_as_anchor: true,
+            canonical_path: false,
+            ..Default::default()
+        },
+    );
+    let implementation = scored(
+        "src/domain/source.rs",
+        "u-impl",
+        0.014_493,
+        RerankSignals {
+            canonical_path: true,
+            ..Default::default()
+        },
+    );
+    assert!(
+        test_helper.rrf < implementation.rrf,
+        "the fixture must keep the implementation the better-fused candidate"
+    );
+
+    let mut hits = vec![test_helper, implementation];
+    rerank(&mut hits);
+    assert_eq!(
+        hits[0].unit_key, "u-impl",
+        "a test path outranked the implementation on a mid-list signal"
+    );
+    // Its own signal 5 still boosts it by BOOST_ADJACENCY; the penalty then
+    // multiplies that. Both factors are visible in the number.
+    let expected = hits[1].rrf * BOOST_ADJACENCY * PENALTY_NON_CANONICAL;
+    assert!(
+        (hits[1].adjusted - expected).abs() < 1e-12,
+        "the test path's score was not actually penalised: {} from {} (expected {expected})",
+        hits[1].adjusted,
+        hits[1].rrf
+    );
+}
+
+/// **The finding the brief did not name (orientation §3e): one file took nine
+/// of ten slots.** `sgt search "bounded judgment ladder"` returned nine chunks
+/// of one `CONTEXT.md` at ranks 2–10. We had no per-file control at all.
+///
+/// semble does: `penalties.py::rerank_topk` decays each additional chunk from
+/// an already-selected file by `_FILE_SATURATION_DECAY = 0.5` per excess
+/// chunk, greedily, in the ranked order (`_FILE_SATURATION_THRESHOLD = 1`).
+///
+/// **Non-vacuous:** with no decay, the six `busy.md` chunks all outscore
+/// `other.md` and it never reaches the top three.
+#[test]
+fn a_second_chunk_of_the_same_file_is_decayed_so_one_file_cannot_take_every_slot() {
+    let mut hits: Vec<FusedHit> = (0..6)
+        .map(|i| {
+            scored(
+                "docs/busy.md",
+                &format!("u-busy-{i}"),
+                0.020 - 0.000_1 * f64::from(i),
+                RerankSignals {
+                    canonical_path: true,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    hits.push(scored(
+        "docs/other.md",
+        "u-other",
+        0.008,
+        RerankSignals {
+            canonical_path: true,
+            ..Default::default()
+        },
+    ));
+    // Without decay every busy.md chunk beats other.md outright.
+    assert!(
+        hits.iter()
+            .filter(|h| h.coordinate.relative_path() == "docs/busy.md")
+            .all(|h| h.rrf > 0.008),
+        "the fixture only discriminates if the crowded file wins on raw score"
+    );
+
+    rerank(&mut hits);
+    let order: Vec<&str> = hits.iter().map(|h| h.unit_key.as_str()).collect();
+    assert_eq!(order[0], "u-busy-0", "the file's best chunk keeps its score");
+    assert!(
+        order[..3].contains(&"u-other"),
+        "one file still took the whole head of the answer: {order:?}"
+    );
+    // The decay is 0.5 per excess chunk, exactly semble's constant.
+    let second_busy = hits
+        .iter()
+        .find(|h| h.unit_key == "u-busy-1")
+        .expect("second chunk");
+    assert!(
+        (second_busy.adjusted - second_busy.rrf * FILE_SATURATION_DECAY).abs() < 1e-12,
+        "second chunk of a file was not decayed by {FILE_SATURATION_DECAY}: {} from {}",
+        second_busy.adjusted,
+        second_busy.rrf
     );
 }
 

@@ -321,7 +321,7 @@ const WALK: &[Item] = &[
             ),
             at(
                 "tests/w4_rrf_fusion.rs",
-                "the_rerank_key_is_a2_section_8s_nine_signals_in_the_contracts_own_order",
+                "the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment",
             ),
             at(
                 "tests/w4_rrf_fusion.rs",

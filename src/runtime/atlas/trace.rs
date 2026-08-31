@@ -94,13 +94,19 @@ pub const LEXICAL_TOKENIZER_VERSION: &str = "1";
 /// One string for both halves because A2 §7 and §8 are one policy in this
 /// build: RRF at [`RRF_K`], α-blended per
 /// [`crate::runtime::atlas::fusion::resolve_alpha`], then A2 §8's nine
-/// signals. Pinned by `tests/w5_search_surface.rs::
+/// signals applied as a **multiplicative score adjustment**
+/// ([`crate::runtime::atlas::fusion::RerankSignals::multiplier`]) with a path
+/// penalty and a per-file saturation decay. Pinned by
+/// `tests/w5_search_surface.rs::
 /// the_retrieval_policy_version_is_pinned_to_the_actual_rrf_and_rerank_policy`.
 ///
-/// **`/2` — the semble-parity port's α blend.** `/1` described an unweighted
-/// `1/(k+r_lex) + 1/(k+r_sem)`; leaving it unchanged would have made A2
-/// §13's own provenance field state a policy this build no longer runs.
-pub const RETRIEVAL_POLICY_VERSION: &str = "rrf-k60+alpha-blend+a2s8-nine-signals/2";
+/// **The semble-parity port moved this twice.** `/1` described an unweighted
+/// `1/(k+r_lex) + 1/(k+r_sem)` and a rerank that compared A2 §8's nine
+/// signals lexicographically ahead of the score; `/2` added the α blend; `/3`
+/// is the score-adjusting rerank. Each bump landed in the commit that changed
+/// the behaviour — a trace field naming a policy the build no longer runs is
+/// a false provenance record, not a saved test.
+pub const RETRIEVAL_POLICY_VERSION: &str = "rrf-k60+alpha-blend+a2s8-score-adjust/3";
 
 /// A2 §13's *"retrieval generation"*, the half that is not a stored id.
 ///
