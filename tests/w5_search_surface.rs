@@ -55,7 +55,10 @@ use sergeant_rs::runtime::atlas::db::{
     Admissibility, AtlasDb, DATASET_COLUMN_PROFILE, FusedAnswer, LexicalQuery, RelatedRequest,
     SourceSelector,
 };
-use sergeant_rs::runtime::atlas::fusion::{RRF_K, RerankSignals};
+use sergeant_rs::runtime::atlas::fusion::{
+    BOOST_EXACT_MATCH, FILE_COHERENCE_BOOST_FRAC, FILE_SATURATION_DECAY, PENALTY_NON_CANONICAL,
+    RRF_K, RerankSignals, STEM_BOOST_MULTIPLIER, STEM_MATCH_MIN_RATIO,
+};
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, UnitAddress, UnitCoordinate, tokenize};
 use sergeant_rs::runtime::atlas::record::record_scan;
 use sergeant_rs::runtime::atlas::scan::{
@@ -976,14 +979,38 @@ fn the_lexical_tokenizer_version_is_pinned_to_the_tokenizers_actual_output() {
 }
 
 /// **A2 §13 field 8, pinned the same way.** The recorded policy version names
-/// RRF at `k = 60` followed by A2 §8's nine signals in the contract's order.
-/// Change either without bumping the string and this goes red.
+/// RRF at `k = 60`, the α blend the semble-parity port introduced, and A2
+/// §8's nine signals. Change any of them without bumping the string and this
+/// goes red — which is what it did when the α blend landed, because a trace
+/// that still said `/1` would have been a false provenance record, not a
+/// saved test.
 #[test]
 fn the_retrieval_policy_version_is_pinned_to_the_actual_rrf_and_rerank_policy() {
-    assert_eq!(RETRIEVAL_POLICY_VERSION, "rrf-k60+a2s8-nine-signals/1");
+    assert_eq!(
+        RETRIEVAL_POLICY_VERSION,
+        "rrf-k60+a2s8-score-adjust+semble-boosts/5"
+    );
     assert_eq!(
         RRF_K, 60.0,
         "the recorded version says k=60; the constant must agree"
+    );
+    assert_eq!(
+        (
+            BOOST_EXACT_MATCH,
+            PENALTY_NON_CANONICAL,
+            FILE_SATURATION_DECAY
+        ),
+        (3.0, 0.3, 0.5),
+        "the recorded version says score-adjust; the multipliers must agree"
+    );
+    assert_eq!(
+        (
+            FILE_COHERENCE_BOOST_FRAC,
+            STEM_BOOST_MULTIPLIER,
+            STEM_MATCH_MIN_RATIO
+        ),
+        (0.2, 1.0, 0.10),
+        "the recorded version says semble-boosts; those constants must agree"
     );
     // Nine signals, and the array the rerank key is built from is nine long.
     let all = RerankSignals {

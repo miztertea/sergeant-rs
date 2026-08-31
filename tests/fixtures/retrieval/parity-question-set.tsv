@@ -1,0 +1,79 @@
+# Retrieval relevance question set — the semble-parity wave, 2026-08-31.
+#
+# 52 questions, EVERY answer hand-verified by opening the file and confirming
+# the symbol, heading or content that answers it. Eight questions is an
+# anecdote and a ranking fix overfits to one; this set spans code, symbol
+# lookups, doctrine/prose, config, the estate's knowledge library and the
+# harness's own memory notes.
+#
+# Columns are TAB separated:
+#   id        stable identifier, category-prefixed
+#   category  code | symbol | doctrine | config | knowledge | memory
+#   query     asked the way a developer would ask it, NOT lifted from the
+#             target file's own wording (that would measure lexical echo)
+#   accept    comma-separated `<source>:<relative-path>`; more than one only
+#             where two paths are genuinely the same answer (a symlink, a
+#             file mirrored under two declared sources, or the owning
+#             document plus the context file that quotes it)
+#
+# `tests/w4a_retrieval_floor.rs` consumes the `sergeant-rs:` rows — the ones
+# whose answers live in this repository and can therefore be scanned in CI.
+# The knowledge-library / agent-memory / sergeant-rs-workspace rows are the
+# estate-wide half of the same set and are measured out of tree; they are
+# committed here because a question set split across two files stops being
+# one question set.
+#
+# Verified against ef66bfe81a3b5e3306711df87f10644d345ff7f9.
+id	category	query	accept
+c01	code	interprocess repository lock	sergeant-rs:src/runtime/repolock.rs
+c02	code	content addressed blob store	sergeant-rs:src/runtime/blob.rs
+c03	code	prune old journal history bounded retention	sergeant-rs:src/runtime/prune.rs
+c04	code	BM25 scoring of identifier tokens	sergeant-rs:src/runtime/atlas/lexical.rs
+c05	code	embedding vectors and cosine similarity	sergeant-rs:src/runtime/atlas/semantic.rs
+c06	code	reciprocal rank fusion	sergeant-rs:src/runtime/atlas/fusion.rs
+c07	code	git preflight checks before a work is admitted	sergeant-rs:src/runtime/preflight.rs
+c08	code	recover executions after the daemon restarts	sergeant-rs:src/runtime/recovery.rs
+c09	code	parse an eml mail message	sergeant-rs:src/runtime/atlas/mail.rs
+c10	code	extract text from word and powerpoint documents	sergeant-rs:src/runtime/atlas/office.rs
+c11	code	tabular dataset column allowlist	sergeant-rs:src/runtime/atlas/tabular.rs
+c12	code	run the installed git binary as a subprocess	sergeant-rs:src/runtime/git.rs
+c13	code	edit sergeant.toml while preserving comments	sergeant-rs:src/domain/manifest.rs
+c14	code	codex exec adapter	sergeant-rs:src/backend/codex.rs
+c15	code	watch for work transitions over server sent events	sergeant-rs:src/watch.rs
+c16	code	create a linked git worktree for a work surface	sergeant-rs:src/runtime/surface.rs
+c17	code	append only event journal segments	sergeant-rs:src/runtime/journal.rs
+c18	code	walk a knowledge folder and index its files	sergeant-rs:src/runtime/atlas/scan.rs
+c19	code	tree-sitter symbol extraction	sergeant-rs:src/runtime/atlas/syntax.rs
+c20	code	the http api routes the daemon serves	sergeant-rs:src/api.rs
+s01	symbol	fused_search	sergeant-rs:src/runtime/atlas/db.rs
+s02	symbol	is_canonical_path	sergeant-rs:src/runtime/atlas/fusion.rs
+s03	symbol	RRF_K	sergeant-rs:src/runtime/atlas/fusion.rs
+s04	symbol	BM25_K1	sergeant-rs:src/runtime/atlas/lexical.rs
+s05	symbol	SourceKind	sergeant-rs:src/domain/source.rs
+s06	symbol	MAX_ROWS	sergeant-rs:src/runtime/atlas/db.rs
+s07	symbol	rrf_contribution	sergeant-rs:src/runtime/atlas/fusion.rs
+s08	symbol	AuthorityClass	sergeant-rs:src/domain/source.rs
+d01	doctrine	bounded judgment ladder	sergeant-rs:AGENTS.md,sergeant-rs:CLAUDE.md,sergeant-rs-workspace:AGENTS.md,sergeant-rs-workspace:CLAUDE.md,sergeant-rs-workspace:.sergeant/common/contexts/bounded-judgment.md
+d02	doctrine	ponytail minimality ladder	sergeant-rs:AGENTS.md,sergeant-rs:CLAUDE.md,sergeant-rs-workspace:AGENTS.md,sergeant-rs-workspace:CLAUDE.md
+d03	doctrine	rules for changing sergeant-rs own code and CI	sergeant-rs:CONTRIBUTING.md
+d04	doctrine	how atlas indexes knowledge sources	sergeant-rs:docs/concepts/atlas-and-knowledge.md
+d05	doctrine	the states a work can be in	sergeant-rs:docs/reference/work-states.md
+d06	doctrine	reference for every key in the estate manifest	sergeant-rs:docs/reference/sergeant-toml.md
+d07	doctrine	how do I install sergeant	sergeant-rs:docs/getting-started/install.md
+d08	doctrine	security and trust model	sergeant-rs:docs/concepts/security-and-trust.md
+d09	doctrine	captain and sergeant division of labour	sergeant-rs:docs/concepts/captain-and-sergeant.md
+d10	doctrine	glossary of sergeant terms	sergeant-rs:docs/reference/glossary-and-support.md
+g01	config	dependency license and ban policy	sergeant-rs:deny.toml
+g02	config	which rust toolchain channel is pinned	sergeant-rs:rust-toolchain.toml
+g03	config	crate dependencies and package metadata	sergeant-rs:Cargo.toml
+g04	config	which test suites the coverage gate runs	sergeant-rs:scripts/coverage/c2-suites.sh
+k01	knowledge	ruling that there is only one atlas database	knowledge-library:rulings/owner-rulings/one-atlas-database-2026-08-29.md
+k02	knowledge	decision record for bounded retention	knowledge-library:rulings/adr/0019-bounded-retention.md
+k03	knowledge	a pull request is a request	knowledge-library:rulings/adr/0015-a-pull-request-is-a-request.md
+k04	knowledge	external git acquisition never fetches	knowledge-library:rulings/adr/0023-external-git-acquisition-scopes-never-fetches.md
+k05	knowledge	ruling adopting anydoc	knowledge-library:rulings/owner-rulings/anydoc-adoption-2026-08-27.md
+k06	knowledge	decision record for the codex adapter	knowledge-library:rulings/adr/0020-codex-adapter.md
+m01	memory	cold cargo build blows the work ceiling	agent-memory:captain-warms-the-cache.md
+m02	memory	do not build under tmp because of the tmpfs quota	agent-memory:tmpfs-quota-no-builds-in-scratchpad.md
+m03	memory	which model subagents should use	agent-memory:subagent-model-policy.md
+m04	memory	never assert what a document says from memory	agent-memory:read-first-always.md

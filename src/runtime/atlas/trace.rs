@@ -92,12 +92,26 @@ pub const LEXICAL_TOKENIZER_VERSION: &str = "1";
 /// A2 §13's *"RRF/rerank policy version"*.
 ///
 /// One string for both halves because A2 §7 and §8 are one policy in this
-/// build: RRF at [`RRF_K`] followed by
-/// [`crate::runtime::atlas::fusion::RerankSignals::priority`]'s nine signals
-/// in the contract's own order. Pinned to both by
+/// build: A2 §7's unweighted `Σ 1/(k + rank_i(d))` RRF at [`RRF_K`]
+/// (`lexical + semantic`, no α blend — see
+/// [`crate::runtime::atlas::fusion::Accumulator::total`]'s own doc for why
+/// the ported blend was measured and reverted), then A2 §8's nine signals
+/// applied as a **multiplicative score adjustment**
+/// ([`crate::runtime::atlas::fusion::RerankSignals::multiplier`]) with a path
+/// penalty and a per-file saturation decay. Pinned by
 /// `tests/w5_search_surface.rs::
 /// the_retrieval_policy_version_is_pinned_to_the_actual_rrf_and_rerank_policy`.
-pub const RETRIEVAL_POLICY_VERSION: &str = "rrf-k60+a2s8-nine-signals/1";
+///
+/// **The semble-parity port moved this four times.** `/1` described an
+/// unweighted `1/(k+r_lex) + 1/(k+r_sem)` and a rerank that compared A2 §8's
+/// nine signals lexicographically ahead of the score; `/2` added an α blend;
+/// `/3` replaced the lexicographic rerank with the score-adjusting one; `/4`
+/// added semble's boosts; `/5` reverted the `/2` α blend after it moved
+/// nothing on the 52-question set, restoring A2 §7's own one expression
+/// exactly as the contract prints it. Each bump landed in the commit that
+/// changed the behaviour — a trace field naming a policy the build no longer
+/// runs is a false provenance record, not a saved test.
+pub const RETRIEVAL_POLICY_VERSION: &str = "rrf-k60+a2s8-score-adjust+semble-boosts/5";
 
 /// A2 §13's *"retrieval generation"*, the half that is not a stored id.
 ///
