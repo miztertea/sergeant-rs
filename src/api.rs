@@ -542,6 +542,157 @@ pub struct ApiState {
     /// Last time [`maybe_run_periodic_sweep`] actually ran, so the interval
     /// above throttles across ticks rather than per-request.
     pub last_swept: Arc<std::sync::Mutex<Option<Instant>>>,
+    /// S6 scan front door: every estate-scoped scan this daemon has
+    /// accepted since it started, in-flight and recently finished
+    /// ([`ScanTracker`]).
+    ///
+    /// **Not** authority. The journal's `intelligence.scan.started` /
+    /// `intelligence.scan.completed` pair is the durable record (A1-01:
+    /// journal remains authority); this is the live progress a polling
+    /// client reads while the scan is still running, and it deliberately
+    /// dies with the process.
+    pub scans: ScanTracker,
+}
+
+/// How many finished scans [`ScanTracker`] keeps addressable.
+///
+/// A poll surface needs the scan the caller just started to still be
+/// there when it asks; it does not need every scan this daemon ever ran —
+/// that is the journal's job, and keeping them all would be an unbounded
+/// map on a long-lived process (R7: the minimum that answers the poll).
+const RETAINED_SCANS: usize = 16;
+
+/// One estate-scoped scan as the poll surface sees it: what it undertook
+/// to cover, what has finished so far, and whether it is done.
+#[derive(Debug, Clone)]
+pub struct ScanProgress {
+    /// The estate this scan addressed.
+    estate_root: String,
+    /// When it was accepted (RFC3339 UTC).
+    started: String,
+    /// When the last source finished — `None` while it is still running.
+    /// This field, not a row count, is what `state` is derived from.
+    completed: Option<String>,
+    /// One `{source, kind}` per source the scan undertook to cover, named
+    /// up front so a client can see 2-of-5 rather than "2 so far".
+    planned: Vec<Value>,
+    /// Finished per-source rows, in completion order — the same rows the
+    /// synchronous response used to return all at once.
+    rows: Vec<Value>,
+}
+
+/// The daemon's live scan-progress map (see [`ApiState::scans`]).
+///
+/// A plain `std::sync::Mutex`, not a tokio one: every critical section
+/// here is a few map operations with no `await` inside, exactly like
+/// [`ApiState::last_swept`]. A poisoned lock is recovered from rather than
+/// propagated — a panic elsewhere must not make a running scan
+/// unobservable, which is the failure mode this whole wave exists to
+/// remove.
+#[derive(Debug, Clone, Default)]
+pub struct ScanTracker(Arc<std::sync::Mutex<BTreeMap<String, ScanProgress>>>);
+
+impl ScanTracker {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, ScanProgress>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Register an accepted scan before its first source is touched.
+    fn begin(&self, scan_id: &str, estate_root: &str, planned: Vec<Value>) -> ScanProgress {
+        let progress = ScanProgress {
+            estate_root: estate_root.to_string(),
+            started: rfc3339_utc_now(),
+            completed: None,
+            planned,
+            rows: Vec::new(),
+        };
+        self.lock().insert(scan_id.to_string(), progress.clone());
+        progress
+    }
+
+    /// Record one finished source. Dropped silently if the scan is no
+    /// longer tracked (only possible once it has been pruned), because the
+    /// journal already holds the durable record.
+    fn push(&self, scan_id: &str, row: Value) {
+        if let Some(progress) = self.lock().get_mut(scan_id) {
+            progress.rows.push(row);
+        }
+    }
+
+    /// Mark a scan finished and prune the oldest scans past
+    /// [`RETAINED_SCANS`], regardless of whether they ever finished. Keys
+    /// are ULIDs, so map order is start order.
+    ///
+    /// Pruning used to search only for entries with `completed.is_some()`,
+    /// which meant a task that never reached this method at all — stuck
+    /// indefinitely on a hanging source, or terminated by a panic before
+    /// this line ran — left a `completed: None` entry invisible to that
+    /// search forever: every later scan's `finish()` would find no
+    /// completed entry to remove and stop, so the map grew without bound
+    /// (F-IN-01). Evicting the oldest *entry*, completed or not, is what
+    /// actually keeps [`ApiState::scans`] the bounded map its own doc
+    /// comment claims: a scan that can never finish still ages out once
+    /// enough newer scans have started, exactly like one that finished
+    /// normally.
+    fn finish(&self, scan_id: &str) {
+        let mut scans = self.lock();
+        if let Some(progress) = scans.get_mut(scan_id) {
+            progress.completed = Some(rfc3339_utc_now());
+        }
+        while scans.len() > RETAINED_SCANS {
+            let Some(oldest) = scans.keys().next().cloned() else {
+                break;
+            };
+            scans.remove(&oldest);
+        }
+    }
+
+    /// This scan's current state, if it is still tracked.
+    pub fn snapshot(&self, scan_id: &str) -> Option<ScanProgress> {
+        self.lock().get(scan_id).cloned()
+    }
+}
+
+/// One [`ScanProgress`] rendered for `POST /v1/intelligence/scan`'s
+/// acceptance and `GET /v1/intelligence/scan/{id}`'s poll — the same shape
+/// from both, so a client parses one thing.
+///
+/// `state` is `"completed"` only when the scan actually finished; it is
+/// never inferred from `completed_sources == total_sources`, because a
+/// scan whose last source has been reported but whose completion event is
+/// not yet journaled has not finished.
+fn scan_status_json(scan_id: &str, progress: &ScanProgress) -> Value {
+    json!({
+        "scan_id": scan_id,
+        "estate_root": progress.estate_root,
+        "state": if progress.completed.is_some() { "completed" } else { "running" },
+        "started": progress.started,
+        "completed": progress.completed,
+        "total_sources": progress.planned.len(),
+        "completed_sources": progress.rows.len(),
+        "sources": progress.planned,
+        "scanned": progress.rows,
+    })
+}
+
+/// The per-source rows one running scan appends as each source finishes.
+///
+/// Deliberately shaped so the scan body's own `report.push(row)` calls are
+/// unchanged from the synchronous version they replace: the difference is
+/// *where* the row goes — straight onto the tracked scan, visible to the
+/// next poll, instead of into a local `Vec` nobody can see until the whole
+/// scan returns.
+struct ScanReport {
+    tracker: ScanTracker,
+    scan_id: String,
+}
+
+impl ScanReport {
+    fn push(&self, row: Value) {
+        self.tracker.push(&self.scan_id, row);
+    }
 }
 
 /// Build the axum router for the full v1 surface.
@@ -585,6 +736,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/intelligence/status", get(intelligence_status))
         // S4 Y5, G8/G6: the scan trigger, and item 10's acquisition surface.
         .route("/intelligence/scan", post(intelligence_scan))
+        // S6 scan front door: the poll surface for one accepted scan. A
+        // GET, because asking how a scan is going changes nothing.
+        .route(
+            "/intelligence/scan/{scan_id}",
+            get(intelligence_scan_status),
+        )
         .route(
             "/intelligence/sources",
             get(intelligence_sources).post(intelligence_add_source),
@@ -5330,6 +5487,19 @@ async fn run_work_overlay_hook(
 /// Scheduling and cadence are deliberately not here (G10): one call, one
 /// scan, one report — a recurring trigger is a later wave's, when retrieval
 /// needs one.
+///
+/// **The call accepts; it does not wait (S6 scan front door).** It returns
+/// `202` with a `scan_id` and the list of sources the scan undertook to
+/// cover, and the scan runs on its own task
+/// ([`run_estate_scan`]). Progress and completion are read from
+/// `GET /v1/intelligence/scan/{scan_id}`, and both ends of the run are
+/// journaled (`intelligence.scan.started` / `intelligence.scan.completed`).
+/// Answering the whole scan inside the request is what made this verb
+/// report failure while succeeding: a five-source estate takes minutes and
+/// the client's request timeout is seconds, so the caller got a transport
+/// error on a scan that was completing. Raising that timeout was the
+/// alternative and was rejected — it re-derives a number per estate size,
+/// the class of bound #278 retired.
 async fn intelligence_scan(
     State(state): State<ApiState>,
     body: Result<Json<ScanRequest>, JsonRejection>,
@@ -5387,7 +5557,93 @@ async fn intelligence_scan(
         .into_response();
     }
 
-    let mut report = Vec::new();
+    // Everything above this line is what the request itself can be
+    // refused for (a bad command id, a root that is not an estate, an
+    // estate whose `[[repo]]` mount does not validate, an Atlas that will
+    // not open). Those stay synchronous refusals with their existing
+    // status codes: they are known before any source is touched, and a
+    // caller must still learn them from the call it made.
+    //
+    // The scan itself does not. It is minutes of work over every declared
+    // source, and answering it inside this request is what made the front
+    // door lie: the client's own request timeout fires long before the
+    // work finishes, so `sgt intelligence scan` printed a transport error
+    // on a scan that was succeeding (measured on the sergeant-rs-workspace
+    // estate, five sources: `error sending request` after ~10s, every
+    // time, while the daemon carried on indexing). So the accepted scan is
+    // registered, journaled as started, spawned, and named back to the
+    // caller — who polls `GET /v1/intelligence/scan/{id}` for progress and
+    // completion.
+    let scan_id = ulid::Ulid::generate().to_string();
+    let planned: Vec<Value> = estate
+        .repositories
+        .iter()
+        .map(|r| json!({"source": r.name, "kind": "estate_git"}))
+        .chain(
+            estate
+                .knowledge
+                .iter()
+                .map(|k| json!({"source": k.name, "kind": "local_knowledge"})),
+        )
+        .chain(
+            external_sources
+                .iter()
+                .map(|e| json!({"source": e.source_name, "kind": "external_git"})),
+        )
+        .collect();
+    let root_display = root.display().to_string();
+    let progress = state.scans.begin(&scan_id, &root_display, planned.clone());
+    journal_scan_event(
+        &state,
+        crate::domain::source::KIND_INTELLIGENCE_SCAN_STARTED,
+        &root_display,
+        json!({
+            "scan_id": scan_id,
+            "estate_root": root_display,
+            "sources": planned,
+            "total_sources": planned.len(),
+        }),
+    )
+    .await;
+    let accepted = scan_status_json(&scan_id, &progress);
+    tokio::spawn(run_estate_scan(
+        state.clone(),
+        estate,
+        external_sources,
+        scan_id,
+        root_display,
+        estate_binding,
+    ));
+    (StatusCode::ACCEPTED, Json(accepted)).into_response()
+}
+
+/// One accepted scan, run to completion on its own task (S6 scan front
+/// door) — the body `intelligence_scan` used to run inline.
+///
+/// Every source's row lands on [`ApiState::scans`] the moment that source
+/// finishes (`report.push`), which is what makes per-source progress
+/// visible for work measured in minutes; the whole run is bracketed by the
+/// two journal events, so the durable record says what was attempted and
+/// what came of it whether or not any client was ever listening.
+async fn run_estate_scan(
+    state: ApiState,
+    estate: Estate,
+    external_sources: Vec<SourceStatus>,
+    scan_id: String,
+    root_display: String,
+    // S6 D1: resolved at ACCEPT time from the addressed root, then carried
+    // onto this task. The scan now outlives the request that started it, so
+    // the estate coordinate cannot be re-derived here — it is the same
+    // string `SearchQuery::admissibility` binds at query time, and one
+    // resolver with one spelling is what keeps a recorded binding and a
+    // queried admission from drifting apart.
+    estate_binding: crate::domain::source::EstateBinding,
+) {
+    let started = Instant::now();
+    let report = ScanReport {
+        tracker: state.scans.clone(),
+        scan_id: scan_id.clone(),
+    };
 
     // ---- estate_git: registered repos, through the Git path at the
     // mount's own committed HEAD (X3a's plumbing) — never the folder
@@ -5650,7 +5906,88 @@ async fn intelligence_scan(
         }
     }
 
-    Json(json!({"scanned": report})).into_response()
+    // Finish before the completion event is journaled, never after: a
+    // client that sees `state: "completed"` and then reads the journal
+    // must not find the completion missing. The ordering costs nothing and
+    // removes the window.
+    state.scans.finish(&scan_id);
+    let rows = state
+        .scans
+        .snapshot(&scan_id)
+        .map(|p| p.rows)
+        .unwrap_or_default();
+    let mut outcomes: BTreeMap<&str, u64> = BTreeMap::new();
+    for row in &rows {
+        let outcome = if row.get("error").is_some() {
+            "error"
+        } else {
+            row["outcome"].as_str().unwrap_or("unknown")
+        };
+        *outcomes.entry(outcome).or_default() += 1;
+    }
+    journal_scan_event(
+        &state,
+        crate::domain::source::KIND_INTELLIGENCE_SCAN_COMPLETED,
+        &root_display,
+        json!({
+            "scan_id": scan_id,
+            "estate_root": root_display,
+            "sources_completed": rows.len(),
+            "outcomes": outcomes,
+            "duration_ms": started.elapsed().as_millis() as u64,
+            "scanned": rows,
+        }),
+    )
+    .await;
+}
+
+/// Append one scan-lifecycle event to the journal (A1-01: the journal is
+/// the authority; [`ApiState::scans`] is only the live view).
+///
+/// Takes the core lock exactly as the per-source `source.scanned` writes
+/// around it do, and catches the registry up before releasing it —
+/// `absorb_journaled`'s own contract: *"every direct-journal writer must
+/// call this before releasing the hold"*, or the next `Core::commit` fails
+/// its contiguity check.
+async fn journal_scan_event(state: &ApiState, kind: &str, estate_root: &str, payload: Value) {
+    let mut core = CoreGuard::acquire(&state.core).await;
+    let draft = EventDraft::new(EventSource::new("daemon", "intelligence"), kind, payload)
+        .with_workspace_id(estate_root);
+    if let Err(e) = core.journal.append(draft) {
+        tracing::error!(kind = %kind, error = %e, "journaling a scan lifecycle event failed");
+    }
+    if let Err(e) = core.absorb_journaled() {
+        tracing::error!(error = %e, "folding a scan lifecycle event into the registry failed");
+    }
+}
+
+/// `GET /v1/intelligence/scan/{scan_id}` — how one accepted scan is going
+/// (S6 scan front door).
+///
+/// Answers from [`ApiState::scans`], the live view, so a caller learns
+/// per-source progress while the scan is still running. `404` when the id
+/// is not tracked: this daemon never accepted it, or it started it before
+/// a restart, or it has aged past [`RETAINED_SCANS`]. That is a real
+/// answer — "this daemon cannot tell you" — and deliberately not a
+/// fabricated `completed`, which would be the same lie in the other
+/// direction as the bug this surface exists to fix. The journal still
+/// holds the durable record either way.
+async fn intelligence_scan_status(
+    State(state): State<ApiState>,
+    Path(scan_id): Path<String>,
+) -> Response {
+    match state.scans.snapshot(&scan_id) {
+        Some(progress) => Json(scan_status_json(&scan_id, &progress)).into_response(),
+        None => error_response(
+            StatusCode::NOT_FOUND,
+            "unknown_scan",
+            format!(
+                "no scan {scan_id} is tracked by this daemon: it was never accepted here, was \
+                 accepted before a restart, or has aged out of the most recent \
+                 {RETAINED_SCANS} scans"
+            ),
+        ),
+    }
 }
 
 /// One [`ScanRecord`] rendered for `POST /v1/intelligence/scan`'s report —
@@ -6929,6 +7266,11 @@ pub static SSE_EVENT_KINDS: std::sync::LazyLock<Vec<&'static str>> =
             // completed scan, never one per file, which is what makes
             // putting it on the live stream affordable at all.
             crate::domain::source::KIND_SOURCE_SCANNED,
+            // S6 scan front door: the two scan-level kinds, one each per
+            // accepted scan. They join the vocabulary through this same
+            // shared list (C1d's route) so it cannot drift.
+            crate::domain::source::KIND_INTELLIGENCE_SCAN_STARTED,
+            crate::domain::source::KIND_INTELLIGENCE_SCAN_COMPLETED,
         ]);
         kinds
     });
@@ -8472,6 +8814,7 @@ mod tests {
             },
             sweep_interval: SWEEP_INTERVAL,
             last_swept: Arc::new(std::sync::Mutex::new(None)),
+            scans: Default::default(),
         }
     }
 
@@ -10329,6 +10672,40 @@ mod tests {
             !WorkOverlayHook::Evict.coalesces(),
             "an eviction is the lifetime rule itself; dropping one leaves evidence about a \
              surface that no longer exists"
+        );
+    }
+
+    /// F-IN-01: a scan whose task never calls [`ScanTracker::finish`] —
+    /// stuck indefinitely on a hanging source, or terminated by a panic
+    /// before that line runs — must still age out of the map once enough
+    /// newer scans have started and finished. Before the fix, pruning only
+    /// ever searched for `completed.is_some()` entries to evict, so a
+    /// `completed: None` entry was permanently invisible to it and the map
+    /// grew without bound; reverting the eviction predicate to
+    /// `find(|(_, p)| p.completed.is_some())` makes this test fail with
+    /// the stuck scan still present.
+    #[test]
+    fn a_scan_that_never_finishes_still_ages_out_of_the_bounded_map() {
+        let tracker = ScanTracker::default();
+        // The stuck scan: begun, never finished.
+        tracker.begin("00_stuck", "/estate", Vec::new());
+        // Enough later scans start and finish normally to push the map
+        // past RETAINED_SCANS.
+        for i in 1..=RETAINED_SCANS {
+            let id = format!("{i:02}_ok");
+            tracker.begin(&id, "/estate", Vec::new());
+            tracker.finish(&id);
+        }
+        assert!(
+            tracker.snapshot("00_stuck").is_none(),
+            "a scan that never finishes must still age out once enough newer scans have \
+             finished, or ApiState::scans is unbounded exactly as F-IN-01 found"
+        );
+        assert_eq!(
+            tracker.lock().len(),
+            RETAINED_SCANS,
+            "the map stays bounded at RETAINED_SCANS even with a permanently unfinished entry \
+             among the candidates for eviction"
         );
     }
 }

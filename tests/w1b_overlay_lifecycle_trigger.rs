@@ -228,10 +228,10 @@ async fn a_bound_work_surface_is_scanned_as_an_overlay_and_evicted_when_it_retir
     //    on an installation that has none
     //    (see `a_work_on_an_unindexed_estate_gains_no_atlas_evidence` below),
     //    so this is the step that makes an installation one that indexes.
-    let (status, body) = post(
+    let (status, body) = support::scan_to_completion(
         &http,
-        &handle,
-        "/v1/intelligence/scan",
+        &handle.endpoint,
+        &handle.token,
         &json!({
             "command_id": ulid::Ulid::generate().to_string(),
             "estate_root": estate.path(),

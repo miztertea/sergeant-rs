@@ -89,24 +89,6 @@ fn client() -> reqwest::Client {
         .expect("client")
 }
 
-async fn post(
-    client: &reqwest::Client,
-    handle: &daemon::DaemonHandle,
-    path: &str,
-    body: &Value,
-) -> (reqwest::StatusCode, Value) {
-    let response = client
-        .post(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(body)
-        .send()
-        .await
-        .expect("request");
-    let status = response.status();
-    let body: Value = response.json().await.expect("json body");
-    (status, body)
-}
-
 /// Item 4's own decisive check (`tests/x5_a1a_acceptance.rs`'s register row
 /// 4): a suspected placeholder, scanned through the real trigger, lands a
 /// named `online_only` coverage row — never `indexed` with the file counted
@@ -134,7 +116,8 @@ async fn an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_tri
         "command_id": ulid::Ulid::generate().to_string(),
         "estate_root": estate_dir.path(),
     });
-    let (status, response) = post(&http, &handle, "/v1/intelligence/scan", &body).await;
+    let (status, response) =
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
     assert_eq!(status, 200, "{response}");
     let scanned = response["scanned"].as_array().expect("scanned array");
     assert_eq!(scanned.len(), 1, "{response}");
@@ -195,7 +178,8 @@ async fn a_genuinely_empty_file_is_not_misreported_as_a_placeholder_through_the_
         "command_id": ulid::Ulid::generate().to_string(),
         "estate_root": estate_dir.path(),
     });
-    let (status, response) = post(&http, &handle, "/v1/intelligence/scan", &body).await;
+    let (status, response) =
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
     assert_eq!(status, 200, "{response}");
     let row = &response["scanned"][0];
     assert_eq!(

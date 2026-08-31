@@ -126,7 +126,8 @@ async fn a_knowledge_scan_indexes_declared_sources_and_reports_from_coverage() {
         "command_id": ulid::Ulid::generate().to_string(),
         "estate_root": estate_dir.path(),
     });
-    let (status, response) = post(&http, &handle, "/v1/intelligence/scan", &body).await;
+    let (status, response) =
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
     assert_eq!(status, 200, "{response}");
     let scanned = response["scanned"].as_array().expect("scanned array");
     assert_eq!(scanned.len(), 1, "{response}");
@@ -158,7 +159,8 @@ async fn a_knowledge_scan_indexes_declared_sources_and_reports_from_coverage() {
         "command_id": ulid::Ulid::generate().to_string(),
         "estate_root": estate_dir.path(),
     });
-    let (status, response) = post(&http, &handle, "/v1/intelligence/scan", &body).await;
+    let (status, response) =
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
     assert_eq!(status, 200, "{response}");
     let row = &response["scanned"][0];
     assert_eq!(row["outcome"], "unchanged", "{row}");
@@ -190,7 +192,8 @@ async fn a_scan_of_an_estate_with_no_knowledge_sources_reports_so_honestly() {
         "command_id": ulid::Ulid::generate().to_string(),
         "estate_root": estate_dir.path(),
     });
-    let (status, response) = post(&http, &handle, "/v1/intelligence/scan", &body).await;
+    let (status, response) =
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
     assert_eq!(status, 200, "{response}");
     assert_eq!(response["scanned"], json!([]), "{response}");
     assert!(

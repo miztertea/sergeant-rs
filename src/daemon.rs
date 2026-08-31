@@ -1338,6 +1338,9 @@ pub async fn start_with(
         prune_policy,
         sweep_interval: config.sweep_interval,
         last_swept: Arc::new(std::sync::Mutex::new(None)),
+        // S6 scan front door: empty at start — an accepted scan is tracked
+        // here, the journal keeps the durable record.
+        scans: Default::default(),
     };
     // §28's export is a fold over the event stream, subscribed here and
     // nowhere else. With export off this task does not exist.

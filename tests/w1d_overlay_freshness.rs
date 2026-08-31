@@ -268,10 +268,10 @@ async fn a_running_works_modified_file_is_findable_through_work_scope() {
     let http = client();
 
     // 1. The estate indexes something.
-    let (status, body) = post(
+    let (status, body) = support::scan_to_completion(
         &http,
-        &handle,
-        "/v1/intelligence/scan",
+        &handle.endpoint,
+        &handle.token,
         &json!({
             "command_id": ulid::Ulid::generate().to_string(),
             "estate_root": estate.path(),

@@ -54,6 +54,27 @@ use serde::{Deserialize, Serialize};
 /// both places and make the journal the slower copy of a database.
 pub const KIND_SOURCE_SCANNED: &str = "source.scanned";
 
+/// Journal kind for the moment an estate-scoped scan is accepted (S6 scan
+/// front door).
+///
+/// One per accepted `POST /v1/intelligence/scan`, appended **before** the
+/// first source is touched, naming the scan id and every source the scan
+/// undertook to cover. A scan that dies mid-flight therefore leaves a
+/// started event with no completion — the journal says what was attempted,
+/// which is exactly the honesty A1 §15 requires of coverage
+/// ("missing capability is never represented as successful empty
+/// evidence") and A1-01 requires of the journal.
+pub const KIND_INTELLIGENCE_SCAN_STARTED: &str = "intelligence.scan.started";
+
+/// Journal kind for the moment an estate-scoped scan finishes (S6 scan
+/// front door).
+///
+/// One per completed scan, carrying the per-source outcome tally and the
+/// wall-clock duration. This — not a row count in another command's
+/// output — is what makes completion knowable: the event exists exactly
+/// when every source the started event named has an outcome.
+pub const KIND_INTELLIGENCE_SCAN_COMPLETED: &str = "intelligence.scan.completed";
+
 /// §4's `source_kind` axis: how the bytes were acquired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -822,6 +843,11 @@ mod tests {
         assert_eq!(AuthorityClass::EstateReadonly.as_str(), "estate_readonly");
         assert_eq!(UnitKind::Section.as_str(), "section");
         assert_eq!(KIND_SOURCE_SCANNED, "source.scanned");
+        assert_eq!(KIND_INTELLIGENCE_SCAN_STARTED, "intelligence.scan.started");
+        assert_eq!(
+            KIND_INTELLIGENCE_SCAN_COMPLETED,
+            "intelligence.scan.completed"
+        );
         for kind in [
             SourceKind::EstateGit,
             SourceKind::LocalKnowledge,
