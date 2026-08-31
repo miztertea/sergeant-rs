@@ -128,6 +128,15 @@ pub struct Core {
     /// finish — because a re-validation aborted it, or because it failed.
     /// Re-arms the next tick's attempt without waiting for a rotation.
     pub prune_pending: bool,
+    /// #334: how many lock holds released with the registry behind the
+    /// journal — a direct-journal writer that skipped
+    /// [`Core::absorb_journaled`]. [`Core::absorb_before_release`] repairs
+    /// the state so the daemon is never wedged, but the breach is still a
+    /// breach and this is what a guard fails on, rather than on a
+    /// `tracing::error!` line nothing reads. Private for the same reason
+    /// `open_group` is: a caller has no business setting it.
+    unabsorbed_holds: u64,
+
     /// The **open group**: events written and folded during the current lock
     /// hold, awaiting the hold's single fsync (#44).
     ///
@@ -167,6 +176,7 @@ impl Core {
             floor_ledger: Arc::new(std::collections::BTreeMap::new()),
             first_seq_by_work: std::collections::BTreeMap::new(),
             prune_pending: false,
+            unabsorbed_holds: 0,
             open_group: Vec::new(),
         }
     }
@@ -259,6 +269,7 @@ impl Core {
     /// pre-publish `core.flush()?`) would read `Ok` over a handle that
     /// refuses all further appends.
     pub fn flush(&mut self) -> Result<(), CoreError> {
+        self.absorb_before_release();
         let synced = self.journal.sync();
         // Taken unconditionally: a group that failed to sync is not retried
         // on the next hold, it is abandoned along with the poisoned handle.
@@ -269,6 +280,53 @@ impl Core {
             let _ = self.events_tx.send(event);
         }
         Ok(())
+    }
+
+    /// **#334's structural close: the release choke point.**
+    ///
+    /// [`Self::absorb_journaled`]'s own doc comment says every direct-journal
+    /// writer must call it before releasing the hold. That was *prose*, and
+    /// `intelligence_add_source` did not: the registry was left one seq
+    /// behind, and the next [`Self::commit`] — whatever Work command happened
+    /// to come next — failed [`crate::runtime::projection::Projection::apply`]'s
+    /// contiguity check, then kept failing, because a failed commit appends
+    /// before it folds and so widens the gap by one every time. A wedged
+    /// daemon wearing a log line.
+    ///
+    /// Enforcing it *here* is what makes the invariant structural rather than
+    /// remembered: [`Self::flush`] is the single point every hold passes
+    /// through ([`CoreGuard::flush`] and [`CoreGuard`]'s `Drop` backstop both
+    /// call it), so a writer that forgets — including one written after this
+    /// comment — cannot leave the registry behind. It does not excuse the
+    /// writer: the omission is reported *and counted*
+    /// ([`Self::unabsorbed_holds`]), so a guard fails on a number rather
+    /// than on a log line nothing reads.
+    ///
+    /// Report-only on failure, deliberately. A fold that cannot be applied is
+    /// not a reason to abandon a group that is already on disk: turning it
+    /// into an `Err` here would drop the hold's events unpublished and lose
+    /// the fan-out as well as the fold. `flush`'s own contract (fsync, then
+    /// publish) is untouched.
+    fn absorb_before_release(&mut self) {
+        if self.journal.next_seq().saturating_sub(1) <= self.registry.last_seq() {
+            return;
+        }
+        self.unabsorbed_holds = self.unabsorbed_holds.saturating_add(1);
+        tracing::error!(
+            registry_last_seq = self.registry.last_seq(),
+            journal_next_seq = self.journal.next_seq(),
+            "a lock hold appended straight to the journal and released without \
+             calling `absorb_journaled`; the registry is being caught up at \
+             release so the next commit is not wedged (#334) — the writer is \
+             the bug"
+        );
+        if let Err(error) = self.absorb_journaled() {
+            tracing::error!(
+                %error,
+                "catching the registry up at hold release failed; the journal \
+                 and the projections that answer for it now disagree (#334)"
+            );
+        }
     }
 
     /// Fold events this hold appended through a writer that owns the
@@ -299,6 +357,12 @@ impl Core {
             self.open_group.push(event);
         }
         Ok(())
+    }
+
+    /// #334: how many lock holds released with the registry behind the
+    /// journal. Zero is the invariant — see [`Self::absorb_before_release`].
+    pub fn unabsorbed_holds(&self) -> u64 {
+        self.unabsorbed_holds
     }
 
     /// How many events the current lock hold has appended and not yet
@@ -1611,7 +1675,12 @@ async fn healthz() -> Json<Value> {
 /// one directory; what changed is *which* — the host runtime root (D2),
 /// no longer any estate's. Which estates this daemon serves is a different
 /// question, and it has its own route: `GET /v1/estates`.
-fn system_body(state: &ApiState, journal_head: u64, admission_paused: bool) -> Value {
+fn system_body(
+    state: &ApiState,
+    journal_head: u64,
+    admission_paused: bool,
+    unabsorbed_holds: u64,
+) -> Value {
     json!({
         "version": env!("CARGO_PKG_VERSION"),
         "api_revision": API_REVISION,
@@ -1622,6 +1691,13 @@ fn system_body(state: &ApiState, journal_head: u64, admission_paused: bool) -> V
         // so `sgt status` can say why a submit is being turned away without
         // an operator having to decode the journal for `admission.paused`.
         "admission_paused": admission_paused,
+        // #334 / F-IN-01: `Core::unabsorbed_holds` was otherwise only
+        // readable from a test assertion — no operator-facing surface
+        // reported it. Zero is the invariant; nonzero means a
+        // direct-journal writer released a lock hold without calling
+        // `absorb_journaled`, which `sgt status` turns into a visible
+        // warning below.
+        "unabsorbed_holds": unabsorbed_holds,
     })
 }
 
@@ -1630,7 +1706,13 @@ async fn system_info(State(state): State<ApiState>) -> Json<Value> {
     let core = CoreGuard::acquire(&state.core).await;
     let head = core.registry.last_seq();
     let admission_paused = core.registry.state().admission_paused;
-    Json(system_body(&state, head, admission_paused))
+    let unabsorbed_holds = core.unabsorbed_holds();
+    Json(system_body(
+        &state,
+        head,
+        admission_paused,
+        unabsorbed_holds,
+    ))
 }
 
 /// The event source all API-origin events carry.
@@ -6141,6 +6223,16 @@ async fn intelligence_add_source(
         record_external_git_scan(atlas, &mut core.journal, &acquired, None)
     })
     .await;
+    // #334: the acquisition appended `source.scanned` straight to the
+    // journal, so the registry has to be caught up before this hold ends or
+    // the next `Core::commit` fails on contiguity — and keeps failing, on
+    // whatever Work command happens to come next. The same three lines every
+    // other direct-journal writer in this file already carried; this handler
+    // was written without them, which is the whole of #334.
+    if let Err(e) = core.absorb_journaled() {
+        tracing::error!(error = %e, "folding an external-git scan's journal summary into the registry failed");
+    }
+    drop(core);
     match recorded {
         Ok(Ok(record)) => Json(scan_record_json(
             "external_git",
@@ -8824,6 +8916,49 @@ mod tests {
             "test.seeded",
             json!({"n": n}),
         )
+    }
+
+    /// F-IN-01: `Core::unabsorbed_holds` must reach an operator-facing
+    /// surface, not only a test assertion on the field itself
+    /// (`tests/f334_journal_integrity.rs` already pins the counter's own
+    /// correctness). This drives the exact same direct-journal-append shape
+    /// those tests use, releases the hold through the real
+    /// `CoreGuard::drop` path, and asserts the breach is visible on
+    /// `GET /v1/system` — the JSON `sgt status` reads. Delete the
+    /// `"unabsorbed_holds"` key from [`system_body`] (or stop threading
+    /// [`Core::unabsorbed_holds`] into it) and this goes red.
+    #[tokio::test]
+    async fn unabsorbed_holds_is_reported_on_v1_system() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let state = test_state(dir.path()).await;
+
+        {
+            let mut guard = CoreGuard::acquire(&state.core).await;
+            guard
+                .journal
+                .append(seeded(1))
+                .expect("append straight to the journal, skipping `commit`/`absorb_journaled`");
+            // Guard drops here: `CoreGuard`'s `Drop` backstop calls
+            // `flush`, which calls `absorb_before_release`, which is where
+            // the breach is counted (this is the real release path, not a
+            // hand-rolled substitute for it).
+        }
+
+        let before = {
+            let core = CoreGuard::acquire(&state.core).await;
+            core.unabsorbed_holds()
+        };
+        assert_eq!(
+            before, 1,
+            "the fixture must actually produce a breach, or this test is not testing the wiring"
+        );
+
+        let Json(system) = system_info(State(state)).await;
+        assert_eq!(
+            system["unabsorbed_holds"], 1,
+            "GET /v1/system must report the same breach count `sgt status` warns an operator \
+             about, not leave it readable only from a test assertion: {system}"
+        );
     }
 
     /// The group commit, end to end (#44): one lock hold, N appends, **one**

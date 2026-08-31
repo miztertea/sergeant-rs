@@ -427,3 +427,12 @@ cov_stage_end 1 "the c1d_attribution_nesting_audit test binary must write its ow
 cov_stage_begin c2-s6_scan_front_door
 cov_run cargo llvm-cov --no-report --test s6_scan_front_door --locked || cov_fail "s6_scan_front_door failed under instrumentation"
 cov_stage_end 1 "the s6_scan_front_door test binary must write its own profile"
+
+# S6 #334, wired at birth (the #231 lesson): the journal's fold is not allowed
+# to fall behind the journal. In-process tests over a real journal and a real
+# Atlas in a tempdir, driving the production `record_scan` direct-journal
+# writer and the `Core::flush` release path the daemon's every lock hold ends
+# at. No daemon, no estate, no subprocess, no clock. Floor 1.
+cov_stage_begin c2-f334_journal_integrity
+cov_run cargo llvm-cov --no-report --test f334_journal_integrity --locked || cov_fail "f334_journal_integrity failed under instrumentation"
+cov_stage_end 1 "the f334_journal_integrity test binary must write its own profile"

@@ -1390,6 +1390,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 }
             }
             let admission_paused = system["admission_paused"].as_bool().unwrap_or(false);
+            let unabsorbed_holds = system["unabsorbed_holds"].as_u64().unwrap_or(0);
             if sgt.json {
                 print_json(&json!({
                     "system": system,
@@ -1407,6 +1408,13 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 if admission_paused {
                     println!(
                         "admission: PAUSED — new work is refused (draining for `sgt daemon stop`)"
+                    );
+                }
+                if unabsorbed_holds > 0 {
+                    println!(
+                        "journal integrity: {unabsorbed_holds} lock hold(s) released with the \
+                         registry behind the journal (#334) — a direct-journal writer skipped \
+                         `absorb_journaled`; self-healed at release, but the writer is a bug"
                     );
                 }
                 println!("work: {total} total");
