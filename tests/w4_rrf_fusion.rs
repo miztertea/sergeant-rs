@@ -64,7 +64,8 @@ use sergeant_rs::runtime::atlas::db::{
     Admissibility, AtlasDb, FusedAnswer, LexicalQuery, SourceSelector,
 };
 use sergeant_rs::runtime::atlas::fusion::{
-    FusedHit, RRF_K, RankOrigins, RerankSignals, fuse, rerank, rrf_contribution, rrf_order,
+    ALPHA_NATURAL, ALPHA_SYMBOL, FusedHit, RRF_K, RankOrigins, RerankSignals, fuse, is_symbol_query,
+    rerank, resolve_alpha, rrf_contribution, rrf_order,
 };
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, LexicalHit, UnitCoordinate};
 use sergeant_rs::runtime::atlas::record::{record_scan, scan_and_record};
@@ -125,17 +126,30 @@ fn paths(hits: &[FusedHit]) -> Vec<String> {
 
 // -------------------------------------------------------- the expression
 
-/// **A2 §7, verbatim:** `RRF(d) = Σ 1 / (k + rank_i(d))`.
+/// **A2 §7's expression, α-blended:**
+/// `α·(1/(k + rank_sem)) + (1−α)·(1/(k + rank_lex))`.
 ///
 /// Computed here by hand from the ranks a reader can count off the two
 /// fixture lists, and compared bit-for-bit — so a "simplification" that
-/// introduced a weight, a normalization or a second `k` fails immediately.
+/// introduced a *second* weight, a normalization or a second `k` still fails
+/// immediately.
+///
+/// **This test was rewritten by the semble-parity wave, not deleted.** Its
+/// previous body asserted the unweighted `1/(k+r_lex) + 1/(k+r_sem)`. A2 §7
+/// prints `RRF(d) = Σ 1/(k + rank_i(d))` and calls it *"intentionally one
+/// expression"*; the α blend is still one expression over the same two
+/// independently-RRF'd lists, with the weight semble's `search.py` puts on
+/// it ([EXT-SEMBLE], the prior art A2 §7 itself cites). At `ALPHA_NATURAL`
+/// the two spellings differ by a constant factor of 2 and therefore rank
+/// identically — the blend changes an *order* only when α ≠ 0.5, which is
+/// exactly the symbol-query case
+/// [`a_symbol_query_leans_on_the_lexical_half`] pins.
 #[test]
 fn the_fused_score_is_a2_section_7s_one_expression() {
     // lexical: a, b, c   semantic: c, a  (1-based ranks)
     let lex = vec![lexical("a", 3.0), lexical("b", 2.0), lexical("c", 1.0)];
     let sem = vec![semantic("c", 0.9), semantic("a", 0.8)];
-    let fused = fuse(&lex, &sem);
+    let fused = fuse(&lex, &sem, ALPHA_NATURAL);
 
     let by_path = |p: &str| {
         fused
@@ -143,9 +157,11 @@ fn the_fused_score_is_a2_section_7s_one_expression() {
             .find(|hit| hit.coordinate.relative_path() == p)
             .unwrap_or_else(|| panic!("{p} missing"))
     };
-    assert_eq!(by_path("a").rrf, 1.0 / (RRF_K + 1.0) + 1.0 / (RRF_K + 2.0));
-    assert_eq!(by_path("b").rrf, 1.0 / (RRF_K + 2.0));
-    assert_eq!(by_path("c").rrf, 1.0 / (RRF_K + 3.0) + 1.0 / (RRF_K + 1.0));
+    let lexical_half = |rank: f64| (1.0 - ALPHA_NATURAL) * (1.0 / (RRF_K + rank));
+    let semantic_half = |rank: f64| ALPHA_NATURAL * (1.0 / (RRF_K + rank));
+    assert_eq!(by_path("a").rrf, lexical_half(1.0) + semantic_half(2.0));
+    assert_eq!(by_path("b").rrf, lexical_half(2.0) + semantic_half(0.0) * 0.0);
+    assert_eq!(by_path("c").rrf, lexical_half(3.0) + semantic_half(1.0));
     assert_eq!(
         by_path("a").origins,
         RankOrigins {
@@ -167,6 +183,49 @@ fn the_fused_score_is_a2_section_7s_one_expression() {
     assert_eq!(paths(&fused), vec!["a", "c", "b"]);
 }
 
+/// **Step (b) of the semble port — query-type detection and the α blend.**
+///
+/// semble resolves the blend from the query's own shape
+/// (`ranking/weighting.py::resolve_alpha`: `_ALPHA_SYMBOL = 0.3` "lean BM25
+/// for exact keyword matching", `_ALPHA_NL = 0.5` "balanced semantic +
+/// BM25") and combines the two independently-RRF'd lists as
+/// `alpha*sem + (1-alpha)*bm25` (`search.py`). Before this change both
+/// halves were summed unweighted, so prose and identifiers took an
+/// identical path — difference 2 of the wave brief.
+///
+/// **Non-vacuous:** with the α ignored (the previous unweighted sum) a
+/// lexical-only rank-1 and a semantic-only rank-1 score *identically*, and
+/// the final assertion — that the lexical one strictly outscores the
+/// semantic one under a symbol query — fails.
+#[test]
+fn a_symbol_query_leans_on_the_lexical_half() {
+    assert!(is_symbol_query("fused_search"));
+    assert!(is_symbol_query("SourceKind"));
+    assert!(is_symbol_query("atlas::fusion"));
+    assert!(!is_symbol_query("session"));
+    assert!(!is_symbol_query("how does the daemon recover"));
+    assert_eq!(resolve_alpha("fused_search"), ALPHA_SYMBOL);
+    assert_eq!(resolve_alpha("how does the daemon recover"), ALPHA_NATURAL);
+
+    let lex = vec![lexical("lex_only", 3.0)];
+    let sem = vec![semantic("sem_only", 0.9)];
+
+    // Natural language: the halves weigh the same, so rank 1 of either list
+    // scores the same and only the stated tie-break key separates them.
+    let natural = fuse(&lex, &sem, ALPHA_NATURAL);
+    assert_eq!(natural[0].rrf, natural[1].rrf);
+
+    // Symbol query: the lexical half carries 0.7 and wins outright.
+    let symbol = fuse(&lex, &sem, ALPHA_SYMBOL);
+    assert_eq!(paths(&symbol), vec!["lex_only", "sem_only"]);
+    assert!(
+        symbol[0].rrf > symbol[1].rrf,
+        "the blend did not weight the two halves: {} vs {}",
+        symbol[0].rrf,
+        symbol[1].rrf
+    );
+}
+
 // -------------------------------------------------- hazard 1: collection order
 
 /// **Hazard 1 — candidate collection order.** `rank_i(d)` must be a function
@@ -181,13 +240,13 @@ fn the_fused_score_is_a2_section_7s_one_expression() {
 fn the_order_the_two_lists_arrive_in_cannot_change_the_fused_answer() {
     let lex = vec![lexical("a", 3.0), lexical("b", 2.0), lexical("c", 1.0)];
     let sem = vec![semantic("c", 0.9), semantic("a", 0.8)];
-    let sorted = fuse(&lex, &sem);
+    let sorted = fuse(&lex, &sem, ALPHA_NATURAL);
 
     let mut lex_reversed = lex.clone();
     lex_reversed.reverse();
     let mut sem_reversed = sem.clone();
     sem_reversed.reverse();
-    let shuffled = fuse(&lex_reversed, &sem_reversed);
+    let shuffled = fuse(&lex_reversed, &sem_reversed, ALPHA_NATURAL);
 
     assert_eq!(shuffled, sorted, "the fused answer followed arrival order");
     // The test discriminates only because the reversed order is a different
@@ -222,7 +281,7 @@ fn the_order_the_two_lists_arrive_in_cannot_change_the_fused_answer() {
 fn tied_fused_scores_are_broken_by_the_stated_key_not_by_arrival_order() {
     let lex = vec![lexical("zzz", 5.0), lexical("aaa", 4.0)];
     let sem = vec![semantic("aaa", 0.9), semantic("zzz", 0.8)];
-    let fused = fuse(&lex, &sem);
+    let fused = fuse(&lex, &sem, ALPHA_NATURAL);
     assert_eq!(fused[0].rrf, fused[1].rrf, "the fixture must really tie");
     assert_eq!(paths(&fused), vec!["aaa", "zzz"]);
 }
@@ -247,7 +306,7 @@ fn tied_fused_scores_follow_the_key_even_when_the_map_order_disagrees() {
     let mut beta_s = semantic("aaa", 0.9);
     beta_s.source_name = "beta".to_string();
 
-    let fused = fuse(&[alpha, beta], &[beta_s, alpha_s]);
+    let fused = fuse(&[alpha, beta], &[beta_s, alpha_s], ALPHA_NATURAL);
     assert_eq!(fused[0].rrf, fused[1].rrf, "the fixture must really tie");
     assert_eq!(
         fused
@@ -281,14 +340,16 @@ fn the_two_contributions_sum_to_the_documented_formula() {
     let fused = fuse(
         &[lexical("aaa", 5.0), lexical("bbb", 4.0)],
         &[semantic("bbb", 0.9), semantic("aaa", 0.8)],
+        ALPHA_NATURAL,
     );
     assert_eq!(fused.len(), 2);
-    let expected = rrf_contribution(1) + rrf_contribution(2);
+    let expected =
+        (1.0 - ALPHA_NATURAL) * rrf_contribution(1) + ALPHA_NATURAL * rrf_contribution(2);
     for hit in &fused {
         assert_eq!(
             hit.rrf, expected,
             "a lexical-rank-1/semantic-rank-2 candidate (or its mirror) must \
-             total exactly rrf_contribution(1) + rrf_contribution(2): {hit:#?}"
+             total exactly (1−α)·rrf_contribution(1) + α·rrf_contribution(2): {hit:#?}"
         );
     }
 }
@@ -1143,6 +1204,7 @@ fn an_exact_name_match_is_promoted_over_a_better_fused_score() {
     let mut hits = fuse(
         &[lexical("b.rs", 9.0), lexical("a.rs", 1.0)],
         &[semantic("b.rs", 0.9), semantic("a.rs", 0.1)],
+        ALPHA_NATURAL,
     );
     hits.sort_by(rrf_order);
     assert_eq!(paths(&hits), vec!["b.rs", "a.rs"], "RRF prefers b.rs");

@@ -92,12 +92,15 @@ pub const LEXICAL_TOKENIZER_VERSION: &str = "1";
 /// A2 §13's *"RRF/rerank policy version"*.
 ///
 /// One string for both halves because A2 §7 and §8 are one policy in this
-/// build: RRF at [`RRF_K`] followed by
-/// [`crate::runtime::atlas::fusion::RerankSignals::priority`]'s nine signals
-/// in the contract's own order. Pinned to both by
-/// `tests/w5_search_surface.rs::
+/// build: RRF at [`RRF_K`], α-blended per
+/// [`crate::runtime::atlas::fusion::resolve_alpha`], then A2 §8's nine
+/// signals. Pinned by `tests/w5_search_surface.rs::
 /// the_retrieval_policy_version_is_pinned_to_the_actual_rrf_and_rerank_policy`.
-pub const RETRIEVAL_POLICY_VERSION: &str = "rrf-k60+a2s8-nine-signals/1";
+///
+/// **`/2` — the semble-parity port's α blend.** `/1` described an unweighted
+/// `1/(k+r_lex) + 1/(k+r_sem)`; leaving it unchanged would have made A2
+/// §13's own provenance field state a policy this build no longer runs.
+pub const RETRIEVAL_POLICY_VERSION: &str = "rrf-k60+alpha-blend+a2s8-nine-signals/2";
 
 /// A2 §13's *"retrieval generation"*, the half that is not a stored id.
 ///

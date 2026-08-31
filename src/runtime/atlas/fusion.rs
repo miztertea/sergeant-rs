@@ -102,6 +102,74 @@ pub fn rrf_contribution(rank: usize) -> f64 {
     1.0 / (RRF_K + rank as f64)
 }
 
+/// semble's `_ALPHA_SYMBOL` — the weight the **semantic** half carries when
+/// the query is a bare symbol (`ranking/weighting.py`, verbatim comment:
+/// *"lean BM25 for exact keyword matching"*). The lexical half therefore
+/// carries `1 - ALPHA_SYMBOL = 0.7`.
+///
+/// **Provenance: adopted, not derived (R5).** These are the shipped, measured
+/// constants of an installed dependency
+/// (`semble/ranking/weighting.py`, [EXT-SEMBLE] — the prior art A2 §5 and §7
+/// already cite), not numbers fitted to any Sergeant corpus. Fitting them to
+/// one would be the *live self-tuning* A2 §16 forbids; adopting a shipped
+/// design is R5 reuse. Like [`RRF_K`] they are `const`, reachable by no
+/// caller and no config key, which is how A2 §14's *"do not expose raw
+/// retrieval weight tuning in workflow files"* is met.
+pub const ALPHA_SYMBOL: f64 = 0.3;
+
+/// semble's `_ALPHA_NL` — *"balanced semantic + BM25"*. See [`ALPHA_SYMBOL`]
+/// for the provenance of both.
+pub const ALPHA_NATURAL: f64 = 0.5;
+
+/// Is this query a bare symbol rather than prose? — semble's
+/// `ranking/boosting.py::is_symbol_query`.
+///
+/// semble spells it as one anchored regex over the stripped query; the same
+/// rule in Rust is: **one whitespace-free token**, made of identifier
+/// characters and namespace separators, that is either namespace-qualified,
+/// starts with an underscore, or carries an uppercase letter or an
+/// underscore. semble's own comment states the discriminating case — *"plain
+/// lowercase words (e.g. `session`) are NL, not symbols"* — and that is the
+/// case this function exists to get right.
+///
+/// Not [`crate::runtime::atlas::lexical::is_identifier_like`] (R2 checked and
+/// rejected): that predicate is true when **any** compound inside a longer
+/// text is identifier-shaped, so it calls *"how is SourceKind validated"* an
+/// identifier query. semble deliberately calls that prose. The two answer
+/// different questions and both are wanted — `is_identifier_like` still
+/// decides A2 §8's *"definition over reference when query is
+/// identifier-like"* signal.
+pub fn is_symbol_query(query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() || query.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let namespaced = ["::", "->", "\\", "."]
+        .iter()
+        .any(|separator| query.contains(separator));
+    if !query
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || namespaced && !c.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    namespaced
+        || query.starts_with('_')
+        || query.contains('_')
+        || query.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// The blend weight for the semantic half — semble's
+/// `ranking/weighting.py::resolve_alpha`, minus its caller-supplied override
+/// (A2 §14: there is no knob to override it with).
+pub fn resolve_alpha(query: &str) -> f64 {
+    if is_symbol_query(query) {
+        ALPHA_SYMBOL
+    } else {
+        ALPHA_NATURAL
+    }
+}
+
 /// Which of A2 §7's two rank lists a candidate appeared in, and at what rank.
 ///
 /// Kept on every [`FusedHit`] because A2 §13's trace records *"result
@@ -380,15 +448,21 @@ impl Accumulator {
         }
     }
 
+    /// A2 §7's expression, **α-blended** — semble's
+    /// `search.py`: `alpha_weight * normalized_semantic + (1 - alpha_weight)
+    /// * normalized_bm25`, over two lists each RRF'd independently (which is
+    /// what `1/(k + rank_i)` per list already is). α comes from
+    /// [`resolve_alpha`] and is a `const`-derived value, never a caller knob.
+    ///
     /// Hazard 3 — **float summation order.** Two terms, added in one fixed
     /// order (lexical, then semantic), with an absent list contributing a
     /// literal `0.0` rather than being skipped. `a + b` and `b + a` differ in
     /// f64 whenever rounding differs, so the order is written down here once
     /// instead of falling out of whichever list a candidate happened to be
     /// found in first.
-    fn total(&self) -> f64 {
-        let lexical = self.hit.origins.lexical.map_or(0.0, rrf_contribution);
-        let semantic = self.hit.origins.semantic.map_or(0.0, rrf_contribution);
+    fn total(&self, alpha: f64) -> f64 {
+        let lexical = (1.0 - alpha) * self.hit.origins.lexical.map_or(0.0, rrf_contribution);
+        let semantic = alpha * self.hit.origins.semantic.map_or(0.0, rrf_contribution);
         lexical + semantic
     }
 }
@@ -421,7 +495,7 @@ impl Accumulator {
 ///
 /// Signals are left at [`RerankSignals::default`] (all false); the caller
 /// computes them and calls [`rerank`].
-pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit]) -> Vec<FusedHit> {
+pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit], alpha: f64) -> Vec<FusedHit> {
     let mut lexical: Vec<&LexicalHit> = lexical.iter().collect();
     lexical.sort_by(|a, b| rank_order(a, b));
     let mut semantic: Vec<&SemanticHit> = semantic.iter().collect();
@@ -468,7 +542,7 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit]) -> Vec<FusedHit> {
     let mut fused: Vec<FusedHit> = candidates
         .into_values()
         .map(|accumulator| {
-            let rrf = accumulator.total();
+            let rrf = accumulator.total(alpha);
             let mut hit = accumulator.hit;
             hit.rrf = rrf;
             hit
