@@ -33,6 +33,8 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
+mod support;
+
 use sergeant_rs::domain::source::{EstateAdmission, EstateBinding};
 use sergeant_rs::runtime::atlas::db::{
     Admissibility, AtlasDb, LexicalQuery, SemanticAnswer, SourceSelector,
@@ -81,18 +83,12 @@ const CORPUS: [(&str, &str); 6] = [
 /// assets. Safe because cargo-nextest runs every test in its own process
 /// (the same reason `tests/w3b_semantic_retrieval.rs` says so).
 fn install_model() {
-    let assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/semantic-model");
-    assert!(
-        assets.join("model.safetensors").is_file(),
-        "the committed assets must be present at {}",
-        assets.display()
-    );
-    unsafe { std::env::set_var(MODEL_DIR_ENV, &assets) };
+    support::install_model(MODEL_DIR_ENV);
 }
 
 /// Make sure no model can be found: the `cargo install`-from-source host.
 fn uninstall_model() {
-    unsafe { std::env::remove_var(MODEL_DIR_ENV) };
+    support::uninstall_model(MODEL_DIR_ENV);
 }
 
 fn write(root: &Path, relative: &str, body: &str) {

@@ -48,13 +48,11 @@ const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 /// because cargo-nextest runs every test in its own process — the same
 /// reason `tests/w3b_semantic_retrieval.rs` gives.
 fn install_model() {
-    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/semantic-model");
-    assert!(assets.join("model.safetensors").is_file());
-    unsafe { std::env::set_var(MODEL_DIR_ENV, &assets) };
+    support::install_model(MODEL_DIR_ENV);
 }
 
 fn uninstall_model() {
-    unsafe { std::env::remove_var(MODEL_DIR_ENV) };
+    support::uninstall_model(MODEL_DIR_ENV);
 }
 
 /// A directory that **is** a complete asset directory by
