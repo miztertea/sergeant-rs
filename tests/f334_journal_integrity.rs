@@ -44,6 +44,12 @@
 //!   before it folds and so widens the gap by one every time. This pins the
 //!   recovery, not the widening: the widening is inside `00-orient` §7's
 //!   escalated J0 and is deliberately not made a contract here.
+//! * [`a_shutdown_journals_and_publishes_its_stop_event_even_from_a_wedged_registry`]
+//!   — issue item 3, in the sharper form `00-orient` §3b established. The
+//!   issue says `daemon.stopped` "is now simply absent"; it is not. It is in
+//!   the journal at its own seq and absent from the projections and the SSE
+//!   fan-out. A test that only read the journal file would have passed
+//!   against the live defect, which is why this one reads both.
 
 use std::fs;
 use std::path::Path;
@@ -53,6 +59,7 @@ use tempfile::TempDir;
 use tokio::sync::broadcast;
 
 use sergeant_rs::api::Core;
+use sergeant_rs::daemon::KIND_DAEMON_STOPPED;
 use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::runtime::atlas::db::AtlasDb;
 use sergeant_rs::runtime::atlas::record::record_scan;
@@ -329,4 +336,66 @@ fn the_wedged_cascade_from_the_issue_is_recovered_when_the_hold_releases() {
 
     core.commit(draft(5))
         .expect("and the daemon is no longer wedged");
+}
+
+/// **Issue item 3: a shutdown always journals its own stop event** — and,
+/// per `00-orient` §3b, "journals" is not enough to state the property.
+///
+/// `run_until_signal`'s shutdown tail is two calls under one `CoreGuard`:
+/// `core.commit(daemon.stopped)` then `core.flush()` (`src/daemon.rs`,
+/// "Clean shutdown: journal the stop, then retire the descriptor"). This
+/// drives that exact shape over a registry a direct-journal writer has
+/// already left behind — the state the issue's daemon was actually in when
+/// it logged `failed to journal daemon.stopped`.
+///
+/// The stop event must survive that: present in the journal (H1 §6, the
+/// authority) **and** delivered to the live subscriber, because the
+/// projections and the SSE stream are where anyone actually looks. The
+/// existing shutdown tests in `tests/m2_daemon_api.rs` assert the journal
+/// half only; this is the half #334 loses.
+#[test]
+fn a_shutdown_journals_and_publishes_its_stop_event_even_from_a_wedged_registry() {
+    let (_dir, data, src_root) = fixture();
+    let (mut core, mut events) = core_and_subscriber(&data);
+    core.commit(draft(1)).expect("first commit");
+    core.flush().expect("first hold releases");
+    while events.try_recv().is_ok() {}
+
+    // Something earlier in this daemon's life appended straight to the
+    // journal and left the registry behind.
+    append_a_scan_directly(&mut core, &data, &src_root);
+
+    // The shutdown tail, exactly as `run_until_signal` writes it: commit the
+    // stop event, then close the group. The commit is refused here — that is
+    // the `failed to journal daemon.stopped` the issue observed, and the
+    // daemon logs it and carries on to the flush, so this test does too.
+    let stop = EventDraft::new(
+        EventSource::new("daemon", "sergeant"),
+        KIND_DAEMON_STOPPED,
+        json!({"pid": 1234}),
+    );
+    let _ = core.commit(stop);
+    core.flush().expect("the shutdown group closes");
+
+    let journaled: Vec<String> = core
+        .journal
+        .replay()
+        .expect("replay")
+        .map(|e| e.expect("event").kind)
+        .collect();
+    assert!(
+        journaled.iter().any(|k| k == KIND_DAEMON_STOPPED),
+        "the shutdown must journal its own stop event, got {journaled:?}"
+    );
+
+    let mut published = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        published.push(event.kind);
+    }
+    assert!(
+        published.iter().any(|k| k == KIND_DAEMON_STOPPED),
+        "the stop event must also reach the surfaces that read the record — being in the \
+         journal and absent from every projection and subscriber is the failure #334 \
+         actually is (00-orient §3b), got {published:?}"
+    );
 }
