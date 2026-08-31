@@ -796,11 +796,28 @@ impl Drop for CrossProcessLock {
 /// defect the product had. Here the wait is over the scan's own reported
 /// completion, and it carries **no time bound of its own**: elapsed time
 /// never decides whether a scan was correct, because estate size is an
-/// input and any duration chosen for it is wrong at some estate. A test
-/// that hangs is the runner's to kill (`.config/nextest.toml`), which
-/// reports "the harness gave up waiting" — a fact about the harness.
-/// A bound asserted here would instead claim the scan failed, which is a
-/// fact about the product this helper cannot know.
+/// input and any duration chosen for it is wrong at some estate. A bound
+/// asserted here would claim the scan failed, which is a fact about the
+/// product this helper cannot know; only a runner can honestly report
+/// "the harness gave up waiting", which is a fact about the harness.
+///
+/// **No runner in this repository currently reports it.** Measured at this
+/// revision: nextest's checked-in config sets no `slow-timeout` and no
+/// `terminate-after`, so a hanging test is warned about (`SLOW
+/// [>60.000s]`, repeated every 60 s) and never killed, and
+/// `.github/workflows/ci.yml`'s `test` job declares no `timeout-minutes`
+/// — unlike `coverage.yml` and `matrix.yml` — so the outer bound is
+/// GitHub's 6-hour default cancellation, which names no test. Whether to
+/// add a runner-level bound is CI policy for every suite in the repo and
+/// is escalated, not decided here. It is stated rather than implied
+/// because this comment previously named a config file as the killer and
+/// that file kills nothing;
+/// `tests/f258_nextest_thread_budget.rs::the_shared_test_support_module_may_not_cite_this_config_as_a_hang_bound_it_does_not_configure`
+/// fails if the citation comes back before the configuration does.
+///
+/// What this loop does refuse is the wait that can never end regardless of
+/// duration: a status poll answering anything but `200` is terminal and is
+/// reported as such below, not polled through.
 ///
 /// Returns the status and body of whatever last answered: the acceptance
 /// itself when it carries no `scan_id` (the estate declares nothing to

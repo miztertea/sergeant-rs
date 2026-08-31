@@ -96,3 +96,58 @@ fn m7_heavy_test_is_still_scheduled_alone_via_threads_required() {
          tests outside the group."
     );
 }
+
+/// The other half of "structural, not prose": what this config does **not**
+/// configure may not be cited elsewhere as if it did.
+///
+/// `tests/support/mod.rs::scan_to_completion` waits on a scan's own reported
+/// completion and deliberately carries no time bound of its own (elapsed
+/// time is not evidence about a product whose input size is the estate).
+/// That is right, and it makes the question "then what ends a hang?" load
+/// bearing. The helper answered it by naming this file. This file answers
+/// nothing of the sort: it holds one `[[profile.default.overrides]]` entry
+/// about thread scheduling, and no `slow-timeout`/`terminate-after`
+/// anywhere, so a hanging test is warned about — `SLOW [>60.000s]`, again at
+/// 120 s, at 180 s, forever — and never killed. `.github/workflows/ci.yml`'s
+/// `test` job declares no `timeout-minutes` either (unlike `coverage.yml`
+/// and `matrix.yml`), so the real bound is GitHub's 6-hour default
+/// cancellation, which names no test.
+///
+/// Deliberately blunt: it trips on *any* mention of this config in the
+/// shared support module, not on one exact sentence, because the failure
+/// class is a reader trusting a bound that is not there — and a citation
+/// reworded around an exact-phrase guard would be the same defect wearing
+/// different words. Either configure the termination and the citation
+/// becomes true, or do not point at this file.
+#[test]
+fn the_shared_test_support_module_may_not_cite_this_config_as_a_hang_bound_it_does_not_configure() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let config_path = repo_root.join(".config/nextest.toml");
+    let raw = std::fs::read_to_string(&config_path).expect("read .config/nextest.toml");
+    let doc: toml::Value = toml::from_str(&raw).expect(".config/nextest.toml must parse");
+
+    fn configures_termination(value: &toml::Value) -> bool {
+        match value {
+            toml::Value::Table(table) => {
+                table.contains_key("terminate-after") || table.values().any(configures_termination)
+            }
+            toml::Value::Array(items) => items.iter().any(configures_termination),
+            _ => false,
+        }
+    }
+    let terminates = configures_termination(&doc);
+
+    let support_path = repo_root.join("tests/support/mod.rs");
+    let support = std::fs::read_to_string(&support_path).expect("read tests/support/mod.rs");
+    let cites = support.contains(".config/nextest.toml");
+
+    assert!(
+        !cites || terminates,
+        "tests/support/mod.rs points at .config/nextest.toml, but that config sets no \
+         `terminate-after` anywhere, so nothing there kills a hanging test — nextest only warns \
+         (`SLOW [>60.000s]`, and again every 60 s, forever) and ci.yml's `test` job sets no \
+         `timeout-minutes`. Either add the termination this citation claims, or stop citing this \
+         file for it: an unbounded wait whose stated safety net does not exist is worse than one \
+         that says plainly that nothing below the CI job ends it."
+    );
+}
