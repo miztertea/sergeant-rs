@@ -3687,11 +3687,15 @@ impl AtlasDb {
     ///
     /// # Bounds, and saying so
     ///
-    /// The scan visits at most [`MAX_ROWS`] units across all admissible
-    /// generations (F12). Because a cap changes *which* units could be
-    /// ranked rather than merely shortening the list,
-    /// [`SemanticAnswer::truncated`] says when it bit — the same disclosure,
-    /// for the same reason, as [`LexicalAnswer::truncated`].
+    /// Since S6, embedding happens once at scan time rather than per query
+    /// (F12), so there is no longer a per-query *unit* bound: every unit in
+    /// every admissible generation is scored, and
+    /// [`SemanticAnswer::truncated`] is never set `true` by this function —
+    /// see the loop comment below for the one bound that remains
+    /// (`admissible_generations`'s own generation-list cap) and why it is
+    /// still unreported. `truncated` is not this function's disclosure
+    /// mechanism; `answer.semantic` is (`SemanticStatus::NotIndexed` when a
+    /// visited generation has unembedded units — see below).
     pub fn semantic_search(&self, query: &LexicalQuery<'_>) -> Result<SemanticAnswer, AtlasError> {
         let scope = self.work_scope(query.filter, true)?;
         let engine = self.semantic_engine();
