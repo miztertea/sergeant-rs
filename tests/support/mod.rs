@@ -843,6 +843,70 @@ pub async fn scan_to_completion(
     }
 }
 
+/// One cited function, sliced the way an acceptance register's citation
+/// guard needs to read it: the attributes written above its signature, and
+/// its body.
+///
+/// Shared by `tests/a2_acceptance.rs`, `tests/c1_acceptance.rs` and
+/// `tests/x5_a1a_acceptance.rs` (F-SI-01): this ~30-line line-based parser
+/// used to be copy-pasted byte-for-byte into all three instead of living
+/// once in this already-idiomatic shared module (Ponytail R2).
+///
+/// Line-based on purpose. The body ends at the first line that is this
+/// signature's own indentation followed by a lone `}` — rustfmt guarantees
+/// that line, and brace counting does not survive the `{{` inside a
+/// `format!` string that several of the cited tests contain.
+///
+/// Attributes are collected as whole units, not lines: a multi-line
+/// attribute such as `#[cfg_attr(\n  feature = "x",\n  ignore\n)]` is
+/// walked backward from its closing `)]`, accumulating lines until the
+/// accumulated text's `[`/`]` count balances on a line that itself starts
+/// `#[` — the point the attribute actually opens. The old single-line-only
+/// scan broke on the `)]` continuation line before ever seeing `ignore`
+/// (F-IN-01): a cited test disabled via a multi-line attribute satisfied
+/// the citation guard as if it still ran.
+pub fn cited_function(text: &str, name: &str) -> Option<(Vec<String>, String)> {
+    let needle = format!("fn {name}(");
+    let lines: Vec<&str> = text.lines().collect();
+    let signature = lines.iter().position(|line| line.contains(&needle))?;
+
+    let mut attributes: Vec<String> = Vec::new();
+    let mut buf: Vec<&str> = Vec::new();
+    let mut index = signature;
+    while index > 0 {
+        index -= 1;
+        let line = lines[index].trim();
+        if buf.is_empty() {
+            if line.starts_with("//") {
+                continue;
+            }
+            if !line.starts_with("#[") && !line.ends_with(']') {
+                break;
+            }
+        }
+        buf.push(line);
+        let joined = buf.iter().rev().copied().collect::<Vec<_>>().join("\n");
+        let opens = joined.matches('[').count();
+        let closes = joined.matches(']').count();
+        if line.starts_with("#[") && opens == closes {
+            attributes.push(joined);
+            buf.clear();
+        }
+    }
+
+    let indent = &lines[signature][..lines[signature].len() - lines[signature].trim_start().len()];
+    let closing = format!("{indent}}}");
+    let mut body = String::new();
+    for line in &lines[signature + 1..] {
+        if *line == closing {
+            break;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    Some((attributes, body))
+}
+
 #[cfg(test)]
 mod cross_process_lock_tests {
     use super::CrossProcessLock;

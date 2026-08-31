@@ -136,6 +136,9 @@ use sergeant_rs::runtime::atlas::record::{ScanRecord, scan_and_record};
 use sergeant_rs::runtime::atlas::scan::KnowledgeSource;
 use sergeant_rs::runtime::journal::Journal;
 
+mod support;
+use support::cited_function;
+
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
 fn repo_root() -> PathBuf {
@@ -1068,63 +1071,6 @@ fn every_contract_item_is_accounted_for() {
             item.number
         );
     }
-}
-
-/// One cited function, sliced the way the citation guard needs to read it:
-/// the attributes written above its signature, and its body.
-///
-/// Line-based on purpose. The body ends at the first line that is this
-/// signature's own indentation followed by a lone `}` — rustfmt guarantees
-/// that line, and brace counting does not survive the `{{` inside a
-/// `format!` string that several of the cited tests contain.
-fn cited_function(text: &str, name: &str) -> Option<(Vec<String>, String)> {
-    let needle = format!("fn {name}(");
-    let lines: Vec<&str> = text.lines().collect();
-    let signature = lines.iter().position(|line| line.contains(&needle))?;
-
-    // Attributes are collected as whole units, not lines: a multi-line
-    // attribute such as `#[cfg_attr(\n  feature = "x",\n  ignore\n)]` is
-    // walked backward from its closing `)]`, accumulating lines until the
-    // accumulated text's `[`/`]` count balances on a line that itself starts
-    // `#[` — the point the attribute actually opens. The old single-line-only
-    // scan broke on the `)]` continuation line before ever seeing `ignore`
-    // (F-IN-01): a cited test disabled via a multi-line attribute satisfied
-    // the citation guard as if it still ran.
-    let mut attributes: Vec<String> = Vec::new();
-    let mut buf: Vec<&str> = Vec::new();
-    let mut index = signature;
-    while index > 0 {
-        index -= 1;
-        let line = lines[index].trim();
-        if buf.is_empty() {
-            if line.starts_with("//") {
-                continue;
-            }
-            if !line.starts_with("#[") && !line.ends_with(']') {
-                break;
-            }
-        }
-        buf.push(line);
-        let joined = buf.iter().rev().copied().collect::<Vec<_>>().join("\n");
-        let opens = joined.matches('[').count();
-        let closes = joined.matches(']').count();
-        if line.starts_with("#[") && opens == closes {
-            attributes.push(joined);
-            buf.clear();
-        }
-    }
-
-    let indent = &lines[signature][..lines[signature].len() - lines[signature].trim_start().len()];
-    let closing = format!("{indent}}}");
-    let mut body = String::new();
-    for line in &lines[signature + 1..] {
-        if *line == closing {
-            break;
-        }
-        body.push_str(line);
-        body.push('\n');
-    }
-    Some((attributes, body))
 }
 
 /// Every citation resolves — and resolves to a check that actually runs and
