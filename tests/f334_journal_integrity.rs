@@ -37,6 +37,13 @@
 //!   `the_trigger_is_reachable_from_production_code_not_only_a_test_module`
 //!   is the in-repo precedent for reading `src/api.rs` as text to pin a
 //!   cross-cutting property no single call site can state (R2).
+//! * [`the_wedged_cascade_from_the_issue_is_recovered_when_the_hold_releases`]
+//!   — #334's *first* observed shape (`expected 146, got 149`). `00-orient`
+//!   §3a: that is not three concurrent appenders, it is three prior failed
+//!   commits after one un-absorbed write, because `Core::commit` appends
+//!   before it folds and so widens the gap by one every time. This pins the
+//!   recovery, not the widening: the widening is inside `00-orient` §7's
+//!   escalated J0 and is deliberately not made a contract here.
 
 use std::fs;
 use std::path::Path;
@@ -56,13 +63,22 @@ use sergeant_rs::runtime::projection::work_registry_projection;
 /// A `Core` over a real journal in `data`, folded exactly as the daemon
 /// folds one at start.
 fn build_core(data: &Path) -> Core {
+    core_and_subscriber(data).0
+}
+
+/// The same `Core`, with a live SSE subscriber attached — `00-orient` §3b's
+/// distinction is that the failure loses the *fold and the publish*, not the
+/// append, so a test about it has to be able to see what was published.
+fn core_and_subscriber(
+    data: &Path,
+) -> (Core, broadcast::Receiver<sergeant_rs::domain::event::Event>) {
     let journal = Journal::open(data).expect("journal");
     let mut registry = work_registry_projection();
     registry
         .catch_up(journal.replay().expect("replay"))
         .expect("catch up");
-    let (events_tx, _) = broadcast::channel(64);
-    Core::new(journal, registry, events_tx)
+    let (events_tx, events_rx) = broadcast::channel(64);
+    (Core::new(journal, registry, events_tx), events_rx)
 }
 
 fn draft(n: u32) -> EventDraft {
@@ -254,4 +270,63 @@ fn every_direct_journal_writer_in_the_api_absorbs_before_releasing_its_hold() {
          call `Core::absorb_journaled`, so they release the hold with the registry behind \
          the journal and wedge the next commit (#334): {writers:#?}"
     );
+}
+
+/// **#334's first observed shape, and its recovery.** The issue reports
+/// `projection seq mismatch: expected 146, got 149` — a gap of three. Per
+/// `00-orient` §3a that is one un-absorbed direct write followed by *three
+/// failed commits*, each of which appended before its fold was refused.
+///
+/// What this test pins is the recovery, and only the recovery: however wide
+/// the gap got, the hold's release leaves the journal and the registry in
+/// agreement, every event reaches the live subscribers that were owed it,
+/// and the next command succeeds. It deliberately does **not** assert that a
+/// failed commit appends — `Core::commit`'s append-before-fold ordering is
+/// inside the J0 `00-orient` §7 escalated and unresolved, and pinning it in
+/// a test would settle by accident a contract question nobody has ruled.
+#[test]
+fn the_wedged_cascade_from_the_issue_is_recovered_when_the_hold_releases() {
+    let (_dir, data, src_root) = fixture();
+    let (mut core, mut events) = core_and_subscriber(&data);
+    core.commit(draft(1)).expect("first commit");
+    core.flush().expect("first hold releases");
+
+    append_a_scan_directly(&mut core, &data, &src_root);
+    // Whatever Work commands happened to come next, while the registry was
+    // behind. Each one is refused; the daemon is wedged for every mutation.
+    for n in 2..=4u32 {
+        core.commit(draft(n))
+            .expect_err("a command issued while the registry is behind is refused");
+    }
+
+    core.flush().expect("the hold releases");
+
+    assert_eq!(
+        core.registry.last_seq(),
+        core.journal.next_seq() - 1,
+        "after the hold releases, the projections must answer for every event the journal \
+         holds — H1 §6: the journal is the authority for what Sergeant can prove"
+    );
+
+    // §3b: the loss was the fold and the publish. Every event the journal
+    // holds past the first flush must have reached the live subscriber too,
+    // not merely the file.
+    let mut published = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        published.push(event.seq);
+    }
+    let journaled: Vec<u64> = core
+        .journal
+        .replay()
+        .expect("replay")
+        .map(|e| e.expect("event").seq)
+        .collect();
+    assert_eq!(
+        published, journaled,
+        "every journaled event must also have been published; the journal and the surfaces \
+         that read it are not allowed to disagree"
+    );
+
+    core.commit(draft(5))
+        .expect("and the daemon is no longer wedged");
 }
