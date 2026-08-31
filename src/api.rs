@@ -128,6 +128,15 @@ pub struct Core {
     /// finish — because a re-validation aborted it, or because it failed.
     /// Re-arms the next tick's attempt without waiting for a rotation.
     pub prune_pending: bool,
+    /// #334: how many lock holds released with the registry behind the
+    /// journal — a direct-journal writer that skipped
+    /// [`Core::absorb_journaled`]. [`Core::absorb_before_release`] repairs
+    /// the state so the daemon is never wedged, but the breach is still a
+    /// breach and this is what a guard fails on, rather than on a
+    /// `tracing::error!` line nothing reads. Private for the same reason
+    /// `open_group` is: a caller has no business setting it.
+    unabsorbed_holds: u64,
+
     /// The **open group**: events written and folded during the current lock
     /// hold, awaiting the hold's single fsync (#44).
     ///
@@ -167,6 +176,7 @@ impl Core {
             floor_ledger: Arc::new(std::collections::BTreeMap::new()),
             first_seq_by_work: std::collections::BTreeMap::new(),
             prune_pending: false,
+            unabsorbed_holds: 0,
             open_group: Vec::new(),
         }
     }
@@ -288,7 +298,9 @@ impl Core {
     /// through ([`CoreGuard::flush`] and [`CoreGuard`]'s `Drop` backstop both
     /// call it), so a writer that forgets — including one written after this
     /// comment — cannot leave the registry behind. It does not excuse the
-    /// writer: the omission is reported.
+    /// writer: the omission is reported *and counted*
+    /// ([`Self::unabsorbed_holds`]), so a guard fails on a number rather
+    /// than on a log line nothing reads.
     ///
     /// Report-only on failure, deliberately. A fold that cannot be applied is
     /// not a reason to abandon a group that is already on disk: turning it
@@ -299,6 +311,7 @@ impl Core {
         if self.journal.next_seq().saturating_sub(1) <= self.registry.last_seq() {
             return;
         }
+        self.unabsorbed_holds = self.unabsorbed_holds.saturating_add(1);
         tracing::error!(
             registry_last_seq = self.registry.last_seq(),
             journal_next_seq = self.journal.next_seq(),
@@ -344,6 +357,12 @@ impl Core {
             self.open_group.push(event);
         }
         Ok(())
+    }
+
+    /// #334: how many lock holds released with the registry behind the
+    /// journal. Zero is the invariant — see [`Self::absorb_before_release`].
+    pub fn unabsorbed_holds(&self) -> u64 {
+        self.unabsorbed_holds
     }
 
     /// How many events the current lock hold has appended and not yet

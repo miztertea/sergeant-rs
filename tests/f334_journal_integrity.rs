@@ -24,6 +24,12 @@
 //! * [`a_hold_that_appended_directly_without_absorbing_does_not_wedge_the_next_commit`]
 //!   — the invariant is enforced where every hold ends, not where each writer
 //!   remembers.
+//! * [`a_hold_that_skipped_absorb_journaled_is_counted_as_a_breach`] /
+//!   [`a_hold_that_absorbed_records_no_breach`] — the repair does not excuse
+//!   the writer. The breach is a number a test can fail on, not a log line
+//!   nothing reads. This pair is also the non-vacuity proof for the guard:
+//!   the first test *is* a writer that skips `absorb_journaled`, and the
+//!   second is the identical fixture that does not.
 
 use std::fs;
 use std::path::Path;
@@ -108,4 +114,51 @@ fn a_hold_that_appended_directly_without_absorbing_does_not_wedge_the_next_commi
     core.commit(draft(2))
         .expect("the next commit must not be wedged by a writer that forgot to absorb");
     core.flush().expect("second hold releases");
+}
+
+/// The repair at the release point is a backstop, **not** absolution: a
+/// writer that skipped [`Core::absorb_journaled`] is counted, so a guard can
+/// fail on the breach instead of on a `tracing::error!` line nothing reads.
+///
+/// This test is itself "a writer that skips it" — the non-vacuity proof the
+/// brief asks for. Delete the counting and this goes red; delete the skip
+/// (see the control below) and it goes red the other way.
+#[test]
+fn a_hold_that_skipped_absorb_journaled_is_counted_as_a_breach() {
+    let (_dir, data, src_root) = fixture();
+    let mut core = build_core(&data);
+    core.commit(draft(1)).expect("first commit");
+    assert_eq!(core.unabsorbed_holds(), 0, "a clean hold is not a breach");
+
+    append_a_scan_directly(&mut core, &data, &src_root);
+    core.flush().expect("the hold releases");
+
+    assert_eq!(
+        core.unabsorbed_holds(),
+        1,
+        "releasing a hold with the registry behind the journal is a breach of \
+         `absorb_journaled`'s contract and must be visible as one"
+    );
+}
+
+/// The control: the identical fixture, with the one call the writer above
+/// omitted. Nothing is counted, because nothing was breached — which is what
+/// makes the test above a measurement of the absorb and not of the fixture.
+#[test]
+fn a_hold_that_absorbed_records_no_breach() {
+    let (_dir, data, src_root) = fixture();
+    let mut core = build_core(&data);
+    core.commit(draft(1)).expect("first commit");
+
+    append_a_scan_directly(&mut core, &data, &src_root);
+    core.absorb_journaled()
+        .expect("the writer absorbs, as it must");
+    core.flush().expect("the hold releases");
+
+    assert_eq!(
+        core.unabsorbed_holds(),
+        0,
+        "a writer that folds what it appended breaches nothing"
+    );
+    core.commit(draft(2)).expect("and the next commit is fine");
 }
