@@ -260,7 +260,10 @@ async fn per_source_progress_is_visible_while_the_scan_is_still_running() {
 
     // Poll fast enough to see the middle of the scan, not only its ends.
     let mut saw_partial_progress = false;
-    let mut completed = None;
+    // The loop returns only on completion, so this is bound by that exit and
+    // never by an initial value — no `None` default that a later reader could
+    // mistake for "the scan might not have completed".
+    let completed;
     loop {
         let (status, progress) = poll_scan(&http, &handle, &scan_id).await;
         assert_eq!(status, 200, "{progress}");
@@ -269,13 +272,12 @@ async fn per_source_progress_is_visible_while_the_scan_is_still_running() {
             saw_partial_progress = true;
         }
         if progress["state"] == "completed" {
-            completed = Some(progress);
+            completed = progress;
             break;
         }
         // Poll cadence only: no outcome depends on this value.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let completed = completed.expect("the poll loop returns only on completion");
 
     assert!(
         saw_partial_progress,
