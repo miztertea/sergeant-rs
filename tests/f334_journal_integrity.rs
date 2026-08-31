@@ -30,6 +30,13 @@
 //!   nothing reads. This pair is also the non-vacuity proof for the guard:
 //!   the first test *is* a writer that skips `absorb_journaled`, and the
 //!   second is the identical fixture that does not.
+//! * [`every_direct_journal_writer_in_the_api_absorbs_before_releasing_its_hold`]
+//!   — the source-level half. The runtime backstop above keeps a forgetful
+//!   writer from wedging the daemon; this one keeps the writer from being
+//!   written. `tests/x5_a1a_acceptance.rs`'s
+//!   `the_trigger_is_reachable_from_production_code_not_only_a_test_module`
+//!   is the in-repo precedent for reading `src/api.rs` as text to pin a
+//!   cross-cutting property no single call site can state (R2).
 
 use std::fs;
 use std::path::Path;
@@ -161,4 +168,90 @@ fn a_hold_that_absorbed_records_no_breach() {
         "a writer that folds what it appended breaches nothing"
     );
     core.commit(draft(2)).expect("and the next commit is fine");
+}
+
+// --------------------------------------------- the source-level half
+
+/// **The invariant, made unforgettable at the point it is written.**
+///
+/// `Core::absorb_journaled`'s doc comment says: *"Every direct-journal writer
+/// must call this before releasing the hold."* That sentence was prose, and
+/// `intelligence_add_source` was written without it — which is #334. This
+/// reads `src/api.rs`'s production region and requires that every function
+/// which hands `&mut …journal` to an Atlas writer also folds what it
+/// appended, so the next writer cannot be added the same way.
+///
+/// Not a substitute for the runtime backstop in `Core::flush`, and not
+/// substituted by it: this one fails in review, that one holds in
+/// production. Both are needed because a source guard is evadable (a writer
+/// could take the journal by another name) and a runtime backstop is silent
+/// (it repairs).
+#[test]
+fn every_direct_journal_writer_in_the_api_absorbs_before_releasing_its_hold() {
+    let api = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api.rs"))
+        .expect("read src/api.rs");
+    // The real test-module boundary, the same way x5_a1a_acceptance finds it.
+    let test_module = api
+        .find("\nmod tests {")
+        .expect("src/api.rs must have a test module for this boundary to mean anything");
+
+    let lines: Vec<&str> = api.lines().collect();
+    let is_fn_line = |line: &str| {
+        let t = line.trim_start();
+        t.starts_with("fn ")
+            || t.starts_with("async fn ")
+            || t.starts_with("pub fn ")
+            || t.starts_with("pub async fn ")
+            || t.starts_with("pub(crate) fn ")
+            || t.starts_with("pub(crate) async fn ")
+    };
+
+    // Byte offset of the start of each line, so a hit can be placed relative
+    // to the test module.
+    let mut offsets = Vec::with_capacity(lines.len());
+    let mut at = 0usize;
+    for line in &lines {
+        offsets.push(at);
+        at += line.len() + 1;
+    }
+
+    let mut writers = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if offsets[i] >= test_module {
+            break;
+        }
+        // A direct-journal writer: this line hands a `&mut …journal` to
+        // something. `self.journal.append(...)` inside `Core::commit` is not
+        // one — that is the append-AND-fold path.
+        let Some(before) = line.split(".journal").next() else {
+            continue;
+        };
+        if !line.contains(".journal")
+            || !before
+                .trim_end()
+                .ends_with(|c: char| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        if !before.contains("&mut ") {
+            continue;
+        }
+        // Walk back to the enclosing function, then forward to the next one.
+        let start = (0..=i).rev().find(|&j| is_fn_line(lines[j])).unwrap_or(0);
+        let end = ((i + 1)..lines.len())
+            .find(|&j| is_fn_line(lines[j]))
+            .unwrap_or(lines.len());
+        let name = lines[start].trim().to_string();
+        let body = lines[start..end].join("\n");
+        if !body.contains("absorb_journaled") {
+            writers.push(format!("{} (line {})", name, i + 1));
+        }
+    }
+
+    assert!(
+        writers.is_empty(),
+        "these functions in src/api.rs append straight through `&mut …journal` and never \
+         call `Core::absorb_journaled`, so they release the hold with the registry behind \
+         the journal and wedge the next commit (#334): {writers:#?}"
+    );
 }

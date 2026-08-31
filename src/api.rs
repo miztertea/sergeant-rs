@@ -5815,6 +5815,16 @@ async fn intelligence_add_source(
         record_external_git_scan(atlas, &mut core.journal, &acquired, None)
     })
     .await;
+    // #334: the acquisition appended `source.scanned` straight to the
+    // journal, so the registry has to be caught up before this hold ends or
+    // the next `Core::commit` fails on contiguity — and keeps failing, on
+    // whatever Work command happens to come next. The same three lines every
+    // other direct-journal writer in this file already carried; this handler
+    // was written without them, which is the whole of #334.
+    if let Err(e) = core.absorb_journaled() {
+        tracing::error!(error = %e, "folding an external-git scan's journal summary into the registry failed");
+    }
+    drop(core);
     match recorded {
         Ok(Ok(record)) => Json(scan_record_json(
             "external_git",
