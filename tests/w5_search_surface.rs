@@ -56,7 +56,7 @@ use sergeant_rs::runtime::atlas::db::{
     SourceSelector,
 };
 use sergeant_rs::runtime::atlas::fusion::{
-    ALPHA_NATURAL, ALPHA_SYMBOL, BOOST_EXACT_MATCH, FILE_COHERENCE_BOOST_FRAC,
+    BOOST_EXACT_MATCH, FILE_COHERENCE_BOOST_FRAC,
     FILE_SATURATION_DECAY, PENALTY_NON_CANONICAL, RRF_K, RerankSignals, STEM_BOOST_MULTIPLIER,
     STEM_MATCH_MIN_RATIO,
 };
@@ -989,16 +989,11 @@ fn the_lexical_tokenizer_version_is_pinned_to_the_tokenizers_actual_output() {
 fn the_retrieval_policy_version_is_pinned_to_the_actual_rrf_and_rerank_policy() {
     assert_eq!(
         RETRIEVAL_POLICY_VERSION,
-        "rrf-k60+alpha-blend+a2s8-score-adjust+semble-boosts/4"
+        "rrf-k60+a2s8-score-adjust+semble-boosts/5"
     );
     assert_eq!(
         RRF_K, 60.0,
         "the recorded version says k=60; the constant must agree"
-    );
-    assert_eq!(
-        (ALPHA_SYMBOL, ALPHA_NATURAL),
-        (0.3, 0.5),
-        "the recorded version says alpha-blend; the constants must agree"
     );
     assert_eq!(
         (BOOST_EXACT_MATCH, PENALTY_NON_CANONICAL, FILE_SATURATION_DECAY),

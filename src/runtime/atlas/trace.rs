@@ -106,7 +106,7 @@ pub const LEXICAL_TOKENIZER_VERSION: &str = "1";
 /// is the score-adjusting rerank. Each bump landed in the commit that changed
 /// the behaviour — a trace field naming a policy the build no longer runs is
 /// a false provenance record, not a saved test.
-pub const RETRIEVAL_POLICY_VERSION: &str = "rrf-k60+alpha-blend+a2s8-score-adjust+semble-boosts/4";
+pub const RETRIEVAL_POLICY_VERSION: &str = "rrf-k60+a2s8-score-adjust+semble-boosts/5";
 
 /// A2 §13's *"retrieval generation"*, the half that is not a stored id.
 ///

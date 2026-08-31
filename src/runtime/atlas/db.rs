@@ -153,7 +153,7 @@ use crate::domain::workflow::{
 };
 use crate::runtime::atlas::external_git::ExternalGitProvenance;
 use crate::runtime::atlas::fusion::{
-    FusedHit, RerankSignals, exact_match, fuse, is_canonical_path, rerank, resolve_alpha, same_section, symbol_of,
+    FusedHit, RerankSignals, exact_match, fuse, is_canonical_path, rerank, same_section, symbol_of,
 };
 use crate::runtime::atlas::lexical::{
     Bm25Corpus, LexicalFamily, LexicalHit, UnitCoordinate, bm25_contribution, is_identifier_like,
@@ -3857,7 +3857,7 @@ impl AtlasDb {
         let snapshot = self.conn.snapshot()?;
         let lexical = self.lexical_search(&full)?;
         let semantic = self.semantic_search(&full)?;
-        let mut hits = fuse(&lexical.hits, &semantic.hits, resolve_alpha(query.text));
+        let mut hits = fuse(&lexical.hits, &semantic.hits);
         self.rerank_signals(query, &mut hits)?;
         drop(snapshot);
         rerank(&mut hits, query.text);
