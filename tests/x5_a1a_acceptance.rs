@@ -9,8 +9,12 @@
 //! Three rules this file exists to enforce, none of which a prose checklist
 //! could:
 //!
-//! 1. **No silent pass.** An item that cannot be proven is recorded as a gap
-//!    with a destination sprint, never as "met". Item 4 was such a row from
+//! 1. **No silent pass, and no silent absence.** An item that cannot be
+//!    proven is recorded as a gap with a destination sprint, never as "met";
+//!    an item no check has been claimed for at all is recorded as
+//!    [`Verdict::Unclaimed`] (S6 P0), because until then `Gap` required a
+//!    check and the only way to say "nothing claims this" was to delete the
+//!    row — which is the failure mode, not a way of recording it. Item 4 was such a row from
 //!    S3 close through S4 Y5: its tripwire,
 //!    `a1a_item_4_gap_cloud_placeholder_detection_is_not_shipped`, failed
 //!    the day someone shipped the heuristic without updating the walk, so
@@ -166,6 +170,21 @@ enum Verdict {
     /// Not fully provable today. The `note` names what is missing and the
     /// sprint that owns it. Never a pass.
     Gap,
+    /// Nobody has claimed a decisive check for this item at all — distinct
+    /// from [`Self::Gap`], which claims a check and reports what that check
+    /// cannot reach.
+    ///
+    /// Added S6 P0, with `a2_acceptance.rs` and `c1_acceptance.rs`, because
+    /// this register could not say it. `Gap` falls in the arm that REQUIRES a
+    /// check, so the only way to record "no check exists for this item" was
+    /// to delete the row — and a deleted row is precisely the failure mode
+    /// the whole battery exists to make visible. An `Unclaimed` row claims no
+    /// check and must name a DESTINATION, exactly as a gap must.
+    ///
+    /// **No row carries this today** — vocabulary, not a census, the same
+    /// way [`Self::MetWithDeviation`] is.
+    #[allow(dead_code)]
+    Unclaimed,
     /// Out of A1a's scope by a ratified re-cut, cited in the `note`.
     DeferredS4,
     /// Out of A1a's scope AND out of S4's own scope, cited in the `note` —
@@ -183,6 +202,7 @@ impl Verdict {
             Self::Met => "met",
             Self::MetWithDeviation => "met-with-deviation",
             Self::Gap => "gap",
+            Self::Unclaimed => "unclaimed",
             Self::DeferredS4 => "deferred-s4",
             Self::DeferredPostS4 => "deferred-post-s4",
         }
@@ -980,9 +1000,9 @@ fn every_contract_item_is_accounted_for() {
             item.number
         );
         match item.verdict {
-            Verdict::DeferredS4 | Verdict::DeferredPostS4 => assert!(
+            Verdict::DeferredS4 | Verdict::DeferredPostS4 | Verdict::Unclaimed => assert!(
                 item.checks.is_empty(),
-                "item {} is deferred; it must not claim a check",
+                "item {} is deferred or unclaimed; it must not claim a check",
                 item.number
             ),
             _ => assert!(
@@ -1038,7 +1058,10 @@ fn every_contract_item_is_accounted_for() {
 
     // A gap must name where it is going, or it is a silent pass wearing a
     // different label.
-    for item in WALK.iter().filter(|i| i.verdict == Verdict::Gap) {
+    for item in WALK
+        .iter()
+        .filter(|i| i.verdict == Verdict::Gap || i.verdict == Verdict::Unclaimed)
+    {
         assert!(
             item.note.contains("DESTINATION"),
             "item {}'s gap must name a destination sprint",
@@ -1170,9 +1193,9 @@ fn the_documented_walk_table_matches_the_register() {
             item.number
         );
         match item.verdict {
-            Verdict::DeferredS4 | Verdict::DeferredPostS4 => assert_eq!(
+            Verdict::DeferredS4 | Verdict::DeferredPostS4 | Verdict::Unclaimed => assert_eq!(
                 cells[3], "—",
-                "a deferred item names no check in the table either"
+                "a deferred or unclaimed item names no check in the table either"
             ),
             _ => {
                 let first = &item.checks[0];
