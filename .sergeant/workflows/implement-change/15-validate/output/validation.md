@@ -1,253 +1,202 @@
-# 15-validate — #334: journal writes silently fail; the invariant is prose
+# 15-validate — semble parity: the baseline's own command, run against the change
 
-The test command `05-baseline` recorded has been run against the implemented
-change. **Result: pass, every command, exit 0.** Nothing was fixed here — this
-stage's contract (`15-validate/CONTEXT.md:30-36`) forbids it, and nothing needed
-fixing.
+Lane: `/var/tmp/hats6/parity`, branch `hats6/semble-parity`.
+Head under validation: `04419f00` (`git -C /var/tmp/hats6/parity rev-parse HEAD`).
+Baseline pin it is compared against: `ef66bfe81a3b5e3306711df87f10644d345ff7f9`.
+Working tree at validation time: `git status --porcelain` → 0 lines before this
+artifact was written.
 
-| | |
-|---|---|
-| Tree validated | `05090bf1` (`10-implement`'s last commit) |
-| Baseline compared against | `c80bc969` / pin `f2b7a372` |
-| Lane | `/var/tmp/hats6/journal`, `git status --porcelain` empty before and after |
-| Crate | `sergeant-rs v0.3.0` |
+Full logs, captured verbatim, under `/var/tmp/hats6/parity-validate/output/`:
+`ranking-suites-validate.txt`, `coverage-gate-validate.txt`,
+`floor-suite-validate.txt`, `fmt-validate.txt`, `clippy-validate.txt`.
 
-## 1. The baseline's command, re-run verbatim
+**Result: PASS. Nothing failed, so nothing is carried forward as a failure.**
 
-Commands copied from `05-baseline/output/baseline.md` §1 without substitution;
-all with `CARGO_BUILD_JOBS=6 TMPDIR=/var/tmp/sgt-test-tmp`.
+---
 
-### 1a. Core + endpoint + replay set — **67 passed, 0 failed** (log `/var/tmp/sgt-test-tmp/val_core.txt`)
+## 1. Command A — the baseline's ranking/retrieval suites, verbatim
 
-```
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
-────────────
- Nextest run ID af09a848-369c-4a6c-b1a9-7a1d4197672e with nextest profile: default
-    Starting 67 tests across 6 binaries
-        PASS [   0.028s] sergeant-rs::m1_event_core blank_journal_line_fails_closed
-        PASS [   0.153s] sergeant-rs::m1_event_core seq_gap_or_duplicate_fails_closed
-        PASS [   0.330s] sergeant-rs::m1_event_core deterministic_replay_and_snapshot_equivalence
-        PASS [   0.156s] sergeant-rs::w3_allowlist_equivalence kind_daemon_stopped_is_replay_equivalent
-        …
-        PASS [  31.125s] sergeant-rs::m5_projections t1_rebuild_from_scratch_reproduces_every_canned_answer
-        PASS [  36.872s] sergeant-rs::m5_projections t4_deleting_the_projections_directory_loses_nothing
-        PASS [  37.248s] sergeant-rs::m5_projections a_restart_over_the_existing_projection_file_rebuilds_it
-────────────
-     Summary [  37.248s] 67 tests run: 67 passed, 0 skipped
-```
-`CORE EXIT=0`. Per-binary counts from the log: `m1_event_core` 14,
-`m5_projections` 21, `x5_a1a_acceptance` 11, `w3_allowlist_equivalence` 10,
-`y5_external_git_triggers` 6, `w1b_overlay_lifecycle_trigger` 5 = **67 —
-identical to the baseline's split**, so this is the same set, not a
-coincidentally equal total.
+Run exactly as `05-baseline` §1 recorded it, unmodified:
 
-Baseline §4b named four tests by hand as the ones that must be *satisfied*,
-never relaxed to make the regression green. All four are in the `PASS` lines
-above at their own names: `seq_gap_or_duplicate_fails_closed` (line 18 of the
-log), `deterministic_replay_and_snapshot_equivalence` (20),
-`kind_daemon_stopped_is_replay_equivalent` (34), and both
-`w1b_overlay_lifecycle_trigger` lifecycle cases — writer #1 still absorbs.
+    cd /var/tmp/hats6/parity && TMPDIR=/var/tmp/sgt-test-tmp CARGO_BUILD_JOBS=6 \
+      cargo nextest run --no-fail-fast \
+        --test w4_rrf_fusion --test w2_lexical_retrieval \
+        --test w3b_semantic_retrieval --test w5_search_surface \
+        --test w3_semantic_degradation --test a2_acceptance
 
-### 1b. #231 coverage membership — **1 passed** (log `val_231.txt`)
+Verbatim head and tail of the run:
 
-```
-   Compiling sergeant-rs v0.3.0 (/var/tmp/hats6/journal)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.19s
-────────────
- Nextest run ID 43eb6da7-e97a-4aa9-8469-b03f625fb142 with nextest profile: default
-    Starting 1 test across 1 binary (27 tests skipped)
-        PASS [   0.006s] sergeant-rs::c2_light coverage_stage_membership::every_suite_is_wired_or_explicitly_allowlisted
-────────────
-     Summary [   0.006s] 1 test run: 1 passed, 27 skipped
-```
-`231 EXIT=0`.
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+    ────────────
+     Nextest run ID 09211606-7fa4-40c6-867a-36008a9bb4c4 with nextest profile: default
+        Starting 77 tests across 6 binaries
+            PASS [   0.005s] sergeant-rs::a2_acceptance the_documented_walk_table_matches_the_register
+    …
+            PASS [  17.332s] sergeant-rs::w2_lexical_retrieval a_bounded_answer_reports_true_when_the_posting_scan_is_actually_capped
+    ────────────
+         Summary [  17.332s] 77 tests run: 77 passed, 0 skipped
 
-### 1c. Shutdown / `daemon.stopped` — **3 passed** (log `val_m2.txt`)
+Exit code **0**. `grep -n "FAIL"` over the log returns nothing (zero FAIL lines);
+77 PASS lines, one per test.
 
-```
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s
-────────────
- Nextest run ID 3837fe6f-ced4-4c12-aa58-84179fe2aab4 with nextest profile: default
-    Starting 3 tests across 1 binary (65 tests skipped)
-        PASS [   4.512s] sergeant-rs::m2_daemon_api t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped
-        PASS [   8.589s] sergeant-rs::m2_daemon_api shutdown_completes_with_a_live_sse_client_attached
-        PASS [   9.415s] sergeant-rs::m2_daemon_api t11d_a_stalled_completion_driver_does_not_hold_shutdown_open
-────────────
-     Summary [   9.416s] 3 tests run: 3 passed, 65 skipped
-```
-`M2 EXIT=0`.
+Per binary (`grep -oP '(?<=sergeant-rs::)\w+' | sort | uniq -c`), against the
+baseline's own table:
 
-### 1d. Format gate
+| suite | baseline | now | delta |
+|---|---|---|---|
+| `w4_rrf_fusion` | 17 | **26** | +9 |
+| `w2_lexical_retrieval` | 17 | 17 | — |
+| `w5_search_surface` | 15 | 15 | — |
+| `w3b_semantic_retrieval` | 9 | 9 | — |
+| `w3_semantic_degradation` | 6 | 6 | — |
+| `a2_acceptance` | 4 | 4 | — |
+| **total** | **68 passed** | **77 passed** | **+9, 0 failed, 0 skipped** |
 
-```
-$ cargo fmt --check
-(no output)
-FMT EXIT=0
-```
+The whole delta lands in `w4_rrf_fusion` — the suite that owns the fusion and
+rerank seams the port touched. Nothing outside it changed count, and nothing
+outside it changed colour.
 
-## 2. What the baseline said must newly exist — run, not asserted
+### The four tests `05-baseline` §4 said would have to move
+`05-baseline` predicted four committed tests a port must rewrite. What the
+validated head actually contains:
 
-`05-baseline` §4a listed six things absent at the pin. The suite that carries
-them now runs (log `val_new.txt`):
+| predicted test | fate at `04419f00` | evidence |
+|---|---|---|
+| `an_exact_name_match_is_promoted_over_a_better_fused_score` | **retained, not deleted** — fixture rewritten so the exact-match boost covers the score gap; still asserts `["a.rs","b.rs"]` after `rerank` | `tests/w4_rrf_fusion.rs:1181-1198` |
+| `the_rerank_key_is_a2_section_8s_nine_signals_in_the_contracts_own_order` | **renamed** → `..._as_a_score_adjustment` | `git diff ef66bfe8..HEAD -- tests/w4_rrf_fusion.rs` shows the `-fn …_in_the_contracts_own_order` / `+fn …_as_a_score_adjustment` pair |
+| `the_fused_score_is_a2_section_7s_one_expression` | **unchanged and green** — step (b) was reverted at `58a1bb64`, so A2 §7's one expression still holds | `tests/w4_rrf_fusion.rs:141`; PASS in the log |
+| `the_retrieval_policy_version_is_pinned_…` | **bumped**, to `rrf-k60+a2s8-score-adjust+semble-boosts/5` | `src/runtime/atlas/trace.rs:109`; the pin test PASSes |
 
-```
- Nextest run ID 4af20319-d1d1-4779-ba22-3afc9a0b7711 with nextest profile: default
-    Starting 12 tests across 2 binaries
-        PASS [   0.008s] sergeant-rs::w3_prune_engine prune_runs_only_under_the_core_guard
-        PASS [   0.011s] sergeant-rs::f334_journal_integrity every_direct_journal_writer_in_the_api_absorbs_before_releasing_its_hold
-        PASS [   0.020s] sergeant-rs::w3_prune_engine no_configuration_or_flag_can_lower_the_prune_predicate
-        PASS [   0.323s] sergeant-rs::w3_prune_engine support::cross_process_lock_tests::excludes_concurrent_holders_of_the_same_name
-        PASS [   3.049s] sergeant-rs::f334_journal_integrity a_shutdown_journals_and_publishes_its_stop_event_even_from_a_wedged_registry
-        PASS [   3.049s] sergeant-rs::f334_journal_integrity a_hold_that_skipped_absorb_journaled_is_counted_as_a_breach
-        PASS [   3.055s] sergeant-rs::f334_journal_integrity a_hold_that_absorbed_records_no_breach
-        PASS [   3.055s] sergeant-rs::f334_journal_integrity the_wedged_cascade_from_the_issue_is_recovered_when_the_hold_releases
-        PASS [   3.056s] sergeant-rs::f334_journal_integrity a_hold_that_appended_directly_without_absorbing_does_not_wedge_the_next_commit
-        PASS [  11.339s] sergeant-rs::w3_prune_engine a_rotation_crossing_the_cap_arms_a_prune_within_one_tick
-        PASS [  14.950s] sergeant-rs::w3_prune_engine a_start_on_an_over_cap_journal_prunes_before_serving
-        PASS [  18.879s] sergeant-rs::w3_prune_engine a_start_after_a_prune_with_no_cache_still_serves
-────────────
-     Summary [  18.880s] 12 tests run: 12 passed, 0 skipped
-```
-`NEW EXIT=0`. Total across every command above: **83 tests, 83 passed, 0
-failed** (67 + 1 + 3 + 12).
+The brief's "do not delete `an_exact_name_match_is_promoted_over_a_better_fused_score`
+without saying so in the same breath" is satisfied by not deleting it: the test
+survives at `tests/w4_rrf_fusion.rs:1181` with an adjusted fixture, and its
+doc-comment states the new mechanism.
 
-## 3. Non-vacuity, re-proven here — not inherited from `10-implement`
+`a2_acceptance` — the suite whose `every_named_check_exists_in_the_suite_it_names`
+`05-baseline` flagged as coupled to those renames — is 4/4 PASS, so no cited
+check was left dangling by the rename.
 
-`10-implement` captured its own reds. This stage did not take them on trust: the
-standing rule is "would it pass with the feature deleted?", so each guard was
-re-broken against **this** tree and restored. Every probe was a patch-then-
-`git status --porcelain`-empty restore; the tree was verified clean after each,
-and the suite re-run green at the end (`Summary … 6 tests run: 6 passed`).
+### The load-bearing greens `05-baseline` §4 named
+All present and PASS in the log: `the_fused_order_does_not_depend_on_the_callers_limit`
+(`00-orient` J0 #2's tripwire — **green**, so the limit-independence pin held and
+the discarded `top_k*5` over-fetch never landed),
+`the_search_cli_exposes_a2_section_14s_selectors_and_no_weight_knob`,
+`a_test_path_loses_to_a_canonical_one_at_an_equal_fused_score`,
+`the_three_filter_shaped_signals_are_uniform_because_admissibility_already_applied_them`,
+the determinism pair (`the_same_query_…_returns_an_identical_answer` /
+`…_identical_fused_answer`), and the `w3_semantic_degradation` six.
 
-**Probe A — delete the located fix** (the `absorb_journaled` block at
-`src/api.rs:5815`, the whole of #334):
+## 2. Command B — the #231 wiring gate, verbatim
 
-```
-thread 'every_direct_journal_writer_in_the_api_absorbs_before_releasing_its_hold' panicked at tests/f334_journal_integrity.rs:274:5:
-these functions in src/api.rs append straight through `&mut …journal` and never call `Core::absorb_journaled`, so they release the hold with the registry behind the journal and wedge the next commit (#334): [
-    "async fn intelligence_add_source( (line 5815)",
-]
-     Summary [   0.010s] 1 test run: 0 passed, 1 failed, 5 skipped
-```
-One entry, naming the real writer. The four writers that *do* absorb are matched
-by the same scan and stay silent — the pattern is validated by a known positive,
-not trusted at a count of zero.
+    cd /var/tmp/hats6/parity && TMPDIR=/var/tmp/sgt-test-tmp CARGO_BUILD_JOBS=6 \
+      cargo nextest run --test c2_light -E 'test(coverage_stage_membership)'
 
-**Probe B — disable the choke point** (`self.absorb_before_release();` removed
-from `Core::flush`, `src/api.rs:272`): **4 of 6 red.**
+Verbatim, in full:
 
-```
-thread 'a_hold_that_appended_directly_without_absorbing_does_not_wedge_the_next_commit' panicked at tests/f334_journal_integrity.rs:145:10:
-the next commit must not be wedged by a writer that forgot to absorb: Projection(SeqMismatch { expected: 2, found: 3 })
+        Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+    ────────────
+     Nextest run ID 97c146e9-fc9e-40d5-96b0-d11b8d264b30 with nextest profile: default
+        Starting 1 test across 1 binary (27 tests skipped)
+            PASS [   0.005s] sergeant-rs::c2_light coverage_stage_membership::every_suite_is_wired_or_explicitly_allowlisted
+    ────────────
+         Summary [   0.005s] 1 test run: 1 passed, 27 skipped
 
-thread 'a_shutdown_journals_and_publishes_its_stop_event_even_from_a_wedged_registry' panicked at tests/f334_journal_integrity.rs:395:5:
-the stop event must also reach the surfaces that read the record — being in the journal and absent from every projection and subscriber is the failure #334 actually is (00-orient §3b), got []
-     Summary [   0.160s] 6 tests run: 2 passed, 4 failed, 0 skipped
-```
-The two that stayed green are the correct two and worth naming: the control
-(`a_hold_that_absorbed_records_no_breach` — a writer that *did* absorb is
-unaffected by the choke point being gone) and the source-text guard (probe B
-changed runtime behaviour, not the source pattern it scans). A probe that turned
-*everything* red would have been the weaker result.
+Exit code **0**. Same shape as the baseline's `1 test run: 1 passed, 27 skipped`.
 
-`SeqMismatch { expected: 2, found: 3 }` is the issue's own shape at minimum
-scale; `got []` is `00-orient` §3b entire — journaled, published to nobody,
-while the operator was told "failed to journal".
+## 3. The wave's new suite — outside the baseline command, run anyway
 
-**Probe C — unwire the new suite** (comment the `cov_run` line at
-`scripts/coverage/c2-suites.sh:426`), because the brief calls the #231 guard
-itself unproven after a sibling lane:
+`w4a_retrieval_floor` did not exist at the pin, so the baseline's command A
+cannot name it. It is the wave's own guard and is run here rather than left
+unvalidated:
 
-```
-thread 'coverage_stage_membership::every_suite_is_wired_or_explicitly_allowlisted' panicked at tests/c2_light/coverage_stage_membership.rs:132:5:
-new orphaned suite(s) wired into neither c2-suites.sh nor c3-spawning-suites.sh, and not named in this test's ALLOWLIST with a reason: ["f334_journal_integrity"] — wire it into a coverage stage, or add an allowlist entry with a specific reason (#231(b))
-     Summary [   0.006s] 1 test run: 0 passed, 1 failed, 27 skipped
-```
-The guard catches an unwired suite. It was run, not reasoned about, in both
-directions.
+    cd /var/tmp/hats6/parity && TMPDIR=/var/tmp/sgt-test-tmp CARGO_BUILD_JOBS=6 \
+      cargo nextest run --no-fail-fast --test w4a_retrieval_floor
 
-## 4. The four close-outs
+Verbatim, in full:
 
-**1. Every new suite wired into `scripts/coverage/` (#231) — done, with the hit shown.**
-```
-$ grep -rn "f334_journal_integrity" scripts/
-scripts/coverage/c2-suites.sh:425:cov_stage_begin c2-f334_journal_integrity
-scripts/coverage/c2-suites.sh:426:cov_run cargo llvm-cov --no-report --test f334_journal_integrity --locked || cov_fail "f334_journal_integrity failed under instrumentation"
-scripts/coverage/c2-suites.sh:427:cov_stage_end 1 "the f334_journal_integrity test binary must write its own profile"
-grep EXIT=0
-```
-`f334_journal_integrity` is the only new suite (`git diff --stat c80bc969..05090bf1`
-lists exactly four files: this workflow artifact, `scripts/coverage/c2-suites.sh`,
-`src/api.rs`, `tests/f334_journal_integrity.rs`). Probe C above proves the
-membership guard would have caught it had it not been wired.
+        Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s
+    ────────────
+     Nextest run ID 80d6d7e3-88dd-4f1e-ad45-438b321145c0 with nextest profile: default
+        Starting 3 tests across 1 binary
+            PASS [   0.004s] sergeant-rs::w4a_retrieval_floor the_committed_question_set_keeps_its_shape
+            PASS [  31.561s] sergeant-rs::w4a_retrieval_floor the_scanned_corpus_is_this_repository
+            PASS [  59.414s] sergeant-rs::w4a_retrieval_floor precision_at_one_over_the_committed_question_set_does_not_regress
+    ────────────
+         Summary [  59.414s] 3 tests run: 3 passed, 0 skipped
 
-**2. `cargo fmt` and `cargo clippy --all-targets` — both clean.**
-```
-$ cargo fmt --check                                              → FMT EXIT=0 (no output)
-$ CARGO_BUILD_JOBS=6 cargo clippy --locked --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s
-                                                                 → CLIPPY EXIT=0
-```
-Stated plainly: clippy `Finished` in 0.32s off a warm fingerprint from this
-lane's earlier run against this same clean tree — the exit code is real, the
-compile was cached. `05-baseline` §2d recorded clippy as *not* pre-cleared, so
-this is new evidence, not an inherited pass. CI runs it cold by SHA.
+Exit code **0**. Grand total across all three commands: **81 tests run, 81
+passed, 0 failed.**
 
-**3. Docs the brief names — none named; nothing skipped.**
-The brief (`brief-334-journal-integrity.md`) mentions docs only in the sense of
-the *existing* `absorb_journaled` doc comment being prose that item 4 must
-replace with structure. It names no documentation deliverable — no ADR, no
-`docs/` page, no CHANGELOG entry. Read, not recalled: the brief's five numbered
-deliverables are the writer enumeration, the scan-front-door check, the
-deterministic repro, the structural guard, and the shutdown stop event; its
-Constraints list names no doc. Recorded as *not applicable*, not as *done*.
+---
 
-**4. No clock decides correctness anywhere touched — verified, pattern validated.**
-```
-$ grep -n "Instant\|elapsed\|sleep\|timeout\|Duration\|BUDGET\|deadline" tests/f334_journal_integrity.rs
-grep EXIT=1  (no match)
-$ git diff c80bc969..05090bf1 -- src/api.rs | grep "^+" | grep -i "instant\|elapsed\|sleep\|timeout\|duration\|deadline"
-grep EXIT=1  (no match)
-```
-A count of zero is a claim, so the same pattern was validated against a known
-positive in the same tree — `tests/w3_prune_engine.rs` returns
-`123: tokio::time::sleep(…from_millis(50))`, `148: .timeout(…from_secs(20))`,
-and three more. The pattern finds clocks where clocks exist. The new suite has
-**no clock at all** — not a poll interval needing a cadence comment, none: every
-assertion waits on recorded state (a journal seq, a registry `last_seq`, a
-`unabsorbed_holds` count, a published event list). `bdda34f3`'s stripped class is
-not reintroduced.
+## 4. Close-out — all four, with evidence
 
-## 5. Carried forward unchanged — still `blocked`, and not by this stage
+### 4.1 Every new suite is wired into `scripts/coverage/` (#231) — DONE
+The wave adds exactly one suite (`git diff --name-only ef66bfe8..HEAD` lists one
+new `tests/*.rs`: `tests/w4a_retrieval_floor.rs`). Grep of `scripts/` for it:
 
-Issue item 2 ("is a failed journal write ever acceptable?") remains escalated at
-`00-orient` §7 with its recommendation and evidence. It is a **J0** (`AGENTS.md`:
-no lower rung resolves a first-principle contract change), and nothing in this
-validation touched, decided, or depended on it. `05-baseline` §4a's six
-expected-to-move items all validated green without it, exactly as the baseline
-predicted.
+    $ grep -rn "w4a_retrieval_floor" scripts/
+    scripts/coverage/c2-suites.sh:418:cov_stage_begin c2-w4a_retrieval_floor
+    scripts/coverage/c2-suites.sh:419:cov_run cargo llvm-cov --no-report --test w4a_retrieval_floor --locked || cov_fail "w4a_retrieval_floor failed under instrumentation"
+    scripts/coverage/c2-suites.sh:420:cov_stage_end 1 "the w4a_retrieval_floor test binary must write its own profile"
 
-Also carried, untouched and deliberately so (`00-orient` §6): the `failed to
-journal …` wording at `src/daemon.rs:1485`/`:1647`, `Core::commit`'s
-append-before-fold ordering, and the scan front door `335d5892` (not on the pin
-— the brief's deliverable 2 is an orient-stage finding, not a change this
-validation could make).
+Same three-line shape as its neighbour `c2-w4_rrf_fusion` at `:404-406`. The
+independent check is command B above, which is exactly the "orphaned suite"
+detector and is green.
 
-## Rungs
+### 4.2 `cargo fmt` and `cargo clippy --all-targets` — DONE, both clean
+`CARGO_BUILD_JOBS=6 cargo fmt --check` → exit **0**, **0 lines of output**
+(`fmt-validate.txt` is empty).
+`TMPDIR=/var/tmp/sgt-test-tmp CARGO_BUILD_JOBS=6 cargo clippy --all-targets` →
+exit **0**, tail `Finished \`dev\` profile [unoptimized + debuginfo] target(s) in
+0.19s`, and `grep -c '^warning\|^error'` → **0**.
 
-- **J3** — the command, the subset, and the pass/fail criteria were settled by
-  `05-baseline`; this stage ran them, it did not choose them.
-- **J2** — the probes. `15-validate/CONTEXT.md:43-45` delegates "ordinary tool
-  mechanics"; re-breaking a guard on this tree and restoring it is how you learn
-  the recorded pass is real, and the standing requirement ("would it pass with
-  the feature deleted?") makes it obligatory rather than optional. No product
-  behaviour was changed: every probe ended `git status --porcelain` empty.
-- **J1** — the wording of this record.
-- **No J0 raised here.** The one J0 in this wave is untouched and still escalated.
-- **No R-rung** — this stage constructed nothing.
+### 4.3 Docs the brief names — NAMED AS NOT APPLICABLE, with the reason
+The brief (`brief-semble-parity.md`) names **no documentation deliverable**. Its
+only doc-shaped instruction is line 83: *"record that as a contract amendment
+with the measured delta behind it and escalate; do not silently diverge"* — an
+amendment to `A2-RETRIEVAL-INTELLIGENCE.md`, which lives in the **knowledge
+library**, not in this lane's tree, and which `10-implement` carried as
+escalation #1. Writing it here would be this stage taking a decision that is the
+owner's (J0), and would put a knowledge-library edit in a product lane. Not done,
+deliberately.
 
-## Verdict
+Verified that the lane holds no product doc contradicted by the change:
+`grep -rln "rrf-k60\|RETRIEVAL_POLICY_VERSION\|retrieval policy" docs/ *.md`
+returns **no hits** — the policy string is documented only in its own Rust
+doc-comment (`src/runtime/atlas/trace.rs:56`), which moved with it.
 
-The baseline's own command, re-run against the change: **83/83 pass, exit 0,
-every command**. No failure to carry forward. The panel gets a green record whose
-guards were each proven red on this tree before it was written.
+### 4.4 No clock decides correctness anywhere the wave touched — CONFIRMED
+The wave's nine changed files (`git diff --name-only ef66bfe8..HEAD`) grepped for
+`Instant::now|SystemTime::now|Duration::from|elapsed()|sleep|timeout|BUDGET|deadline`:
+
+- `src/runtime/atlas/fusion.rs`, `src/runtime/atlas/trace.rs`,
+  `tests/w4_rrf_fusion.rs`, `tests/w4a_retrieval_floor.rs`,
+  `tests/a2_acceptance.rs` — **zero matches**.
+- `src/runtime/atlas/db.rs` — the diff hunks contain no clock construct at all
+  (`git diff … -- src/runtime/atlas/db.rs | grep -i "now()\|elapsed\|sleep\|deadline\|Duration"` → no output).
+- `tests/w5_search_surface.rs:117` — one hit, `deadline: Duration::from_secs(30)`,
+  a `WorkerRuntime` field. **Not introduced by this wave**: the file's diff
+  against `ef66bfe8` contains no `deadline` line. It is the anydoc worker's hang
+  guard (`src/runtime/atlas/worker.rs:56`: *"The deadline above is a HANG guard"*),
+  it bounds a child process rather than asserting anything, and no assertion in
+  the file reads a wall clock or a ratio.
+
+No deadline loop, no `Instant::now() + BUDGET`, no wall-clock or ratio assertion
+was added. The relevance floor (`w4a_retrieval_floor`) asserts a **p@1 count**,
+not a duration.
+
+---
+
+## 5. Carried forward
+
+Nothing failed, so this stage carries no failure. Two things the panel should
+still see, both raised by earlier stages and neither resolved by a green run:
+
+1. `10-implement`'s three J0 escalations stand unchanged — A2 §8 signal 5 no
+   longer influencing order; the p@1 floor threshold `.57` being a **new
+   acceptance criterion the owner must set**; and the `RETRIEVAL_POLICY_VERSION`
+   bump. A green suite is not the owner's ruling on any of them.
+2. The measured outcome is **not parity**: p@1 `.404 → .538` against semble's
+   `.731` upper bound. The suites passing says the port is correct, not that the
+   wave's objective is met.
