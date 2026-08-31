@@ -193,3 +193,17 @@ cov_run cargo llvm-cov --no-report --test w7_container_children --locked || cov_
 cov_stage_end 2 "w7_container_children dispatches real sgt-atlas-worker subprocesses from four \
 real scans (a zip, a zip-inside-a-mail chain, an unclaimed-extension child, and a four-level \
 nested archive); more than the test binary's own profile must arrive, or no subprocess flushed"
+
+# S6 D1, wired at birth (the #231 lesson, same as y1-y4/y8/w7 above): A2 §2
+# stage 1's estate axis, proven across TWO estates on ONE host daemon — the
+# seam no suite crossed before, and the one the leak lived in. Every test here
+# either drives real `sgt` client processes against a spawned daemon (search,
+# related, intelligence scan, from each estate in turn) or builds an
+# `Admissibility` directly against a real store. Floor 2, not higher, for the
+# same reason y1-y4's is: the test binary's own profile plus at least one
+# flushed subprocess.
+cov_stage_begin c3-d1_estate_isolation
+cov_run cargo llvm-cov --no-report --test d1_estate_isolation --locked || cov_fail "d1_estate_isolation failed under instrumentation"
+cov_stage_end 2 "d1_estate_isolation spawns a real daemon and drives real sgt search/related/scan \
+clients from two separate estate roots; more than the test binary's own profile must arrive, or \
+no subprocess flushed"
