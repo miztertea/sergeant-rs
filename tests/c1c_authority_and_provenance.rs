@@ -590,6 +590,101 @@ fn a_document_excerpt_carries_extractor_native_coordinate_and_heading() {
     );
 }
 
+/// **§21 item 8 + A2 §9, the render half.** *"it must use the strongest
+/// coordinate actually produced, not invent cell precision."*
+///
+/// A unit the extractor had to decode a container to reach has **no** byte
+/// span — `0`/`0` is its honest not-applicable stored value — and its native
+/// coordinate is the only thing that addresses it. Rendering `bytes 0..0`
+/// beside it prints the *absence* where a reader reads evidence, which is
+/// S5 closeout finding **F-AC-02**. That was fixed once already for the CLI
+/// hit renderer (`src/cli.rs`'s `print_hit`: *"Printing `bytes 0..0` there
+/// prints the absence instead of the evidence"*); this is the same defect on
+/// the C1 compiled-prompt render path.
+///
+/// **The control that makes this non-vacuous** is the Markdown unit landed in
+/// the same generation: its byte span *is* its address, it has no native
+/// coordinate, and its `bytes 0..N` must still be rendered. So a fix that
+/// suppressed byte spans generally — the easy way to make the first assertion
+/// pass — fails the second.
+#[test]
+fn an_excerpt_addressed_by_a_native_coordinate_renders_no_empty_byte_span() {
+    const OFFICE_EXTRACTOR: &str = "office-docx/v3";
+    const NATIVE: &str = "block:17";
+    const OFFICE_BODY: &str = "The vendor's retention defaults, from the deck.";
+    const CONTROL_BODY: &str = "The retention policy, in one paragraph.";
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+
+    let office = ScannedFile {
+        relative_path: "decks/current-state.docx".to_string(),
+        content_hash: "hash/decks/current-state.docx".to_string(),
+        extractor: OFFICE_EXTRACTOR.to_string(),
+        local_key: "key/decks/current-state.docx".to_string(),
+        byte_len: OFFICE_BODY.len() as u64,
+        mtime_millis: None,
+        units: vec![ScannedUnit {
+            ordinal: 0,
+            kind: UnitKind::Section,
+            heading_level: Some(2),
+            title: Some("Retention".to_string()),
+            // The not-applicable span: there is no offset into the
+            // compressed original that addresses this unit.
+            byte_start: 0,
+            byte_end: 0,
+            coordinate: Some(NATIVE.to_string()),
+            text: OFFICE_BODY.to_string(),
+        }],
+        syntax: None,
+        parent: None,
+    };
+    let overlay = scan(
+        &overlay_source_name(WORK_ID, REPOSITORY),
+        SourceKind::EstateGit,
+        AuthorityClass::EstateMutable,
+        vec![office, file("notes/plan.md", vec![unit(0, "Plan", CONTROL_BODY)])],
+    );
+    record_scan(
+        &mut db,
+        &mut journal,
+        &overlay,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record overlay");
+
+    let snapshot = compiled(&db, &bindings(), &prior_stages());
+    let docx = unit_at(&snapshot, "decks/current-state.docx");
+    assert_eq!(
+        docx.provenance.native_coordinate.as_deref(),
+        Some(NATIVE),
+        "the fixture must actually carry a native coordinate, or this proves nothing: {docx:?}"
+    );
+    let control = unit_at(&snapshot, "notes/plan.md");
+    assert_eq!(
+        control.provenance.native_coordinate, None,
+        "the control must genuinely have no native coordinate: {control:?}"
+    );
+
+    let rendered = snapshot.render_onto(AUTHORED);
+    assert!(
+        !rendered.contains("bytes 0..0"),
+        "F-AC-02: `bytes 0..0` prints the absence of a byte span where a reader reads \
+         evidence; the native coordinate is this unit's address: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("native {NATIVE}")),
+        "the native coordinate must be what addresses the excerpt instead: {rendered}"
+    );
+    // The control: suppressing byte spans generally is not the fix.
+    assert!(
+        rendered.contains(&format!("bytes 0..{}", CONTROL_BODY.len())),
+        "the Markdown control's byte span IS its address and must still be rendered: {rendered}"
+    );
+}
+
 /// **§21 item 8's deferred half, stated where a reader of item 8 looks.**
 ///
 /// OCR is the one thing the owner ruled outside 0.3.0, so this build derives

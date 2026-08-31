@@ -1020,7 +1020,23 @@ impl EvidenceProvenance {
                 None => parts.push(format!("title {title:?}")),
             }
         }
-        if let Some((start, end)) = self.byte_span {
+        // A2 §9: *"it must use the strongest coordinate actually produced,
+        // not invent cell precision."* A unit the extractor had to decode a
+        // container to reach — a mail body, an Office block — has no offset
+        // into the original; `0`/`0` is its honest not-applicable *stored*
+        // value, and its native coordinate is what addresses it. Printing
+        // `bytes 0..0` beside it prints the absence where a reader reads
+        // evidence (S5 closeout, F-AC-02; already fixed once for the CLI hit
+        // renderer in `src/cli.rs`'s `print_hit`).
+        //
+        // Narrow on purpose: only the empty span is dropped, and only when a
+        // native coordinate is actually there to replace it. §12 forbids
+        // erasing provenance to make the prompt cleaner, so a byte span the
+        // extractor really produced is still rendered even beside a native
+        // coordinate.
+        if let Some((start, end)) = self.byte_span
+            && !(start == end && self.native_coordinate.is_some())
+        {
             parts.push(format!("bytes {start}..{end}"));
         }
         if let Some(ocr) = &self.ocr {
