@@ -201,6 +201,15 @@ cov_stage_begin c2-x5_a1a_acceptance
 cov_run cargo llvm-cov --no-report --test x5_a1a_acceptance --locked || cov_fail "x5_a1a_acceptance failed under instrumentation"
 cov_stage_end 1 "the x5_a1a_acceptance test binary must write its own profile"
 
+# S6 P0, wired at birth (the #231 lesson, same as x5 above): the A2 §17
+# acceptance register — the ten-item walk, its citation guard (which also
+# refuses an `#[ignore]`d or assertion-free check) and its doc-table guard.
+# Reads this repository's own test sources only — no daemon, no estate, no
+# subprocess. Floor 1.
+cov_stage_begin c2-a2_acceptance
+cov_run cargo llvm-cov --no-report --test a2_acceptance --locked || cov_fail "a2_acceptance failed under instrumentation"
+cov_stage_end 1 "the a2_acceptance test binary must write its own profile"
+
 # S4 Y2, wired at birth (the #231 lesson, same as x1/x5 above): the
 # replaceability boundary's structural pin. A token scan of this repository's
 # own `.rs` sources under `src/`/`tests/` — no daemon, no estate, no
