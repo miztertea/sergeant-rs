@@ -4975,15 +4975,58 @@ fn source_status_json(status: &SourceStatus) -> Value {
 
 /// `GET /v1/intelligence/status` — F8's coverage, per indexed source.
 async fn intelligence_status(State(state): State<ApiState>) -> Response {
-    match with_atlas(&state, |atlas| atlas.indexed_sources()).await {
-        Ok(None) => atlas_absent(),
+    let indexed = with_atlas(&state, |atlas| atlas.indexed_sources()).await;
+    // A2 §15's *"reports that coverage/capability honestly"*, on **both**
+    // branches: whether the semantic model is loaded is a fact about this
+    // host, not about whether anything has been indexed on it yet, and an
+    // operator asking "will search rank semantically?" on a fresh host is
+    // asking exactly this. Before S6 the only surface that said anything was
+    // a search answer's disclosure line, so the question could only be
+    // answered by running a query.
+    let semantic = semantic_capability(&state).await;
+    match indexed {
+        Ok(None) => Json(json!({
+            "atlas": {"present": false},
+            "sources": [],
+            "semantic": semantic,
+            "detail": "no source has been indexed on this host yet",
+        }))
+        .into_response(),
         Ok(Some(sources)) => Json(json!({
             "atlas": {"present": true},
             "sources": sources.iter().map(source_status_json).collect::<Vec<_>>(),
+            "semantic": semantic,
         }))
         .into_response(),
         Err(response) => *response,
     }
+}
+
+/// This host's [`SemanticCapability`], rendered.
+///
+/// Asked of the open Atlas handle when there is one — it loaded the model at
+/// most once for the life of the process and answering from it is free — and
+/// probed directly when there is not, which is the never-indexed host where
+/// the question is most likely to be asked and where paying for one load is
+/// the only way to answer it.
+async fn semantic_capability(state: &ApiState) -> Value {
+    let capability = {
+        let guard = state.atlas.lock().await;
+        match guard.as_ref() {
+            Some(atlas) => atlas.semantic_capability(),
+            None => atlas_semantic::capability(),
+        }
+    };
+    let mut body = json!({"state": capability.as_str()});
+    match &capability {
+        atlas_semantic::SemanticCapability::Installed(model) => {
+            body["identity"] = json!(model.identity);
+            body["content_hash"] = json!(model.content_hash);
+        }
+        atlas_semantic::SemanticCapability::Failed { detail } => body["detail"] = json!(detail),
+        atlas_semantic::SemanticCapability::NotInstalled => {}
+    }
+    body
 }
 
 #[derive(Debug, Deserialize)]

@@ -161,8 +161,8 @@ use crate::runtime::atlas::lexical::{
 };
 use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
 use crate::runtime::atlas::semantic::{
-    SemanticEngine, SemanticHit, SemanticModel, SemanticRequest, SemanticStatus, cosine,
-    rank_semantic, resolve as resolve_semantic,
+    SemanticCapability, SemanticEngine, SemanticError, SemanticHit, SemanticModel, SemanticRequest,
+    SemanticStatus, cosine, rank_semantic, resolve as resolve_semantic,
 };
 use crate::runtime::atlas::tabular::{
     DatasetFormat, RowKeyBasis, RowUnit, ScannedDataset, row_units,
@@ -1697,7 +1697,7 @@ pub struct AtlasDb {
     /// handles in one process (a test suite's) must be able to disagree
     /// about what is installed instead of racing to cache the first answer
     /// for everyone.
-    semantic: OnceLock<Option<SemanticEngine>>,
+    semantic: OnceLock<Result<Option<SemanticEngine>, SemanticError>>,
 }
 
 impl std::fmt::Debug for AtlasDb {
@@ -3587,6 +3587,22 @@ impl AtlasDb {
         Self::engine_of(&self.semantic)
     }
 
+    /// **A2 §15's capability, honestly**, from the load this handle already
+    /// made — so an operator can ask whether the semantic half is available
+    /// without running a query to find out, and a directory that exists and
+    /// will not load is not reported as no assets at all
+    /// ([`SemanticEngine::load`]'s own doc: *"`Ok(None)` and `Err(_)` are
+    /// different answers on purpose"*).
+    pub fn semantic_capability(&self) -> SemanticCapability {
+        match Self::load_of(&self.semantic) {
+            Ok(Some(engine)) => SemanticCapability::Installed(engine.descriptor().clone()),
+            Ok(None) => SemanticCapability::NotInstalled,
+            Err(error) => SemanticCapability::Failed {
+                detail: error.to_string(),
+            },
+        }
+    }
+
     /// [`Self::semantic_engine`], borrowing **only the `semantic` field**.
     ///
     /// The scan write path needs the engine and the connection at the same
@@ -3596,15 +3612,31 @@ impl AtlasDb {
     /// borrows are not. Nothing else is different — the `OnceLock`, the
     /// at-most-once load and the degraded `None` are all as documented on
     /// [`Self::semantic_engine`].
-    fn engine_of(cell: &OnceLock<Option<SemanticEngine>>) -> Option<&SemanticEngine> {
-        cell.get_or_init(|| match SemanticEngine::load() {
-            Ok(engine) => engine,
-            Err(error) => {
-                log::warn!("{error}");
-                None
+    fn engine_of(
+        cell: &OnceLock<Result<Option<SemanticEngine>, SemanticError>>,
+    ) -> Option<&SemanticEngine> {
+        Self::load_of(cell).as_ref().ok().and_then(Option::as_ref)
+    }
+
+    /// The load itself, memoized — **including its failure**.
+    ///
+    /// Before S6 the error was logged and discarded, so "no assets" and
+    /// "assets that will not load" were the same `None` to every caller.
+    /// `tracing::warn!` rather than `log::warn!` because the daemon installs
+    /// a `tracing` subscriber (`src/cli.rs`) and no `log`/`tracing` bridge,
+    /// so the old line reached a facade with no logger and was dropped in
+    /// the one process that most needed to hear it (R5 — the dependency
+    /// already in this binary, already configured).
+    fn load_of(
+        cell: &OnceLock<Result<Option<SemanticEngine>, SemanticError>>,
+    ) -> &Result<Option<SemanticEngine>, SemanticError> {
+        cell.get_or_init(|| {
+            let loaded = SemanticEngine::load();
+            if let Err(error) = &loaded {
+                tracing::warn!("{error}");
             }
+            loaded
         })
-        .as_ref()
     }
 
     /// A2 §6's semantic retrieval: **exact cosine over the admissible set**,
