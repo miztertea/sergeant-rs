@@ -723,10 +723,7 @@ pub fn rerank(hits: &mut [FusedHit], query: &str) {
     boost_multi_chunk_files(hits);
     // Stage 3 — semble's `apply_query_boost`, NL branch: additive against
     // the answer's largest score, computed once, before any boost is added.
-    let max_score = hits
-        .iter()
-        .map(|hit| hit.adjusted)
-        .fold(0.0_f64, f64::max);
+    let max_score = hits.iter().map(|hit| hit.adjusted).fold(0.0_f64, f64::max);
     if max_score > 0.0 {
         for hit in hits.iter_mut() {
             let ratio = path_stem_match_ratio(query, hit.coordinate.relative_path());
@@ -848,7 +845,11 @@ pub fn path_stem_match_ratio(query: &str, relative_path: &str) -> f64 {
         })
         .count();
     let ratio = matched as f64 / keywords.len() as f64;
-    if ratio >= STEM_MATCH_MIN_RATIO { ratio } else { 0.0 }
+    if ratio >= STEM_MATCH_MIN_RATIO {
+        ratio
+    } else {
+        0.0
+    }
 }
 
 /// semble's `boosting.py::boost_multi_chunk_files`: a file whose candidate

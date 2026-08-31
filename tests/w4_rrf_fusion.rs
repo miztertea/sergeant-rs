@@ -64,11 +64,10 @@ use sergeant_rs::runtime::atlas::db::{
     Admissibility, AtlasDb, FusedAnswer, LexicalQuery, SourceSelector,
 };
 use sergeant_rs::runtime::atlas::fusion::{
-    BOOST_ADJACENCY, BOOST_DEFINITION, BOOST_EXACT_MATCH,
-    BOOST_WORK_CHANGED, FILE_COHERENCE_BOOST_FRAC, FILE_SATURATION_DECAY, FusedHit,
-    PENALTY_NON_CANONICAL, RRF_K, RankOrigins, RerankSignals, fuse,
-    STEM_BOOST_MULTIPLIER, is_symbol_query, path_stem_match_ratio, rerank, rrf_contribution,
-    rrf_order,
+    BOOST_ADJACENCY, BOOST_DEFINITION, BOOST_EXACT_MATCH, BOOST_WORK_CHANGED,
+    FILE_COHERENCE_BOOST_FRAC, FILE_SATURATION_DECAY, FusedHit, PENALTY_NON_CANONICAL, RRF_K,
+    RankOrigins, RerankSignals, STEM_BOOST_MULTIPLIER, fuse, is_symbol_query,
+    path_stem_match_ratio, rerank, rrf_contribution, rrf_order,
 };
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, LexicalHit, UnitCoordinate};
 use sergeant_rs::runtime::atlas::record::{record_scan, scan_and_record};
@@ -359,6 +358,9 @@ fn no_hash_map_or_hash_set_reaches_the_fusion_module() {
 
 // ------------------------------------------------- the nine, in order
 
+/// Turning one of A2 §8's nine signals on, for the table below.
+type SetSignal = fn(&mut RerankSignals);
+
 /// **A2 §8's nine signals, now as one multiplicative score adjustment.**
 ///
 /// *Renamed from `..._in_the_contracts_own_order` by the semble-parity wave,
@@ -394,18 +396,20 @@ fn no_hash_map_or_hash_set_reaches_the_fusion_module() {
 ///   when its boost covers the score gap and does not when it cannot.
 #[test]
 fn the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment() {
-    let one = |set: fn(&mut RerankSignals)| {
-        let mut signals = RerankSignals::default();
-        // Signal 7 fires *positively* for a canonical path, so the neutral
-        // baseline has it set; every other signal is off.
-        signals.canonical_path = true;
+    // Signal 7 fires *positively* for a canonical path, so the neutral
+    // baseline has it set; every other signal is off.
+    let one = |set: SetSignal| {
+        let mut signals = RerankSignals {
+            canonical_path: true,
+            ..Default::default()
+        };
         set(&mut signals);
         signals
     };
     let neutral = one(|_| {});
     assert_eq!(neutral.multiplier(), 1.0, "the neutral baseline is 1.0");
 
-    let cases: [(usize, fn(&mut RerankSignals), f64); 9] = [
+    let cases: [(usize, SetSignal, f64); 9] = [
         (0, |s| s.exact_match = true, BOOST_EXACT_MATCH),
         (1, |s| s.definition_over_reference = true, BOOST_DEFINITION),
         (2, |s| s.caller_selected_source = true, 1.0),
@@ -1194,7 +1198,6 @@ fn an_exact_name_match_is_promoted_over_a_better_fused_score() {
     );
 }
 
-
 // ------------------------------- step (d): the rerank adjusts, it does not outrank
 
 /// A bare [`FusedHit`] at a stated score, for the score-arithmetic tests.
@@ -1368,7 +1371,10 @@ fn a_second_chunk_of_the_same_file_is_decayed_so_one_file_cannot_take_every_slot
 
     rerank(&mut hits, "");
     let order: Vec<&str> = hits.iter().map(|h| h.unit_key.as_str()).collect();
-    assert_eq!(order[0], "u-busy-0", "the file's best chunk keeps its score");
+    assert_eq!(
+        order[0], "u-busy-0",
+        "the file's best chunk keeps its score"
+    );
     assert!(
         order[..3].contains(&"u-other"),
         "one file still took the whole head of the answer: {order:?}"
@@ -1493,9 +1499,12 @@ fn a_file_whose_chunks_collectively_score_well_has_its_best_chunk_boosted() {
 
     rerank(&mut hits, "");
     assert_eq!(
-        hits[0].unit_key, "u-x1",
+        hits[0].unit_key,
+        "u-x1",
         "the coherent file's best chunk was not boosted: {:?}",
-        hits.iter().map(|h| (&h.unit_key, h.adjusted)).collect::<Vec<_>>()
+        hits.iter()
+            .map(|h| (&h.unit_key, h.adjusted))
+            .collect::<Vec<_>>()
     );
     // x.md's total is the largest, so its share is 1.0 and its best chunk
     // takes the full 0.2 — semble's constant, exactly.
@@ -1533,8 +1542,10 @@ fn a_file_whose_chunks_collectively_score_well_has_its_best_chunk_boosted() {
 #[test]
 fn a_file_named_after_the_question_is_boosted_by_the_fraction_of_words_it_matches() {
     let query = "ruling that there is only one atlas database";
-    let named =
-        path_stem_match_ratio(query, "rulings/owner-rulings/one-atlas-database-2026-08-29.md");
+    let named = path_stem_match_ratio(
+        query,
+        "rulings/owner-rulings/one-atlas-database-2026-08-29.md",
+    );
     let unrelated = path_stem_match_ratio(query, "src/backend/codex.rs");
     assert_eq!(unrelated, 0.0, "an unrelated path must not be boosted");
     assert!(
@@ -1591,8 +1602,14 @@ fn the_stem_boost_does_not_fire_for_a_symbol_query() {
 /// gets the same lift and the signal is noise.
 #[test]
 fn stopwords_and_short_words_are_not_keywords() {
-    assert_eq!(path_stem_match_ratio("how do we do it", "src/domain/work.rs"), 0.0);
-    assert_eq!(path_stem_match_ratio("of on or the to", "src/domain/work.rs"), 0.0);
+    assert_eq!(
+        path_stem_match_ratio("how do we do it", "src/domain/work.rs"),
+        0.0
+    );
+    assert_eq!(
+        path_stem_match_ratio("of on or the to", "src/domain/work.rs"),
+        0.0
+    );
 }
 
 // --------------------------------- the three filter-shaped signals

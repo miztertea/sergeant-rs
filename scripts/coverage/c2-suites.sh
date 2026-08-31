@@ -405,6 +405,20 @@ cov_stage_begin c2-w4_rrf_fusion
 cov_run cargo llvm-cov --no-report --test w4_rrf_fusion --locked || cov_fail "w4_rrf_fusion failed under instrumentation"
 cov_stage_end 1 "the w4_rrf_fusion test binary must write its own profile"
 
+# The semble-parity wave's relevance floor, wired at birth (#231) in the same
+# commit as the ranking change it guards. Scans THIS repository's working tree
+# as one Atlas source and measures precision@1 over the committed,
+# hand-verified question set (tests/fixtures/retrieval/parity-question-set.tsv)
+# through the real `fused_search`. It exists because every other suite here
+# passed at the revision where the measured p@1 was .404: a structural test
+# cannot see a relevance regression. Loads the committed model once per test
+# process, like w3b_semantic_retrieval and w4_rrf_fusion; the whole-repository
+# scan makes it the slowest suite in C2 (about a minute). No daemon, no
+# estate, no subprocess. Floor 1.
+cov_stage_begin c2-w4a_retrieval_floor
+cov_run cargo llvm-cov --no-report --test w4a_retrieval_floor --locked || cov_fail "w4a_retrieval_floor failed under instrumentation"
+cov_stage_end 1 "the w4a_retrieval_floor test binary must write its own profile"
+
 # S5 W5, wired at birth (the #231 lesson, same as w1/w1b/w1c/w1d/w2/w3/w3b/w4
 # above): A2 §13's search trace, A2 §14's two verbs (`sgt search` AND `sgt
 # related`), and the three A2 §17 items the mid-sprint acceptance walk found

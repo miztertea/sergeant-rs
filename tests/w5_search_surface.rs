@@ -56,9 +56,8 @@ use sergeant_rs::runtime::atlas::db::{
     SourceSelector,
 };
 use sergeant_rs::runtime::atlas::fusion::{
-    BOOST_EXACT_MATCH, FILE_COHERENCE_BOOST_FRAC,
-    FILE_SATURATION_DECAY, PENALTY_NON_CANONICAL, RRF_K, RerankSignals, STEM_BOOST_MULTIPLIER,
-    STEM_MATCH_MIN_RATIO,
+    BOOST_EXACT_MATCH, FILE_COHERENCE_BOOST_FRAC, FILE_SATURATION_DECAY, PENALTY_NON_CANONICAL,
+    RRF_K, RerankSignals, STEM_BOOST_MULTIPLIER, STEM_MATCH_MIN_RATIO,
 };
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, UnitAddress, UnitCoordinate, tokenize};
 use sergeant_rs::runtime::atlas::record::record_scan;
@@ -996,7 +995,11 @@ fn the_retrieval_policy_version_is_pinned_to_the_actual_rrf_and_rerank_policy() 
         "the recorded version says k=60; the constant must agree"
     );
     assert_eq!(
-        (BOOST_EXACT_MATCH, PENALTY_NON_CANONICAL, FILE_SATURATION_DECAY),
+        (
+            BOOST_EXACT_MATCH,
+            PENALTY_NON_CANONICAL,
+            FILE_SATURATION_DECAY
+        ),
         (3.0, 0.3, 0.5),
         "the recorded version says score-adjust; the multipliers must agree"
     );
