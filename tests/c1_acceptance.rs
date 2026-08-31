@@ -11,9 +11,21 @@
 //! none of which could see the whole. Nothing enumerated the fourteen, so
 //! nothing could report a gap. **Building this register found one**: §21 item
 //! 8 names document, mail and OCR excerpts, and no test in this repository
-//! proves that a *mail* excerpt in a compiled prompt carries its
-//! resource/native/extractor provenance. That row is a gap with a
-//! destination, not a `met` transcribed from `c1c`'s own header.
+//! proved that a *mail* excerpt in a compiled prompt carried its
+//! resource/native/extractor provenance. That row was carried as a gap with a
+//! destination rather than a `met` transcribed from `c1c`'s own header —
+//! which is the whole reason this file exists.
+//!
+//! **That gap is now closed, by running the thing rather than re-reading the
+//! note.** A follow-up wave compiled a context binding a real `.eml` landed
+//! through the real worker subprocess and read the rendered prompt. The mail
+//! third was a missing *proof*, not a missing behaviour — all three of
+//! resource, native coordinate and extractor already reached the prompt. But
+//! compiling it also surfaced a real defect the reading would never have
+//! found: the C1 render printed `bytes 0..0` beside every native coordinate
+//! (S5 closeout F-AC-02, on a second render path), now fixed and guarded.
+//! Item 8's OCR third remains a ruling-backed deferral, not a gap, and the
+//! `met` verdict is argued from the two thirds 0.3.0 ships, never from it.
 //!
 //! This file is a copy of `tests/x5_a1a_acceptance.rs`'s shape (Ponytail R2),
 //! not a new one — the same `Verdict`/`Check`/`Item`/`WALK` register, the same
@@ -28,7 +40,8 @@
 //! every one of the fourteen items has a named, existing, running, asserting
 //! answer, or an honest verdict saying it does not. Every `met` verdict below
 //! was written after running its own checks and reading the output: 36 checks
-//! across `c1a`/`c1b`/`c1c`/`c1d`, all green at `afed0aa9` (S6 P0).
+//! across `c1a`/`c1b`/`c1c`/`c1d`, all green at `afed0aa9` (S6 P0), plus the
+//! two checks item 8's mail wave added, run green in that wave.
 //!
 //! ## The walk
 //!
@@ -41,7 +54,7 @@
 //! | 5 | Reachable map/search/query remains available | met | `c1b_tiers_and_budget::an_exhausted_budget_leaves_reachable_available_and_caps_no_resolution` |
 //! | 6 | local knowledge directory evidence can be selected without acquiring Work mutation authority | met | `c1c_authority_and_provenance::knowledge_evidence_is_selected_without_widening_the_works_mutation_scope` |
 //! | 7 | structured query results can be Bound while large datasets remain outside prompt context | met | `c1c_authority_and_provenance::a_query_result_is_bound_compact_while_the_dataset_stays_out_of_the_prompt` |
-//! | 8 | document/mail/OCR excerpts preserve original resource/native/extractor provenance | gap | `c1c_authority_and_provenance::a_document_excerpt_carries_extractor_native_coordinate_and_heading` |
+//! | 8 | document/mail/OCR excerpts preserve original resource/native/extractor provenance | met | `c1c_authority_and_provenance::a_document_excerpt_carries_extractor_native_coordinate_and_heading` |
 //! | 9 | external evidence is visibly external and cannot alter instruction hierarchy | met | `c1c_authority_and_provenance::an_external_instruction_cannot_displace_reorder_or_escape_the_data_frame` |
 //! | 10 | context snapshot pins exact source/Work/query/retrieval generations | met | `c1a_compiled_context::the_snapshot_pins_generations_that_re_resolve_to_the_same_evidence` |
 //! | 11 | actor context queries are attributable to execution | met | `c1d_attribution_nesting_audit::a_managed_context_query_is_attributed_to_the_execution_not_merely_the_work` |
@@ -331,7 +344,7 @@ const WALK: &[Item] = &[
     },
     Item {
         number: 8,
-        verdict: Verdict::Gap,
+        verdict: Verdict::Met,
         checks: &[
             at(
                 "tests/c1c_authority_and_provenance.rs",
@@ -339,24 +352,43 @@ const WALK: &[Item] = &[
             ),
             at(
                 "tests/c1c_authority_and_provenance.rs",
+                "a_mail_excerpt_carries_its_resource_native_coordinate_and_extractor",
+            ),
+            at(
+                "tests/c1c_authority_and_provenance.rs",
+                "an_excerpt_addressed_by_a_native_coordinate_renders_no_empty_byte_span",
+            ),
+            at(
+                "tests/c1c_authority_and_provenance.rs",
                 "the_ocr_half_of_item_8_is_declared_absent_rather_than_omitted",
             ),
         ],
-        note: "The item names three kinds of excerpt and only one of them is proven. DOCUMENT: \
-               proven — extractor identity, A2 §9 native coordinate, heading and byte span, with \
-               a Markdown control that carries no native coordinate so the check cannot pass by \
-               printing a string. OCR: declared absent rather than omitted, by the owner ruling \
-               of 2026-08-29 that keeps OCR out of 0.3.0 entirely — that third is a deferral and \
-               not this gap. MAIL: nothing in this repository proves a mail excerpt in a \
-               compiled prompt carries its resource/native/extractor provenance. \
-               `src/runtime/context.rs`'s resolution path is kind-agnostic and \
-               `w2_lexical_retrieval::lexical_search_returns_mail_units_with_exact_a1_provenance` \
-               proves mail units carry exact A1 provenance at the RETRIEVAL layer, so the \
-               mechanism very probably works — and 'very probably works' from reading the code \
-               is exactly how A2 §2's estate axis went missing under a `met` verdict. \
-               DESTINATION: a C1 follow-up wave writes the mail-excerpt equivalent of the \
-               document check; this row closes when it runs, never by re-reading this note. Both \
-               cited checks ran green at afed0aa9.",
+        note: "The item names three kinds of excerpt. DOCUMENT: proven — extractor identity, \
+               A2 §9 native coordinate, heading and byte span, with a Markdown control that \
+               carries no native coordinate so the check cannot pass by printing a string. \
+               MAIL: proven at the C1 layer as of this row's update — a compiled, RENDERED \
+               prompt carries the `.eml`'s own path, A1 §6.5's `native text-body` (which body \
+               of the message, the only coordinate a mail body has) and \
+               `extractor mail-parser/0.11.8+eml/v1`. Nothing in that fixture is hand-built: \
+               the `.eml` goes through the REAL supervised worker subprocess and the real \
+               `record_scan`, because S5 closeout F-AC-02 recorded that a hand-built mail row \
+               pins values production never emits and passes with the adapter deleted. Its \
+               control is a Markdown unit in the same generation whose native coordinate is \
+               asserted absent before the render is read. The check was taken RED on purpose \
+               by stripping the native coordinate from the renderer, then reverted. The \
+               previous note said the mechanism 'very probably works' from reading a \
+               kind-agnostic resolution path — that reading is how A2 §2's estate axis went \
+               missing under a `met` verdict, and this row closed by RUNNING it instead. \
+               Landing it also surfaced a real defect, now fixed: the C1 render printed \
+               `bytes 0..0` beside every native coordinate — F-AC-02's shape on a second \
+               render path, A2 §9's 'do not invent cell precision' — guarded by the third \
+               check, whose Markdown control keeps the fix from becoming a blanket \
+               suppression §12 would forbid. OCR: declared absent rather than omitted, by the \
+               owner ruling of 2026-08-29 that keeps OCR out of 0.3.0 entirely. That third is \
+               a ruling-backed DEFERRAL, not a gap in this row, and this verdict is not \
+               argued from it: the two thirds 0.3.0 ships are each proven by a check above. \
+               All four ran green together in this wave; the first, second and fourth ran \
+               green at afed0aa9 or (the second) at this row's own commit.",
     },
     Item {
         number: 9,

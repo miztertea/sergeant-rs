@@ -51,15 +51,15 @@ use sergeant_rs::domain::source::{AuthorityClass, SourceKind, UnitKind};
 use sergeant_rs::domain::workflow::{StageDefinition, StageKind, StageRecord, StageStatus};
 use sergeant_rs::runtime::atlas::db::{AtlasDb, LexicalQuery, SourceSelector};
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, UnitCoordinate};
-use sergeant_rs::runtime::atlas::overlay::overlay_source_name;
 use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
+use sergeant_rs::runtime::atlas::overlay::overlay_source_name;
 use sergeant_rs::runtime::atlas::record::{record_scan, scan_and_record};
 use sergeant_rs::runtime::atlas::scan::{
     KnowledgeSource, ScannedFile, ScannedUnit, scan_local_knowledge_with_worker,
 };
-use sergeant_rs::runtime::atlas::worker::WorkerRuntime;
 use sergeant_rs::runtime::atlas::semantic::SemanticRequest;
 use sergeant_rs::runtime::atlas::tabular::ContextFields;
+use sergeant_rs::runtime::atlas::worker::WorkerRuntime;
 use sergeant_rs::runtime::context::{
     CompileRequest, ContextSnapshot, DATA_PREFIX, EXTERNAL_BANNER, EvidenceCoordinate,
     EvidenceUnit, RenderBudget, Tier, compile,
@@ -651,7 +651,10 @@ fn an_excerpt_addressed_by_a_native_coordinate_renders_no_empty_byte_span() {
         &overlay_source_name(WORK_ID, REPOSITORY),
         SourceKind::EstateGit,
         AuthorityClass::EstateMutable,
-        vec![office, file("notes/plan.md", vec![unit(0, "Plan", CONTROL_BODY)])],
+        vec![
+            office,
+            file("notes/plan.md", vec![unit(0, "Plan", CONTROL_BODY)]),
+        ],
     );
     record_scan(
         &mut db,
