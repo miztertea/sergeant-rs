@@ -1711,6 +1711,145 @@ async fn the_finalize_sweep_removes_evidence_class_output_and_keeps_promote_clas
     handle.shutdown().await;
 }
 
+/// #297, the two-Work sequence: a Work's finalize sweep must never touch a
+/// stage-output directory that is not one of the *running* workflow's own
+/// declared stages.
+///
+/// Reported from a real downstream estate: `stage_output_dirs` walks the
+/// worktree and keys by composed directory path, consulting no catalog, so
+/// a `<dir>/output/` an *earlier, unrelated* Work already merged into the
+/// base branch reads as a stage of this run. It has no `output/README.md`
+/// in this workflow's package — it is not in this package at all — so
+/// `declared_output_disposition`'s "silence promotes nothing" default
+/// classifies it `Evidence`, and the sweep copies it out, `remove_dir_all`s
+/// it, and commits the deletion. Merging that branch deletes another Work's
+/// evidence upstream, silently.
+///
+/// `99-foreign/output/leftover.md` stands in for that already-merged
+/// evidence: seeded and committed into the mount before submit, exactly as
+/// a previous Work's merge would have left it. `sweep` declares only
+/// `00-evidence`. Judged on observable state — the file on the branch, the
+/// finalize commit's own diff, and the retained-evidence area — not on the
+/// guard's reasoning. `00-evidence` is asserted swept in the same run, so a
+/// filter that simply matched nothing could not pass this test either.
+#[tokio::test]
+async fn the_finalize_sweep_leaves_an_undeclared_stage_directory_alone() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (mount, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_workflow(&estate, "sweep", &[("00-evidence", "first stage context")]);
+
+    // This run's own declared stage output.
+    std::fs::create_dir_all(mount.join("00-evidence/output")).expect("output dir");
+    std::fs::write(
+        mount.join("00-evidence/output/notes.md"),
+        "scratch working notes\n",
+    )
+    .expect("seed evidence artifact");
+    // Another Work's evidence, already merged into the base branch. Not a
+    // declared stage of `sweep`.
+    std::fs::create_dir_all(mount.join("99-foreign/output")).expect("foreign output dir");
+    std::fs::write(
+        mount.join("99-foreign/output/leftover.md"),
+        "another Work's merged evidence\n",
+    )
+    .expect("seed foreign artifact");
+    support::git(&mount, &["add", "-A"]);
+    support::git(
+        &mount,
+        &["commit", "-m", "seed this run's output and a prior Work's"],
+    );
+
+    let (registry, _fake) = one_fake([FakeStep::complete()]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        Some(&estate),
+        &estate,
+        "sweep only what this workflow declares",
+        json!({"workflow": "sweep"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let surface_root = PathBuf::from(body["surface"]["root"].as_str().expect("surface root"));
+
+    let final_body = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(
+        final_body["work"]["state"], "completed",
+        "the sweep's own commit leaves the worktree clean: {final_body}"
+    );
+    let branch = format!("sergeant/{work_id}");
+
+    // The declared stage was swept — without this the assertions below
+    // would also pass on a filter that matched nothing at all.
+    let evidence_still_present = Command::new("git")
+        .args(["show", &format!("{branch}:00-evidence/output/notes.md")])
+        .current_dir(&mount)
+        .output()
+        .expect("run git")
+        .status
+        .success();
+    assert!(
+        !evidence_still_present,
+        "the running workflow's own evidence-class output must still be swept"
+    );
+
+    // The foreign directory is untouched on the branch, byte for byte.
+    assert_eq!(
+        git(
+            &mount,
+            &["show", &format!("{branch}:99-foreign/output/leftover.md")]
+        ),
+        "another Work's merged evidence",
+        "#297: another Work's already-merged evidence must survive this Work's sweep"
+    );
+
+    // ...and the finalize commit's own diff deletes nothing of it.
+    let sweep_commit = git(
+        &mount,
+        &[
+            "log",
+            &branch,
+            "--format=%H",
+            "--grep=sergeant: finalize sweep",
+        ],
+    );
+    assert!(
+        !sweep_commit.is_empty(),
+        "the sweep must have made its finalize commit at all"
+    );
+    let swept_diff = git(
+        &mount,
+        &["show", "--name-status", "--format=", &sweep_commit],
+    );
+    assert!(
+        !swept_diff.contains("99-foreign"),
+        "#297: the finalize sweep's diff must not touch an undeclared directory: {swept_diff}"
+    );
+    assert!(
+        swept_diff.contains("00-evidence/output/notes.md"),
+        "the declared stage's removal is what this commit is for: {swept_diff}"
+    );
+
+    // Nor is it laundered into this Work's retained evidence.
+    assert!(
+        !surface_root.join("solo.output/99-foreign").exists(),
+        "an undeclared directory must not be copied out as this Work's evidence"
+    );
+
+    handle.shutdown().await;
+}
+
 /// F-IN-01: the finalize sweep's commit must be scoped to the `output/`
 /// dirs it actually swept, not the whole worktree (`git add -A`) — else
 /// stray dirty/untracked content the actor left *elsewhere* in the

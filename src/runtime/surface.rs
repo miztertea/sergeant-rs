@@ -2124,6 +2124,14 @@ fn copy_declared_output_artifacts_at(
 /// disposition from) sweeps nothing, matching the Q3 gate's own
 /// `SOURCE_EMBEDDED` early return.
 ///
+/// #297: scoped to the ids that package actually declares
+/// ([`crate::domain::workflow::declared_stage_ids`]) — a `<dir>/output/`
+/// an earlier Work merged into the base branch is in this worktree but is
+/// not this run's to sweep, and removing it here commits somebody else's
+/// evidence away. A package that will not load sweeps nothing, the same
+/// fail-closed posture the absent-source case already takes; there is no
+/// fallback to the unscoped walk.
+///
 /// Best-effort and fail-open toward the worktree's *content*: a git
 /// failure here is folded into the returned report rather than treated as
 /// fatal — every real artifact was already durably copied out as evidence
@@ -2138,12 +2146,27 @@ pub fn finalize_sweep(
     let Some(workflow_source) = workflow_source else {
         return report;
     };
+    // #297: fail closed on a package that will not load, exactly as the
+    // absent-source case above does. Without a declared set there is no way
+    // to tell this Work's stage directories from another Work's already-
+    // merged ones, and the unscoped walk is precisely what deleted an
+    // outside estate's evidence.
+    let Some(declared) = crate::domain::workflow::declared_stage_ids(workflow_source) else {
+        return report;
+    };
     let Some(surface_root) = binding.worktree_path.parent() else {
         return report;
     };
     let dest_root = surface_root.join(format!("{}.output", binding.repository));
     let mut swept_stage_dirs = Vec::new();
     for (stage_id, output_dir) in stage_output_dirs(&binding.worktree_path) {
+        // #297: the walk is the worktree's filesystem shape, which includes
+        // whatever earlier Works merged into the base branch. Only this
+        // workflow's own declared stages (leaves and containers) are this
+        // sweep's to touch.
+        if !declared.contains(&stage_id) {
+            continue;
+        }
         if crate::domain::workflow::declared_output_disposition(workflow_source, &stage_id)
             == crate::domain::workflow::OutputDisposition::Promote
         {
@@ -2771,6 +2794,39 @@ mod tests {
     }
 
     /// [`teardown`] against the data dir this fixture surface belongs to.
+    /// Writes a real workflow package: a `workflow.toml` declaring `stages`,
+    /// plus a `CONTEXT.md` for each. #297 scopes both sweeps to the ids the
+    /// package at `workflow_source` actually declares, so a fixture that is
+    /// only a bag of `output/README.md` files is no longer a workflow
+    /// package at all — it declares nothing, and a sweep against it fails
+    /// closed. Nested packages are written by calling this again on the
+    /// container's own directory, exactly as `WorkflowDefinition::load_dir`
+    /// reads them.
+    fn write_workflow_package(dir: &Path, name: &str, stages: &[&str]) {
+        std::fs::create_dir_all(dir).expect("package dir");
+        let declared = stages
+            .iter()
+            .map(|id| format!("{id:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            dir.join("workflow.toml"),
+            format!("[workflow]\nname = {name:?}\nversion = \"1\"\nstages = [{declared}]\n"),
+        )
+        .expect("workflow.toml");
+        for id in stages {
+            let stage = dir.join(id);
+            std::fs::create_dir_all(&stage).expect("stage dir");
+            // E15: a directory holding both `workflow.toml` and `CONTEXT.md`
+            // is refused at load — a container is not also a leaf. Write the
+            // nested package first and this skips its context.
+            if !stage.join("workflow.toml").is_file() {
+                std::fs::write(stage.join("CONTEXT.md"), format!("{id} context"))
+                    .expect("CONTEXT.md");
+            }
+        }
+    }
+
     fn teardown_of(surface: &WorkSurface) -> TeardownReport {
         teardown(fixture_data_dir(surface), surface, None)
     }
@@ -5712,6 +5768,12 @@ mod tests {
         std::fs::write(code_output.join("deliverable.md"), "ships").expect("code artifact");
 
         let workflow_source = dir.path().join("workflow-package");
+        write_workflow_package(
+            &workflow_source.join("10-investigate"),
+            "10-investigate",
+            &["00-lead", "10-code"],
+        );
+        write_workflow_package(&workflow_source, "workflow-package", &["10-investigate"]);
         let declared = workflow_source
             .join("10-investigate")
             .join("10-code")
