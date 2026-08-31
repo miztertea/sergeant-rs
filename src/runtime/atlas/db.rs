@@ -5316,8 +5316,9 @@ fn vector_bytes(vector: &[f32]) -> Vec<u8> {
 
 /// The inverse of [`vector_bytes`]. A trailing partial float is dropped
 /// rather than guessed — `dimensions` is stored beside the blob so a
-/// truncated row is detectable, and a wrong-length vector scores as an
-/// unrelated unit through [`cosine`]'s zip rather than panicking.
+/// truncated row is detectable: the caller compares the decoded vector's
+/// length against `dimensions` and, on a mismatch, treats the row as absent
+/// rather than scoring a wrong-length vector as an unrelated unit.
 fn vector_from_bytes(bytes: &[u8]) -> Vec<f32> {
     bytes
         .as_chunks::<4>()
@@ -5342,7 +5343,7 @@ fn stored_vectors(
     model: &SemanticModel,
 ) -> Result<HashMap<String, Vec<f32>>, AtlasError> {
     let mut statement = conn.prepare(sql!(
-        "SELECT unit_key, vector FROM context.semantic_vectors \
+        "SELECT unit_key, vector, dimensions FROM context.semantic_vectors \
          WHERE generation_id = ? AND model_identity = ? AND model_content_hash = ?"
     ))?;
     let mut rows = statement.query(duckdb::params![
@@ -5354,7 +5355,16 @@ fn stored_vectors(
     while let Some(row) = rows.next()? {
         let unit_key: String = row.get(0)?;
         let bytes: Vec<u8> = row.get(1)?;
-        vectors.insert(unit_key, vector_from_bytes(&bytes));
+        let dimensions: i64 = row.get(2)?;
+        let vector = vector_from_bytes(&bytes);
+        // A truncated row is detectable exactly because `dimensions` was
+        // stored beside the blob at write time: a decoded length that
+        // disagrees with it is dropped here rather than scored as a
+        // same-length-by-luck vector against an unrelated unit.
+        if vector.len() as i64 != dimensions {
+            continue;
+        }
+        vectors.insert(unit_key, vector);
     }
     Ok(vectors)
 }
