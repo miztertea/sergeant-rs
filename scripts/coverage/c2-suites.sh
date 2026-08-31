@@ -369,6 +369,29 @@ cov_stage_begin c2-w3b_model2vec_manifest_pin
 cov_run cargo llvm-cov --no-report --test w3b_model2vec_manifest_pin --locked || cov_fail "w3b_model2vec_manifest_pin failed under instrumentation"
 cov_stage_end 1 "the w3b_model2vec_manifest_pin test binary must write its own profile"
 
+# S6, wired at birth (the #231 lesson, same as w1/w1b/w1c/w1d/w2/w3/w3b
+# above): the semantic half answers from vectors persisted at SCAN time
+# rather than re-embedding the corpus on every query, and an index that
+# carries no vectors for the loaded model says `not_indexed` instead of
+# claiming a ranking it cannot produce (A1 §15). Loads the committed model
+# once per test process, like w3b_semantic_retrieval; builds Atlas stores in
+# tempdirs and records scans through the ordinary `scan_and_record` path. No
+# daemon, no estate, no subprocess. Floor 1.
+cov_stage_begin c2-s6_semantic_vectors
+cov_run cargo llvm-cov --no-report --test s6_semantic_vectors --locked || cov_fail "s6_semantic_vectors failed under instrumentation"
+cov_stage_end 1 "the s6_semantic_vectors test binary must write its own profile"
+
+# S6, wired at birth (the #231 lesson): the semantic half AT THE CROSSING —
+# through a real in-process daemon, over real repository text, with the
+# committed model installed. The axis crossing no other suite covered, and
+# where the per-query re-embedding defect lived. Also A2 §15's capability
+# reporting on `GET /v1/intelligence/status`: installed / not_installed /
+# failed, three states an operator acts on differently. Starts a real
+# daemon; no subprocess and no estate beyond its own tempdir. Floor 1.
+cov_stage_begin c2-s6_semantic_crossing
+cov_run cargo llvm-cov --no-report --test s6_semantic_crossing --locked || cov_fail "s6_semantic_crossing failed under instrumentation"
+cov_stage_end 1 "the s6_semantic_crossing test binary must write its own profile"
+
 # S5 W4, wired at birth (the #231 lesson, same as w1/w1b/w1c/w1d/w2/w3/w3b
 # above): A2 §7's Reciprocal Rank Fusion and A2 §8's deterministic
 # reranking — the one RRF expression, the four determinism hazards with a

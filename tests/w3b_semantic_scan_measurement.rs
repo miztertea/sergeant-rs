@@ -24,9 +24,20 @@
 //! Honesty note, in the same spirit: this measures a synthetic corpus of
 //! short one-sentence units on one host, in a **debug build**. Release
 //! figures are not measured here and would be better; the shape — cost
-//! linear in admissible units, dominated by embedding rather than by SQL —
-//! is what the numbers demonstrate, and nothing here says anything about a
-//! corpus two orders of magnitude larger than the largest run below.
+//! linear in admissible units — is what the numbers demonstrate, and
+//! nothing here says anything about a corpus two orders of magnitude larger
+//! than the largest run below.
+//!
+//! **S6 changed what this measures, and the change is the point.** When
+//! this file was written the query embedded every admissible unit on every
+//! search, so its numbers were dominated by model inference — and its own
+//! recorded gap (*"real repository text rather than synthetic one-sentence
+//! units"*) was where the defect hid: on the real estate a query spent the
+//! CLI's whole ten-second timeout. Embeddings are now written once, at scan
+//! time, so what the runs below time is A2-07's cosine over stored vectors,
+//! which is what A2-07 always described. The scan-time cost the change
+//! moved this to is not measured here; it was measured on the real estate
+//! and recorded with the S6 wave.
 
 /// **S6 D1 — A2 §2 stage 1's estate coordinate.** This suite is
 /// single-estate: every generation it records is bound to this one root and
@@ -131,12 +142,15 @@ fn require_assets() -> bool {
 
 /// Print per-query wall time and units/second at three corpus sizes.
 ///
-/// **What a reader should take from the output.** The scan embeds every
-/// admissible unit on every query — there is no cache and no index (A2-07)
-/// — so the interesting number is units/second and whether the per-query
-/// time at a realistic corpus size is tolerable. If a future corpus makes it
-/// intolerable, *that* run is the evidence A2 §16 asks for before ANN
-/// machinery may be considered, and this file is how to produce it.
+/// **What a reader should take from the output.** Since S6 the corpus is
+/// embedded once, at scan time; the query embeds only the query string and
+/// runs an exact cosine over the stored vectors, with no index and no
+/// approximation (A2-07). So the interesting number is units/second of that
+/// cosine, and whether the per-query time at a realistic corpus size is
+/// tolerable. If a future corpus makes it intolerable, *that* run is the
+/// evidence A2 §16 asks for before ANN machinery may be considered, and this
+/// file is how to produce it — an ANN case has to be made against this
+/// number, not against the recomputation S6 removed.
 #[test]
 #[ignore = "measurement, not a gate — run explicitly"]
 fn exact_cosine_scan_cost_by_corpus_size() {

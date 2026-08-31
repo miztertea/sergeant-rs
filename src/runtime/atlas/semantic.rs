@@ -148,11 +148,31 @@ pub enum SemanticStatus {
     /// entirely different reason, and a consumer that must not confuse a
     /// host-configuration fact with a caller's choice can tell them apart.
     Disabled,
+    /// The model is installed and the caller wanted it, but at least one
+    /// admissible generation carries **no stored vectors for this model** —
+    /// so the semantic ranking this answer could offer is incomplete, or
+    /// absent entirely.
+    ///
+    /// The state a store scanned before its vectors existed is in, and the
+    /// state a store scanned under a *different* model is in: vectors are
+    /// keyed by [`SemanticModel`], so a model swap invalidates rather than
+    /// silently reusing (by analogy with A1 §8's extractor-identity cache
+    /// discipline).
+    ///
+    /// **This variant exists because none of the other three can say it.**
+    /// [`Self::Applied`] would claim a ranking the store cannot produce,
+    /// which is A1 §15's *"missing capability … represented as successful
+    /// empty evidence"*; [`Self::NotInstalled`] would blame the host for a
+    /// model that is in fact loaded and send an operator to install it
+    /// again; [`Self::Disabled`] would blame the caller. The remedy is a
+    /// re-scan, and only a word of its own points at it.
+    NotIndexed,
 }
 
 impl SemanticStatus {
     /// H4's own three spellings — `applied` | `not_installed` | `disabled`
-    /// — as the stable wire word every surface renders.
+    /// — plus S6's `not_indexed`, as the stable wire word every surface
+    /// renders.
     ///
     /// One function rather than a `match` at each render site: A2 §15's
     /// honesty is only mechanical if every consumer reads the same three
@@ -162,6 +182,7 @@ impl SemanticStatus {
             Self::Applied => "applied",
             Self::NotInstalled => "not_installed",
             Self::Disabled => "disabled",
+            Self::NotIndexed => "not_indexed",
         }
     }
 }
@@ -209,6 +230,62 @@ pub fn resolve(request: SemanticRequest, model: Option<&SemanticModel>) -> Seman
 /// `Command::new("curl")`, or a `concat!`-assembled URL, and `reqwest` is
 /// already in this crate's graph for backend transport — so the manifest, not
 /// a scan, is where the pin belongs.
+/// **A2 §15's *"reports that coverage/capability honestly"*, as a value.**
+///
+/// Three answers, kept apart because an operator acts differently on each:
+/// a loaded model (nothing to do), no assets (install them), and assets that
+/// exist and will not load (a fault — look at the directory). Before S6 the
+/// third collapsed into the second everywhere an operator could look: the
+/// load error was reported with `log::warn!`, and the daemon installs a
+/// `tracing` subscriber with no `log` bridge, so it reached a facade with no
+/// logger and was dropped.
+///
+/// Descriptor only, like [`installed_model`]: the probe pays for a load and
+/// then drops the model, so answering "is it installed" never leaves 32 MB
+/// of weights resident on a path that is not going to embed anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SemanticCapability {
+    /// A model is installed and loads. Carries A2 §13's two identity halves.
+    Installed(SemanticModel),
+    /// No complete asset directory is present — A2-13's supported degraded
+    /// state, **not** an error.
+    NotInstalled,
+    /// A directory that exists and would not produce a model.
+    Failed {
+        /// What the loader or the filesystem said.
+        detail: String,
+    },
+}
+
+impl SemanticCapability {
+    /// The stable wire word every surface renders, the way
+    /// [`SemanticStatus::as_str`] is for an answer's status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Installed(_) => "installed",
+            Self::NotInstalled => "not_installed",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// Probe this host for [`SemanticCapability`], paying for one load.
+///
+/// For a caller that has no [`crate::runtime::atlas::db::AtlasDb`] handle to
+/// ask — an operator running `intelligence status` on a host that has never
+/// indexed anything. A caller that does have one asks it instead
+/// (`AtlasDb::semantic_capability`), which answers from the load it already
+/// made.
+pub fn capability() -> SemanticCapability {
+    match SemanticEngine::load() {
+        Ok(Some(engine)) => SemanticCapability::Installed(engine.descriptor),
+        Ok(None) => SemanticCapability::NotInstalled,
+        Err(error) => SemanticCapability::Failed {
+            detail: error.to_string(),
+        },
+    }
+}
+
 pub fn installed_model() -> Option<SemanticModel> {
     SemanticEngine::load()
         .ok()

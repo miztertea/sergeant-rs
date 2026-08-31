@@ -10,7 +10,32 @@ released before a release can proceed.
 
 ## [Unreleased]
 
-(nothing yet)
+### Fixed
+
+- **Semantic search no longer re-embeds the corpus on every query.** Unit
+  embeddings are now written once, at scan time, into the Atlas `context`
+  schema and keyed by the model's identity and content hash; a query embeds
+  only the query string and runs the same exact cosine over the stored
+  vectors (A2-07 is unchanged — no index, no approximation). On a real
+  estate this was O(corpus) model inference per search, which spent `sgt`'s
+  whole ten-second request timeout on a debug build and roughly 1.7 s of a
+  1.9 s release answer. The semantic scan's 10,000-unit cap is removed with
+  it: it bounded per-query inference, and on any real corpus it silently
+  left half the units out of the semantic ranking.
+- **An index with no vectors for the loaded model now says so.** New
+  disclosure word `not_indexed`, beside `applied`/`not_installed`/
+  `disabled` — an index built before the assets were installed, or under a
+  different model, is no longer reported as a complete semantic answer. The
+  remedy is a re-scan.
+
+### Added
+
+- `sgt intelligence status --json` reports semantic capability:
+  `installed` (with model identity and content hash), `not_installed`, or
+  `failed` with the reason. A model directory that exists and will not load
+  is no longer indistinguishable from no assets — its load error was
+  previously logged through a `log` facade the daemon installs no logger
+  for, and was dropped.
 
 ## [0.3.0] - accumulating
 

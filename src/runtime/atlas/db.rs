@@ -116,6 +116,7 @@
 //! and "journal-present, database-evicted" is the same both-present violation
 //! as its mirror image, only harder to notice.
 
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -160,8 +161,8 @@ use crate::runtime::atlas::lexical::{
 };
 use crate::runtime::atlas::scan::{ScannedFile, ScannedSyntax, ScannedUnit, SourceScan};
 use crate::runtime::atlas::semantic::{
-    SemanticEngine, SemanticHit, SemanticModel, SemanticRequest, SemanticStatus, cosine,
-    rank_semantic, resolve as resolve_semantic,
+    SemanticCapability, SemanticEngine, SemanticError, SemanticHit, SemanticModel, SemanticRequest,
+    SemanticStatus, cosine, rank_semantic, resolve as resolve_semantic,
 };
 use crate::runtime::atlas::tabular::{
     DatasetFormat, RowKeyBasis, RowUnit, ScannedDataset, row_units,
@@ -751,6 +752,14 @@ CREATE TABLE IF NOT EXISTS context.lexical_postings (\n\
   unit_key       TEXT NOT NULL,\n\
   term           TEXT NOT NULL,\n\
   term_frequency BIGINT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS context.semantic_vectors (\n\
+  generation_id      TEXT NOT NULL,\n\
+  unit_key           TEXT NOT NULL,\n\
+  model_identity     TEXT NOT NULL,\n\
+  model_content_hash TEXT NOT NULL,\n\
+  dimensions         BIGINT NOT NULL,\n\
+  vector             BLOB NOT NULL\n\
 );\n";
 
 /// A generation whose rows are written but whose summary is not yet journaled
@@ -1688,7 +1697,7 @@ pub struct AtlasDb {
     /// handles in one process (a test suite's) must be able to disagree
     /// about what is installed instead of racing to cache the first answer
     /// for everyone.
-    semantic: OnceLock<Option<SemanticEngine>>,
+    semantic: OnceLock<Result<Option<SemanticEngine>, SemanticError>>,
 }
 
 impl std::fmt::Debug for AtlasDb {
@@ -1972,6 +1981,11 @@ impl AtlasDb {
             .iter()
             .map(|dataset| read_dataset(&self.conn, scan, dataset, &scratch_root))
             .collect();
+        // S6: the model, resolved before the transaction opens so the
+        // embedding the lexical index is written beside comes from the same
+        // handle-lifetime load every query uses (`Self::engine_of` for why
+        // it is not `self.semantic_engine()` here).
+        let engine = Self::engine_of(&self.semantic);
         let tx = self.conn.transaction()?;
         tx.execute(
             sql!(
@@ -2081,7 +2095,7 @@ impl AtlasDb {
         // evidence a hit will cite, and there is no second derivation path
         // that could disagree with the first (A2-02: no independent chunk
         // universe). All-or-nothing with everything else the scan staged.
-        index_generation(&tx, &generation_id)?;
+        index_generation(&tx, &generation_id, engine)?;
         tx.commit()?;
         Ok(ScanCommit::Staged { generation_id })
     }
@@ -3570,15 +3584,59 @@ impl AtlasDb {
     /// `semantic: not_installed` plus the lexical half, which is exactly
     /// what A2 §15 asks for.
     pub fn semantic_engine(&self) -> Option<&SemanticEngine> {
-        self.semantic
-            .get_or_init(|| match SemanticEngine::load() {
-                Ok(engine) => engine,
-                Err(error) => {
-                    log::warn!("{error}");
-                    None
-                }
-            })
-            .as_ref()
+        Self::engine_of(&self.semantic)
+    }
+
+    /// **A2 §15's capability, honestly**, from the load this handle already
+    /// made — so an operator can ask whether the semantic half is available
+    /// without running a query to find out, and a directory that exists and
+    /// will not load is not reported as no assets at all
+    /// ([`SemanticEngine::load`]'s own doc: *"`Ok(None)` and `Err(_)` are
+    /// different answers on purpose"*).
+    pub fn semantic_capability(&self) -> SemanticCapability {
+        match Self::load_of(&self.semantic) {
+            Ok(Some(engine)) => SemanticCapability::Installed(engine.descriptor().clone()),
+            Ok(None) => SemanticCapability::NotInstalled,
+            Err(error) => SemanticCapability::Failed {
+                detail: error.to_string(),
+            },
+        }
+    }
+
+    /// [`Self::semantic_engine`], borrowing **only the `semantic` field**.
+    ///
+    /// The scan write path needs the engine and the connection at the same
+    /// time (`let tx = self.conn.transaction()?` takes `&mut self.conn`),
+    /// and a method taking `&self` would borrow the whole handle. Two
+    /// disjoint field borrows in one function body are fine; two whole-`self`
+    /// borrows are not. Nothing else is different — the `OnceLock`, the
+    /// at-most-once load and the degraded `None` are all as documented on
+    /// [`Self::semantic_engine`].
+    fn engine_of(
+        cell: &OnceLock<Result<Option<SemanticEngine>, SemanticError>>,
+    ) -> Option<&SemanticEngine> {
+        Self::load_of(cell).as_ref().ok().and_then(Option::as_ref)
+    }
+
+    /// The load itself, memoized — **including its failure**.
+    ///
+    /// Before S6 the error was logged and discarded, so "no assets" and
+    /// "assets that will not load" were the same `None` to every caller.
+    /// `tracing::warn!` rather than `log::warn!` because the daemon installs
+    /// a `tracing` subscriber (`src/cli.rs`) and no `log`/`tracing` bridge,
+    /// so the old line reached a facade with no logger and was dropped in
+    /// the one process that most needed to hear it (R5 — the dependency
+    /// already in this binary, already configured).
+    fn load_of(
+        cell: &OnceLock<Result<Option<SemanticEngine>, SemanticError>>,
+    ) -> &Result<Option<SemanticEngine>, SemanticError> {
+        cell.get_or_init(|| {
+            let loaded = SemanticEngine::load();
+            if let Err(error) = &loaded {
+                tracing::warn!("{error}");
+            }
+            loaded
+        })
     }
 
     /// A2 §6's semantic retrieval: **exact cosine over the admissible set**,
@@ -3629,11 +3687,15 @@ impl AtlasDb {
     ///
     /// # Bounds, and saying so
     ///
-    /// The scan visits at most [`MAX_ROWS`] units across all admissible
-    /// generations (F12). Because a cap changes *which* units could be
-    /// ranked rather than merely shortening the list,
-    /// [`SemanticAnswer::truncated`] says when it bit — the same disclosure,
-    /// for the same reason, as [`LexicalAnswer::truncated`].
+    /// Since S6, embedding happens once at scan time rather than per query
+    /// (F12), so there is no longer a per-query *unit* bound: every unit in
+    /// every admissible generation is scored, and
+    /// [`SemanticAnswer::truncated`] is never set `true` by this function —
+    /// see the loop comment below for the one bound that remains
+    /// (`admissible_generations`'s own generation-list cap) and why it is
+    /// still unreported. `truncated` is not this function's disclosure
+    /// mechanism; `answer.semantic` is (`SemanticStatus::NotIndexed` when a
+    /// visited generation has unembedded units — see below).
     pub fn semantic_search(&self, query: &LexicalQuery<'_>) -> Result<SemanticAnswer, AtlasError> {
         let scope = self.work_scope(query.filter, true)?;
         let engine = self.semantic_engine();
@@ -3660,11 +3722,37 @@ impl AtlasDb {
         let query_vector = engine.embed_query(query.text);
 
         let admitted = self.admissible_generations(query.filter, MAX_ROWS)?;
+        // **S6's `MAX_ROWS` decision, stated.** Before S6 this loop broke out
+        // at `seen >= MAX_ROWS` and set `truncated`, so on the real estate
+        // (19,025 admissible units) the semantic half never saw roughly half
+        // the corpus — while still paying to embed the whole generation that
+        // tripped the cap. That cap bought exactly one thing: a bound on how
+        // much *model inference* one query could be made to do. Embedding
+        // now happens once, at scan time, so it buys nothing and costs half
+        // the ranking, and A2-07's "exact cosine over the admissible set"
+        // means the set. The remaining per-unit work is one 256-component
+        // dot product against a vector already in the store.
+        //
+        // `admissible_generations` still caps the *generation* list at
+        // `MAX_ROWS`; that bound is untouched here and, as before S6,
+        // neither half reports it — a pre-existing gap this change did not
+        // widen and does not fix.
         let family = query.family;
+        let model = engine.descriptor();
         let mut hits: Vec<SemanticHit> = Vec::new();
-        let mut seen = 0usize;
-        'generations: for generation in &admitted.hits {
+        let mut fully_indexed = true;
+        for generation in &admitted.hits {
             let units = indexable_units(&self.conn, &generation.id)?;
+            let stored = stored_vectors(&self.conn, &generation.id, model)?;
+            // A2 §15's honesty, decided per generation and before the family
+            // filter narrows anything: this generation's units were indexed
+            // under some other model, or under none at all. Either way the
+            // ranking below is missing them, and saying so is the whole of
+            // A1 §15's "missing capability is never represented as
+            // successful empty evidence".
+            if stored.len() < units.len() {
+                fully_indexed = false;
+            }
             let units: Vec<IndexableUnit> = units
                 .into_iter()
                 .filter(|unit| family.is_none_or(|wanted| unit.family == wanted))
@@ -3672,14 +3760,10 @@ impl AtlasDb {
             if units.is_empty() {
                 continue;
             }
-            let texts: Vec<String> = units.iter().map(|unit| unit.text.clone()).collect();
-            let vectors = engine.embed(&texts);
-            for (unit, vector) in units.iter().zip(vectors.iter()) {
-                if seen >= MAX_ROWS {
-                    answer.truncated = true;
-                    break 'generations;
-                }
-                seen += 1;
+            for unit in &units {
+                let Some(vector) = stored.get(&unit.unit_key) else {
+                    continue;
+                };
                 hits.push(SemanticHit {
                     score: cosine(&query_vector, vector),
                     source_name: unit.source_name.clone(),
@@ -3694,6 +3778,10 @@ impl AtlasDb {
                     coordinate: unit.coordinate(),
                 });
             }
+        }
+        if !fully_indexed {
+            answer.semantic = SemanticStatus::NotIndexed;
+            answer.semantic_model = None;
         }
         hits.sort_by(rank_semantic);
         hits.truncate(limit);
@@ -3778,8 +3866,16 @@ impl AtlasDb {
             hits,
             scope: lexical.scope,
             truncated: lexical.truncated || semantic.truncated,
-            semantic: lexical.semantic,
-            semantic_model: lexical.semantic_model,
+            // The **semantic** half's status, not the lexical half's. They
+            // agree on all three of H4's original words, because both come
+            // from `resolve` over the same installed model; only the
+            // semantic half can see S6's `not_indexed`, which is a fact
+            // about stored vectors that `lexical_search` never looks at.
+            // Reading it off `lexical` here would have made the new state
+            // invisible on `/v1/search`, which is the only surface an
+            // operator actually reads.
+            semantic: semantic.semantic,
+            semantic_model: semantic.semantic_model,
         })
     }
 
@@ -4126,6 +4222,10 @@ impl AtlasDb {
         drop(statement);
         let truncated = targets.len() > MAX_ROWS;
         targets.truncate(MAX_ROWS);
+        // S6: the same rebuild covers the vectors — `reindex_lexical` is
+        // the upgrade path for a store written before the index it rebuilds
+        // existed, and after S6 that includes a store with no vectors.
+        let engine = Self::engine_of(&self.semantic);
         let tx = self.conn.transaction()?;
         let mut indexed = 0u64;
         for generation_id in &targets {
@@ -4137,7 +4237,11 @@ impl AtlasDb {
                 sql!("DELETE FROM context.lexical_units WHERE generation_id = ?"),
                 duckdb::params![generation_id],
             )?;
-            indexed += index_generation(&tx, generation_id)?;
+            tx.execute(
+                sql!("DELETE FROM context.semantic_vectors WHERE generation_id = ?"),
+                duckdb::params![generation_id],
+            )?;
+            indexed += index_generation(&tx, generation_id, engine)?;
         }
         tx.commit()?;
         Ok(ReindexOutcome { indexed, truncated })
@@ -5195,7 +5299,81 @@ fn indexable_units(
     Ok(units)
 }
 
-fn index_generation(conn: &impl Statements, generation_id: &str) -> Result<u64, AtlasError> {
+/// Serialize one embedding as little-endian `f32` bytes.
+///
+/// A `BLOB` rather than a DuckDB `FLOAT[]` column: this store only ever
+/// reads a vector back **whole**, to hand to [`cosine`], and never selects,
+/// aggregates or unnests a component of one. A list column would buy SQL
+/// operations nothing here uses and cost a per-element round trip on every
+/// read. R6 — the one line that already does the job.
+fn vector_bytes(vector: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// The inverse of [`vector_bytes`]. A trailing partial float is dropped
+/// rather than guessed — `dimensions` is stored beside the blob so a
+/// truncated row is detectable: the caller compares the decoded vector's
+/// length against `dimensions` and, on a mismatch, treats the row as absent
+/// rather than scoring a wrong-length vector as an unrelated unit.
+fn vector_from_bytes(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect()
+}
+
+/// Every stored vector of one generation for **one model**, by unit key.
+///
+/// The model descriptor is part of the `WHERE` clause rather than something
+/// the caller compares afterwards, which is what makes a model swap
+/// *invalidate* instead of silently reusing: a differently-identified or
+/// differently-hashed model simply matches no rows. By analogy with A1 §8's
+/// rule that a cache key carry extractor identity, not only content
+/// identity — A1 §8 is written about source parsing, and this is the same
+/// discipline applied to the embedding extractor.
+fn stored_vectors(
+    conn: &impl Statements,
+    generation_id: &str,
+    model: &SemanticModel,
+) -> Result<HashMap<String, Vec<f32>>, AtlasError> {
+    let mut statement = conn.prepare(sql!(
+        "SELECT unit_key, vector, dimensions FROM context.semantic_vectors \
+         WHERE generation_id = ? AND model_identity = ? AND model_content_hash = ?"
+    ))?;
+    let mut rows = statement.query(duckdb::params![
+        generation_id,
+        &model.identity,
+        &model.content_hash
+    ])?;
+    let mut vectors = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let unit_key: String = row.get(0)?;
+        let bytes: Vec<u8> = row.get(1)?;
+        let dimensions: i64 = row.get(2)?;
+        let vector = vector_from_bytes(&bytes);
+        // A truncated row is detectable exactly because `dimensions` was
+        // stored beside the blob at write time: a decoded length that
+        // disagrees with it is dropped here rather than scored as a
+        // same-length-by-luck vector against an unrelated unit.
+        if vector.len() as i64 != dimensions {
+            continue;
+        }
+        vectors.insert(unit_key, vector);
+    }
+    Ok(vectors)
+}
+
+fn index_generation(
+    conn: &impl Statements,
+    generation_id: &str,
+    engine: Option<&SemanticEngine>,
+) -> Result<u64, AtlasError> {
     let units = indexable_units(conn, generation_id)?;
 
     // The two batches, appended rather than inserted row by row. This file
@@ -5251,6 +5429,43 @@ fn index_generation(conn: &impl Statements, generation_id: &str) -> Result<u64, 
         name!("lexical_postings"),
         posting_rows,
     )?;
+    // A2 §6's corpus side, embedded **once, here**, on the write path the
+    // daemon already owns (A1 §12: "the daemon remains sole Atlas writer").
+    // Before S6 this happened inside `semantic_search`'s per-generation
+    // loop, so every query paid O(corpus) model inference; the scan is the
+    // only place that cost belongs. Same batch, same appender, same
+    // transaction as the postings above — R2, the mechanism this function
+    // already owns.
+    //
+    // `None` is the supported degraded state, not a failure: a host with no
+    // assets indexes lexically and its generations carry no vectors, which
+    // `semantic_search` then reports as `not_indexed` rather than as an
+    // empty `applied` answer (A1 §15).
+    if let Some(engine) = engine {
+        let model = engine.descriptor();
+        let texts: Vec<String> = units.iter().map(|unit| unit.text.clone()).collect();
+        let vectors = engine.embed(&texts);
+        let vector_rows: Vec<Vec<Duck>> = units
+            .iter()
+            .zip(vectors.iter())
+            .map(|(unit, vector)| {
+                vec![
+                    Duck::Text(generation_id.to_string()),
+                    Duck::Text(unit.unit_key.clone()),
+                    Duck::Text(model.identity.clone()),
+                    Duck::Text(model.content_hash.clone()),
+                    Duck::BigInt(vector.len() as i64),
+                    Duck::Blob(vector_bytes(vector)),
+                ]
+            })
+            .collect();
+        append_rows(
+            conn,
+            name!(CONTEXT_SCHEMA),
+            name!("semantic_vectors"),
+            vector_rows,
+        )?;
+    }
     Ok(indexed)
 }
 

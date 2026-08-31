@@ -935,6 +935,32 @@ pub fn cited_function(text: &str, name: &str) -> Option<(Vec<String>, String)> {
     Some((attributes, body))
 }
 
+// --------------------------------------------------------------- semantic
+
+/// Point the documented operator override
+/// (`sergeant_rs::runtime::atlas::semantic::MODEL_DIR_ENV`) at this
+/// repository's committed model assets. Safe under `cargo nextest` because
+/// it runs every test in its own process, so the env var mutation is never
+/// visible across tests.
+///
+/// Takes the env var's name rather than importing the `semantic` module
+/// directly, so this file stays usable from suites that don't otherwise
+/// depend on that module.
+pub fn install_model(model_dir_env: &str) {
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/semantic-model");
+    assert!(
+        assets.join("model.safetensors").is_file(),
+        "the committed assets must be present at {}",
+        assets.display()
+    );
+    unsafe { std::env::set_var(model_dir_env, &assets) };
+}
+
+/// Make sure no model can be found: the `cargo install`-from-source host.
+pub fn uninstall_model(model_dir_env: &str) {
+    unsafe { std::env::remove_var(model_dir_env) };
+}
+
 #[cfg(test)]
 mod cross_process_lock_tests {
     use super::CrossProcessLock;

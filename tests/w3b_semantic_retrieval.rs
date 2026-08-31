@@ -70,9 +70,11 @@
 const D1_ESTATE: &str = "/estates/w3b_semantic_retrieval";
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use tempfile::TempDir;
+
+mod support;
 
 use sergeant_rs::domain::event::rfc3339_utc_now;
 use sergeant_rs::domain::source::{AuthorityClass, SourceKind, UnitKind};
@@ -187,18 +189,12 @@ const UNRELATED: [&str; 4] = [
 /// assets. See the module doc for why an environment variable and why that
 /// is safe under nextest.
 fn use_repository_assets() {
-    let assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/semantic-model");
-    assert!(
-        assets.join("model.safetensors").is_file(),
-        "the committed assets must be present at {}",
-        assets.display()
-    );
-    unsafe { std::env::set_var(MODEL_DIR_ENV, &assets) };
+    support::install_model(MODEL_DIR_ENV);
 }
 
 /// Make sure no model can be found: the `cargo install`-from-source host.
 fn use_no_assets() {
-    unsafe { std::env::remove_var(MODEL_DIR_ENV) };
+    support::uninstall_model(MODEL_DIR_ENV);
 }
 
 fn write(root: &Path, relative: &str, body: &str) {
