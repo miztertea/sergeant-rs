@@ -36,6 +36,10 @@
 //! * [`the_verb_itself_exits_zero_and_prints_a_row_for_every_source`] — the
 //!   front door, through the real binary: the exit code and the printed
 //!   rows an operator and a script actually see.
+//! * [`the_shared_scan_driver_gives_up_when_the_status_endpoint_stops_tracking_the_scan`]
+//!   — the contract of the shared driver every scanning suite follows a
+//!   scan through: a terminal `404` ends the wait by name instead of being
+//!   polled forever by a loop that carries no time bound of its own.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -480,4 +484,114 @@ async fn the_verb_itself_exits_zero_and_prints_a_row_for_every_source() {
         "progress is counted against what the scan undertook: {stdout}"
     );
     handle.shutdown().await;
+}
+
+/// The shared driver's own contract, held at the same seam every scanning
+/// suite reaches it through: `support::scan_to_completion` follows a scan by
+/// polling `GET /v1/intelligence/scan/{id}`, and that endpoint answers `404`
+/// for an id this daemon does not track — never accepted here, accepted
+/// before a restart, or aged past `RETAINED_SCANS` (`src/api.rs`'s own doc
+/// on `intelligence_scan_status`). A `404` is terminal: nothing will ever
+/// turn that id into a tracked, completing scan. The helper's wait carries
+/// no time bound of its own by design, so a poll loop that ignores the
+/// status polls a dead id until something outside the test kills it — and
+/// this repo's runner is not configured to do that (see
+/// `tests/f258_nextest_thread_budget.rs`), so the operator's signal is a job
+/// that hangs and names no test.
+///
+/// The stub is the instrument because the real defect needs a daemon that
+/// forgets a scan it just accepted; the panic payload is asserted, not just
+/// the fact of a panic, so a transport failure against the stub cannot make
+/// this test pass for the wrong reason.
+#[tokio::test]
+async fn the_shared_scan_driver_gives_up_when_the_status_endpoint_stops_tracking_the_scan() {
+    let endpoint = stub_that_accepts_a_scan_then_forgets_it();
+    let http = client();
+    let joined = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::spawn(async move {
+            support::scan_to_completion(&http, &endpoint, "stub-token", &json!({})).await
+        }),
+    )
+    .await
+    .expect(
+        "scan_to_completion must give up when the scan status endpoint answers 404; it polled a \
+         scan the daemon no longer tracks until this test's own bound cut it off, which in a real \
+         run is a job that hangs and names no test",
+    );
+    let panic = joined.expect_err("a terminal status must fail the test, not return a report");
+    let message = panic
+        .into_panic()
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        message.contains("404"),
+        "the failure must name the status that ended the wait, so the reader is not left \
+         guessing: {message:?}"
+    );
+}
+
+/// A `202` acceptance carrying a `scan_id` the status endpoint then answers
+/// `404` for — the daemon-restart / aged-out shape, served by hand because
+/// no real daemon can be asked to forget a scan it just accepted. Stdlib
+/// only (R3): this speaks two fixed responses, which is less code than
+/// wiring a server framework into `[dev-dependencies]` for it.
+fn stub_that_accepts_a_scan_then_forgets_it() -> String {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+    let port = listener.local_addr().expect("stub addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            // Read the whole request — headers, then exactly the declared
+            // body — so the client is never answered mid-write and cannot
+            // fail with a transport error instead of the status under test.
+            let mut raw = Vec::new();
+            let mut byte = [0u8; 1];
+            let mut saw_headers = false;
+            while !saw_headers {
+                match stream.read(&mut byte) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        raw.push(byte[0]);
+                        saw_headers = raw.ends_with(b"\r\n\r\n");
+                    }
+                }
+            }
+            if !saw_headers {
+                continue;
+            }
+            let head = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+            let content_length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 && stream.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let (status, payload) = if head.starts_with("post ") {
+                (
+                    "202 Accepted",
+                    r#"{"scan_id":"forgotten","state":"running","scanned":[]}"#,
+                )
+            } else {
+                (
+                    "404 Not Found",
+                    r#"{"error":"unknown_scan","message":"no scan forgotten is tracked by this daemon"}"#,
+                )
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: \
+                 {}\r\nconnection: close\r\n\r\n{payload}",
+                payload.len()
+            );
+            let _ = stream.flush();
+        }
+    });
+    format!("http://127.0.0.1:{port}")
 }

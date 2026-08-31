@@ -110,9 +110,16 @@ fn append_a_scan_directly(core: &mut Core, data: &Path, src_root: &Path) {
     let scan = scan_local_knowledge(&source).expect("scan");
     // S6 D1 added the estate binding as `record_scan`'s fifth argument. A
     // `local_knowledge` scan is the estate's own bytes, never host-scoped
-    // (`EstateBinding::Host` is reserved for `external_git`), so this test's
-    // fixture root is the honest binding — and using the real production
-    // signature is what keeps this from passing by imitating the writer.
+    // (`EstateBinding::Host` is reserved for `external_git`), so the
+    // `Estate` variant is the right shape here. The *value* is this
+    // fixture's knowledge source directory, not an estate root — this
+    // suite has no estate at all, and nothing in it reads the binding
+    // back: what it asserts is journal/fold contiguity, for which any
+    // well-formed binding does. The admissibility contract over that
+    // value — that it is the same canonical root the query path binds —
+    // is `tests/d1_estate_isolation.rs`'s, not this suite's. What matters
+    // here is calling the real production signature, which is what keeps
+    // this from passing by imitating the writer.
     record_scan(
         &mut atlas,
         &mut core.journal,
