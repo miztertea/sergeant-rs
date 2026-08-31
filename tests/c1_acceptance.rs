@@ -667,13 +667,35 @@ fn every_named_check_exists_in_the_suite_it_names() {
                 check.file,
                 check.test
             );
+            // A bare substring test for "assert" matches inside a comment or a
+            // string literal too — a cited test whose body only reads
+            // `// no assert needed, this is documentation-only` (no macro
+            // call) would satisfy it while asserting nothing (F-IN-02).
+            // Comment-only lines are dropped first, and what remains must
+            // contain an actual assert-family macro invocation, not just
+            // the word.
+            let asserts = body
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with("//"))
+                .any(|line| {
+                    [
+                        "assert!(",
+                        "assert_eq!(",
+                        "assert_ne!(",
+                        "assert_matches!(",
+                        "debug_assert!(",
+                        "debug_assert_eq!(",
+                        "debug_assert_ne!(",
+                    ]
+                    .iter()
+                    .any(|needle| line.contains(needle))
+                });
             assert!(
-                body.contains("assert"),
+                asserts,
                 "item {}: {}::{} contains no assertion — a citation to a check that proves \
                  nothing is a verdict with nothing behind it",
-                item.number,
-                check.file,
-                check.test
+                item.number, check.file, check.test
             );
         }
     }
