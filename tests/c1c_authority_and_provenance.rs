@@ -8,6 +8,8 @@
 //! | **item 9, the security half** — an external `AGENTS.md` that *looks like an instruction* cannot displace, reorder or escape the data frame: the same world compiled with benign prose and with a prompt-injection payload renders identically apart from the quoted body bytes | [`an_external_instruction_cannot_displace_reorder_or_escape_the_data_frame`] |
 //! | **item 9** — §11's frame is rendered literally, and a banner forged inside external text adds no frame and claims no authority | [`a_forged_banner_in_external_text_adds_no_frame_and_claims_no_authority`] |
 //! | **item 8** — a document excerpt in the prompt carries its extractor identity, A2 §9 native coordinate, heading and byte span; a fresh markdown unit carries the ones it really has and no more | [`a_document_excerpt_carries_extractor_native_coordinate_and_heading`] |
+//! | **item 8, the mail third** — a mail excerpt in a compiled prompt carries the `.eml`'s own path, A1 §6.5's *which body* native coordinate and the mail normalizer's identity, landed through the REAL worker subprocess | [`a_mail_excerpt_carries_its_resource_native_coordinate_and_extractor`] |
+//! | **item 8 + A2 §9** — a unit addressed by a native coordinate renders no `bytes 0..0`, while a Markdown control's real byte span still renders (S5 closeout F-AC-02, on the C1 render path) | [`an_excerpt_addressed_by_a_native_coordinate_renders_no_empty_byte_span`] |
 //! | **item 8, the deferred half** — OCR provenance is declared absent rather than omitted | [`the_ocr_half_of_item_8_is_declared_absent_rather_than_omitted`] |
 //! | **item 7** — a deterministic query result is Bound compact while a 20,000-row dataset stays entirely outside the prompt | [`a_query_result_is_bound_compact_while_the_dataset_stays_out_of_the_prompt`] |
 //! | **item 7** — the bound result carries all seven of §10's lines, and its `query_result_id` is on the snapshot | [`a_bound_query_result_carries_all_seven_of_section_10s_lines`] |
@@ -41,6 +43,7 @@
 const D1_ESTATE: &str = "/estates/demo";
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tempfile::TempDir;
 
@@ -48,11 +51,15 @@ use sergeant_rs::domain::source::{AuthorityClass, SourceKind, UnitKind};
 use sergeant_rs::domain::workflow::{StageDefinition, StageKind, StageRecord, StageStatus};
 use sergeant_rs::runtime::atlas::db::{AtlasDb, LexicalQuery, SourceSelector};
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, UnitCoordinate};
+use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
 use sergeant_rs::runtime::atlas::overlay::overlay_source_name;
 use sergeant_rs::runtime::atlas::record::{record_scan, scan_and_record};
-use sergeant_rs::runtime::atlas::scan::{KnowledgeSource, ScannedFile, ScannedUnit};
+use sergeant_rs::runtime::atlas::scan::{
+    KnowledgeSource, ScannedFile, ScannedUnit, scan_local_knowledge_with_worker,
+};
 use sergeant_rs::runtime::atlas::semantic::SemanticRequest;
 use sergeant_rs::runtime::atlas::tabular::ContextFields;
+use sergeant_rs::runtime::atlas::worker::WorkerRuntime;
 use sergeant_rs::runtime::context::{
     CompileRequest, ContextSnapshot, DATA_PREFIX, EXTERNAL_BANNER, EvidenceCoordinate,
     EvidenceUnit, RenderBudget, Tier, compile,
@@ -587,6 +594,307 @@ fn a_document_excerpt_carries_extractor_native_coordinate_and_heading() {
     assert!(
         rendered.contains(OFFICE_BODY),
         "the excerpt itself is missing: {rendered}"
+    );
+}
+
+/// **§21 item 8 + A2 §9, the render half.** *"it must use the strongest
+/// coordinate actually produced, not invent cell precision."*
+///
+/// A unit the extractor had to decode a container to reach has **no** byte
+/// span — `0`/`0` is its honest not-applicable stored value — and its native
+/// coordinate is the only thing that addresses it. Rendering `bytes 0..0`
+/// beside it prints the *absence* where a reader reads evidence, which is
+/// S5 closeout finding **F-AC-02**. That was fixed once already for the CLI
+/// hit renderer (`src/cli.rs`'s `print_hit`: *"Printing `bytes 0..0` there
+/// prints the absence instead of the evidence"*); this is the same defect on
+/// the C1 compiled-prompt render path.
+///
+/// **The control that makes this non-vacuous** is the Markdown unit landed in
+/// the same generation: its byte span *is* its address, it has no native
+/// coordinate, and its `bytes 0..N` must still be rendered. So a fix that
+/// suppressed byte spans generally — the easy way to make the first assertion
+/// pass — fails the second.
+#[test]
+fn an_excerpt_addressed_by_a_native_coordinate_renders_no_empty_byte_span() {
+    const OFFICE_EXTRACTOR: &str = "office-docx/v3";
+    const NATIVE: &str = "block:17";
+    const OFFICE_BODY: &str = "The vendor's retention defaults, from the deck.";
+    const CONTROL_BODY: &str = "The retention policy, in one paragraph.";
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+
+    let office = ScannedFile {
+        relative_path: "decks/current-state.docx".to_string(),
+        content_hash: "hash/decks/current-state.docx".to_string(),
+        extractor: OFFICE_EXTRACTOR.to_string(),
+        local_key: "key/decks/current-state.docx".to_string(),
+        byte_len: OFFICE_BODY.len() as u64,
+        mtime_millis: None,
+        units: vec![ScannedUnit {
+            ordinal: 0,
+            kind: UnitKind::Section,
+            heading_level: Some(2),
+            title: Some("Retention".to_string()),
+            // The not-applicable span: there is no offset into the
+            // compressed original that addresses this unit.
+            byte_start: 0,
+            byte_end: 0,
+            coordinate: Some(NATIVE.to_string()),
+            text: OFFICE_BODY.to_string(),
+        }],
+        syntax: None,
+        parent: None,
+    };
+    let overlay = scan(
+        &overlay_source_name(WORK_ID, REPOSITORY),
+        SourceKind::EstateGit,
+        AuthorityClass::EstateMutable,
+        vec![
+            office,
+            file("notes/plan.md", vec![unit(0, "Plan", CONTROL_BODY)]),
+        ],
+    );
+    record_scan(
+        &mut db,
+        &mut journal,
+        &overlay,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record overlay");
+
+    let snapshot = compiled(&db, &bindings(), &prior_stages());
+    let docx = unit_at(&snapshot, "decks/current-state.docx");
+    assert_eq!(
+        docx.provenance.native_coordinate.as_deref(),
+        Some(NATIVE),
+        "the fixture must actually carry a native coordinate, or this proves nothing: {docx:?}"
+    );
+    let control = unit_at(&snapshot, "notes/plan.md");
+    assert_eq!(
+        control.provenance.native_coordinate, None,
+        "the control must genuinely have no native coordinate: {control:?}"
+    );
+
+    let rendered = snapshot.render_onto(AUTHORED);
+    assert!(
+        !rendered.contains("bytes 0..0"),
+        "F-AC-02: `bytes 0..0` prints the absence of a byte span where a reader reads \
+         evidence; the native coordinate is this unit's address: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("native {NATIVE}")),
+        "the native coordinate must be what addresses the excerpt instead: {rendered}"
+    );
+    // The control: suppressing byte spans generally is not the fix.
+    assert!(
+        rendered.contains(&format!("bytes 0..{}", CONTROL_BODY.len())),
+        "the Markdown control's byte span IS its address and must still be rendered: {rendered}"
+    );
+}
+
+/// **§21 item 8, the MAIL third.** *"document/mail/OCR excerpts preserve
+/// original resource/native/extractor provenance."*
+///
+/// This is the row the 0.3.0 acceptance register carried as its one open
+/// Gap. The document third had a check; the OCR third is a deferral (owner
+/// ruling, 2026-08-29); nothing proved that a **mail excerpt in a compiled
+/// prompt** carries the three things the item names. The retrieval layer
+/// proves its own half — `w2_lexical_retrieval::
+/// lexical_search_returns_mail_units_with_exact_a1_provenance` — but that is
+/// a different layer, and "the resolution path is kind-agnostic so it very
+/// probably works" is exactly the reading that let A2 §2's first filter go
+/// missing under a `met` verdict. So this compiles a real context and reads
+/// the rendered prompt.
+///
+/// **Nothing here is hand-built.** The mail unit comes from this repo's own
+/// `.eml` fixture walked through the **real** supervised worker subprocess —
+/// the route `scan.rs`'s `worker_extractor_for` sends `.eml` down — and
+/// recorded through the real `record_scan`. S5 closeout F-AC-02 is why: the
+/// hand-built mail row set a title and a byte span by hand that the worker
+/// landing path cannot produce, so the test pinned values production never
+/// emits and would have passed with the mail adapter deleted.
+///
+/// The three things item 8 names, in the render:
+///
+/// - **original resource** — the `.eml`'s own relative path on the
+///   coordinate line above the excerpt;
+/// - **native coordinate** — A1 §6.5's message shape, *which body*
+///   (`text-body`), not a byte offset (a mail body has no byte span into the
+///   wire bytes at all);
+/// - **extractor identity** — §12's normalizer, `mail-parser/…+eml/v1`.
+///
+/// **The control that makes this non-vacuous** is the Markdown file written
+/// into the same mailbox and landed by the same walk: its
+/// `native_coordinate` is genuinely `None`, so the assertion cannot be
+/// satisfied by a renderer that prints any string in that position. The
+/// control is asserted `None` *before* the render is read, so a fixture that
+/// silently started producing coordinates for Markdown fails here rather
+/// than quietly hollowing out the mail assertion.
+#[test]
+fn a_mail_excerpt_carries_its_resource_native_coordinate_and_extractor() {
+    const MAIL_PATH: &str = "inbox/message.eml";
+    const CONTROL_PATH: &str = "notes.md";
+    const CONTROL_BODY: &str = "An alternative body demo, in plain Markdown prose.";
+    /// A1 §6.5's message shape: *which body*, not a byte span.
+    const NATIVE_BODY: &str = "text-body";
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+
+    // A real mailbox on disk: this repository's own `.eml` fixture, plus a
+    // Markdown control in the same source so both land in one generation
+    // through one walk.
+    let mailbox_root = tempfile::tempdir().expect("mailbox root");
+    std::fs::create_dir_all(mailbox_root.path().join("inbox")).expect("inbox");
+    std::fs::write(
+        mailbox_root.path().join(MAIL_PATH),
+        std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mail_corpus/02-multipart-alternative.eml"),
+        )
+        .expect("read the mail fixture"),
+    )
+    .expect("write the mail fixture");
+    std::fs::write(
+        mailbox_root.path().join(CONTROL_PATH),
+        format!("# Alternative\n\n{CONTROL_BODY}\n"),
+    )
+    .expect("write the control");
+
+    let mailbox = scan_local_knowledge_with_worker(
+        &KnowledgeSource {
+            name: "mailbox".to_string(),
+            root: mailbox_root.path().to_path_buf(),
+            ignore: Vec::new(),
+            context_fields: ContextFields::none(),
+        },
+        &WorkerRuntime {
+            program: PathBuf::from(env!("CARGO_BIN_EXE_sgt-atlas-worker")),
+            deadline: Duration::from_secs(20),
+        },
+    )
+    .expect("scan the mailbox through the real worker");
+    assert!(
+        mailbox.extractors.contains(MAIL_EXTRACTOR),
+        "the fixture must have routed through the REAL mail adapter, or this test is \
+         about something else entirely: {:?}",
+        mailbox.extractors
+    );
+    record_scan(
+        &mut db,
+        &mut journal,
+        &mailbox,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record mailbox");
+
+    let stage = stage();
+    let snapshot = compile(
+        Some(&db),
+        &CompileRequest {
+            estate_root: Some(Path::new(D1_ESTATE)),
+            work_id: WORK_ID,
+            intent: "summarise the alternative body demo message",
+            stage: &stage,
+            stage_index: 1,
+            attempt: 1,
+            execution_id: "01EXECUTION",
+            journal_watermark: 42,
+            bindings: &[],
+            prior_stages: &[],
+            profile: Some("standard"),
+            parent: None,
+            budget: RenderBudget::DEFAULT,
+        },
+    );
+
+    let mail = unit_at(&snapshot, MAIL_PATH);
+    let control = unit_at(&snapshot, CONTROL_PATH);
+    assert_eq!(
+        control.provenance.native_coordinate, None,
+        "the control's native coordinate must be GENUINELY absent, or the mail assertion \
+         below could be satisfied by printing any string: {control:?}"
+    );
+    assert!(
+        control.provenance.extractor.is_some(),
+        "every landed resource has an extractor identity: {control:?}"
+    );
+
+    // Item 8's three things, in the compiled snapshot.
+    assert_eq!(
+        mail.provenance.native_coordinate.as_deref(),
+        Some(NATIVE_BODY),
+        "A2 §9 / A1 §6.5: the excerpt must be addressed by WHICH BODY of the message: {mail:?}"
+    );
+    let extractor = mail
+        .provenance
+        .extractor
+        .as_deref()
+        .expect("the mail excerpt must name the normalizer that produced it");
+    assert!(
+        extractor.starts_with("mail-parser/") && extractor.ends_with("+eml/v1"),
+        "§12's normalizer identity must be the real mail adapter's: {extractor}"
+    );
+    assert_ne!(
+        mail.provenance.extractor, control.provenance.extractor,
+        "the two units were landed by different extractors and must say so"
+    );
+
+    // And they reach the PROMPT, which is what item 8 is actually about.
+    let rendered = snapshot.render_onto(AUTHORED);
+    assert!(
+        rendered.contains(MAIL_PATH),
+        "the original resource — the `.eml`'s own path — never reached the prompt: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("native {NATIVE_BODY}")),
+        "the native coordinate never reached the rendered mail excerpt: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("extractor {extractor}")),
+        "the extractor identity never reached the rendered mail excerpt: {rendered}"
+    );
+    // A2 §9: a mail body has no byte span, and `0..0` prints the absence
+    // where a reader reads evidence (F-AC-02).
+    assert!(
+        !rendered.contains("bytes 0..0"),
+        "the mail excerpt must be addressed by its native coordinate, not by an empty \
+         byte span: {rendered}"
+    );
+    // The control still renders the coordinate it really has. The expected
+    // value comes from the file on disk, not from the unit's own provenance
+    // — a span read back out of the thing under test would agree with it by
+    // construction.
+    let control_bytes = std::fs::metadata(mailbox_root.path().join(CONTROL_PATH))
+        .expect("the control file")
+        .len();
+    assert!(
+        rendered.contains(&format!("bytes 0..{control_bytes}")),
+        "the Markdown control's byte span IS its address and must still be rendered \
+         (expected the whole {control_bytes}-byte file): {rendered}"
+    );
+
+    // F-IN-01: the JSON provenance representation must agree with the text
+    // one above, not reprint the empty span the text render just suppressed.
+    // The key stays present (this method's own "every line is present, null
+    // included" contract), only the sentinel value is dropped.
+    let mail_json = mail.provenance.json();
+    assert!(
+        mail_json["byte_span"].is_null(),
+        "the mail excerpt has no byte span to give — JSON must say null, not print the \
+         absence as [0, 0]: {mail_json}"
+    );
+    let control_json = control.provenance.json();
+    assert_eq!(
+        control_json["byte_span"],
+        serde_json::json!([0, control_bytes]),
+        "the control's real byte span must still be present in its JSON provenance: \
+         {control_json}"
     );
 }
 

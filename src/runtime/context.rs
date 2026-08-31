@@ -1020,7 +1020,23 @@ impl EvidenceProvenance {
                 None => parts.push(format!("title {title:?}")),
             }
         }
-        if let Some((start, end)) = self.byte_span {
+        // A2 §9: *"it must use the strongest coordinate actually produced,
+        // not invent cell precision."* A unit the extractor had to decode a
+        // container to reach — a mail body, an Office block — has no offset
+        // into the original; `0`/`0` is its honest not-applicable *stored*
+        // value, and its native coordinate is what addresses it. Printing
+        // `bytes 0..0` beside it prints the absence where a reader reads
+        // evidence (S5 closeout, F-AC-02; already fixed once for the CLI hit
+        // renderer in `src/cli.rs`'s `print_hit`).
+        //
+        // Narrow on purpose: only the empty span is dropped, and only when a
+        // native coordinate is actually there to replace it. §12 forbids
+        // erasing provenance to make the prompt cleaner, so a byte span the
+        // extractor really produced is still rendered even beside a native
+        // coordinate.
+        if let Some((start, end)) = self.byte_span
+            && !(start == end && self.native_coordinate.is_some())
+        {
             parts.push(format!("bytes {start}..{end}"));
         }
         if let Some(ocr) = &self.ocr {
@@ -1042,7 +1058,20 @@ impl EvidenceProvenance {
             "native_coordinate": self.native_coordinate,
             "title": self.title,
             "heading_level": self.heading_level,
-            "byte_span": self.byte_span.map(|(start, end)| json!([start, end])),
+            // F-IN-01: mirrors render_line()'s guard above — an empty span
+            // that only exists because the extractor had no offset to give
+            // (a native coordinate is present instead) is the same absence
+            // there and here. The key stays present as `null`, matching this
+            // method's own "every line is present" contract; only the
+            // sentinel value is suppressed, and only under the identical
+            // condition the text path already uses.
+            "byte_span": self.byte_span.and_then(|(start, end)| {
+                if start == end && self.native_coordinate.is_some() {
+                    None
+                } else {
+                    Some(json!([start, end]))
+                }
+            }),
             // Reads self.ocr rather than hardcoding null: OCR is deferred
             // outside 0.3.0 by owner ruling and this build never constructs
             // an OcrProvenance, so today this is always null in practice —
