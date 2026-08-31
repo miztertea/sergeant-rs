@@ -1956,6 +1956,22 @@ fn composed_stage_id(dir: &Path, worktree_root: &Path) -> Option<String> {
     Some(components.join("/"))
 }
 
+/// F-SI-01: the fail-closed guard [`retain_stage_outputs`] and
+/// [`finalize_sweep`] both need before they may treat any worktree
+/// directory as *this* run's stage — absent `workflow_source` sweeps
+/// nothing, and a `workflow_source` whose package will not load sweeps
+/// nothing either (#297; see both callers' own doc comments for why:
+/// there is no fallback to the unscoped walk that used to sweep another
+/// Work's already-merged evidence). Shared so the two-step fail-closed
+/// check exists once rather than being repeated at each call site.
+fn declared_stage_ids_for_sweep(
+    workflow_source: Option<&Path>,
+) -> Option<(&Path, std::collections::BTreeSet<String>)> {
+    let workflow_source = workflow_source?;
+    let declared = crate::domain::workflow::declared_stage_ids(workflow_source)?;
+    Some((workflow_source, declared))
+}
+
 /// #240: copy each stage directory's declared `output/` artifacts out of
 /// `binding.worktree_path` before it is removed, into
 /// `<stage-dir>.output/<stage-dir>/` sibling to the worktree — the same
@@ -2001,10 +2017,7 @@ fn retain_stage_outputs(
     // evidence area. The flat `.dirty.patch` still captures the worktree's
     // content either way, so nothing here discards content — it stops
     // labeling a stranger's directory as one of this run's stages.
-    let Some(workflow_source) = workflow_source else {
-        return Vec::new();
-    };
-    let Some(declared) = crate::domain::workflow::declared_stage_ids(workflow_source) else {
+    let Some((workflow_source, declared)) = declared_stage_ids_for_sweep(workflow_source) else {
         return Vec::new();
     };
     let Some(surface_root) = binding.worktree_path.parent() else {
@@ -2167,15 +2180,11 @@ pub fn finalize_sweep(
     workflow_source: Option<&Path>,
 ) -> FinalizeSweepReport {
     let mut report = FinalizeSweepReport::default();
-    let Some(workflow_source) = workflow_source else {
-        return report;
-    };
-    // #297: fail closed on a package that will not load, exactly as the
-    // absent-source case above does. Without a declared set there is no way
-    // to tell this Work's stage directories from another Work's already-
-    // merged ones, and the unscoped walk is precisely what deleted an
-    // outside estate's evidence.
-    let Some(declared) = crate::domain::workflow::declared_stage_ids(workflow_source) else {
+    // #297: fail closed on an absent or unloadable package. Without a
+    // declared set there is no way to tell this Work's stage directories
+    // from another Work's already-merged ones, and the unscoped walk is
+    // precisely what deleted an outside estate's evidence.
+    let Some((workflow_source, declared)) = declared_stage_ids_for_sweep(workflow_source) else {
         return report;
     };
     let Some(surface_root) = binding.worktree_path.parent() else {
