@@ -878,6 +878,24 @@ fn a_mail_excerpt_carries_its_resource_native_coordinate_and_extractor() {
         "the Markdown control's byte span IS its address and must still be rendered \
          (expected the whole {control_bytes}-byte file): {rendered}"
     );
+
+    // F-IN-01: the JSON provenance representation must agree with the text
+    // one above, not reprint the empty span the text render just suppressed.
+    // The key stays present (this method's own "every line is present, null
+    // included" contract), only the sentinel value is dropped.
+    let mail_json = mail.provenance.json();
+    assert!(
+        mail_json["byte_span"].is_null(),
+        "the mail excerpt has no byte span to give — JSON must say null, not print the \
+         absence as [0, 0]: {mail_json}"
+    );
+    let control_json = control.provenance.json();
+    assert_eq!(
+        control_json["byte_span"],
+        serde_json::json!([0, control_bytes]),
+        "the control's real byte span must still be present in its JSON provenance: \
+         {control_json}"
+    );
 }
 
 /// **§21 item 8's deferred half, stated where a reader of item 8 looks.**

@@ -1058,7 +1058,20 @@ impl EvidenceProvenance {
             "native_coordinate": self.native_coordinate,
             "title": self.title,
             "heading_level": self.heading_level,
-            "byte_span": self.byte_span.map(|(start, end)| json!([start, end])),
+            // F-IN-01: mirrors render_line()'s guard above — an empty span
+            // that only exists because the extractor had no offset to give
+            // (a native coordinate is present instead) is the same absence
+            // there and here. The key stays present as `null`, matching this
+            // method's own "every line is present" contract; only the
+            // sentinel value is suppressed, and only under the identical
+            // condition the text path already uses.
+            "byte_span": self.byte_span.and_then(|(start, end)| {
+                if start == end && self.native_coordinate.is_some() {
+                    None
+                } else {
+                    Some(json!([start, end]))
+                }
+            }),
             // Reads self.ocr rather than hardcoding null: OCR is deferred
             // outside 0.3.0 by owner ruling and this build never constructs
             // an OcrProvenance, so today this is always null in practice —
