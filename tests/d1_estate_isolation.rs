@@ -520,14 +520,26 @@ fn a_search_that_addresses_no_estate_is_refused_rather_than_answered_widely() {
         .build()
         .expect("runtime")
         .block_on(async { client.get(&format!("/v1/search?q={SHARED_TERM}")).await });
-    let body = match answer {
-        Ok(value) => serde_json::to_string(&value).expect("render"),
-        Err(e) => format!("{e}"),
-    };
-    assert!(
-        !body.contains(ALPHA_TOKEN) && !body.contains(BETA_TOKEN),
-        "an unaddressed search answered from the host's estates: {body}"
-    );
+    // The actual refusal, not a proxy for it: an unaddressed request must
+    // come back as `admit_addressed_estate`'s own "no estate addressed"
+    // shape (`src/api.rs`) — HTTP 404, error code `no_estate` — never a
+    // 2xx `Value`. Checking only that the two tokens are absent from the
+    // rendered output is not this test: a `no_estate` error's own body
+    // never contains either token, but so does *any* successful search
+    // response, since hits carry path/symbol/coordinate metadata only and
+    // never a unit's raw source text — so that check alone would pass
+    // whether or not the request was actually refused.
+    match answer {
+        Err(sergeant_rs::api::ClientError::Api { status, code, .. }) => {
+            assert_eq!(status, 404, "wrong refusal status");
+            assert_eq!(code, "no_estate", "wrong refusal code");
+        }
+        Ok(value) => panic!(
+            "an unaddressed search was answered instead of refused: {}",
+            serde_json::to_string(&value).expect("render")
+        ),
+        Err(e) => panic!("expected a structured `no_estate` refusal, got: {e}"),
+    }
 }
 
 /// Guard-rail for this file itself: the fixtures really are distinguishable.
