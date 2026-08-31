@@ -259,6 +259,7 @@ impl Core {
     /// pre-publish `core.flush()?`) would read `Ok` over a handle that
     /// refuses all further appends.
     pub fn flush(&mut self) -> Result<(), CoreError> {
+        self.absorb_before_release();
         let synced = self.journal.sync();
         // Taken unconditionally: a group that failed to sync is not retried
         // on the next hold, it is abandoned along with the poisoned handle.
@@ -269,6 +270,50 @@ impl Core {
             let _ = self.events_tx.send(event);
         }
         Ok(())
+    }
+
+    /// **#334's structural close: the release choke point.**
+    ///
+    /// [`Self::absorb_journaled`]'s own doc comment says every direct-journal
+    /// writer must call it before releasing the hold. That was *prose*, and
+    /// `intelligence_add_source` did not: the registry was left one seq
+    /// behind, and the next [`Self::commit`] — whatever Work command happened
+    /// to come next — failed [`crate::runtime::projection::Projection::apply`]'s
+    /// contiguity check, then kept failing, because a failed commit appends
+    /// before it folds and so widens the gap by one every time. A wedged
+    /// daemon wearing a log line.
+    ///
+    /// Enforcing it *here* is what makes the invariant structural rather than
+    /// remembered: [`Self::flush`] is the single point every hold passes
+    /// through ([`CoreGuard::flush`] and [`CoreGuard`]'s `Drop` backstop both
+    /// call it), so a writer that forgets — including one written after this
+    /// comment — cannot leave the registry behind. It does not excuse the
+    /// writer: the omission is reported.
+    ///
+    /// Report-only on failure, deliberately. A fold that cannot be applied is
+    /// not a reason to abandon a group that is already on disk: turning it
+    /// into an `Err` here would drop the hold's events unpublished and lose
+    /// the fan-out as well as the fold. `flush`'s own contract (fsync, then
+    /// publish) is untouched.
+    fn absorb_before_release(&mut self) {
+        if self.journal.next_seq().saturating_sub(1) <= self.registry.last_seq() {
+            return;
+        }
+        tracing::error!(
+            registry_last_seq = self.registry.last_seq(),
+            journal_next_seq = self.journal.next_seq(),
+            "a lock hold appended straight to the journal and released without \
+             calling `absorb_journaled`; the registry is being caught up at \
+             release so the next commit is not wedged (#334) — the writer is \
+             the bug"
+        );
+        if let Err(error) = self.absorb_journaled() {
+            tracing::error!(
+                %error,
+                "catching the registry up at hold release failed; the journal \
+                 and the projections that answer for it now disagree (#334)"
+            );
+        }
     }
 
     /// Fold events this hold appended through a writer that owns the
