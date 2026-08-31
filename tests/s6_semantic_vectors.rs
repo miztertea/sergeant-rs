@@ -234,3 +234,72 @@ fn an_index_scanned_with_the_model_installed_still_answers_semantically() {
             .collect::<Vec<_>>()
     );
 }
+
+// ------------------------------------------- the extractor half of the key
+
+/// A copy of the committed assets whose **bytes differ** while its pinned
+/// identity does not: one trailing space appended to `config.json`, which
+/// still parses and still loads.
+///
+/// That is deliberately the harder of the two cases `SemanticModel`'s own
+/// doc separates — *"a repointed identity with unchanged bytes and unchanged
+/// bytes under a new identity are different situations"*. `identity` is
+/// `MODEL_REPO@MODEL_REVISION`, a compile-time constant, so a test can only
+/// move `content_hash`; if the key ignored it, this case is the one that
+/// would slip through.
+fn install_repointed_model() -> TempDir {
+    let assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/semantic-model");
+    let swapped = tempfile::tempdir().expect("swapped model dir");
+    for entry in std::fs::read_dir(&assets).expect("read assets") {
+        let entry = entry.expect("asset entry");
+        std::fs::copy(entry.path(), swapped.path().join(entry.file_name())).expect("copy asset");
+    }
+    let config = swapped.path().join("config.json");
+    let mut text = std::fs::read_to_string(&config).expect("read config.json");
+    text.push(' ');
+    std::fs::write(&config, text).expect("rewrite config.json");
+    unsafe { std::env::set_var(MODEL_DIR_ENV, swapped.path()) };
+    swapped
+}
+
+/// **A model swap invalidates the stored vectors — it never silently reuses
+/// them.**
+///
+/// A1 §8 requires a cache key to carry enough *extractor* identity that a
+/// parser change cannot reuse stale facts. A1 §8's own text is about source
+/// parsing; this is the same discipline applied to the embedding extractor,
+/// and the extractor here is the model. A vector embedded by one model and
+/// cosined against another model's query vector is not a similarity — the
+/// two live in different spaces — so reuse would be silently wrong rather
+/// than merely stale.
+#[test]
+fn vectors_embedded_by_one_model_are_not_reused_by_another() {
+    install_model();
+    let estate = scanned_estate();
+    let before = estate.semantic("running out of storage space");
+    assert_eq!(
+        before.semantic,
+        SemanticStatus::Applied,
+        "precondition: the scan stored vectors for the model it ran under"
+    );
+    assert!(!before.hits.is_empty());
+
+    let _swapped = install_repointed_model();
+    let estate = estate.reopen();
+    let after = estate.semantic("running out of storage space");
+
+    assert_eq!(
+        after.semantic,
+        SemanticStatus::NotIndexed,
+        "the store holds vectors, but none this model embedded"
+    );
+    assert!(
+        after.hits.is_empty(),
+        "a vector embedded by another model was reused: {:?}",
+        after
+            .hits
+            .iter()
+            .map(|h| (h.coordinate.relative_path().to_string(), h.score))
+            .collect::<Vec<_>>()
+    );
+}
