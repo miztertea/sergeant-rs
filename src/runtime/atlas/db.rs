@@ -6550,24 +6550,21 @@ impl Admissible<'_> {
         let overlay_exclude = overlay_exclude_like();
         let overlay_admit = filter.source.overlay_admit_source_name();
         let out = self.reader.rows(
-            read_sql!(
+            read_sql!(concat!(
                 "SELECT generation_id, source_name, source_kind, authority_class, content_key, \
                         observed_at \
                  FROM source.generations g \
                  WHERE g.state = ? \
-                   AND ? IS NOT NULL \
-                   AND EXISTS (SELECT 1 FROM source.generation_estates ge \
-                               WHERE ge.generation_id = g.generation_id \
-                                 AND (ge.estate_scope = 'host' \
-                                      OR ge.estate_root = ?)) \
-                   AND ( (g.source_name NOT LIKE ? \
+                   AND ",
+                admissible_estate_clause!(),
+                " AND ( (g.source_name NOT LIKE ? \
                           AND (? IS NULL OR g.source_name = ?)) \
                          OR (? IS NOT NULL AND g.source_name = ?) ) \
                    AND (? IS NULL OR g.content_key = ?) \
                    AND (? IS NULL OR g.source_kind = ?) \
                    AND (? IS NULL OR g.authority_class = ?) \
                  ORDER BY g.source_name, g.observed_at DESC, g.generation_id DESC LIMIT ?"
-            ),
+            )),
             duckdb::params![
                 STATE_CONFIRMED,
                 estate,
@@ -6652,7 +6649,7 @@ impl Admissible<'_> {
         let overlay_exclude = overlay_exclude_like();
         let overlay_admit = filter.source.overlay_admit_source_name();
         let out = self.reader.rows(
-            read_sql!(
+            read_sql!(concat!(
                 "SELECT g.source_name, u.relative_path, u.local_key, u.ordinal, u.unit_kind, \
                         u.heading_level, u.title, u.byte_start, u.byte_end, u.body \
                  FROM source.units u \
@@ -6660,12 +6657,9 @@ impl Admissible<'_> {
                  JOIN source.files f ON f.generation_id = u.generation_id \
                                      AND f.relative_path = u.relative_path \
                  WHERE g.state = ? \
-                   AND ? IS NOT NULL \
-                   AND EXISTS (SELECT 1 FROM source.generation_estates ge \
-                               WHERE ge.generation_id = g.generation_id \
-                                 AND (ge.estate_scope = 'host' \
-                                      OR ge.estate_root = ?)) \
-                   AND (f.extractor IN (?, ?, ?) OR f.extractor LIKE ?) \
+                   AND ",
+                admissible_estate_clause!(),
+                " AND (f.extractor IN (?, ?, ?) OR f.extractor LIKE ?) \
                    AND ( (g.source_name NOT LIKE ? \
                           AND (? IS NULL OR g.source_name = ?)) \
                          OR (? IS NOT NULL AND g.source_name = ?) ) \
@@ -6673,7 +6667,7 @@ impl Admissible<'_> {
                    AND (? IS NULL OR g.source_kind = ?) \
                    AND (? IS NULL OR g.authority_class = ?) \
                  ORDER BY g.source_name, u.relative_path, u.ordinal LIMIT ?"
-            ),
+            )),
             duckdb::params![
                 STATE_CONFIRMED,
                 estate,
@@ -6765,17 +6759,14 @@ impl Admissible<'_> {
         let overlay_exclude = overlay_exclude_like();
         let overlay_admit = filter.source.overlay_admit_source_name();
         let out = self.reader.rows(
-            read_sql!(
+            read_sql!(concat!(
                 "SELECT g.source_name, o.relative_path, o.syntax_key, o.extractor, o.language, \
                         o.ordinal, o.label, o.name, o.byte_start, o.byte_end \
                  FROM source.occurrences o JOIN source.generations g USING (generation_id) \
                  WHERE g.state = ? \
-                   AND ? IS NOT NULL \
-                   AND EXISTS (SELECT 1 FROM source.generation_estates ge \
-                               WHERE ge.generation_id = g.generation_id \
-                                 AND (ge.estate_scope = 'host' \
-                                      OR ge.estate_root = ?)) \
-                   AND o.extractor LIKE ? \
+                   AND ",
+                admissible_estate_clause!(),
+                " AND o.extractor LIKE ? \
                    AND ( (g.source_name NOT LIKE ? \
                           AND (? IS NULL OR g.source_name = ?)) \
                          OR (? IS NOT NULL AND g.source_name = ?) ) \
@@ -6783,7 +6774,7 @@ impl Admissible<'_> {
                    AND (? IS NULL OR g.source_kind = ?) \
                    AND (? IS NULL OR g.authority_class = ?) \
                  ORDER BY g.source_name, o.relative_path, o.ordinal LIMIT ?"
-            ),
+            )),
             duckdb::params![
                 STATE_CONFIRMED,
                 estate,
@@ -6851,24 +6842,21 @@ impl Admissible<'_> {
         let overlay_exclude = overlay_exclude_like();
         let overlay_admit = filter.source.overlay_admit_source_name();
         let out = self.reader.rows(
-            read_sql!(
+            read_sql!(concat!(
                     "SELECT g.source_name, d.relative_path, d.format, d.content_hash, d.reader, \
                         d.dataset_key, d.byte_len, d.columns, d.row_count, d.truncated, d.row_units \
                  FROM source.datasets d JOIN source.generations g USING (generation_id) \
                  WHERE g.state = ? \
-                   AND ? IS NOT NULL \
-                   AND EXISTS (SELECT 1 FROM source.generation_estates ge \
-                               WHERE ge.generation_id = g.generation_id \
-                                 AND (ge.estate_scope = 'host' \
-                                      OR ge.estate_root = ?)) \
-                   AND ( (g.source_name NOT LIKE ? \
+                   AND ",
+                admissible_estate_clause!(),
+                " AND ( (g.source_name NOT LIKE ? \
                           AND (? IS NULL OR g.source_name = ?)) \
                          OR (? IS NOT NULL AND g.source_name = ?) ) \
                    AND (? IS NULL OR g.content_key = ?) \
                    AND (? IS NULL OR g.source_kind = ?) \
                    AND (? IS NULL OR g.authority_class = ?) \
                  ORDER BY g.source_name, d.relative_path LIMIT ?"
-            ),
+            )),
             duckdb::params![
                 STATE_CONFIRMED,
                 estate,
