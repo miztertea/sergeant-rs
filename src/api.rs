@@ -7628,6 +7628,14 @@ pub struct ApiClient {
     endpoint: String,
     token: String,
     estate_root: Option<PathBuf>,
+    /// The PID of the daemon this client's descriptor named, if the caller
+    /// bound one (S6 scan-follow-retry): a locally-checkable liveness fact
+    /// (`daemon::pid_alive`) that does not depend on the same network path
+    /// a request over `self.http` does — the thing a poll failure alone
+    /// cannot distinguish is "the daemon is gone" from "this one request
+    /// didn't land", and this is how a caller answers that without guessing
+    /// from a count of failed requests.
+    pid: Option<u32>,
 }
 
 impl ApiClient {
@@ -7646,6 +7654,7 @@ impl ApiClient {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             token: token.to_string(),
             estate_root: None,
+            pid: None,
         })
     }
 
@@ -7655,6 +7664,21 @@ impl ApiClient {
     pub fn with_estate_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.estate_root = Some(root.into());
         self
+    }
+
+    /// Bind this client to the PID of the daemon its descriptor named (S6
+    /// scan-follow-retry). `None` (the default from [`Self::new`]) means no
+    /// PID is known — a caller with no PID to check can never *prove* the
+    /// daemon is gone, so it must not claim to.
+    pub fn with_pid(mut self, pid: u32) -> Self {
+        self.pid = Some(pid);
+        self
+    }
+
+    /// The PID of the daemon this client's descriptor named, if bound via
+    /// [`Self::with_pid`].
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// The estate this client addresses, if any.

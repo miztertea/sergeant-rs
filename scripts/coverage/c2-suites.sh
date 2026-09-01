@@ -497,6 +497,14 @@ cov_stage_begin c2-s6_scan_front_door
 cov_run cargo llvm-cov --no-report --test s6_scan_front_door --locked || cov_fail "s6_scan_front_door failed under instrumentation"
 cov_stage_end 1 "the s6_scan_front_door test binary must write its own profile"
 
+# S6 scan-follow-retry (#231 lesson, wired at birth): the structural guard
+# that pins "no clock decides correctness" over the daemon follow surface
+# (src/cli.rs, src/api.rs, src/watch.rs) — a source walker, no subprocess,
+# no daemon, no clock of its own. Floor 1.
+cov_stage_begin c2-s6_no_clock_decides_correctness
+cov_run cargo llvm-cov --no-report --test s6_no_clock_decides_correctness --locked || cov_fail "s6_no_clock_decides_correctness failed under instrumentation"
+cov_stage_end 1 "the s6_no_clock_decides_correctness test binary must write its own profile"
+
 # S6 #334, wired at birth (the #231 lesson): the journal's fold is not allowed
 # to fall behind the journal. In-process tests over a real journal and a real
 # Atlas in a tempdir, driving the production `record_scan` direct-journal

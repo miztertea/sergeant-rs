@@ -53,10 +53,6 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 /// grows — the property #278 retired the class of tuned-per-estate bounds
 /// for.
 const SCAN_POLL: Duration = Duration::from_millis(500);
-/// How many consecutive failed polls are tolerated before the follow gives
-/// up and says so. A poll is a fresh HTTP request; one dropped connection
-/// must not end a scan that is still running.
-const POLL_FAILURES_TOLERATED: u32 = 5;
 
 /// `sgt` — sergeant-rs command line.
 #[derive(Parser, Debug)]
@@ -2509,13 +2505,9 @@ async fn run_intelligence_scan(
     }
     let path = format!("/v1/intelligence/scan/{scan_id}");
     let mut printed = 0usize;
-    let mut consecutive_failures = 0u32;
     loop {
         let status = match client.get(&path).await {
-            Ok(status) => {
-                consecutive_failures = 0;
-                status
-            }
+            Ok(status) => status,
             // A definitive 404 is not a lost poll — the daemon answered and
             // said it holds no record of this scan. That happens when it
             // restarted (the spawned scan task died with the old process,
@@ -2543,15 +2535,33 @@ async fn run_intelligence_scan(
                 // about this poll, never about the scan — the daemon is
                 // running it whether or not this client is watching, and
                 // saying otherwise is the exact defect this command was
-                // fixed for. Retry a few times, then say precisely what is
-                // and is not known.
-                consecutive_failures += 1;
-                if consecutive_failures > POLL_FAILURES_TOLERATED {
+                // fixed for.
+                //
+                // AMENDMENT (owner, 2026-08-30): distinguish "a dropped
+                // connection" from "the daemon is gone" by state, not by a
+                // count — a guessed number of tolerated failures conflates
+                // one bad poll with the daemon actually exiting no matter
+                // what the number is. The state this client can actually
+                // check locally, independent of whatever just failed on the
+                // network, is whether the PID its descriptor named is still
+                // alive (same fact [`ensure_daemon`]/[`observe_connect`]
+                // already check at connect time, R2). A daemon that is
+                // still alive is retried indefinitely, cadence-bounded by
+                // `SCAN_POLL` and nothing else; a daemon whose PID has
+                // actually exited ends the follow at once. No PID bound to
+                // this client (only possible outside production use, e.g. a
+                // client built directly rather than through
+                // [`client_for`]) can prove nothing either way, so it also
+                // retries — absence of evidence is never treated as
+                // evidence the daemon is gone.
+                if let Some(pid) = client.pid()
+                    && !daemon::pid_alive(pid)
+                {
                     return Err(CliError::new(format!(
                         "lost contact with the daemon while following scan {scan_id} ({e}); \
-                         the scan itself is the daemon's and may still be running — \
-                         `sgt intelligence scan` again once it answers, or read the \
-                         journal's intelligence.scan.completed event for {scan_id}"
+                         the daemon process (pid {pid}) has exited, so the scan ended when it \
+                         did — read the journal's intelligence.scan.completed event for \
+                         {scan_id} for whatever outcome it recorded before exiting"
                     )));
                 }
                 tokio::time::sleep(SCAN_POLL).await;
@@ -3686,7 +3696,7 @@ fn client_for(
     descriptor: &RuntimeDescriptor,
     estate_root: Option<&Path>,
 ) -> Result<ApiClient, CliError> {
-    let client = ApiClient::new(&descriptor.endpoint, &descriptor.token)?;
+    let client = ApiClient::new(&descriptor.endpoint, &descriptor.token)?.with_pid(descriptor.pid);
     Ok(match estate_root {
         Some(root) => client.with_estate_root(root),
         None => client,
@@ -7544,12 +7554,17 @@ pub(crate) mod doctor {
 mod tests {
     use super::*;
 
-    /// A bare-bones HTTP/1.1 responder for exactly the two requests
-    /// `run_intelligence_scan` makes: it does not attempt to be a real
-    /// server, only to answer a fixed script of (method, path) -> (status,
-    /// body) pairs once each, in order, which is all F-IN-02's regression
-    /// test needs and all that justifies not pulling in a mocking
-    /// dependency for one test (R2/R6: plain `std::net`, a few lines).
+    /// A bare-bones HTTP/1.1 responder for a fixed script of (method, path)
+    /// -> (status, body) triples, answered once each, in order — it does
+    /// not attempt to be a real server, only what F-IN-02's and S6's
+    /// regression tests need, which is all that justifies not pulling in a
+    /// mocking dependency for it (R2/R6: plain `std::net`, a few lines).
+    ///
+    /// `status: 0` is the one sentinel: accept the connection, read
+    /// whatever request arrives, then drop it with no bytes written at all
+    /// — the real shape of a lost connection (a connection reset, not a
+    /// status code), for a script entry that must simulate a hangup rather
+    /// than answer.
     fn spawn_scripted_http_server(script: Vec<(&'static str, u16, &'static str)>) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
         let addr = listener.local_addr().expect("local addr");
@@ -7559,10 +7574,14 @@ mod tests {
                 let (mut stream, _) = listener.accept().expect("accept");
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf); // discard the request itself
-                let reason = if status == 202 {
-                    "Accepted"
-                } else {
-                    "Not Found"
+                if status == 0 {
+                    drop(stream); // hangup: no response written at all
+                    continue;
+                }
+                let reason = match status {
+                    200 => "OK",
+                    202 => "Accepted",
+                    _ => "Not Found",
                 };
                 let response = format!(
                     "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
@@ -7628,6 +7647,103 @@ mod tests {
             !message.contains("may still be running"),
             "a definitive 404 must never be reported with the lost-contact retry message: \
              {message}"
+        );
+    }
+
+    /// A fake daemon that accepts a scan, then drops `hangups` consecutive
+    /// poll connections with no response at all (a real transport failure —
+    /// `reqwest` sees a connection reset, not a status code), before
+    /// finally answering `completed`. `hangups` is deliberately dialable
+    /// past the retired `POLL_FAILURES_TOLERATED = 5` so a test using a
+    /// count above it can only pass if nothing in the poll loop is still
+    /// counting.
+    fn spawn_flaky_scan_server(hangups: usize) -> String {
+        let scan_id = "01FLAKYSCAN000000000000000";
+        let accepted = json!({
+            "scan_id": scan_id,
+            "total_sources": 1,
+            "state": "in_progress",
+            "scanned": [],
+        })
+        .to_string();
+        let completed = json!({
+            "scan_id": scan_id,
+            "state": "completed",
+            "scanned": [{"name": "notes", "state": "unchanged"}],
+        })
+        .to_string();
+        let mut script: Vec<(&'static str, u16, &'static str)> = Vec::with_capacity(hangups + 2);
+        script.push((
+            "POST /v1/intelligence/scan",
+            202,
+            Box::leak(accepted.into_boxed_str()),
+        ));
+        // `hangups` hangup entries, each answered by the shared server's
+        // `status: 0` sentinel — see this function's own doc comment above.
+        for _ in 0..hangups {
+            script.push(("GET /v1/intelligence/scan/poll", 0, ""));
+        }
+        script.push((
+            "GET /v1/intelligence/scan/poll",
+            200,
+            Box::leak(completed.into_boxed_str()),
+        ));
+        spawn_scripted_http_server(script)
+    }
+
+    /// S6 scan-follow-retry, the AMENDMENT (owner, 2026-08-30): "A dropped
+    /// connection to a live daemon is retried indefinitely... Distinguish
+    /// the two by state, not by a count." Eight consecutive lost polls is
+    /// past the retired `POLL_FAILURES_TOLERATED = 5` bound; the daemon this
+    /// client is bound to (this test process's own PID) never stops being
+    /// alive, so the follow must keep going and see the scan complete
+    /// rather than declaring the daemon gone on the sixth failure.
+    #[tokio::test]
+    async fn a_run_of_lost_polls_against_a_live_daemon_is_retried_not_treated_as_the_daemon_being_gone()
+     {
+        let endpoint = spawn_flaky_scan_server(8);
+        let client = ApiClient::new(&endpoint, "fake-token")
+            .expect("client")
+            .with_pid(std::process::id());
+
+        run_intelligence_scan(&client, None, false).await.expect(
+            "eight lost polls against a provably live daemon must never end the follow; \
+                 the scan itself completed and the loop must have seen that",
+        );
+    }
+
+    /// The other half of the same rule: a poll failure against a daemon
+    /// whose PID has actually exited must end the follow immediately —
+    /// "by state, not by a count" cuts both ways. One lost poll is enough
+    /// once the state check itself says the daemon is gone; it must not
+    /// wait for a count that no longer exists.
+    #[tokio::test]
+    async fn a_lost_poll_against_a_daemon_whose_pid_has_exited_ends_the_follow_at_once() {
+        let mut dead = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        let dead_pid = dead.id();
+        dead.wait().expect("the process must have a pid to reap");
+        assert!(
+            !daemon::pid_alive(dead_pid),
+            "the reaped process must read as dead, or this test measures nothing"
+        );
+
+        // One accepted POST, one dropped poll, then nothing further — a
+        // second poll must never be sent once the state check already
+        // found the daemon gone.
+        let endpoint = spawn_flaky_scan_server(1_000_000);
+        let client = ApiClient::new(&endpoint, "fake-token")
+            .expect("client")
+            .with_pid(dead_pid);
+
+        let err = run_intelligence_scan(&client, None, false)
+            .await
+            .expect_err("a lost poll against a dead daemon's PID must end the follow, not retry");
+        let message = err.to_string();
+        assert!(
+            message.contains(&dead_pid.to_string()) && message.to_lowercase().contains("exited"),
+            "the refusal must name the pid and say it exited, not guess from a count: {message}"
         );
     }
 
