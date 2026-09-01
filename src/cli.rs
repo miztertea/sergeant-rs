@@ -51,8 +51,11 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 /// going. Every poll is a small read, so this is a display cadence, not a
 /// bound on the work: nothing here has to be re-derived when an estate
 /// grows — the property #278 retired the class of tuned-per-estate bounds
-/// for.
-const SCAN_POLL: Duration = Duration::from_millis(500);
+/// for. `pub(crate)`: `ApiClient::send_with_retry` (`src/api.rs`, S6
+/// client-request-retry) reuses this same cadence for its own retries
+/// against a daemon proven alive by PID rather than defining a second
+/// constant for the identical value and role (R2: one shared site).
+pub(crate) const SCAN_POLL: Duration = Duration::from_millis(500);
 
 /// `sgt` — sergeant-rs command line.
 #[derive(Parser, Debug)]
@@ -7555,44 +7558,17 @@ mod tests {
     use super::*;
 
     /// A bare-bones HTTP/1.1 responder for a fixed script of (method, path)
-    /// -> (status, body) triples, answered once each, in order — it does
-    /// not attempt to be a real server, only what F-IN-02's and S6's
-    /// regression tests need, which is all that justifies not pulling in a
-    /// mocking dependency for it (R2/R6: plain `std::net`, a few lines).
-    ///
-    /// `status: 0` is the one sentinel: accept the connection, read
-    /// whatever request arrives, then drop it with no bytes written at all
-    /// — the real shape of a lost connection (a connection reset, not a
-    /// status code), for a script entry that must simulate a hangup rather
-    /// than answer.
+    /// -> (status, body) triples, answered once each, in order. The
+    /// method/path label is documentation only, never read; the actual
+    /// server is the shared fixture at `crate::test_support::
+    /// spawn_scripted_http_server` (R2: one site for `cli`'s and `api`'s
+    /// scripted-HTTP-server tests, S6 client-request-retry).
     fn spawn_scripted_http_server(script: Vec<(&'static str, u16, &'static str)>) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
-        let addr = listener.local_addr().expect("local addr");
-        std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            for (_method_and_path, status, body) in script {
-                let (mut stream, _) = listener.accept().expect("accept");
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf); // discard the request itself
-                if status == 0 {
-                    drop(stream); // hangup: no response written at all
-                    continue;
-                }
-                let reason = match status {
-                    200 => "OK",
-                    202 => "Accepted",
-                    _ => "Not Found",
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-            }
-        });
-        format!("http://{addr}")
+        let script = script
+            .into_iter()
+            .map(|(_method_and_path, status, body)| (status, body))
+            .collect();
+        crate::test_support::spawn_scripted_http_server(script).0
     }
 
     /// F-IN-02: a **definitive** 404 (`unknown_scan`) from the daemon is

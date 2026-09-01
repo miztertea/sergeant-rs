@@ -7638,6 +7638,16 @@ pub struct ApiClient {
     pid: Option<u32>,
 }
 
+/// Cadence between retry attempts against a daemon this client's bound PID
+/// still says is alive (S6 client-request-retry): the same [`crate::cli::
+/// SCAN_POLL`] cadence the scan-follow poll already uses, reused rather
+/// than redefined (R2 — one shared site, not a second constant with the
+/// same value and role). Courtesy pacing only, per the AMENDMENT (owner,
+/// 2026-08-30): nothing branches on this value or an elapsed count of it,
+/// it only paces how often a doomed attempt is retried while
+/// [`daemon::pid_alive`] keeps saying yes.
+use crate::cli::SCAN_POLL as REQUEST_RETRY;
+
 impl ApiClient {
     /// Build a client for a daemon endpoint and its bearer token.
     ///
@@ -7716,39 +7726,74 @@ impl ApiClient {
         &self.endpoint
     }
 
+    /// Send a request built fresh by `build` on each attempt, retrying a
+    /// transport-level failure (a lost connection, not a real HTTP
+    /// response — [`Self::into_value`] never returns [`ClientError::
+    /// Transport`], so a real answer from the daemon — including its 404
+    /// `unknown_scan` special case — is always returned immediately,
+    /// retried or not) at [`REQUEST_RETRY`] cadence for as long as this
+    /// client's bound [`Self::pid`] is alive.
+    ///
+    /// S6 client-request-retry, the AMENDMENT (owner, 2026-08-30): "time is
+    /// not a correctness signal" — distinguish a doomed request from a
+    /// merely unlucky one by the daemon's own liveness, not by a guessed
+    /// retry count or duration. A client with no bound PID cannot prove the
+    /// daemon dead ([`Self::with_pid`]'s own doc comment), so it also
+    /// retries — absence of evidence is never treated as evidence the
+    /// daemon is gone. This generalizes `run_intelligence_scan`'s own poll
+    /// loop retry (`src/cli.rs`) onto every verb below, R2: one shared site.
+    async fn send_with_retry<F>(&self, build: F) -> Result<Value, ClientError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        loop {
+            match build().send().await {
+                Ok(response) => return Self::into_value(response).await,
+                Err(e) => {
+                    if let Some(pid) = self.pid
+                        && !crate::daemon::pid_alive(pid)
+                    {
+                        return Err(ClientError::Transport(format!(
+                            "lost contact with the daemon ({e}); the daemon process (pid \
+                             {pid}) has exited, so the request ended when it did"
+                        )));
+                    }
+                    tokio::time::sleep(REQUEST_RETRY).await;
+                }
+            }
+        }
+    }
+
     /// Authenticated GET returning the parsed body.
     pub async fn get(&self, path: &str) -> Result<Value, ClientError> {
-        let response = self
-            .http
-            .get(format!("{}{path}", self.endpoint))
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
-        Self::into_value(response).await
+        self.send_with_retry(|| {
+            self.http
+                .get(format!("{}{path}", self.endpoint))
+                .bearer_auth(&self.token)
+        })
+        .await
     }
 
     /// Authenticated POST with a JSON body, returning the parsed body.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
-        let response = self
-            .http
-            .post(format!("{}{path}", self.endpoint))
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()
-            .await?;
-        Self::into_value(response).await
+        self.send_with_retry(|| {
+            self.http
+                .post(format!("{}{path}", self.endpoint))
+                .bearer_auth(&self.token)
+                .json(body)
+        })
+        .await
     }
 
     /// Authenticated DELETE with a JSON body, returning the parsed body.
     pub async fn delete(&self, path: &str, body: &Value) -> Result<Value, ClientError> {
-        let response = self
-            .http
-            .delete(format!("{}{path}", self.endpoint))
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()
-            .await?;
-        Self::into_value(response).await
+        self.send_with_retry(|| {
+            self.http
+                .delete(format!("{}{path}", self.endpoint))
+                .bearer_auth(&self.token)
+                .json(body)
+        })
+        .await
     }
 
     /// `GET /v1/system`.
@@ -8218,6 +8263,131 @@ mod tests {
     use crate::backend::BackendRegistry;
     use crate::domain::event::EVENT_SCHEMA;
     use crate::runtime::projection::work_registry_projection;
+
+    /// `hangups` hangup entries followed by one `(status, body)` answer —
+    /// the shared fixture at `crate::test_support::
+    /// spawn_scripted_http_server` (R2: one site for `cli`'s and `api`'s
+    /// scripted-HTTP-server tests, S6 client-request-retry) scripted for
+    /// this module's own shape: a request that must survive `hangups` lost
+    /// connections before it lands. Returns the endpoint and a shared
+    /// counter of accepted connections, so a test can assert exactly how
+    /// many attempts were made rather than inferring it from timing.
+    fn spawn_flaky_http_server(
+        hangups: usize,
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let mut script: Vec<(u16, &'static str)> = vec![(0, ""); hangups];
+        script.push((status, body));
+        crate::test_support::spawn_scripted_http_server(script)
+    }
+
+    /// S6 client-request-retry (generalizing the scan-follow poll's own
+    /// AMENDMENT-compliant retry, `run_intelligence_scan`, onto
+    /// `ApiClient`'s own request path, R2): a one-shot caller like `sgt
+    /// search` must survive a lost connection to a daemon it can prove is
+    /// still alive, exactly as the poll loop already does — not just the
+    /// scan-follow poll.
+    #[tokio::test]
+    async fn get_retries_a_lost_connection_against_a_live_pid_until_it_succeeds() {
+        let (endpoint, attempts) = spawn_flaky_http_server(2, 200, r#"{"ok":true}"#);
+        let client = ApiClient::new(&endpoint, "fake-token")
+            .expect("client")
+            .with_pid(std::process::id());
+
+        let result = client.get("/v1/whatever").await;
+
+        assert_eq!(
+            result.expect(
+                "two lost connections against a provably live daemon must never end \
+                            the request; it must retry until one lands"
+            ),
+            json!({"ok": true}),
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "must have retried exactly past the two hangups, not given up early nor kept going \
+             past the answer"
+        );
+    }
+
+    /// The other half of the same rule, "by state, not by a count": a
+    /// request against a daemon whose bound PID has actually exited must
+    /// fail at once, naming the PID, rather than retrying — this already
+    /// holds for today's one-shot `get` (it never retries at all), so this
+    /// is a regression guard fixed alongside the retry above, not a
+    /// separately red-then-green cycle: written now so the retry this
+    /// commit adds never grows into an unconditional loop against a
+    /// genuinely dead daemon.
+    #[tokio::test]
+    async fn get_fails_at_once_naming_the_pid_when_the_bound_pid_is_dead() {
+        let mut dead = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        let dead_pid = dead.id();
+        dead.wait().expect("the process must have a pid to reap");
+        assert!(
+            !crate::daemon::pid_alive(dead_pid),
+            "the reaped process must read as dead, or this test measures nothing"
+        );
+
+        // Enough scripted hangups that a wrongly-still-looping implementation
+        // would never reach a real answer within this test's lifetime.
+        let (endpoint, attempts) = spawn_flaky_http_server(1_000_000, 200, r#"{"ok":true}"#);
+        let client = ApiClient::new(&endpoint, "fake-token")
+            .expect("client")
+            .with_pid(dead_pid);
+
+        let err = client
+            .get("/v1/whatever")
+            .await
+            .expect_err("a request against a dead daemon's pid must fail, not succeed");
+        match err {
+            ClientError::Transport(ref message) => {
+                assert!(
+                    message.contains(&dead_pid.to_string()),
+                    "expected the dead pid to be named in the failure, got: {message}"
+                );
+                assert!(
+                    message.contains("has exited"),
+                    "expected the message to say the daemon process has exited, got: {message}"
+                );
+            }
+            other => panic!("expected ClientError::Transport, got {other:?}"),
+        }
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a dead pid must end the attempt after exactly one lost connection, never retry"
+        );
+    }
+
+    /// The retry above must generalize past `get` (R2: one shared site for
+    /// every verb, not a copy that only covers `get`) — `post` and `delete`
+    /// carry a JSON body but otherwise reach the daemon the same way.
+    #[tokio::test]
+    async fn post_also_retries_a_lost_connection_via_the_same_shared_site() {
+        let (endpoint, attempts) = spawn_flaky_http_server(1, 200, r#"{"ok":true}"#);
+        let client = ApiClient::new(&endpoint, "fake-token")
+            .expect("client")
+            .with_pid(std::process::id());
+
+        let result = client.post("/v1/whatever", &json!({"x": 1})).await;
+
+        assert_eq!(
+            result.expect(
+                "one lost connection against a provably live daemon must never end a POST \
+                 either; it must retry until one lands"
+            ),
+            json!({"ok": true}),
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "must have retried exactly past the one hangup"
+        );
+    }
 
     fn scaffold_estate_manifest(root: &std::path::Path, name: &str) {
         std::fs::create_dir_all(root.join("repos").join("solo")).expect("mount dir");
