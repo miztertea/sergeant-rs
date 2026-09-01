@@ -166,6 +166,12 @@ fn evidence_world() -> (TempDir, AtlasDb) {
     let data = tempfile::tempdir().expect("data dir");
     let mut journal = Journal::open(data.path()).expect("journal");
     let mut db = AtlasDb::open(data.path()).expect("atlas");
+    // This fixture host installs no semantic assets — a fact every test in
+    // this file asserts on (`NotInstalled`), forced here rather than merely
+    // assumed, so a process-wide `SGT_SEMANTIC_MODEL_DIR` pointing at a real
+    // model (this wave's own standing test policy) cannot make the fixture's
+    // stated assumption false out from under it.
+    db.force_semantic_not_installed_for_test();
 
     let base = scan(
         REPOSITORY,

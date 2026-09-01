@@ -436,7 +436,7 @@ mod tests {
         let filter = filter();
         for denied in [
             ".sergeant/data",
-            ".sergeant/data/atlas.duckdb",
+            ".sergeant/data/atlas.db",
             ".sergeant/data/surfaces/01ABCDEF/sergeant-rs/src/main.rs",
         ] {
             assert!(

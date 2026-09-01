@@ -1040,23 +1040,31 @@ fn a_non_work_selector_reports_not_work_scoped() {
 /// plain-text structure extraction (`claims_for`'s own doc: "every
 /// acquired resource still has units"). This test proves that live: a
 /// `Cargo.toml` produces BOTH a `source.occurrences` row under
-/// `"syntax-toml/v1"` (H13.1's own worked example) AND one `source.units`
-/// row (a whole-document unit, extractor `"text/v1"`) — not the "zero
-/// units" the plan asserted. H13.1's DECIDED mechanism (table +
-/// extractor-prefix routing, no new column, `config` not offered as a
-/// distinct value) is unaffected by this correction: `admissible_units`
-/// still cannot tell this fallback unit apart from a genuine `.txt`
-/// document (both carry extractor `"text/v1"`), which is exactly the
-/// "safety net, not a clean split" [`AtlasDb::admissible_units`]'s own doc
-/// names.
+/// `"syntax-toml/v1"` (H13.1's own worked example) AND at least one
+/// `source.units` row (extractor `"text/v1"`) — not the "zero units" the
+/// plan asserted. H13.1's DECIDED mechanism (table + extractor-prefix
+/// routing, no new column, `config` not offered as a distinct value) is
+/// unaffected by this correction: `admissible_units` still cannot tell
+/// this unit apart from a genuine `.txt` document by extractor alone
+/// (both carry `"text/v1"`), which is exactly the "safety net, not a
+/// clean split" [`AtlasDb::admissible_units`]'s own doc names.
+///
+/// **Superseded a second time (chunker-wire wave, squash `f2b4c1a3`),
+/// updated here rather than in the doc paragraph above because the
+/// *routing* H13.1 decided is unaffected — only the unit *shape* changed.**
+/// The `source.units` row this test originally pinned was a single
+/// whole-document `Document` unit. It is now one or more `Section` units
+/// from [`chunk::chunk_source`]'s retrieval-sized spans (`scan.rs`'s
+/// `extract_units` doc, R2: reuses `UnitKind::Section`, "the code/config
+/// family's equivalent of Markdown's section units" — `chunk.rs:97`'s own
+/// doc), matching A1 §6.2's "bounded structural units" for source/config
+/// content. Code and design agree; this is a test update, not a finding.
 #[test]
 fn a_toml_files_config_content_lives_in_the_code_lane_and_also_leaves_a_document_fallback_unit() {
+    const CARGO_TOML_BODY: &str = "[package]\nname = \"demo\"\n";
     let source_dir = tempfile::tempdir().expect("source dir");
-    std::fs::write(
-        source_dir.path().join("Cargo.toml"),
-        "[package]\nname = \"demo\"\n",
-    )
-    .expect("write Cargo.toml");
+    std::fs::write(source_dir.path().join("Cargo.toml"), CARGO_TOML_BODY)
+        .expect("write Cargo.toml");
     let knowledge = KnowledgeSource {
         name: "manifest".to_string(),
         root: source_dir.path().to_path_buf(),
@@ -1094,16 +1102,33 @@ fn a_toml_files_config_content_lives_in_the_code_lane_and_also_leaves_a_document
         "{occurrences:#?}"
     );
 
-    // The live correction: a document-family unit exists too — not the
-    // "zero source.units rows" the plan's own text asserted.
+    // The live correction: a code-lane unit exists too — not the
+    // "zero source.units rows" the plan's own text asserted. See the
+    // function doc comment above for the chunker-wire rationale.
     let units = db.admissible_units(&filter, 500).expect("admissible units");
     assert_eq!(
         units.hits.len(),
         1,
-        "Cargo.toml must leave exactly one fallback document unit, got {units:#?}"
+        "this fixture's Cargo.toml body is under chunk::MIN_CHUNK_SIZE, so chunk_source's root span \
+must short-circuit to exactly one Section unit deterministically — a different count is a \
+chunking-determinism regression, got {units:#?}"
     );
-    assert_eq!(units.hits[0].unit.relative_path, "Cargo.toml");
-    assert_eq!(units.hits[0].unit.kind, UnitKind::Document);
+    for hit in &units.hits {
+        assert_eq!(hit.unit.relative_path, "Cargo.toml");
+        assert_eq!(
+            hit.unit.kind,
+            UnitKind::Section,
+            "grammar-claimed, structure-unclaimed files chunk into Section units now, not a whole-document Document unit — {units:#?}"
+        );
+        assert!(
+            hit.unit.byte_start < hit.unit.byte_end,
+            "a chunked unit must have a sane, non-empty span — {units:#?}"
+        );
+        assert!(
+            hit.unit.byte_end <= CARGO_TOML_BODY.len() as u64,
+            "a chunked unit's span must stay within the file's own bytes — {units:#?}"
+        );
+    }
 }
 
 // -------------------------------------------------- tabular family, datasets

@@ -2466,8 +2466,8 @@ mod tests {
                 ("big.rs", big_rs.as_bytes()),
                 (".env", secret),
                 (
-                    ".sergeant/data/atlas.duckdb",
-                    b"not a real duckdb file, just bytes",
+                    ".sergeant/data/atlas.db",
+                    b"not a real database file, just bytes",
                 ),
             ],
             &[],

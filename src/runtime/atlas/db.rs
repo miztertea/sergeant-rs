@@ -3779,6 +3779,42 @@ impl AtlasDb {
         Self::engine_of(&self.semantic)
     }
 
+    /// Force this handle to answer "no semantic assets installed",
+    /// bypassing [`model_dir`](crate::runtime::atlas::semantic::model_dir)'s
+    /// process-wide `$SGT_SEMANTIC_MODEL_DIR` resolution entirely — the
+    /// struct doc's own promise that two handles in one process can
+    /// disagree about what is installed, made real.
+    ///
+    /// For a fixture whose assertions depend on `SemanticStatus::NotInstalled`
+    /// regardless of what the ambient test process happens to have set: this
+    /// wave's own standing test policy sets `$SGT_SEMANTIC_MODEL_DIR` to a
+    /// real model for the whole nextest invocation, which would otherwise
+    /// make a "this host has no assets" fixture's stated assumption false
+    /// out from under it.
+    ///
+    /// # Panics
+    ///
+    /// If [`Self::semantic_engine`] or [`Self::semantic_capability`] has
+    /// already resolved this handle's semantic half (`OnceLock::set` after
+    /// the first `get_or_init` is a no-op that would otherwise fail
+    /// silently) — call it immediately after [`Self::open`]. Fix (F-IN-02):
+    /// this was a doc-comment-only contract; a late call now fails loudly
+    /// instead of quietly doing nothing.
+    ///
+    /// Gated behind `cfg(any(test, feature = "test-util"))` (Fix
+    /// (F-SI-01)) rather than left as unrestricted, permanently-shipped
+    /// public API: its one caller is an integration test under `tests/`, a
+    /// separate compilation unit plain `#[cfg(test)]` cannot reach, so
+    /// `test-util` is a feature this crate's own `[dev-dependencies]` self
+    /// entry enables for `tests/*.rs` builds and no release build of the
+    /// library carries.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn force_semantic_not_installed_for_test(&self) {
+        self.semantic.set(Ok(None)).expect(
+            "force_semantic_not_installed_for_test called after the semantic half already resolved",
+        );
+    }
+
     /// **A2 §15's capability, honestly**, from the load this handle already
     /// made — so an operator can ask whether the semantic half is available
     /// without running a query to find out, and a directory that exists and
@@ -4267,9 +4303,14 @@ impl AtlasDb {
         else {
             return Ok(None);
         };
+        // A2 §9: `request.unit_key` is the path-based coordinate a human
+        // typed (what `sgt search` prints, `UnitCoordinate::path_key`), not
+        // `db::unit_key`'s digest-or-canonical-path dedup identity — the two
+        // diverge for exactly the units the projection-identity wave (S6)
+        // changed. Match on the path key, never on the internal identity.
         let Some(unit) = indexable_units(&self.conn, &generation.id)?
             .into_iter()
-            .find(|unit| unit.unit_key == request.unit_key)
+            .find(|unit| unit.coordinate().path_key() == request.unit_key)
         else {
             return Ok(None);
         };
@@ -5043,6 +5084,21 @@ fn insert_unit(
 /// A generation with no such row is a no-op pass (one query, no writes) —
 /// this is called for every target [`AtlasDb::reindex_lexical`] rebuilds,
 /// not only ones known in advance to be stale.
+///
+/// **Markdown is the one exception, and this query excludes it — the same
+/// guard [`AtlasDb::lexical_index_needs_rebuild`] already carries for the
+/// identical reason.** [`CODE_EXTRACTOR_LIKE`] (`"syntax-%"`) matches
+/// `syntax-markdown` occurrences too, and an ordinary, current markdown
+/// file legitimately carries *both* a `document`-kind unit and
+/// `syntax-markdown` occurrences — that combination is not staleness, it
+/// is every markdown file, always. Without this exclusion every rebuild
+/// deleted and re-chunked every markdown document through
+/// [`crate::runtime::atlas::chunk::chunk_source`] (the code/config
+/// chunker, not Markdown's own heading-structured units), corrupting a
+/// unit that was never stale and silently reshaping its BM25 stats on
+/// every rebuild — `tests/w2_lexical_retrieval.rs::
+/// the_lexical_index_rebuilds_from_the_a1_rows_it_derives_from` is the
+/// tripwire.
 fn rechunk_stale_code_units(conn: &impl Statements, generation_id: &str) -> Result<(), AtlasError> {
     let mut stale: Vec<(String, String, String, i64, String, String)> = Vec::new();
     {
@@ -5051,12 +5107,13 @@ fn rechunk_stale_code_units(conn: &impl Statements, generation_id: &str) -> Resu
              FROM source.units u \
              JOIN ( \
                SELECT DISTINCT generation_id, relative_path, language \
-               FROM source.occurrences WHERE extractor LIKE ? \
+               FROM source.occurrences WHERE extractor LIKE ? AND extractor != ? \
              ) o ON o.generation_id = u.generation_id AND o.relative_path = u.relative_path \
              WHERE u.generation_id = ? AND u.unit_kind = ?"
         ))?;
         let mut rows = statement.query(duckdb::params![
             CODE_EXTRACTOR_LIKE,
+            crate::runtime::atlas::syntax::SyntaxLanguage::Markdown.extractor_identity(),
             generation_id,
             crate::domain::source::UnitKind::Document.as_str()
         ])?;
@@ -7295,9 +7352,12 @@ pub struct FusedAnswer {
 pub struct RelatedRequest<'a> {
     /// The declared source the anchor unit belongs to.
     pub source_name: &'a str,
-    /// Atlas's own per-generation unit identity, `<family>:<path>#<ordinal>`
-    /// — the value every hit already carries as `unit_key`, so a coordinate
-    /// printed by `sgt search` is a coordinate `sgt related` accepts.
+    /// A2 §9's path-based coordinate key, `<family>:<relative_path>
+    /// #<ordinal>` ([`UnitCoordinate::path_key`]) — the value every hit's
+    /// printed coordinate already carries, so a coordinate printed by
+    /// `sgt search` is a coordinate `sgt related` accepts. **Not**
+    /// `db::unit_key`'s internal dedup identity, which may be
+    /// digest-or-canonical-path-shaped and is never what a human types.
     pub unit_key: &'a str,
     /// A2 §2's deterministic admissibility filter, applied to the anchor
     /// lookup **and** to the neighbours.

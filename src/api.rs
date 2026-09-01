@@ -6846,15 +6846,23 @@ fn parse_source_selector(spec: &str) -> atlas_db::SourceSelector {
 /// One answered hit, with **everything A2 §3 and §17 item 8 require it to
 /// cite**: source, generation, unit, family-shaped coordinate, and the two
 /// values that make an external hit visibly external.
+///
+/// `"coordinate"` is the path-based key a human types and `sgt related`
+/// accepts (`RelatedRequest::unit_key`'s exact shape). `"dedup_key"` is a
+/// different value — `db::unit_key`'s internal, possibly digest-or-
+/// canonical-path-shaped collapsing identity — deliberately **not** named
+/// `"unit_key"` in this JSON so it cannot be mistaken for the request
+/// parameter of that name (S6 gave the two values distinct meanings; this
+/// gives them distinct keys too).
 fn hit_json(hit: &atlas_fusion::FusedHit) -> Value {
     json!({
-        "coordinate": atlas_lexical::UnitAddress::render(&hit.source_name, &hit.unit_key),
+        "coordinate": atlas_lexical::UnitAddress::render(&hit.source_name, &hit.coordinate.path_key()),
         "source": hit.source_name,
         "source_kind": hit.source_kind.as_str(),
         "authority_class": hit.authority_class.as_str(),
         "generation_id": hit.generation_id,
         "content_key": hit.content_key,
-        "unit_key": hit.unit_key,
+        "dedup_key": hit.unit_key,
         "unit": atlas_trace::coordinate_json(&hit.coordinate),
         "rrf": hit.rrf,
         "ranks": {"lexical": hit.origins.lexical, "semantic": hit.origins.semantic},
@@ -6989,14 +6997,17 @@ async fn related_query(
                 "anchor": {
                     "coordinate": atlas_lexical::UnitAddress::render(
                         &related.anchor.source_name,
-                        &related.anchor.unit_key,
+                        &related.anchor.coordinate.path_key(),
                     ),
                     "source": related.anchor.source_name,
                     "source_kind": related.anchor.source_kind.as_str(),
                     "authority_class": related.anchor.authority_class.as_str(),
                     "generation_id": related.anchor.generation_id,
                     "content_key": related.anchor.content_key,
-                    "unit_key": related.anchor.unit_key,
+                    // Same distinct naming as `hit_json`'s "dedup_key": this
+                    // is `db::unit_key`, not `RelatedRequest::unit_key`'s
+                    // path-based shape carried by "coordinate" above.
+                    "dedup_key": related.anchor.unit_key,
                     "unit": atlas_trace::coordinate_json(&related.anchor.coordinate),
                 },
                 "top": query.top(),

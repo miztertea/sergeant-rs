@@ -968,14 +968,30 @@ fn the_same_query_over_the_same_generations_returns_the_same_ordered_result() {
     }
 }
 
-/// **The stated tie-break rule, pinned.** Two units with byte-identical text
-/// score identically, so their order is decided entirely by
-/// `LexicalHit::tie_break_key` — `(source_name, relative_path, ordinal,
-/// unit_key)` ascending.
+/// **The stated tie-break rule, pinned.** Two DIFFERENT units that score
+/// identically are ordered entirely by `LexicalHit::tie_break_key` —
+/// `(source_name, relative_path, ordinal, unit_key)` ascending.
 ///
-/// The fixture records the sources in the REVERSE of that order (`zeta`
-/// first, `alpha` second), so an implementation accumulating into a hash map
-/// would put them in whatever order that map iterated and fail here.
+/// **Superseded premise, corrected (S6 projection-identity wave).** This
+/// test used to tie two units by making them byte-identical across two
+/// sources. `projection-model-and-false-j0s-2026-08-31.md` §3 rules that
+/// exactly that case — "If file 'a' exists, it's the source of
+/// truth. … if something is double indexed then ya not being bucketed
+/// properly" — must merge into ONE hit, not two: the file is the identity,
+/// sources are memberships. The landed, guarded design
+/// (`byte_identical_files_from_two_different_roots_share_one_identity`,
+/// `45faa761`) does exactly that merge, correctly, which is why the old
+/// fixture stopped proving a tie-break at all. The tie-break claim this
+/// test exists to prove is still true and still needs a fixture: two
+/// files with DIFFERENT content (different relative paths, different
+/// bodies, so no merge applies) that tie in BM25 score BY CONSTRUCTION —
+/// each carries the query term exactly once in an equal-length two-token
+/// unit, so term frequency, document length and IDF all agree.
+///
+/// The fixture records the sources in the REVERSE of tie-break order
+/// (`zeta` first, `alpha` second), so an implementation accumulating into a
+/// hash map would put them in whatever order that map iterated and fail
+/// here.
 ///
 /// That score outranks arrival order at all is proved next door rather than
 /// here: in
@@ -996,9 +1012,12 @@ fn equal_scores_are_broken_by_the_stated_key_not_by_row_arrival_order() {
             AuthorityClass::EstateReadonly,
             &format!("{name}@key-1"),
             vec![scanned_file(
-                "note.md",
+                &format!("{name}.md"),
                 MARKDOWN_EXTRACTOR,
-                vec![document_unit(None, "PaymentRetryPolicy")],
+                vec![document_unit(
+                    None,
+                    &format!("PaymentRetryPolicy {name}-marker"),
+                )],
             )],
         );
         record_scan(

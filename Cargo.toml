@@ -35,6 +35,15 @@ path = "src/main.rs"
 name = "sgt-atlas-worker"
 path = "src/bin/atlas_worker.rs"
 
+[features]
+# Fix (F-SI-01): a home for test-only production API that a plain
+# `#[cfg(test)]` cannot gate because its one caller is an integration test
+# under `tests/` — a separate compilation unit `cfg(test)` never fires for
+# (see `AtlasDb::force_semantic_not_installed_for_test`'s doc comment).
+# Off by default, so a release build of the library never carries it; the
+# self dev-dependency below turns it on for every `tests/*.rs` binary.
+test-util = []
+
 [dependencies]
 # S4 Y2 (G3, gate a — SETTLED by owner ruling, J4): Office/document
 # normalization. `anydoc` is the recon's leading candidate
@@ -298,6 +307,12 @@ debug = false
 debug = false
 
 [dev-dependencies]
+# Fix (F-SI-01): self dev-dependency, enabled only for the `tests/*.rs`
+# binaries (feature unification never reaches the `sgt`/`sgt-atlas-worker`
+# release binaries) — turns the `test-util` feature above on for every
+# integration test without making it a default, always-shipped feature of
+# the library itself.
+sergeant-rs = { path = ".", features = ["test-util"] }
 # Synchronously decoding an axum `Response` body in `tests/i9_floor_pinning.rs`
 # (spec §6.3 compensating assertion (c): calling the real `below_floor_refusal`
 # and inspecting its wire shape) — the version already pinned transitively by

@@ -125,12 +125,20 @@ impl std::fmt::Display for LexicalFamily {
 ///
 /// # Why the address is exactly the two fields a hit already prints
 ///
-/// Every hit carries `source_name` and `unit_key`, and `unit_key` is
-/// `<family>:<path>#<ordinal>` (see `db::unit_key`). So the coordinate `sgt
-/// related` accepts is the coordinate `sgt search` prints, with no third
-/// spelling in between — **R2**, and the reason A2 §3's *"the result's
-/// evidence coordinate remains A1-owned"* survives a round trip through the
-/// CLI.
+/// Every hit carries `source_name` and a path-based coordinate key
+/// (`UnitCoordinate::path_key`, `<family>:<path>#<ordinal>`). So the
+/// coordinate `sgt related` accepts is the coordinate `sgt search` prints,
+/// with no third spelling in between — **R2**, and the reason A2 §3's *"the
+/// result's evidence coordinate remains A1-owned"* survives a round trip
+/// through the CLI.
+///
+/// **This field is named `unit_key` but is never `db::unit_key`.**
+/// Projection-identity (S6) gave the index's own internal dedup key an
+/// identity component that is a content digest or a canonicalized absolute
+/// path — correct for collapsing postings across sources that cover one
+/// physical file, wrong for what a human types and reads. This struct's
+/// `unit_key` field is always [`UnitCoordinate::path_key`]'s value: path,
+/// never digest.
 ///
 /// # Parsing, and the one ambiguity it removes deliberately
 ///
@@ -138,7 +146,7 @@ impl std::fmt::Display for LexicalFamily {
 /// `work:<id>/<repo>` — so splitting on the first `/` would mis-address
 /// every overlay unit. [`UnitAddress::parse`] instead splits at the first
 /// `/` **whose remainder begins with a known family prefix**, which is
-/// exactly the shape `db::unit_key` writes and nothing else is. A relative
+/// exactly the shape a path key has and nothing else is. A relative
 /// path that itself began with `code:`/`document:`/`mail:`/`row-text:` at a
 /// path segment boundary could in principle produce a second candidate
 /// split; the earliest is taken, stated here rather than discovered, and
@@ -149,7 +157,8 @@ impl std::fmt::Display for LexicalFamily {
 pub struct UnitAddress {
     /// The declared source (or `work:<id>/<repo>` overlay source name).
     pub source_name: String,
-    /// Atlas's own per-generation unit identity.
+    /// The path-based coordinate key ([`UnitCoordinate::path_key`]), never
+    /// `db::unit_key`'s internal dedup identity.
     pub unit_key: String,
 }
 
@@ -570,6 +579,25 @@ impl UnitCoordinate {
             | Self::Mail { ordinal, .. }
             | Self::RowText { ordinal, .. } => *ordinal,
         }
+    }
+
+    /// **A2 §9's human-facing coordinate key**: `<family>:<relative_path>
+    /// #<ordinal>` — always path-based, deliberately never `db::unit_key`'s
+    /// digest-or-canonical-path identity.
+    ///
+    /// Projection-identity (S6) gave `db::unit_key` an identity component
+    /// that is a content digest or a canonicalized absolute path, so that
+    /// two sources covering one physical file dedupe onto one postings row
+    /// — correct and necessary for the index's own internal bookkeeping
+    /// (postings, corpus stats, the semantic vector cache), but wrong for
+    /// what a human types and reads: A2 §9 requires a result to "cite the
+    /// original source path/native coordinate" and never invent precision
+    /// the source didn't produce. This is the pre-S6 formula, kept alive
+    /// here as the *address* half of a unit's identity rather than folded
+    /// into the *dedup* half — `UnitAddress::render`/`parse` and
+    /// `sgt related`'s anchor lookup use this, never `db::unit_key` itself.
+    pub fn path_key(&self) -> String {
+        format!("{}:{}#{}", self.family().as_str(), self.relative_path(), self.ordinal())
     }
 }
 
