@@ -666,12 +666,25 @@ impl EvidenceCoordinate {
                 ordinal,
                 ..
             } => {
-                let mut line = relative_path.clone();
-                if let Some(ordinal) = ordinal {
-                    line.push_str(&format!("#{ordinal}"));
-                }
+                // Computed once, reused for both the visible path and the
+                // rebuilt bracket below (F-SI-01: was duplicated).
+                let ordinal_suffix = ordinal.map(|o| format!("#{o}")).unwrap_or_default();
+                let mut line = format!("{relative_path}{ordinal_suffix}");
                 if let Some(key) = unit_key {
-                    line.push_str(&format!(" [{key}]"));
+                    // The bracket is a reader-facing display coordinate,
+                    // never the raw dedup key. `unit_key`'s own contract
+                    // (`db.rs`'s `unit_key()`) is
+                    // `<family>:<identity>#<ordinal>`, and since the S6
+                    // projection-identity wave `identity` may be an internal
+                    // content digest rather than a path — projection
+                    // identity, not for the reader (owner ruling: "the file
+                    // is the identity; sources are memberships", digest is
+                    // internal). Only the family prefix is reader-facing;
+                    // the rest of the bracket is rebuilt from this
+                    // coordinate's own already-displayed, safe fields
+                    // (`relative_path`, `ordinal`) rather than the raw key.
+                    let family = key.split(':').next().unwrap_or(key);
+                    line.push_str(&format!(" [{family}:{relative_path}{ordinal_suffix}]"));
                 }
                 Some(line)
             }
@@ -712,12 +725,19 @@ impl EvidenceCoordinate {
                 ordinal,
                 ..
             } => {
-                let mut line = format!("{source_name}@{content_key}:{relative_path}");
-                if let Some(ordinal) = ordinal {
-                    line.push_str(&format!("#{ordinal}"));
-                }
+                let ordinal_suffix = ordinal.map(|o| format!("#{o}")).unwrap_or_default();
+                let mut line =
+                    format!("{source_name}@{content_key}:{relative_path}{ordinal_suffix}");
                 if let Some(key) = unit_key {
-                    line.push_str(&format!(" [{key}]"));
+                    // Same redaction as `path_coordinate()` above: the
+                    // bracket is reader-facing and must never carry the raw
+                    // dedup key, which may embed an internal content digest
+                    // (`db.rs`'s `unit_key()` contract). Rebuild it from the
+                    // family prefix plus this coordinate's own safe,
+                    // already-displayed fields instead (F-SF-01/F-IN-01/
+                    // F-TH-02: this arm still leaked the raw key).
+                    let family = key.split(':').next().unwrap_or(key);
+                    line.push_str(&format!(" [{family}:{relative_path}{ordinal_suffix}]"));
                 }
                 line
             }
@@ -3301,5 +3321,83 @@ mod ocr_json_tests {
         let json = provenance.json();
         assert!(json.get("ocr").is_some(), "the ocr key must be present");
         assert!(json["ocr"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod evidence_coordinate_redaction_tests {
+    use super::EvidenceCoordinate;
+
+    /// F-TH-01: `path_coordinate()`'s `Some(unit_key)` branch — the exact
+    /// code the coordinate-leak fix changed — was never exercised by any
+    /// test, so a revert of the fix would not turn anything red. This
+    /// constructs an Atlas coordinate whose `unit_key` embeds a raw content
+    /// digest (per `db.rs`'s `unit_key()` contract, `identity` may be a
+    /// digest rather than a path) and asserts the digest never appears in
+    /// the rendered coordinate — only the safe, reader-facing fields do.
+    fn atlas_with_digest_unit_key() -> EvidenceCoordinate {
+        EvidenceCoordinate::Atlas {
+            source_name: "repo".to_string(),
+            generation_id: "gen-1".to_string(),
+            content_key: "content-1".to_string(),
+            relative_path: "src/lib.rs".to_string(),
+            unit_key: Some("code:sha256-deadbeefcafef00d#3".to_string()),
+            ordinal: Some(3),
+        }
+    }
+
+    #[test]
+    fn path_coordinate_rebuilds_the_bracket_instead_of_leaking_the_raw_unit_key() {
+        let coordinate = atlas_with_digest_unit_key();
+        let rendered = coordinate
+            .path_coordinate()
+            .expect("Atlas coordinates render a path_coordinate");
+
+        assert!(
+            !rendered.contains("sha256-deadbeefcafef00d"),
+            "the raw content digest inside unit_key must never reach the \
+             reader-facing coordinate: {rendered}"
+        );
+        assert_eq!(rendered, "src/lib.rs#3 [code:src/lib.rs#3]");
+    }
+
+    /// F-TH-02: `render()` carries the identical digest-leak defect in its
+    /// own `Some(unit_key)` branch, unreached by any prior test. Same
+    /// assertion shape as the `path_coordinate()` case above, against the
+    /// sibling method.
+    #[test]
+    fn render_rebuilds_the_bracket_instead_of_leaking_the_raw_unit_key() {
+        let coordinate = atlas_with_digest_unit_key();
+        let rendered = coordinate.render();
+
+        assert!(
+            !rendered.contains("sha256-deadbeefcafef00d"),
+            "the raw content digest inside unit_key must never reach the \
+             reader-facing coordinate: {rendered}"
+        );
+        assert_eq!(rendered, "repo@content-1:src/lib.rs#3 [code:src/lib.rs#3]");
+    }
+
+    /// The no-ordinal case still redacts correctly and doesn't panic on the
+    /// absent `#{ordinal}` suffix.
+    #[test]
+    fn redaction_holds_without_an_ordinal() {
+        let coordinate = EvidenceCoordinate::Atlas {
+            source_name: "repo".to_string(),
+            generation_id: "gen-1".to_string(),
+            content_key: "content-1".to_string(),
+            relative_path: "README.md".to_string(),
+            unit_key: Some("doc:sha256-abc123".to_string()),
+            ordinal: None,
+        };
+
+        assert_eq!(
+            coordinate.path_coordinate().unwrap(),
+            "README.md [doc:README.md]"
+        );
+        assert_eq!(
+            coordinate.render(),
+            "repo@content-1:README.md [doc:README.md]"
+        );
     }
 }
