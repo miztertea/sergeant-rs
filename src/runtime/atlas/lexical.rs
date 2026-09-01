@@ -597,7 +597,12 @@ impl UnitCoordinate {
     /// into the *dedup* half — `UnitAddress::render`/`parse` and
     /// `sgt related`'s anchor lookup use this, never `db::unit_key` itself.
     pub fn path_key(&self) -> String {
-        format!("{}:{}#{}", self.family().as_str(), self.relative_path(), self.ordinal())
+        format!(
+            "{}:{}#{}",
+            self.family().as_str(),
+            self.relative_path(),
+            self.ordinal()
+        )
     }
 }
 
