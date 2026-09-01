@@ -130,6 +130,7 @@ fn scanned_file(relative_path: &str, extractor: &str, units: Vec<ScannedUnit>) -
     ScannedFile {
         relative_path: relative_path.to_string(),
         content_hash: format!("hash/{relative_path}"),
+        content_digest: format!("hash/{relative_path}"),
         extractor: extractor.to_string(),
         local_key: format!("key/{relative_path}"),
         byte_len: 64,
@@ -169,6 +170,7 @@ fn hand_built_scan(
         extractors,
         datasets: Vec::new(),
         root: None,
+        identity_root: None,
         context_fields: ContextFields::none(),
     }
 }
@@ -441,6 +443,46 @@ fn code_units_index_identifiers_while_document_units_additionally_index_prose() 
         finds(&identifier, "src/lib.rs"),
         "the code family must still find the identifier; got {:?}",
         paths(&identifier)
+    );
+}
+
+/// **prose-relevance wave (host-atlas-s6): the Markdown-heading-as-symbol
+/// collision.** A Markdown heading already becomes a document-family unit
+/// through A1 §6.1's own structure extraction (`text::markdown_units`,
+/// carrying the heading as that unit's `title`) — the same section this
+/// suite's `lexical_search_returns_a_document_unit_with_exact_a1_provenance`
+/// exercises. The generic tree-sitter symbol table
+/// (`syntax::SyntaxLanguage::Markdown::symbol_kinds`) *also* claims every
+/// `atx_heading`/`setext_heading` node, labelled `"heading"` — real,
+/// intentional coverage for `source.occurrences` (the F5 corpus manifest
+/// pins it), but if that occurrence *also* became a code-family retrievable
+/// unit the same heading text would be indexed twice, once correctly as
+/// prose (document family) and once as though it were a distinguishing
+/// per-file identifier (code family) — which is exactly what let a generic,
+/// widely-shared heading (`"## Ruling"`, four unrelated files) flood A2 §8
+/// signal 1's exact-symbol-match boost ahead of the actually relevant
+/// document. A heading is retrievable prose, never a code identifier, so it
+/// must show up in the document family only.
+#[test]
+fn markdown_headings_are_not_code_family_units() {
+    let estate = estate();
+    let filter = only_knowledge();
+
+    // "forms" appears nowhere but the `# Retry forms` heading in
+    // `docs/forms.md` — not in `src/lib.rs`'s `payment_retry_policy` symbol
+    // (which splits to "payment"/"retry"/"policy"), not in the CSV columns.
+    let code = estate.search("forms", &filter, Some(LexicalFamily::Code));
+    assert!(
+        code.hits.is_empty(),
+        "a Markdown heading must not become a code-family unit; got {:?}",
+        paths(&code)
+    );
+
+    let document = estate.search("forms", &filter, Some(LexicalFamily::Document));
+    assert!(
+        finds(&document, "docs/forms.md"),
+        "the document family must still retain the heading; got {:?}",
+        paths(&document)
     );
 }
 

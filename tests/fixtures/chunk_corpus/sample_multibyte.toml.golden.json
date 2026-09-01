@@ -1,0 +1,114 @@
+[
+  {
+    "byte_start": 0,
+    "byte_end": 684,
+    "line_start": 1,
+    "line_end": 11,
+    "content": "# Dependency policy source of truth (proposal-ci-cd-release-engineering.md \u00a75.2).\n#\n# Routine PRs run `cargo deny check bans licenses sources` (advisories stay a\n# separate security signal so a new RustSec advisory against an unchanged\n# Cargo.lock doesn't redden an unrelated PR). Release qualification runs the\n# full `cargo deny check`, including advisories.\n#\n# License allow-list is exactly what knowledge/evidence/ci-slice1-baseline-2026-08-17.md\n# measured against the unmodified graph: 27 distinct expressions across 409\n# resolved package versions, all ordinary permissive/public-domain terms.\n# `LGPL-2.1-or-later` \u2014 the one entry the baseline flagged as worth a specific"
+  },
+  {
+    "byte_start": 685,
+    "byte_end": 784,
+    "line_start": 12,
+    "line_end": 13,
+    "content": "# look rather than blanket admission \u2014 is deliberately NOT allowed here; see\n# the comment below."
+  },
+  {
+    "byte_start": 786,
+    "byte_end": 1481,
+    "line_start": 15,
+    "line_end": 30,
+    "content": "[advisories]\ndb-path = \"~/.cargo/advisory-db\"\ndb-urls = [\"https://github.com/rustsec/advisory-db\"]\nyanked = \"deny\"\n\n# S4 Y2 (G3, gate a): scoped, dated exception for a single named advisory,\n# not a broadened rule and not a disabled gate.\n#\n# RUSTSEC-2026-0192 \u2014 `ttf-parser` 0.25.1 is unmaintained, no safe upgrade.\n# Reached unconditionally via anydoc -> pdf-inspector -> lopdf -> ttf-parser\n# (font metadata for `pdf-inspector`'s PDF leg; `anydoc` ships no feature\n# flag to drop `pdf-inspector` from the build). Recorded/reverted spike:\n# tests/fixtures/anydoc_corpus/SPIKE-G3.md.\n#\n# Owner ruling (J4), 2026-08-27:\n# knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md \u2014 ADOPT"
+  },
+  {
+    "byte_start": 1482,
+    "byte_end": 2178,
+    "line_start": 31,
+    "line_end": 41,
+    "content": "# anydoc; the advisory is accepted risk in a pre-alpha, open-source, MIT\n# harness because per-format composition would defeat the \"any doc\"\n# capability itself (A1 \u00a76.3). The ruling's condition (2) is a\n# replaceability boundary \u2014 anydoc lives behind a narrow adapter contract\n# so it stays swappable; that is proved structurally by this wave's\n# one-owner adapter test, not by this file.\n#\n# This entry ignores exactly this one advisory ID. It does NOT ignore the\n# `ttf-parser` crate, the `anydoc`/`pdf-inspector`/`lopdf` crates, or any\n# other advisory ID \u2014 cargo-deny's `ignore` list matches by RUSTSEC ID, so a\n# different advisory reaching the graph through the same subtree (a new ID"
+  },
+  {
+    "byte_start": 2179,
+    "byte_end": 2885,
+    "line_start": 42,
+    "line_end": 52,
+    "content": "# against ttf-parser, lopdf, pdf-inspector, anydoc, or anything else the\n# anydoc dependency edge pulls in) still fails `cargo deny check` under this\n# same config. Proven, not just asserted, against this exact file, by\n# `tests/fixtures/anydoc_corpus/prove-exception-is-scoped.sh` (rerunnable;\n# last recorded run: `tests/fixtures/anydoc_corpus/G3-exception-narrowness-proof.md`) \u2014\n# it runs `cargo deny check advisories` against THIS file with a synthetic\n# advisory injected against `lopdf` (a sibling of `ttf-parser` under\n# `anydoc -> pdf-inspector -> lopdf`) under a fresh id this entry has never\n# heard of, and asserts that advisory still fails the gate while\n# RUSTSEC-2026-0192 stays ignored.\n#"
+  },
+  {
+    "byte_start": 2886,
+    "byte_end": 3593,
+    "line_start": 53,
+    "line_end": 64,
+    "content": "# Revisit triggers (ruling, \"Revisit triggers\" section \u2014 any one reopens\n# this decision):\n# - an `anydoc`/`pdf-inspector` release drops or replaces `ttf-parser`, or a\n#   `ttf-parser` release resolves RUSTSEC-2026-0192 with a safe upgrade;\n# - a NEW advisory arrives through the anydoc subtree (by design, this\n#   entry will not suppress it \u2014 the gate goes red and that redness is the\n#   trigger firing, not a bug in this exception);\n# - `anydoc` itself becomes unmaintained, at which point the replaceability\n#   boundary is what gets exercised.\n#\n# NOT covered by this entry: the pre-existing, unrelated yanked `chacha20`\n# via `ulid` -> `rand` (sergeant-rs#328) stays a live failure of its own \u2014"
+  },
+  {
+    "byte_start": 3594,
+    "byte_end": 4332,
+    "line_start": 65,
+    "line_end": 76,
+    "content": "# this exception does not touch it and does not suppress it.\n# S5 W3b (F5, gate 1): a SECOND scoped, dated exception for a single named\n# advisory. It sits beside the anydoc entry above and does not touch,\n# generalise or replace it \u2014 two named IDs, not a relaxed rule.\n#\n# RUSTSEC-2024-0436 \u2014 `paste` 1.0.15 is unmaintained and archived; the\n# advisory itself says \"No safe upgrade is available!\". Reached\n# unconditionally via `paste -> tokenizers 0.21.4 -> model2vec-rs 0.2.1`,\n# and A2 \u00a76's semantic half needs a Model2Vec implementation (decision\n# A2-06). Verified unavoidable rather than asserted, in\n# tests/fixtures/model2vec_corpus/SPIKE-F5.md:\n#   - `paste` is NOT optional in `tokenizers 0.21.4` \u2014 no `optional = true`,"
+  },
+  {
+    "byte_start": 4333,
+    "byte_end": 5061,
+    "line_start": 77,
+    "line_end": 90,
+    "content": "#     no feature guard, so no feature combination drops it;\n#   - `tokenizers 0.23.1` still depends on it;\n#   - `model2vec-rs` requires `tokenizers = \"0.21\"` regardless;\n#   - the alternative crate `model2vec 0.3.0` requires the same.\n#   Every Rust Model2Vec reads `tokenizer.json` through `tokenizers`, and\n#   `tokenizers` goes through `paste`.\n#\n# Owner ruling (J4), 2026-08-30:\n# knowledge/rulings/owner-rulings/model2vec-paste-advisory-2026-08-30.md \u2014\n# \"Model2Vec is ADOPTED \u2014 it always was (A2-06) \u2026 RUSTSEC-2024-0436 is\n# accepted as a SCOPED, DATED cargo-deny exception naming that advisory ID\n# specifically \u2014 never a broadened rule, never a disabled gate \u2026 The next\n# advisory must still fail the gate.\"\n#"
+  },
+  {
+    "byte_start": 5062,
+    "byte_end": 5799,
+    "line_start": 91,
+    "line_end": 102,
+    "content": "# NOT excepted, and must never be: **RUSTSEC-2025-0119** (`number_prefix` via\n# `indicatif` via `tokenizers/progressbar`). It is AVOIDED, not ignored \u2014\n# `Cargo.toml` declares `tokenizers` directly with `fancy-regex` alone, which\n# drops `indicatif`/`number_prefix` from `Cargo.lock` entirely. The ruling's\n# decision 3 is explicit: \"The second advisory stays avoided, not excepted.\"\n# `tests/w3b_model2vec_manifest_pin.rs` fails if either crate reappears in\n# the lockfile.\n#\n# Scoped by ID, and PROVEN so rather than asserted, against this exact file,\n# by `tests/fixtures/model2vec_corpus/prove-exception-is-scoped.sh`\n# (rerunnable; last recorded run:\n# tests/fixtures/model2vec_corpus/F5-exception-narrowness-proof.md) \u2014 it runs"
+  },
+  {
+    "byte_start": 5800,
+    "byte_end": 6437,
+    "line_start": 103,
+    "line_end": 112,
+    "content": "# `cargo deny check advisories` against THIS file with a synthetic advisory\n# injected against `tokenizers` (the crate directly between `paste` and\n# `model2vec-rs`) under a fresh id this entry has never heard of, and asserts\n# that advisory still fails the gate while RUSTSEC-2024-0436 stays ignored.\n#\n# Revisit triggers (ruling, \"Revisit triggers\" \u2014 any one reopens this):\n# - a `tokenizers` release that drops or replaces `paste`;\n# - a `paste` release resolving the advisory;\n# - a NEW advisory arriving through the model2vec subtree \u2014 by design this\n#   entry will not suppress it, and the gate going red IS the trigger firing."
+  },
+  {
+    "byte_start": 6438,
+    "byte_end": 7146,
+    "line_start": 113,
+    "line_end": 121,
+    "content": "ignore = [\n  { id = \"RUSTSEC-2026-0192\", reason = \"anydoc's pdf-inspector->lopdf leg pulls unmaintained ttf-parser unconditionally; accepted risk per owner ruling knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md (J4), scoped to this one advisory ID only \u2014 see the comment above for revisit triggers.\" },\n  { id = \"RUSTSEC-2024-0436\", reason = \"model2vec-rs -> tokenizers pulls unmaintained/archived paste unconditionally (no safe upgrade); accepted risk per owner ruling knowledge/rulings/owner-rulings/model2vec-paste-advisory-2026-08-30.md (J4), scoped to this one advisory ID only \u2014 see the comment above for revisit triggers.\" },\n]\n\n[bans]\nmultiple-versions = \"warn\"\nwildcards = \"deny\"\n\n"
+  },
+  {
+    "byte_start": 7146,
+    "byte_end": 7878,
+    "line_start": 122,
+    "line_end": 143,
+    "content": "[licenses]\nallow = [\n  \"MIT\",\n  \"Apache-2.0\",\n  \"BSD-2-Clause\",\n  \"BSD-3-Clause\",\n  \"ISC\",\n  \"Zlib\",\n  \"CC0-1.0\",\n  \"Unlicense\",\n  \"Unicode-3.0\",\n  \"CDLA-Permissive-2.0\",\n]\nconfidence-threshold = 0.8\n\n# LGPL-2.1-or-later appears once in the graph, inside an OR clause on a\n# dependency in the windows-sys/icu-adjacent cluster (baseline \u00a73). Left off\n# the allow-list on purpose: it's the one expression in the measured set that\n# isn't a permissive/public-domain-style license, and it hasn't had an owner\n# ruling to admit it. Verified with `cargo deny check licenses` against this\n# allow-list: the crate's OR clause resolves to an already-allowed sibling\n# term, so `licenses ok` holds without adding LGPL-2.1-or-later here. If a"
+  },
+  {
+    "byte_start": 7879,
+    "byte_end": 8080,
+    "line_start": 144,
+    "line_end": 146,
+    "content": "# future dependency bump drops that sibling term from the OR clause, this\n# check starts failing on it \u2014 that failure is the intended fail-closed\n# behavior, not a regression to silently work around."
+  },
+  {
+    "byte_start": 8082,
+    "byte_end": 8808,
+    "line_start": 148,
+    "line_end": 163,
+    "content": "[sources]\nunknown-registry = \"deny\"\nunknown-git = \"deny\"\n\n# --- chunker-utf8 density extension (S6 wave) \u2014 synthetic, appended for\n# fixture coverage only; the content above this line is the REAL\n# sergeant-rs deny.toml, verbatim, and is what reproduced the original\n# panic at byte 3592 (see brief-chunker-utf8.md). This block adds the\n# additional multi-byte forms the wave brief names that deny.toml alone\n# does not contain: accented words, CJK, and an emoji.\n#\n# Accented: caf\u00e9, na\u00efve, fa\u00e7ade, jalape\u00f1o, Z\u00fcrich, r\u00e9sum\u00e9 \u2014 six words.\n# CJK: \u4f60\u597d\u4e16\u754c (\"hello world\"), \u6771\u4eac (\"Tokyo\"), \u6570\u636e\u5e93 (\"database\").\n# Emoji: a lock \ud83d\udd12, a check \u2705, and a warning \u26a0\ufe0f \u2014 three graphemes, each\n# a multi-byte.\n#"
+  },
+  {
+    "byte_start": 8809,
+    "byte_end": 9546,
+    "line_start": 164,
+    "line_end": 173,
+    "content": "# NOTE (F-IN-02): an earlier revision of this comment claimed the lock and\n# check together straddle a byte offset that is an exact multiple of\n# chunk::DESIRED_CHUNK_LENGTH (750). That is false of the committed golden:\n# tree-sitter's TOML grammar always splits chunks at comment/node edges, so\n# the AST-merge path cannot naturally land a chunk boundary mid-codepoint \u2014\n# every byte_start/byte_end in sample_multibyte.toml.golden.json already\n# lands on a valid char boundary, and the lock/check pair sits entirely\n# inside one chunk (bytes 8082..8791), straddling nothing. This fixture\n# exercises non-ASCII density and round-trip content fidelity through the\n# real pipeline; the mid-codepoint boundary-snapping invariant itself is"
+  },
+  {
+    "byte_start": 9547,
+    "byte_end": 9920,
+    "line_start": 174,
+    "line_end": 180,
+    "content": "# proven directly, by construction, in `chunk.rs`'s\n# `finalize_chunk_never_panics_on_a_boundary_that_splits_a_multibyte_char`\n# and `finalize_chunk_never_duplicates_content_across_adjacent_boundaries_\n# sharing_a_split_point` \u2014 not by this file landing on a real chunk seam.\n#\n[extension.metadata]\nnote = \"Z\u00fcrich \u2192 \u6771\u4eac \u2014 one em dash, one arrow, both multi-byte\"\n"
+  }
+]

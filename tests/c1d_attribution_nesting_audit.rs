@@ -188,6 +188,7 @@ fn evidence_world() -> (TempDir, AtlasDb) {
     let deck = ScannedFile {
         relative_path: "decks/retention.pptx".to_string(),
         content_hash: "hash/decks/retention.pptx".to_string(),
+        content_digest: "hash/decks/retention.pptx".to_string(),
         extractor: OFFICE_EXTRACTOR.to_string(),
         local_key: "key/decks/retention.pptx".to_string(),
         byte_len: 4096,

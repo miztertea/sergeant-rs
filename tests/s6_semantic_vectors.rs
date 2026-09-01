@@ -299,3 +299,58 @@ fn vectors_embedded_by_one_model_are_not_reused_by_another() {
             .collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------- S6 fix: byte-identical content
+
+/// **Two different files whose bytes are byte-identical still report a
+/// complete semantic index.**
+///
+/// Bug 2 (S6, projection-identity) made `unit_key`'s identity input a
+/// content digest (`identity_of`) rather than a canonicalized path, so two
+/// distinct files that happen to share their exact bytes now compute the
+/// identical `unit_key` within one generation — a real, ratified
+/// consequence of that merge (owner ruling
+/// `projection-model-and-false-j0s-2026-08-31.md`: "the file is the
+/// identity; sources are memberships"), not something to prevent. The
+/// completeness check must tolerate it: every unit's embedding is present,
+/// so the generation must report `Applied`, not `NotIndexed`.
+#[test]
+fn byte_identical_files_sharing_a_unit_key_still_report_applied() {
+    install_model();
+    let data = tempfile::tempdir().expect("data dir");
+    let root = tempfile::tempdir().expect("knowledge root");
+    let twin_body = "Tighten the peg slowly until the string sounds the \
+                      reference pitch from the tuning fork.";
+    write(root.path(), "music/tuning-a.md", twin_body);
+    write(root.path(), "music/tuning-b.md", twin_body);
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+    let knowledge = KnowledgeSource {
+        name: "knowledge".to_string(),
+        root: root.path().to_path_buf(),
+        ignore: Vec::new(),
+        context_fields: ContextFields::none(),
+    };
+    scan_and_record(
+        &mut db,
+        &mut journal,
+        &knowledge,
+        None,
+        &EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record knowledge");
+    let estate = Estate {
+        _data: data,
+        _root: root,
+        db,
+    };
+
+    let answer = estate.semantic("tuning fork pitch");
+    assert_eq!(
+        answer.semantic,
+        SemanticStatus::Applied,
+        "two byte-identical files legitimately share one unit_key; every \
+         row's embedding is present, so the check must not conflate a \
+         shared key with a missing vector. Answer was: {answer:?}"
+    );
+}

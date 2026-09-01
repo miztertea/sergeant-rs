@@ -289,6 +289,13 @@ pub fn acquire_and_scan(source: &ExternalGitSource) -> Result<ExternalGitScan, E
         // allowlist to gate.
         datasets: Vec::new(),
         root: None,
+        // A bare cache has no working tree, so there is no absolute
+        // filesystem path a real file lives at — `identity_root: None`
+        // falls back to `relative_path` (`SourceScan::identity_root`'s own
+        // doc), the pre-S6 identity. Correct here, not merely unimplemented:
+        // an external source is host-scoped and out of this wave's named
+        // scenario (a `[[repo]]`/`[[knowledge]]` overlap within one estate).
+        identity_root: None,
         context_fields: ContextFields::none(),
         coverage: out.coverage,
         extractors: out.extractors,
@@ -404,6 +411,7 @@ mod tests {
             files: out.files,
             datasets: Vec::new(),
             root: None,
+            identity_root: None,
             context_fields: ContextFields::none(),
             coverage: out.coverage,
             extractors: out.extractors,

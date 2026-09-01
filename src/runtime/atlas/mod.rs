@@ -176,6 +176,7 @@
 //! the correct direction for it to bite.)
 
 pub mod archive;
+pub mod chunk;
 pub mod db;
 pub mod deny;
 pub mod external_git;

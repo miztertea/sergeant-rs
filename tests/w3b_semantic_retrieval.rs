@@ -222,6 +222,7 @@ fn scanned_file(relative_path: &str, units: Vec<ScannedUnit>) -> ScannedFile {
     ScannedFile {
         relative_path: relative_path.to_string(),
         content_hash: format!("hash/{relative_path}"),
+        content_digest: format!("hash/{relative_path}"),
         extractor: MARKDOWN_EXTRACTOR.to_string(),
         local_key: format!("key/{relative_path}"),
         byte_len: 64,
@@ -257,6 +258,7 @@ fn hand_built_scan(
         extractors,
         datasets: Vec::new(),
         root: None,
+        identity_root: None,
         context_fields: ContextFields::none(),
     }
 }

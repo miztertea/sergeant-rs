@@ -678,6 +678,7 @@ pub fn file(
     sergeant_rs::runtime::atlas::scan::ScannedFile {
         relative_path: relative_path.to_string(),
         content_hash: format!("hash/{relative_path}"),
+        content_digest: format!("hash/{relative_path}"),
         extractor: sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR.to_string(),
         local_key: format!("key/{relative_path}"),
         byte_len: bytes,
@@ -709,6 +710,7 @@ pub fn scan(
         extractors,
         datasets: Vec::new(),
         root: None,
+        identity_root: None,
         context_fields: sergeant_rs::runtime::atlas::tabular::ContextFields::none(),
     }
 }

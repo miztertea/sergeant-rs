@@ -1,0 +1,16 @@
+[
+  {
+    "byte_start": 0,
+    "byte_end": 696,
+    "line_start": 1,
+    "line_end": 33,
+    "content": "#!/usr/bin/env bash\n# A small synthetic bash fixture for the chunker corpus. ASCII-only.\nset -euo pipefail\n\nTMPDIR=\"${TMPDIR:-/tmp}\"\nLOG_FILE=\"${LOG_FILE:-/dev/null}\"\n\nlog() {\n    local message=\"$1\"\n    echo \"[$(date +%s)] ${message}\" >> \"${LOG_FILE}\"\n}\n\nrequire_command() {\n    local name=\"$1\"\n    if ! command -v \"${name}\" >/dev/null 2>&1; then\n        echo \"missing required command: ${name}\" >&2\n        exit 1\n    fi\n}\n\nbuild_one() {\n    local target=\"$1\"\n    log \"building ${target}\"\n    require_command cargo\n    CARGO_BUILD_JOBS=6 cargo build --release -p \"${target}\"\n}\n\nbuild_all() {\n    local targets=(\"$@\")\n    for target in \"${targets[@]}\"; do\n        build_one \"${target}\"\n    done\n}"
+  },
+  {
+    "byte_start": 698,
+    "byte_end": 1043,
+    "line_start": 35,
+    "line_end": 51,
+    "content": "run_tests() {\n    local target=\"$1\"\n    log \"testing ${target}\"\n    require_command cargo\n    cargo test -p \"${target}\" --no-fail-fast\n}\n\nmain() {\n    local targets=(\"fixture-one\" \"fixture-two\" \"fixture-three\")\n    build_all \"${targets[@]}\"\n    for target in \"${targets[@]}\"; do\n        run_tests \"${target}\"\n    done\n    log \"done\"\n}\n\nmain \"$@\""
+  }
+]

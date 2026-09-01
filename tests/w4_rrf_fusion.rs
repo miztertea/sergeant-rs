@@ -536,6 +536,7 @@ fn scanned_file_with_hash(
     ScannedFile {
         relative_path: relative_path.to_string(),
         content_hash: content_hash.to_string(),
+        content_digest: content_hash.to_string(),
         extractor: MARKDOWN_EXTRACTOR.to_string(),
         local_key: format!("key/{relative_path}"),
         byte_len: 64,
@@ -602,6 +603,7 @@ fn hand_built_scan(
         extractors,
         datasets: Vec::new(),
         root: None,
+        identity_root: None,
         context_fields: ContextFields::none(),
     }
 }
@@ -685,9 +687,13 @@ const CORPUS: [(&str, &str); 5] = [
 ];
 
 fn knowledge_estate(with_decoy: bool) -> Estate {
+    knowledge_estate_with(&CORPUS, with_decoy)
+}
+
+fn knowledge_estate_with(docs: &[(&str, &str)], with_decoy: bool) -> Estate {
     let data = tempfile::tempdir().expect("data dir");
     let root = tempfile::tempdir().expect("knowledge root");
-    for (relative, body) in CORPUS {
+    for (relative, body) in docs.iter().copied() {
         write(root.path(), relative, body);
     }
     let mut journal = Journal::open(data.path()).expect("journal");
@@ -803,6 +809,166 @@ fn an_inadmissible_unit_that_wins_the_semantic_list_never_reaches_the_fused_answ
             .any(|label| label.starts_with("vendor-lib:")),
         "an inadmissible unit reached the fused answer: {:#?}",
         labelled(&closed)
+    );
+}
+
+// ------------------------------------------- SEMANTIC IS NOT INERT (S6 wave)
+
+/// **The `semantic-inert` wave's regression guard.** `00-orient` found the
+/// brief's suspected defect ("fused order collapses to the lexical-only
+/// order because content-digest `unit_key` broke `fuse()`'s
+/// `(generation_id, unit_key)` join") does not reproduce at this pin — but
+/// no suite in the tree proved it *end to end* through
+/// scan→embed→`fused_search`. This is that guard: "applied and inert" must
+/// never pass again.
+///
+/// The corpus plants a unit whose content shares **zero terms** with the
+/// query (so a pure lexical search cannot find it at all — the same shape
+/// as `00-orient`'s `src/watch.rs` finding: `ranks.lexical: null`) next to a
+/// decoy that shares every query term but is unrelated in meaning — so the
+/// lexical-only list has something to rank first, and the corpus is not
+/// merely one document the fused answer trivially returns. The guard's
+/// claim: `fused_search` with semantic *requested* surfaces the
+/// lexically-invisible unit (through its semantic rank); `fused_search`
+/// with semantic *suppressed* — the exact degenerate construction the
+/// brief suspected `51c0f650` always collapses to — cannot, because an
+/// empty semantic list fuses down to the plain lexical order. The two
+/// answers disagreeing on this unit's presence is "the fused order is
+/// provably not the lexical-only order," made concrete.
+#[test]
+fn a_semantically_relevant_lexically_silent_unit_outranks_the_lexical_only_answer() {
+    use_repository_assets();
+
+    // The query is `operating system scheduler priority queue selection`
+    // (`query_terms` does not stem or stop-word-filter — see `tokenize` —
+    // so "shares zero terms" means literally zero exact lowercase tokens in
+    // common, checked term by term below).
+    const DOCS: [(&str, &str); 3] = [
+        (
+            "runtime/dispatch-policy.md",
+            "Whichever runnable process waited longest gets handed processor \
+             first so nothing starves indefinitely.",
+        ),
+        (
+            "notes/next-job-listing.md",
+            "The garden club voted on rose selection while a hospital \
+             operating theater queue formed outside; a choir's priority \
+             scheduler assigned solo parts, and the postal system \
+             delivered late.",
+        ),
+        (
+            "kitchen/sourdough.md",
+            "Feed the starter twice a day until it doubles reliably.",
+        ),
+    ];
+    let estate = knowledge_estate_with(&DOCS, false);
+    let db = &estate.db;
+
+    let query = "operating system scheduler priority queue selection";
+    let filter = everything();
+
+    // Non-vacuity: a pure lexical search cannot see the target at all, and
+    // ranks the keyword-overlapping decoy first — so there is a real
+    // lexical-only order for the fused answer to differ from.
+    let lexical_only = db
+        .lexical_search(&LexicalQuery {
+            text: query,
+            filter: &filter,
+            family: None,
+            limit: 50,
+            semantic: SemanticRequest::Suppressed,
+        })
+        .expect("lexical search");
+    assert_eq!(
+        lexical_only
+            .hits
+            .first()
+            .map(|hit| hit.coordinate.relative_path()),
+        Some("notes/next-job-listing.md"),
+        "the keyword decoy must win lexical search, or this negative proves nothing: {:#?}",
+        lexical_only
+            .hits
+            .iter()
+            .map(|h| h.coordinate.relative_path())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !lexical_only
+            .hits
+            .iter()
+            .any(|hit| hit.coordinate.relative_path() == "runtime/dispatch-policy.md"),
+        "the target must be invisible to lexical search, or this negative proves nothing: {:#?}",
+        lexical_only
+            .hits
+            .iter()
+            .map(|h| h.coordinate.relative_path())
+            .collect::<Vec<_>>()
+    );
+
+    // The fused answer, semantic applied end to end through scan→embed→fuse.
+    let fused = db
+        .fused_search(&LexicalQuery {
+            text: query,
+            filter: &filter,
+            family: None,
+            limit: 50,
+            semantic: SemanticRequest::Requested,
+        })
+        .expect("fused search");
+    show(query, &fused);
+    assert_eq!(
+        fused.semantic,
+        SemanticStatus::Applied,
+        "the semantic half must actually apply, or this guard measures nothing"
+    );
+
+    let target_hit = fused
+        .hits
+        .iter()
+        .find(|hit| hit.coordinate.relative_path() == "runtime/dispatch-policy.md")
+        .unwrap_or_else(|| {
+            panic!(
+                "the semantically-relevant, lexically-silent unit never reached the fused \
+                 answer: {:#?}",
+                labelled(&fused)
+            )
+        });
+    assert_eq!(
+        target_hit.origins.lexical, None,
+        "the target must still carry no lexical rank inside the fused answer"
+    );
+    assert!(
+        target_hit.origins.semantic.is_some(),
+        "the target must be reached through its semantic rank"
+    );
+
+    // The claim itself: the fused order is provably not the lexical-only
+    // order. With the semantic half suppressed, `fused_search` degenerates
+    // to exactly the lexical order tested above (`fuse()` on an empty
+    // semantic list is the lexical list) — the same construction the brief
+    // suspected `51c0f650` always collapses to. The target, invisible to
+    // lexical search, must be absent from *that* answer even though it is
+    // present, ranked, in the real one above — the fused answer and the
+    // lexical-only answer disagree on this unit's presence, not merely its
+    // position.
+    let lexical_only_fused = db
+        .fused_search(&LexicalQuery {
+            text: query,
+            filter: &filter,
+            family: None,
+            limit: 50,
+            semantic: SemanticRequest::Suppressed,
+        })
+        .expect("fused search, semantic suppressed");
+    show(query, &lexical_only_fused);
+    assert!(
+        !lexical_only_fused
+            .hits
+            .iter()
+            .any(|hit| hit.coordinate.relative_path() == "runtime/dispatch-policy.md"),
+        "with semantic suppressed the fused answer must degenerate to the lexical-only order, \
+         which cannot contain the target: {:#?}",
+        labelled(&lexical_only_fused)
     );
 }
 
@@ -1512,6 +1678,72 @@ fn a_file_whose_chunks_collectively_score_well_has_its_best_chunk_boosted() {
         (hits[0].adjusted - 0.011_0 * (1.0 + FILE_COHERENCE_BOOST_FRAC)).abs() < 1e-12,
         "boost was not 1 + {FILE_COHERENCE_BOOST_FRAC}: {}",
         hits[0].adjusted
+    );
+}
+
+/// **The coherence share must be computed from the pre-signal-boost score,
+/// exactly as semble's own pipeline order does it** —
+/// `search.py::search`: `boost_multi_chunk_files(combined_scores)` runs
+/// (line 124) on the raw alpha-blended/RRF'd score, **before**
+/// `apply_query_boost` (line 126) — the function that carries semble's
+/// exact-match/definition-tier boost — ever touches any candidate's score.
+///
+/// [`rerank`] must keep the same order: [`RerankSignals::multiplier`] (this
+/// module's carrier of that same boost, §8 signal 1) applied *after*
+/// `boost_multi_chunk_files`, not before. Applying it first lets a file's own
+/// exact-match-boosted chunk inflate that file's `file_total`, which in turn
+/// inflates the *shared* `max_total` denominator every other file's
+/// coherence share is computed against — a candidate with no signal at all
+/// ends up penalised by a boost it never earned, purely because it happened
+/// to share the answer with a file that had one.
+///
+/// **Non-vacuous, worked by hand.** Two files, `src/watch.rs` (two chunks,
+/// one flagged `exact_match`) and `docs/other.md` (one chunk, no signals):
+///
+/// - raw totals: `watch.rs` = 0.0101 + 0.0100 = 0.0201, `other.md` = 0.0195.
+///   `watch.rs` is the larger — the correct `max_total` is `0.0201`.
+/// - `other.md`'s correct share is `0.0195 / 0.0201`, coherence factor
+///   `1 + 0.2 × that share`, giving `other.md.adjusted ≈ 0.023294`.
+/// - Multiplying `watch.rs`'s flagged chunk by [`BOOST_EXACT_MATCH`] (3.0)
+///   *before* the coherence pass — the bug — inflates `watch.rs`'s total to
+///   0.0403, which becomes `max_total` instead; `other.md`'s share nearly
+///   halves and its adjusted score comes out to ≈ 0.021387, a number semble's
+///   own pipeline order never produces.
+///
+/// **Verified red first:** with the multiplier stage left ahead of
+/// `boost_multi_chunk_files` (today's order), `other.md.adjusted` lands at
+/// the buggy 0.021387…, not the 0.023294… this asserts.
+#[test]
+fn a_files_own_exact_match_does_not_inflate_the_coherence_denominator_other_files_share() {
+    let flagged = RerankSignals {
+        exact_match: true,
+        canonical_path: true,
+        ..Default::default()
+    };
+    let plain = RerankSignals {
+        canonical_path: true,
+        ..Default::default()
+    };
+    let mut hits = vec![
+        scored("src/watch.rs", "u-watch-1", 0.0101, flagged),
+        scored("src/watch.rs", "u-watch-2", 0.0100, plain),
+        scored("docs/other.md", "u-other", 0.0195, plain),
+    ];
+
+    rerank(&mut hits, "");
+
+    let other = hits
+        .iter()
+        .find(|hit| hit.unit_key == "u-other")
+        .expect("docs/other.md must still be in the answer");
+    let watch_raw_total = 0.0101_f64 + 0.0100_f64;
+    let expected = 0.0195 * (1.0 + FILE_COHERENCE_BOOST_FRAC * (0.0195 / watch_raw_total));
+    assert!(
+        (other.adjusted - expected).abs() < 1e-9,
+        "docs/other.md's coherence share was computed against a signal-\
+         boosted denominator, not the raw one semble uses: got {}, expected {expected} \
+         (the buggy pre-fix order produces ≈0.021387)",
+        other.adjusted
     );
 }
 

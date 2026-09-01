@@ -89,6 +89,7 @@ fn scan(units: usize) -> SourceScan {
         .map(|i| ScannedFile {
             relative_path: format!("docs/unit-{i:06}.md"),
             content_hash: format!("hash/{i}"),
+            content_digest: format!("hash/{i}"),
             extractor: MARKDOWN_EXTRACTOR.to_string(),
             local_key: format!("key/{i}"),
             byte_len: 128,
@@ -121,6 +122,7 @@ fn scan(units: usize) -> SourceScan {
         extractors,
         datasets: Vec::new(),
         root: None,
+        identity_root: None,
         context_fields: ContextFields::none(),
     }
 }

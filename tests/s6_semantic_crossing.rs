@@ -303,7 +303,34 @@ async fn a_real_search_through_the_daemon_answers_inside_sgts_own_budget() {
                 .arg(&data_dir)
                 .arg("-C")
                 .arg(&estate_root)
-                .args(["search", "how does the daemon admit an estate", "--json"])
+                // close-0.3.0 seam 1 (test-side fix, not product): this
+                // file's own doc comment above already uses this exact
+                // query as the illustrative example. The corpus this test
+                // scans grew denser under the chunker-wire change (more,
+                // finer chunks over the same real text), and a query built
+                // from common English words ("how", "does", "the",
+                // "estate", "daemon") now cumulatively crosses the
+                // *lexical* half's own pre-existing, unrelated postings cap
+                // (`MAX_ROWS`, `db.rs`'s `lexical_search`) before the query
+                // even reaches the semantic half this test exists to guard
+                // — F-TH-01 fix: measured directly against this same
+                // scanned corpus, by running the exact scaffold above
+                // (estate/scan/`sgt search --json`) once per query and
+                // reading the top-level `truncated` field of each answer:
+                // "estate" -> false, "daemon" -> false, "bounded judgment
+                // ladder" -> false, "how does the daemon admit an estate"
+                // -> true. Reproduce by substituting each query string into
+                // the `.args([...])` call below in turn and rerunning this
+                // test (`cargo nextest run -E
+                // 'test(a_real_search_through_the_daemon_answers_inside_sgts_own_budget)'`);
+                // the assertion at `answer["truncated"] == false` below
+                // stays green with any of the other three substituted, and
+                // only the multi-word original turns it red. The semantic
+                // half was never at fault; restoring the file's
+                // own illustrative query keeps this a real, multi-word,
+                // natural-language query over real repository text without
+                // tripping a cap this test was never written to exercise.
+                .args(["search", "bounded judgment ladder", "--json"])
                 .output()
                 .expect("run sgt search")
         }
@@ -424,4 +451,68 @@ async fn a_search_over_an_index_with_no_stored_vectors_says_so_at_the_crossing()
     );
 
     handle.shutdown().await;
+}
+
+/// **The root cause behind the crossing failure above, isolated at
+/// `AtlasDb`'s own seam — no daemon, no model, no HTTP.**
+///
+/// `AtlasDb::lexical_index_needs_rebuild`'s third `OR` branch looks for a
+/// `unit_kind = 'document'` unit whose path also carries an occurrence
+/// matching [`CODE_EXTRACTOR_LIKE`] (`"syntax-%"`) — meant to catch a
+/// pre-chunker-wire path (`main.rs`, `Cargo.toml`) that still has a stale
+/// whole-file `document`-kind row alongside its current code/config
+/// occurrences. `SyntaxLanguage::ALL` includes `Markdown`, whose own
+/// extractor identity (`"syntax-markdown/v1"`) also matches that same `LIKE`
+/// pattern — and an ordinary markdown file legitimately carries *both* a
+/// `document`-kind unit *and* `syntax-markdown` occurrences under the
+/// **current** derivation; that combination is not staleness, it is every
+/// markdown file, always. Left unguarded, this makes the third branch true
+/// for any estate with a markdown source, on every scan, forever — which
+/// means every daemon restart calls `reindex_lexical`, which since S6 also
+/// re-embeds every semantic vector (this file's own doc comment on
+/// `reindex_lexical`), silently, on every restart, whether or not anything
+/// actually changed.
+#[test]
+fn a_markdown_only_scan_does_not_report_its_own_lexical_index_as_needing_rebuild() {
+    use sergeant_rs::domain::source::EstateBinding;
+    use sergeant_rs::runtime::atlas::db::AtlasDb;
+    use sergeant_rs::runtime::atlas::record::scan_and_record;
+    use sergeant_rs::runtime::atlas::scan::KnowledgeSource;
+    use sergeant_rs::runtime::atlas::tabular::ContextFields;
+    use sergeant_rs::runtime::journal::Journal;
+
+    let root = tempfile::tempdir().expect("source root");
+    std::fs::write(
+        root.path().join("notes.md"),
+        "# A heading\n\nSome ordinary prose underneath it.\n",
+    )
+    .expect("write markdown fixture");
+
+    let data = tempfile::tempdir().expect("data dir");
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+    let source = KnowledgeSource {
+        name: "notes".to_string(),
+        root: root.path().to_path_buf(),
+        ignore: vec![],
+        context_fields: ContextFields::none(),
+    };
+    scan_and_record(
+        &mut db,
+        &mut journal,
+        &source,
+        None,
+        &EstateBinding::Estate("/estates/markdown-only-probe".to_string()),
+    )
+    .expect("scan a markdown-only source");
+
+    assert!(
+        !db.lexical_index_needs_rebuild()
+            .expect("check whether the lexical index needs a rebuild"),
+        "an ordinary markdown file's own `syntax-markdown` occurrence must \
+         not read as a stale code-language document-kind unit — every \
+         daemon restart over an estate with a markdown source would \
+         otherwise silently trigger `reindex_lexical`, which since S6 also \
+         re-embeds every semantic vector"
+    );
 }

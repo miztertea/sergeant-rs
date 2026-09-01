@@ -62,7 +62,8 @@ use sergeant_rs::runtime::atlas::fusion::{
 use sergeant_rs::runtime::atlas::lexical::{LexicalFamily, UnitAddress, UnitCoordinate, tokenize};
 use sergeant_rs::runtime::atlas::record::record_scan;
 use sergeant_rs::runtime::atlas::scan::{
-    KnowledgeSource, ScannedFile, ScannedUnit, SourceScan, scan_local_knowledge_with_worker,
+    KnowledgeSource, ScannedFile, ScannedUnit, SourceScan, scan_local_knowledge,
+    scan_local_knowledge_with_worker,
 };
 use sergeant_rs::runtime::atlas::semantic::{SemanticRequest, SemanticStatus};
 use sergeant_rs::runtime::atlas::tabular::{ContextFields, DatasetFormat};
@@ -152,6 +153,11 @@ fn hand_built_scan(
     let file = ScannedFile {
         relative_path: relative_path.to_string(),
         content_hash: format!("hash/{relative_path}"),
+        // Real BLAKE3 of the real bytes, not a fake string — this is the
+        // bug-2 identity-merge key (F-IN-01's own territory), and a fixture
+        // whose digest does not actually match its bytes would silently
+        // stop exercising the merge it claims to.
+        content_digest: sergeant_rs::domain::source::content_hash(body.as_bytes()),
         extractor: MARKDOWN_EXTRACTOR.to_string(),
         local_key: format!("key/{relative_path}"),
         byte_len: body.len() as u64,
@@ -174,6 +180,7 @@ fn hand_built_scan(
         extractors,
         datasets: Vec::new(),
         root: None,
+        identity_root: None,
         context_fields: ContextFields::none(),
     }
 }
@@ -366,6 +373,80 @@ fn an_external_hit_is_identifiable_as_external_from_the_answer_alone() {
                 && *kind == SourceKind::LocalKnowledge
                 && *authority == AuthorityClass::EstateReadonly),
         "the estate-side hits must carry their own kind, not a default: {received:?}"
+    );
+}
+
+/// **F-SF-01 / `brief-search-three-bugs.md` Bug 3** — *"the same (source,
+/// path) twice in one top-5"*, through the **real** scan → index → query
+/// pipeline (Standing Requirement 5), not a hand-built `FusedHit` list.
+///
+/// `crowded.md` has six sections that each match the query term heavily;
+/// `sparse.md` mentions it once. Non-vacuous the same way `tests/
+/// w4_rrf_fusion.rs::
+/// a_second_chunk_of_the_same_file_is_decayed_so_one_file_cannot_take_every_slot`
+/// is: without `fusion::dedup_file_rows`, `crowded.md`'s six units all
+/// outscore `sparse.md`'s one, and several of them individually survive
+/// `FILE_SATURATION_DECAY` — decay alone thins them, it does not collapse
+/// them to a single file-level row. This asserts the row count directly:
+/// `crowded.md` may appear **at most once** in the final answer.
+#[test]
+fn a_file_with_many_matching_units_appears_once_in_file_level_results() {
+    let data = tempfile::tempdir().expect("data dir");
+    let root = tempfile::tempdir().expect("knowledge root");
+    let mut crowded = String::new();
+    for i in 0..6 {
+        crowded.push_str(&format!(
+            "## Section {i}\n\nwidgetcraft widgetcraft widgetcraft, discussion {i} of widgetcraft.\n\n"
+        ));
+    }
+    write(root.path(), "crowded.md", &crowded);
+    write(
+        root.path(),
+        "sparse.md",
+        "# Sparse\n\nwidgetcraft is mentioned here exactly once.\n",
+    );
+
+    let mut journal = Journal::open(data.path()).expect("journal");
+    let mut db = AtlasDb::open(data.path()).expect("atlas");
+    let source = KnowledgeSource {
+        name: "library".to_string(),
+        root: root.path().to_path_buf(),
+        ignore: Vec::new(),
+        context_fields: ContextFields::none(),
+    };
+    let scan = scan_local_knowledge(&source).expect("scan library");
+    record_scan(
+        &mut db,
+        &mut journal,
+        &scan,
+        None,
+        &sergeant_rs::domain::source::EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("record library");
+
+    let answer = db
+        .fused_search(&LexicalQuery {
+            text: "widgetcraft",
+            filter: &Admissibility::within_estate(D1_ESTATE),
+            family: None,
+            limit: 10,
+            semantic: SemanticRequest::Suppressed,
+        })
+        .expect("fused search");
+
+    let paths: Vec<&str> = answer
+        .hits
+        .iter()
+        .map(|h| h.coordinate.relative_path())
+        .collect();
+    let crowded_rows = paths.iter().filter(|p| **p == "crowded.md").count();
+    assert_eq!(
+        crowded_rows, 1,
+        "crowded.md's many matching units surfaced as {crowded_rows} file-level rows, not one: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"sparse.md"),
+        "sparse.md was crowded out of the answer entirely: {paths:?}"
     );
 }
 

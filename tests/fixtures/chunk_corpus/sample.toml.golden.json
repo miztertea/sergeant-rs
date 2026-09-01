@@ -1,0 +1,16 @@
+[
+  {
+    "byte_start": 0,
+    "byte_end": 738,
+    "line_start": 1,
+    "line_end": 40,
+    "content": "# A small synthetic TOML fixture for the chunker corpus. ASCII-only.\n\n[package]\nname = \"chunk-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\ndescription = \"not a real package, only chunker corpus input\"\n\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\nthiserror = \"1\"\ntree-sitter = \"0.26\"\n\n[dev-dependencies]\nproptest = \"1\"\n\n[[bin]]\nname = \"fixture-one\"\npath = \"src/bin/one.rs\"\n\n[[bin]]\nname = \"fixture-two\"\npath = \"src/bin/two.rs\"\n\n[profile.release]\nopt-level = 3\nlto = true\ncodegen-units = 1\n\n[profile.dev]\nopt-level = 0\ndebug = true\n\n[workspace]\nmembers = [\"crates/one\", \"crates/two\", \"crates/three\"]\n\n[workspace.metadata.fixture]\nowner = \"chunk-corpus\"\nnote = \"small and synthetic, not lifted from any real config file\"\n\n"
+  },
+  {
+    "byte_start": 738,
+    "byte_end": 855,
+    "line_start": 41,
+    "line_end": 51,
+    "content": "[[table_array]]\nid = 1\nname = \"first\"\n\n[[table_array]]\nid = 2\nname = \"second\"\n\n[[table_array]]\nid = 3\nname = \"third\"\n"
+  }
+]

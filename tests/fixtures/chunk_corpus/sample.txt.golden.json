@@ -1,0 +1,16 @@
+[
+  {
+    "byte_start": 0,
+    "byte_end": 739,
+    "line_start": 1,
+    "line_end": 14,
+    "content": "A small synthetic plain-text fixture for the chunker corpus.\n\nThis file exists only to exercise the line-fallback path: no tree-sitter\ngrammar applies to plain text, so the chunker must fall back to merging\nwhole lines up to the desired chunk length instead of walking a parse\ntree. ASCII-only, like the other fixtures in this corpus, so char offsets\nand byte offsets coincide and the golden data captured from semble's own\nchunker is directly comparable to this port's byte-offset output.\n\nThe content below is filler, repeated with small variations so the file\nis long enough to force at least one merge boundary at the desired chunk\nlength of seven hundred fifty characters, without being anywhere near the\nsize of a real source file.\n\n"
+  },
+  {
+    "byte_start": 739,
+    "byte_end": 1452,
+    "line_start": 15,
+    "line_end": 26,
+    "content": "Paragraph one talks about ledgers. A ledger holds entries. Each entry has\na key, a value, and an optional tag. Entries can be inserted, removed, and\nlooked up by tag. None of this is real, it only needs a rough shape.\n\nParagraph two talks about chunkers. A chunker takes bytes and a language\nand returns a list of chunks. Each chunk has text, a byte span, and a\nline span. The chunker should not care what the bytes mean, only how long\neach candidate span is relative to the desired chunk length.\n\nParagraph three is the last one. It exists purely to push the file past\nthe point where a single merge boundary is not enough, so the golden data\nthis fixture produces actually exercises more than one output chunk.\n"
+  }
+]

@@ -135,6 +135,7 @@ fn estate() -> Estate {
         files: vec![ScannedFile {
             relative_path: "docs/note.md".to_string(),
             content_hash: "hash/docs/note.md".to_string(),
+            content_digest: "hash/docs/note.md".to_string(),
             extractor: MARKDOWN_EXTRACTOR.to_string(),
             local_key: "key/docs/note.md".to_string(),
             byte_len: NOTE_MD.len() as u64,
@@ -156,6 +157,7 @@ fn estate() -> Estate {
         extractors,
         datasets: Vec::new(),
         root: None,
+        identity_root: None,
         context_fields: ContextFields::none(),
     };
     record_scan(

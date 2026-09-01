@@ -11,6 +11,21 @@
 #
 # One sub-stage per suite, each with its own accounting and hygiene sweep, so
 # a loss can be attributed to the suite that lost it rather than to "the run".
+#
+# close-0.3.0 seam 2 (brief-gate-d-env-race.md, #258's env axis): `cargo
+# llvm-cov --no-report --test <suite>` gives one-process `cargo test`
+# semantics — env vars set by one test in a binary leak into its siblings.
+# Twelve suites repo-wide call `set_var`; eight of them are wired here
+# (`m4_backends`, `codex_backend`, `x3a_scan_uses_only_local_reads`,
+# `w3b_semantic_retrieval`, `s6_semantic_vectors`, `s6_semantic_crossing`,
+# `w4_rrf_fusion`, `w4a_retrieval_floor`) and were latent-red under this gate
+# whether or not they had fired yet — reproduced firing for
+# `w3b_semantic_retrieval` (release dry-run 33436757846). Each is invoked
+# through `cargo llvm-cov nextest` instead of plain `cargo llvm-cov`: same
+# instrumentation, but nextest's own process-per-test isolation (the reason
+# every suite in this repo is nextest-safe to begin with) removes the race
+# at its source rather than serializing around it. Every other suite in this
+# file mutates no shared env and is unaffected; left on the plain form.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +37,7 @@ cov_run cargo llvm-cov --no-report --test m1_event_core --locked || cov_fail "m1
 cov_stage_end 1 "the m1 test binary must write its own profile"
 
 cov_stage_begin c2-m4_backends
-cov_run cargo llvm-cov --no-report --test m4_backends --locked || cov_fail "m4_backends failed under instrumentation"
+cov_run cargo llvm-cov nextest --no-report --test m4_backends --locked || cov_fail "m4_backends failed under instrumentation"
 cov_stage_end 1 "the m4 test binary must write its own profile"
 
 cov_stage_begin c2-m3_execution
@@ -68,7 +83,7 @@ cov_stage_end 1 "the estate_routes test binary must write its own profile"
 # at all, exactly m3_execution's/estate_routes's rig. codex_routing.rs is
 # in-process-only throughout (no StubCodex, no subprocess). Floor 1 for both.
 cov_stage_begin c2-codex_backend
-cov_run cargo llvm-cov --no-report --test codex_backend --locked || cov_fail "codex_backend failed under instrumentation"
+cov_run cargo llvm-cov nextest --no-report --test codex_backend --locked || cov_fail "codex_backend failed under instrumentation"
 cov_stage_end 1 "the codex_backend test binary must write its own profile (StubCodex's children are shell-script stand-ins, uninstrumented and no loss, per m4's own precedent)"
 
 # Added 2026-08-23, in the same commit that adds the suite (the W1 opencode
@@ -163,7 +178,7 @@ cov_stage_end 1 "the x3a_git_plumbing test binary must write its own profile"
 # scan runs only read-only Git verbs and leaves the mount byte-identical.
 # Floor 1.
 cov_stage_begin c2-x3a_scan_uses_only_local_reads
-cov_run cargo llvm-cov --no-report --test x3a_scan_uses_only_local_reads --locked || cov_fail "x3a_scan_uses_only_local_reads failed under instrumentation"
+cov_run cargo llvm-cov nextest --no-report --test x3a_scan_uses_only_local_reads --locked || cov_fail "x3a_scan_uses_only_local_reads failed under instrumentation"
 cov_stage_end 1 "the x3a_scan_uses_only_local_reads test binary must write its own profile"
 
 # S3 X3b: the F5 corpus gate — the hand-verified multi-language fixture corpus
@@ -362,7 +377,7 @@ cov_stage_end 1 "the w3_semantic_degradation test binary must write its own prof
 # w1d_overlay_scan_measurement, w2_startup_measurement and
 # w3_prune_measurement get.
 cov_stage_begin c2-w3b_semantic_retrieval
-cov_run cargo llvm-cov --no-report --test w3b_semantic_retrieval --locked || cov_fail "w3b_semantic_retrieval failed under instrumentation"
+cov_run cargo llvm-cov nextest --no-report --test w3b_semantic_retrieval --locked || cov_fail "w3b_semantic_retrieval failed under instrumentation"
 cov_stage_end 1 "the w3b_semantic_retrieval test binary must write its own profile"
 
 cov_stage_begin c2-w3b_model2vec_manifest_pin
@@ -378,7 +393,7 @@ cov_stage_end 1 "the w3b_model2vec_manifest_pin test binary must write its own p
 # tempdirs and records scans through the ordinary `scan_and_record` path. No
 # daemon, no estate, no subprocess. Floor 1.
 cov_stage_begin c2-s6_semantic_vectors
-cov_run cargo llvm-cov --no-report --test s6_semantic_vectors --locked || cov_fail "s6_semantic_vectors failed under instrumentation"
+cov_run cargo llvm-cov nextest --no-report --test s6_semantic_vectors --locked || cov_fail "s6_semantic_vectors failed under instrumentation"
 cov_stage_end 1 "the s6_semantic_vectors test binary must write its own profile"
 
 # S6, wired at birth (the #231 lesson): the semantic half AT THE CROSSING —
@@ -389,7 +404,7 @@ cov_stage_end 1 "the s6_semantic_vectors test binary must write its own profile"
 # failed, three states an operator acts on differently. Starts a real
 # daemon; no subprocess and no estate beyond its own tempdir. Floor 1.
 cov_stage_begin c2-s6_semantic_crossing
-cov_run cargo llvm-cov --no-report --test s6_semantic_crossing --locked || cov_fail "s6_semantic_crossing failed under instrumentation"
+cov_run cargo llvm-cov nextest --no-report --test s6_semantic_crossing --locked || cov_fail "s6_semantic_crossing failed under instrumentation"
 cov_stage_end 1 "the s6_semantic_crossing test binary must write its own profile"
 
 # S5 W4, wired at birth (the #231 lesson, same as w1/w1b/w1c/w1d/w2/w3/w3b
@@ -402,7 +417,7 @@ cov_stage_end 1 "the s6_semantic_crossing test binary must write its own profile
 # stores in tempdirs and records scans through the ordinary `record_scan`
 # path. No daemon, no estate, no subprocess of any kind. Floor 1.
 cov_stage_begin c2-w4_rrf_fusion
-cov_run cargo llvm-cov --no-report --test w4_rrf_fusion --locked || cov_fail "w4_rrf_fusion failed under instrumentation"
+cov_run cargo llvm-cov nextest --no-report --test w4_rrf_fusion --locked || cov_fail "w4_rrf_fusion failed under instrumentation"
 cov_stage_end 1 "the w4_rrf_fusion test binary must write its own profile"
 
 # The semble-parity wave's relevance floor, wired at birth (#231) in the same
@@ -416,7 +431,7 @@ cov_stage_end 1 "the w4_rrf_fusion test binary must write its own profile"
 # scan makes it the slowest suite in C2 (about a minute). No daemon, no
 # estate, no subprocess. Floor 1.
 cov_stage_begin c2-w4a_retrieval_floor
-cov_run cargo llvm-cov --no-report --test w4a_retrieval_floor --locked || cov_fail "w4a_retrieval_floor failed under instrumentation"
+cov_run cargo llvm-cov nextest --no-report --test w4a_retrieval_floor --locked || cov_fail "w4a_retrieval_floor failed under instrumentation"
 cov_stage_end 1 "the w4a_retrieval_floor test binary must write its own profile"
 
 # S5 W5, wired at birth (the #231 lesson, same as w1/w1b/w1c/w1d/w2/w3/w3b/w4
@@ -490,3 +505,18 @@ cov_stage_end 1 "the s6_scan_front_door test binary must write its own profile"
 cov_stage_begin c2-f334_journal_integrity
 cov_run cargo llvm-cov --no-report --test f334_journal_integrity --locked || cov_fail "f334_journal_integrity failed under instrumentation"
 cov_stage_end 1 "the f334_journal_integrity test binary must write its own profile"
+
+# Wave `projection-identity` seam 1, wired at birth (the #231 lesson, same as
+# w2/w3/w3b above): the owner's ruling
+# (projection-model-and-false-j0s-2026-08-31.md #3) — one physical file
+# covered by two admissible sources is one unit in the projection, not two.
+# A real temporary Git repository (real `git init`/`add`/`commit`
+# subprocesses) whose tree contains a `knowledge/` subtree, scanned once as
+# an estate-git source (`scan_and_record_estate_git`) and once as a
+# `[[knowledge]]` source at that subtree (`scan_and_record`), into one real
+# on-disk Atlas store, then queried through the real `lexical_search`. No
+# daemon, no `sgt` client subprocess — only `git`, the same uninstrumented
+# stand-in m4/w2 above already rely on. Floor 1.
+cov_stage_begin c2-seam1_projection_identity
+cov_run cargo llvm-cov --no-report --test seam1_projection_identity --locked || cov_fail "seam1_projection_identity failed under instrumentation"
+cov_stage_end 1 "the seam1_projection_identity test binary must write its own profile"

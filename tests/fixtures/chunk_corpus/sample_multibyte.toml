@@ -1,0 +1,180 @@
+# Dependency policy source of truth (proposal-ci-cd-release-engineering.md §5.2).
+#
+# Routine PRs run `cargo deny check bans licenses sources` (advisories stay a
+# separate security signal so a new RustSec advisory against an unchanged
+# Cargo.lock doesn't redden an unrelated PR). Release qualification runs the
+# full `cargo deny check`, including advisories.
+#
+# License allow-list is exactly what knowledge/evidence/ci-slice1-baseline-2026-08-17.md
+# measured against the unmodified graph: 27 distinct expressions across 409
+# resolved package versions, all ordinary permissive/public-domain terms.
+# `LGPL-2.1-or-later` — the one entry the baseline flagged as worth a specific
+# look rather than blanket admission — is deliberately NOT allowed here; see
+# the comment below.
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+
+# S4 Y2 (G3, gate a): scoped, dated exception for a single named advisory,
+# not a broadened rule and not a disabled gate.
+#
+# RUSTSEC-2026-0192 — `ttf-parser` 0.25.1 is unmaintained, no safe upgrade.
+# Reached unconditionally via anydoc -> pdf-inspector -> lopdf -> ttf-parser
+# (font metadata for `pdf-inspector`'s PDF leg; `anydoc` ships no feature
+# flag to drop `pdf-inspector` from the build). Recorded/reverted spike:
+# tests/fixtures/anydoc_corpus/SPIKE-G3.md.
+#
+# Owner ruling (J4), 2026-08-27:
+# knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md — ADOPT
+# anydoc; the advisory is accepted risk in a pre-alpha, open-source, MIT
+# harness because per-format composition would defeat the "any doc"
+# capability itself (A1 §6.3). The ruling's condition (2) is a
+# replaceability boundary — anydoc lives behind a narrow adapter contract
+# so it stays swappable; that is proved structurally by this wave's
+# one-owner adapter test, not by this file.
+#
+# This entry ignores exactly this one advisory ID. It does NOT ignore the
+# `ttf-parser` crate, the `anydoc`/`pdf-inspector`/`lopdf` crates, or any
+# other advisory ID — cargo-deny's `ignore` list matches by RUSTSEC ID, so a
+# different advisory reaching the graph through the same subtree (a new ID
+# against ttf-parser, lopdf, pdf-inspector, anydoc, or anything else the
+# anydoc dependency edge pulls in) still fails `cargo deny check` under this
+# same config. Proven, not just asserted, against this exact file, by
+# `tests/fixtures/anydoc_corpus/prove-exception-is-scoped.sh` (rerunnable;
+# last recorded run: `tests/fixtures/anydoc_corpus/G3-exception-narrowness-proof.md`) —
+# it runs `cargo deny check advisories` against THIS file with a synthetic
+# advisory injected against `lopdf` (a sibling of `ttf-parser` under
+# `anydoc -> pdf-inspector -> lopdf`) under a fresh id this entry has never
+# heard of, and asserts that advisory still fails the gate while
+# RUSTSEC-2026-0192 stays ignored.
+#
+# Revisit triggers (ruling, "Revisit triggers" section — any one reopens
+# this decision):
+# - an `anydoc`/`pdf-inspector` release drops or replaces `ttf-parser`, or a
+#   `ttf-parser` release resolves RUSTSEC-2026-0192 with a safe upgrade;
+# - a NEW advisory arrives through the anydoc subtree (by design, this
+#   entry will not suppress it — the gate goes red and that redness is the
+#   trigger firing, not a bug in this exception);
+# - `anydoc` itself becomes unmaintained, at which point the replaceability
+#   boundary is what gets exercised.
+#
+# NOT covered by this entry: the pre-existing, unrelated yanked `chacha20`
+# via `ulid` -> `rand` (sergeant-rs#328) stays a live failure of its own —
+# this exception does not touch it and does not suppress it.
+# S5 W3b (F5, gate 1): a SECOND scoped, dated exception for a single named
+# advisory. It sits beside the anydoc entry above and does not touch,
+# generalise or replace it — two named IDs, not a relaxed rule.
+#
+# RUSTSEC-2024-0436 — `paste` 1.0.15 is unmaintained and archived; the
+# advisory itself says "No safe upgrade is available!". Reached
+# unconditionally via `paste -> tokenizers 0.21.4 -> model2vec-rs 0.2.1`,
+# and A2 §6's semantic half needs a Model2Vec implementation (decision
+# A2-06). Verified unavoidable rather than asserted, in
+# tests/fixtures/model2vec_corpus/SPIKE-F5.md:
+#   - `paste` is NOT optional in `tokenizers 0.21.4` — no `optional = true`,
+#     no feature guard, so no feature combination drops it;
+#   - `tokenizers 0.23.1` still depends on it;
+#   - `model2vec-rs` requires `tokenizers = "0.21"` regardless;
+#   - the alternative crate `model2vec 0.3.0` requires the same.
+#   Every Rust Model2Vec reads `tokenizer.json` through `tokenizers`, and
+#   `tokenizers` goes through `paste`.
+#
+# Owner ruling (J4), 2026-08-30:
+# knowledge/rulings/owner-rulings/model2vec-paste-advisory-2026-08-30.md —
+# "Model2Vec is ADOPTED — it always was (A2-06) … RUSTSEC-2024-0436 is
+# accepted as a SCOPED, DATED cargo-deny exception naming that advisory ID
+# specifically — never a broadened rule, never a disabled gate … The next
+# advisory must still fail the gate."
+#
+# NOT excepted, and must never be: **RUSTSEC-2025-0119** (`number_prefix` via
+# `indicatif` via `tokenizers/progressbar`). It is AVOIDED, not ignored —
+# `Cargo.toml` declares `tokenizers` directly with `fancy-regex` alone, which
+# drops `indicatif`/`number_prefix` from `Cargo.lock` entirely. The ruling's
+# decision 3 is explicit: "The second advisory stays avoided, not excepted."
+# `tests/w3b_model2vec_manifest_pin.rs` fails if either crate reappears in
+# the lockfile.
+#
+# Scoped by ID, and PROVEN so rather than asserted, against this exact file,
+# by `tests/fixtures/model2vec_corpus/prove-exception-is-scoped.sh`
+# (rerunnable; last recorded run:
+# tests/fixtures/model2vec_corpus/F5-exception-narrowness-proof.md) — it runs
+# `cargo deny check advisories` against THIS file with a synthetic advisory
+# injected against `tokenizers` (the crate directly between `paste` and
+# `model2vec-rs`) under a fresh id this entry has never heard of, and asserts
+# that advisory still fails the gate while RUSTSEC-2024-0436 stays ignored.
+#
+# Revisit triggers (ruling, "Revisit triggers" — any one reopens this):
+# - a `tokenizers` release that drops or replaces `paste`;
+# - a `paste` release resolving the advisory;
+# - a NEW advisory arriving through the model2vec subtree — by design this
+#   entry will not suppress it, and the gate going red IS the trigger firing.
+ignore = [
+  { id = "RUSTSEC-2026-0192", reason = "anydoc's pdf-inspector->lopdf leg pulls unmaintained ttf-parser unconditionally; accepted risk per owner ruling knowledge/rulings/owner-rulings/anydoc-adoption-2026-08-27.md (J4), scoped to this one advisory ID only — see the comment above for revisit triggers." },
+  { id = "RUSTSEC-2024-0436", reason = "model2vec-rs -> tokenizers pulls unmaintained/archived paste unconditionally (no safe upgrade); accepted risk per owner ruling knowledge/rulings/owner-rulings/model2vec-paste-advisory-2026-08-30.md (J4), scoped to this one advisory ID only — see the comment above for revisit triggers." },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "CC0-1.0",
+  "Unlicense",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+# LGPL-2.1-or-later appears once in the graph, inside an OR clause on a
+# dependency in the windows-sys/icu-adjacent cluster (baseline §3). Left off
+# the allow-list on purpose: it's the one expression in the measured set that
+# isn't a permissive/public-domain-style license, and it hasn't had an owner
+# ruling to admit it. Verified with `cargo deny check licenses` against this
+# allow-list: the crate's OR clause resolves to an already-allowed sibling
+# term, so `licenses ok` holds without adding LGPL-2.1-or-later here. If a
+# future dependency bump drops that sibling term from the OR clause, this
+# check starts failing on it — that failure is the intended fail-closed
+# behavior, not a regression to silently work around.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# --- chunker-utf8 density extension (S6 wave) — synthetic, appended for
+# fixture coverage only; the content above this line is the REAL
+# sergeant-rs deny.toml, verbatim, and is what reproduced the original
+# panic at byte 3592 (see brief-chunker-utf8.md). This block adds the
+# additional multi-byte forms the wave brief names that deny.toml alone
+# does not contain: accented words, CJK, and an emoji.
+#
+# Accented: café, naïve, façade, jalapeño, Zürich, résumé — six words.
+# CJK: 你好世界 ("hello world"), 東京 ("Tokyo"), 数据库 ("database").
+# Emoji: a lock 🔒, a check ✅, and a warning ⚠️ — three graphemes, each
+# a multi-byte.
+#
+# NOTE (F-IN-02): an earlier revision of this comment claimed the lock and
+# check together straddle a byte offset that is an exact multiple of
+# chunk::DESIRED_CHUNK_LENGTH (750). That is false of the committed golden:
+# tree-sitter's TOML grammar always splits chunks at comment/node edges, so
+# the AST-merge path cannot naturally land a chunk boundary mid-codepoint —
+# every byte_start/byte_end in sample_multibyte.toml.golden.json already
+# lands on a valid char boundary, and the lock/check pair sits entirely
+# inside one chunk (bytes 8082..8791), straddling nothing. This fixture
+# exercises non-ASCII density and round-trip content fidelity through the
+# real pipeline; the mid-codepoint boundary-snapping invariant itself is
+# proven directly, by construction, in `chunk.rs`'s
+# `finalize_chunk_never_panics_on_a_boundary_that_splits_a_multibyte_char`
+# and `finalize_chunk_never_duplicates_content_across_adjacent_boundaries_
+# sharing_a_split_point` — not by this file landing on a real chunk seam.
+#
+[extension.metadata]
+note = "Zürich → 東京 — one em dash, one arrow, both multi-byte"

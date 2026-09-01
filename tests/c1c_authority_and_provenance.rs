@@ -484,6 +484,7 @@ fn a_document_excerpt_carries_extractor_native_coordinate_and_heading() {
     let office = ScannedFile {
         relative_path: "decks/current-state.docx".to_string(),
         content_hash: "hash/decks/current-state.docx".to_string(),
+        content_digest: "hash/decks/current-state.docx".to_string(),
         extractor: OFFICE_EXTRACTOR.to_string(),
         local_key: "key/decks/current-state.docx".to_string(),
         byte_len: OFFICE_BODY.len() as u64,
@@ -628,6 +629,7 @@ fn an_excerpt_addressed_by_a_native_coordinate_renders_no_empty_byte_span() {
     let office = ScannedFile {
         relative_path: "decks/current-state.docx".to_string(),
         content_hash: "hash/decks/current-state.docx".to_string(),
+        content_digest: "hash/decks/current-state.docx".to_string(),
         extractor: OFFICE_EXTRACTOR.to_string(),
         local_key: "key/decks/current-state.docx".to_string(),
         byte_len: OFFICE_BODY.len() as u64,

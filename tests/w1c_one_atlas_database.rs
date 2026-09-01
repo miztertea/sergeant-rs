@@ -88,6 +88,7 @@ fn scan(source_name: &str, content_key: &str, body: &str) -> SourceScan {
     let file = ScannedFile {
         relative_path: "src/main.rs".to_string(),
         content_hash: format!("hash/{content_key}"),
+        content_digest: format!("hash/{content_key}"),
         extractor: TEXT_EXTRACTOR.to_string(),
         local_key: format!("key/{content_key}"),
         byte_len: body.len() as u64,
@@ -117,6 +118,7 @@ fn scan(source_name: &str, content_key: &str, body: &str) -> SourceScan {
         coverage: Vec::new(),
         datasets: Vec::new(),
         root: None,
+        identity_root: None,
         context_fields: ContextFields::none(),
     }
 }

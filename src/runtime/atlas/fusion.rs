@@ -70,7 +70,7 @@
 //! and in the fused answer, with the filter open, and absent from both with
 //! it closed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::source::{AuthorityClass, SourceKind};
 
@@ -690,21 +690,35 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit]) -> Vec<FusedHit> {
 /// A2 §8's second step, applied to a list [`fuse`] produced and a caller
 /// filled the signals of: **adjust every score, then sort by it once.**
 ///
-/// semble's `penalties.py::rerank_topk`, in its order:
+/// semble's own order (`search.py::search` calling into
+/// `ranking/boosting.py` and `ranking/penalties.py::rerank_topk`):
 ///
-/// 1. each candidate's score is multiplied by its signal factor
-///    ([`RerankSignals::multiplier`]);
-/// 2. a file whose chunks score well collectively has its best chunk
-///    boosted ([`boost_multi_chunk_files`]);
+/// 1. a file whose chunks score well collectively has its best chunk
+///    boosted, computed from the raw fused score
+///    ([`boost_multi_chunk_files`]) — *first*, before any per-query signal
+///    has touched a single candidate;
+/// 2. each candidate's score is then multiplied by its signal factor
+///    ([`RerankSignals::multiplier`]) — this module's carrier of semble's
+///    exact-match/definition-tier boost (`boosting.py`'s `apply_query_boost`,
+///    symbol branch);
 /// 3. semble's NL query boost is added — `max_score ×
-///    STEM_BOOST_MULTIPLIER × `[`path_stem_match_ratio`];
+///    STEM_BOOST_MULTIPLIER × `[`path_stem_match_ratio`] (the same
+///    function's stem branch, mutually exclusive with step 2's symbol
+///    branch in semble, sequential here for the same net effect since a
+///    query is either symbol-shaped or not);
 /// 4. signal 7's path penalty multiplies what is left
 ///    ([`RerankSignals::path_penalty`]);
-/// 2. candidates are put in that order;
-/// 3. a greedy pass decays each chunk after the first from an
+/// 5. candidates are put in that order;
+/// 6. a greedy pass decays each chunk after the first from an
 ///    already-seen file by [`FILE_SATURATION_DECAY`] per excess chunk —
 ///    without this one file took nine of ten slots on the real estate;
-/// 4. one final sort by the decayed score.
+/// 7. one final sort by the decayed score.
+///
+/// **Steps 1 and 2 must not swap.** Swapped, a file's own signal-boosted
+/// chunk inflates that file's total, which inflates the *shared*
+/// `max_total` denominator every other file's coherence share (step 1) is
+/// computed against — measured and pinned by `tests/w4_rrf_fusion.rs::
+/// a_files_own_exact_match_does_not_inflate_the_coherence_denominator_other_files_share`.
 ///
 /// **Limit-independent by construction.** semble's `rerank_topk` takes
 /// `top_k` and exits the greedy pass early once the remaining scores cannot
@@ -714,13 +728,32 @@ pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit]) -> Vec<FusedHit> {
 /// answer alone and `tests/w4_rrf_fusion.rs::
 /// the_fused_order_does_not_depend_on_the_callers_limit` stays true.
 pub fn rerank(hits: &mut [FusedHit], query: &str) {
-    // Stage 1 — A2 §8's signals as boosts. Signal 7 is deliberately not
-    // here; it is a later stage, as in semble.
+    // Stage 1 — file coherence, computed from the raw fused score.
+    //
+    // semble's own order (`search.py::search`): `boost_multi_chunk_files`
+    // (line 124) runs on the raw alpha-blended/RRF'd `combined_scores`,
+    // *before* `apply_query_boost` (line 126) — the function carrying the
+    // exact-match/definition-tier boost this module ports as
+    // [`RerankSignals::multiplier`] — ever touches a single candidate's
+    // score. Running the multiplier first (the order this stage used to
+    // have) let one file's own exact-match-boosted chunk inflate that
+    // file's `file_total`, which in turn inflated the *shared* `max_total`
+    // denominator every other file's coherence share is computed against —
+    // a candidate with no signal of its own ended up penalised by a boost
+    // it never earned, purely for sharing the answer with a flagged file.
+    // `tests/w4_rrf_fusion.rs::
+    // a_files_own_exact_match_does_not_inflate_the_coherence_denominator_other_files_share`
+    // pins the corrected number by hand.
     for hit in hits.iter_mut() {
-        hit.adjusted = hit.rrf * hit.signals.multiplier();
+        hit.adjusted = hit.rrf;
     }
-    // Stage 2 — file coherence.
     boost_multi_chunk_files(hits);
+    // Stage 2 — A2 §8's signals as boosts, now applied on top of the
+    // coherence-adjusted score. Signal 7 is deliberately not here; it is a
+    // later stage, as in semble.
+    for hit in hits.iter_mut() {
+        hit.adjusted *= hit.signals.multiplier();
+    }
     // Stage 3 — semble's `apply_query_boost`, NL branch: additive against
     // the answer's largest score, computed once, before any boost is added.
     let max_score = hits.iter().map(|hit| hit.adjusted).fold(0.0_f64, f64::max);
@@ -746,6 +779,91 @@ pub fn rerank(hits: &mut [FusedHit], query: &str) {
         *already += 1;
     }
     hits.sort_by(rerank_order);
+}
+
+/// **F-SF-01 / brief-search-three-bugs.md Bug 3** — *"the same (source,
+/// path) twice in one top-5"*: two units of one file surfacing as two
+/// file-level rows (measured: `c02` `blob.rs` ×2, `c07` `preflight.rs` ×2
+/// from a single source).
+///
+/// [`FILE_SATURATION_DECAY`] (applied inside [`rerank`], directly above)
+/// only *discounts* a file's second-and-later chunk — it is semble's own
+/// shape (`penalties.py::rerank_topk`) and semble's shape does not remove a
+/// duplicate, it only makes it less likely to outrank something else. A
+/// file whose two units both score well can still both survive into the
+/// caller's `top_k` after decay; `tests/w4_rrf_fusion.rs::
+/// a_second_chunk_of_the_same_file_is_decayed_so_one_file_cannot_take_every_slot`
+/// pins exactly that (it asserts the crowded file no longer takes *every*
+/// slot, never that it takes only one). The brief's own bug report is a
+/// *file-row* duplicate, not merely a decayed-but-present one, so decay
+/// alone does not close it.
+///
+/// This is the grouping half the brief asks to port alongside decay
+/// (`boosting.py::boost_multi_chunk_files` *"+ rerank's per-file decay"*,
+/// read together): one row per **generation** of a file in the final
+/// answer. `hits` must already be in [`rerank_order`] (i.e. already run
+/// through [`rerank`]), so the first candidate seen for a given
+/// `(source_name, relative_path, generation_id)` is that generation's
+/// best-scoring surviving chunk — the one this keeps, in its already-decided
+/// rank position. **R7** — no existing grouping utility in this crate
+/// collapses by a multi-part key, and a `BTreeSet` membership filter is the
+/// minimum that works.
+///
+/// # Two things this must not collapse, and why `generation_id` is in the
+/// key rather than just `(source_name, relative_path)`
+///
+/// `tests/w4_rrf_fusion.rs::
+/// an_overlay_unit_whose_content_matches_the_base_is_not_marked_work_changed`
+/// queries a Work's base and its overlay generation of the *same*
+/// `docs/ledger.md` under the *same* `source_name` — two rows the caller
+/// must see side by side to compare, not a duplicate. Keying on
+/// `generation_id` too keeps them apart; `(source_name, relative_path)`
+/// alone collapsed them; this was measured, not assumed (the fixture-red
+/// run below).
+///
+/// # What this must not collapse either, and why a native-addressed unit is
+/// exempt outright
+///
+/// `tests/w5_search_surface.rs::
+/// one_local_knowledge_query_spans_a_normalized_docx_and_a_markdown_file`
+/// expects *both* a `.docx`'s whole-document unit and its section units in
+/// one answer — one generation, one `relative_path`, several genuinely
+/// distinct addresses. A section's [`UnitCoordinate::Document::native`] (or
+/// [`UnitCoordinate::Mail::native`]) is, per those fields' own doc,
+/// *"the only address it has"* once the byte span is honestly `0`/`0` — a
+/// unit for which the file's byte range cannot serve as the disambiguator
+/// a plain chunk relies on. A hit that carries one is never folded into
+/// another hit of the same generation; it is always kept, and it is never
+/// what causes an *other* hit to be dropped (`seen.insert` is skipped for
+/// it entirely, in both directions).
+pub fn dedup_file_rows(hits: Vec<FusedHit>) -> Vec<FusedHit> {
+    let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+    hits.into_iter()
+        .filter(|hit| {
+            if has_native_address(&hit.coordinate) {
+                return true;
+            }
+            seen.insert((
+                hit.source_name.clone(),
+                hit.coordinate.relative_path().to_string(),
+                hit.generation_id.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// Whether `coordinate` carries A2 §9's *native coordinate* — see
+/// [`dedup_file_rows`]'s own doc for why that exempts it from grouping.
+/// Only [`UnitCoordinate::Document`] and [`UnitCoordinate::Mail`] have the
+/// field at all; [`UnitCoordinate::Code`] and [`UnitCoordinate::RowText`]
+/// never do, and are always grouped like any ordinary chunk.
+fn has_native_address(coordinate: &UnitCoordinate) -> bool {
+    match coordinate {
+        UnitCoordinate::Document { native, .. } | UnitCoordinate::Mail { native, .. } => {
+            native.is_some()
+        }
+        UnitCoordinate::Code { .. } | UnitCoordinate::RowText { .. } => false,
+    }
 }
 
 /// The minimum fraction of a query's keywords a path must match before the
@@ -921,15 +1039,55 @@ fn boost_multi_chunk_files(hits: &mut [FusedHit]) {
 /// A `RowText` unit's "name" is its row key — A2 §3's structured-text
 /// coordinate has no heading and no symbol, and the row id is the only name
 /// that coordinate carries.
-pub fn exact_match(terms: &[String], coordinate: &UnitCoordinate) -> bool {
-    let mut names: Vec<String> = Vec::new();
+///
+/// **The file-name/stem half of this signal fires for any query shape; the
+/// symbol/title half is gated on the whole query looking like a bare symbol
+/// (`query_is_symbol`, i.e. [`is_symbol_query`]).** A file name naming
+/// exactly what a natural-language query is about ("watch" → `watch.rs`,
+/// "preflight" → `preflight.rs`) is `code`-category signal this wave
+/// measured as real — gating it off dropped the `code` category from p@1
+/// 0.700 to 0.450 (`/var/tmp/sgt-test-tmp/sgt_results.json`, this stage's
+/// own first, reverted attempt). A code *symbol* or a document
+/// *title/heading* coincidentally matching one term of an otherwise
+/// unrelated natural-language query is a different, much weaker signal —
+/// that is exactly what semble's `boosting.py::apply_query_boost` reserves
+/// for `is_symbol_query(query)` (matched against the *entire* trimmed query
+/// string; its own comment: *"Plain lowercase words (e.g. 'session') are
+/// NL, not symbols"*), leaving symbol/definition boosting for a
+/// non-symbol-shaped NL query to a narrower, additive, half-strength path
+/// (`_boost_embedded_symbols`) this port does not replicate (R7: adopting
+/// the *gate*, not the additive mechanism behind it — see this module's own
+/// provenance table). Without this half of the gate, a three-word query
+/// like "bounded judgment ladder" earns the full [`BOOST_EXACT_MATCH`]
+/// multiplier for a bash helper function *named* `bounded()`, over the
+/// actually-relevant doctrine section (measured: `sgt search "bounded
+/// judgment ladder"` returning `scripts/probe-env.sh` above `AGENTS.md`'s
+/// own Bounded-Judgment Ladder section).
+///
+/// **Not [`crate::runtime::atlas::lexical::is_identifier_like`] (F-SF-01):**
+/// that predicate is true when *any* compound inside a longer text is
+/// identifier-shaped, so a multi-word NL query with one embedded
+/// identifier-shaped term (this file's own worked example, *"how is
+/// SourceKind validated"*) would pass it and open the full symbol/title
+/// boost — exactly the class of defect this signal exists to avoid. The
+/// caller passes [`is_symbol_query`] instead, which is gated on the *entire*
+/// query looking like a symbol, not on any one compound inside it.
+pub fn exact_match(terms: &[String], coordinate: &UnitCoordinate, query_is_symbol: bool) -> bool {
+    let mut file_names: Vec<String> = Vec::new();
     let path = coordinate.relative_path();
     if let Some(file_name) = path.rsplit('/').next() {
-        names.push(file_name.to_lowercase());
+        file_names.push(file_name.to_lowercase());
         if let Some((stem, _)) = file_name.split_once('.') {
-            names.push(stem.to_lowercase());
+            file_names.push(stem.to_lowercase());
         }
     }
+    if any_term_matches(&file_names, terms) {
+        return true;
+    }
+    if !query_is_symbol {
+        return false;
+    }
+    let mut names: Vec<String> = Vec::new();
     match coordinate {
         UnitCoordinate::Code { symbol, .. } => names.push(symbol.to_lowercase()),
         UnitCoordinate::Document { title, .. } | UnitCoordinate::Mail { title, .. } => {
@@ -939,6 +1097,15 @@ pub fn exact_match(terms: &[String], coordinate: &UnitCoordinate) -> bool {
         }
         UnitCoordinate::RowText { row_key, .. } => names.push(row_key.to_lowercase()),
     }
+    any_term_matches(&names, terms)
+}
+
+/// F-SI-01: the shared match predicate behind both halves of
+/// [`exact_match`] — one of `names` (already lowercased) equals one of
+/// `terms` (already lowercased and distinct). Factored out so the
+/// file-name/stem check and the symbol/title check share one definition of
+/// "exact" instead of carrying the same closure twice.
+fn any_term_matches(names: &[String], terms: &[String]) -> bool {
     names
         .iter()
         .any(|name| !name.is_empty() && terms.iter().any(|term| term == name))
@@ -1089,16 +1256,103 @@ mod tests {
     }
 
     #[test]
-    fn an_exact_symbol_or_file_name_match_fires_and_a_partial_one_does_not() {
+    fn an_exact_symbol_or_file_name_match_fires_only_when_the_whole_query_looks_like_a_symbol() {
         let terms = vec!["retry".to_string()];
+        // Gate open: the caller asserts the whole query looked like a bare
+        // symbol (e.g. `retry_policy`, `RetryPolicy`) — name-equality logic
+        // is unchanged from before this test.
         assert!(exact_match(
             &terms,
-            &code("src/payments/charge.rs", "retry")
+            &code("src/payments/charge.rs", "retry"),
+            true
         ));
-        assert!(exact_match(&terms, &code("src/payments/retry.rs", "other")));
+        assert!(exact_match(
+            &terms,
+            &code("src/payments/retry.rs", "other"),
+            true
+        ));
         assert!(!exact_match(
             &terms,
-            &code("src/payments/retrying.rs", "retry_policy")
+            &code("src/payments/retrying.rs", "retry_policy"),
+            true
         ));
+    }
+
+    #[test]
+    fn a_single_incidental_term_match_does_not_fire_for_a_natural_language_query() {
+        // d01/d05/m01's reproduced defect (orientation, af3ec467): a
+        // three-word NL query like "bounded judgment ladder" contains the
+        // term "bounded", which happens to equal a bash helper's symbol
+        // name. semble's own `is_symbol_query` (boosting.py) requires the
+        // *whole* query to look identifier-shaped before this signal fires
+        // at all — a plain lowercase NL query never qualifies. This is
+        // that same gate: name-equality alone, on an NL query, must not
+        // fire the signal, even though the term literally equals the name.
+        let terms = vec![
+            "bounded".to_string(),
+            "judgment".to_string(),
+            "ladder".to_string(),
+        ];
+        assert!(
+            !exact_match(&terms, &code("scripts/probe-env.sh", "bounded"), false),
+            "an incidental single-term match on a natural-language query must not fire"
+        );
+    }
+
+    #[test]
+    fn a_file_name_match_still_fires_for_a_natural_language_query() {
+        // Gating the *whole* signal on query shape (this stage's first,
+        // reverted attempt — see `exact_match`'s own doc) took the `code`
+        // category from p@1 0.700 to 0.450: many code-category questions
+        // ("git preflight checks before a work is admitted", "watch for
+        // work transitions over server sent events") are natural-language
+        // *and* legitimately named by the file they're asking about. The
+        // file-name/stem half of this signal must keep firing regardless
+        // of query shape — only the symbol/title half is gated.
+        let terms = vec![
+            "git".to_string(),
+            "preflight".to_string(),
+            "checks".to_string(),
+        ];
+        assert!(
+            exact_match(&terms, &code("src/runtime/preflight.rs", "run"), false),
+            "a file-stem match must fire even on a natural-language query"
+        );
+    }
+
+    #[test]
+    fn is_identifier_like_and_is_symbol_query_diverge_on_an_embedded_identifier() {
+        use crate::runtime::atlas::lexical::is_identifier_like;
+
+        // F-SF-01: a multi-word NL query with one identifier-shaped
+        // compound (this file's own worked example) is identifier-like —
+        // `is_identifier_like` looks at *any* compound — but is not itself
+        // a symbol query — `is_symbol_query` requires the *whole* trimmed
+        // query to be one identifier-shaped token. `exact_match`'s
+        // symbol/title gate must use the latter, not the former, or this
+        // query would open the full exact-match boost for any unit merely
+        // named "sourcekind".
+        let query = "how is SourceKind validated";
+        assert!(
+            is_identifier_like(query),
+            "the repro query must actually be identifier-like by that predicate, \
+             or this test proves nothing about the divergence"
+        );
+        assert!(
+            !is_symbol_query(query),
+            "a multi-word NL query is never a bare symbol query"
+        );
+
+        let terms = vec![
+            "how".to_string(),
+            "is".to_string(),
+            "sourcekind".to_string(),
+            "validated".to_string(),
+        ];
+        let unrelated = code("src/somewhere/unrelated.rs", "SourceKind");
+        assert!(
+            !exact_match(&terms, &unrelated, is_symbol_query(query)),
+            "the symbol/title boost must not fire for an embedded-identifier NL query"
+        );
     }
 }

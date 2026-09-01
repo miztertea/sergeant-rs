@@ -53,7 +53,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::domain::event::rfc3339_utc_now;
-use crate::domain::source::{AuthorityClass, Coverage, CoverageRow, SourceKind};
+use crate::domain::source::{AuthorityClass, Coverage, CoverageRow, SourceKind, content_hash};
 use crate::runtime::atlas::deny::{AcquisitionFilter, BadPattern, Verdict};
 use crate::runtime::atlas::scan::{
     DATASET_NO_ROOT, KeySpace, MAX_RESOURCE_BYTES, ScannedFile, SourceScan, UNCLAIMED, claims_for,
@@ -340,6 +340,11 @@ fn extract_tree_impl(
         // F10a allowlist has nothing to gate (see [`DATASET_NO_ROOT`]).
         datasets: Vec::new(),
         root: None,
+        // The mount *is* a stable absolute path (§8.2 pins the exact commit
+        // it must be at) — populated here, not on `root`, per
+        // `SourceScan::identity_root`'s own doc: this is identity, not an
+        // in-place-dataset-read capability this source kind does not have.
+        identity_root: Some(source.mount.clone()),
         context_fields: ContextFields::none(),
         coverage: out.coverage,
         extractors: out.extractors,
@@ -541,6 +546,18 @@ pub(crate) fn extract_blobs(
             out.files.push(ScannedFile {
                 relative_path: entry.path.clone(),
                 local_key: extracted.key,
+                // Bug 2 (`brief-search-three-bugs.md`): the git-oid
+                // `content_hash` above is a different hash (and a different
+                // byte framing) from `blake3(bytes)`, so it can never merge
+                // with a filesystem-acquired twin's `content_hash`. This is
+                // the one extra hash pass F7's own doc, two lines up, warns
+                // against for the *identity-key* purpose — but that purpose
+                // is already served by `entry.oid`; this is a second,
+                // narrower purpose (cross-source projection identity, R7:
+                // the minimum that actually works, since no algorithm
+                // shared with the filesystem side exists without it) over
+                // bytes already resident in memory, not a second git read.
+                content_digest: content_hash(&object.bytes),
                 content_hash: entry.oid.clone(),
                 extractor: extracted.extractor.to_string(),
                 byte_len: object.bytes.len() as u64,
@@ -589,7 +606,7 @@ pub(crate) fn directory_coverage(
         if denied.iter().any(|dir| directory.starts_with(dir)) {
             continue;
         }
-        match filter.verdict(&directory) {
+        match filter.verdict_directory(&directory) {
             Verdict::Denied { pattern } => {
                 coverage.push(CoverageRow {
                     path: Some(directory.clone()),
@@ -885,6 +902,38 @@ mod tests {
         assert_eq!(row(&scan, "vendor").status, Coverage::Discovered);
         assert_eq!(row(&scan, "vendor/lib.md").status, Coverage::Excluded);
         assert_eq!(scan.files.len(), 1);
+    }
+
+    /// Bug 1 (`brief-search-three-bugs.md`), end to end through the real
+    /// git-source scan: a dotted top-level directory that is not
+    /// VCS/machinery (`.sergeant`, matching the ruling's own example) must
+    /// be walked and its files indexed, not silently dropped as if the
+    /// directory's own bare path were a hidden file leaf.
+    #[test]
+    fn a_dotted_top_level_directory_is_walked_and_its_files_are_indexed() {
+        let (dir, sha) = repo(&[
+            ("keep.md", "# Keep\n"),
+            (".sergeant/doc.md", "# Doctrine\n"),
+            (".sergeant/nested/deeper.md", "# Deeper\n"),
+        ]);
+        let scan = scan_estate_git(&source(dir.path(), &sha, &[]))
+            .expect("scan")
+            .scan;
+        assert_eq!(
+            row(&scan, ".sergeant").status,
+            Coverage::Discovered,
+            "a dotted directory that is not machinery is walked like any other"
+        );
+        assert_eq!(row(&scan, ".sergeant/doc.md").status, Coverage::Indexed);
+        assert_eq!(
+            row(&scan, ".sergeant/nested/deeper.md").status,
+            Coverage::Indexed
+        );
+        assert_eq!(
+            scan.files.len(),
+            3,
+            "keep.md and both files under .sergeant/ must all be indexed"
+        );
     }
 
     /// Batching is a real property, not a comment: many blobs are grouped,

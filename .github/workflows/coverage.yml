@@ -43,9 +43,19 @@ jobs:
         run: rustup toolchain install
       - name: rustup component add llvm-tools (for cargo-llvm-cov)
         run: rustup component add llvm-tools
+      # close-0.3.0 seam 2 (brief-gate-d-env-race.md): `cargo llvm-cov
+      # --no-report --test <suite>` runs `cargo test`'s one-process
+      # semantics, which races the env-mutating suites named there
+      # (`w3b_semantic_retrieval`'s own doc comment: its `set_var` is
+      # nextest-only-safe). `cargo llvm-cov nextest` keeps process-per-test
+      # isolation under instrumentation; `c2-suites.sh` swaps the eight
+      # such suites this job actually runs onto it. Exact-pinned, same
+      # action and version this repo's `ci.yml` already installs
+      # cargo-nextest with. Both tools install in one step via this
+      # action's comma-separated `tool:` list.
       - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
         with:
-          tool: cargo-llvm-cov@0.9.0
+          tool: cargo-llvm-cov@0.9.0,cargo-nextest@0.9.99
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-directories: target/llvm-cov-target

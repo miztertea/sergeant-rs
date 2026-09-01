@@ -153,7 +153,8 @@ use crate::domain::workflow::{
 };
 use crate::runtime::atlas::external_git::ExternalGitProvenance;
 use crate::runtime::atlas::fusion::{
-    FusedHit, RerankSignals, exact_match, fuse, is_canonical_path, rerank, same_section, symbol_of,
+    FusedHit, RerankSignals, dedup_file_rows, exact_match, fuse, is_canonical_path,
+    is_symbol_query, rerank, same_section, symbol_of,
 };
 use crate::runtime::atlas::lexical::{
     Bm25Corpus, LexicalFamily, LexicalHit, UnitCoordinate, bm25_contribution, is_identifier_like,
@@ -580,6 +581,54 @@ SET lock_configuration = true;\n";
 ///   postings are evicted with it" a property of the schema rather than a
 ///   promise — and keeps the reported-never-silent eviction discipline
 ///   identical to every other table's.
+///
+/// **Projection-identity wave (S6), one more: `source.file_identity`.**
+/// Ruling `projection-model-and-false-j0s-2026-08-31.md` #3: "the file is
+/// the identity; sources are memberships" — one physical file covered by
+/// two admissible sources must be one unit in the projection, not two.
+/// `source.files`'s own key is `(generation_id, source_name,
+/// relative_path, ...)`, and `relative_path` is resolved against *that
+/// source's own root*, so the same on-disk file reached through two
+/// overlapping sources (a `[[repo]]` mount containing a `[[knowledge]]`
+/// source's own root) carries two different `relative_path` strings and,
+/// pre-S6, two different `unit_key`s — which is the double-count this wave
+/// closes (`estate-double-indexing-2026-08-31.md`).
+///
+/// A new table rather than a column on `source.files`, for the reason
+/// `git.provenance`'s own doc two bullets up already states for this file:
+/// "only ever added to, never altered" (`CREATE TABLE IF NOT EXISTS`, so a
+/// column added to an existing table would silently not appear in a
+/// database that already has it). One row per `(generation_id,
+/// relative_path)`, carrying [`crate::runtime::atlas::scan::canonical_identity`]'s
+/// value — `identity_root.join(relative_path)`, canonicalized, so a symlink
+/// or an overlapping mount resolves both sources to the one string. Written
+/// once per file, inside the same staging transaction [`insert_file`]
+/// already runs in (F1: all-or-nothing with everything else a generation
+/// stages). [`indexable_units`] joins it in and folds it into `unit_key` in
+/// place of the per-source `relative_path`, so two generations covering the
+/// same physical file agree on one `unit_key` and [`LEXICAL_CORPUS_SQL`] /
+/// [`LEXICAL_DOCUMENT_FREQUENCY_SQL`] / [`LEXICAL_POSTINGS_SQL`] can dedupe
+/// on it — never a column re-derived twice, the same discipline `coordinate`
+/// already keeps for `context.lexical_units`.
+///
+/// **`source.file_content_identity`, bug 2 (`brief-search-three-bugs.md`,
+/// S6 search-three-bugs wave), one more.** `canonical_path` above is a real
+/// path on disk and cannot merge two sources whose `identity_root`s are
+/// genuinely different directories — a `repos/` clone and the live working
+/// tree it mirrors are two different inodes, however identical their bytes.
+/// A second table rather than a second column, for the identical reason
+/// `file_identity` itself is a second table and not a column on
+/// `source.files` (two paragraphs up): `CREATE TABLE IF NOT EXISTS` would
+/// silently not add a column to an existing installation's database. One
+/// row per `(generation_id, relative_path)`, carrying
+/// [`crate::domain::source::content_hash`] of the file's raw bytes (plain
+/// BLAKE3, the same algorithm [`crate::runtime::blob::BlobStore`] already
+/// content-addresses with — R2, not a new hash), written alongside
+/// `file_identity` inside the same staging transaction
+/// ([`insert_file_content_identity`]). [`indexable_units`] prefers it over
+/// `canonical_path` when both are present, so two generations whose files
+/// are byte-identical agree on one `unit_key` regardless of whether their
+/// roots happen to share a real path.
 const TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS source.generation_estates (\n\
   generation_id TEXT NOT NULL,\n\
@@ -760,6 +809,16 @@ CREATE TABLE IF NOT EXISTS context.semantic_vectors (\n\
   model_content_hash TEXT NOT NULL,\n\
   dimensions         BIGINT NOT NULL,\n\
   vector             BLOB NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS source.file_identity (\n\
+  generation_id  TEXT NOT NULL,\n\
+  relative_path  TEXT NOT NULL,\n\
+  canonical_path TEXT NOT NULL\n\
+);\n\
+CREATE TABLE IF NOT EXISTS source.file_content_identity (\n\
+  generation_id  TEXT NOT NULL,\n\
+  relative_path  TEXT NOT NULL,\n\
+  content_digest TEXT NOT NULL\n\
 );\n";
 
 /// A generation whose rows are written but whose summary is not yet journaled
@@ -866,21 +925,68 @@ macro_rules! lexical_posting_join {
 
 /// BM25's corpus statistics — `N` and the mean document length — measured
 /// over the admissible, family-filtered set and nothing wider.
+///
+/// **Projection-identity wave (S6): deduped by `unit_key`.** Two admissible
+/// generations covering the same physical file through two different
+/// sources now compute the identical `unit_key` (`unit_key`'s own doc) — a
+/// bare `count(*)`/`sum` over `context.lexical_units` would still count that
+/// file's units, and their token lengths, once per covering source. The
+/// inner `GROUP BY` collapses that to one row per unit before `N` and the
+/// length sum are taken; `MIN(l.token_count)` rather than `sum`/`avg`
+/// because a genuine duplicate's `token_count` is identical across every
+/// covering source (same bytes, same tokenizer) — `MIN` is simply a
+/// deterministic pick among equal values, not an aggregation choice.
+///
+/// **Overlay-identity wave (S6b): the `GROUP BY` also splits on state, not
+/// just identity — matching [`LEXICAL_POSTINGS_SQL`]'s own partition.** A
+/// `SourceSelector::WorkBase` query admits a base generation and that same
+/// Work's overlay generation for one file; `lexical_search`'s scoring loop
+/// keys its accumulator on `(generation_id, unit_key)`, so base and overlay
+/// score as two separate documents whenever both are admitted. Corpus `N`
+/// and `avgdl` have to count them as two documents too, or they disagree
+/// with exactly the postings scored against them. Without the second group
+/// key, a touched file's base and overlay rows — genuinely different
+/// content, not duplicates (`work_changed_unit`'s whole premise) — would
+/// collapse into one `MIN(token_count)`, silently picking the shorter side
+/// and corrupting `avgdl`. With it, `MIN` only ever collapses *within* one
+/// state — genuine cross-source duplicates — which is the case the comment
+/// above actually justifies.
 const LEXICAL_CORPUS_SQL: &str = concat!(
-    "SELECT count(*), coalesce(sum(l.token_count), 0) \
-     FROM context.lexical_units l \
-     JOIN source.generations g USING (generation_id) \
-     WHERE ",
+    "SELECT count(*), coalesce(sum(token_count), 0) FROM ( \
+       SELECT l.unit_key, MIN(l.token_count) AS token_count \
+       FROM context.lexical_units l \
+       JOIN source.generations g USING (generation_id) \
+       WHERE ",
     admissible_generations_where!(),
-    " AND (? IS NULL OR l.family = ?)"
+    " AND (? IS NULL OR l.family = ?) \
+       GROUP BY l.unit_key, (g.source_name LIKE 'work:%') \
+     )"
 );
 
 /// One term's document frequency over that same set.
+///
+/// **Projection-identity wave (S6):** dedupes by `l.unit_key` rather than
+/// `count(*)`, for the identical reason [`LEXICAL_CORPUS_SQL`] dedupes — a
+/// term's posting exists once per covering source's own generation, and
+/// `df` must count the *file* once, not once per source that happens to
+/// admit it.
+///
+/// **Overlay-identity wave (S6b):** the dedupe key also splits on state —
+/// `(g.source_name LIKE 'work:%')` — for the same reason
+/// [`LEXICAL_CORPUS_SQL`]'s `GROUP BY` does: a base/overlay pair scores as
+/// two separate documents, so `df` must count them as two documents too,
+/// matching [`LEXICAL_POSTINGS_SQL`]'s partition rather than
+/// [`LEXICAL_CORPUS_SQL`]'s old bare `unit_key` dedupe. `count(DISTINCT
+/// expr)` takes one expression, so the pair is folded through an explicit
+/// `GROUP BY` subquery rather than a tuple.
 const LEXICAL_DOCUMENT_FREQUENCY_SQL: &str = concat!(
-    "SELECT count(*) ",
+    "SELECT count(*) FROM ( \
+       SELECT l.unit_key ",
     lexical_posting_join!(),
     admissible_generations_where!(),
-    " AND (? IS NULL OR l.family = ?) AND p.term = ?"
+    " AND (? IS NULL OR l.family = ?) AND p.term = ? \
+       GROUP BY l.unit_key, (g.source_name LIKE 'work:%') \
+     )"
 );
 
 /// One term's postings, with every coordinate column a hit has to cite.
@@ -903,7 +1009,45 @@ const LEXICAL_POSTINGS_SQL: &str = concat!(
                                             AND l.family IN ('document', 'mail') "
     ),
     admissible_generations_where!(),
+    // **Projection-identity wave (S6): one row per `unit_key`.** Without
+    // this, the same physical file covered by two admissible generations
+    // would return two posting rows for one term — not merely a display
+    // duplicate: `lexical_search`'s scoring loop keys its accumulator on
+    // `(generation_id, unit_key)` (`AtlasDb::lexical_search`'s own `scored`
+    // map), so two rows with two different `generation_id`s for the *same*
+    // `unit_key` would score as two separate hits and double the file's
+    // effective weight in the ranking, not just its row count.
+    // `ROW_NUMBER() ... = 1` picks exactly one generation's row per unit,
+    // deterministically — the same tie-break the final `ORDER BY` already
+    // uses, so which generation "wins" is stable across repeated queries.
+    //
+    // **Overlay-identity wave (S6b): the partition also splits on state,
+    // not just identity.** The collapse above is correct for *cross-source*
+    // twins — two different sources covering one physical file, the owner
+    // ruling's "file = identity, sources = memberships"
+    // (`projection-model-and-false-j0s-2026-08-31.md` §3). A
+    // `SourceSelector::WorkBase` query admits a different pair in one
+    // query: a base generation and that same Work's overlay generation —
+    // the *same* file in two **states** of one Work's view, not two
+    // sources of one file (the ruling draws this exact axis line). Without
+    // the second partition key, a byte-identical overlay unit collapsed
+    // into its base row before `rerank_signals`'s `work_changed_unit`
+    // comparison (`db.rs:4347-4389`) ever saw both sides, so an unchanged
+    // overlay could never even be shown, let alone correctly marked
+    // unchanged. `(g.source_name LIKE 'work:%')` (the overlay module's own
+    // prefix, `OVERLAY_PREFIX`/`overlay_exclude_like`, hardcoded here as a
+    // literal for the same reason line 9431 already does — a compile-time
+    // `concat!` literal, not client SQL, item 13's pin) is `true` for at
+    // most one admitted generation per `WorkBase` query
+    // (`SourceSelector::overlay_admit_source_name`'s doc: never a
+    // `work:<id>/%` prefix, always the exact overlay name), so it can only
+    // ever add a second row, never reopen genuine cross-source collapse
+    // among the (still one-partition) non-overlay generations.
     " AND (? IS NULL OR l.family = ?) AND p.term = ? \
+      QUALIFY ROW_NUMBER() OVER ( \
+        PARTITION BY l.unit_key, (g.source_name LIKE 'work:%') \
+        ORDER BY l.source_name, l.relative_path, l.ordinal \
+      ) = 1 \
       ORDER BY l.source_name, l.relative_path, l.ordinal, l.unit_key \
       LIMIT ?"
 );
@@ -1942,6 +2086,37 @@ impl AtlasDb {
         if let Some(current) = self.confirmed_generation(&scan.source_name)?
             && current.content_key == scan.content_key
             && self.generation_extractors(&current.id)? == scan.extractors
+            // **Projection-identity wave (S6) migration.** A generation
+            // staged before this wave has files but no `source.file_identity`
+            // rows — `insert_file_identity` did not exist yet to write them
+            // — so its units still key on their own `relative_path` and
+            // cannot dedupe against a same-file generation from another
+            // source (`unit_key`'s own doc). `reindex_lexical`'s own
+            // mechanism cannot repair this: it only re-derives
+            // `context.lexical_*` from rows already in `source.*`, and
+            // `source.file_identity` needs the scan's `identity_root`,
+            // which is not itself stored anywhere reindex could read it
+            // back from. So identity-incompleteness is not honored by the
+            // *content-unchanged* shortcut at all — it forces the same path
+            // an actual content change takes, which is the one path that
+            // re-runs `insert_file`/`insert_file_identity` and genuinely
+            // backfills it (extends `af3ec467`'s
+            // `lexical_index_needs_rebuild` precedent at the layer this
+            // migration actually needs: the scan, not the reindex).
+            //
+            // F-IN-01: the same gate for bug 2's `source.file_content_identity`
+            // table, which is a *different* migration boundary than
+            // `file_identity`'s — a generation can have every
+            // `file_identity` row (so the check above says `false`) and
+            // still have zero `file_content_identity` rows, because that
+            // table did not exist until a later wave. Without this second
+            // check, such a generation takes the `Unchanged` shortcut
+            // forever and `identity_of` resolves it to `canonical_path`
+            // while every generation staged after this fix resolves the
+            // same real file to `content_digest` — two identity strings for
+            // one file, permanently.
+            && !self.generation_missing_file_identity(&current.id)?
+            && !self.generation_missing_file_content_identity(&current.id)?
         {
             // **The two-estates-one-world case.** A generation is reached by
             // content key, so a second estate that declares a source whose
@@ -2020,6 +2195,8 @@ impl AtlasDb {
         let mut index: BTreeMap<(&str, &str, &str), u64> = BTreeMap::new();
         for file in &scan.files {
             insert_file(&tx, &generation_id, &scan.source_name, file)?;
+            insert_file_identity(&tx, &generation_id, file, scan.identity_root.as_deref())?;
+            insert_file_content_identity(&tx, &generation_id, file)?;
             if let Some(syntax) = &file.syntax {
                 for symbol in &syntax.symbols {
                     *index
@@ -2143,7 +2320,22 @@ impl AtlasDb {
                 if self.generation_content_key(previous)?
                     == self.generation_content_key(generation_id)? =>
             {
-                "superseded: the extractor identities changed (the source bytes did not)"
+                // **Projection-identity wave (S6): a third cause, same
+                // content key.** `stage_scan_impl`'s own Unchanged shortcut
+                // now also falls through when the *predecessor* lacks
+                // `source.file_identity` rows (a generation staged before
+                // this wave) — same bytes, same extractors, a migration
+                // backfill. Left unchecked, this branch would misreport
+                // that case as an extractor change, which is exactly the
+                // "false statement" this comment already warns against.
+                if self.generation_extractors(previous)?
+                    == self.generation_extractors(generation_id)?
+                {
+                    "superseded: the projection-identity migration backfilled canonical file \
+                     identity (neither the source bytes nor the extractor identities changed)"
+                } else {
+                    "superseded: the extractor identities changed (the source bytes did not)"
+                }
             }
             _ => "superseded: the source bytes changed",
         };
@@ -3739,9 +3931,45 @@ impl AtlasDb {
         // widen and does not fix.
         let family = query.family;
         let model = engine.descriptor();
-        let mut hits: Vec<SemanticHit> = Vec::new();
+        // **Projection-identity wave (S6): keyed by `unit_key`, not pushed
+        // to a flat `Vec`.** Unlike the lexical half (whose SQL already
+        // dedupes via `LEXICAL_POSTINGS_SQL`'s `QUALIFY`), this loop walks
+        // one admissible generation at a time and has no single query to
+        // add a `QUALIFY` to — two admissible generations covering the same
+        // physical file compute the identical `unit_key` (`unit_key`'s own
+        // doc) and, without this map, would each push their own
+        // `SemanticHit`, doubling the file's presence in the ranked list
+        // exactly as the pre-fix lexical half did. First-seen wins:
+        // `admitted.hits` is [`Self::admissible_generations`]'s own
+        // deterministic order, so which generation's row is kept is stable
+        // across repeated queries — and every duplicate's score is the
+        // identical cosine anyway (same text, same stored vector), so
+        // "which one" never changes the ranking.
+        //
+        // **Overlay-identity wave (S6b): keyed by `(unit_key,
+        // is_overlay_admit)`, not `unit_key` alone.** The doc above states
+        // the cross-*source* case this map is correct for (owner ruling
+        // `projection-model-and-false-j0s-2026-08-31.md` §3: "file =
+        // identity, sources = memberships"). A `SourceSelector::WorkBase`
+        // query admits a different pair: a base generation and that same
+        // Work's overlay generation of the same file — two **states** of
+        // one Work's view, not two sources of one file (the ruling's own
+        // axis distinction). Bare `unit_key` keying folded that pair to
+        // one `SemanticHit` before `rerank_signals`'s `work_changed_unit`
+        // comparison (`db.rs:4347-4389`) ever saw both sides. Adding the
+        // overlay flag to the key does not reopen genuine cross-source
+        // collapse: at most one admitted generation per `WorkBase` query
+        // has `source_name` under `OVERLAY_PREFIX`
+        // (`SourceSelector::overlay_admit_source_name`'s own doc — never a
+        // `work:<id>/%` prefix, always the exact overlay name), so every
+        // non-overlay generation still shares the same `false` half of the
+        // key and collapses together exactly as before.
+        let mut hits: BTreeMap<(String, bool), SemanticHit> = BTreeMap::new();
         let mut fully_indexed = true;
         for generation in &admitted.hits {
+            let is_overlay_admit = generation
+                .source_name
+                .starts_with(crate::runtime::atlas::overlay::OVERLAY_PREFIX);
             let units = indexable_units(&self.conn, &generation.id)?;
             let stored = stored_vectors(&self.conn, &generation.id, model)?;
             // A2 §15's honesty, decided per generation and before the family
@@ -3750,7 +3978,27 @@ impl AtlasDb {
             // ranking below is missing them, and saying so is the whole of
             // A1 §15's "missing capability is never represented as
             // successful empty evidence".
-            if stored.len() < units.len() {
+            //
+            // **Distinct keys, not raw rows** (S6 fix,
+            // `byte_identical_files_sharing_a_unit_key_still_report_applied`).
+            // `stored` is already deduped by `unit_key` (`stored_vectors`'s
+            // own `HashMap`), so comparing it against `units.len()` — a raw
+            // row count — treats every row that shares a key with another
+            // (bug 2: two byte-identical files legitimately collide on one
+            // `unit_key`, owner ruling
+            // `projection-model-and-false-j0s-2026-08-31.md`) as if its
+            // vector were missing, even when it was written. Checking each
+            // unit's key for membership in `stored` (rather than comparing
+            // counts) is the right-sized comparison: `stored.contains_key`
+            // is idempotent, so a shared key checked twice via the raw
+            // `units` iterator no longer trips this check, while a
+            // genuinely absent vector — a real model swap, or no model at
+            // scan time — still does, because that key is absent from
+            // `stored` regardless of counting.
+            if units
+                .iter()
+                .any(|unit| !stored.contains_key(unit.unit_key.as_str()))
+            {
                 fully_indexed = false;
             }
             let units: Vec<IndexableUnit> = units
@@ -3761,28 +4009,37 @@ impl AtlasDb {
                 continue;
             }
             for unit in &units {
+                let key = (unit.unit_key.clone(), is_overlay_admit);
+                if hits.contains_key(&key) {
+                    continue;
+                }
                 let Some(vector) = stored.get(&unit.unit_key) else {
                     continue;
                 };
-                hits.push(SemanticHit {
-                    score: cosine(&query_vector, vector),
-                    source_name: unit.source_name.clone(),
-                    // A2 §17 item 8, from the admitted generation row this
-                    // unit was enumerated under — the same two values the
-                    // lexical half reads off `source.generations`.
-                    source_kind: generation.kind,
-                    authority_class: generation.authority,
-                    generation_id: generation.id.clone(),
-                    content_key: generation.content_key.clone(),
-                    unit_key: unit.unit_key.clone(),
-                    coordinate: unit.coordinate(),
-                });
+                hits.insert(
+                    key,
+                    SemanticHit {
+                        score: cosine(&query_vector, vector),
+                        source_name: unit.source_name.clone(),
+                        // A2 §17 item 8, from the admitted generation row
+                        // this unit was enumerated under — the same two
+                        // values the lexical half reads off
+                        // `source.generations`.
+                        source_kind: generation.kind,
+                        authority_class: generation.authority,
+                        generation_id: generation.id.clone(),
+                        content_key: generation.content_key.clone(),
+                        unit_key: unit.unit_key.clone(),
+                        coordinate: unit.coordinate(),
+                    },
+                );
             }
         }
         if !fully_indexed {
             answer.semantic = SemanticStatus::NotIndexed;
             answer.semantic_model = None;
         }
+        let mut hits: Vec<SemanticHit> = hits.into_values().collect();
         hits.sort_by(rank_semantic);
         hits.truncate(limit);
         answer.hits = hits;
@@ -3861,6 +4118,13 @@ impl AtlasDb {
         self.rerank_signals(query, &mut hits)?;
         drop(snapshot);
         rerank(&mut hits, query.text);
+        // F-SF-01: one row per (source, path) in the final answer — see
+        // `dedup_file_rows`'s own doc comment for why decay alone (inside
+        // `rerank`, above) does not close Bug 3. Must run before the
+        // `truncate` below: deduping after truncation could still leave a
+        // slot occupied by a file's second chunk instead of a distinct
+        // file's single, lower-ranked one.
+        let mut hits = dedup_file_rows(hits);
         hits.truncate(query.limit.min(MAX_ROWS));
         Ok(FusedAnswer {
             hits,
@@ -4074,6 +4338,12 @@ impl AtlasDb {
 
         let terms = query_terms(query.text);
         let identifier_like = is_identifier_like(query.text);
+        // Signal 1's symbol/title half (F-SF-01): `is_symbol_query`, not
+        // `identifier_like` — the whole query must look like a bare symbol,
+        // not merely contain one identifier-shaped compound among several
+        // NL words. See `exact_match`'s own doc for why these are two
+        // different, both-wanted predicates.
+        let symbol_query = is_symbol_query(query.text);
         // Signal 3: the caller named a source at all. See
         // `RerankSignals`'s own doc for why this is uniform.
         let selected_source = !matches!(query.filter.source, SourceSelector::Any);
@@ -4172,7 +4442,7 @@ impl AtlasDb {
                 _ => false,
             };
             hit.signals = RerankSignals {
-                exact_match: exact_match(&terms, &hit.coordinate),
+                exact_match: exact_match(&terms, &hit.coordinate, symbol_query),
                 definition_over_reference: identifier_like
                     && hit.coordinate.family() == LexicalFamily::Code,
                 caller_selected_source: selected_source,
@@ -4229,6 +4499,12 @@ impl AtlasDb {
         let tx = self.conn.transaction()?;
         let mut indexed = 0u64;
         for generation_id in &targets {
+            // chunker-wire (brief-chunker-wire.md item 2): correct the raw
+            // `source.units` shape before deriving from it — see
+            // `rechunk_stale_code_units`'s own doc for why re-deriving from
+            // the stale rows alone (this function's usual mode) cannot fix
+            // this particular staleness.
+            rechunk_stale_code_units(&tx, generation_id)?;
             tx.execute(
                 sql!("DELETE FROM context.lexical_postings WHERE generation_id = ?"),
                 duckdb::params![generation_id],
@@ -4250,19 +4526,84 @@ impl AtlasDb {
     /// Whether the lexical index is missing postings for a non-evicted
     /// generation that has rows — the exact condition
     /// [`Self::reindex_lexical`]'s doc names as "a store written before S5
-    /// W2". Cheap: an anti-join over generation ids, not a rebuild, so it is
-    /// safe to call every startup rather than only once at a version
-    /// boundary this crate has no other way to detect (F-SF-01).
+    /// W2" — **or** carries postings that the current derivation logic
+    /// would never itself produce. The second half exists because presence
+    /// of postings is not the same as *current* postings: the S6
+    /// prose-relevance wave changed `indexable_units()` to stop deriving a
+    /// code-family unit from a Markdown heading occurrence
+    /// (`markdown_headings_are_not_code_family_units`), but a generation
+    /// confirmed before that change already has such rows in
+    /// `context.lexical_units` and this function's presence-only check
+    /// would report it clean forever (F-IN-01). A row with `family = 'code'`
+    /// and `language = 'markdown'` is exactly that: under the current
+    /// derivation it can never be written, so its existence *is* the
+    /// staleness signal, no separate version marker needed. Cheap: two
+    /// anti/semi-joins over generation ids, not a rebuild, so it is safe to
+    /// call every startup.
+    ///
+    /// **chunker-wire (host-atlas-s6-series/brief-chunker-wire.md item 2),
+    /// third use of this signature.** Before this wave, `extract_units`
+    /// gave every grammar-claimed, structure-unclaimed path
+    /// (`main.rs`, `Cargo.toml`) exactly one whole-file
+    /// `source.units.unit_kind = 'document'` row (`plain_units`'s only
+    /// output). After this wave the same path always gets
+    /// `chunk_source`'s `'section'` spans instead — a `'document'`-kind
+    /// `source.units` row for a path that also carries real code
+    /// occurrences (`source.occurrences` matched on
+    /// [`CODE_EXTRACTOR_LIKE`]) is exactly as impossible under the current
+    /// derivation as the code/Markdown combination the second half of this
+    /// query already keys on, and for the identical reason: presence of
+    /// postings/units is not the same as *current* ones.
+    ///
+    /// **Markdown is the one exception, and this branch excludes it
+    /// (close-0.3.0, seam 1).** [`CODE_EXTRACTOR_LIKE`]'s own doc calls it
+    /// "code-owned", but it is really "every `SyntaxLanguage`-owned" — it is
+    /// pinned against `SyntaxLanguage::ALL`, which includes `Markdown`. An
+    /// ordinary, current markdown file legitimately carries *both* a
+    /// `document`-kind unit *and* `syntax-markdown` occurrences — that
+    /// combination is not staleness, it is every markdown file, always.
+    /// Measured: on this repository's own working tree (`docs`, `.sergeant`,
+    /// `skills` all carry markdown), the unguarded query above reported
+    /// every one of five generations stale on **every** startup, which
+    /// silently ran `reindex_lexical` — and, since S6, silently re-embedded
+    /// every semantic vector — on every restart, whether anything had
+    /// changed or not. `SyntaxLanguage::Markdown.extractor_identity()` is
+    /// therefore named explicitly and excluded.
     pub fn lexical_index_needs_rebuild(&self) -> Result<bool, AtlasError> {
         let mut statement = self.conn.prepare(sql!(
             "SELECT COUNT(*) FROM source.generations g \
              WHERE g.state != ? \
-               AND NOT EXISTS ( \
-                 SELECT 1 FROM context.lexical_units l \
-                 WHERE l.generation_id = g.generation_id \
+               AND ( \
+                 NOT EXISTS ( \
+                   SELECT 1 FROM context.lexical_units l \
+                   WHERE l.generation_id = g.generation_id \
+                 ) \
+                 OR EXISTS ( \
+                   SELECT 1 FROM context.lexical_units l \
+                   WHERE l.generation_id = g.generation_id \
+                     AND l.family = ? \
+                     AND l.language = ? \
+                 ) \
+                 OR EXISTS ( \
+                   SELECT 1 FROM source.units u \
+                   JOIN source.occurrences o \
+                     ON o.generation_id = u.generation_id \
+                    AND o.relative_path = u.relative_path \
+                   WHERE u.generation_id = g.generation_id \
+                     AND u.unit_kind = ? \
+                     AND o.extractor LIKE ? \
+                     AND o.extractor != ? \
+                 ) \
                )"
         ))?;
-        let mut rows = statement.query(duckdb::params![STATE_EVICTED])?;
+        let mut rows = statement.query(duckdb::params![
+            STATE_EVICTED,
+            LexicalFamily::Code.as_str(),
+            crate::runtime::atlas::syntax::SyntaxLanguage::Markdown.name(),
+            crate::domain::source::UnitKind::Document.as_str(),
+            CODE_EXTRACTOR_LIKE,
+            crate::runtime::atlas::syntax::SyntaxLanguage::Markdown.extractor_identity()
+        ])?;
         let count: i64 = match rows.next()? {
             Some(row) => row.get(0)?,
             None => 0,
@@ -4329,6 +4670,67 @@ impl AtlasDb {
             return Ok(BTreeSet::new());
         };
         Ok(split_extractors(&row.get::<usize, String>(0)?))
+    }
+
+    /// **Projection-identity wave (S6) migration signal**: does this
+    /// generation have `source.files` rows but zero `source.file_identity`
+    /// rows? True only for a generation staged before this wave —
+    /// [`insert_file_identity`] writes one file_identity row per file inside
+    /// the very same staging transaction [`insert_file`] runs in, so any
+    /// generation staged since always has one row per file, never zero
+    /// (unless it has no files at all, which this check does not flag —
+    /// nothing to dedupe against).
+    ///
+    /// [`Self::stage_scan`]'s own staleness test for this migration —
+    /// [`Self::generation_extractors`]'s neighbor, same shape, same doc
+    /// pattern.
+    fn generation_missing_file_identity(&self, generation_id: &str) -> Result<bool, AtlasError> {
+        let mut statement = self.conn.prepare(sql!(
+            "SELECT EXISTS (SELECT 1 FROM source.files WHERE generation_id = ?) \
+               AND NOT EXISTS (SELECT 1 FROM source.file_identity WHERE generation_id = ?)"
+        ))?;
+        let mut rows = statement.query(duckdb::params![generation_id, generation_id])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<usize, bool>(0)?),
+            None => Ok(false),
+        }
+    }
+
+    /// **F-IN-01 — the same migration signal, for the content-identity table
+    /// bug 2 added.** [`Self::generation_missing_file_identity`] only ever
+    /// answers `true` for a generation staged *before the projection-identity
+    /// wave*, because [`insert_file_identity`] and [`insert_file_content_identity`]
+    /// were introduced in two different waves: a generation staged after the
+    /// first but before the second (every generation on `main` between S6's
+    /// projection-identity wave and this one) has a full set of
+    /// `source.file_identity` rows — so
+    /// [`Self::generation_missing_file_identity`] reports `false` and the
+    /// `Unchanged` shortcut in [`Self::stage_scan`] fires — while
+    /// `source.file_content_identity` was never written for it at all.
+    /// [`identity_of`]'s `COALESCE(fci.content_digest, fi.canonical_path)`
+    /// then resolves that generation to `canonical_path` forever, while any
+    /// generation staged after this fix resolves the *same real file* to
+    /// `content_digest` — two different identity strings for one file,
+    /// permanently, because nothing ever re-stages the old generation to
+    /// backfill the missing table.
+    ///
+    /// Same shape as its neighbor on purpose: `EXISTS files AND NOT EXISTS
+    /// file_content_identity`, so this too only fires for a generation that
+    /// predates the table, never for one with no files staged at all.
+    fn generation_missing_file_content_identity(
+        &self,
+        generation_id: &str,
+    ) -> Result<bool, AtlasError> {
+        let mut statement = self.conn.prepare(sql!(
+            "SELECT EXISTS (SELECT 1 FROM source.files WHERE generation_id = ?) \
+               AND NOT EXISTS \
+                 (SELECT 1 FROM source.file_content_identity WHERE generation_id = ?)"
+        ))?;
+        let mut rows = statement.query(duckdb::params![generation_id, generation_id])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<usize, bool>(0)?),
+            None => Ok(false),
+        }
     }
 
     /// The stored `content_key` of any generation, in any state.
@@ -4425,6 +4827,88 @@ fn insert_file(
         insert_syntax(conn, generation_id, source_name, file, syntax)?;
     }
     Ok(())
+}
+
+/// Insert one acquired file's canonical identity row (S6, projection-identity
+/// wave) — `source.file_identity`'s only writer.
+///
+/// One row per `(generation_id, relative_path)`, computed once, here, from
+/// [`crate::runtime::atlas::scan::canonical_identity`]: `identity_root`
+/// known (a filesystem/estate-git walk) resolves to the real absolute path
+/// on disk, canonicalized; `identity_root: None` (a Work overlay, an
+/// external Git bare cache, a hand-built test fixture) falls back to
+/// `relative_path` itself — the pre-S6 identity, so that source kind is
+/// simply not deduped against anything rather than merged incorrectly.
+fn insert_file_identity(
+    conn: &impl Statements,
+    generation_id: &str,
+    file: &ScannedFile,
+    identity_root: Option<&std::path::Path>,
+) -> Result<(), AtlasError> {
+    let canonical_path =
+        crate::runtime::atlas::scan::canonical_identity(identity_root, &file.relative_path)
+            .unwrap_or_else(|| generation_scoped_identity(generation_id, &file.relative_path));
+    conn.prepare_cached(sql!(
+        "INSERT INTO source.file_identity (generation_id, relative_path, canonical_path) \
+         VALUES (?, ?, ?)"
+    ))?
+    .execute(duckdb::params![
+        generation_id,
+        &file.relative_path,
+        &canonical_path,
+    ])?;
+    Ok(())
+}
+
+/// Insert one acquired file's content-digest identity row (bug 2, S6
+/// search-three-bugs wave) — `source.file_content_identity`'s only writer.
+///
+/// One row per `(generation_id, relative_path)`, the file's
+/// [`ScannedFile::content_digest`] — plain BLAKE3 of the raw bytes,
+/// computed identically regardless of source kind (`scan.rs`, `git.rs` and
+/// `overlay.rs` each set it, next to `content_hash`, from bytes already
+/// held in memory — no second read of anything). Written unconditionally,
+/// unlike [`insert_file_identity`]'s `identity_root` gate: content equality
+/// is never an "incorrect merge" the way a stale symlink or an
+/// overlapping-mount path alias could be — two rows with the same digest
+/// are, by construction, the same bytes.
+fn insert_file_content_identity(
+    conn: &impl Statements,
+    generation_id: &str,
+    file: &ScannedFile,
+) -> Result<(), AtlasError> {
+    conn.prepare_cached(sql!(
+        "INSERT INTO source.file_content_identity (generation_id, relative_path, content_digest) \
+         VALUES (?, ?, ?)"
+    ))?
+    .execute(duckdb::params![
+        generation_id,
+        &file.relative_path,
+        &file.content_digest,
+    ])?;
+    Ok(())
+}
+
+/// The fallback identity for a file whose source kind has no known
+/// [`crate::runtime::atlas::scan::SourceScan::identity_root`] — used both
+/// here, at write time (so every generation this wave stages, known or
+/// unknown identity alike, gets exactly one `source.file_identity` row per
+/// file — which is what makes [`AtlasDb::generation_missing_file_identity`]
+/// a clean "predates this migration" signal rather than a permanent `true`
+/// for every overlay/external-Git generation), and at read time by
+/// [`identity_of`], for a generation staged *before* this wave that has no
+/// row at all.
+///
+/// `generation_id` folded in is exactly what a plain `(generation_id,
+/// unit_key)` map key already gave every reader before this wave —
+/// `relative_path` alone is not a cross-source identity (two unrelated
+/// sources can coincidentally declare the same relative path), so without
+/// this qualifier two such files would wrongly dedupe into one hit
+/// (`equal_scores_are_broken_by_the_stated_key_not_by_row_arrival_order`).
+/// `\u{0}` separates the two halves because it cannot appear in either, so
+/// no real canonical path can ever collide with a fallback key by accident.
+fn generation_scoped_identity(generation_id: &str, relative_path: &str) -> String {
+    format!("{generation_id}\u{0}{relative_path}")
 }
 
 /// Insert one file's syntax extraction: its symbol sites and its edges.
@@ -4532,6 +5016,116 @@ fn insert_unit(
             &file.local_key,
             unit.ordinal as i64,
             coordinate,
+        ])?;
+    }
+    Ok(())
+}
+
+/// **chunker-wire (host-atlas-s6-series/brief-chunker-wire.md item 2),
+/// third use of [`AtlasDb::lexical_index_needs_rebuild`]'s
+/// "impossible-under-current-derivation signature" mechanism.**
+///
+/// [`indexable_units`] is deliberately "derived from the stored rows, not
+/// from the in-memory scan" (that function's own doc) — a lexical hit's
+/// citation has to resolve back into a real `source.units` row, so
+/// re-chunking a stale whole-file body only at read time (fabricating
+/// ordinals `source.units` never actually has) would answer queries with
+/// citations the citing table cannot back. This function corrects the
+/// table itself instead: it finds every `source.units` row of `generation_id`
+/// still carrying the pre-chunker-wire shape — `UnitKind::Document`, the
+/// whole file, for a path this generation's own `source.occurrences` prove
+/// is grammar-claimed — deletes it, and inserts the
+/// [`crate::runtime::atlas::chunk::chunk_source`] chunks a fresh scan would
+/// have produced in its place (R2: the identical algorithm, not a
+/// re-derived one). [`index_generation`] runs against the corrected table
+/// right after, the same way it runs against a freshly staged scan.
+///
+/// A generation with no such row is a no-op pass (one query, no writes) —
+/// this is called for every target [`AtlasDb::reindex_lexical`] rebuilds,
+/// not only ones known in advance to be stale.
+fn rechunk_stale_code_units(conn: &impl Statements, generation_id: &str) -> Result<(), AtlasError> {
+    let mut stale: Vec<(String, String, String, i64, String, String)> = Vec::new();
+    {
+        let mut statement = conn.prepare(sql!(
+            "SELECT u.source_name, u.relative_path, u.local_key, u.ordinal, u.body, o.language \
+             FROM source.units u \
+             JOIN ( \
+               SELECT DISTINCT generation_id, relative_path, language \
+               FROM source.occurrences WHERE extractor LIKE ? \
+             ) o ON o.generation_id = u.generation_id AND o.relative_path = u.relative_path \
+             WHERE u.generation_id = ? AND u.unit_kind = ?"
+        ))?;
+        let mut rows = statement.query(duckdb::params![
+            CODE_EXTRACTOR_LIKE,
+            generation_id,
+            crate::domain::source::UnitKind::Document.as_str()
+        ])?;
+        while let Some(row) = rows.next()? {
+            stale.push((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ));
+        }
+    }
+    for (source_name, relative_path, local_key, ordinal, body, language_name) in stale {
+        let Some(language) = crate::runtime::atlas::syntax::SyntaxLanguage::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.name() == language_name)
+        else {
+            // A language name `source.occurrences` carries but this build's
+            // own `SyntaxLanguage::ALL` no longer does — leave the row
+            // exactly as it stood rather than guess at a grammar.
+            continue;
+        };
+        conn.prepare_cached(sql!(
+            "DELETE FROM source.units \
+             WHERE generation_id = ? AND relative_path = ? AND ordinal = ?"
+        ))?
+        .execute(duckdb::params![generation_id, &relative_path, ordinal])?;
+        let chunks = crate::runtime::atlas::chunk::chunk_source(&body, Some(language));
+        let chunk_count = chunks.len();
+        for (chunk_ordinal, chunk) in chunks.into_iter().enumerate() {
+            conn.prepare_cached(sql!(
+                "INSERT INTO source.units \
+                 (generation_id, source_name, relative_path, local_key, ordinal, unit_kind, \
+                  heading_level, title, byte_start, byte_end, body) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            ))?
+            .execute(duckdb::params![
+                generation_id,
+                &source_name,
+                &relative_path,
+                &local_key,
+                chunk_ordinal as i64,
+                crate::domain::source::UnitKind::Section.as_str(),
+                Option::<i64>::None,
+                Option::<String>::None,
+                chunk.byte_start as i64,
+                chunk.byte_end as i64,
+                &chunk.content,
+            ])?;
+        }
+        // F-IN-01: a fresh scan would have set `source.files.unit_count` to
+        // this file's unit count via `insert_file`'s single write (this
+        // function's own doc: "the chunks a fresh scan would have produced
+        // in its place"). The DELETE+INSERT above replaces one Document row
+        // with `chunk_count` Section rows but never told `source.files`,
+        // leaving that column permanently stale — the exact "second,
+        // driftable copy" `insert_file`'s doc says this schema avoids.
+        conn.prepare_cached(sql!(
+            "UPDATE source.files SET unit_count = ? \
+             WHERE generation_id = ? AND source_name = ? AND relative_path = ?"
+        ))?
+        .execute(duckdb::params![
+            chunk_count as i64,
+            generation_id,
+            &source_name,
+            &relative_path,
         ])?;
     }
     Ok(())
@@ -5178,13 +5772,18 @@ fn indexable_units(
     let [doc_a, doc_b, doc_c] = DOCUMENT_EXTRACTOR_IDENTITIES;
     let mut statement = conn.prepare(sql!(
         "SELECT u.source_name, u.relative_path, u.ordinal, u.title, u.byte_start, u.byte_end, \
-                u.body, f.extractor, c.coordinate \
+                u.body, f.extractor, c.coordinate, \
+                COALESCE(fci.content_digest, fi.canonical_path) \
          FROM source.units u \
          JOIN source.files f ON f.generation_id = u.generation_id \
                              AND f.relative_path = u.relative_path \
          LEFT JOIN source.unit_coordinates c ON c.generation_id = u.generation_id \
                                              AND c.relative_path = u.relative_path \
                                              AND c.ordinal = u.ordinal \
+         LEFT JOIN source.file_identity fi ON fi.generation_id = u.generation_id \
+                                           AND fi.relative_path = u.relative_path \
+         LEFT JOIN source.file_content_identity fci ON fci.generation_id = u.generation_id \
+                                                     AND fci.relative_path = u.relative_path \
          WHERE u.generation_id = ? \
            AND (f.extractor IN (?, ?, ?) OR f.extractor LIKE ?) \
          ORDER BY u.relative_path, u.ordinal"
@@ -5211,10 +5810,15 @@ fn indexable_units(
             Some(title) => format!("{title}\n{body}"),
             None => body,
         };
+        let identity = identity_of(
+            row.get::<usize, Option<String>>(9)?,
+            generation_id,
+            &relative_path,
+        );
         units.push(IndexableUnit {
             source_name: row.get(0)?,
             family,
-            unit_key: unit_key(family, &relative_path, ordinal),
+            unit_key: unit_key(family, &identity, ordinal),
             relative_path,
             ordinal,
             title,
@@ -5233,26 +5837,55 @@ fn indexable_units(
     drop(rows);
     drop(statement);
 
+    // prose-relevance wave (host-atlas-s6): a Markdown heading is already a
+    // document-family unit through A1 §6.1's own structure extraction
+    // (`text::markdown_units`, carried as that unit's `title`, indexed just
+    // above this loop). `source.occurrences` also claims every heading as a
+    // generic tree-sitter symbol — real, intentional coverage of that table
+    // (the F5 corpus manifest pins it) — but a heading is retrievable
+    // prose, not a per-file identifier, so it must not *also* become a
+    // code-family retrievable unit: doing so let a generic, widely-shared
+    // heading flood A2 §8 signal 1's exact-symbol-match boost as though it
+    // were a distinguishing identifier match
+    // (`markdown_headings_are_not_code_family_units`). Filtered in the WHERE
+    // clause alongside the existing extractor predicate rather than fetched
+    // and skipped in Rust.
     let mut statement = conn.prepare(sql!(
-        "SELECT source_name, relative_path, ordinal, language, label, name, byte_start, byte_end \
-         FROM source.occurrences \
-         WHERE generation_id = ? AND extractor LIKE ? \
-         ORDER BY relative_path, ordinal"
+        "SELECT o.source_name, o.relative_path, o.ordinal, o.language, o.label, o.name, \
+                o.byte_start, o.byte_end, \
+                COALESCE(fci.content_digest, fi.canonical_path) \
+         FROM source.occurrences o \
+         LEFT JOIN source.file_identity fi ON fi.generation_id = o.generation_id \
+                                           AND fi.relative_path = o.relative_path \
+         LEFT JOIN source.file_content_identity fci ON fci.generation_id = o.generation_id \
+                                                     AND fci.relative_path = o.relative_path \
+         WHERE o.generation_id = ? AND o.extractor LIKE ? AND o.language <> ? \
+         ORDER BY o.relative_path, o.ordinal"
     ))?;
-    let mut rows = statement.query(duckdb::params![generation_id, CODE_EXTRACTOR_LIKE])?;
+    let mut rows = statement.query(duckdb::params![
+        generation_id,
+        CODE_EXTRACTOR_LIKE,
+        crate::runtime::atlas::syntax::SyntaxLanguage::Markdown.name()
+    ])?;
     while let Some(row) = rows.next()? {
+        let language: String = row.get(3)?;
         let relative_path: String = row.get(1)?;
         let ordinal = row.get::<usize, i64>(2)? as u64;
         let name: String = row.get(5)?;
+        let identity = identity_of(
+            row.get::<usize, Option<String>>(8)?,
+            generation_id,
+            &relative_path,
+        );
         units.push(IndexableUnit {
             source_name: row.get(0)?,
             family: LexicalFamily::Code,
-            unit_key: unit_key(LexicalFamily::Code, &relative_path, ordinal),
+            unit_key: unit_key(LexicalFamily::Code, &identity, ordinal),
             relative_path,
             ordinal,
             title: None,
             symbol: Some(name.clone()),
-            language: Some(row.get(3)?),
+            language: Some(language),
             label: Some(row.get(4)?),
             dataset_key: None,
             row_key: None,
@@ -5267,17 +5900,29 @@ fn indexable_units(
     drop(statement);
 
     let mut statement = conn.prepare(sql!(
-        "SELECT source_name, relative_path, dataset_key, ordinal, row_key, fields, body \
-         FROM context.row_units WHERE generation_id = ? ORDER BY relative_path, ordinal"
+        "SELECT r.source_name, r.relative_path, r.dataset_key, r.ordinal, r.row_key, r.fields, \
+                r.body, \
+                COALESCE(fci.content_digest, fi.canonical_path) \
+         FROM context.row_units r \
+         LEFT JOIN source.file_identity fi ON fi.generation_id = r.generation_id \
+                                           AND fi.relative_path = r.relative_path \
+         LEFT JOIN source.file_content_identity fci ON fci.generation_id = r.generation_id \
+                                                     AND fci.relative_path = r.relative_path \
+         WHERE r.generation_id = ? ORDER BY r.relative_path, r.ordinal"
     ))?;
     let mut rows = statement.query(duckdb::params![generation_id])?;
     while let Some(row) = rows.next()? {
         let relative_path: String = row.get(1)?;
         let ordinal = row.get::<usize, i64>(3)? as u64;
+        let identity = identity_of(
+            row.get::<usize, Option<String>>(7)?,
+            generation_id,
+            &relative_path,
+        );
         units.push(IndexableUnit {
             source_name: row.get(0)?,
             family: LexicalFamily::RowText,
-            unit_key: unit_key(LexicalFamily::RowText, &relative_path, ordinal),
+            unit_key: unit_key(LexicalFamily::RowText, &identity, ordinal),
             relative_path,
             ordinal,
             title: None,
@@ -5559,15 +6204,49 @@ fn coordinate_of(row: &duckdb::Row<'_>) -> Result<UnitCoordinate, AtlasError> {
     })
 }
 
-/// The index's own per-generation unit identity: `<family>:<path>#<ordinal>`.
+/// The index's own unit identity: `<family>:<path>#<ordinal>`.
 ///
 /// The family prefix is load-bearing rather than decorative — one `.rs` file
 /// produces both a `source.occurrences` row at ordinal 0 and (through
 /// `claims_for`'s plain-text fallback) a `source.units` row at ordinal 0, and
 /// without the prefix those two distinct pieces of evidence would collide on
 /// one key and one would silently overwrite the other's postings.
-fn unit_key(family: LexicalFamily, relative_path: &str, ordinal: u64) -> String {
-    format!("{}:{relative_path}#{ordinal}", family.as_str())
+///
+/// **Projection-identity wave (S6): `path` is the file's canonical identity,
+/// not its per-source `relative_path`.** [`identity_of`] resolves it — a
+/// `source.file_content_identity` row when the generation has one (bug 2:
+/// content digest, preferred), else a `source.file_identity` row (path
+/// canonicalization), else the bare `relative_path`. That is what makes
+/// this key **no longer per-generation**: two generations covering the same
+/// physical file, or genuinely different files whose bytes are identical,
+/// compute the identical string here — either their `canonical_path`s agree
+/// (a symlink or overlapping mount, the same real path) or, when they don't
+/// (bug 2's clone/working-copy twins, two different inodes), their
+/// `content_digest`s do — and only their `generation_id`s differ. That
+/// string is exactly the join [`LEXICAL_CORPUS_SQL`],
+/// [`LEXICAL_DOCUMENT_FREQUENCY_SQL`] and [`LEXICAL_POSTINGS_SQL`] dedupe
+/// on. A source kind with no known identity root falls back to
+/// `relative_path` — the pre-S6 value, so it keeps behaving exactly as it
+/// always did rather than colliding with anything.
+fn unit_key(family: LexicalFamily, identity: &str, ordinal: u64) -> String {
+    format!("{}:{identity}#{ordinal}", family.as_str())
+}
+
+/// [`unit_key`]'s identity input: `COALESCE(source.file_content_identity
+/// .content_digest, source.file_identity.canonical_path)`, already resolved
+/// by the caller's SQL — the content digest first (bug 2: a plain BLAKE3 of
+/// the raw bytes, genuinely comparable across generations regardless of
+/// where their roots sit on disk), the canonicalized path second (a real
+/// absolute filesystem path, comparable when two sources share it), either
+/// of which makes deduping across sources on it correct (every generation
+/// this wave stages has both rows, known identity root or not — see
+/// [`insert_file_identity`] and [`insert_file_content_identity`]).
+///
+/// **Without a row at all — a generation staged before this wave —
+/// [`generation_scoped_identity`]'s own fallback.** Read that function's doc
+/// for why `relative_path` alone is never used bare.
+fn identity_of(identity: Option<String>, generation_id: &str, relative_path: &str) -> String {
+    identity.unwrap_or_else(|| generation_scoped_identity(generation_id, relative_path))
 }
 
 /// One unit on its way into the index — the stored row plus the text that
@@ -9206,6 +9885,7 @@ mod tests {
             observed_at: crate::domain::event::rfc3339_utc_now(),
             files: vec![ScannedFile {
                 relative_path: "doc.md".to_string(),
+                content_digest: hash.clone(),
                 content_hash: hash,
                 extractor: "markdown/v1".to_string(),
                 local_key: key,
@@ -9233,6 +9913,7 @@ mod tests {
             extractors: BTreeSet::from(["markdown/v1".to_string()]),
             datasets: Vec::new(),
             root: None,
+            identity_root: None,
             context_fields: crate::runtime::atlas::tabular::ContextFields::none(),
         }
     }
@@ -9667,6 +10348,484 @@ mod tests {
         assert!(
             !after.hits.is_empty(),
             "reindex_lexical must backfill the generation's postings"
+        );
+    }
+
+    /// F-IN-01: a generation confirmed before the S6 prose-relevance fix
+    /// (`markdown_headings_are_not_code_family_units`) already has a
+    /// code-family `context.lexical_units` row derived from a Markdown
+    /// heading — postings the current `indexable_units()` would never
+    /// itself write. `lexical_index_needs_rebuild`'s presence-only check
+    /// would report such a generation clean forever; reproduce the shape
+    /// directly (insert the exact stale row, rather than relying on old
+    /// binary behavior this crate no longer contains) and confirm it is
+    /// both detected and cleared by `reindex_lexical`.
+    #[test]
+    fn a_confirmed_generation_with_stale_markdown_code_postings_is_detected_and_backfilled() {
+        let mut db = AtlasDb::open_in_memory().expect("atlas");
+        let generation_id = record(&mut db, &scan_of("notes", "# Heading\nbody"), "evt-1");
+
+        assert!(
+            !db.lexical_index_needs_rebuild().expect("check"),
+            "a freshly confirmed generation must not already look stale"
+        );
+
+        // Simulate the pre-fix derivation: a Markdown heading occurrence
+        // written as a code-family lexical unit, the exact shape the S6 fix
+        // stopped producing.
+        let stale_key = unit_key(LexicalFamily::Code, "notes.md", 999);
+        db.conn
+            .execute(
+                sql!(
+                    "INSERT INTO context.lexical_units \
+                     (generation_id, source_name, family, unit_key, relative_path, \
+                      ordinal, title, symbol, language, label, dataset_key, row_key, \
+                      fields, byte_start, byte_end, token_count) \
+                     VALUES (?, 'notes', ?, ?, 'notes.md', 999, NULL, 'Heading', ?, \
+                             'heading', NULL, NULL, NULL, 0, 7, 1)"
+                ),
+                duckdb::params![
+                    generation_id,
+                    LexicalFamily::Code.as_str(),
+                    stale_key,
+                    crate::runtime::atlas::syntax::SyntaxLanguage::Markdown.name()
+                ],
+            )
+            .expect("insert stale unit");
+
+        assert!(
+            db.lexical_index_needs_rebuild().expect("check"),
+            "a generation carrying a code-family Markdown unit must be flagged stale"
+        );
+
+        let outcome = db.reindex_lexical().expect("reindex");
+        assert!(outcome.indexed > 0, "the rebuild must actually index units");
+        assert!(
+            !db.lexical_index_needs_rebuild().expect("recheck"),
+            "after reindex_lexical the store must no longer look stale"
+        );
+
+        let mut statement = db
+            .conn
+            .prepare(sql!(
+                "SELECT COUNT(*) FROM context.lexical_units \
+                 WHERE generation_id = ? AND family = ? AND language = ?"
+            ))
+            .expect("prepare");
+        let mut rows = statement
+            .query(duckdb::params![
+                generation_id,
+                LexicalFamily::Code.as_str(),
+                crate::runtime::atlas::syntax::SyntaxLanguage::Markdown.name()
+            ])
+            .expect("query");
+        let remaining: i64 = match rows.next().expect("row") {
+            Some(row) => row.get(0).expect("count"),
+            None => 0,
+        };
+        assert_eq!(
+            remaining, 0,
+            "reindex_lexical must not re-derive the stale code-family Markdown unit"
+        );
+    }
+
+    /// chunker-wire (`brief-chunker-wire.md` item 2), third use of the
+    /// `lexical_index_needs_rebuild` "impossible-under-current-derivation
+    /// signature" mechanism the two tests above establish. A generation
+    /// confirmed before this wave has a grammar-claimed file (`.rs`) whose
+    /// structure extraction still produced one whole-file
+    /// `UnitKind::Document` unit paired with real code occurrences from
+    /// that same path's grammar — exactly the pre-fix shape
+    /// `extract_units` no longer writes (a grammar-claimed path now always
+    /// gets `chunk_source`'s `UnitKind::Section` spans). Reproduce that
+    /// shape directly, by hand, rather than relying on old binary behavior
+    /// this crate no longer contains.
+    #[test]
+    fn a_confirmed_generation_with_a_whole_file_code_document_unit_is_detected_and_backfilled() {
+        use crate::runtime::atlas::scan::ScannedSymbol;
+        use crate::runtime::atlas::syntax::SyntaxLanguage;
+
+        // Comfortably over `chunk::DESIRED_CHUNK_LENGTH` (750 bytes) many
+        // times over, so the repaired shape is more than one chunk and none
+        // of them span the whole file — the same fixture shape
+        // `scan::tests`' end-to-end case uses.
+        let mut body = String::new();
+        for n in 0..60 {
+            body.push_str(&format!(
+                "pub fn function_{n}(x: i32) -> i32 {{ x + {n} }}\n"
+            ));
+        }
+        let body = body.as_str();
+        let hash = crate::domain::source::content_hash(body.as_bytes());
+        let key = crate::domain::source::local_key(&hash, "text/v1");
+        let language = SyntaxLanguage::Rust;
+        let syntax_extractor = language.extractor_identity();
+        let scan = SourceScan {
+            source_name: "notes".to_string(),
+            kind: SourceKind::LocalKnowledge,
+            authority: AuthorityClass::EstateReadonly,
+            content_key: hash.clone(),
+            revision: None,
+            observed_at: crate::domain::event::rfc3339_utc_now(),
+            files: vec![ScannedFile {
+                relative_path: "lib.rs".to_string(),
+                content_digest: hash.clone(),
+                content_hash: hash.clone(),
+                extractor: "text/v1".to_string(),
+                local_key: key,
+                byte_len: body.len() as u64,
+                mtime_millis: None,
+                // The pre-fix shape: one whole-file Document unit, exactly
+                // what `plain_units` produced for a grammar-claimed path
+                // before this wave wired `chunk_source` in.
+                units: vec![ScannedUnit {
+                    ordinal: 0,
+                    kind: UnitKind::Document,
+                    heading_level: None,
+                    title: None,
+                    byte_start: 0,
+                    byte_end: body.len() as u64,
+                    coordinate: None,
+                    text: body.to_string(),
+                }],
+                syntax: Some(ScannedSyntax {
+                    language: language.name(),
+                    extractor: syntax_extractor.clone(),
+                    syntax_key: crate::domain::source::local_key(&hash, &syntax_extractor),
+                    symbols: vec![ScannedSymbol {
+                        ordinal: 0,
+                        label: "function",
+                        name: "f".to_string(),
+                        byte_start: 0,
+                        byte_end: body.len() as u64,
+                    }],
+                    edges: Vec::new(),
+                }),
+                parent: None,
+            }],
+            coverage: vec![CoverageRow {
+                path: Some("lib.rs".to_string()),
+                status: Coverage::Indexed,
+                detail: Some("text/v1".to_string()),
+                bytes: Some(body.len() as u64),
+            }],
+            extractors: BTreeSet::from(["text/v1".to_string(), syntax_extractor]),
+            datasets: Vec::new(),
+            root: None,
+            identity_root: None,
+            context_fields: crate::runtime::atlas::tabular::ContextFields::none(),
+        };
+
+        let mut db = AtlasDb::open_in_memory().expect("atlas");
+        let generation_id = record(&mut db, &scan, "evt-1");
+
+        assert!(
+            db.lexical_index_needs_rebuild().expect("check"),
+            "a generation carrying a whole-file Document unit for a \
+             grammar-claimed path must be flagged stale"
+        );
+
+        let outcome = db.reindex_lexical().expect("reindex");
+        assert!(outcome.indexed > 0, "the rebuild must actually index units");
+        assert!(
+            !db.lexical_index_needs_rebuild().expect("recheck"),
+            "after reindex_lexical the store must no longer look stale"
+        );
+
+        // The repair actually landed real, citable `source.units` rows —
+        // not just a derived-only fix that would leave a lexical hit citing
+        // an ordinal the table does not have.
+        let mut statement = db
+            .conn
+            .prepare(sql!(
+                "SELECT COUNT(*), MIN(byte_end - byte_start) FROM source.units \
+                 WHERE generation_id = ? AND relative_path = ? AND unit_kind = ?"
+            ))
+            .expect("prepare");
+        let mut rows = statement
+            .query(duckdb::params![
+                generation_id,
+                "lib.rs",
+                UnitKind::Section.as_str()
+            ])
+            .expect("query");
+        let (count, min_span): (i64, Option<i64>) = match rows.next().expect("row") {
+            Some(row) => (row.get(0).expect("count"), row.get(1).expect("min span")),
+            None => (0, None),
+        };
+        assert!(count > 0, "the whole-file Document row was never chunked");
+        assert!(
+            min_span.is_some_and(|span| span < body.len() as i64),
+            "a repaired unit still spans the whole {}-byte file",
+            body.len()
+        );
+
+        // F-IN-01: `source.files.unit_count` must track the repair, not
+        // stay pinned at the pre-fix whole-file count of 1 — a fresh scan
+        // would have written `chunk_count` here via `insert_file`.
+        let mut statement = db
+            .conn
+            .prepare(sql!(
+                "SELECT unit_count FROM source.files \
+                 WHERE generation_id = ? AND relative_path = ?"
+            ))
+            .expect("prepare");
+        let mut rows = statement
+            .query(duckdb::params![generation_id, "lib.rs"])
+            .expect("query");
+        let unit_count: i64 = rows
+            .next()
+            .expect("row")
+            .expect("a source.files row for lib.rs")
+            .get(0)
+            .expect("unit_count");
+        assert_eq!(
+            unit_count, count,
+            "source.files.unit_count must be updated to match the rechunked \
+             source.units row count, not left at the stale pre-fix value"
+        );
+    }
+
+    /// A freshly confirmed generation whose grammar-claimed file already
+    /// went through the post-fix `extract_units` (chunked `Section` units,
+    /// the real end-to-end path `scan::tests` exercises) must never be
+    /// flagged stale by the same predicate — the signature this migration
+    /// mechanism keys on is the pre-fix shape specifically, not "has code".
+    #[test]
+    fn a_freshly_chunked_code_generation_is_not_flagged_stale() {
+        let mut db = AtlasDb::open_in_memory().expect("atlas");
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut big_rs = String::new();
+        for n in 0..60 {
+            big_rs.push_str(&format!(
+                "pub fn function_{n}(x: i32) -> i32 {{ x + {n} }}\n"
+            ));
+        }
+        std::fs::write(dir.path().join("big.rs"), &big_rs).expect("write fixture");
+        let source = crate::runtime::atlas::scan::KnowledgeSource {
+            name: "notes".to_string(),
+            root: dir.path().to_path_buf(),
+            ignore: Vec::new(),
+            context_fields: crate::runtime::atlas::tabular::ContextFields::none(),
+        };
+        let scan = crate::runtime::atlas::scan::scan_local_knowledge(&source).expect("scan");
+        record(&mut db, &scan, "evt-1");
+
+        assert!(
+            !db.lexical_index_needs_rebuild().expect("check"),
+            "a freshly confirmed, already-chunked generation must not be flagged stale"
+        );
+    }
+
+    /// **Projection-identity wave (S6) migration.** A generation staged
+    /// before this wave has `source.files` rows but zero
+    /// `source.file_identity` rows — `reindex_lexical`'s own mechanism
+    /// cannot backfill this (its doc: it re-derives `context.lexical_*`
+    /// from `source.*` rows already on disk, and `source.file_identity`
+    /// needs the scan's `identity_root`, which is nowhere stored to read
+    /// back). So `stage_scan`'s own content-unchanged shortcut must itself
+    /// decline to shortcut — reproduced directly, the same way
+    /// `a_confirmed_generation_with_stale_markdown_code_postings_is_detected_and_backfilled`
+    /// reproduces its own pre-fix shape: strip the row this wave's code
+    /// would have written, not rely on old binary behavior this crate no
+    /// longer contains.
+    #[test]
+    fn a_generation_missing_file_identity_is_backfilled_on_the_next_scan_not_shortcut() {
+        let mut db = AtlasDb::open_in_memory().expect("atlas");
+        let scan = scan_of("notes", "PaymentRetryPolicy lives here");
+        let generation_id = record(&mut db, &scan, "evt-1");
+
+        assert!(
+            !db.generation_missing_file_identity(&generation_id)
+                .expect("check"),
+            "a freshly confirmed generation must already carry its file_identity rows"
+        );
+
+        // Reproduce the exact pre-wave shape: rows exist, but
+        // `insert_file_identity` never ran for this generation.
+        db.conn
+            .execute(
+                sql!("DELETE FROM source.file_identity WHERE generation_id = ?"),
+                duckdb::params![generation_id],
+            )
+            .expect("strip file_identity");
+        assert!(
+            db.generation_missing_file_identity(&generation_id)
+                .expect("check"),
+            "a generation with files but no file_identity rows must be flagged"
+        );
+
+        // Re-stage the identical content. The plain `content_key ==` check
+        // alone would take the `Unchanged` shortcut and leave
+        // `source.file_identity` empty forever; the migration-aware
+        // condition must instead supersede the generation exactly as a
+        // real content or extractor change would.
+        let restaged = db
+            .stage_scan(&scan, &EstateBinding::Estate(TEST_ESTATE.to_string()))
+            .expect("re-stage");
+        let ScanCommit::Staged {
+            generation_id: new_generation_id,
+        } = restaged
+        else {
+            panic!(
+                "an identity-incomplete generation must not take the Unchanged shortcut: {restaged:?}"
+            );
+        };
+        assert_ne!(
+            new_generation_id, generation_id,
+            "the backfill must supersede the old generation with a new one"
+        );
+        db.confirm_scan(&new_generation_id, "evt-2")
+            .expect("confirm");
+
+        assert!(
+            !db.generation_missing_file_identity(&new_generation_id)
+                .expect("check"),
+            "the re-staged generation must carry file_identity rows this time"
+        );
+    }
+
+    /// **F-IN-01.** A generation staged in the window between the
+    /// projection-identity wave (which introduced `file_identity`) and bug
+    /// 2 (which introduced `file_content_identity`) has every
+    /// `file_identity` row it needs — so
+    /// `generation_missing_file_identity` alone reports `false` — and zero
+    /// `file_content_identity` rows. Reproduced the same way
+    /// `a_generation_missing_file_identity_is_backfilled_on_the_next_scan_not_shortcut`
+    /// reproduces its own predecessor gap: strip only the newer table,
+    /// leaving the older one intact, and confirm re-staging the identical
+    /// scan backfills it rather than taking the `Unchanged` shortcut.
+    ///
+    /// **Non-vacuous, the way the finding's own evidence was measured**: a
+    /// byte-identical twin generation (a fresh scan of the same real bytes,
+    /// a different source) resolves to `content_digest`; the
+    /// content-identity-incomplete generation resolves to `canonical_path`
+    /// before this fix — two different `unit_key`s for one real file, which
+    /// is what `identity_of`'s cross-generation dedup is for. After the
+    /// backfill, both resolve to the same `unit_key`.
+    #[test]
+    fn a_generation_missing_file_content_identity_is_backfilled_on_the_next_scan_not_shortcut() {
+        let mut db = AtlasDb::open_in_memory().expect("atlas");
+        let body = "PaymentRetryPolicy lives here\n";
+        let scan = scan_of("notes", body);
+        let generation_id = record(&mut db, &scan, "evt-1");
+
+        assert!(
+            !db.generation_missing_file_content_identity(&generation_id)
+                .expect("check"),
+            "a freshly confirmed generation must already carry its \
+             file_content_identity rows"
+        );
+
+        // Reproduce the exact between-waves shape: `file_identity` rows
+        // exist (this generation is not "pre-projection-identity"), but
+        // `insert_file_content_identity` never ran for it — the shape
+        // `generation_missing_file_identity` alone cannot see.
+        db.conn
+            .execute(
+                sql!("DELETE FROM source.file_content_identity WHERE generation_id = ?"),
+                duckdb::params![generation_id],
+            )
+            .expect("strip file_content_identity");
+        assert!(
+            !db.generation_missing_file_identity(&generation_id)
+                .expect("check"),
+            "file_identity is untouched — the older migration signal must \
+             not fire for this gap"
+        );
+        assert!(
+            db.generation_missing_file_content_identity(&generation_id)
+                .expect("check"),
+            "a generation with files but no file_content_identity rows must \
+             be flagged"
+        );
+
+        // The bug, made concrete: a byte-identical twin generation from a
+        // different source resolves to `content_digest`; this one, stuck on
+        // `canonical_path`, computes a different `unit_key` for the same
+        // real bytes.
+        let twin_scan = scan_of("notes-twin", body);
+        let twin_generation_id = record(&mut db, &twin_scan, "evt-2");
+        let stuck_units = indexable_units(&db.conn, &generation_id).expect("stuck units");
+        let twin_units = indexable_units(&db.conn, &twin_generation_id).expect("twin units");
+        assert_eq!(stuck_units.len(), 1);
+        assert_eq!(twin_units.len(), 1);
+        assert_ne!(
+            stuck_units[0].unit_key, twin_units[0].unit_key,
+            "before the fix, the content-identity-incomplete generation \
+             must NOT already agree with its byte-identical twin — \
+             otherwise this fixture proves nothing"
+        );
+
+        // Re-stage the identical content. The plain `content_key ==` check
+        // plus the older migration signal alone would take the `Unchanged`
+        // shortcut and leave `file_content_identity` empty forever.
+        let restaged = db
+            .stage_scan(&scan, &EstateBinding::Estate(TEST_ESTATE.to_string()))
+            .expect("re-stage");
+        let ScanCommit::Staged {
+            generation_id: new_generation_id,
+        } = restaged
+        else {
+            panic!(
+                "a content-identity-incomplete generation must not take the \
+                 Unchanged shortcut: {restaged:?}"
+            );
+        };
+        assert_ne!(
+            new_generation_id, generation_id,
+            "the backfill must supersede the old generation with a new one"
+        );
+        db.confirm_scan(&new_generation_id, "evt-3")
+            .expect("confirm");
+
+        assert!(
+            !db.generation_missing_file_content_identity(&new_generation_id)
+                .expect("check"),
+            "the re-staged generation must carry file_content_identity rows this time"
+        );
+        let healed_units = indexable_units(&db.conn, &new_generation_id).expect("healed units");
+        assert_eq!(healed_units.len(), 1);
+        assert_eq!(
+            healed_units[0].unit_key, twin_units[0].unit_key,
+            "after the backfill, the same real file agrees with its \
+             byte-identical twin on unit_key"
+        );
+    }
+
+    /// Bug 2 (`brief-search-three-bugs.md`): byte-identical content
+    /// acquired through two sources whose `identity_root`s are genuinely
+    /// different directories (a `repos/` clone and the live working tree it
+    /// mirrors — real, different inodes) must still merge to one identity.
+    /// Path canonicalization alone cannot catch this — the ruling's own
+    /// example ("clone/working-copy twins") is exactly two different real
+    /// paths, so `canonical_path` legitimately differs between the two
+    /// generations; the content digest is the merge key that must still
+    /// agree.
+    #[test]
+    fn byte_identical_files_from_two_different_roots_share_one_identity() {
+        let mut db = AtlasDb::open_in_memory().expect("atlas");
+        let clone_dir = tempfile::TempDir::new().expect("clone dir");
+        let live_dir = tempfile::TempDir::new().expect("live dir");
+        let body = "PaymentRetryPolicy lives here\n";
+
+        let mut clone_scan = scan_of("repo-clone", body);
+        clone_scan.identity_root = Some(clone_dir.path().to_path_buf());
+        let clone_gen = record(&mut db, &clone_scan, "evt-1");
+
+        let mut live_scan = scan_of("live-working-copy", body);
+        live_scan.identity_root = Some(live_dir.path().to_path_buf());
+        let live_gen = record(&mut db, &live_scan, "evt-2");
+
+        let clone_units = indexable_units(&db.conn, &clone_gen).expect("clone units");
+        let live_units = indexable_units(&db.conn, &live_gen).expect("live units");
+        assert_eq!(clone_units.len(), 1);
+        assert_eq!(live_units.len(), 1);
+        assert_eq!(
+            clone_units[0].unit_key, live_units[0].unit_key,
+            "byte-identical content from two genuinely different roots must \
+             compute the same unit_key even though their canonicalized \
+             paths differ (two different real directories on disk)"
         );
     }
 

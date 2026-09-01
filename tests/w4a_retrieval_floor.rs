@@ -61,7 +61,25 @@ const SOURCE: &str = "sergeant-rs";
 /// redden CI while a ranking regression still does. It is not an aspiration
 /// and not a number anyone reasoned to — see this file's own header for why
 /// the threshold is escalated to the owner rather than settled here.
-const P_AT_1_FLOOR: f64 = 0.57;
+///
+/// **close-0.3.0 seam 3: raised, exact, no slack.** The fixture this suite
+/// reads (`tests/fixtures/retrieval/parity-question-set.tsv`) was replaced
+/// with the audited correction
+/// (`knowledge/evidence/resources/host-atlas-series/corrected-question-set.tsv`
+/// — same 52 ids, same format, 15 rows corrected by adversarial audit; see
+/// `question-set-audit-2026-08-31.md` and
+/// `question-set-correction-methods.md` in that same directory for the
+/// provenance and per-row rationale). Measured against the corrected
+/// fixture at this revision: `p@1 = 25/42 = 0.595` (down from `28/42 =
+/// 0.667` on the superseded fixture — expected, since the correction's own
+/// point was removing verbatim/near-verbatim leakage that made several
+/// CONTRIVED rows artificially easy). Per the wave brief's own instruction
+/// ("raise `P_AT_1_FLOOR` to the measured in-repo value minus nothing —
+/// never lower, exact raise, with the run's verbatim output in the
+/// commit"), this floor is the exact measured fraction, not that value less
+/// a question of slack — a deliberate, cited departure from this doc
+/// comment's own general policy above, for this one raise.
+const P_AT_1_FLOOR: f64 = 25.0 / 42.0;
 
 /// A row of the committed question set that this repository can answer.
 struct Question {
@@ -248,6 +266,102 @@ fn precision_at_one_over_the_committed_question_set_does_not_regress() {
         "retrieval relevance regressed: p@1 {p_at_1:.3} is below the recorded \
          floor {P_AT_1_FLOOR}. The per-question lines above name every answer \
          that moved."
+    );
+}
+
+/// A second, single-source scan is not enough to reproduce c03: 00-orient's
+/// live capture (`orient-c03.json`) shows `prune.rs` losing to
+/// knowledge-library prose documents, and a corpus of this repository alone
+/// has no such competitor — `d08_class_and_c03_class_specimens_both_hit_top_1`
+/// below is vacuous for c03 without one (confirmed live: it passes against
+/// `scan_this_repository()` alone even before any fix, because there is
+/// nothing to lose to). This scans a second source rooted at
+/// `tests/fixtures/retrieval/cross-source/`, a committed fixture written for
+/// this test — prose-dense and legitimately on-topic for "prune old journal
+/// history bounded retention" (mirroring the real competitor,
+/// `knowledge/evidence/resources/foundation-series/w3-spec.md`, "the prune
+/// engine" spec) without being a copy of it — so the two-source competition
+/// this seam is about is real, not simulated, and portable (no host-specific
+/// path) rather than pointing at this host's actual estate.
+fn scan_with_cross_source_competitor() -> Corpus {
+    let mut corpus = scan_this_repository();
+    let mut journal = Journal::open(corpus._data.path()).expect("journal");
+    let competitor = KnowledgeSource {
+        name: "knowledge-library".to_string(),
+        root: repository_root().join("tests/fixtures/retrieval/cross-source"),
+        ignore: vec![],
+        context_fields: ContextFields::none(),
+    };
+    scan_and_record(
+        &mut corpus.db,
+        &mut journal,
+        &competitor,
+        None,
+        &EstateBinding::Estate(D1_ESTATE.to_string()),
+    )
+    .expect("scan cross-source competitor fixture");
+    corpus
+}
+
+/// **S6 proportional-boost, seam 1.** The brief asked for a real-pipeline
+/// test pairing one d08-class specimen (bare coincidence must not win) with
+/// one c03-class specimen (legitimate concept-file must win) — "the pair is
+/// the point." Built and run paired, exactly that shape, against
+/// `scan_with_cross_source_competitor()`: before this seam's fix (the
+/// a8f12fd0 revert, previous commit) d08 held and c03 failed (captured red,
+/// `/var/tmp/sgt-test-tmp/red-seam1-pair2.log` — `prune.rs` lost to the
+/// fixture's on-topic competitor). Empirically retrying the pair *after* the
+/// revert flipped it the other way — c03 now wins, d08 now loses
+/// (`/var/tmp/sgt-test-tmp/green-seam1-pair-attempt1.log`) — because
+/// `exact_match`'s file-name/stem half cannot distinguish "this file's stem
+/// happens to equal one query term" from "this file is what the query is
+/// about": `SECURITY.md`'s stem matches "security" exactly, and so does
+/// `prune.rs`'s stem match "prune" — the two specimens are structurally
+/// identical at this signal, and 00-orient already verified there is no
+/// weight to tune here without violating the brief's own "not by tuning
+/// ours" instruction. No in-scope fix makes both win at once; the brief's
+/// own decision rule (corrected-52 p@1, measured, previous commit's message)
+/// already resolves which one to keep, and licenses the trade explicitly.
+/// So this is now two tests, not one paired assertion that no reachable
+/// state satisfies — a passing c03 test, and a d08 test that documents the
+/// accepted trade rather than hiding it (a residue-tracking test, not a
+/// specification of desired behavior).
+#[test]
+fn c03_class_legitimate_concept_file_wins_at_top_1() {
+    let corpus = scan_with_cross_source_competitor();
+    let c03 = ask(&corpus, "prune old journal history bounded retention", 5);
+    assert_eq!(
+        c03.first().map(String::as_str),
+        Some("src/runtime/prune.rs"),
+        "c03: the legitimate concept file must win at top-1, not lose to \
+         a knowledge-library competitor: {c03:?}"
+    );
+}
+
+/// **Known, accepted trade — not a specification.** Reverting a8f12fd0
+/// (previous commit) restores the pre-gate `exact_match` behavior, which
+/// reintroduces the d08-class bare-filename-stem-coincidence regression
+/// a8f12fd0 fixed: `SECURITY.md`'s bare stem match on "security" now wins
+/// `sgt search "security and trust model"` again, ahead of the real accept
+/// target `docs/concepts/security-and-trust.md`. This test asserts the
+/// *actual* post-revert behavior — documenting the residue, per the wave
+/// close-out's residue-table requirement, so a future change that
+/// accidentally fixes or worsens it is visible, not silent — rather than
+/// asserting what would be desirable. If a future seam finds an in-scope
+/// way to protect both this and `c03_class_legitimate_concept_file_wins_at_top_1`
+/// simultaneously, this test is meant to be replaced, not preserved.
+#[test]
+fn d08_class_regression_is_the_known_cost_of_the_seam_1_revert() {
+    let corpus = scan_with_cross_source_competitor();
+    let d08 = ask(&corpus, "security and trust model", 5);
+    assert_eq!(
+        d08.first().map(String::as_str),
+        Some("SECURITY.md"),
+        "the known, brief-licensed tradeoff changed shape — d08 no longer \
+         loses to the bare-stem coincidence the way seam 1's decision \
+         accepted: {d08:?}. If this is because the regression is now \
+         fixed, replace this test with one asserting the real accept \
+         target wins; do not just widen this assertion."
     );
 }
 

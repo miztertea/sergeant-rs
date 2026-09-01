@@ -338,6 +338,24 @@ pub struct ScannedSyntax {
 pub struct ScannedFile {
     /// Path relative to the source root, `/`-separated.
     pub relative_path: String,
+    /// **BLAKE3 hex of the raw bytes, always this one algorithm regardless
+    /// of source kind** — the projection-identity merge key (bug 2,
+    /// `brief-search-three-bugs.md`). Deliberately a *different* field from
+    /// [`Self::content_hash`], which stays F7's own per-source-kind key
+    /// (the estate-git half is Git's own blob OID, a different hash and a
+    /// different byte framing — `sha1("blob <len>\0<content>")` vs plain
+    /// `blake3(content)` — so two byte-identical files acquired one via Git
+    /// and one via the filesystem carry two different `content_hash`
+    /// strings and could never merge on it). This field is what lets two
+    /// sources whose `identity_root`s are genuinely different directories
+    /// (a `repos/` clone and the live working tree it mirrors — two really
+    /// different inodes `canonical_identity`'s own path-canonicalization
+    /// cannot merge) still resolve to the same file identity: it is the
+    /// same reused algorithm [`crate::domain::source::content_hash`]
+    /// and [`crate::runtime::blob::BlobStore`] already compute
+    /// (`blake3::hash(bytes)`), applied uniformly rather than invented anew
+    /// (R2).
+    pub content_digest: String,
     /// BLAKE3 hex of the file's bytes (F7's content half).
     pub content_hash: String,
     /// Identity of the extractor that read it (F7's other half).
@@ -421,10 +439,62 @@ pub struct SourceScan {
     /// why an estate-git dataset is reported `unsupported` rather than
     /// silently skipped (see [`DATASET_NO_ROOT`]).
     pub root: Option<PathBuf>,
+    /// **Projection-identity wave (S6): the absolute path each acquired
+    /// file's canonical identity resolves against** (`root.join(relative_path)`,
+    /// canonicalized — symlinks resolve to their target).
+    ///
+    /// Deliberately a *different* field from [`Self::root`], not a reuse of
+    /// it: `root`'s only job is gating an in-place dataset read
+    /// ([`DATASET_NO_ROOT`]), and an estate-git scan's bytes coming out of
+    /// the object store rather than the filesystem (`root: None`) says
+    /// nothing about whether the *mount* has a stable absolute path a
+    /// canonical identity can resolve against — it does
+    /// ([`crate::runtime::atlas::git::EstateGitSource::mount`]). Populating
+    /// `root` from `mount` to get this identity would have silently
+    /// re-enabled in-place git dataset reads, which A1 §6.4 does not
+    /// support. `None` here means "no known absolute base" (a Work overlay,
+    /// today) and every reader falls back to the file's own `relative_path`
+    /// as its identity — the pre-S6 behavior, not a crash and not a
+    /// cross-source merge.
+    pub identity_root: Option<PathBuf>,
     /// **F10a**: the operator-declared column allowlist for this source,
     /// defaulting to none. Governs whether a dataset row's text may become a
     /// context unit, and nothing else.
     pub context_fields: ContextFields,
+}
+
+/// The projection-identity wave's canonical file identity (ruling
+/// `projection-model-and-false-j0s-2026-08-31.md` #3: *"the file is the
+/// identity; sources are memberships"*): `root.join(relative_path)`,
+/// canonicalized so two sources whose roots overlap on disk — one nested
+/// inside the other, or a symlink between them — agree on one string for
+/// the same physical file, independent of which source's own root-relative
+/// path produced the walk.
+///
+/// Falls back to the un-canonicalized join when `identity_root` is known but
+/// the path could not be resolved (already gone, a dangling symlink, or a
+/// test fixture that never touched a real filesystem for this exact join).
+///
+/// **`None` in, `None` out — deliberately, not `relative_path` verbatim.**
+/// `relative_path` alone is not a cross-source identity, merely a
+/// coincidence of spelling: two *unrelated* sources can each declare their
+/// own, unrelated file at the same relative path
+/// (`equal_scores_are_broken_by_the_stated_key_not_by_row_arrival_order`'s
+/// own fixture does exactly this, deliberately). A caller with no known
+/// `identity_root` (a Work overlay, an external Git bare cache) has no
+/// cross-source identity to offer and must say so rather than hand back a
+/// value a reader could mistake for one — the caller's own
+/// generation-scoped fallback is what actually preserves the pre-S6
+/// behavior of never merging across sources.
+pub fn canonical_identity(identity_root: Option<&Path>, relative_path: &str) -> Option<String> {
+    let root = identity_root?;
+    let joined = root.join(relative_path);
+    Some(
+        std::fs::canonicalize(&joined)
+            .unwrap_or(joined)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 impl SourceScan {
@@ -574,6 +644,7 @@ fn scan_local_knowledge_impl(
         files,
         datasets,
         root: Some(source.root.clone()),
+        identity_root: Some(source.root.clone()),
         context_fields: source.context_fields.clone(),
         coverage,
         extractors,
@@ -791,6 +862,7 @@ impl Walk<'_> {
         self.files.push(ScannedFile {
             relative_path: relative,
             local_key: extracted.key,
+            content_digest: hash.clone(),
             content_hash: hash,
             extractor: extracted.extractor.to_string(),
             byte_len: bytes.len() as u64,
@@ -1405,6 +1477,10 @@ fn dispatch_worker_resource_at_depth(
             sink.files.push(ScannedFile {
                 relative_path: relative_path.clone(),
                 local_key: parent_key.clone(),
+                // `identity.resource_hash` above is already `content_hash(&bytes)`
+                // — plain BLAKE3 of these exact bytes, computed once, reused
+                // here rather than a second hash pass (R2).
+                content_digest: identity.resource_hash.clone(),
                 content_hash: content_id.to_string(),
                 extractor: batch.extractor,
                 byte_len: bytes.len() as u64,
@@ -1641,6 +1717,9 @@ fn land_child(
         sink.files.push(ScannedFile {
             relative_path: composed.clone(),
             local_key: local_key.clone(),
+            // `hash` above is already the daemon's own BLAKE3 of these
+            // bytes (F7's child rule), reused rather than a second hash.
+            content_digest: hash.clone(),
             content_hash: hash,
             extractor: extractor.to_string(),
             byte_len,
@@ -1707,6 +1786,8 @@ fn land_child(
     sink.files.push(ScannedFile {
         relative_path: composed,
         local_key: extracted.key,
+        // Same daemon-computed BLAKE3 as the container-child site above.
+        content_digest: hash.clone(),
         content_hash: hash,
         extractor: extracted.extractor.to_string(),
         byte_len,
@@ -1793,7 +1874,7 @@ pub fn extract_resource(
     let mut out = ResourceExtraction {
         extractor: claims.structure,
         key: keys.key(content_id, claims.structure),
-        units: extract_units(text, claims.structure),
+        units: extract_units(text, claims.structure, claims.language),
         syntax: None,
         identities: vec![claims.structure.to_string()],
         failure: None,
@@ -1848,7 +1929,57 @@ pub fn extract_resource(
 /// bytes by different routes, and F7's premise is that identical bytes plus an
 /// identical extractor identity are *one* extraction. Two copies of this loop
 /// would be two ways for that to stop being true.
-pub fn extract_units(text: &str, extractor: &str) -> Vec<ScannedUnit> {
+///
+/// `language` is [`Claims::language`] — `Some` exactly when a grammar
+/// claims this path (X3b's union). Markdown always keeps `markdown_units`
+/// (A1 §6.1's heading/section structure), and a genuinely plain-text path
+/// (`extractor == TEXT_EXTRACTOR`, `language == None` — semble.txt/.text,
+/// nothing else claims it) keeps `plain_units`'s single whole-document unit
+/// per R1 (no structure this build can honestly claim to see). The one path
+/// that changes here (chunker-wire,
+/// `knowledge/evidence/resources/host-atlas-s6-series/brief-chunker-wire.md`):
+/// a path a *grammar* claims but the structure table does not —
+/// `main.rs`, `Cargo.toml` — used to fall onto that same whole-document
+/// branch through [`TEXT_EXTRACTOR`] (`claims_for`'s own union, this
+/// module's doc above); it now gets [`super::chunk::chunk_source`]'s
+/// retrieval-sized spans instead, the code/config family's equivalent of
+/// Markdown's section units.
+pub fn extract_units(
+    text: &str,
+    extractor: &str,
+    language: Option<SyntaxLanguage>,
+) -> Vec<ScannedUnit> {
+    // F-SI-01 (R2: reuse existing structure). Markdown and genuinely
+    // plain-text both land on the same `Vec<StructureUnit>` ->
+    // `ScannedUnit` mapping; the code/config `chunk_source` branch below is
+    // the only shape that actually differs, so it alone stays a separate
+    // arm. `extractor != MARKDOWN_EXTRACTOR && language.is_some()` is
+    // exactly the pre-chunker-wire "structure vs. chunk_source" split.
+    if extractor != MARKDOWN_EXTRACTOR
+        && let Some(language) = language
+    {
+        return crate::runtime::atlas::chunk::chunk_source(text, Some(language))
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, chunk)| ScannedUnit {
+                ordinal: ordinal as u64,
+                // A chunk is a byte-delimited span within a document, the
+                // same shape Markdown's own non-Document unit is (R2:
+                // reuse `UnitKind::Section` rather than add a third
+                // variant every `UnitKind::as_str`/`parse`/DB consumer
+                // would then need to learn, for a unit that is not
+                // heading-delimited but is exactly as much "not the
+                // whole document" as a section is).
+                kind: UnitKind::Section,
+                heading_level: None,
+                title: None,
+                byte_start: chunk.byte_start as u64,
+                byte_end: chunk.byte_end as u64,
+                coordinate: None,
+                text: chunk.content,
+            })
+            .collect();
+    }
     let structure = if extractor == MARKDOWN_EXTRACTOR {
         markdown_units(text)
     } else {
@@ -1864,8 +1995,9 @@ pub fn extract_units(text: &str, extractor: &str) -> Vec<ScannedUnit> {
             title: unit.title,
             byte_start: unit.byte_start as u64,
             byte_end: unit.byte_end as u64,
-            // A text/Markdown unit's byte span IS its address, so there is
-            // no second, native one to carry (`ScannedUnit::coordinate`).
+            // A text/Markdown unit's byte span IS its address, so there
+            // is no second, native one to carry
+            // (`ScannedUnit::coordinate`).
             coordinate: None,
             text: text[unit.byte_start..unit.byte_end].to_string(),
         })
@@ -2304,5 +2436,206 @@ mod tests {
         assert_eq!(Coverage::OnlineOnly.as_str(), "online_only");
         assert_eq!(Coverage::parse("online_only"), Some(Coverage::OnlineOnly));
         assert!(Coverage::ALL.contains(&Coverage::OnlineOnly));
+    }
+
+    /// chunker-wire (host-atlas-s6-series/brief-chunker-wire.md item 3): a
+    /// grammar-claimed, structure-unclaimed file (`.rs`) that today falls
+    /// onto `plain_units`'s single whole-file [`crate::domain::source::UnitKind::Document`]
+    /// unit must instead come back as several [`crate::domain::source::UnitKind::Section`]
+    /// chunk units, none of them the whole file — while a planted secret
+    /// and the estate's own `.sergeant/data/` machinery both stay excluded
+    /// exactly as they did before this wave (J5, unaffected by this change).
+    #[test]
+    fn a_grammar_claimed_file_is_chunked_not_left_as_one_document_unit() {
+        // Comfortably over `chunk::DESIRED_CHUNK_LENGTH` (750 bytes) many
+        // times over, so the AST-merge path has to emit more than one chunk.
+        let mut big_rs = String::new();
+        for n in 0..60 {
+            big_rs.push_str(&format!(
+                "/// Doc comment for function number {n}.\npub fn function_{n}(x: i32) -> i32 {{\n    x + {n}\n}}\n\n"
+            ));
+        }
+        assert!(
+            big_rs.len() > 2048,
+            "fixture must be >2KB per the brief's own end-to-end case: {}",
+            big_rs.len()
+        );
+        let secret = b"SECRET=hunter3\n";
+        let (_dir, scan) = scan_tree(
+            &[
+                ("big.rs", big_rs.as_bytes()),
+                (".env", secret),
+                (
+                    ".sergeant/data/atlas.duckdb",
+                    b"not a real duckdb file, just bytes",
+                ),
+            ],
+            &[],
+        );
+
+        // The new unit shape.
+        let rs_file = scan
+            .files
+            .iter()
+            .find(|f| f.relative_path == "big.rs")
+            .expect("big.rs was acquired");
+        assert_eq!(rs_file.extractor, TEXT_EXTRACTOR);
+        assert!(
+            rs_file.units.len() > 1,
+            "expected multiple chunk units for a {}-byte grammar-claimed file, got {}: {:?}",
+            big_rs.len(),
+            rs_file.units.len(),
+            rs_file.units
+        );
+        for unit in &rs_file.units {
+            let span = (unit.byte_end - unit.byte_start) as usize;
+            assert!(
+                span > 0 && span < big_rs.len(),
+                "unit {} spans {span} bytes of a {}-byte file — it must be a \
+                 chunk, not the whole document",
+                unit.ordinal,
+                big_rs.len()
+            );
+            assert!(
+                unit.byte_start as usize <= big_rs.len() && unit.byte_end as usize <= big_rs.len(),
+                "unit {} out of bounds: {}..{} in a {}-byte file",
+                unit.ordinal,
+                unit.byte_start,
+                unit.byte_end,
+                big_rs.len()
+            );
+        }
+        // Ordinals are dense and spans move forward — sane coordinates
+        // (A2 §9), not an arbitrary bag of slices.
+        for (index, unit) in rs_file.units.iter().enumerate() {
+            assert_eq!(unit.ordinal, index as u64);
+        }
+        for pair in rs_file.units.windows(2) {
+            assert!(
+                pair[1].byte_start >= pair[0].byte_start,
+                "chunk order regressed: {:?} then {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // Markdown's own unit shape is untouched by this change.
+        assert_eq!(row(&scan, "big.rs").status, Coverage::Indexed);
+
+        // The planted secret never reaches a unit's text, exactly as before.
+        let all_text: String = scan
+            .files
+            .iter()
+            .flat_map(|f| f.units.iter().map(|u| u.text.clone()))
+            .collect();
+        assert!(!all_text.contains("hunter3"), "secret reached a unit");
+        assert!(
+            !scan.files.iter().any(|f| f.relative_path == ".env"),
+            "an excluded path was acquired"
+        );
+        assert!(
+            !scan
+                .files
+                .iter()
+                .any(|f| f.relative_path.starts_with(".sergeant/data/")),
+            "estate machinery under .sergeant/data/ was acquired"
+        );
+    }
+
+    /// Round-trips this repository's own `deny.toml` (a real, evolving,
+    /// em-dash-bearing file, not a synthetic fixture) through the actual
+    /// wired entry point (`scan_local_knowledge` -> [`extract_units`] ->
+    /// [`super::chunk::chunk_source`]), asserting every unit lands on a
+    /// valid char boundary, its recorded text matches its own span exactly,
+    /// and no em dash present in the source is lost or duplicated across
+    /// the chunk set. A grammar-claimed, structure-unclaimed extension
+    /// (`.toml`) is required so this file routes through `chunk_source`
+    /// rather than `plain_units` (see
+    /// `a_grammar_claimed_file_is_chunked_not_left_as_one_document_unit`
+    /// above, same routing, ASCII-only fixture).
+    ///
+    /// # What this does — and does not — prove (F-TH-01)
+    ///
+    /// This is **not** a targeted reproduction of the specific panic
+    /// `brief-chunker-utf8.md` and `00-orient` measured (byte offset 3592).
+    /// `deny.toml` has since grown past that measurement, and — verified by
+    /// reverting [`super::chunk::finalize_chunk`]'s char-boundary snapping
+    /// and re-running this exact test — the file's current committed
+    /// content does not drive any chunk boundary mid-codepoint even with
+    /// the pre-fix, panic-prone slicing restored, so this test alone would
+    /// not catch a regression that reintroduced the panic; `00-orient`'s
+    /// own investigation could not fully bottom out the natural-occurrence
+    /// mechanism either (see [`super::chunk::finalize_chunk`]'s doc
+    /// comment). The targeted, always-reproducing case lives in
+    /// `chunk::tests::finalize_chunk_never_panics_on_a_boundary_that_splits_a_multibyte_char`
+    /// and `chunk::tests::finalize_chunk_never_duplicates_content_across_adjacent_boundaries_sharing_a_split_point`,
+    /// which construct the mid-codepoint boundary directly rather than
+    /// relying on a real file happening to produce one. What this test
+    /// does provide: a live, real-world regression net against silent
+    /// content loss or duplication should `deny.toml`'s content ever
+    /// change to include such a seam.
+    #[test]
+    fn a_real_multibyte_file_scans_without_panicking_and_keeps_every_codepoint_intact() {
+        let deny_toml = include_str!("../../../deny.toml");
+        assert!(
+            deny_toml.len() != deny_toml.chars().count(),
+            "fixture must actually be non-ASCII for this test to mean anything: {} bytes, {} chars",
+            deny_toml.len(),
+            deny_toml.chars().count()
+        );
+
+        let (_dir, scan) = scan_tree(&[("deny.toml", deny_toml.as_bytes())], &[]);
+
+        let file = scan
+            .files
+            .iter()
+            .find(|f| f.relative_path == "deny.toml")
+            .expect("deny.toml was acquired");
+        assert!(
+            file.units.len() > 1,
+            "expected multiple chunk units for an {}-byte file, got {}",
+            deny_toml.len(),
+            file.units.len()
+        );
+
+        // Every unit's recorded span must be a valid, in-bounds byte range
+        // into the real file, and re-slicing that exact range must
+        // reproduce the unit's own text — the same property that panicked
+        // in production when a span landed mid-codepoint.
+        for unit in &file.units {
+            let (start, end) = (unit.byte_start as usize, unit.byte_end as usize);
+            assert!(
+                start <= end && end <= deny_toml.len(),
+                "unit {} out of bounds: {start}..{end} in a {}-byte file",
+                unit.ordinal,
+                deny_toml.len()
+            );
+            assert!(
+                deny_toml.is_char_boundary(start) && deny_toml.is_char_boundary(end),
+                "unit {} span {start}..{end} does not land on a char boundary",
+                unit.ordinal
+            );
+            assert_eq!(
+                unit.text,
+                deny_toml[start..end],
+                "unit {}'s recorded text must match what its own span actually slices",
+                unit.ordinal
+            );
+        }
+
+        // No multi-byte codepoint present in the source is lost across the
+        // full set of chunks — concatenating every unit's text must still
+        // contain each of the fixture's own em dashes (`—`, U+2014).
+        let dash_count_in_source = deny_toml.matches('\u{2014}').count();
+        assert!(dash_count_in_source > 0, "fixture must contain an em dash");
+        let dash_count_in_units: usize = file
+            .units
+            .iter()
+            .map(|u| u.text.matches('\u{2014}').count())
+            .sum();
+        assert_eq!(
+            dash_count_in_units, dash_count_in_source,
+            "every em dash in the source must survive chunking exactly once"
+        );
     }
 }

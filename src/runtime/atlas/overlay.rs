@@ -284,6 +284,15 @@ pub fn extract_overlay(
             // no allowlist to gate (see `scan::DATASET_NO_ROOT`).
             datasets: Vec::new(),
             root: None,
+            // Deliberately `None`, not `overlay.surface`: a Work overlay is
+            // its own isolated world by generation scope
+            // (`another_works_overlay_unit_never_surfaces_through_a_lexical_query`),
+            // not by identity, and this wave's named scenario is a
+            // `[[repo]]`/`[[knowledge]]` overlap — an overlay merging
+            // identity with its own base generation is a different question
+            // this wave does not decide. `None` preserves the exact pre-S6
+            // identity (`relative_path`), so overlay isolation is unaffected.
+            identity_root: None,
             context_fields: ContextFields::none(),
             coverage: out.coverage,
             extractors: out.extractors,
@@ -411,6 +420,9 @@ fn changed_file(overlay: &WorkOverlay, path: &str, out: &mut Extracted) -> Strin
     out.files.push(ScannedFile {
         relative_path: path.to_string(),
         local_key: extracted.key,
+        // `hash` is already `content_hash(&bytes)` — plain BLAKE3, same as
+        // the local rule two lines up already states.
+        content_digest: hash.clone(),
         content_hash: hash.clone(),
         extractor: extracted.extractor.to_string(),
         byte_len: bytes.len() as u64,
