@@ -1,0 +1,90 @@
+# Retrieval relevance question set — CORRECTED, 2026-08-31.
+#
+# This is a correction of parity-question-set.tsv per the adversarial audit
+# knowledge/evidence/resources/host-atlas-series/question-set-audit-2026-08-31.md.
+# Same 52 ids, same format. 30 rows unchanged (SOUND). 15 rows changed:
+# 9 CONTRIVED rows reworded to remove verbatim/near-verbatim leakage from the
+# target file's own text (c01,c04,c06,c08,c12,c17,d03,k03,k04 — k04 also had
+# its query's premise corrected, not just its wording), and 6 INCOMPLETE-ACCEPT
+# rows had padding removed and/or missing legitimate accept files added
+# (d01,d02,d09,g02,k01,s08). Full per-row rationale and verification quotes:
+# see /var/tmp/hats6/question-set-correction-methods.md.
+#
+# fusion.rs-dependent rows (c06,s02,s03,s07) are flagged VOLATILE in the
+# methods note — same wave's own +480/-36 rerank work touches this file —
+# but are kept, since removing them would only shrink coverage further.
+#
+# Columns are TAB separated:
+#   id        stable identifier, category-prefixed
+#   category  code | symbol | doctrine | config | knowledge | memory
+#   query     asked the way a developer would ask it, NOT lifted from the
+#             target file's own wording (that would measure lexical echo)
+#   accept    comma-separated `<source>:<relative-path>`; more than one only
+#             where two paths are genuinely the same answer (a symlink, a
+#             file mirrored under two declared sources, or the owning
+#             document plus the context file that quotes it) OR where two
+#             distinct real files answer the query equally well.
+#
+# `tests/w4a_retrieval_floor.rs` consumes the `sergeant-rs:` rows — the ones
+# whose answers live in this repository and can therefore be scanned in CI.
+# The knowledge-library / agent-memory / sergeant-rs-workspace rows are the
+# estate-wide half of the same set and are measured out of tree; they are
+# committed here because a question set split across two files stops being
+# one question set.
+#
+# Base verified against ef66bfe81a3b5e3306711df87f10644d345ff7f9; corrections
+# verified against sergeant-rs:af3ec4675 (prose lane) and the workspace repo
+# at HEAD as of 2026-08-31.
+id	category	query	accept
+c01	code	what stops two concurrent sgt processes from corrupting the same repo's linked-worktree state	sergeant-rs:src/runtime/repolock.rs
+c02	code	content addressed blob store	sergeant-rs:src/runtime/blob.rs
+c03	code	prune old journal history bounded retention	sergeant-rs:src/runtime/prune.rs
+c04	code	what search algorithm handles keyword matching over identifiers and file text in atlas	sergeant-rs:src/runtime/atlas/lexical.rs
+c05	code	embedding vectors and cosine similarity	sergeant-rs:src/runtime/atlas/semantic.rs
+c06	code	how does atlas combine separate lexical and semantic result lists into one ranking	sergeant-rs:src/runtime/atlas/fusion.rs
+c07	code	git preflight checks before a work is admitted	sergeant-rs:src/runtime/preflight.rs
+c08	code	if the daemon process dies mid-execution, how does it know what was still running when it comes back up	sergeant-rs:src/runtime/recovery.rs
+c09	code	parse an eml mail message	sergeant-rs:src/runtime/atlas/mail.rs
+c10	code	extract text from word and powerpoint documents	sergeant-rs:src/runtime/atlas/office.rs
+c11	code	tabular dataset column allowlist	sergeant-rs:src/runtime/atlas/tabular.rs
+c12	code	does sgt embed a git library or just shell out to the git binary already on the machine	sergeant-rs:src/runtime/git.rs
+c13	code	edit sergeant.toml while preserving comments	sergeant-rs:src/domain/manifest.rs
+c14	code	codex exec adapter	sergeant-rs:src/backend/codex.rs
+c15	code	watch for work transitions over server sent events	sergeant-rs:src/watch.rs
+c16	code	create a linked git worktree for a work surface	sergeant-rs:src/runtime/surface.rs
+c17	code	how is the durable event log split into files on disk	sergeant-rs:src/runtime/journal.rs
+c18	code	walk a knowledge folder and index its files	sergeant-rs:src/runtime/atlas/scan.rs
+c19	code	tree-sitter symbol extraction	sergeant-rs:src/runtime/atlas/syntax.rs
+c20	code	the http api routes the daemon serves	sergeant-rs:src/api.rs
+s01	symbol	fused_search	sergeant-rs:src/runtime/atlas/db.rs
+s02	symbol	is_canonical_path	sergeant-rs:src/runtime/atlas/fusion.rs
+s03	symbol	RRF_K	sergeant-rs:src/runtime/atlas/fusion.rs
+s04	symbol	BM25_K1	sergeant-rs:src/runtime/atlas/lexical.rs
+s05	symbol	SourceKind	sergeant-rs:src/domain/source.rs
+s06	symbol	MAX_ROWS	sergeant-rs:src/runtime/atlas/db.rs
+s07	symbol	rrf_contribution	sergeant-rs:src/runtime/atlas/fusion.rs
+s08	symbol	AuthorityClass	sergeant-rs:src/domain/source.rs,sergeant-rs:src/runtime/atlas/db.rs
+d01	doctrine	bounded judgment ladder	sergeant-rs:AGENTS.md,sergeant-rs-workspace:AGENTS.md,knowledge-library:rulings/adr/0014-product-workspace-split-owner-rulings.md,sergeant-rs:.sergeant/common/contexts/bounded-judgment.md,sergeant-rs-workspace:.sergeant/common/contexts/bounded-judgment.md
+d02	doctrine	ponytail minimality ladder	sergeant-rs:AGENTS.md,sergeant-rs-workspace:AGENTS.md
+d03	doctrine	what's the process for getting a code change into sergeant-rs merged — build, tests, review, CI	sergeant-rs:CONTRIBUTING.md
+d04	doctrine	how atlas indexes knowledge sources	sergeant-rs:docs/concepts/atlas-and-knowledge.md
+d05	doctrine	the states a work can be in	sergeant-rs:docs/reference/work-states.md
+d06	doctrine	reference for every key in the estate manifest	sergeant-rs:docs/reference/sergeant-toml.md
+d07	doctrine	how do I install sergeant	sergeant-rs:docs/getting-started/install.md
+d08	doctrine	security and trust model	sergeant-rs:docs/concepts/security-and-trust.md
+d09	doctrine	captain and sergeant division of labour	sergeant-rs:docs/concepts/captain-and-sergeant.md,sergeant-rs:README.md,sergeant-rs:docs/getting-started/captain-first.md
+d10	doctrine	glossary of sergeant terms	sergeant-rs:docs/reference/glossary-and-support.md
+g01	config	dependency license and ban policy	sergeant-rs:deny.toml
+g02	config	which rust toolchain channel is pinned	sergeant-rs:rust-toolchain.toml,sergeant-rs:Cargo.toml
+g03	config	crate dependencies and package metadata	sergeant-rs:Cargo.toml
+g04	config	which test suites the coverage gate runs	sergeant-rs:scripts/coverage/c2-suites.sh
+k01	knowledge	ruling that there is only one atlas database	knowledge-library:rulings/owner-rulings/one-atlas-database-2026-08-29.md,knowledge-library:evidence/resources/host-atlas-s5-series/brief-w1c-one-atlas-database.md
+k02	knowledge	decision record for bounded retention	knowledge-library:rulings/adr/0019-bounded-retention.md
+k03	knowledge	why doesn't opening a PR from a Work automatically merge it — what's the actual authority boundary	knowledge-library:rulings/adr/0015-a-pull-request-is-a-request.md
+k04	knowledge	does adding a new external-git knowledge source to atlas ever run a git fetch, or does sgt's never-fetches rule cover that too	knowledge-library:rulings/adr/0023-external-git-acquisition-scopes-never-fetches.md
+k05	knowledge	ruling adopting anydoc	knowledge-library:rulings/owner-rulings/anydoc-adoption-2026-08-27.md
+k06	knowledge	decision record for the codex adapter	knowledge-library:rulings/adr/0020-codex-adapter.md
+m01	memory	cold cargo build blows the work ceiling	agent-memory:captain-warms-the-cache.md
+m02	memory	do not build under tmp because of the tmpfs quota	agent-memory:tmpfs-quota-no-builds-in-scratchpad.md
+m03	memory	which model subagents should use	agent-memory:subagent-model-policy.md
+m04	memory	never assert what a document says from memory	agent-memory:read-first-always.md

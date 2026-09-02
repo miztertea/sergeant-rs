@@ -339,7 +339,8 @@ pub fn daemon_pids(data_dir: &Path) -> Vec<u32> {
     pids
 }
 
-/// SIGTERM every daemon on `data_dir`, then SIGKILL whatever is left.
+/// SIGTERM every daemon on `data_dir`, then SIGKILL whatever is left — and
+/// then everything those daemons had descended from them.
 ///
 /// Returns what was signalled and with what, so a test can assert the rig
 /// did something rather than trusting it silently — and so the escalation
@@ -348,11 +349,30 @@ pub fn daemon_pids(data_dir: &Path) -> Vec<u32> {
 /// coverage profile that never arrived. A `Kill` in this report is therefore
 /// also announced on stderr, because `Drop` throws the value away and the
 /// escalation is exactly the thing a discarded return value must not hide.
+///
+/// **#310: the descendant sweep, and why its order is the whole point.** A
+/// daemon's children are its children only while it is alive; the instant it
+/// is signalled they reparent to init and no ancestry query can find them
+/// again. That is how dozens of ~265 MB `opencode serve` probe children
+/// accumulated over a working day while every orphan check reported clean —
+/// both doctrinal patterns are `sgt`-shaped and the leaked species is named
+/// `opencode`. So the tree is enumerated **before** the daemon is signalled,
+/// and the recorded pids are signalled afterwards.
+///
+/// This is belt to the product's own braces (`backend::child`'s
+/// `PR_SET_PDEATHSIG`, which is what actually closes the leak). It is the
+/// half that still works on a platform with no parent-death signal, and the
+/// half that reaches a child something other than a hardened probe spawned.
 pub fn reap_daemons(data_dir: &Path) -> Vec<ReapedDaemon> {
     let pids = daemon_pids(data_dir);
     if pids.is_empty() {
         return Vec::new();
     }
+    let descendants: Vec<u32> = pids
+        .iter()
+        .flat_map(|&pid| sergeant_rs::platform::process::descendants(pid))
+        .filter(|pid| !pids.contains(pid))
+        .collect();
     // Built from the escalation branch this call actually took, never from
     // "it went away, so TERM must have done it": that inference would report
     // `Term` for a reaper that had been changed to open with SIGKILL.
@@ -382,6 +402,34 @@ pub fn reap_daemons(data_dir: &Path) -> Vec<ReapedDaemon> {
                 TERM_GRACE.as_secs()
             );
         }
+    }
+    // The recorded tree, now that the daemons are gone. `kill -KILL -<pid>`
+    // rather than `kill -KILL <pid>`: a hardened probe child leads its own
+    // process group (`backend::child`), so the negated form reaches whatever
+    // *it* spawned, and an already-empty group is `ESRCH` — success, not an
+    // error worth reporting. Both forms are sent, because a descendant that
+    // is not a group leader is reached only by the plain one.
+    let survivors: Vec<u32> = descendants
+        .into_iter()
+        .filter(|&pid| sergeant_rs::platform::process::process_alive(pid))
+        .collect();
+    if !survivors.is_empty() {
+        for pid in &survivors {
+            let _ = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "kill -KILL -{pid} 2>/dev/null; kill -KILL {pid} 2>/dev/null"
+                ))
+                .status();
+        }
+        eprintln!(
+            "support::reap_daemons: {} process(es) descended from the daemon(s) on {:?} \
+             outlived them and were killed by recorded pid: {survivors:?}. #310: a probe \
+             child that reaches this line is one the product's own PR_SET_PDEATHSIG should \
+             already have taken.",
+            survivors.len(),
+            data_dir,
+        );
     }
     reaped
 }
@@ -597,4 +645,359 @@ pub fn scaffold_estate(root: &Path, name: &str, repos: &[&str]) -> Vec<String> {
 pub fn scaffold_solo_estate(root: &Path, name: &str) -> (PathBuf, String) {
     let head = scaffold_estate(root, name, &[name]).remove(0);
     (root.join("repos").join(name), head)
+}
+
+/// A C1a/C1b Atlas-scan fixture unit: one section, deliberately minimal
+/// (heading level 1, no coordinate) so callers only ever vary ordinal, title
+/// and text (R2 — shared by `tests/c1a_compiled_context.rs` and
+/// `tests/c1b_tiers_and_budget.rs`, which built byte-identical copies of this
+/// before F-SI-01).
+pub fn unit(
+    ordinal: u64,
+    title: &str,
+    text: &str,
+) -> sergeant_rs::runtime::atlas::scan::ScannedUnit {
+    sergeant_rs::runtime::atlas::scan::ScannedUnit {
+        ordinal,
+        kind: sergeant_rs::domain::source::UnitKind::Section,
+        heading_level: Some(1),
+        title: Some(title.to_string()),
+        byte_start: 0,
+        byte_end: text.len() as u64,
+        coordinate: None,
+        text: text.to_string(),
+    }
+}
+
+/// A C1a/C1b Atlas-scan fixture file wrapping [`unit`]s. See [`unit`]'s doc.
+pub fn file(
+    relative_path: &str,
+    units: Vec<sergeant_rs::runtime::atlas::scan::ScannedUnit>,
+) -> sergeant_rs::runtime::atlas::scan::ScannedFile {
+    let bytes: u64 = units.iter().map(|u| u.text.len() as u64).sum();
+    sergeant_rs::runtime::atlas::scan::ScannedFile {
+        relative_path: relative_path.to_string(),
+        content_hash: format!("hash/{relative_path}"),
+        content_digest: format!("hash/{relative_path}"),
+        extractor: sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR.to_string(),
+        local_key: format!("key/{relative_path}"),
+        byte_len: bytes,
+        mtime_millis: None,
+        units,
+        syntax: None,
+        parent: None,
+    }
+}
+
+/// A C1a/C1b Atlas-scan fixture source wrapping [`file`]s. See [`unit`]'s doc.
+pub fn scan(
+    source_name: &str,
+    kind: sergeant_rs::domain::source::SourceKind,
+    authority: sergeant_rs::domain::source::AuthorityClass,
+    files: Vec<sergeant_rs::runtime::atlas::scan::ScannedFile>,
+) -> sergeant_rs::runtime::atlas::scan::SourceScan {
+    let mut extractors = std::collections::BTreeSet::new();
+    extractors.insert(sergeant_rs::runtime::atlas::text::MARKDOWN_EXTRACTOR.to_string());
+    sergeant_rs::runtime::atlas::scan::SourceScan {
+        source_name: source_name.to_string(),
+        kind,
+        authority,
+        content_key: format!("{source_name}@generation-1"),
+        revision: None,
+        observed_at: sergeant_rs::domain::event::rfc3339_utc_now(),
+        files,
+        coverage: Vec::new(),
+        extractors,
+        datasets: Vec::new(),
+        root: None,
+        identity_root: None,
+        context_fields: sergeant_rs::runtime::atlas::tabular::ContextFields::none(),
+    }
+}
+
+/// A cross-process mutex over a fixed OS resource a test cannot make
+/// per-process-unique (#305: `t5_disabled_export_runs_no_exporter_machinery`
+/// must bind the daemon's literal `DEFAULT_OTLP_ENDPOINT`, port 0 or a
+/// per-process offset would test nothing — the whole point is standing in
+/// for the address a regression would really dial).
+///
+/// Backed by an atomically-created lock file (`create_new`, so the OS
+/// resolves the race), not `flock`, to stay dependency-free per this
+/// module's own precedent. A holder that panics or is killed leaves the file
+/// behind; [`Self::acquire`] treats a lock file older than `STALE_AFTER` as
+/// abandoned and steals it rather than hanging forever.
+pub struct CrossProcessLock {
+    path: PathBuf,
+}
+
+const STALE_AFTER: Duration = Duration::from_secs(60);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+impl CrossProcessLock {
+    /// Block until the named lock is held exclusively by this call.
+    ///
+    /// `name` should identify the contended resource (e.g. a port number),
+    /// not the test — two different tests contending the same resource must
+    /// use the same name to actually serialize against each other.
+    pub fn acquire(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("sgt-test-lock-{name}"));
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Self { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = std::fs::metadata(&path)
+                        .ok()
+                        .and_then(|meta| meta.modified().ok())
+                        .and_then(|m| m.elapsed().ok())
+                        .is_some_and(|age| age > STALE_AFTER);
+                    if stale {
+                        // A holder that never dropped this — the process was
+                        // killed, not just the test failed. Reclaim rather
+                        // than deadlock every future run.
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if Instant::now() > deadline {
+                        panic!(
+                            "cross-process lock {path:?} held for over 120s; \
+                             a holder is stuck or STALE_AFTER needs raising"
+                        );
+                    }
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+                Err(e) => panic!("acquire cross-process lock {path:?}: {e}"),
+            }
+        }
+    }
+}
+
+impl Drop for CrossProcessLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Drive `POST /v1/intelligence/scan` to completion and hand back the
+/// finished report (S6 scan front door).
+///
+/// The trigger accepts and returns a `scan_id`; the scan itself runs on the
+/// daemon's own task and is followed through
+/// `GET /v1/intelligence/scan/{scan_id}`. Every suite that scans goes
+/// through this one helper, so no test can quietly go back to asserting on
+/// an acceptance as if it were a report.
+///
+/// This is also what makes those suites *honest* rather than lucky. The
+/// synchronous trigger they used to call was raced against one HTTP
+/// request timeout, and `y6a`'s own repository scan had begun timing out in
+/// CI — a real scan outrunning a fixed client bound, which is the same
+/// defect the product had. Here the wait is over the scan's own reported
+/// completion, and it carries **no time bound of its own**: elapsed time
+/// never decides whether a scan was correct, because estate size is an
+/// input and any duration chosen for it is wrong at some estate. A bound
+/// asserted here would claim the scan failed, which is a fact about the
+/// product this helper cannot know; only a runner can honestly report
+/// "the harness gave up waiting", which is a fact about the harness.
+///
+/// **No runner in this repository currently reports it.** Measured at this
+/// revision: nextest's checked-in config sets no `slow-timeout` and no
+/// `terminate-after`, so a hanging test is warned about (`SLOW
+/// [>60.000s]`, repeated every 60 s) and never killed, and
+/// `.github/workflows/ci.yml`'s `test` job declares no `timeout-minutes`
+/// — unlike `coverage.yml` and `matrix.yml` — so the outer bound is
+/// GitHub's 6-hour default cancellation, which names no test. Whether to
+/// add a runner-level bound is CI policy for every suite in the repo and
+/// is escalated, not decided here. It is stated rather than implied
+/// because this comment previously named a config file as the killer and
+/// that file kills nothing;
+/// `tests/f258_nextest_thread_budget.rs::the_shared_test_support_module_may_not_cite_this_config_as_a_hang_bound_it_does_not_configure`
+/// fails if the citation comes back before the configuration does.
+///
+/// What this loop does refuse is the wait that can never end regardless of
+/// duration: a status poll answering anything but `200` is terminal and is
+/// reported as such below, not polled through.
+///
+/// Returns the status and body of whatever last answered: the acceptance
+/// itself when it carries no `scan_id` (the estate declares nothing to
+/// scan — a real, immediate answer), otherwise the terminal poll, whose
+/// `scanned` array is exactly the per-source report.
+pub async fn scan_to_completion(
+    http: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    body: &serde_json::Value,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let response = http
+        .post(format!("{endpoint}/v1/intelligence/scan"))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .expect("scan request");
+    let status = response.status();
+    let accepted: serde_json::Value = response.json().await.expect("json body");
+    let Some(scan_id) = accepted["scan_id"].as_str().map(str::to_string) else {
+        return (status, accepted);
+    };
+    let mut last: serde_json::Value;
+    let mut last_status: reqwest::StatusCode;
+    loop {
+        let response = http
+            .get(format!("{endpoint}/v1/intelligence/scan/{scan_id}"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("scan status request");
+        last_status = response.status();
+        last = response.json().await.expect("json body");
+        // A poll that does not answer `200` is terminal, not slow. The only
+        // non-success this endpoint has is `404` — never accepted here,
+        // accepted before a restart, or aged past `RETAINED_SCANS`
+        // (`intelligence_scan_status`'s own doc) — and no id in that state
+        // ever becomes a tracked, completing scan. Waiting on it is waiting
+        // forever, which is the one failure this unbounded loop must not
+        // have; the status is reported rather than polled through.
+        assert!(
+            last_status.is_success(),
+            "GET {endpoint}/v1/intelligence/scan/{scan_id} answered {last_status}: {last}\nthis              daemon does not track that scan, so no amount of further polling can complete it"
+        );
+        if last["state"] == "completed" {
+            return (last_status, last);
+        }
+        // Display/poll cadence only: no outcome depends on this value.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// One cited function, sliced the way an acceptance register's citation
+/// guard needs to read it: the attributes written above its signature, and
+/// its body.
+///
+/// Shared by `tests/a2_acceptance.rs`, `tests/c1_acceptance.rs` and
+/// `tests/x5_a1a_acceptance.rs` (F-SI-01): this ~30-line line-based parser
+/// used to be copy-pasted byte-for-byte into all three instead of living
+/// once in this already-idiomatic shared module (Ponytail R2).
+///
+/// Line-based on purpose. The body ends at the first line that is this
+/// signature's own indentation followed by a lone `}` — rustfmt guarantees
+/// that line, and brace counting does not survive the `{{` inside a
+/// `format!` string that several of the cited tests contain.
+///
+/// Attributes are collected as whole units, not lines: a multi-line
+/// attribute such as `#[cfg_attr(\n  feature = "x",\n  ignore\n)]` is
+/// walked backward from its closing `)]`, accumulating lines until the
+/// accumulated text's `[`/`]` count balances on a line that itself starts
+/// `#[` — the point the attribute actually opens. The old single-line-only
+/// scan broke on the `)]` continuation line before ever seeing `ignore`
+/// (F-IN-01): a cited test disabled via a multi-line attribute satisfied
+/// the citation guard as if it still ran.
+pub fn cited_function(text: &str, name: &str) -> Option<(Vec<String>, String)> {
+    let needle = format!("fn {name}(");
+    let lines: Vec<&str> = text.lines().collect();
+    let signature = lines.iter().position(|line| line.contains(&needle))?;
+
+    let mut attributes: Vec<String> = Vec::new();
+    let mut buf: Vec<&str> = Vec::new();
+    let mut index = signature;
+    while index > 0 {
+        index -= 1;
+        let line = lines[index].trim();
+        if buf.is_empty() {
+            if line.starts_with("//") {
+                continue;
+            }
+            if !line.starts_with("#[") && !line.ends_with(']') {
+                break;
+            }
+        }
+        buf.push(line);
+        let joined = buf.iter().rev().copied().collect::<Vec<_>>().join("\n");
+        let opens = joined.matches('[').count();
+        let closes = joined.matches(']').count();
+        if line.starts_with("#[") && opens == closes {
+            attributes.push(joined);
+            buf.clear();
+        }
+    }
+
+    let indent = &lines[signature][..lines[signature].len() - lines[signature].trim_start().len()];
+    let closing = format!("{indent}}}");
+    let mut body = String::new();
+    for line in &lines[signature + 1..] {
+        if *line == closing {
+            break;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    Some((attributes, body))
+}
+
+// --------------------------------------------------------------- semantic
+
+/// Point the documented operator override
+/// (`sergeant_rs::runtime::atlas::semantic::MODEL_DIR_ENV`) at this
+/// repository's committed model assets. Safe under `cargo nextest` because
+/// it runs every test in its own process, so the env var mutation is never
+/// visible across tests.
+///
+/// Takes the env var's name rather than importing the `semantic` module
+/// directly, so this file stays usable from suites that don't otherwise
+/// depend on that module.
+pub fn install_model(model_dir_env: &str) {
+    let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/semantic-model");
+    assert!(
+        assets.join("model.safetensors").is_file(),
+        "the committed assets must be present at {}",
+        assets.display()
+    );
+    unsafe { std::env::set_var(model_dir_env, &assets) };
+}
+
+/// Make sure no model can be found: the `cargo install`-from-source host.
+pub fn uninstall_model(model_dir_env: &str) {
+    unsafe { std::env::remove_var(model_dir_env) };
+}
+
+#[cfg(test)]
+mod cross_process_lock_tests {
+    use super::CrossProcessLock;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Two contenders for the same name never hold it at once; a fresh name
+    /// never blocks. This is the decisive property #305's fix depends on —
+    /// without it, the port-0 alternative would be indistinguishable from a
+    /// lock that doesn't actually exclude.
+    #[test]
+    fn excludes_concurrent_holders_of_the_same_name() {
+        let name = format!("test-{}", std::process::id());
+        let overlap = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let name = name.clone();
+            let overlap = Arc::clone(&overlap);
+            let peak = Arc::clone(&peak);
+            handles.push(std::thread::spawn(move || {
+                let _lock = CrossProcessLock::acquire(&name);
+                let now = overlap.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                overlap.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "at most one holder of the same lock name at a time"
+        );
+    }
 }

@@ -37,4 +37,55 @@ pub(crate) mod test_support {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
+
+    /// A bare-bones HTTP/1.1 responder for a fixed script of `(status,
+    /// body)` pairs, answered once each, in order (R2: one shared site for
+    /// `cli`'s scan-follow tests and `api`'s request-retry tests — both
+    /// need "accept, read, then hang up with no response" as the real shape
+    /// of a lost connection, not a mocking dependency, S6 client-request-
+    /// retry). Returns the endpoint and a shared counter of accepted
+    /// connections, so a test can assert exactly how many attempts were
+    /// made rather than inferring it from timing.
+    ///
+    /// `status: 0` is the one sentinel: accept the connection, read
+    /// whatever request arrives, then drop it with no bytes written at all
+    /// — a connection reset, not a status code — for a script entry that
+    /// must simulate a hangup rather than answer.
+    pub(crate) fn spawn_scripted_http_server(
+        script: Vec<(u16, &'static str)>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+        let addr = listener.local_addr().expect("local addr");
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for (status, body) in script {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                attempts_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf); // discard the request itself
+                if status == 0 {
+                    drop(stream); // hangup: no response written at all
+                    continue;
+                }
+                let reason = match status {
+                    200 => "OK",
+                    202 => "Accepted",
+                    404 => "Not Found",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://{addr}"), attempts)
+    }
 }

@@ -1,9 +1,11 @@
-//! Runtime: journal, projections, git, surfaces, integrity, repository
+//! Runtime: journal, projections, atlas, git, surfaces, integrity, repository
 //! locking, git admission preflight, routing, engine, recovery, sweep.
 
-pub mod analytics;
+pub mod atlas;
 pub mod blob;
+pub mod context;
 pub mod engine;
+pub mod estates;
 pub(crate) mod fsutil;
 pub mod git;
 pub mod graph;
@@ -55,11 +57,24 @@ pub(crate) mod testing {
         .expect("commit");
     }
 
-    /// Record a submitted (`pending`) work.
+    /// Record a submitted (`pending`) work with no estate coordinate — a
+    /// submission that offered no repository context, or a journal line
+    /// older than the envelope field.
     pub(crate) fn submit(core: &mut Core, work_id: &str, intent: &str) {
-        commit(
-            core,
-            work_id,
+        submit_in(core, work_id, intent, None);
+    }
+
+    /// [`submit`], but recording the canonical estate root the submission
+    /// resolved against — H1 D1's coordinate, on the envelope where the real
+    /// `work.submitted` draft puts it (never in the payload).
+    pub(crate) fn submit_in(
+        core: &mut Core,
+        work_id: &str,
+        intent: &str,
+        estate_root: Option<&str>,
+    ) {
+        let mut draft = EventDraft::new(
+            EventSource::new("daemon", "test"),
             KIND_WORK_SUBMITTED,
             json!({"work": {
                 "id": work_id,
@@ -68,6 +83,11 @@ pub(crate) mod testing {
                 "created_by": "test",
                 "created_at": "2026-01-01T00:00:00Z",
             }}),
-        );
+        )
+        .with_work_id(work_id);
+        if let Some(root) = estate_root {
+            draft = draft.with_workspace_id(root);
+        }
+        core.commit(draft).expect("commit");
     }
 }

@@ -491,6 +491,27 @@ pub struct WorkIndexRow {
     /// wrote"), per §20's forward-compatibility stance.
     #[serde(default)]
     pub last_seq: u64,
+    /// H1 D1/D10: the canonical estate root this Work was submitted against,
+    /// folded once from the **envelope's** `workspace_id` at
+    /// `work.submitted` — never from a payload key, and never overwritten
+    /// later (a Work's estate is fixed at submission and immutable for its
+    /// life).
+    ///
+    /// This row is the per-Work estate coordinate the daemon reads back:
+    /// `Engine::commit` stamps every later event from it, and recovery
+    /// re-admits each resumed Work's estate from it — the recon-flagged
+    /// silent-failure trap (resuming estate B's Work against estate A's
+    /// pinned config) exists precisely because there was nowhere to read
+    /// this from before. It lives on the slim index row rather than on
+    /// [`Work`] because the index row is the one per-Work structure that is
+    /// never evicted (#4) and is not a journaled payload.
+    ///
+    /// `None` is an honest "not recorded": every journal line written before
+    /// the envelope carried the field, and every Work submitted with no
+    /// repository context at all. Never an error, and never a reason to
+    /// invent a coordinate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estate_root: Option<String>,
 }
 
 /// Everything the journal says about one work's run: the workflow it pinned,
@@ -927,6 +948,12 @@ fn apply_registry_event(state: &mut WorkRegistry, event: &Event, evict: bool) {
                         created_at: work.created_at.clone(),
                         updated_at: work.created_at.clone(),
                         last_seq: event.seq,
+                        // D1: the envelope's coordinate, folded once, here
+                        // and nowhere else. `workflow.bound`'s
+                        // `"workspace"` payload key stays what it always
+                        // was — a display name — and is deliberately not
+                        // consulted: two estates may share one.
+                        estate_root: event.workspace_id.clone(),
                     },
                 );
                 state.works.insert(work.id.clone(), work);

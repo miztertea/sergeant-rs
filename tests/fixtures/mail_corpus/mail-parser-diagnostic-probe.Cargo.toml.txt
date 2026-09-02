@@ -1,0 +1,7 @@
+[package]
+name = "mailspike-verify"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mail-parser = { version = "0.11.8", features = ["full_encoding"] }

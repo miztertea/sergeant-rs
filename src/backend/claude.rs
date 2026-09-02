@@ -129,6 +129,7 @@ use super::{
     ExecutionHandle, NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport,
     ResumeRequest, RuntimeScope, StartRequest,
 };
+use crate::backend::child;
 use crate::domain::estate::InstructionPolicy;
 use crate::domain::event::{Event, EventDraft, EventSource};
 use crate::domain::profile::Profile;
@@ -876,6 +877,25 @@ impl std::fmt::Debug for ClaudeBackend {
     }
 }
 
+/// One bounded probe invocation, hardened per #310.
+///
+/// `output()` waits, so the child cannot outlive *this call* — but it can
+/// outlive a daemon `SIGKILL`ed during it, and a `--version` that never
+/// returns is exactly how one gets stuck there. Both of this adapter's probe
+/// invocations go through here so neither can forget the hardening.
+///
+/// Audited for #310 alongside the other four adapters: this adapter's probe
+/// spawns **nothing persistent** — two token-free one-shots that exit on
+/// their own — so it was never a source of the leak. It is hardened anyway
+/// because the cost is one line and the failure mode it guards against is a
+/// process nobody counts.
+fn probe_output(exe: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new(exe);
+    command.args(args);
+    child::harden_probe_child(&mut command);
+    command.output()
+}
+
 impl ClaudeBackend {
     /// Build the adapter. Probing is lazy (first PROBE/START), so
     /// constructing one costs nothing on daemons that never route to it.
@@ -1014,7 +1034,7 @@ impl ClaudeBackend {
 
     fn run_probe(&self) -> ProbeOutcome {
         let exe = &self.config.executable;
-        let version_out = match Command::new(exe).arg("--version").output() {
+        let version_out = match probe_output(exe, &["--version"]) {
             Ok(out) => out,
             Err(e) => {
                 return ProbeOutcome {
@@ -1070,7 +1090,7 @@ impl ClaudeBackend {
                 version: Some(canonical_version),
             };
         }
-        let help_out = match Command::new(exe).arg("--help").output() {
+        let help_out = match probe_output(exe, &["--help"]) {
             Ok(out) => out,
             Err(e) => {
                 return ProbeOutcome {
@@ -1123,7 +1143,26 @@ impl ClaudeBackend {
     /// `sergeant.toml` parse (built directly by a test, or by a future
     /// caller), so the launch boundary itself must still refuse an
     /// unrecognized mode rather than pass the raw string to the CLI.
-    fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
+    ///
+    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`] at
+    /// START, [`crate::backend::resume_causation_env`] at RESUME), merged
+    /// **after** the profile so a workflow-authored `Profile.env` key cannot
+    /// shadow what sergeant itself intended to send. That is hygiene, not
+    /// security — W1 §6 makes the daemon's journal the only authority on
+    /// lineage — and it mirrors `CODEX_HOME`'s own deliberate
+    /// last-writer-wins precedent in the codex adapter. RESUME rebuilds the
+    /// triple rather than passing an empty map: `ResumeRequest::estate_root`
+    /// re-supplies the estate coordinate (S2 E6) and the execution id comes
+    /// from the `handle` every `resume()` already receives, so nothing here
+    /// is invented — and, critically, the cached env this produces is what
+    /// every later turn on this execution reuses, not only the
+    /// reconciliation snapshot, so a dropped triple here was a permanent
+    /// loss of causation for the execution's remaining life.
+    fn launch_config(
+        &self,
+        profile: Option<&Profile>,
+        causation: &BTreeMap<String, String>,
+    ) -> Result<LaunchConfig, BackendError> {
         let executable = profile
             .and_then(|p| p.executable.clone())
             .unwrap_or_else(|| self.config.executable.clone());
@@ -1138,6 +1177,9 @@ impl ClaudeBackend {
                     config_home.display().to_string(),
                 );
             }
+        }
+        for (key, value) in causation {
+            env.insert(key.clone(), value.clone());
         }
         // Permission mode is profile-pinned. Unspecified -> no flag at all
         // (the CLI's own default); `bypassPermissions` only ever reaches
@@ -1810,7 +1852,10 @@ impl Backend for ClaudeBackend {
             executable,
             env,
             permission_args,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -2023,7 +2068,10 @@ impl Backend for ClaudeBackend {
             executable,
             env,
             permission_args,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::resume_causation_env(request, &handle.execution_id),
+        )?;
         let mut state = self.lock();
         if let Some(existing) = state.executions.get(&handle.execution_id) {
             // Another thread adopted it while this one gathered evidence.
@@ -2505,6 +2553,7 @@ mod tests {
             execute: None,
             instruction_policy: crate::domain::estate::InstructionPolicy::default(),
             bindings,
+            estate_root: None,
         }
     }
 
@@ -3049,6 +3098,7 @@ mod tests {
         let session = "11111111-2222-4333-8444-555555555555";
         let turn = ProcessArgv {
             pid: 42,
+            ppid: None,
             argv: vec![
                 "claude".to_string(),
                 "-p".to_string(),

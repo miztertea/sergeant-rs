@@ -140,7 +140,7 @@ impl StubOpencode {
              if [ \"$1\" = \"--help\" ]; then printf '%s\\n' \"{top_help}\" >&2; exit 0; fi\n\
              if [ \"$1\" = \"serve\" ] && [ \"$2\" = \"--help\" ]; then printf 'Options: --port  --hostname  --pure  --log-level  --print-logs\\n' >&2; exit 0; fi\n\
              {{ for arg in \"$@\"; do printf 'arg %s\\n' \"$arg\"; done;\n\
-             env | grep -E '^(OPENCODE_[A-Z_]*|SGT_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n\
+             env | grep -E '^(OPENCODE_[A-Z_]*|SGT_[A-Z_]*|SERGEANT_[A-Z_]*|PROBE_[A-Z_]*)=' | sed 's/^/env /' | tr -d '\\r';\n\
              printf 'cwd %s\\n' \"$(pwd)\";\n\
              printf 'stdin %s\\n' \"$(cat | tr '\\n' '|')\";\n\
              printf 'end\\n'; }} >> \"{record}\"\n\
@@ -428,6 +428,10 @@ fn start_request(cwd: &Path) -> StartRequest {
         execute: None,
         instruction_policy: InstructionPolicy::default(),
         bindings: Vec::<BindingSummary>::new(),
+        // S2 E5: a real estate coordinate on every request this suite builds,
+        // so the causation-triple tests read the value the engine would
+        // actually have threaded rather than a hole.
+        estate_root: Some(PathBuf::from("/home/dev/estate")),
     }
 }
 
@@ -1511,6 +1515,72 @@ fn a_profile_executable_and_env_reach_every_turn() {
         );
     }
     backend.stop(&handle).expect("stop").wait();
+}
+
+/// S2 E5/E6 (W1 §6): the causation triple reaches the actor process on the
+/// run-json transport, on every turn — and a profile cannot shadow it, since
+/// the triple merges after `Profile.env`.
+#[test]
+fn s2_the_causation_triple_reaches_every_run_json_turn() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubOpencode::passing(dir.path());
+    stub.replays(MINIMAL_TURN);
+    let backend = OpencodeBackend::new(config_for(&stub, dir.path()));
+    let mut request = start_request(dir.path());
+    request.work_id = "01PARENTWORK".to_string();
+    let execution_id = request.execution_id.clone();
+    let mut launch_profile = profile("forger");
+    launch_profile
+        .env
+        .insert("SERGEANT_WORK_ID".to_string(), "01FORGED".to_string());
+    request.profile = Some(launch_profile);
+    let handle = launch_with(&backend, &request).expect("launch");
+    wait_for_settled(&backend, &handle);
+    backend.send(&handle, "second turn").expect("send");
+    for launch in &stub.wait_for_run_launches(2) {
+        assert_eq!(
+            launch.env.get("SERGEANT_ESTATE_ROOT").map(String::as_str),
+            Some("/home/dev/estate")
+        );
+        assert_eq!(
+            launch.env.get("SERGEANT_WORK_ID").map(String::as_str),
+            Some("01PARENTWORK"),
+            "the profile's own SERGEANT_WORK_ID must not win: {:?}",
+            launch.env
+        );
+        assert_eq!(
+            launch.env.get("SERGEANT_EXECUTION_ID").map(String::as_str),
+            Some(execution_id.as_str())
+        );
+    }
+    backend.stop(&handle).expect("stop").wait();
+}
+
+/// E6: a probe is not a `StartRequest`-bound execution. `apply_env` is shared
+/// verbatim between probe and turn launch, which is exactly why the triple is
+/// folded into the resolved `env` map at `launch_config` rather than into
+/// `apply_env`'s signature — a probe reaches it with a map that never carried
+/// the three values.
+#[test]
+fn s2_a_probe_invocation_never_receives_the_causation_triple() {
+    let dir = TempDir::new().expect("tempdir");
+    let stub = StubOpencode::passing(dir.path());
+    let backend = OpencodeBackend::new(config_for(&stub, dir.path()));
+    let report = backend.probe();
+    assert!(report.available, "the stub probes clean: {report:?}");
+    for launch in stub.launches() {
+        for name in [
+            "SERGEANT_ESTATE_ROOT",
+            "SERGEANT_WORK_ID",
+            "SERGEANT_EXECUTION_ID",
+        ] {
+            assert!(
+                !launch.env.contains_key(name),
+                "a probe invocation must not carry {name}: {:?}",
+                launch.env
+            );
+        }
+    }
 }
 
 /// Refused, not ignored: silently dropping a launch decision the human made
@@ -2949,6 +3019,23 @@ fn a_profile_executable_and_env_reach_the_serve_child() {
             .and_then(Value::as_str),
         Some("w3"),
         "the profile's own env reached the serve child's actual environment"
+    );
+    // S2 E5/E6: the serve child is a persistent process rather than one per
+    // turn, so it is the *only* place the triple can reach on this transport
+    // — every later turn is an HTTP call into a server already spawned.
+    assert_eq!(
+        env_dump.get("SERGEANT_WORK_ID").and_then(Value::as_str),
+        Some("w-opencode"),
+        "the causation triple reached the serve child too: {env_dump}"
+    );
+    assert_eq!(
+        env_dump.get("SERGEANT_ESTATE_ROOT").and_then(Value::as_str),
+        Some("/home/dev/estate"),
+        "the causation triple reached the serve child too: {env_dump}"
+    );
+    assert!(
+        env_dump.get("SERGEANT_EXECUTION_ID").is_some(),
+        "the causation triple reached the serve child too: {env_dump}"
     );
     backend.stop(&handle).expect("stop").wait();
 }

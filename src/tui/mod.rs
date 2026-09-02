@@ -317,8 +317,17 @@ fn footer_line(app: &App) -> Paragraph<'_> {
 ///
 /// The terminal is restored exactly once, on the way out, whatever ended the
 /// loop; `ratatui::try_init` covers the panic path with its own hook.
-pub async fn run(client: ApiClient) -> Result<(), TuiError> {
+///
+/// `initial_estate` (W4d deliverable 2, H1 §9) is the CLI's opportunistic
+/// cwd-derived estate name, if cwd happened to be a valid estate root —
+/// `None` otherwise, never a refusal: the connection above never depended
+/// on it (`is_host_scoped`), and this is presentation-only, the same
+/// "silently fall back rather than gate" shape `sgt watch`'s own D6 default
+/// already uses. Applied once, before the first paint, as Fleet's *initial*
+/// estate filter — the operator is free to retoggle it with `e` afterward.
+pub async fn run(client: ApiClient, initial_estate: Option<String>) -> Result<(), TuiError> {
     let mut app = App::new();
+    app.apply_initial_estate(initial_estate);
     // The first read happens before the terminal is touched: a daemon that
     // cannot answer should print an error to a normal terminal, not paint an
     // empty UI over an alternate screen.

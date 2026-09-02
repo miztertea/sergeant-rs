@@ -40,7 +40,7 @@ use sergeant_rs::domain::event::{EVENT_SCHEMA, Event};
 use sergeant_rs::domain::event::{EventDraft, EventSource};
 use sergeant_rs::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_BLOCKED, KIND_WORK_CANCELED,
-    KIND_WORK_RESUMED, KIND_WORK_SUBMITTED, WorkState,
+    KIND_WORK_RESUMED, KIND_WORK_SUBMITTED, KIND_WORK_WAITING, WorkState,
 };
 use sergeant_rs::domain::workflow::{KIND_STAGE_ENTERED, KIND_WORKFLOW_BOUND};
 use sergeant_rs::runtime::engine::DEFAULT_TURN_CAP;
@@ -48,7 +48,7 @@ use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::runtime::surface::KIND_SURFACE_MATERIALIZED;
 
 mod support;
-use support::{DataDir, ReapSignal, daemon_pids};
+use support::{DataDir, ReapSignal, daemon_pids, scaffold_solo_estate};
 
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
@@ -74,10 +74,28 @@ async fn submit(
     command_id: &str,
     intent: &str,
 ) -> (reqwest::StatusCode, Vec<u8>, Value) {
+    submit_addressed(http, handle, None, command_id, intent).await
+}
+
+/// [`submit`] addressing an estate (D4). `None` is the captured-intent
+/// shape — no repository context offered — which is what most of this
+/// file's daemon-lifecycle rigs want, since they are about the daemon, not
+/// about an estate.
+async fn submit_addressed(
+    http: &reqwest::Client,
+    handle: &DaemonHandle,
+    estate_root: Option<&std::path::Path>,
+    command_id: &str,
+    intent: &str,
+) -> (reqwest::StatusCode, Vec<u8>, Value) {
     let resp = http
         .post(format!("{}/v1/work", handle.endpoint))
         .bearer_auth(&handle.token)
-        .json(&json!({"command_id": command_id, "intent": intent}))
+        .json(&json!({
+            "command_id": command_id,
+            "intent": intent,
+            "estate_root": estate_root,
+        }))
         .send()
         .await
         .expect("submit request");
@@ -324,7 +342,7 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     let path = daemon::descriptor_path(dir.path());
     let bytes = std::fs::read(&path).expect("descriptor readable");
     let descriptor: RuntimeDescriptor = serde_json::from_slice(&bytes).expect("descriptor json");
-    assert_eq!(descriptor.schema, "sergeant.runtime/v2");
+    assert_eq!(descriptor.schema, "sergeant.runtime/v3");
     assert!(
         descriptor.endpoint.starts_with("http://127.0.0.1:"),
         "loopback endpoint, got {}",
@@ -334,14 +352,25 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     assert_eq!(descriptor.api_revision, "v1");
     assert_eq!(descriptor.token, handle.token);
     assert_token_plausible(&descriptor.token);
-    // estate-root §5.1: `v2` exists for these two fields. This daemon was
-    // started against no estate (`DaemonConfig::estate_root` is `None` — the
-    // shape most of this file's in-process rigs use), and the descriptor has
-    // to *say so* rather than omit the question: a client comparing its own
-    // exact root against `None` gets the mismatch refusal, which is the only
-    // safe answer when the daemon would plan against nothing.
-    assert_eq!(descriptor.estate_root, None);
-    assert_eq!(descriptor.manifest_path, None);
+    // D3: a v3 descriptor carries **no** estate fields at all. The admitted-
+    // estate set is dynamic daemon state (`GET /v1/estates`); baking a set
+    // into a file written once, atomically, at startup would contradict lazy
+    // admission. The serialized keys are asserted exactly, so a re-added
+    // estate field is a test failure rather than a silent re-narrowing of
+    // what the descriptor means.
+    let raw: Value = serde_json::from_slice(&bytes).expect("descriptor json");
+    let mut keys: Vec<&str> = raw
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["api_revision", "endpoint", "pid", "schema", "token"],
+        "D3: descriptor v3 is schema/endpoint/pid/api_revision/token — nothing else"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -382,34 +411,34 @@ async fn t1_descriptor_lifecycle_and_healthz() {
     );
     successor.shutdown().await;
 
-    // The other half of §5.1: a daemon started *against* an estate publishes
-    // the canonical root and its manifest, because that is what every client
-    // compares its own exact root to before using the endpoint. Recorded, not
-    // reconstructed — a reader must never have to re-derive
-    // `<root>/sergeant.toml` (or, worse, walk for it).
+    // D3's other half, re-scoped from the retired "the descriptor publishes
+    // the one bound root" assertion: a daemon that has an estate in play
+    // publishes exactly the same five-key descriptor. The estate is not a
+    // property of the process any more, so it cannot be a property of the
+    // file the process writes once at startup.
     let estate = TempDir::new().expect("tempdir");
     support::scaffold_estate(estate.path(), "descriptor-lifecycle", &["solo"]);
-    let root = std::fs::canonicalize(estate.path()).expect("canonical estate root");
-    let bound_dir = TempDir::new().expect("tempdir");
-    let bound = daemon::start_with(
-        bound_dir.path(),
-        DaemonConfig {
-            estate_root: Some(estate.path().to_path_buf()),
-            ..DaemonConfig::default()
-        },
+    let host_dir = TempDir::new().expect("tempdir");
+    let host = daemon::start_with(host_dir.path(), DaemonConfig::default())
+        .await
+        .expect("daemon start");
+    let raw: Value = serde_json::from_slice(
+        &std::fs::read(daemon::descriptor_path(host_dir.path())).expect("descriptor readable"),
     )
-    .await
-    .expect("daemon start");
-    let descriptor = daemon::read_descriptor(bound_dir.path())
-        .expect("read descriptor")
-        .expect("descriptor published");
-    assert_eq!(descriptor.estate_root.as_deref(), Some(root.as_path()));
+    .expect("descriptor json");
+    let mut keys: Vec<&str> = raw
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
     assert_eq!(
-        descriptor.manifest_path,
-        Some(root.join("sergeant.toml")),
-        "the manifest path travels with the root, so no client reconstructs it"
+        keys,
+        vec!["api_revision", "endpoint", "pid", "schema", "token"],
+        "D3: no estate ever reaches the descriptor, however many are in play"
     );
-    bound.shutdown().await;
+    host.shutdown().await;
 }
 
 /// A bearer token must be long, high-entropy-looking, and safe to put in a
@@ -588,6 +617,57 @@ async fn t3_submit_lists_pending_journals_and_survives_restart() {
     assert_eq!(list["works"][0]["id"], work_id.as_str());
     assert_eq!(list["works"][0]["state"], "pending");
     handle.shutdown().await;
+}
+
+/// H1 touch point #4/#5, re-scoped by D4/D10: `work.submitted` carries the
+/// estate the submission **addressed** — its canonical root, not the
+/// `[estate] name` — end to end through a real submission, not a
+/// hand-fabricated `Event`.
+///
+/// W1a wrote this against the daemon's *bound* estate. There is no binding
+/// left to read, and the fact is stronger for it: the root recorded is the
+/// one this request named and this daemon then admitted, so a second estate
+/// submitting to the same daemon records its own.
+#[tokio::test]
+async fn work_submitted_carries_the_addressed_estate_root() {
+    let estate_dir = TempDir::new().expect("estate tempdir");
+    scaffold_solo_estate(estate_dir.path(), "target");
+    let data_dir = TempDir::new().expect("data dir tempdir");
+    let handle = daemon::start_with(
+        data_dir.path(),
+        DaemonConfig {
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start");
+    let http = client();
+
+    let (status, _, body) = submit_addressed(
+        &http,
+        &handle,
+        Some(estate_dir.path()),
+        &ulid(),
+        "carry the estate root",
+    )
+    .await;
+    assert_eq!(status, 201, "submit must accept: {body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+
+    handle.shutdown().await;
+
+    let canonical_root =
+        std::fs::canonicalize(estate_dir.path()).expect("canonicalize estate root");
+    let submitted = Journal::replay_data_dir(data_dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .find(|e| e.kind == KIND_WORK_SUBMITTED && e.work_id.as_deref() == Some(&work_id))
+        .expect("work.submitted journaled");
+    assert_eq!(
+        submitted.workspace_id.as_deref(),
+        Some(canonical_root.to_string_lossy().as_ref()),
+        "work.submitted must carry the estate root the submission addressed"
+    );
 }
 
 #[tokio::test]
@@ -1429,6 +1509,36 @@ fn estate_data_dir() -> DataDir {
     dir
 }
 
+/// H1's two-estate fixture: a **second** estate root, elsewhere on disk, that
+/// addresses the *same* host runtime dir.
+///
+/// Additive on purpose (brief deliverable 10): [`estate_data_dir`] and every
+/// test built on it stay exactly as they were, because single-estate is a
+/// special case of host mode, not a removed mode. The second estate is a
+/// plain `TempDir` rather than a `DataDir` — nothing runs a daemon *for* it;
+/// its Work runs on the host daemon the first estate already spawned, which
+/// is the whole point.
+fn second_estate(name: &str) -> TempDir {
+    let dir = TempDir::new().expect("second estate tempdir");
+    support::scaffold_estate(dir.path(), name, &["solo"]);
+    dir
+}
+
+/// [`sgt_env`] run against `estate_root` with `-C`, while still pointing at
+/// `data_dir` as the host runtime root — the shape a second estate uses to
+/// reach a daemon it did not spawn.
+fn sgt_in(data_dir: &DataDir, estate_root: &Path, args: &[&str]) -> Output {
+    let mut command = std::process::Command::new(SGT);
+    command
+        .current_dir(estate_root)
+        .arg("-C")
+        .arg(estate_root)
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .args(args);
+    command.output().expect("run sgt")
+}
+
 /// Run the sgt binary with args against a data dir; capture output.
 ///
 /// The child runs in the data dir, not in whatever directory `cargo test` was
@@ -1701,9 +1811,29 @@ fn a_data_dir_defaults_onto_disk_not_the_hosts_tmpfs() {
     );
 }
 
+/// **The H1 pair**, replacing `t7_cli_end_to_end_auto_spawn_and_second_
+/// daemon_fails_closed`.
+///
+/// That test asserted one thing twice over: a second *anything* on this data
+/// dir fails closed. H1 splits it, because the two halves now have opposite
+/// answers and both matter:
+///
+/// - a second **estate** is *admitted* into the running daemon and its Work
+///   runs there (H1 §11 criterion 1: two exact-root estates submit Work to
+///   one daemon). This is the invariant H1 inverts, and the old test was its
+///   direct contradiction;
+/// - a second **process** over the host runtime root still fails closed on
+///   `daemon.lock` (H1 §2: one long-lived daemon per user installation).
+///   This is the invariant H1 keeps, and it is *load-bearing* precisely
+///   because the first half now shares one journal between estates.
+///
+/// Both halves live in one test so neither can be quietly dropped: proving
+/// only the first would leave a host that races two journals, and proving
+/// only the second would be the pre-H1 world.
 #[test]
-fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
+fn t7_cli_end_to_end_a_second_estate_is_admitted_and_a_second_process_fails_closed() {
     let dir = estate_data_dir();
+    let other = second_estate("m2-second");
 
     // No daemon running: `sgt run` auto-spawns one and submits.
     let output = sgt(&dir, &["run", "ship the M2 milestone"]);
@@ -1713,7 +1843,26 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // `sgt work list --json` shows it.
+    // --- Half one: a second estate, same daemon, no second process. ---
+    //
+    // This client never spawns: the descriptor is already there and healthy,
+    // so it connects to the daemon the *first* estate started and addresses
+    // its own root. Before H1 this was the `EstateBindingMismatch` refusal.
+    let before = daemon_pids(dir.path());
+    assert_eq!(before.len(), 1, "exactly one daemon so far: {before:?}");
+    let output = sgt_in(&dir, other.path(), &["run", "ship the second estate"]);
+    assert!(
+        output.status.success(),
+        "a second estate must be admitted, not refused: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        daemon_pids(dir.path()),
+        before,
+        "the second estate must reuse the running daemon, never start another"
+    );
+
+    // `sgt work list --json` shows both — one fleet, one daemon, two estates.
     let output = sgt(&dir, &["work", "list", "--json"]);
     assert!(
         output.status.success(),
@@ -1723,32 +1872,192 @@ fn t7_cli_end_to_end_auto_spawn_and_second_daemon_fails_closed() {
     let listed: Value =
         serde_json::from_slice(&output.stdout).expect("work list --json must print JSON");
     let works = listed["works"].as_array().expect("works array");
-    assert_eq!(works.len(), 1);
-    assert_eq!(works[0]["intent"], "ship the M2 milestone");
-    // §5.2: the auto-spawned daemon is bound to the estate this client
-    // admitted (`spawn_daemon` names it with `-C`), so the submission is
-    // planned and run rather than parked. `completed` is the fake backend's
-    // deterministic answer — every stage settles inside the submit call — and
-    // asserting it is what proves the spawned daemon really adopted *this*
-    // estate: a daemon bound to nothing would have left this `pending`.
-    assert_eq!(works[0]["state"], "completed");
-    assert_eq!(works[0]["repositories"], json!(["solo"]));
-    assert_eq!(works[0]["created_by"], "cli");
+    assert_eq!(
+        works.len(),
+        2,
+        "both estates' Work is on one daemon: {listed}"
+    );
+    let by_intent = |intent: &str| {
+        works
+            .iter()
+            .find(|w| w["intent"] == intent)
+            .unwrap_or_else(|| panic!("{intent} missing from {listed}"))
+            .clone()
+    };
+    for intent in ["ship the M2 milestone", "ship the second estate"] {
+        let work = by_intent(intent);
+        // `completed` is the fake backend's deterministic answer — every
+        // stage settles inside the submit call — and asserting it is what
+        // proves the daemon really planned against *that* submission's
+        // estate: an unaddressed submission would have stayed `pending`.
+        assert_eq!(work["state"], "completed", "{intent}: {work}");
+        assert_eq!(work["repositories"], json!(["solo"]));
+        assert_eq!(work["created_by"], "cli");
+    }
 
-    // A second daemon on the same data dir fails closed.
+    // H1 §11 criterion 5, on the same rig: **one journal reconstructs both
+    // estates.** Every Work's own canonical estate root is on the envelope
+    // (D1), so a replay can tell them apart without a second journal, a
+    // second projection, or an estate UUID.
+    let mut roots: Vec<String> = Journal::replay_data_dir(dir.path())
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == KIND_WORK_SUBMITTED)
+        .map(|e| {
+            e.workspace_id
+                .clone()
+                .expect("submitted carries its estate")
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    let mut expected = vec![
+        std::fs::canonicalize(dir.path())
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned(),
+        std::fs::canonicalize(other.path())
+            .expect("canonical")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    expected.sort();
+    assert_eq!(
+        roots, expected,
+        "one journal must reconstruct both estates by their own coordinates"
+    );
+
+    // And the registry says so out loud (H1 §4): both roots admitted,
+    // observationally, because both were addressed.
+    let output = sgt(&dir, &["daemon", "stop", "--json"]);
+    assert!(
+        output.status.success(),
+        "daemon stop failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stopped: Value =
+        serde_json::from_slice(&output.stdout).expect("daemon stop --json prints JSON");
+    // D5: the blast radius is stated, not left for the operator to infer —
+    // `sgt daemon stop` stops the *host* daemon, every admitted estate's.
+    let message = stopped["message"].as_str().expect("message");
+    assert!(
+        message.contains("host daemon") && message.contains("2 admitted estates"),
+        "daemon stop must name its blast radius: {message}"
+    );
+
+    // --- Half two: a second *process* still fails closed on the host lock. ---
+    let output = sgt(&dir, &["run", "restart the daemon"]);
+    assert!(
+        output.status.success(),
+        "sgt run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let output = sgt(&dir, &["daemon"]);
     assert!(
         !output.status.success(),
-        "second daemon must fail closed, got: {}",
+        "a second daemon process must fail closed, got: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("another daemon"),
-        "second daemon should explain the lock, got: {stderr}"
+        "the second process should explain the lock, got: {stderr}"
     );
 
     stop_daemon(dir.path());
+}
+
+/// §26 outranks D4's admission check, and the crash window is where that
+/// actually bites.
+///
+/// A daemon that dies between `work.submitted` and `command.accepted` leaves
+/// a durable Work with no recorded outcome; `command_works` is the index that
+/// lets the retry answer for the command that already ran instead of running
+/// a second one (`crash_between_mutation_and_command_record_still_replays`
+/// pins that on its own). H1 adds a step *before* planning — admit the
+/// addressed estate — and if that step answered first, a retry landing in
+/// exactly this window after the estate broke would be told `422 the estate
+/// is invalid` while its Work sat in the journal. The client would conclude
+/// nothing happened. §26's promise is about what already happened, not about
+/// whether it could happen again now, so admission is deliberately behind
+/// both replay checks.
+#[tokio::test]
+async fn a_crash_window_retry_replays_even_after_its_estate_stops_admitting() {
+    let dir = TempDir::new().expect("tempdir");
+    let estate = second_estate("crash-window");
+    let handle = start(dir.path()).await;
+    let command_id = ulid();
+    let (status, _, body) = submit_addressed(
+        &client(),
+        &handle,
+        Some(estate.path()),
+        &command_id,
+        "accepted, then the estate vanished",
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    handle.shutdown().await;
+
+    // The exact crash image: the durable `work.submitted`, its
+    // `command.accepted` never written.
+    let events = journal_events(dir.path());
+    let submitted_at = events
+        .iter()
+        .position(|e| e.kind == KIND_WORK_SUBMITTED)
+        .expect("work.submitted journaled");
+    truncate_journal(dir.path(), submitted_at + 1);
+
+    // ...and by the time anyone retries, the estate is gone.
+    std::fs::remove_file(estate.path().join("sergeant.toml")).expect("break the estate");
+
+    let handle = start(dir.path()).await;
+    let http = client();
+    let (retry_status, _, retry_body) = submit_addressed(
+        &http,
+        &handle,
+        Some(estate.path()),
+        &command_id,
+        "accepted, then the estate vanished",
+    )
+    .await;
+    assert_eq!(
+        retry_status, status,
+        "the retry must answer for the command that already ran: {retry_body}"
+    );
+    assert_eq!(
+        retry_body["work"]["id"].as_str(),
+        Some(work_id.as_str()),
+        "and for the same Work: {retry_body}"
+    );
+    // Deliberately not byte-equality with the first response, unlike
+    // `crash_between_mutation_and_command_record_still_replays`: that rig's
+    // daemon plans nothing, so its Work never moves past `pending` and the
+    // two bodies are identical. Here the first submission really ran, and the
+    // truncation cut every event after `work.submitted` away — so the
+    // re-derived view honestly describes the journal as it now stands. What
+    // this test is about is *which* answer the retry gives (the recorded
+    // command's, not a refusal), not how much of the run survived surgery.
+    assert!(
+        retry_body["error"].is_null(),
+        "the retry must not be an error at all: {retry_body}"
+    );
+
+    // A genuinely new submission against the same broken estate is still
+    // refused — the exemption is for the command that already ran, not for
+    // the estate.
+    let (fresh_status, _, fresh_body) = submit_addressed(
+        &http,
+        &handle,
+        Some(estate.path()),
+        &ulid(),
+        "a new one, after the break",
+    )
+    .await;
+    assert_eq!(fresh_status, 422, "{fresh_body}");
+    assert_eq!(fresh_body["error"]["code"], "invalid_estate");
+
+    handle.shutdown().await;
 }
 
 /// The rest of the contracted CLI surface through the spawned binary:
@@ -1912,26 +2221,21 @@ fn t8_two_concurrent_auto_spawns_one_survivor_both_commands_complete() {
     stop_daemon(dir.path());
 }
 
-/// Hand-write a `sergeant.runtime/v2` descriptor into `dir`, bound to `dir`
-/// itself as its estate root.
+/// Hand-write a `sergeant.runtime/v3` descriptor into `dir`.
 ///
-/// The binding matters even for a descriptor whose whole point is to be
-/// dead: §5.1 has clients verify `estate_root` **before** they judge
-/// staleness or probe the endpoint, so a fabricated descriptor naming some
-/// other root would get the mismatch refusal and the staleness path under
-/// test would never run. The canonical form is what
-/// [`Estate::admit`](sergeant_rs::domain::estate::Estate::admit)
-/// puts in the descriptor, so it is what a fixture must reproduce.
+/// D3: no estate fields. The fixture used to have to reproduce the exact
+/// canonical bound root, because §5.1 had clients compare it *before* they
+/// judged staleness — a fabricated descriptor naming any other root got the
+/// mismatch refusal and the staleness path under test never ran. That
+/// refusal class is retired; a v3 descriptor says nothing about estates, so
+/// the staleness path is reached on its own terms.
 fn write_fabricated_descriptor(dir: &DataDir, endpoint: &str, pid: u32, token: &str) {
-    let root = std::fs::canonicalize(dir.path()).expect("canonical estate root");
     let descriptor = json!({
-        "schema": "sergeant.runtime/v2",
+        "schema": "sergeant.runtime/v3",
         "endpoint": endpoint,
         "pid": pid,
         "api_revision": "v1",
         "token": token,
-        "estate_root": root,
-        "manifest_path": root.join("sergeant.toml"),
     });
     std::fs::write(
         daemon::descriptor_path(dir.path()),
@@ -1980,21 +2284,24 @@ fn stale_descriptor_is_replaced_but_ambiguous_descriptor_fails_closed() {
 /// Half-interpreting it could mean talking to the wrong process, or spawning
 /// a second daemon on a data dir that already has an owner.
 ///
-/// **Both directions, since estate-root §5.1 bumped the schema to
-/// `sergeant.runtime/v2`.** A newer build's descriptor was always the
-/// forward case; `sergeant.runtime/v1` is now the backward one, and it is not
-/// hypothetical — it is what a daemon from the previous release leaves on
-/// disk. There is deliberately no compatibility shim: a v1 descriptor carries
-/// no `estate_root`, so a client could not verify §5.1's binding against it
-/// at all, and reading it half-way is exactly the "talking to the wrong
-/// process" failure above. Both refusals must also carry the *remedy* (stop
-/// the old daemon and let a restarted one republish), because an operator
-/// staring at a live-but-unusable daemon has no other way to know what to do.
+/// **Both directions, and now one release deeper.** H1's D3 bumped the
+/// schema to `sergeant.runtime/v3` (no estate fields at all), so
+/// `sergeant.runtime/v2` — an estate-*bound* daemon from the previous
+/// release, still running on a developer's machine at cutover — joins the
+/// backward cases beside v1, and `v4` stands in for the forward one. There
+/// is deliberately no compatibility shim in either direction: a v2
+/// descriptor names one bound estate this build no longer believes in, and
+/// half-reading it is exactly the "talking to the wrong process" failure
+/// above. Every refusal must also carry the *remedy* (stop the old daemon
+/// and let a restarted one republish), because an operator staring at a
+/// live-but-unusable daemon has no other way to know what to do — that
+/// remedy is H1 §6's cutover story with a real backstop under it.
 #[test]
 fn descriptor_with_an_unknown_schema_fails_closed() {
     for (label, schema) in [
-        ("from the future", "sergeant.runtime/v3"),
-        ("from the previous release", "sergeant.runtime/v1"),
+        ("from the future", "sergeant.runtime/v4"),
+        ("from the previous release", "sergeant.runtime/v2"),
+        ("from two releases back", "sergeant.runtime/v1"),
     ] {
         let dir = estate_data_dir();
         let unreadable = json!({
@@ -2677,8 +2984,25 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
         sgt_dir.path().join("journal").is_dir(),
         "SGT_DATA_DIR must win over XDG_DATA_HOME and HOME"
     );
+    // Both negatives name **sergeant's own** path under the overridden root,
+    // not the root itself. The `HOME` this test hands `sgt` is inherited by
+    // every process `sgt` starts, including the backend probe walk's
+    // third-party CLI children, and those write their own state where their
+    // own conventions put it: measured on Cerberus 2026-08-25 with all five
+    // adapters installed, a single `sgt run` here leaves
+    // `$HOME/.local/state/opencode/locks`, `$HOME/.codex/`, `$HOME/.config/`,
+    // `$HOME/.cache/` and `$XDG_DATA_HOME/opencode/` behind — none of it
+    // sergeant's, none of it evidence about `resolve_data_dir`. Asserting
+    // `!$HOME/.local` therefore failed deterministically on a
+    // fully-provisioned host while passing on a runner with no such CLI
+    // installed, which is a fact about the host rather than about the rung
+    // under test. (Ordering-independent: it failed identically on the
+    // pre-#293 build.) The XDG line was already scoped this way; this makes
+    // the HOME line say the same thing — sgt did not fall through to the
+    // platform tail — which is the claim the doc comment above actually
+    // makes.
     assert!(!xdg.path().join("sergeant").exists());
-    assert!(!home.path().join(".local").exists());
+    assert!(!home.path().join(".local/share/sergeant").exists());
     assert!(
         !estate.path().join(".sergeant").exists(),
         "SGT_DATA_DIR must also outrank the estate's own `.sergeant/data` default \
@@ -2725,7 +3049,8 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
             "macOS's convention must ignore XDG_DATA_HOME, not merely prefer its own path"
         );
     } else {
-        assert!(!home2.path().join(".local").exists());
+        // Same narrowing, same reason as the first rung's pair above.
+        assert!(!home2.path().join(".local/share/sergeant").exists());
     }
 
     // Absent both, `$HOME`'s own convention-suffix is the last resort. Same
@@ -2854,14 +3179,13 @@ async fn start_with_fake(data_dir: &Path, fake: &FakeBackend) -> DaemonHandle {
 async fn start_with_fake_bound(
     data_dir: &Path,
     fake: &FakeBackend,
-    estate_root: Option<&Path>,
+    _estate_root: Option<&Path>,
 ) -> DaemonHandle {
     daemon::start_with(
         data_dir,
         DaemonConfig {
             backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
-            estate_root: estate_root.map(Path::to_path_buf),
             ..DaemonConfig::default()
         },
     )
@@ -3681,6 +4005,538 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
     );
 }
 
+// ------------------------------------- H1-15 (W4b) execution lane
+
+/// [`start_with_fake`], with the execution lane capped at `cap` — the one
+/// knob the lane tests below need beyond what `start_with_fake` already
+/// gives every §22.6 test above.
+async fn start_with_fake_capped(data_dir: &Path, fake: &FakeBackend, cap: usize) -> DaemonHandle {
+    daemon::start_with(
+        data_dir,
+        DaemonConfig {
+            backends: Arc::new(BackendRegistry::new().with(Arc::new(fake.clone()))),
+            default_backend: Some(FAKE_BACKEND_NAME.to_string()),
+            execution_lane_cap: Some(cap),
+            ..DaemonConfig::default()
+        },
+    )
+    .await
+    .expect("daemon start")
+}
+
+/// Every `KIND_WORK_WAITING`/`KIND_WORK_BLOCKED` payload journaled for
+/// `work_id`'s `reason`, in order — the direct-journal read the lane tests
+/// use to tell "waiting on the lane" from "blocked on the turn cap" apart,
+/// the same instrument `t3`/the SGT_TURN_CAP CLI test already use for
+/// journal-level assertions.
+fn park_reasons(data_dir: &Path, work_id: &str, kind: &str) -> Vec<String> {
+    Journal::replay_data_dir(data_dir)
+        .expect("replay")
+        .map(|e| e.expect("event"))
+        .filter(|e| e.kind == kind && e.work_id.as_deref() == Some(work_id))
+        .map(|e| e.payload["reason"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Deliverable 4's decisive test: a lane capped at 1, two Works retried
+/// concurrently — the second must wait for the first rather than both
+/// launching at once, and both must still complete once the first frees its
+/// slot. Deliverable 2 rides along for free: the second Work's wait is
+/// journaled as `KIND_WORK_WAITING` (state `waiting`), never
+/// `KIND_WORK_BLOCKED` (state `blocked`) — the turn-cap vocabulary — so the
+/// two are observably distinct via the same journal a `work show` reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANEWORKA000000000000000", "01LANEWORKB000000000000000");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::complete(), FakeStep::complete()],
+    );
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    fake.hold_launches();
+    let retry = |work_id: &'static str| {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("retry request")
+                .status()
+        })
+    };
+
+    // A is admitted (the lane has one slot) and parks inside the fake's own
+    // launch gate — the external effect itself, one seam past the lane.
+    let retry_a = retry(work_a);
+    assert!(
+        fake.await_stalled_launches(1, Duration::from_secs(30)),
+        "A's launch never reached its gate"
+    );
+
+    // B cannot be admitted: the lane is full. It must not park in the fake's
+    // gate at all (there is only one slot, A holds it) — it parks *before*
+    // ever reaching LAUNCH, on the lane itself.
+    let retry_b = retry(work_b);
+    let b_waiting = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let show: Value = client()
+                .get(format!("{}/v1/work/{work_b}", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("show B")
+                .json()
+                .await
+                .expect("show B json");
+            if show["work"]["state"] == "waiting" {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        b_waiting.is_ok(),
+        "B never reported `waiting` while the lane was held by A"
+    );
+    // Only one launch ever reached the fake's gate — B's is genuinely
+    // parked earlier, on the lane, not queued behind A inside the backend.
+    assert!(
+        !fake.await_stalled_launches(2, Duration::from_millis(200)),
+        "B must not reach LAUNCH while the lane is full"
+    );
+
+    fake.release_launches();
+    let (status_a, status_b) = (
+        retry_a.await.expect("A retry task"),
+        retry_b.await.expect("B retry task"),
+    );
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
+
+    // Both actually finish (B's admission unblocked once A released).
+    let both_completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let list: Value = client()
+                .get(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("list")
+                .json()
+                .await
+                .expect("list json");
+            // `completed_dirty` (ADR 0007(b)) counts too: the seeded surface
+            // points at a non-git `data_dir`, so teardown strands it — an
+            // artifact of this test's fixture, not of the lane feature under
+            // test, which only cares that both Works reached a completed
+            // disposition rather than staying `active`/`waiting`.
+            let done = list["works"]
+                .as_array()
+                .expect("works")
+                .iter()
+                .filter(|w| {
+                    w["state"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("completed"))
+                })
+                .count();
+            if done == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(both_completed.is_ok(), "both Works must reach completed");
+
+    handle.shutdown().await;
+
+    // Deliverable 2: distinct journal vocabulary. B waited on the lane
+    // (`KIND_WORK_WAITING`, a lane-specific reason) and never touched the
+    // turn-cap's own `KIND_WORK_BLOCKED` vocabulary.
+    let waiting = park_reasons(dir.path(), work_b, KIND_WORK_WAITING);
+    assert!(
+        waiting.iter().any(|r| r.contains("execution lane")),
+        "B's wait must be journaled with a lane-specific reason, got {waiting:?}"
+    );
+    // `seed_blocked_run` itself journals one `blocked` ("seeded") to give the
+    // retry something to retry from — the fixture's own starting position,
+    // not evidence about the lane. What must never appear is a *second* one
+    // caused by the retry itself (a turn-cap-style block).
+    let blocked = park_reasons(dir.path(), work_b, KIND_WORK_BLOCKED);
+    assert_eq!(
+        blocked,
+        vec!["seeded".to_string()],
+        "B waited on the lane, not the turn cap — retrying it must never add \
+         a second `blocked` reason: {blocked:?}"
+    );
+}
+
+/// Deliverable 4: a permit released on a **daemon-side launch error** (the
+/// backend's own `launch()` returning `Err`, settled in `settle_launch`'s
+/// no-live-execution branch, never `stop_execution`). If this leaked, B's
+/// retry below would hang forever on a lane of 1 with A's permit never
+/// freed — this test would time out rather than merely fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_execution_lane_permit_releases_on_a_daemon_side_launch_error() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANEFAILA0000000000000000", "01LANEFAILB0000000000000000");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [
+            FakeStep::invalid_model_refusal("no such model"),
+            FakeStep::complete(),
+        ],
+    );
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    let status_a = http
+        .post(format!("{}/v1/work/{work_a}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("A retry")
+        .status();
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+
+    let show_a: Value = http
+        .get(format!("{}/v1/work/{work_a}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show A")
+        .json()
+        .await
+        .expect("show A json");
+    assert_eq!(
+        show_a["work"]["state"], "blocked",
+        "A's launch error must fail it closed, not leave it waiting: {show_a}"
+    );
+
+    // The decisive check: B's retry must not hang. A bounded timeout — not
+    // a bare `.await` — is what turns "the permit leaked" into a named test
+    // failure instead of a wedged suite.
+    let retried_b = tokio::time::timeout(Duration::from_secs(10), async {
+        http.post(format!("{}/v1/work/{work_b}/retry", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid()}))
+            .send()
+            .await
+            .expect("B retry")
+            .status()
+    })
+    .await;
+    handle.shutdown().await;
+
+    let status_b = retried_b
+        .expect("B's retry never answered — A's execution-lane permit leaked on the launch error");
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
+}
+
+/// Deliverable 4: a permit released on **execution failure** — an
+/// observed `BackendSignal::Failed`, settled through `drive`'s `Failed` arm
+/// and released in `stop_execution`, the other release chokepoint from the
+/// launch-error one above. Same shape, same decisive check: B's retry must
+/// not hang on a lane of 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_execution_lane_permit_releases_on_execution_failure() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANESTOPA0000000000000000", "01LANESTOPB0000000000000000");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::fail("the turn failed"), FakeStep::complete()],
+    );
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    let status_a = http
+        .post(format!("{}/v1/work/{work_a}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("A retry")
+        .status();
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+
+    let show_a: Value = http
+        .get(format!("{}/v1/work/{work_a}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show A")
+        .json()
+        .await
+        .expect("show A json");
+    assert_eq!(show_a["work"]["state"], "failed", "A must fail: {show_a}");
+
+    let retried_b = tokio::time::timeout(Duration::from_secs(10), async {
+        http.post(format!("{}/v1/work/{work_b}/retry", handle.endpoint))
+            .bearer_auth(&handle.token)
+            .json(&json!({"command_id": ulid()}))
+            .send()
+            .await
+            .expect("B retry")
+            .status()
+    })
+    .await;
+    handle.shutdown().await;
+
+    let status_b = retried_b
+        .expect("B's retry never answered — A's execution-lane permit leaked on stage failure");
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
+}
+
+/// The fixed defect: a stop *request* must not free the execution-lane
+/// permit — only a *confirmed* stop (the native context's own tail work,
+/// joined) may. `stop_execution` used to call `release_execution_permit`
+/// unconditionally, before `backend.stop()`'s completion was ever awaited;
+/// on a lane of 1 that let a canceled Work's slot free the instant the
+/// cancel was issued, while the fake's "evidence archive" completion —
+/// standing in for the native process's own teardown — was still stalled.
+/// A second Work could then admit and launch while the canceled one might
+/// still be alive: exactly the transient oversubscription the finding
+/// named.
+///
+/// Decisive shape: cancel A with its archive completion held open (so the
+/// "native process" is provably still un-torn-down), and prove B *cannot*
+/// admit to a lane of 1 while that hold is in effect — only after the
+/// archive is released (and the completion actually joined) does B's
+/// admission become possible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_execution_lane_permit_stays_held_until_stop_is_confirmed_not_merely_requested() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANECONFIRMA00000000000A", "01LANECONFIRMB00000000000B");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    // `hang` keeps A's execution alive so the cancel below has a real native
+    // context to stop; B just needs to complete once admitted.
+    let fake = FakeBackend::scripted(FAKE_BACKEND_NAME, [FakeStep::hang(), FakeStep::complete()]);
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    let status_a = http
+        .post(format!("{}/v1/work/{work_a}/retry", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .json(&json!({"command_id": ulid()}))
+        .send()
+        .await
+        .expect("A retry")
+        .status();
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+
+    // Arm the archive gate — A's coming STOP will hand back a *pending*
+    // `Completion` that stalls here, standing in for a native process still
+    // tearing down.
+    fake.hold_archives();
+    let cancel_a = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_a}/cancel"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("cancel A request")
+                .status()
+        })
+    };
+    assert!(
+        fake.await_stalled_archives(1, Duration::from_secs(30)),
+        "A's stop completion never reached its gate — cancel A never actually stopped anything"
+    );
+
+    // The decisive check: with A's stop merely *requested* (its completion
+    // still stalled, unconfirmed), B must not be able to admit to a lane of
+    // 1. Give it a bounded window rather than asserting instantaneously —
+    // enough to catch a leaked permit without making the test itself slow.
+    let retry_b = {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_b}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("B retry request")
+                .status()
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let show_b: Value = http
+        .get(format!("{}/v1/work/{work_b}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show B")
+        .json()
+        .await
+        .expect("show B json");
+    assert_eq!(
+        show_b["work"]["state"], "waiting",
+        "B must still be parked on the lane while A's stop is only requested, not confirmed: \
+         {show_b}"
+    );
+
+    // Now confirm the stop: release the archive, let A's cancel finish
+    // joining it, and only then does the permit free for B.
+    fake.release_archives();
+    let status_a2 = cancel_a.await.expect("cancel A task");
+    assert!(status_a2.is_success(), "cancel A answered {status_a2}");
+
+    let status_b = tokio::time::timeout(Duration::from_secs(10), retry_b)
+        .await
+        .expect("B's retry never answered after A's stop was confirmed — the permit leaked")
+        .expect("B retry task");
+    handle.shutdown().await;
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
+}
+
+/// The other fixed defect: `crank`'s `Launch` arm blocking the *client's own
+/// request* on execution-lane admission, not just the Work's internal
+/// state. With the fix, a request that lands in a full lane journals the
+/// wait and returns promptly — it does not sit open until another Work
+/// vacates a slot.
+///
+/// Decisive shape: hold A's launch at the fake's own launch gate (a stall
+/// downstream of, and much longer than, lane admission itself), then send
+/// B's retry into the full lane and require its HTTP response to land
+/// quickly — long before A's stall is ever released. The old behavior
+/// (blocking inline on `Engine::admit_execution`) would make this request
+/// hang until `release_launches` below runs; this test never calls that
+/// until after asserting B's response already arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blocking() {
+    let dir = TempDir::new().expect("tempdir");
+    let (work_a, work_b) = ("01LANEFASTA000000000000000", "01LANEFASTB000000000000000");
+    seed_blocked_run(dir.path(), work_a);
+    seed_blocked_run(dir.path(), work_b);
+
+    let fake = FakeBackend::scripted(
+        FAKE_BACKEND_NAME,
+        [FakeStep::complete(), FakeStep::complete()],
+    );
+    let handle = start_with_fake_capped(dir.path(), &fake, 1).await;
+    let http = client();
+
+    fake.hold_launches();
+    let retry = |work_id: &'static str| {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{endpoint}/v1/work/{work_id}/retry"))
+                .bearer_auth(token)
+                .json(&json!({"command_id": ulid()}))
+                .send()
+                .await
+                .expect("retry request")
+                .status()
+        })
+    };
+
+    // A takes the lane's one slot and stalls inside the fake's own launch
+    // gate — a stall this test deliberately never releases until well after
+    // judging B.
+    let retry_a = retry(work_a);
+    assert!(
+        fake.await_stalled_launches(1, Duration::from_secs(30)),
+        "A's launch never reached its gate"
+    );
+
+    // The decisive check: B's retry into the full lane must answer well
+    // inside a short bound, without waiting on A's still-held launch.
+    let started = Instant::now();
+    let status_b = tokio::time::timeout(Duration::from_secs(2), retry(work_b))
+        .await
+        .expect("B's retry blocked on execution-lane admission instead of returning promptly")
+        .expect("B retry task");
+    let elapsed = started.elapsed();
+    assert!(status_b.is_success(), "B's retry answered {status_b}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "B's retry took {elapsed:?} — it must return as soon as the lane wait is journaled, \
+         not once a slot actually frees"
+    );
+
+    let show_b: Value = http
+        .get(format!("{}/v1/work/{work_b}", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("show B")
+        .json()
+        .await
+        .expect("show B json");
+    assert_eq!(
+        show_b["work"]["state"], "waiting",
+        "B's request returned promptly, but the Work itself must still be durably parked on \
+         the lane: {show_b}"
+    );
+
+    // Only now release A — proving B's earlier prompt response was not an
+    // artifact of the lane already having freed by coincidence.
+    fake.release_launches();
+    let status_a = retry_a.await.expect("A retry task");
+    assert!(status_a.is_success(), "A's retry answered {status_a}");
+
+    let both_completed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let list: Value = client()
+                .get(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("list")
+                .json()
+                .await
+                .expect("list json");
+            let done = list["works"]
+                .as_array()
+                .expect("works")
+                .iter()
+                .filter(|w| {
+                    w["state"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("completed"))
+                })
+                .count();
+            if done == 2 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(both_completed.is_ok(), "both Works must reach completed");
+
+    handle.shutdown().await;
+}
+
 // ------------------------------------- the throughput floor, as a guard
 //
 // N3-10: adjudication A-N3-1 amended the burst-50 floor to ">=24 works/s with
@@ -3689,8 +4545,8 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
 // by hand. Nothing in m1..m6 asserted a throughput floor at all, so a further
 // regression below the amended floor shipped silently.
 
-/// Submission throughput has an automated floor, **on the path the budget was
-/// measured on**.
+/// The submit path's per-submission cost is guarded as a **ratio measured on
+/// this host, in this run** — never as an absolute works/s rate.
 ///
 /// Round-2 finding N3R2-04: the first version of this posted
 /// `{command_id, intent}` with no `origin.cwd`, which `Engine::plan` answers
@@ -3707,7 +4563,9 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
 /// accepted call resolves the estate, resolves and binds a workflow,
 /// materializes a worktree, reserves an execution and runs the stages. A
 /// call's latency is a work's end-to-end latency, which is what the A-N3-1
-/// number means.
+/// budget (24 works/s at burst 50;
+/// sergeant-rs-workspace's `knowledge/evidence/perf/n3-two-phase-boundary-2026-08-10.md`)
+/// means.
 ///
 /// **Estate-root §5.2 moved where the topology comes from, not how much of
 /// it is done.** `origin.cwd` used to be what made this the whole submit
@@ -3717,63 +4575,118 @@ async fn t11e_a_stalled_drivers_completed_settle_lands_before_daemon_stopped() {
 /// the shape `s1-burst.sh` sends — but it decides nothing, and a version of
 /// this test that dropped the binding would silently go back to measuring
 /// the HTTP surface (`Ok(None)`, everything `pending`), which is precisely
-/// what the completion assertion below exists to catch.
+/// what the completion assertion below exists to catch. It is not decoration:
+/// delete it and every number here becomes a number about `axum`.
 ///
-/// **The floor, and how it is scaled.** A-N3-1's amended budget is ≥24
-/// works/s at burst 50 on a quiet machine. This runs at burst 25 inside a
-/// suite that shares its cores with seven others, so the floor takes a 2×
-/// contention allowance: **12 works/s** on Linux. On M3 Pro / macOS,
-/// git-spawn overhead limits the fixed path to ~11.6 works/s under load, so
-/// the floor is revised to **8.0 works/s** on this hardware (#128,
-/// owner-approved). Two measurements make 8.0 the honest number rather than a
-/// round one:
+/// # Why a ratio, and why *this* ratio (#278, 2026-08-29)
 ///
-/// - the healthy path here runs 38 works/s idle and 33 works/s with the whole
-///   suite in flight — 2.8× the Linux floor on a loaded host, which is margin
-///   against a scheduler hiccup and not against a regression;
-/// - and the floor is still above the ceiling that the regression class this
-///   exists to catch imposes. Any effect of duration *d* serialized under the
-///   submit guard caps throughput at `1/d` regardless of burst size or host
-///   speed: the full-serialized baseline measures at 4.8 works/s and the
-///   regression-path simulation at 10.2 works/s — both well below 8.0.
+/// This asserted an absolute floor of 8.0 works/s until 2026-08-29. That is
+/// the class `scripts/coverage/README.md` ("Every wall-clock deadline in
+/// `tests/`") calls an **asserted performance bound** rather than a polling
+/// deadline, and the rule that section now carries is that such a bound is
+/// admissible only with headroom measured on the **slowest supported
+/// target** — `docs/reference/glossary-and-support.md:18`: x86_64 Linux,
+/// Apple Silicon macOS, Windows through WSL2, plus shared CI runners in
+/// practice. 8.0 never had that. On one unchanged commit the S4 close
+/// dry-run measured **6.5 works/s and failed** (GH run 33250519400) and
+/// passed forty minutes later on the same SHA (run 33251738966); only runner
+/// load differed. Worse, 6.5 sits *below* the 10.2 works/s regression-path
+/// simulation recorded in #128 — on that hardware a healthy path scored
+/// worse than a regressed one does on the reference host, so the floor had
+/// no discriminating power left where it ran.
 ///
-/// The burst is 25 rather than 50 because the guard is bounded by the ceiling
-/// above, not by the burst, and 50 concurrent worktrees on a shared test host
-/// is a lot of disk for no extra signal. When the group-commit fix (#44) lands
-/// and the measurement rises, this floor rises with it.
+/// The regression this guard exists to catch is stated in N3R2-04's own
+/// terms: **an external effect of duration `d` put back under the submit
+/// guard** (`runtime::surface::with_repository`), which caps throughput at
+/// `1/d` whatever the burst size or host speed. So what is measured is the
+/// *cost of the guarded section per submission*, expressed in a unit taken on
+/// the same host in the same run: **one `git worktree add`** against the same
+/// repository — the operation the regression is made of, and the one whose
+/// cost varies most across the supported targets. Both terms move together
+/// when the host is slow, which is the property a works/s number only
+/// pretended to have.
+///
+/// **Both candidate controls were measured before one was chosen** (2026-08-29,
+/// 20-core container; conditions: idle, 16 CPU hogs, 6 fsync hogs, both
+/// together, and each again under `taskset -c 0,1`; full tables in
+/// sergeant-rs-workspace's `knowledge/evidence/perf/t12-ratio-guard-2026-08-29.md`).
+/// The obvious control — the same burst run strictly serialized, healthy rate
+/// ÷ serialized rate — was implemented first and **rejected on its own
+/// measurements**: healthy speedup ranged **0.48×–3.78×** across those
+/// conditions, while an 86 ms effect injected under `with_repository` produced
+/// **1.29×**. On two cores the healthy speedup is 1.07×–1.34×, i.e.
+/// *indistinguishable from the regression*, because that speedup is
+/// parallelism and parallelism is exactly what the slowest supported target
+/// lacks. Asserting it would have re-created #278 with a new constant.
+///
+/// **The bound, with the arithmetic.** Per-submission cost of the guarded
+/// section, in units of one `git worktree add` on the same repository:
+///
+/// | condition (2026-08-29) | healthy | +20 ms | +40 ms | +86 ms |
+/// |---|---|---|---|---|
+/// | 20 cores, idle | 2.4–6.7 | 14.0 | 37.2 | 51.5 |
+/// | 20 cores, 16 CPU hogs | 5.4 | 14.4 | 25.6 | 48.4 |
+/// | 20 cores, 6 fsync hogs | 2.4–8.8 | — | 23.4 | 46.1 |
+/// | 20 cores, 24 CPU + 6 fsync hogs | 2.6–3.3 | — | — | 21.0 |
+/// | `taskset -c 0,1` | 3.1–8.7 | 9.7 | 31.5 | 64.9 |
+/// | `taskset -c 0,1` + hogs | 3.0–5.6 | 14.7 | 10.8 | 17.5–19.8 |
+///
+/// The absolute rate over the same runs ranged 5.0–97.2 works/s; the ratio
+/// ranged 2.4–8.8 healthy. `SUBMIT_COST_CEILING_GIT_UNITS` is **12.0**: above
+/// every healthy measurement in every condition (worst 8.8, 1.4×) and below
+/// every simulated +86 ms regression in every condition (worst 17.5, 1.5×) —
+/// which is N3R2-04's own number and the class this guard exists for. A
+/// +40 ms effect is caught in five of six conditions and a +20 ms effect in
+/// three, so the sensitivity is at worst comparable to the ~80 ms the retired
+/// floor claimed, and no longer a function of how fast the host is.
+///
+/// **Best of `ATTEMPTS`, deliberately.** A ratio is still a wall-clock
+/// measurement, and a shared runner can stall one burst for reasons that have
+/// nothing to do with this code (uncontrolled runs on this same box, with
+/// other lanes compiling, produced 14.0, 14.4 and 34.1 healthy units). So a
+/// breach is retried rather than fatal, which is the risk class
+/// `scripts/coverage/README.md` calls a *polling* wait: a slowdown eats
+/// headroom instead of invalidating the premise. An effect serialized under
+/// the guard is not transient — every attempt measures it — so this costs the
+/// guard nothing and costs the suite one extra burst only when it would
+/// otherwise have flaked.
+///
+/// **The #128 macOS special case is retired by this change.** 8.0 existed
+/// because git-spawn overhead makes the fixed path slower on M3 Pro
+/// (~11.6 works/s under load) than on Linux, so an absolute floor had to be
+/// re-derived per host. A ratio in git-spawn units does not care: slower
+/// git-spawn inflates the numerator and the unit together, which the
+/// hog-loaded rows above show directly (the unit went 3.8 ms → ~10 ms and the
+/// ratio went *down*). No per-platform constant remains in this test.
+///
+/// **Known limit, stated rather than papered over.** The ceiling bounds the
+/// *accept* phase, so a submit path that answered `202` before doing the
+/// guarded work would pass it cheaply. That is the same hazard the completion
+/// assertion exists for, and it is why the burst is still driven to a terminal
+/// state and asserted `completed`: the guard is the pair, not either half.
 ///
 /// **What it does not catch, and what does.** A second fsync per journal
 /// append — A-N3-1's own cost story, and #44's target — is ~5% of a submit on
 /// this container's filesystem (38.2 → 36.8 works/s measured), which is inside
-/// the noise of any floor that does not flake. Timing is the wrong instrument
-/// for it and the previous version of this comment claimed otherwise; m6's
+/// the noise of any bound that does not flake. Timing is the wrong instrument
+/// for it and an earlier version of this comment claimed otherwise; m6's
 /// `t11b_the_append_path_issues_exactly_the_fsync_it_accounts_for` counts it
-/// instead.
+/// instead. Historical absolute numbers, kept as history and no longer
+/// asserted anywhere: `knowledge/evidence/perf/t12-lane-era-throughput-2026-08-26.md`
+/// (18.9–100.5 works/s) and `.../macbook-arrival-git-spawn-2026-08-15.md`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t12_submission_throughput_has_an_automated_floor() {
-    /// A-N3-1's amended budget, on a quiet machine at burst 50.
-    const BUDGET: f64 = 24.0;
-    // Load-sensitivity note (macOS / Apple M3 Pro, issue #128,
-    // sergeant-rs-workspace's knowledge/evidence/perf/macbook-arrival-git-spawn-2026-08-15.md):
-    // Isolated throughput on M3 Pro is ~10.96–11.13 works/s; under parallel
-    // cargo-test / compilation contention it drops to ~9.3 works/s. The submit
-    // path serializes through a single per-repo lock, so throughput = 1 /
-    // per-submission latency — it is not a concurrency count. Git subprocess
-    // spawn overhead dominates that latency on macOS; OS scheduling pressure
-    // under load inflates it further. Floor set to 8.0: gives real margin under
-    // both isolated and contended conditions while still catching a genuine
-    // regression toward the original ~5 works/s baseline (#128). Owner-approved:
-    // durable queuing and eventual execution matter far more than sub-100ms
-    // submission latency on this host.
-    /// How much slower a suite sharing its cores with seven others may be.
-    const CONTENTION_ALLOWANCE: f64 = 2.0;
-    /// Works per second the daemon must sustain, whole submit path.
-    /// Floor set to 8.0 (owner-approved, #128): isolated M3 Pro range is
-    /// ~10.96–11.13 works/s; contended range down to ~9.3 works/s; 8.0 gives
-    /// headroom under both while catching regressions toward the ~5 works/s
-    /// baseline this fix started from.
-    const THROUGHPUT_FLOOR: f64 = 8.0;
     const BURST: usize = 25;
+    /// Per-submission cost of the guarded section, in `git worktree add`s.
+    /// Derived in the doc comment above from the 2026-08-29 measurements in
+    /// sergeant-rs-workspace's `knowledge/evidence/perf/t12-ratio-guard-2026-08-29.md`:
+    /// worst healthy 8.8, worst +86 ms regression 17.5.
+    const SUBMIT_COST_CEILING_GIT_UNITS: f64 = 12.0;
+    /// Samples of the in-run unit per attempt. Odd, and the median is taken:
+    /// one scheduler hiccup must not move the unit in either direction.
+    const UNIT_SAMPLES: usize = 5;
+    /// A breach is retried, not fatal — see "Best of ATTEMPTS" above.
+    const ATTEMPTS: usize = 3;
 
     let dir = TempDir::new().expect("tempdir");
     let estate = TempDir::new().expect("tempdir");
@@ -3783,66 +4696,186 @@ async fn t12_submission_throughput_has_an_automated_floor() {
     let handle = start_with_fake_bound(dir.path(), &fake, Some(estate.path())).await;
     let http = client();
 
-    let started = Instant::now();
-    let mut inflight = Vec::with_capacity(BURST);
-    for _ in 0..BURST {
-        let http = http.clone();
-        let endpoint = handle.endpoint.clone();
-        let token = handle.token.clone();
-        let repo = repo.clone();
-        inflight.push(tokio::spawn(async move {
-            let response = http
-                .post(format!("{endpoint}/v1/work"))
-                .bearer_auth(token)
-                .json(&json!({
-                    "command_id": ulid(),
-                    "intent": "throughput floor",
-                    "backend": FAKE_BACKEND_NAME,
-                    "origin": {"client": "cli", "cwd": repo},
-                }))
-                .send()
-                .await
-                .expect("submit");
-            let status = response.status();
-            let body: Value = response.json().await.expect("submit json");
-            (status, body)
-        }));
-    }
-    let mut completed = 0usize;
-    let mut created = 0usize;
-    for task in inflight {
-        let (status, body) = task.await.expect("submit task");
-        if status.is_success() {
-            created += 1;
-            if body["work"]["state"] == "completed" {
-                completed += 1;
+    let mut observed: Vec<String> = Vec::with_capacity(ATTEMPTS);
+    let mut passed = false;
+    for attempt in 1..=ATTEMPTS {
+        // W4b's execution lane (`Engine::try_admit_execution`, `src/runtime/engine.rs`,
+        // J3 ratified) means a launch that finds the lane full is handed off to a
+        // detached task (`api::crank_inner`'s `EngineNext::Launch` arm, `src/api.rs`)
+        // and the submit's HTTP response returns immediately with the Work left
+        // `waiting` — the response body no longer means "this Work is done" the way
+        // it did before the lane existed. Reading completion from the submit response
+        // body (the original shape of this test) is exactly the regression N3R2-04's
+        // own doc comment above warns about: it measures the HTTP surface, not the
+        // submit path's whole operation. So the burst is driven to terminal below,
+        // and the ratio is taken over the accept phase — the span the repository
+        // guard is actually contended in.
+        let started = Instant::now();
+        let mut inflight = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let http = http.clone();
+            let endpoint = handle.endpoint.clone();
+            let token = handle.token.clone();
+            let repo = repo.clone();
+            let estate_root = estate.path().to_path_buf();
+            inflight.push(tokio::spawn(async move {
+                let response = http
+                    .post(format!("{endpoint}/v1/work"))
+                    .bearer_auth(token)
+                    .json(&json!({
+                        "command_id": ulid(),
+                        "intent": "throughput floor",
+                        "backend": FAKE_BACKEND_NAME,
+                        // D4: `cwd` is the mount; the addressed estate is its root.
+                        "estate_root": estate_root,
+                        "origin": {"client": "cli", "cwd": repo},
+                    }))
+                    .send()
+                    .await
+                    .expect("submit");
+                let status = response.status();
+                let body: Value = response.json().await.expect("submit json");
+                (status, body)
+            }));
+        }
+        let mut created = 0usize;
+        let mut work_ids = Vec::with_capacity(BURST);
+        for task in inflight {
+            let (status, body) = task.await.expect("submit task");
+            if status.is_success() {
+                created += 1;
+                work_ids.push(
+                    body["work"]["id"]
+                        .as_str()
+                        .expect("accepted submission carries a work id")
+                        .to_string(),
+                );
             }
         }
+        // The accept phase: every submission answered. This is the span an
+        // effect serialized under the repository guard can hide in.
+        let accept_phase = started.elapsed();
+        assert_eq!(created, BURST, "every submission must be accepted");
+
+        let poll_deadline = Instant::now() + Duration::from_secs(30);
+        let mut states: Vec<String> = Vec::new();
+        loop {
+            states.clear();
+            let mut all_terminal = true;
+            for id in &work_ids {
+                let body: Value = http
+                    .get(format!("{}/v1/work/{id}", handle.endpoint))
+                    .bearer_auth(&handle.token)
+                    .send()
+                    .await
+                    .expect("work show")
+                    .json()
+                    .await
+                    .expect("work show json");
+                let state = body["work"]["state"]
+                    .as_str()
+                    .expect("work has a state")
+                    .to_string();
+                if !matches!(state.as_str(), "completed" | "failed" | "canceled") {
+                    all_terminal = false;
+                }
+                states.push(state);
+            }
+            if all_terminal {
+                break;
+            }
+            // L7 revert-sensitivity: a lane that never releases a permit (the
+            // exact shape a leaked `execution_permits` entry or a re-broken
+            // `resume_after_execution_lane` edge would produce) wedges here
+            // rather than silently passing — this loop does not have a "give up
+            // and read whatever the response body already said" fallback the
+            // way the pre-lane-era version of this test effectively did.
+            assert!(
+                Instant::now() < poll_deadline,
+                "burst did not reach a terminal state within 30s — the execution lane \
+                 wedged (states observed: {states:?})"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let elapsed = started.elapsed();
+
+        let completed = states.iter().filter(|s| s.as_str() == "completed").count();
+        // The whole point is that the measured operation is the whole operation: a
+        // burst that parked in `waiting` and was never driven on would have shown
+        // up here as a non-`completed` terminal state, not as this test's request
+        // timing out. This is also what keeps the estate binding honest — without
+        // it the burst above could be answering `Ok(None)` and the ratio would be
+        // a ratio about the HTTP surface.
+        assert_eq!(
+            completed, BURST,
+            "every submission must have run its workflow to completion — otherwise \
+             this is not measuring the submit path the budget was measured on \
+             (attempt {attempt}, states observed: {states:?})"
+        );
+
+        // The in-run unit: one `git worktree add` against the same repository, on
+        // this host, now. Not an exact replica of what the submit path does under
+        // the guard (that one is `--no-checkout` plus a later `reset --hard`,
+        // `runtime::surface`) — it does not need to be. It needs to be the same
+        // class of operation, a git subprocess mutating the same repository's
+        // worktree registry, so that whatever makes the guarded section slow on a
+        // given target (git-spawn cost on macOS, #128; a loaded CI runner; an
+        // instrumented build) makes the unit slow with it. Measured per attempt,
+        // after that attempt's burst has settled, so it cannot perturb what it is
+        // a unit for and cannot go stale if load changes between attempts.
+        let scratch = TempDir::new().expect("tempdir");
+        let mut unit_samples_ms: Vec<f64> = Vec::with_capacity(UNIT_SAMPLES);
+        for i in 0..UNIT_SAMPLES {
+            let target = scratch.path().join(format!("unit-{attempt}-{i}"));
+            let at = Instant::now();
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["worktree", "add", "--detach"])
+                .arg(&target)
+                .output()
+                .expect("git worktree add (the in-run unit)");
+            assert!(
+                out.status.success(),
+                "the in-run unit must actually run: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            unit_samples_ms.push(at.elapsed().as_secs_f64() * 1000.0);
+        }
+        unit_samples_ms.sort_by(f64::total_cmp);
+        let unit_ms = unit_samples_ms[UNIT_SAMPLES / 2];
+
+        let per_submission_ms = accept_phase.as_secs_f64() * 1000.0 / BURST as f64;
+        let cost_in_units = per_submission_ms / unit_ms;
+        let rate = BURST as f64 / elapsed.as_secs_f64();
+        let line = format!(
+            "attempt {attempt}: {cost_in_units:.1} units \
+             ({per_submission_ms:.1} ms/submission over a {BURST}-burst ÷ a {unit_ms:.1} ms \
+             `git worktree add`); whole span {elapsed:?} = {rate:.1} works/s, recorded not asserted"
+        );
+        eprintln!("t12 {line} (ceiling {SUBMIT_COST_CEILING_GIT_UNITS} units)");
+        observed.push(line);
+        if cost_in_units <= SUBMIT_COST_CEILING_GIT_UNITS {
+            passed = true;
+            break;
+        }
     }
-    let elapsed = started.elapsed();
     handle.shutdown().await;
 
-    assert_eq!(created, BURST, "every submission must be accepted");
-    // The whole point is that the measured operation is the whole operation: a
-    // burst that parked in `pending` would be timing the HTTP surface again.
-    assert_eq!(
-        completed, BURST,
-        "every submission must have run its workflow to completion — otherwise \
-         this is not measuring the submit path the budget was measured on"
-    );
-    let rate = BURST as f64 / elapsed.as_secs_f64();
-    eprintln!("burst {BURST} (full submit path): {rate:.1} works/s in {elapsed:?}");
     assert!(
-        rate >= THROUGHPUT_FLOOR,
-        "submission throughput fell to {rate:.1} works/s at burst {BURST}, below the \
-         {THROUGHPUT_FLOOR} works/s floor. Derivation: A-N3-1's amended budget of \
-         {BUDGET} works/s at burst 50 (sergeant-rs-workspace's knowledge/evidence/perf/n3-two-phase-boundary-2026-08-10.md) \
-         divided by a {CONTENTION_ALLOWANCE}× allowance for a shared test host gives \
-         12.0 on Linux; revised to {THROUGHPUT_FLOOR} on M3 Pro / macOS due to \
-         git-spawn overhead (#128). This is the whole submit path — estate discovery, \
-         workflow bind, `git worktree add`, reservation, launch — so any external effect \
-         of ~80 ms or more put back under the core lock lands below it, whatever the host \
-         speed."
+        passed,
+        "a submission cost more than {SUBMIT_COST_CEILING_GIT_UNITS} `git worktree add`s \
+         under the repository guard on every one of {ATTEMPTS} attempts — an external effect \
+         has been put back under `runtime::surface::with_repository`, where it caps throughput \
+         at 1/d whatever the host speed. Observed: {observed:#?}. Derivation (2026-08-29, \
+         sergeant-rs-workspace's knowledge/evidence/perf/t12-ratio-guard-2026-08-29.md): \
+         healthy 2.4-8.8 units across idle / CPU-hogged / fsync-hogged / 2-core / \
+         2-core-plus-hogs conditions; the same conditions with 86 ms — N3R2-04's own number — \
+         serialized under that guard measure 17.5-64.9; 12.0 sits 1.4x above the worst healthy \
+         and 1.5x below the worst regression. This replaced an absolute 8.0 works/s floor that \
+         failed and passed on one unchanged commit purely on runner load (#278, GH runs \
+         33250519400 / 33251738966), and it is a ratio precisely so that a slow host moves both \
+         of its terms."
     );
 }
 
@@ -4078,6 +5111,7 @@ async fn scope_all_combined_with_repos_refuses_with_conflicting_scope() {
         .json(&json!({
             "command_id": ulid(),
             "intent": "everything and also just this one",
+            "estate_root": estate.path(),
             "scope": {"repos": ["solo"], "all": true},
         }))
         .send()
@@ -4402,7 +5436,7 @@ async fn r_mvp1_10_start(
     data_dir: &Path,
     registry: BackendRegistry,
     completion_poll: Duration,
-    estate_root: &Path,
+    _estate_root: &Path,
 ) -> DaemonHandle {
     daemon::start_with(
         data_dir,
@@ -4410,7 +5444,6 @@ async fn r_mvp1_10_start(
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll,
-            estate_root: Some(estate_root.to_path_buf()),
             ..DaemonConfig::default()
         },
     )
@@ -4422,9 +5455,9 @@ async fn r_mvp1_10_start(
 ///
 /// `cwd` is sent because §13.3 still records it as origin evidence, and
 /// leaving it out would stop exercising the field — but since §5.2 it decides
-/// nothing: the daemon plans against the estate it was started against. It is
-/// passed the estate root here so the recorded evidence matches where the
-/// run actually happened.
+/// nothing. What decides is `estate_root` (D4), which every call site here
+/// passes as the same path: these tests run one estate, and the recorded
+/// evidence should match where the run actually happened.
 async fn r_mvp1_10_submit(
     http: &reqwest::Client,
     handle: &DaemonHandle,
@@ -4435,6 +5468,7 @@ async fn r_mvp1_10_submit(
     let mut req = json!({
         "command_id": ulid(),
         "intent": intent,
+        "estate_root": cwd,
         "origin": {"client": "cli", "cwd": cwd},
     });
     if let Some(name) = workflow {

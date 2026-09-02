@@ -25,6 +25,7 @@
 //! a client that removes the path can delete a descriptor a *successor*
 //! daemon just published and leave it undiscoverable.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -46,6 +47,15 @@ const SPAWN_POLL: Duration = Duration::from_millis(50);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for a single `/healthz` probe.
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often `sgt intelligence scan` asks how the scan it started is
+/// going. Every poll is a small read, so this is a display cadence, not a
+/// bound on the work: nothing here has to be re-derived when an estate
+/// grows — the property #278 retired the class of tuned-per-estate bounds
+/// for. `pub(crate)`: `ApiClient::send_with_retry` (`src/api.rs`, S6
+/// client-request-retry) reuses this same cadence for its own retries
+/// against a daemon proven alive by PID rather than defining a second
+/// constant for the identical value and role (R2: one shared site).
+pub(crate) const SCAN_POLL: Duration = Duration::from_millis(500);
 
 /// `sgt` — sergeant-rs command line.
 #[derive(Parser, Debug)]
@@ -183,6 +193,29 @@ enum Command {
         /// it — the operator types it for that submission or it is not set.
         #[arg(long)]
         override_git_preflight: bool,
+        /// Submit, then stay attached until this Work reaches a terminal
+        /// state (W1 §7/W1-10, S2 E9).
+        ///
+        /// Purely client-side: this is `sgt watch --follow <id>` running in
+        /// the same process, over the same API and event surfaces, after the
+        /// submission returns. No new engine state exists to hold a Work
+        /// open — the parent actor blocks, the daemon does not, and a
+        /// `--wait` that is interrupted leaves the Work running exactly as
+        /// an unwatched one would.
+        ///
+        /// Attention transitions (`needs_input`, `blocked`, `failed`,
+        /// `waiting`) are reported as they happen and do **not** end the
+        /// wait; only `completed`/`canceled` do — the same watch set and the
+        /// same exit rule `sgt watch --follow` already uses, including its
+        /// consequence that a Work which fails and is never retried keeps a
+        /// waiter attached after the `failed` notice.
+        ///
+        /// Under `--json` the stream is concatenated JSON documents: the
+        /// submit record exactly as `sgt run --json` already prints it,
+        /// then one compact notice per line, exactly as `sgt watch --json`
+        /// emits them.
+        #[arg(long)]
+        wait: bool,
     },
     /// Inspect work items.
     Work {
@@ -248,6 +281,15 @@ enum Command {
         /// one-shot mode and re-arms.
         #[arg(long)]
         follow: bool,
+        /// D6: watch every admitted estate's events, even when the current
+        /// directory (or `-C`) happens to be a valid estate root. Without
+        /// this, `sgt watch` inside an estate defaults to that estate's
+        /// events only (estate-wide meaning preserved) — the same default
+        /// this verb has always had, now made explicit rather than implicit
+        /// in a single-estate daemon's binding. Outside any estate root the
+        /// watch is already host-wide with no flag needed.
+        #[arg(long)]
+        all: bool,
     },
     /// Ask the daemon one of the canned §22 analytical questions.
     ///
@@ -258,6 +300,55 @@ enum Command {
     Analytics {
         /// Query name (omit to list what is available).
         name: Option<String>,
+    },
+    /// Report what Atlas has indexed, and how completely (S3, F8/F11).
+    ///
+    /// Coverage is the point: a status that only listed what was indexed
+    /// would say nothing about what was *excluded*, and F10's secrets posture
+    /// is only honest if an excluded byte is reported as excluded.
+    Intelligence {
+        #[command(subcommand)]
+        command: IntelligenceCommand,
+    },
+    /// Search everything this estate can see (A2 §14), one query across
+    /// every admissible source.
+    ///
+    /// A **pure read**: nothing is scanned, indexed or refreshed by asking.
+    /// Run `sgt intelligence scan` to change what is searchable.
+    ///
+    /// Every hit cites source, generation, unit and an A1-owned coordinate,
+    /// and every answer states whether A2 §6's semantic half participated
+    /// (`semantic: applied | not_installed | disabled`). `--json` carries
+    /// A2 §13's full search trace.
+    Search {
+        /// What to search for. Tokenized for identifiers and document
+        /// words alike — `PaymentRetryPolicy` and `payment` both find it.
+        query: String,
+        #[command(flatten)]
+        selectors: SearchSelectors,
+    },
+    /// Find units related to one already-retrieved coordinate (A2 §14).
+    ///
+    /// The coordinate is the one `sgt search` prints —
+    /// `<source>/<family>:<path>#<ordinal>`. Neighbours are ranked by the
+    /// same pipeline `sgt search` uses, over the anchor unit's own indexed
+    /// text, inside the same deterministic filter; the anchor itself is
+    /// never returned as its own neighbour.
+    Related {
+        /// A coordinate as `sgt search` prints it.
+        coordinate: String,
+        #[command(flatten)]
+        selectors: SearchSelectors,
+    },
+    /// Read the world map Atlas derived from the estate's sources (S3, F11).
+    ///
+    /// Canned reads over rows the daemon already holds — no client SQL, no
+    /// client-named path, no pattern. `map neighbors` and `map changed` are
+    /// deliberately absent: they land with the waves whose consumers need
+    /// them, rather than shipping now as verbs with nothing behind them.
+    Map {
+        #[command(subcommand)]
+        command: MapCommand,
     },
     /// Open the TUI cockpit (ADR 0010, D6): a client like any other, so it
     /// never auto-spawns a daemon (ADR 0009's no-spawn set) — with none
@@ -284,6 +375,14 @@ enum Command {
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
+    },
+    /// Manage the estate's declared knowledge sources (`[[knowledge]]` in
+    /// `sergeant.toml`): local paths read as **evidence**, never mounted and
+    /// never written to (A1-03). A pure manifest edit — no daemon involved,
+    /// and nothing is cloned, created or touched on disk.
+    Knowledge {
+        #[command(subcommand)]
+        command: KnowledgeCommand,
     },
     /// Manage the estate's declared groups (`[group.<name>]` in
     /// `sergeant.toml`). A pure manifest edit — no daemon involved.
@@ -354,6 +453,28 @@ enum DaemonCommand {
     /// Idempotent: stopping a daemon that is not running, or one already
     /// mid-drain from an earlier `sgt daemon stop`, is not an error.
     Stop,
+    /// Generate the native per-user service unit for the host daemon (H1
+    /// §2, #275/#276): a systemd user unit on Linux, a macOS LaunchAgent
+    /// elsewhere — pointed at [`resolve_host_runtime_dir`]'s host runtime
+    /// root, with `harness::toolchain_path_dirs`' PATH enrichment baked
+    /// into the unit's own `Environment=`/`EnvironmentVariables` at
+    /// generation time (#275's fix — never an inline prefix on the start
+    /// command, `scripts/gate.sh`'s own measured Cerberus hazard).
+    ///
+    /// Without `--print`: writes the unit/plist to its native per-user
+    /// location and, when a service manager is reachable, enables it
+    /// (`systemctl --user daemon-reload && enable`,
+    /// `launchctl bootstrap`). A manager that is not reachable is not an
+    /// error — the files are still written, and the check names the
+    /// remedy (H1-05: no silent linger enabling). Idempotent: re-running
+    /// against an unchanged binary/PATH writes nothing and does not
+    /// restart an already-enabled unit.
+    InstallService {
+        /// Write the generated unit/plist to stdout instead of the native
+        /// per-user location. Never attempts enablement.
+        #[arg(long)]
+        print: bool,
+    },
 }
 
 /// `sgt repo ...` subcommands (MVP-3).
@@ -389,6 +510,289 @@ enum RepoCommand {
     },
     /// List declared repositories.
     List,
+}
+
+/// `sgt intelligence ...` subcommands (S3 X4, F11; `Add`/`List` added S4
+/// Y5, G6/G8 item 10; `Scan` added S4 Y6, G8's correction of S4 Y5's own
+/// G8 — the estate-scoped trigger's primary home).
+#[derive(Debug, Subcommand)]
+pub enum IntelligenceCommand {
+    /// Coverage and generation status for every indexed source (F8).
+    Status,
+    /// Acquire (or refresh) one external Git source: fetch it into this
+    /// host's own bare, no-working-tree cache, resolve the exact commit,
+    /// and extract it through the normal adapters (A1 §9, S4 Y5 G6) —
+    /// item 10's acquisition surface.
+    ///
+    /// The locator is validated against an HTTPS/SSH allowlist **before**
+    /// Git ever sees it (`ext::`, `file://`, and every other transport form
+    /// are refused by name, not silently coerced). A second `add` of an
+    /// already-declared name refreshes it: a new `SourceGeneration` is
+    /// written when the tree changed, and nothing is written when it did
+    /// not (ruling §4).
+    Add {
+        /// The Git locator: `https://…` or `ssh://…`/`user@host:path`.
+        /// Nothing else is accepted — see the allowlist's own refusal
+        /// message for exactly why a given string was refused.
+        url: String,
+        /// A branch or tag to fetch. Omit to fetch the remote's own default
+        /// branch.
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// Declared name (source coordinate, and the cache directory's own
+        /// name). Defaults to the locator's final path segment with a
+        /// trailing `.git` stripped, when that segment is itself a safe
+        /// plain name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List every declared external Git source, with its provenance (A1
+    /// §9): origin, requested ref, resolved commit, and when it was last
+    /// retrieved.
+    List,
+    /// Drive a full scan of everything this estate declares — every
+    /// `[[repo]]` repository through the Git path at its mount's own
+    /// committed HEAD, every `[[knowledge]]` source through the folder
+    /// walker, and every external Git source already added on this host
+    /// refreshed through `add`'s own acquisition — on the daemon's
+    /// intelligence lane, with the lane's own bounded concurrency (S4 Y6,
+    /// G8 correction of S4 Y5's own G8).
+    ///
+    /// **This is the estate-scoped verb** — the reason `sgt intelligence`
+    /// rather than `sgt knowledge` is where it now lives, argued in this
+    /// wave's own commit body: a scan whose whole point is that a
+    /// registered repository is not a knowledge folder should not live
+    /// under the verb group that only ever declares knowledge folders.
+    /// `sgt knowledge scan` still runs the identical scan — nothing that
+    /// already used that spelling stops working — but this is the name a
+    /// new script should reach for.
+    ///
+    /// Reports what was indexed and what was not **from the coverage rows
+    /// the scan actually produced**, never a guess: each source's own kind,
+    /// outcome (recorded/unchanged/root_unavailable) and coverage counts.
+    ///
+    /// Scheduling and cadence are deliberately NOT here (G10): this runs
+    /// once, when invoked, and returns. A recurring scan is a later wave's,
+    /// when retrieval needs one.
+    Scan,
+}
+
+/// A2 §14's deterministic selectors, shared by `sgt search` and `sgt
+/// related` because §14 gives them one list and two verbs.
+///
+/// > ```text
+/// > --source <name>   --work <id>   --content code|document|email|config|all
+/// > --type knowledge  --external    --top <n>
+/// > ```
+///
+/// **Every one of these narrows the world before ranking** (A2 §2, decision
+/// A2-01) — none of them is a retrieval weight. A2 §14's *"Do not expose raw
+/// retrieval weight tuning"* is met by there being nothing here to expose:
+/// BM25's `k1`/`b` and RRF's `k` are `const`s no flag reaches.
+#[derive(Debug, clap::Args)]
+pub struct SearchSelectors {
+    /// Search one declared source only; `<name>@<content-key>` pins one
+    /// exact generation.
+    #[arg(long)]
+    pub source: Option<String>,
+    /// Search one Work's world: its repository's base generation plus that
+    /// Work's own overlay of it. The answer states which of the two it
+    /// actually covered.
+    #[arg(long, conflicts_with = "source")]
+    pub work: Option<String>,
+    /// Which repository a multi-repository `--work` addresses. Required
+    /// only when the Work targets more than one.
+    #[arg(long, requires = "work")]
+    pub repo: Option<String>,
+    /// Narrow to one content family: `code`, `document`, `email`,
+    /// `row-text`, or `all` (the default). `config` is named in A2 §14 and
+    /// is refused with its reason in this build — Atlas stores no value
+    /// that separates a config file from a text document.
+    #[arg(long)]
+    pub content: Option<String>,
+    /// Narrow to one source kind: `repo`, `knowledge` or `external`.
+    #[arg(long = "type")]
+    pub source_type: Option<String>,
+    /// Shorthand for `--type external`: evidence acquired from outside the
+    /// estate.
+    #[arg(long)]
+    pub external: bool,
+    /// How many hits to print (default 10). A display bound only — both
+    /// retrieval halves always rank the whole admissible set, so this cannot
+    /// change the order of what it returns.
+    #[arg(long)]
+    pub top: Option<usize>,
+    /// Leave A2 §6's semantic half out even where a model is installed. The
+    /// answer reports `semantic: disabled`, which is a different fact from
+    /// `not_installed` and is not reported as one.
+    #[arg(long)]
+    pub no_semantic: bool,
+}
+
+impl SearchSelectors {
+    /// The selectors as query parameters, url-encoded — never a path
+    /// segment, never spliced into anything the daemon parses as a query
+    /// language (the same rule `sgt map` follows).
+    pub fn query_string(&self) -> String {
+        let mut out = String::new();
+        let mut add = |key: &str, value: &str| {
+            out.push('&');
+            out.push_str(key);
+            out.push('=');
+            out.push_str(&crate::api::urlencode(value));
+        };
+        if let Some(source) = &self.source {
+            add("source", source);
+        }
+        if let Some(work) = &self.work {
+            add("work", work);
+        }
+        if let Some(repo) = &self.repo {
+            add("repo", repo);
+        }
+        if let Some(content) = &self.content {
+            add("content", content);
+        }
+        if let Some(kind) = &self.source_type {
+            add("type", kind);
+        }
+        if self.external {
+            add("external", "true");
+        }
+        if let Some(top) = self.top {
+            add("top", &top.to_string());
+        }
+        if self.no_semantic {
+            add("semantic", "off");
+        }
+        out
+    }
+}
+
+/// `sgt map ...` subcommands (S3 X4, F11's minimum honest set).
+///
+/// Every one of these addresses rows Atlas already holds. None of them takes
+/// SQL, a filesystem path, or a match pattern — `--source` and `--name` are
+/// bound as parameters and compared for equality.
+#[derive(Debug, Subcommand)]
+pub enum MapCommand {
+    /// Repository sources the map covers, with what each generation holds.
+    Repos,
+    /// What the map holds, per source and in total.
+    Stats,
+    /// One source's titled structure units, in document order.
+    Outline {
+        /// Declared source name.
+        source: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// One source's container children (A1 §6.6): each expanded entry's own
+    /// coordinate, its IMMEDIATE parent's path and key, its entry path, and
+    /// the entry content hash and adapter joined back from its own row.
+    Children {
+        /// Declared source name.
+        source: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// One source's stored relational evidence: every canned dataset
+    /// query's answer, with the query identity and output hash that make it
+    /// checkable (A1 §6.4).
+    ///
+    /// A2 §17 item 3's relational read. `dataset_key` is the join key
+    /// `sgt search --content row-text` prints on every row hit, so an
+    /// aggregate and the example rows behind it cite one identity instead of
+    /// becoming two unrelated representations (A2 §4).
+    Facts {
+        /// Declared source name.
+        source: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// The symbol index, by exact name.
+    Symbol {
+        /// Symbol name, matched exactly — never as a pattern.
+        name: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Recorded sites of one exact symbol name.
+    ///
+    /// **Definition sites**, which is what a grammar can state without
+    /// resolving anything (A1-09) — the answer says so rather than letting
+    /// the verb's name imply resolution this build does not do.
+    References {
+        /// Symbol name, matched exactly — never as a pattern.
+        name: String,
+        /// Row ceiling; the store caps it regardless (F12).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+}
+
+/// `sgt knowledge ...` subcommands (S3, F11's minimum honest set; `Scan`
+/// added S4 Y5, G8, widened to estate scope and given a second, primary
+/// spelling at `sgt intelligence scan` in S4 Y6, G8's own correction).
+///
+/// Add, list, and the trigger verb kept here as a working alias — see
+/// `Scan`'s own doc for why it is no longer this verb group's exclusive
+/// scan trigger. A `remove` verb and a per-source coverage report are still
+/// real needs with no consumer yet, and stay unbuilt on the same R1 terms
+/// this doc comment always stated: shipping a verb whose output nothing yet
+/// produces is the same false promise as an empty table.
+#[derive(Subcommand, Debug)]
+enum KnowledgeCommand {
+    /// Declare a local path as read-only evidence. Nothing is cloned,
+    /// created or verified on disk — this appends a `[[knowledge]]` entry
+    /// and validates the manifest it would produce.
+    ///
+    /// Refused if the path resolves inside a repository mount, the surfaces
+    /// directory, or the data directory: a knowledge source is evidence
+    /// about a world the estate observes, not one it mutates.
+    Add {
+        /// Source name (used in coverage rows and source coordinates).
+        name: String,
+        /// Path to the source root. Relative paths resolve against the
+        /// estate root.
+        path: PathBuf,
+        /// Glob to exclude from scanning, repeatable. **Extends** the
+        /// built-in secrets deny set; it can never narrow it.
+        #[arg(long)]
+        ignore: Vec<String>,
+        /// **F10a**: a tabular column whose text may become a retrievable
+        /// context unit, repeatable. Omit it and the answer is none — a
+        /// dataset is still registered, counted and profiled, but no row's
+        /// text is exposed.
+        ///
+        /// A different axis from `--ignore`, not an extension of it:
+        /// `--ignore` decides which bytes are read at all and speaks in
+        /// paths; this decides which values may leave a dataset as text and
+        /// speaks in columns.
+        #[arg(long = "context-field")]
+        context_field: Vec<String>,
+    },
+    /// List declared knowledge sources.
+    List,
+    /// **Kept working, unchanged spelling** (S4 Y6, G8 correction): this
+    /// verb used to scan only `[[knowledge]]` sources (S4 Y5, G8), the
+    /// gap the owner ruling `estate-intelligence-is-the-feature-2026-08-28`
+    /// names — a scan whose trigger sat under the verb group that only
+    /// ever *declares* knowledge folders had no way to also cover the
+    /// estate's own registered repositories. It now runs the same
+    /// estate-scoped scan `sgt intelligence scan` does — every `[[repo]]`,
+    /// every `[[knowledge]]` source and every already-added external Git
+    /// source — because nobody who already typed `sgt knowledge scan`
+    /// should have it silently start doing less than before, and `sgt
+    /// intelligence scan` (see [`IntelligenceCommand::Scan`]'s own doc) is
+    /// the coherent name for what the verb now does. Prefer that spelling
+    /// in anything new; this one is not deprecated, just no longer the
+    /// primary name.
+    Scan,
 }
 
 /// `sgt group ...` subcommands (MVP-3).
@@ -589,7 +993,26 @@ pub fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(dispatch(sgt)) {
+    let outcome = runtime.block_on(dispatch(sgt));
+    // Dropping a runtime waits, unboundedly, for every blocking task that has
+    // started — and `dispatch` has already returned, so anything still inside
+    // one is a straggler whose answer nothing is left to read. That was
+    // harmless until #293 put the daemon's backend probe walk on the blocking
+    // pool: a daemon SIGTERMed inside its startup window has already journaled
+    // `daemon.stopped` and retired its descriptor (`daemon::start_with`'s
+    // shutdown tail bounds that) but could not *exit* until its in-flight
+    // `--help` child processes returned — measured on Cerberus 2026-08-25 at
+    // 13.7s under an eighteen-daemon burst, well past the ten seconds a
+    // supervisor gives a SIGTERMed process before escalating to SIGKILL.
+    //
+    // The bound introduces no hazard that was not already there, which is what
+    // makes it the right lever rather than a shortcut: the thing it gives up —
+    // a probe child still running when its parent goes — is precisely what the
+    // SIGKILL it replaces already did, and this way the process leaves by
+    // itself, with its exit code intact and everything registered at exit
+    // (coverage profiles included) actually flushed.
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    match outcome {
         Ok(()) => ExitCode::SUCCESS,
         Err(CliError(message)) if message.is_empty() => ExitCode::FAILURE,
         Err(e) => {
@@ -704,6 +1127,21 @@ impl DataDirSource {
 ///
 /// Returns the winning rung alongside the path (#80) so a caller can surface
 /// *why* this path won, not just what it is.
+///
+/// **The host+atlas split (H1 sprint plan D2, this wave W1b):** this
+/// function's *contract is unchanged* — every rung above still resolves
+/// exactly what it always has, and this wave does not rewire a single
+/// caller. What changes is what the result is *for*: `resolve_data_dir`
+/// names *estate-local* daemon state (today: journal, projections, and
+/// everything beneath them, because nothing has moved yet). At W2 cutover
+/// this function is slated to lose journal/projection ownership to
+/// [`resolve_host_runtime_dir`]'s host runtime root — the `Manifest`/
+/// `EstateDefault` rungs (and the `[estate] data_dir` manifest key behind
+/// `Manifest`) are deprecated as *journal* location from that point on
+/// (D9): a manifest still declaring `[estate] data_dir` loses its object,
+/// and `sgt doctor` is meant to warn about it, but that warning is W4c's
+/// deliverable, not this wave's — it is **not implemented here**.
+/// `surfaces_dir` is unaffected by D9 and stays estate-local (H1-07).
 fn resolve_data_dir(
     flag: Option<PathBuf>,
     root: &Path,
@@ -728,15 +1166,112 @@ fn resolve_data_dir(
         .map_err(CliError::new)
 }
 
-/// §4.2: which commands require an exact estate root, and which are
-/// deliberately usable outside one.
+/// Resolve the **host runtime root** (H1 sprint plan D2): `--data-dir`
+/// flag, then `SGT_DATA_DIR`, then [`crate::platform::data_dir::fallback_dir`]
+/// — the same pre-estate platform convention `resolve_data_dir`'s own last
+/// rung already reaches (#82), now applied unconditionally rather than only
+/// when `root` fails to be an estate root. No new path constant and no new
+/// env var (R2): D2 ratified reusing the existing XDG/macOS convention
+/// as-is precisely because it is "already implemented, tested, ADR 0002 D3
+/// both-convention discipline."
 ///
-/// Estate-scoped: `run`, `status`, `work *`, `respond`/`retry`/`extend`/
-/// `cancel`, `watch`, `analytics`, `tui`, `daemon`(+`stop`), `repo *`,
-/// `group *`, `workflow *`, and the five harnesses. Unscoped: bare `sgt`,
-/// `--help`, `--version`, `init`, `doctor` — nothing else.
+/// This is a **new, parallel resolver, not a rewrite of [`resolve_data_dir`]**
+/// — this wave (W1b) is pure seam-cutting: it introduces the host-root
+/// ladder alongside the estate-root one without moving a single caller onto
+/// it yet (that is W2/W3's job, once the daemon core actually owns a host
+/// runtime root to move state into). Today the two ladders still name the
+/// *same* rungs at the top for the same reason `resolve_data_dir`'s own doc
+/// comment gives: `--data-dir`/`SGT_DATA_DIR` have never meant "this
+/// estate's data," only "the data dir," and #80's precedence ruling settled
+/// their rank once, for both meanings.
+///
+/// **Under host mode (from W2 on), `--data-dir`/`SGT_DATA_DIR` name the
+/// host runtime root** — the journal, Atlas, runtime descriptor, and
+/// `daemon.lock` all live beneath whatever this function resolves, no
+/// longer beneath the estate. Estate-local material (`sergeant.toml`,
+/// `repos/`, `surfaces_dir`) keeps resolving off the estate root via
+/// [`resolve_data_dir`]'s untouched rungs — that split, not a shared
+/// meaning, is exactly what D2/H1 §3 draw.
+///
+/// Returns the winning rung alongside the path, reusing [`DataDirSource`]
+/// (`Manifest`/`EstateDefault` simply never occur here — there is no
+/// estate rung on this ladder at all).
+///
+/// W1b landed this resolver caller-less ("zero behavior change" by
+/// design). Two callers own it now: W4c's [`install_service`] resolves
+/// the host runtime root a generated unit points at, and W2 wires the
+/// foreground `sgt daemon` verb (the one that creates the runtime root)
+/// onto it. W3 rewires the remaining client paths
+/// (`ensure_daemon`/`observe_connect`/`spawn_daemon`) — until then those
+/// still resolve per-estate, which stays consistent because
+/// `spawn_daemon` passes `--data-dir` explicitly (the flag rung wins on
+/// both ladders).
+fn resolve_host_runtime_dir(
+    flag: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<OsString>,
+) -> Result<(PathBuf, DataDirSource), CliError> {
+    if let Some(dir) = flag {
+        return Ok((dir, DataDirSource::Flag));
+    }
+    if let Some(dir) = env("SGT_DATA_DIR") {
+        return Ok((PathBuf::from(dir), DataDirSource::Env));
+    }
+    crate::platform::data_dir::fallback_dir(env)
+        .map(|dir| (dir, DataDirSource::PlatformFallback))
+        .map_err(CliError::new)
+}
+
+/// §4.2/H1 §5: which commands require an exact estate root before any
+/// daemon contact is even attempted, and which are deliberately usable
+/// outside one.
+///
+/// Estate-scoped: `run`, `respond`/`retry`/`extend`/`cancel`,
+/// `work reap`/`sweep`/`retained`, `analytics`, `repo *`, `group *`,
+/// `workflow *`, and the five harnesses — H1 §11.3, preserved verbatim
+/// (brief deliverable 2). Unscoped: bare `sgt`, `--help`, `--version`,
+/// `init`, `doctor`. **Host-scoped** ([`is_host_scoped`]) is the third
+/// bucket H1 §5 adds: `tui`, `status`, `work show`/`list`/`transcript`,
+/// `watch`, and every `daemon` verb — no estate root is required, but one
+/// addressed via `-C`/cwd is still validated where the command actually
+/// consults it (`watch`'s D6 default, `daemon stop`'s ordinary directory
+/// check).
 fn is_estate_scoped(command: &Command) -> bool {
-    !matches!(command, Command::Doctor | Command::Init { .. })
+    !matches!(command, Command::Doctor | Command::Init { .. }) && !is_host_scoped(command)
+}
+
+/// H1 §5's host-scoped bucket (brief deliverable 2): exactly the existing
+/// no-spawn set (ADR 0009) plus the two `daemon` variants that never
+/// consulted an estate to begin with — `sgt daemon` (foreground) serves
+/// every estate admitted to it later, and `sgt daemon install-service`
+/// touches no daemon and no estate at all. `-C`/cwd is never *required* for
+/// any of these; [`dispatch`] never calls [`admit_root`] on their account,
+/// so a directory mistake here is not a root-gate refusal — it is simply
+/// not consulted.
+fn is_host_scoped(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Tui
+            | Command::Status
+            | Command::Watch { .. }
+            | Command::Work {
+                command: WorkCommand::List
+            }
+            | Command::Work {
+                command: WorkCommand::Show { .. }
+            }
+            | Command::Work {
+                command: WorkCommand::Transcript { .. }
+            }
+            | Command::Daemon { command: None, .. }
+            | Command::Daemon {
+                command: Some(DaemonCommand::Stop),
+                ..
+            }
+            | Command::Daemon {
+                command: Some(DaemonCommand::InstallService { .. }),
+                ..
+            }
+    )
 }
 
 async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
@@ -761,21 +1296,42 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
         None
     };
     let (data_dir, data_dir_source) = resolve_data_dir(
-        sgt.data_dir,
+        sgt.data_dir.clone(),
         estate.as_ref().map(|e| e.path.as_path()).unwrap_or(&root),
     )?;
+    // W1b's caller classification, W2/W3 consuming it fully. The HOST bucket
+    // — daemon discovery/spawn/stop and the foreground daemon start that
+    // creates the runtime root — is what `resolve_host_runtime_dir` is for;
+    // the ESTATE bucket (`doctor::run`'s journal-replay-derived checks,
+    // `exec_harness`'s adapter state) keeps `resolve_data_dir`.
+    //
+    // **W3 wires every remaining client-side daemon-contact caller onto the
+    // host root**: `ensure_daemon`/`observe_connect`/`daemon_stop` (and
+    // through it, `spawn_daemon`) all take `host_root` below, never the
+    // estate-derived `data_dir` above — brief deliverable 1's whole point
+    // is that a second estate's client must discover the *same* running
+    // daemon a first estate's client found, which is only true once both
+    // resolve to one path regardless of which estate admitted them. This
+    // stays consistent with `--data-dir`/`SGT_DATA_DIR` (both resolvers'
+    // top two rungs are identical, D2) and only actually diverges from the
+    // old estate-derived path for an operator who relied on neither flag
+    // nor env — exactly the case D2 moves to the host runtime root.
+    let (host_root, _host_root_source) =
+        resolve_host_runtime_dir(data_dir_flag.clone(), |name| std::env::var_os(name))?;
     match command {
         Command::Daemon {
             command: None,
             rebuild_cache,
         } => {
             tracing_subscriber::fmt().init();
-            daemon::run_until_signal(
-                &data_dir,
-                estate.as_ref().map(|e| e.path.as_path()),
-                rebuild_cache,
-            )
-            .await?;
+            // D2 (J3): `--data-dir` -> `SGT_DATA_DIR` -> the platform
+            // convention, with no estate rung at all. `-C` on this verb
+            // named the estate this invocation addresses; it does not bind
+            // the process (deliverable 8), and the daemon it starts serves
+            // every estate admitted to it later. Host-scoped
+            // ([`is_host_scoped`]): no root was admitted above, so this
+            // never required one to begin with.
+            daemon::run_until_signal(&host_root, rebuild_cache).await?;
             Ok(())
         }
         Command::Daemon {
@@ -792,10 +1348,22 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                      `sgt daemon stop` does not start a daemon",
                 ));
             }
-            daemon_stop(&data_dir, &estate_root(&estate), sgt.json).await
+            daemon_stop(&host_root, estate_root_opt(&estate), sgt.json).await
+        }
+        Command::Daemon {
+            command: Some(DaemonCommand::InstallService { print }),
+            rebuild_cache,
+        } => {
+            if rebuild_cache {
+                return Err(CliError::new(
+                    "--rebuild-cache applies only to `sgt daemon` (foreground start); \
+                     `sgt daemon install-service` does not start a daemon",
+                ));
+            }
+            install_service(data_dir_flag, print, sgt.json)
         }
         Command::Status => {
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
             let system = client.get("/v1/system").await?;
             let works = client.get("/v1/work").await?;
             let mut counts = std::collections::BTreeMap::<String, u64>::new();
@@ -821,6 +1389,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 }
             }
             let admission_paused = system["admission_paused"].as_bool().unwrap_or(false);
+            let unabsorbed_holds = system["unabsorbed_holds"].as_u64().unwrap_or(0);
             if sgt.json {
                 print_json(&json!({
                     "system": system,
@@ -838,6 +1407,13 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 if admission_paused {
                     println!(
                         "admission: PAUSED — new work is refused (draining for `sgt daemon stop`)"
+                    );
+                }
+                if unabsorbed_holds > 0 {
+                    println!(
+                        "journal integrity: {unabsorbed_holds} lock hold(s) released with the \
+                         registry behind the journal (#334) — a direct-journal writer skipped \
+                         `absorb_journaled`; self-healed at release, but the writer is a bug"
                     );
                 }
                 println!("work: {total} total");
@@ -867,6 +1443,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             turns,
             ceiling_secs,
             override_git_preflight,
+            wait,
         } => {
             // estate-root proposal §7.2: scope resolution is core-owned. The
             // CLI forwards `--repo`/`--group`/`--all` verbatim as
@@ -894,7 +1471,8 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                     ));
                 }
             };
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let claimed = claimed_causation();
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let envelope = if turns.is_some() || ceiling_secs.is_some() {
                 Some(json!({"turn_cap": turns, "ceiling_secs": ceiling_secs}))
             } else {
@@ -903,6 +1481,10 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "intent": intent,
+                // D4: the submission *addresses* this estate — the exact
+                // root §4.3 already admitted above, sent explicitly rather
+                // than left to a daemon binding that no longer exists.
+                "estate_root": estate_root(&estate),
                 "workflow": workflow,
                 "backend": backend,
                 "profile": profile,
@@ -918,6 +1500,15 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 "override_git_preflight": override_git_preflight,
                 "created_by": "cli",
                 "origin": origin(),
+                // W1 §5/§6 (S2 E8 as amended): when this invocation is itself
+                // running inside a managed execution, `claimed_causation()`
+                // carries the `SERGEANT_*` coordinates it inherited. Claimed,
+                // never asserted — the daemon validates them against its own
+                // journal and drops the relation (with a journaled marker) if
+                // they do not check out. Absent outside a managed execution,
+                // which is the ordinary top-level `sgt run`.
+                "claimed_parent_work_id": claimed.0,
+                "claimed_parent_execution_id": claimed.1,
             });
             let result = client.post("/v1/work", &body).await?;
             if sgt.json {
@@ -925,10 +1516,44 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             } else {
                 print_work_line("submitted", &result);
             }
-            Ok(())
+            if !wait {
+                return Ok(());
+            }
+            // W1-10 / E9: submit **then observe**, over the API and event
+            // path that already exist. `crate::watch::watch` is called, not
+            // re-derived: its head-before-stream-before-read sequencing is
+            // what closes the race between the submission above and the
+            // subscription below, and inlining a poll loop here would either
+            // duplicate that or reopen it (m9 pins the module's own crate
+            // boundary; nothing in this arm crosses it).
+            let Some(id) = result["work"]["id"].as_str() else {
+                return Err(CliError::new(
+                    "the daemon accepted the submission but named no work id, so there is \
+                     nothing to wait on",
+                ));
+            };
+            let options = crate::watch::WatchOptions {
+                work_id: Some(id.to_string()),
+                follow: true,
+                estate_root: Some(estate_root(&estate)),
+            };
+            let json = sgt.json;
+            crate::watch::watch(&client, &options, |notice| {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(notice).expect("watch notice serializes")
+                    );
+                } else {
+                    println!("{}", crate::watch::render_human(notice));
+                }
+            })
+            .await
+            .map(|_exit| ())
+            .map_err(|e| CliError::new(e.to_string()))
         }
         Command::Respond { id, input } => {
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "input": input,
@@ -942,7 +1567,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Retry { id } => {
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
             let result = client.post(&format!("/v1/work/{id}/retry"), &body).await?;
             if sgt.json {
@@ -956,7 +1581,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             id,
             additional_turns,
         } => {
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let body = json!({
                 "command_id": ulid::Ulid::generate().to_string(),
                 "additional_turns": additional_turns,
@@ -980,7 +1605,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // `retained` (ADR 0009: observation must not materialize the
             // thing observed) rather than auto-spawning a daemon.
             if !yes {
-                let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+                let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
                 let retained = client.retained().await?;
                 let mine: Vec<&Value> = retained["retained"]
                     .as_array()
@@ -1007,7 +1632,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                 }
                 return Ok(());
             }
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let result = client.reap(&id, true).await?;
             if sgt.json {
                 print_json(&result);
@@ -1028,9 +1653,9 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // observed). Only the confirmed deletion joins `reap`'s bucket
             // and may spawn a daemon.
             let client = if delete_redundant && yes {
-                ensure_daemon(&data_dir, &estate_root(&estate)).await?
+                ensure_daemon(&host_root, &estate_root(&estate)).await?
             } else {
-                observe_connect(&data_dir, &estate_root(&estate)).await?
+                observe_connect(&host_root, estate_root_opt(&estate)).await?
             };
             let report = client.sweep().await?;
             if !delete_redundant {
@@ -1077,7 +1702,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             Ok(())
         }
         Command::Work { command } => {
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
             match command {
                 WorkCommand::List => {
                     let result = client.get("/v1/work").await?;
@@ -1186,7 +1811,7 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
         }
         Command::Analytics { name } => {
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
             let result = match &name {
                 Some(name) => client.get(&format!("/v1/analytics/{name}")).await?,
                 None => client.get("/v1/analytics").await?,
@@ -1200,8 +1825,151 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
+        Command::Intelligence { command } => {
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            match command {
+                IntelligenceCommand::Status => {
+                    let result = client.get("/v1/intelligence/status").await?;
+                    if sgt.json {
+                        print_json(&result);
+                    } else {
+                        print_intelligence_status(&result);
+                    }
+                    Ok(())
+                }
+                IntelligenceCommand::Add { url, git_ref, name } => {
+                    let body = json!({
+                        "command_id": ulid::Ulid::generate().to_string(),
+                        "url": url,
+                        "ref": git_ref,
+                        "name": name,
+                    });
+                    let result = client.post("/v1/intelligence/sources", &body).await?;
+                    if sgt.json {
+                        print_json(&result);
+                    } else {
+                        print_external_git_added(&result);
+                    }
+                    Ok(())
+                }
+                IntelligenceCommand::List => {
+                    let result = client.get("/v1/intelligence/sources").await?;
+                    if sgt.json {
+                        print_json(&result);
+                    } else {
+                        print_external_git_sources(&result);
+                    }
+                    Ok(())
+                }
+                IntelligenceCommand::Scan => {
+                    run_intelligence_scan(&client, estate_root_opt(&estate), sgt.json).await
+                }
+            }
+        }
+        Command::Search { query, selectors } => {
+            // A2 §14's first verb. `observe_connect`, not `ensure_daemon`:
+            // a search is a question about evidence that already exists, and
+            // spawning a daemon to answer one would make a pure read a
+            // side effect (ADR 0009's no-spawn posture, the same one
+            // `sgt map` takes).
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            // S6 D1: A2 §2 stage 1's estate coordinate rides with every
+            // query. `search` was already estate-scoped at this end — it
+            // refuses outside an estate root, like every non-host-scoped verb
+            // — but the daemon never learned *which* estate was asking, and
+            // Atlas is host-scoped. This is that missing half.
+            let path = format!(
+                "/v1/search?q={}{}{}",
+                crate::api::urlencode(&query),
+                estate_query_param(&estate),
+                selectors.query_string()
+            );
+            let result = client.get(&path).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_search(&result);
+            }
+            Ok(())
+        }
+        Command::Related {
+            coordinate,
+            selectors,
+        } => {
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            let path = format!(
+                "/v1/related?coordinate={}{}{}",
+                crate::api::urlencode(&coordinate),
+                estate_query_param(&estate),
+                selectors.query_string()
+            );
+            let result = client.get(&path).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_related(&result);
+            }
+            Ok(())
+        }
+        Command::Map { command } => {
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            // Every argument is a *query parameter*, url-encoded, never a
+            // path segment and never spliced into anything the daemon parses
+            // as a query language (F11).
+            let (path, key) = match &command {
+                MapCommand::Repos => ("/v1/map/repos".to_string(), "repos"),
+                MapCommand::Stats => ("/v1/map/stats".to_string(), "sources"),
+                MapCommand::Outline { source, limit } => (
+                    format!(
+                        "/v1/map/outline?source={}{}",
+                        crate::api::urlencode(source),
+                        limit_query(*limit)
+                    ),
+                    "outline",
+                ),
+                MapCommand::Children { source, limit } => (
+                    format!(
+                        "/v1/map/children?source={}{}",
+                        crate::api::urlencode(source),
+                        limit_query(*limit)
+                    ),
+                    "children",
+                ),
+                MapCommand::Facts { source, limit } => (
+                    format!(
+                        "/v1/map/facts?source={}{}",
+                        crate::api::urlencode(source),
+                        limit_query(*limit)
+                    ),
+                    "facts",
+                ),
+                MapCommand::Symbol { name, limit } => (
+                    format!(
+                        "/v1/map/symbol?name={}{}",
+                        crate::api::urlencode(name),
+                        limit_query(*limit)
+                    ),
+                    "symbols",
+                ),
+                MapCommand::References { name, limit } => (
+                    format!(
+                        "/v1/map/references?name={}{}",
+                        crate::api::urlencode(name),
+                        limit_query(*limit)
+                    ),
+                    "references",
+                ),
+            };
+            let result = client.get(&path).await?;
+            if sgt.json {
+                print_json(&result);
+            } else {
+                print_map(&result, key);
+            }
+            Ok(())
+        }
         Command::Cancel { id } => {
-            let client = ensure_daemon(&data_dir, &estate_root(&estate)).await?;
+            let client = ensure_daemon(&host_root, &estate_root(&estate)).await?;
             let body = json!({"command_id": ulid::Ulid::generate().to_string()});
             let result = client.post(&format!("/v1/work/{id}/cancel"), &body).await?;
             if sgt.json {
@@ -1215,13 +1983,29 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
             Ok(())
         }
-        Command::Watch { id, follow } => {
+        Command::Watch { id, follow, all } => {
             // R-WATCH-3 / ADR 0009: never `ensure_daemon` — this verb
-            // refuses rather than spawns.
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
+            // refuses rather than spawns. Host-scoped (H1 §5): connection
+            // itself never requires or addresses an estate — `estate` is
+            // always `None` here (`is_host_scoped`).
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            // D6, brief deliverable 3: cwd is consulted **only** to default
+            // the watch filter, never to gate the connection above (H1 §5's
+            // "opportunistic filter" — the one case this wave itself owns,
+            // distinct from the TUI's own screens, W4d). `--all` always
+            // wins; otherwise an exact-root cwd/`-C` scopes the watch to
+            // that one estate, silently falling back to host-wide when it
+            // is not one — never a refusal, because this verb never
+            // required an estate to begin with.
+            let watch_estate = if all {
+                None
+            } else {
+                Estate::admit(&root).ok().map(|admitted| admitted.path)
+            };
             let options = crate::watch::WatchOptions {
                 work_id: id,
                 follow,
+                estate_root: watch_estate,
             };
             let json = sgt.json;
             crate::watch::watch(&client, &options, |notice| {
@@ -1244,8 +2028,28 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // ADR 0009/0010: the TUI never auto-spawns — it is in the
             // no-spawn set like every other observation surface, and bare
             // `sgt` no longer falls into it by default.
-            let client = observe_connect(&data_dir, &estate_root(&estate)).await?;
-            crate::tui::run(client).await.map_err(CliError::from)
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            // brief deliverable 2 (W4d), H1 §9: cwd is consulted only to
+            // default Fleet's initial estate filter, mirroring `Watch`'s own
+            // opportunistic default a few arms up (that arm's own comment
+            // names this one as its analogue) — it never gates the
+            // connection above (`estate` is always `None` here,
+            // `is_host_scoped`), and a cwd that is not an estate root falls
+            // back to no initial filter rather than refusing.
+            //
+            // The canonical root (`EstateRoot::path`), not a parsed manifest
+            // name: `Filters::estate`/`WorkRow::estate` (W4d deliverable 1)
+            // key on the same root-is-identity coordinate the daemon itself
+            // folds per Work (`estate_root`, H1 D1) — "a name is not an
+            // identity" holds here exactly as it does there, and reusing it
+            // avoids a manifest read this presentation-only default has no
+            // real need for.
+            let initial_estate = Estate::admit(&root)
+                .ok()
+                .map(|admitted| admitted.path.to_string_lossy().into_owned());
+            crate::tui::run(client, initial_estate)
+                .await
+                .map_err(CliError::from)
         }
         Command::Doctor => {
             let report = doctor::run(&data_dir, &root, data_dir_source.xdg_outranked()).await;
@@ -1278,11 +2082,44 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             // rather than left behind (#241). It writes only within `cwd`,
             // and never inside `.sergeant/local/`.
             let distro_outcome = crate::domain::distro::write_distro(&cwd)?;
+            // H1 recon risk 2: `sgt init` had zero concept of a host-level,
+            // cross-estate bootstrap step — no service-unit generation, no
+            // host data-dir creation, no "is this the first estate on this
+            // host" branch anywhere in this path. This is that branch, kept
+            // to exactly what the risk note asks for and no more: create
+            // the host runtime root the *first* time it is missing, and
+            // point at `sgt daemon install-service` — never install a
+            // service, never touch a live daemon, so a second/Nth estate's
+            // `sgt init` on an already-bootstrapped host is a true no-op
+            // here (idempotent: `host_runtime_dir.exists()` is the whole
+            // guard).
+            // Resolution failure (no flag/env and `$HOME` unset — the same
+            // last rung `resolve_data_dir`'s own pre-estate fallback can
+            // hit) must not turn into an `sgt init` regression on a host
+            // with no host-runtime concept available: this step degrades
+            // to "nothing to bootstrap" rather than failing the whole
+            // command, the same advisory posture `claude`/`docker`'s rows
+            // already take at init time.
+            let host_bootstrap: Option<(PathBuf, bool)> =
+                resolve_host_runtime_dir(data_dir_flag.clone(), |name| std::env::var_os(name))
+                    .ok()
+                    .map(|(host_runtime_dir, _source)| {
+                        let created = if host_runtime_dir.exists() {
+                            false
+                        } else {
+                            std::fs::create_dir_all(&host_runtime_dir).is_ok()
+                        };
+                        (host_runtime_dir, created)
+                    });
             // Re-resolve now that `sergeant.toml` exists: the `data_dir`
             // computed above ran before `init_estate` created it, so on a
             // fresh estate estate discovery had nothing to find yet and
             // this report would otherwise self-check the pre-estate
             // fallback and call it `[ok]` (#164).
+            //
+            // W1b caller classification: same split as the `dispatch`-level
+            // call above — `doctor::run`'s journal-replay checks are
+            // ESTATE, the rest of what it reports on `data_dir` is HOST.
             let (data_dir, data_dir_source) = resolve_data_dir(data_dir_flag, &cwd)?;
             let report = doctor::run(&data_dir, &cwd, data_dir_source.xdg_outranked()).await;
             if sgt.json {
@@ -1301,6 +2138,10 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         "distro_symlink_unavailable": distro_outcome.symlink_unavailable,
                         "changed": outcome.changed() || distro_outcome.changed(),
                     },
+                    "host_bootstrap": host_bootstrap.as_ref().map(|(dir, created)| json!({
+                        "host_runtime_dir": dir,
+                        "created": created,
+                    })),
                     "doctor": report.to_json(),
                 }));
             } else {
@@ -1356,6 +2197,17 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
                         cwd.display()
                     );
                 }
+                if let Some((host_runtime_dir, true)) = &host_bootstrap {
+                    println!();
+                    println!(
+                        "host runtime root created at {}",
+                        host_runtime_dir.display()
+                    );
+                    println!(
+                        "  run `sgt daemon install-service` to install the native per-user \
+                         service unit for the host daemon (H1 §2) — not done automatically"
+                    );
+                }
                 println!();
                 report.print();
             }
@@ -1366,6 +2218,21 @@ async fn dispatch(sgt: Sgt) -> Result<(), CliError> {
             }
         }
         Command::Repo { command } => repo_command(sgt.json, &estate_root(&estate), command).await,
+        // `Scan` is the one `KnowledgeCommand` that talks to the daemon
+        // (S4 Y5, G8) — matched before the generic arm below, which stays
+        // the pure-manifest path `Add`/`List` always were. It runs the
+        // identical scan `IntelligenceCommand::Scan` does, above — see
+        // `KnowledgeCommand::Scan`'s own doc for why both spellings work
+        // (S4 Y6, G8 correction).
+        Command::Knowledge {
+            command: KnowledgeCommand::Scan,
+        } => {
+            let client = observe_connect(&host_root, estate_root_opt(&estate)).await?;
+            run_intelligence_scan(&client, estate_root_opt(&estate), sgt.json).await
+        }
+        Command::Knowledge { command } => {
+            knowledge_command(sgt.json, &estate_root(&estate), command).await
+        }
         Command::Group { command } => group_command(sgt.json, &estate_root(&estate), command).await,
         Command::Workflow { command } => {
             workflow_command(sgt.json, &estate_root(&estate), command).await
@@ -1409,6 +2276,37 @@ fn estate_root(estate: &Option<EstateRoot>) -> PathBuf {
         .expect("dispatch admits the root for every estate-scoped command")
         .path
         .clone()
+}
+
+/// The addressed root, for [`observe_connect`]/[`daemon_stop`] call sites
+/// shared by the estate-scoped and host-scoped buckets (H1 §5, brief
+/// deliverable 2).
+///
+/// Never panics, unlike [`estate_root`]: `estate` is `Some` exactly when
+/// [`dispatch`] admitted a root ([`is_estate_scoped`] answered `true`), and
+/// `None` exactly when the command is host-scoped or unscoped — which this
+/// simply forwards as the `Option` those two functions' host-scoped shape
+/// already expects, so a single call site works unchanged whichever bucket
+/// the matched command turned out to be in.
+fn estate_root_opt(estate: &Option<EstateRoot>) -> Option<&Path> {
+    estate.as_ref().map(|e| e.path.as_path())
+}
+
+/// `&estate_root=<canonical root>` for a GET whose query string already
+/// started — A2 §2 stage 1's estate coordinate on `sgt search`/`sgt related`.
+///
+/// Empty when no root was admitted, which is not a fallback to "every
+/// estate": the daemon refuses a search that addressed no estate, because
+/// Atlas is host-scoped and an unaddressed query has no world to be about
+/// (S6 D1).
+fn estate_query_param(estate: &Option<EstateRoot>) -> String {
+    match estate_root_opt(estate) {
+        Some(root) => format!(
+            "&estate_root={}",
+            crate::api::urlencode(&root.to_string_lossy())
+        ),
+        None => String::new(),
+    }
 }
 
 /// The most an `--intent-file` may hold (#166).
@@ -1572,6 +2470,216 @@ async fn repo_command(
             }
             Ok(())
         }
+    }
+}
+
+/// `POST /v1/intelligence/scan`, then print the report — shared by the two
+/// spellings that reach it (`sgt intelligence scan`'s own match arm, and
+/// `sgt knowledge scan`'s separate one — two arms rather than one combined
+/// pattern, because `Command::Intelligence { command }`'s generic arm
+/// already sits earlier in [`dispatch`]'s match and would make a combined
+/// arm's `Intelligence` half unreachable) so there is exactly one place
+/// that builds the request body and picks the renderer, never two copies to
+/// let drift apart (S4 Y6, G8 correction).
+async fn run_intelligence_scan(
+    client: &ApiClient,
+    estate_root: Option<&Path>,
+    json: bool,
+) -> Result<(), CliError> {
+    let body = json!({
+        "command_id": ulid::Ulid::generate().to_string(),
+        "estate_root": estate_root,
+    });
+    let accepted = client.post("/v1/intelligence/scan", &body).await?;
+    // The one answer that starts no scan: an estate that declares nothing
+    // to scan. It carries no `scan_id`, so there is nothing to follow —
+    // print it exactly as before.
+    let Some(scan_id) = accepted["scan_id"].as_str() else {
+        if json {
+            print_json(&accepted);
+        } else {
+            print_intelligence_scan(&accepted);
+        }
+        return Ok(());
+    };
+    let total = accepted["total_sources"].as_u64().unwrap_or(0);
+    if !json {
+        println!("scan {scan_id}: {total} source(s)");
+    }
+    let path = format!("/v1/intelligence/scan/{scan_id}");
+    let mut printed = 0usize;
+    loop {
+        let status = match client.get(&path).await {
+            Ok(status) => status,
+            // A definitive 404 is not a lost poll — the daemon answered and
+            // said it holds no record of this scan. That happens when it
+            // restarted (the spawned scan task died with the old process,
+            // so "may still be running" would be false) or the entry aged
+            // past the retained window (the scan already finished). Either
+            // way retrying will not change the answer, and claiming the
+            // scan "may still be running" here would repeat the exact
+            // defect this command was fixed for, just in the other
+            // direction: reporting uncertainty the daemon has just
+            // resolved.
+            Err(ClientError::Api {
+                status: 404,
+                ref code,
+                ref message,
+            }) if code == "unknown_scan" => {
+                return Err(CliError::new(format!(
+                    "the daemon has no record of scan {scan_id} ({message}); if it was \
+                     accepted before a daemon restart, that run ended when the daemon did \
+                     — read the journal's intelligence.scan.completed event for {scan_id} \
+                     for the outcome"
+                )));
+            }
+            Err(e) => {
+                // A poll that fails to reach the daemon at all is a fact
+                // about this poll, never about the scan — the daemon is
+                // running it whether or not this client is watching, and
+                // saying otherwise is the exact defect this command was
+                // fixed for.
+                //
+                // AMENDMENT (owner, 2026-08-30): distinguish "a dropped
+                // connection" from "the daemon is gone" by state, not by a
+                // count — a guessed number of tolerated failures conflates
+                // one bad poll with the daemon actually exiting no matter
+                // what the number is. The state this client can actually
+                // check locally, independent of whatever just failed on the
+                // network, is whether the PID its descriptor named is still
+                // alive (same fact [`ensure_daemon`]/[`observe_connect`]
+                // already check at connect time, R2). A daemon that is
+                // still alive is retried indefinitely, cadence-bounded by
+                // `SCAN_POLL` and nothing else; a daemon whose PID has
+                // actually exited ends the follow at once. No PID bound to
+                // this client (only possible outside production use, e.g. a
+                // client built directly rather than through
+                // [`client_for`]) can prove nothing either way, so it also
+                // retries — absence of evidence is never treated as
+                // evidence the daemon is gone.
+                if let Some(pid) = client.pid()
+                    && !daemon::pid_alive(pid)
+                {
+                    return Err(CliError::new(format!(
+                        "lost contact with the daemon while following scan {scan_id} ({e}); \
+                         the daemon process (pid {pid}) has exited, so the scan ended when it \
+                         did — read the journal's intelligence.scan.completed event for \
+                         {scan_id} for whatever outcome it recorded before exiting"
+                    )));
+                }
+                tokio::time::sleep(SCAN_POLL).await;
+                continue;
+            }
+        };
+        let empty = Vec::new();
+        let rows = status["scanned"].as_array().unwrap_or(&empty);
+        while printed < rows.len() {
+            if !json {
+                print!("[{}/{total}] ", printed + 1);
+                print_scan_record_row(&rows[printed]);
+            }
+            printed += 1;
+        }
+        if status["state"] == "completed" {
+            if json {
+                print_json(&status);
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(SCAN_POLL).await;
+    }
+}
+
+/// `sgt knowledge add/list` (S3 F11): a pure manifest edit/read, same
+/// rationale as [`repo_command`] — no daemon, no network, no disk beyond
+/// `sergeant.toml` itself.
+async fn knowledge_command(
+    json: bool,
+    estate_root: &Path,
+    command: KnowledgeCommand,
+) -> Result<(), CliError> {
+    match command {
+        KnowledgeCommand::Add {
+            name,
+            path,
+            ignore,
+            context_field,
+        } => {
+            crate::domain::manifest::add_knowledge(
+                estate_root,
+                &name,
+                &path,
+                &ignore,
+                &context_field,
+            )?;
+            if json {
+                print_json(&json!({
+                    "added": name,
+                    "path": path,
+                    "ignore": ignore,
+                    "context_fields": context_field,
+                }));
+            } else {
+                println!("added knowledge source {name} at {}", path.display());
+                if context_field.is_empty() {
+                    println!(
+                        "  tabular context fields: none — this source's dataset rows expose \
+                         no text (F10a's default)"
+                    );
+                } else {
+                    println!("  tabular context fields: {}", context_field.join(", "));
+                }
+            }
+            Ok(())
+        }
+        KnowledgeCommand::List => {
+            // The structural loader, not the strict one: a knowledge source
+            // has nothing to do with whether every declared repository is
+            // cloned, and listing sources must not fail because one is not
+            // (the same reason the manifest pen validates structurally).
+            let estate = crate::domain::estate::Estate::from_config_structural(
+                &estate_root.join(crate::domain::estate::MANIFEST_FILE),
+            )?;
+            if json {
+                print_json(&json!({
+                    "knowledge": estate.knowledge.iter().map(|k| json!({
+                        "name": k.name,
+                        "path": k.path,
+                        "ignore": k.ignore,
+                        // F10a's declared exposure, read back. An allowlist an
+                        // operator cannot see is one they cannot audit, and
+                        // `[]` is a real answer here — the default-none
+                        // refusal — not an absent field.
+                        "context_fields": k.context_fields,
+                    })).collect::<Vec<_>>(),
+                }));
+            } else if estate.knowledge.is_empty() {
+                println!("no knowledge sources declared");
+            } else {
+                for source in &estate.knowledge {
+                    println!(
+                        "{}  {}  ignore={}  context_fields={}",
+                        source.name,
+                        source.path.display(),
+                        if source.ignore.is_empty() {
+                            "-".to_string()
+                        } else {
+                            source.ignore.join(",")
+                        },
+                        if source.context_fields.is_empty() {
+                            "none".to_string()
+                        } else {
+                            source.context_fields.join(",")
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
+        // Handled by its own dedicated arm above, in `dispatch` — never
+        // reachable here (it needs a daemon connection this function's
+        // signature has no client for).
+        KnowledgeCommand::Scan => unreachable!("scan is matched before this arm"),
     }
 }
 
@@ -1973,6 +3081,369 @@ fn print_table(result: &Value) {
 }
 
 /// The questions this daemon answers, and how populated the projection is.
+/// The `&limit=` tail of a `map` request, or nothing when none was asked for.
+fn limit_query(limit: Option<usize>) -> String {
+    limit.map(|n| format!("&limit={n}")).unwrap_or_default()
+}
+
+/// `sgt intelligence status` as plain text (M6 owns presentation).
+///
+/// Coverage is printed for every source, including the zero counts: "0
+/// excluded" is a fact an operator checking F10's posture needs to see, and a
+/// renderer that hid empty statuses would hide exactly that.
+fn print_intelligence_status(result: &Value) {
+    let empty = Vec::new();
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!(
+            "{}",
+            result["detail"]
+                .as_str()
+                .unwrap_or("no source has been indexed on this host yet")
+        );
+        return;
+    }
+    let sources = result["sources"].as_array().unwrap_or(&empty);
+    if sources.is_empty() {
+        println!("atlas is present but no source has a confirmed generation");
+        return;
+    }
+    for source in sources {
+        println!(
+            "{} ({}, {})",
+            source["source"].as_str().unwrap_or("?"),
+            source["kind"].as_str().unwrap_or("?"),
+            source["authority"].as_str().unwrap_or("?"),
+        );
+        println!(
+            "  generation {}  observed {}",
+            source["generation"].as_str().unwrap_or("?"),
+            source["observed_at"].as_str().unwrap_or("?"),
+        );
+        println!(
+            "  files {}  units {}  symbols {}  occurrences {}  edges {}  datasets {}  \
+             row units {}",
+            source["files"],
+            source["units"],
+            source["symbols"],
+            source["occurrences"],
+            source["edges"],
+            source["datasets"],
+            source["row_units"],
+        );
+        let coverage = source["coverage"].as_object();
+        let rendered = coverage
+            .map(|map| {
+                map.iter()
+                    .map(|(status, count)| format!("{status} {count}"))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            })
+            .unwrap_or_default();
+        println!(
+            "  coverage: {}",
+            if rendered.is_empty() {
+                "none recorded".to_string()
+            } else {
+                rendered
+            }
+        );
+    }
+}
+
+/// One scan-record row (the daemon's `{source, kind, outcome, generation,
+/// content_key, coverage, drift?, ...}` shape), rendered as plain text —
+/// shared by `sgt intelligence scan`'s per-source rows and `sgt
+/// intelligence add`'s single one.
+fn print_scan_record_row(row: &Value) {
+    let source = row["source"].as_str().unwrap_or("?");
+    let kind = row["kind"].as_str().unwrap_or("?");
+    if let Some(error) = row["error"].as_str() {
+        println!("{source} ({kind}): ERROR — {error}");
+        return;
+    }
+    let outcome = row["outcome"].as_str().unwrap_or("?");
+    println!(
+        "{source} ({kind}): {outcome}  generation={}  content_key={}",
+        row["generation"].as_str().unwrap_or("?"),
+        row["content_key"].as_str().unwrap_or("?"),
+    );
+    if let Some(detail) = row["detail"].as_str() {
+        println!("  {detail}");
+    }
+    if let Some(evicted) = row["evicted"].as_str() {
+        println!("  superseded generation {evicted}");
+    }
+    if let Some(coverage) = row["coverage"].as_object()
+        && !coverage.is_empty()
+    {
+        let rendered = coverage
+            .iter()
+            .map(|(status, count)| format!("{status} {count}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        println!("  coverage: {rendered}");
+    }
+    // Only an `estate_git` row ever carries this (§11.4's observation, see
+    // `EstateDriftObservation`) — absent everywhere else, so this prints
+    // nothing extra for `local_knowledge`/`external_git` rows.
+    if let Some(drift) = row["drift"].as_object() {
+        println!(
+            "  drift: mount is now at {}, pinned scan read {}",
+            drift["observed"].as_str().unwrap_or("?"),
+            drift["before"].as_str().unwrap_or("?"),
+        );
+    }
+}
+
+/// `sgt intelligence scan`'s plain-text report (S4 Y6, G8 correction): one
+/// row per source the estate-scoped scan actually covered — every
+/// `[[repo]]`, every `[[knowledge]]` source, every already-added external
+/// Git source — from the coverage each one actually produced. Also `sgt
+/// knowledge scan`'s report, since it drives the identical scan (see
+/// `KnowledgeCommand::Scan`'s own doc).
+fn print_intelligence_scan(result: &Value) {
+    let empty = Vec::new();
+    let scanned = result["scanned"].as_array().unwrap_or(&empty);
+    if scanned.is_empty() {
+        println!(
+            "{}",
+            result["detail"].as_str().unwrap_or(
+                "no [[repo]] repositories, [[knowledge]] sources, or external Git sources are \
+                 declared for this estate"
+            )
+        );
+        return;
+    }
+    for row in scanned {
+        print_scan_record_row(row);
+    }
+}
+
+/// `sgt intelligence add`'s plain-text report (S4 Y5, G6).
+fn print_external_git_added(result: &Value) {
+    print_scan_record_row(result);
+}
+
+/// `sgt intelligence list`'s plain-text report: every declared external Git
+/// source with its provenance (A1 §9).
+fn print_external_git_sources(result: &Value) {
+    let empty = Vec::new();
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!("no source has been indexed on this host yet");
+        return;
+    }
+    let sources = result["sources"].as_array().unwrap_or(&empty);
+    if sources.is_empty() {
+        println!("no external Git sources declared");
+        return;
+    }
+    for source in sources {
+        let provenance = &source["provenance"];
+        println!(
+            "{}  origin={}  ref={}  commit={}  retrieved={}",
+            source["source"].as_str().unwrap_or("?"),
+            provenance["origin"].as_str().unwrap_or("?"),
+            provenance["requested_ref"].as_str().unwrap_or("?"),
+            provenance["resolved_commit"].as_str().unwrap_or("?"),
+            provenance["retrieved_at"].as_str().unwrap_or("?"),
+        );
+    }
+}
+
+/// A `sgt search` answer as plain text.
+///
+/// **Two things are printed unconditionally, not on a flag**: every hit's
+/// coordinate — source, generation, unit and A1 coordinate, so an answer
+/// traces to exact bytes — and the answer's disclosure line
+/// (`semantic:`/`work scope`/`truncated`). A2 §15 requires a degraded answer
+/// to report itself honestly and decision **H4** makes that a required
+/// field; a renderer that only showed it under `--json` would have made it
+/// omittable again at the surface a human actually reads.
+///
+/// A2 §17 item 8's `source_kind`/`authority_class` are on the coordinate
+/// line for the same reason: *"external evidence remains **visibly**
+/// external"* is a claim about what the answer shows.
+fn print_search(result: &Value) {
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!(
+            "{}",
+            result["detail"]
+                .as_str()
+                .unwrap_or("no source has been indexed on this host yet")
+        );
+        return;
+    }
+    let empty = Vec::new();
+    let hits = result["hits"].as_array().unwrap_or(&empty);
+    if hits.is_empty() {
+        println!("no hits");
+    }
+    for (index, hit) in hits.iter().enumerate() {
+        print_hit(index + 1, hit);
+    }
+    print_disclosure(result);
+}
+
+/// A `sgt related` answer: the anchor it actually resolved, then the
+/// neighbours, then the same disclosure line.
+///
+/// The anchor is echoed because a coordinate can parse to a unit the caller
+/// did not mean, and an answer that only listed neighbours would give a
+/// reader no way to notice.
+fn print_related(result: &Value) {
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!(
+            "{}",
+            result["detail"]
+                .as_str()
+                .unwrap_or("no source has been indexed on this host yet")
+        );
+        return;
+    }
+    let anchor = &result["anchor"];
+    println!(
+        "anchor {}  [{}/{}]",
+        anchor["coordinate"].as_str().unwrap_or("?"),
+        anchor["source_kind"].as_str().unwrap_or("?"),
+        anchor["authority_class"].as_str().unwrap_or("?"),
+    );
+    let empty = Vec::new();
+    let hits = result["hits"].as_array().unwrap_or(&empty);
+    if hits.is_empty() {
+        println!("no related units");
+    }
+    for (index, hit) in hits.iter().enumerate() {
+        print_hit(index + 1, hit);
+    }
+    print_disclosure(result);
+}
+
+/// One hit: rank, coordinate, the item-8 pair, the fused score and which of
+/// A2 §7's two lists it came from.
+fn print_hit(rank: usize, hit: &Value) {
+    let unit = &hit["unit"];
+    let detail = match unit["family"].as_str() {
+        Some("code") => format!(
+            "{} {} `{}` bytes {}..{}",
+            unit["language"].as_str().unwrap_or("?"),
+            unit["label"].as_str().unwrap_or("?"),
+            unit["symbol"].as_str().unwrap_or("?"),
+            cell_text(&unit["byte_start"]),
+            cell_text(&unit["byte_end"]),
+        ),
+        // A2 §3: structured row text has a dataset key, a row key and a
+        // field set, and NO byte span. Rendering one would be inventing
+        // evidence (W2's J5 correction).
+        Some("row-text") => format!(
+            "dataset {} row {} fields {}",
+            cell_text(&unit["dataset_key"]),
+            cell_text(&unit["row_key"]),
+            cell_text(&unit["fields"]),
+        ),
+        // A2 §9: a result cites the original source path *and native
+        // coordinate*. A document or mail unit the adapter had to decode a
+        // container to reach has no byte span (`0`/`0` is its honest
+        // not-applicable), and its native coordinate — which body of the
+        // message, which block of the document — is the only thing that
+        // addresses it. Printing `bytes 0..0` there prints the absence
+        // instead of the evidence (S5 closeout, F-AC-02).
+        _ => {
+            let title = unit["title"].as_str().unwrap_or("(untitled)");
+            match unit["native"].as_str() {
+                Some(native) => format!("{title} at {native}"),
+                None => format!(
+                    "{title} bytes {}..{}",
+                    cell_text(&unit["byte_start"]),
+                    cell_text(&unit["byte_end"]),
+                ),
+            }
+        }
+    };
+    println!(
+        "{rank}. {}  [{}/{}]",
+        hit["coordinate"].as_str().unwrap_or("?"),
+        hit["source_kind"].as_str().unwrap_or("?"),
+        hit["authority_class"].as_str().unwrap_or("?"),
+    );
+    println!(
+        "   {detail}\n   generation={} rrf={} lexical={} semantic={}",
+        hit["generation_id"].as_str().unwrap_or("?"),
+        cell_text(&hit["rrf"]),
+        cell_text(&hit["ranks"]["lexical"]),
+        cell_text(&hit["ranks"]["semantic"]),
+    );
+}
+
+/// The disclosure line every retrieval answer prints — decision **H4**'s
+/// required semantic status, the `--work` scope, and whether a bound bit.
+fn print_disclosure(result: &Value) {
+    let scope = &result["work_scope"];
+    let scope_text = match scope["kind"].as_str() {
+        Some("base_and_overlay_snapshot") => format!(
+            "base+overlay as of {}",
+            scope["overlay_observed_at"].as_str().unwrap_or("?")
+        ),
+        Some("base_only") => "base only (no overlay stands for this work)".to_string(),
+        _ => "not work-scoped".to_string(),
+    };
+    println!(
+        "semantic: {}  |  scope: {scope_text}  |  truncated: {}",
+        result["semantic"].as_str().unwrap_or("?"),
+        cell_text(&result["truncated"]),
+    );
+}
+
+/// A `map` answer as plain text: one line per row, keys in the order the
+/// daemon put them in the object.
+///
+/// Deliberately generic over the five verbs rather than five renderers: the
+/// answers are flat objects, and a renderer per verb would be five places for
+/// a field to be silently dropped.
+fn print_map(result: &Value, key: &str) {
+    let empty = Vec::new();
+    if result["atlas"]["present"] != Value::Bool(true) {
+        println!(
+            "{}",
+            result["detail"]
+                .as_str()
+                .unwrap_or("no source has been indexed on this host yet")
+        );
+        return;
+    }
+    if let Some(derivation) = result["derivation"].as_str() {
+        println!("({derivation})");
+    }
+    let rows = result[key].as_array().unwrap_or(&empty);
+    if rows.is_empty() {
+        println!("no rows");
+        return;
+    }
+    for row in rows {
+        let Some(fields) = row.as_object() else {
+            println!("{row}");
+            continue;
+        };
+        println!(
+            "{}",
+            fields
+                .iter()
+                .map(|(name, value)| format!("{name}={}", cell_text(value)))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+    if let Some(totals) = result["totals"].as_object() {
+        println!(
+            "totals: {}",
+            totals
+                .iter()
+                .map(|(name, value)| format!("{name}={}", cell_text(value)))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
+}
+
 fn print_analytics_index(result: &Value) {
     let empty = Vec::new();
     println!("queries:");
@@ -2036,6 +3507,37 @@ fn origin() -> Value {
     })
 }
 
+/// W1 §6 (S2 E5/E8): the parent Work/execution this invocation **claims**,
+/// read out of the `SERGEANT_*` environment a managed execution was launched
+/// with ([`crate::backend::causation_env`] is what puts them there).
+///
+/// Read exactly the way [`origin`] above reads `SGT_ORIGIN_CLIENT` — the
+/// client owns its own environment, the daemon has none — and with exactly as
+/// much authority: none. W1 §6 calls these "a transport hint, not trusted
+/// lineage"; the daemon checks both against its own journal before recording
+/// any relation, and journals a `causation_unverified` marker (never a
+/// refusal) when they do not check out. An empty value is treated as absent,
+/// so an exported-but-blank variable claims nothing rather than claiming
+/// `""`.
+///
+/// **`SERGEANT_ESTATE_ROOT` is deliberately not read here.** The estate is
+/// resolved by ordinary `-C`/cwd admission before this function is ever
+/// reached (§4.3), and reading a *claimed* root would be exactly the implicit
+/// estate discovery from a Work surface that W1 §12 lists as a non-goal. The
+/// actor passes it as `-C`, where it is admitted like any other addressed
+/// root, or the command refuses.
+fn claimed_causation() -> (Option<String>, Option<String>) {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    };
+    (
+        read(crate::backend::SERGEANT_WORK_ID_ENV),
+        read(crate::backend::SERGEANT_EXECUTION_ID_ENV),
+    )
+}
+
 /// ASCII-art wordmark for the bare-`sgt` homepage (ADR 0010, D6).
 const LOGO: &str = r"
    ___ ___ ___ __  __
@@ -2094,26 +3596,38 @@ fn print_homepage(root: &Path) {
     println!("sgt <command> --help for the full verb list");
 }
 
-/// Connect to the daemon for `data_dir`, auto-spawning one if needed.
+/// Connect to the host daemon at `data_dir` (the **host runtime root**,
+/// [`resolve_host_runtime_dir`] — never a per-estate data dir under H1),
+/// auto-spawning one if needed, then address it at `estate_root` (D4).
 ///
 /// This is the CLI's half of the client contract — descriptor discovery,
 /// staleness judgement, detached spawn — and it hands back the crate's one
 /// API client ([`ApiClient`], defined next to the router it speaks to). Only
 /// the mutating verbs (ADR 0009) come through here; every observation verb,
 /// TUI included, goes through [`observe_connect`] instead.
+///
+/// **Deliverable 1's second-estate case.** A second estate's first mutating
+/// command reaches this same function. Because `data_dir` is now the host
+/// root regardless of which estate is addressed, its descriptor read finds
+/// the *same* already-running daemon the first estate's client found —
+/// [`spawn_daemon`] is only ever reached when no host daemon answers at
+/// all, never to compete with one that already admitted a different
+/// estate. The addressed estate is validated and sent on every request
+/// (`check_binding`, `client_for`); nothing here re-spawns to "fix" a
+/// binding, because a v3 host daemon has none to fix.
 async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient, CliError> {
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
 
     let stale = if let Some(descriptor) = daemon::read_descriptor(data_dir)? {
-        // §5.1: verify the binding **before** the endpoint is used for
-        // anything, and before any decision that could spawn. A daemon bound
-        // to another estate is a named refusal — never a connection, and
-        // never a second daemon over the same data dir.
-        check_binding(&descriptor, data_dir, estate_root)?;
+        // D4: validate the addressed estate **before** the endpoint is used
+        // for anything, and before any decision that could spawn. The
+        // refusal is now about the estate ("not an estate", "admission
+        // failed"), never about which estate some descriptor was bound to.
+        check_binding(estate_root, "this command")?;
         if healthz_ok(&http, &descriptor.endpoint).await {
-            return client_for(&descriptor);
+            return client_for(&descriptor, Some(estate_root));
         }
         if daemon::pid_alive(descriptor.pid) {
             // Ambiguous: something with that PID is alive but the endpoint
@@ -2142,7 +3656,7 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
         None
     };
 
-    spawn_daemon(data_dir, estate_root)?;
+    spawn_daemon(data_dir)?;
 
     // Wait for a healthy descriptor. It may be written by our child or by a
     // concurrently racing client's child — either is fine; the daemon lock
@@ -2155,12 +3669,13 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
         if let Ok(Some(descriptor)) = daemon::read_descriptor(data_dir)
             && !is_stale_descriptor(stale.as_ref(), &descriptor)
         {
-            // The winner of the spawn race may be another client's child,
-            // and §5.1 applies to it exactly as it did above: a daemon bound
-            // elsewhere is refused, not adopted.
-            check_binding(&descriptor, data_dir, estate_root)?;
+            // The winner of the spawn race may be another client's child.
+            // Under H1 that is fine — it is the *host* daemon either way —
+            // but the addressed estate is re-validated exactly as above,
+            // because a manifest can break inside the spawn window.
+            check_binding(estate_root, "this command")?;
             if healthz_ok(&http, &descriptor.endpoint).await {
-                return client_for(&descriptor);
+                return client_for(&descriptor, Some(estate_root));
             }
         }
         tokio::time::sleep(SPAWN_POLL).await;
@@ -2173,21 +3688,45 @@ async fn ensure_daemon(data_dir: &Path, estate_root: &Path) -> Result<ApiClient,
     )))
 }
 
-fn client_for(descriptor: &RuntimeDescriptor) -> Result<ApiClient, CliError> {
-    ApiClient::new(&descriptor.endpoint, &descriptor.token).map_err(CliError::from)
+/// Build the API client for a descriptor, addressed at the estate this
+/// invocation already admitted (D4).
+///
+/// `None` is the host-scoped shape: a client that names no estate, whose
+/// estate-scoped requests the daemon refuses by name rather than guessing
+/// for. W3 is what actually routes verbs into that bucket; the client can
+/// already express it.
+fn client_for(
+    descriptor: &RuntimeDescriptor,
+    estate_root: Option<&Path>,
+) -> Result<ApiClient, CliError> {
+    let client = ApiClient::new(&descriptor.endpoint, &descriptor.token)?.with_pid(descriptor.pid);
+    Ok(match estate_root {
+        Some(root) => client.with_estate_root(root),
+        None => client,
+    })
 }
 
-/// §5.1/§15: refuse a descriptor bound to a different estate, naming both
-/// roots. Runs before the endpoint is probed, connected to, or used to
-/// decide whether to spawn — "never connect, never a second daemon on the
-/// same data dir" is only true if the check comes first.
-fn check_binding(
-    descriptor: &RuntimeDescriptor,
-    data_dir: &Path,
-    estate_root: &Path,
-) -> Result<(), CliError> {
-    descriptor
-        .check_estate_root(data_dir, Some(estate_root))
+/// The client gate, rewritten for H1 (sprint-plan D4, brief deliverable 4).
+///
+/// **What it used to be.** `check_binding` compared the client's exact root
+/// against the one root the v2 descriptor published, refusing in both
+/// directions — "this daemon is bound to a different estate", "this daemon
+/// is bound to no estate". That class is retired, not silently deleted: a
+/// host daemon serving an estate it was never started from is H1's whole
+/// point, so the comparison has no object left to make.
+///
+/// **What it is now.** The one thing that was ever load-bearing: does the
+/// estate this command addresses actually validate, right now, as an estate
+/// (§4.1's exact-root check, plus this root's own filesystem reliability)?
+/// The taxonomy is [`crate::runtime::estates::EstateAdmissionError`]'s —
+/// (a) not an estate, (b) admission failed, (c) no estate addressed at all.
+///
+/// It still runs *before* the endpoint is probed, connected to, or used to
+/// decide whether to spawn, for the same reason it always did: a directory
+/// mistake must not be able to reach a daemon at all.
+fn check_binding(estate_root: &Path, operation: &str) -> Result<(), CliError> {
+    crate::runtime::estates::check_estate_root(Some(estate_root), operation)
+        .map(|_| ())
         .map_err(|e| CliError::new(e.to_string()))
 }
 
@@ -2210,7 +3749,19 @@ fn check_binding(
 /// 3. A descriptor naming a live PID that does not answer `/healthz` → the
 ///    same ambiguous, fail-closed refusal `ensure_daemon` gives, spawn
 ///    nothing.
-async fn observe_connect(data_dir: &Path, estate_root: &Path) -> Result<ApiClient, CliError> {
+///
+/// **`estate_root: None` (H1 §5, brief deliverable 2) is the host-scoped
+/// shape.** `tui`, `status`, `work show`/`list`/`transcript` and `watch`
+/// reach this with no estate at all — connection to the host daemon must
+/// succeed regardless, because none of them needs one. `check_binding` is
+/// skipped entirely rather than called with a fabricated root: there is
+/// nothing to validate when the command addressed nothing, and
+/// `check_estate_root(None, ..)` would otherwise manufacture exactly the
+/// `NoEstateAddressed` refusal a host-scoped verb must never hit.
+async fn observe_connect(
+    data_dir: &Path,
+    estate_root: Option<&Path>,
+) -> Result<ApiClient, CliError> {
     let path = daemon::descriptor_path(data_dir);
     let Some(descriptor) = daemon::read_descriptor(data_dir)? else {
         return Err(CliError::new(format!(
@@ -2220,14 +3771,17 @@ async fn observe_connect(data_dir: &Path, estate_root: &Path) -> Result<ApiClien
             data_dir.display(),
         )));
     };
-    // §5.1, before the endpoint is touched at all — the same gate
-    // `ensure_daemon` applies, for the same reason.
-    check_binding(&descriptor, data_dir, estate_root)?;
+    // D4, before the endpoint is touched at all — the same gate
+    // `ensure_daemon` applies, for the same reason. Only when an estate was
+    // actually addressed: see the host-scoped note above.
+    if let Some(root) = estate_root {
+        check_binding(root, "this command")?;
+    }
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
     if healthz_ok(&http, &descriptor.endpoint).await {
-        return client_for(&descriptor);
+        return client_for(&descriptor, estate_root);
     }
     if daemon::pid_alive(descriptor.pid) {
         return Err(CliError::new(format!(
@@ -2271,11 +3825,24 @@ async fn healthz_ok(http: &reqwest::Client, endpoint: &str) -> bool {
     )
 }
 
-/// Spawn a detached `sgt daemon` for `data_dir`: own process group, stdio to
-/// `daemon.log` in the data dir. The child is *not* waited on — it outlives
-/// this client by design; losing the daemon-lock race makes it exit on its
-/// own.
-fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
+/// Spawn a detached `sgt daemon` for `data_dir` (H1: the **host runtime
+/// root**, never a per-estate data dir — see [`resolve_host_runtime_dir`]):
+/// own process group, stdio to `daemon.log` in the data dir. The child is
+/// *not* waited on — it outlives this client by design; losing the
+/// daemon-lock race makes it exit on its own.
+///
+/// **No `-C <estate_root>` scalar (H1 §4, brief deliverable 1).** Before H1
+/// the spawned daemon was bound to exactly the one estate this client had
+/// already admitted, named explicitly with `-C` because a detached child
+/// does not reliably keep the parent's cwd. A host daemon serves every
+/// estate admitted to it *later*, over the wire (D4) — baking one estate
+/// into the child's argv would make a second estate's first `sgt run`
+/// either hit this same estate's binding (wrong) or spawn a second,
+/// competing host process (exactly what H1 §2 rules out: "one long-lived
+/// daemon per Sergeant user installation"). The child therefore addresses
+/// no estate at all; every estate it ever serves is admitted per-request
+/// once it is already running.
+fn spawn_daemon(data_dir: &Path) -> Result<(), CliError> {
     std::fs::create_dir_all(data_dir)?;
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new()
@@ -2283,18 +3850,13 @@ fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
         .append(true)
         .open(data_dir.join("daemon.log"))?;
     let mut command = std::process::Command::new(exe);
-    // §5.1, C10: the spawned daemon is bound to the estate this client
-    // already admitted — named explicitly with `-C` rather than inherited
-    // from a cwd the detached child does not reliably keep.
     command
-        .arg("-C")
-        .arg(estate_root)
         .arg("--data-dir")
         .arg(data_dir)
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log.try_clone()?))
-        .stderr(std::process::Stdio::from(log));
+        .stderr(std::process::Stdio::from(log.try_clone()?));
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -2302,8 +3864,90 @@ fn spawn_daemon(data_dir: &Path, estate_root: &Path) -> Result<(), CliError> {
         // and not receive the client's signals.
         command.process_group(0);
     }
-    command.spawn()?;
+    // #275's cli-side share: a bare `e?` here used to vanish the spawn
+    // failure into a generic message with no PATH diagnostic and nothing
+    // logged for a caller with no terminal (systemd) to ever see it.
+    // `spawn_daemon_error` prints *and* logs a named reason instead.
+    //
+    // W2 seam: the daemon-side half of #275 — journaling a `NotFound`/
+    // PATH-shaped backend-spawn failure (`Command::new(claude_cli).spawn()`
+    // and friends inside `src/daemon.rs`) as a Work-visible reason at the
+    // actual call site — is W2's file to change, not this one. It can reuse
+    // this same `harness::dirs_missing_from_path` diagnostic.
+    if let Err(e) = command.spawn() {
+        return Err(spawn_daemon_error(e, log));
+    }
     Ok(())
+}
+
+/// #275's cli-side share: a spawn failure that used to vanish into a bare
+/// `io::Error` message now prints *and* logs a named reason. `NotFound`/
+/// `PermissionDenied` are exactly #60's failure shape — the same fact
+/// `doctor::environment_check` already surfaces (a toolchain dir exists on
+/// disk but is not on `PATH`, so an exec that depends on it reads as a
+/// permissions fault) — so this reuses that check's exact underlying
+/// diagnostic ([`crate::harness::dirs_missing_from_path`], the identical
+/// list `doctor` prints) rather than inventing a second copy that could
+/// silently disagree with it. `log` is the same `daemon.log` handle
+/// `spawn_daemon` already opened, so the reason survives even when nothing
+/// interactive is watching stderr (a systemd-launched daemon has no such
+/// terminal at all — the exact gap this deliverable closes).
+fn spawn_daemon_error(e: std::io::Error, log: std::fs::File) -> CliError {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let path = std::env::var_os("PATH");
+    spawn_daemon_error_with(e, log, home.as_deref(), path.as_ref(), |d| d.exists())
+}
+
+/// The injectable core of [`spawn_daemon_error`] — real `HOME`/`PATH` and a
+/// real filesystem `exists` check in production, a controlled `home`/`path`/
+/// `exists` in tests, the same injection shape as
+/// [`crate::harness::dirs_missing_from_path`] itself. Both halves of #275's
+/// deliverable live here together — the diagnostic appended to the returned
+/// message, and the identical reason written to `log` — so a test calling
+/// this once and reading `log` back afterward can assert the two stayed in
+/// sync, exactly the gap that used to let a spawn failure vanish for a
+/// systemd-launched daemon with no terminal to print to.
+fn spawn_daemon_error_with(
+    e: std::io::Error,
+    mut log: std::fs::File,
+    home: Option<&Path>,
+    path: Option<&OsString>,
+    exists: impl Fn(&Path) -> bool,
+) -> CliError {
+    use std::io::Write;
+
+    let path_diagnostic = if matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    ) {
+        home.and_then(|home| {
+            let dirs = crate::harness::toolchain_path_dirs(home);
+            let missing = crate::harness::dirs_missing_from_path(path, &dirs, exists);
+            if missing.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "; {} exist{} on disk but {} not on PATH (#60/#275's failure shape) — \
+                     this is likely why the exec failed",
+                    missing
+                        .iter()
+                        .map(|d| d.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if missing.len() == 1 { "s" } else { "" },
+                    if missing.len() == 1 { "is" } else { "are" },
+                ))
+            }
+        })
+    } else {
+        None
+    };
+    let message = format!(
+        "cannot spawn daemon: {e}{}",
+        path_diagnostic.as_deref().unwrap_or("")
+    );
+    let _ = writeln!(log, "spawn failed: {message}");
+    CliError::new(message)
 }
 
 /// How long `sgt daemon stop` waits for `active` work to settle before
@@ -2339,7 +3983,18 @@ const STOP_POLL: Duration = Duration::from_millis(100);
 /// Deliberately does **not** auto-spawn a daemon — asking to stop something
 /// that is not running is answered "already stopped", never "let me start
 /// one so I can stop it", mirroring `sgt doctor`'s own no-auto-spawn rule.
-async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<(), CliError> {
+///
+/// `estate_root: None` (H1 §5, brief deliverable 2): `sgt daemon stop` is a
+/// host-scoped verb — it works from any cwd, because it addresses no
+/// estate at all (it stops the host daemon, D5, not "my estate's"). When
+/// `estate_root` is `Some` (cwd happened to be a valid root), it is
+/// validated the ordinary way; when it is `None`, there is nothing to
+/// validate and nothing is skipped by skipping it.
+async fn daemon_stop(
+    data_dir: &Path,
+    estate_root: Option<&Path>,
+    json: bool,
+) -> Result<(), CliError> {
     let Some(descriptor) = daemon::read_descriptor(data_dir)? else {
         report_daemon_stop(
             json,
@@ -2348,10 +4003,14 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
         );
         return Ok(());
     };
-    // §5.1, before the endpoint is touched: stopping is *using* a daemon,
-    // and a daemon bound to another estate is no more this estate's to stop
-    // than it is this estate's to submit to.
-    check_binding(&descriptor, data_dir, estate_root)?;
+    // D4/D5, before the endpoint is touched: `sgt daemon stop` stops the
+    // *host* daemon — every admitted estate's — so the estate this
+    // invocation stands in (if any) is validated for the ordinary reason (a
+    // directory mistake must not reach a daemon), not because it owns the
+    // daemon.
+    if let Some(root) = estate_root {
+        check_binding(root, "sgt daemon stop")?;
+    }
     let http = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()?;
@@ -2376,7 +4035,23 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
         );
         return Ok(());
     }
-    let client = client_for(&descriptor)?;
+    let client = client_for(&descriptor, estate_root)?;
+
+    // 0. D5: **say what is about to stop.** `sgt daemon stop` stops the
+    // *host* daemon — every admitted estate's, not just the one this
+    // invocation happens to stand in. Before H1 those were the same
+    // sentence; now they are not, and a stop whose blast radius the operator
+    // has to infer is exactly the kind of silent behavior carryover the
+    // recon flagged. The count is read live from `GET /v1/estates` rather
+    // than assumed, and a daemon that cannot answer is reported as an
+    // unknown count rather than a comfortable zero.
+    let affected = match client.estates().await {
+        Ok(body) => body["estates"].as_array().map(Vec::len),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not read the admitted-estate registry");
+            None
+        }
+    };
 
     // 1. Pause admission — MVP-3's drain flag, scoped exactly to this verb.
     // Idempotent: a retry against a still-live, already-paused daemon
@@ -2434,8 +4109,23 @@ async fn daemon_stop(data_dir: &Path, estate_root: &Path, json: bool) -> Result<
             descriptor.pid,
         )));
     }
-    report_daemon_stop(json, "stopped", "daemon stopped");
+    report_daemon_stop(json, "stopped", &stopped_message(affected));
     Ok(())
+}
+
+/// D5's blast-radius sentence: what was stopped, and how much it covered.
+///
+/// `None` is an honest "the registry could not be read", never a silent 0 —
+/// telling an operator that no estates were affected when nobody actually
+/// asked is worse than telling them the count is unknown.
+fn stopped_message(affected: Option<usize>) -> String {
+    match affected {
+        Some(1) => "stopped the host daemon; 1 admitted estate affected".to_string(),
+        Some(n) => format!("stopped the host daemon; {n} admitted estates affected"),
+        None => {
+            "stopped the host daemon; the number of admitted estates could not be read".to_string()
+        }
+    }
 }
 
 /// `sgt daemon stop`'s one report shape, human or `--json`.
@@ -2444,6 +4134,246 @@ fn report_daemon_stop(json: bool, status: &str, message: &str) {
         print_json(&json!({"status": status, "message": message}));
     } else {
         println!("{message}");
+    }
+}
+
+/// `sgt daemon install-service` (H1 §2, #275/#276): generate the native
+/// per-user service unit for the host daemon and, unless `--print`, write
+/// it and attempt enablement.
+///
+/// `--print` is a pure dry run: generate, print to stdout, touch nothing on
+/// disk, attempt no enablement — the golden-file content a test or an
+/// operator inspecting before installing sees is exactly what this
+/// function would otherwise write. Otherwise: the unit/plist is written to
+/// its native per-user location via [`crate::runtime::fsutil::write_atomic`]
+/// (the same idempotent-write discipline `domain::distro::write_distro`
+/// already uses — unchanged content is not rewritten), and enablement is
+/// attempted only when [`enable_service`]'s manager probe says one is
+/// reachable (the `docker_check` degradation pattern: an absent/unreachable
+/// manager is a named, non-fatal fact). Exit 0 whenever the unit/plist is
+/// written; nonzero only on an actual write failure — a skipped enablement
+/// is reported, never turned into a command failure (H1-05: no silent
+/// linger enabling means the *absence* must stay visible, not that this
+/// command must fail because of it).
+fn install_service(
+    data_dir_flag: Option<PathBuf>,
+    print: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    // The host runtime root, not the estate-scoped `data_dir` — H1 §3's
+    // whole point is that the daemon a unit supervises is decoupled from
+    // any one estate (W1b's seam; see `resolve_host_runtime_dir`'s own doc
+    // comment).
+    let (host_runtime_dir, _source) =
+        resolve_host_runtime_dir(data_dir_flag, |name| std::env::var_os(name))?;
+    let binary_path = std::env::current_exe()?;
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        CliError::new(
+            "cannot compose the service unit's PATH enrichment: $HOME is not set — set HOME \
+             and retry",
+        )
+    })?;
+    let home = PathBuf::from(home);
+    let dirs = crate::harness::toolchain_path_dirs(&home);
+    // #275's fix, baked in here rather than left to the manager's own
+    // inherited environment (`scripts/gate.sh`'s measured Cerberus hazard,
+    // see `platform::service`'s module doc): the composed PATH becomes part
+    // of the generated content itself.
+    let path =
+        crate::harness::compose_path(std::env::var_os("PATH").as_ref(), &dirs, |d| d.exists())
+            .to_string_lossy()
+            .into_owned();
+    let spec = crate::platform::service::ServiceSpec {
+        binary_path,
+        host_runtime_dir,
+        path,
+    };
+
+    #[cfg(target_os = "macos")]
+    let (content, install_path) = (
+        crate::platform::service::launchd_plist(&spec),
+        crate::platform::service::launchd_plist_path(&home),
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (content, install_path) = (
+        crate::platform::service::systemd_unit(&spec),
+        crate::platform::service::systemd_unit_path(&home),
+    );
+
+    if print {
+        print!("{content}");
+        return Ok(());
+    }
+
+    if let Some(parent) = install_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::runtime::fsutil::write_atomic(&install_path, content.as_bytes())?;
+
+    let enable = enable_service(&install_path);
+    report_install_service(json, &install_path, &enable);
+    Ok(())
+}
+
+/// What happened when [`install_service`] tried to enable the just-written
+/// unit/plist.
+enum EnableOutcome {
+    /// The manager was reachable and both the reload/bootstrap and the
+    /// enable step succeeded.
+    Enabled,
+    /// No attempt was made — the manager is not reachable from this
+    /// session. Never a command failure (H1-05): the files are already
+    /// written, and `remedy` names what to do next.
+    Skipped { remedy: String },
+    /// The manager was reachable but the enable attempt itself failed.
+    /// Also never a command failure by itself — the files are already
+    /// written and stand on their own; `detail` is the evidence.
+    Failed { detail: String },
+}
+
+/// Linux arm: probe `systemctl --user`, and only on [`ManagerStatus::
+/// Reachable`] run `daemon-reload` then `enable --now` against the unit
+/// just written. `unit_path`'s file name (not the whole path — `systemctl
+/// --user enable` resolves unit names against its own search path, which
+/// already includes [`crate::platform::service::systemd_user_unit_dir`])
+/// is what gets enabled.
+#[cfg(not(target_os = "macos"))]
+fn enable_service(unit_path: &Path) -> EnableOutcome {
+    use crate::platform::service::ManagerStatus;
+
+    match crate::platform::service::detect_systemd_status() {
+        ManagerStatus::Reachable => {
+            let unit_name = unit_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(crate::platform::service::SYSTEMD_UNIT_NAME);
+            // Same binary the probe above just used (`SGT_SYSTEMCTL_BIN`,
+            // default `systemctl`) — a test pointing the probe at a fake
+            // must see these calls go to the identical fake, not a real
+            // `systemctl` this host may not even have.
+            let bin = std::env::var(crate::platform::service::SYSTEMCTL_BIN_ENV)
+                .unwrap_or_else(|_| "systemctl".to_string());
+            let reload = std::process::Command::new(&bin)
+                .args(["--user", "daemon-reload"])
+                .status();
+            let enable = std::process::Command::new(&bin)
+                .args(["--user", "enable", "--now", unit_name])
+                .status();
+            match (reload, enable) {
+                (Ok(r), Ok(e)) if r.success() && e.success() => EnableOutcome::Enabled,
+                (reload, enable) => EnableOutcome::Failed {
+                    detail: format!(
+                        "systemctl --user daemon-reload/enable --now {unit_name} did not both \
+                         succeed: daemon-reload={reload:?}, enable={enable:?}"
+                    ),
+                },
+            }
+        }
+        ManagerStatus::PresentNoUserSession { detail } => EnableOutcome::Skipped {
+            remedy: format!(
+                "a systemd user manager is installed but not reachable from this session \
+                 ({detail}) — this is the common bare SSH/cron shape (no user D-Bus session); \
+                 run `loginctl enable-linger $USER` and start a session with one (a desktop \
+                 login, or `machinectl shell`/`systemd-run --user` from an already-lingering \
+                 session), then re-run `sgt daemon install-service`"
+            ),
+        },
+        ManagerStatus::Absent => EnableOutcome::Skipped {
+            remedy: "no systemd user manager was found on PATH — the unit file has been \
+                      written at the path above; install one and re-run `sgt daemon \
+                      install-service`, or continue running `sgt daemon` in the foreground as \
+                      the development/diagnostic path (H1 §2)"
+                .to_string(),
+        },
+    }
+}
+
+/// macOS arm: probe `launchctl print gui/$UID`, and only on
+/// [`ManagerStatus::Reachable`] run `launchctl bootstrap`. `$UID` is read
+/// via `id -u` rather than a new libc/nix dependency for one syscall's
+/// worth of value (R2/R6: `daemon_stop`'s SIGTERM path already shells out
+/// to `kill` for the identical reason).
+#[cfg(target_os = "macos")]
+fn enable_service(plist_path: &Path) -> EnableOutcome {
+    use crate::platform::service::ManagerStatus;
+
+    let Some(uid) = macos_uid() else {
+        return EnableOutcome::Skipped {
+            remedy: "could not determine this user's UID (`id -u` failed) — the plist has \
+                      been written at the path above; run `launchctl bootstrap gui/$(id -u) \
+                      <path>` yourself, or continue running `sgt daemon` in the foreground as \
+                      the development/diagnostic path (H1 §2)"
+                .to_string(),
+        };
+    };
+    match crate::platform::service::detect_launchd_status(uid) {
+        ManagerStatus::Reachable => {
+            // Same binary the probe above just used — see the systemd
+            // arm's identical note.
+            let bin = std::env::var(crate::platform::service::LAUNCHCTL_BIN_ENV)
+                .unwrap_or_else(|_| "launchctl".to_string());
+            let bootstrap = std::process::Command::new(&bin)
+                .args(["bootstrap", &format!("gui/{uid}")])
+                .arg(plist_path)
+                .status();
+            match bootstrap {
+                Ok(status) if status.success() => EnableOutcome::Enabled,
+                other => EnableOutcome::Failed {
+                    detail: format!(
+                        "launchctl bootstrap gui/{uid} {}: {other:?}",
+                        plist_path.display()
+                    ),
+                },
+            }
+        }
+        ManagerStatus::PresentNoUserSession { detail } => EnableOutcome::Skipped {
+            remedy: format!(
+                "launchd is present but this session's GUI/user domain is not reachable \
+                 ({detail}) — this typically means no GUI session (bare SSH); log in \
+                 interactively, then re-run `sgt daemon install-service`"
+            ),
+        },
+        ManagerStatus::Absent => EnableOutcome::Skipped {
+            remedy: "launchctl was not found on PATH — the plist file has been written at the \
+                      path above; install one and re-run `sgt daemon install-service`, or \
+                      continue running `sgt daemon` in the foreground as the \
+                      development/diagnostic path (H1 §2)"
+                .to_string(),
+        },
+    }
+}
+
+/// `id -u`, the one-syscall value `enable_service`'s macOS arm needs
+/// without a new dependency.
+#[cfg(target_os = "macos")]
+fn macos_uid() -> Option<u32> {
+    let output = std::process::Command::new("id").arg("-u").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
+}
+
+/// `sgt daemon install-service`'s one report shape, human or `--json`.
+fn report_install_service(json: bool, install_path: &Path, enable: &EnableOutcome) {
+    let (enabled, remedy_or_detail) = match enable {
+        EnableOutcome::Enabled => (true, None),
+        EnableOutcome::Skipped { remedy } => (false, Some(remedy.clone())),
+        EnableOutcome::Failed { detail } => (false, Some(detail.clone())),
+    };
+    if json {
+        print_json(&json!({
+            "written": install_path,
+            "enabled": enabled,
+            "remedy": remedy_or_detail,
+        }));
+    } else {
+        println!("wrote {}", install_path.display());
+        match enable {
+            EnableOutcome::Enabled => println!("enabled and started"),
+            EnableOutcome::Skipped { remedy } => println!("not enabled: {remedy}"),
+            EnableOutcome::Failed { detail } => println!("enable attempt failed: {detail}"),
+        }
     }
 }
 
@@ -2476,7 +4406,7 @@ pub(crate) mod doctor {
     use crate::daemon;
     use crate::domain::estate::{DEFAULT_RETENTION, Estate, MANIFEST_FILE};
     use crate::domain::event::Event;
-    use crate::runtime::analytics::Analytics;
+    use crate::runtime::atlas::db::Analytics;
     use crate::runtime::journal::Journal;
     use crate::runtime::projection::{Projection, WorkRegistry, work_registry_reducer};
     use crate::runtime::prune::{FirstSeqIndex, PolicySource, PrunePolicy};
@@ -2684,7 +4614,14 @@ pub(crate) mod doctor {
         let (journal_check, journal_ok, journal_events) = journal_check(data_dir);
         checks.push(journal_check);
         checks.push(projection_check(journal_ok, journal_events.as_deref()));
+        checks.push(atlas_coverage_check(data_dir));
         checks.push(daemon_check(data_dir).await);
+        // H1 §2/#276: "is a native per-user service manager reachable at
+        // all" — a distinct question from `daemon_check`'s per-data-dir
+        // descriptor health above, and the prerequisite `sgt daemon
+        // install-service`'s enablement step probes identically (never a
+        // second, disagreeing probe).
+        checks.push(host_service_manager_check());
         // §4.2: `sgt doctor` is usable outside an estate and never searches
         // upward. The estate-root row is the one that says out loud whether
         // this directory is an estate root at all — a failing row with the
@@ -2694,10 +4631,20 @@ pub(crate) mod doctor {
         // by name instead of each re-deriving the same answer.
         let (estate_root_check, admitted) = estate_root_check(root);
         checks.push(estate_root_check);
+        // H1 §6's cutover gate: is this estate still carrying daemon state
+        // under its own `.sergeant/data` from before a host runtime root
+        // existed. Threaded off `admitted` the same way the rows below it
+        // are — never a second, independent estate-root search.
+        checks.push(legacy_estate_runtime_check(admitted.as_deref()));
         checks.push(permission_mode_check(admitted.as_deref()));
         checks.push(network_access_check(admitted.as_deref()));
         checks.push(estate_check(admitted.as_deref()));
         checks.push(workflows_check(admitted.as_deref()));
+        // S2 V4 (owner-directed 2026-08-27): an authoring-drift observation
+        // distinct from workflows_check's own declared-package census above —
+        // a stage-shaped directory *inside* a package that no stages entry
+        // names. Same estate-root threading.
+        checks.push(undeclared_stage_dirs_check(admitted.as_deref()));
         // #261: the installed corpus must cite only routes that actually
         // resolve — deliberately not exempted from `healthy_for_init`, see
         // `doc_routes_check`'s own doc comment.
@@ -3247,6 +5194,137 @@ pub(crate) mod doctor {
         }
     }
 
+    /// S2 V4 (owner-directed 2026-08-27): a directory *inside* a workflow
+    /// package that looks like a stage — it holds `CONTEXT.md`, `README.md`,
+    /// or its own `workflow.toml` — but is not named in that package's
+    /// declared `[workflow].stages` list is authoring drift: the directory
+    /// is really on disk, but no run will ever reach it (`check_stage_ids`,
+    /// `domain::workflow.rs`, only ever sees the declared list). Recurses
+    /// into a *declared* nested package (W1 §2/E1) against that package's
+    /// own `stages`, since the same drift can recur at any depth; an
+    /// entirely undeclared nested-package directory is not recursed into
+    /// further — one row names the whole unreachable subtree, since nothing
+    /// beneath it is reachable either.
+    ///
+    /// Warn, not fail: doctor's fail-closed rule is for a declaration that
+    /// is broken (a stage the loader cannot resolve); this is a directory
+    /// nobody declared anything about, broken or otherwise. A malformed
+    /// `workflow.toml` is silently skipped here — `workflows_check` and the
+    /// loader itself are where a parse failure is reported; this check only
+    /// ever adds warnings on top of a package it could parse.
+    fn undeclared_stage_dirs_check(estate_root: Option<&Path>) -> Check {
+        use crate::domain::workflow::{
+            CONTEXT_FILE, LOCAL_WORKFLOW_ROOT, WORKFLOW_FILE, WORKFLOW_ROOT,
+        };
+
+        const NAME: &str = "workflow_stage_declarations";
+
+        let Some(estate_root) = estate_root else {
+            return Check::ok(NAME, "not an estate root — nothing to check");
+        };
+
+        fn is_stage_shaped(dir: &Path) -> bool {
+            dir.join(CONTEXT_FILE).is_file()
+                || dir.join("README.md").is_file()
+                || dir.join(WORKFLOW_FILE).is_file()
+        }
+
+        fn declared_stages(package_dir: &Path) -> Option<std::collections::BTreeSet<String>> {
+            let text = std::fs::read_to_string(package_dir.join(WORKFLOW_FILE)).ok()?;
+            let value: toml::Value = toml::from_str(&text).ok()?;
+            let stages = value
+                .get("workflow")?
+                .get("stages")?
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            Some(stages)
+        }
+
+        /// `label` is the warning's own package-plus-path prefix — composed
+        /// as recursion descends into a declared nested package, so a warn
+        /// two levels deep still names the whole path from the package root
+        /// an operator would recognize.
+        fn scan(label: &str, package_dir: &Path, warnings: &mut Vec<String>) {
+            let Some(declared) = declared_stages(package_dir) else {
+                return;
+            };
+            let Ok(entries) = std::fs::read_dir(package_dir) else {
+                return;
+            };
+            let mut children: Vec<_> = entries.flatten().collect();
+            children.sort_by_key(|e| e.file_name());
+            for entry in children {
+                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let path = entry.path();
+                if !is_stage_shaped(&path) {
+                    continue;
+                }
+                let nested_package = path.join(WORKFLOW_FILE).is_file();
+                if declared.contains(&name) {
+                    if nested_package {
+                        scan(&format!("{label}/{name}"), &path, warnings);
+                    }
+                    continue;
+                }
+                if nested_package {
+                    warnings.push(format!(
+                        "{label}: {name}/ (undeclared nested workflow package — the whole subtree is unreachable)"
+                    ));
+                } else {
+                    warnings.push(format!("{label}: {name}/"));
+                }
+            }
+        }
+
+        let mut warnings = Vec::new();
+        for root in [WORKFLOW_ROOT, LOCAL_WORKFLOW_ROOT] {
+            let workflows_dir = estate_root.join(root);
+            let Ok(entries) = std::fs::read_dir(&workflows_dir) else {
+                continue;
+            };
+            let mut packages: Vec<_> = entries.flatten().collect();
+            packages.sort_by_key(|e| e.file_name());
+            for entry in packages {
+                if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    continue;
+                }
+                let path = entry.path();
+                if !path.join(WORKFLOW_FILE).is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                scan(&format!("{root}/{name}"), &path, &mut warnings);
+            }
+        }
+
+        if warnings.is_empty() {
+            Check::ok(
+                NAME,
+                "every stage-shaped directory is declared in its package's workflow.toml",
+            )
+        } else {
+            Check::warn(
+                NAME,
+                format!(
+                    "{} undeclared stage-shaped director{}: {}",
+                    warnings.len(),
+                    if warnings.len() == 1 { "y" } else { "ies" },
+                    warnings.join("; "),
+                ),
+                "declare it in workflow.toml's stages, or move it out of the package (e.g. \
+                 .sergeant/drafts/)",
+            )
+        }
+    }
+
     /// #261: does the *installed* corpus — `AGENTS.md`, every `skills/*/
     /// SKILL.md`, every `.sergeant/workflows/**/*.md`, and every
     /// `.sergeant/common/contexts/*.md` — cite only paths that actually
@@ -3257,8 +5335,17 @@ pub(crate) mod doctor {
     ///
     /// Two unconditional severities:
     /// - The literal substring `sergeant-rs-workspace` anywhere in the
-    ///   installed corpus is always a `Fail` — a route into a private,
-    ///   unshipped repository is wrong in principle for a consumer estate.
+    ///   sgt-owned corpus is a `Fail` — a route into a private, unshipped
+    ///   repository is wrong in principle for a consumer estate. #282: for
+    ///   `AGENTS.md` this is scoped to the `sgt:managed` block only — the
+    ///   rest of the file is user-authored content
+    ///   (`domain::distro::write_agents_md`'s own contract), and a consumer
+    ///   estate's own constitution citing its own paths is not this
+    ///   binary's mistake to fail on (found live on the dev workspace's own
+    ///   estate, whose `AGENTS.md` legitimately cites
+    ///   `sergeant-rs-workspace` paths because that estate IS that
+    ///   repository). A malformed `AGENTS.md` with no markers falls back to
+    ///   the whole file — fail closed, never a silent skip.
     /// - A dead `AGENTS.md ... step N` anchor cited anywhere when
     ///   `AGENTS.md` itself has no matching `step N` text.
     ///
@@ -3299,12 +5386,42 @@ pub(crate) mod doctor {
                 continue;
             };
             let rel = path.strip_prefix(estate_root).unwrap_or(path);
+            let is_agents_md = *path == estate_root.join("AGENTS.md");
 
-            if text.contains("sergeant-rs-workspace") {
+            // #282: `AGENTS.md` outside the `sgt:managed` block is
+            // user-authored (`domain::distro::write_agents_md`'s own
+            // contract) — a consumer estate's own constitution citing its
+            // own paths (including, on this very repo's dev estate, a path
+            // that happens to spell `sergeant-rs-workspace` because that IS
+            // this estate) is not sgt's mistake to fail on. Every other
+            // source here (`skills/`, `.sergeant/workflows/`,
+            // `.sergeant/common/contexts/`) is entirely sgt-owned, so the
+            // unconditional rule still applies to the whole file there.
+            // A malformed `AGENTS.md` with no markers at all falls back to
+            // checking the whole file — fail closed, never silently skip.
+            let workspace_check_text: &str = if is_agents_md {
+                match (
+                    text.find(crate::domain::distro::MANAGED_BEGIN),
+                    text.find(crate::domain::distro::MANAGED_END),
+                ) {
+                    (Some(begin), Some(end)) if begin <= end => {
+                        &text[begin..end + crate::domain::distro::MANAGED_END.len()]
+                    }
+                    _ => &text,
+                }
+            } else {
+                &text
+            };
+            if workspace_check_text.contains("sergeant-rs-workspace") {
                 fails.push(format!(
                     "{} cites `sergeant-rs-workspace` — a private, unshipped repository \
-                     path",
-                    rel.display()
+                     path{}",
+                    rel.display(),
+                    if is_agents_md {
+                        " (inside the sgt:managed block)"
+                    } else {
+                        ""
+                    }
                 ));
             }
 
@@ -4433,8 +6550,11 @@ pub(crate) mod doctor {
     /// §31: the disposable projection can be rebuilt from the journal.
     ///
     /// Built into a scratch directory, not the data dir: a live daemon owns
-    /// the real DuckDB file, and a diagnostic must not touch state it does
-    /// not own. What this proves is the property that matters — the fold from
+    /// the real database, and a diagnostic must not touch state it does not
+    /// own. Since S5 W1c that matters more, not less — the real file also
+    /// holds persisted source facts, so a diagnostic that rebuilt in place
+    /// would be dropping a schema in the operator's live store to answer a
+    /// question about whether a fold completes. What this proves is the property that matters — the fold from
     /// journal to projection completes — which is exactly what the daemon
     /// does on every start (§40: projections are disposable).
     fn projection_check(journal_ok: bool, events: Option<&[Event]>) -> Check {
@@ -4463,11 +6583,112 @@ pub(crate) mod doctor {
             Err(e) => Check::fail(
                 "projection",
                 format!("rebuild failed: {e}"),
-                "the analytical projection is disposable: stop the daemon, delete \
-                 `projections/` in the data dir, and start it again. If it still fails, the \
-                 journal is the source of truth and nothing has been lost",
+                "the operations tables are disposable: restart the daemon — it drops the \
+                 `ops` schema and re-folds it from the journal on every start. Do NOT delete \
+                 the Atlas database under `atlas/` in the data dir to force this: since S5 W1c \
+                 it also holds persisted source facts that no replay reproduces, and deleting \
+                 it would cost you a full re-scan. The journal is the source of truth and \
+                 nothing it carries has been lost",
             ),
         }
+    }
+
+    /// **F8's doctor row**: what Atlas has indexed, and what it could not.
+    ///
+    /// Coverage is the whole point of the row. A line that only counted
+    /// indexed files would be silent about the statuses an operator actually
+    /// needs surfaced — `excluded`, which is F10's secrets posture working;
+    /// `error`/`unavailable`, which is it failing; and `online_only`, which
+    /// is a cloud-sync placeholder that was correctly *not* opened (S4 Y6,
+    /// G7/A1-06) but still was not indexed — so all of them are reported,
+    /// and the ones that mean an operator is missing content they think they
+    /// have (`error`, `unavailable`, `online_only`) warn.
+    ///
+    /// Tallied over [`Coverage::ALL`] rather than a hand-picked subset of
+    /// statuses: a source whose coverage rows are entirely `online_only` (an
+    /// estate synced from a cloud client that has hydrated nothing) used to
+    /// tally zero in every counted bucket and print `ok` — indistinguishable
+    /// from "nothing to report", exactly the silent-gap failure this row
+    /// exists to prevent. Iterating the whole enum also means a coverage
+    /// status added later cannot repeat this omission by simply being
+    /// forgotten here.
+    ///
+    /// **A missing store is `ok`, not a warning.** An estate that has declared
+    /// no `[[knowledge]]` source has nothing to index, and a diagnostic that
+    /// nagged about an unused feature would train operators to ignore it.
+    /// This checks for the file first and never brings one into existence to
+    /// report on it — and once it exists, the open below is Atlas's
+    /// read-only constructor (S4 register row 12's rider), never the
+    /// read-write one the daemon uses: the daemon is Atlas's sole writer, so
+    /// the one caller outside the daemon that reads this store may not hold
+    /// a connection that could write it, "IF NOT EXISTS" DDL included.
+    fn atlas_coverage_check(data_dir: &Path) -> Check {
+        use crate::domain::source::Coverage;
+        use crate::runtime::atlas::db::{AtlasDb, atlas_db_path};
+
+        let path = atlas_db_path(data_dir);
+        if !path.exists() {
+            return Check::ok(
+                "atlas",
+                "no source has been indexed on this host yet (nothing to report)",
+            );
+        }
+        let sources = match AtlasDb::open_read_only(data_dir).and_then(|db| db.indexed_sources()) {
+            Ok(sources) => sources,
+            // Almost always a running daemon holding the store, which is not
+            // a fault: the daemon is the surface that can answer, and the row
+            // says so rather than reporting a failure that is really a lock.
+            Err(e) => {
+                return Check::warn(
+                    "atlas",
+                    format!("{} could not be read from here: {e}", path.display()),
+                    "a running daemon holds this store; ask it instead with \
+                     `sgt intelligence status`",
+                );
+            }
+        };
+        if sources.is_empty() {
+            return Check::ok(
+                "atlas",
+                "atlas is present; no source has a confirmed generation",
+            );
+        }
+        let total = |status: Coverage| -> u64 {
+            sources
+                .iter()
+                .filter_map(|s| s.coverage.get(status.as_str()))
+                .copied()
+                .sum()
+        };
+        let counts: Vec<(Coverage, u64)> = Coverage::ALL.iter().map(|&c| (c, total(c))).collect();
+        let detail = format!(
+            "{} source(s): {}",
+            sources.len(),
+            counts
+                .iter()
+                .map(|(c, n)| format!("{} {n}", c.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        // A named, reported gap in content an operator would otherwise
+        // believe they have (missing, unreadable, or unhydrated) warns.
+        // `generation_evicted` is excluded on purpose: an eviction is
+        // ordinary lifecycle (the source changed, or a crash-window rebuild
+        // ran), not a fault — it is tallied above for visibility, never for
+        // severity.
+        let reported_gap =
+            total(Coverage::Error) + total(Coverage::Unavailable) + total(Coverage::OnlineOnly);
+        if reported_gap > 0 {
+            return Check::warn(
+                "atlas",
+                detail,
+                "some paths could not be read or extracted, or were suspected cloud-sync \
+                 placeholders never opened for that reason (best-effort, honestly labelled — \
+                 see the coverage row's own `detail`); `sgt intelligence status` names the \
+                 source",
+            );
+        }
+        Check::ok("atlas", detail)
     }
 
     /// §31: the runtime descriptor and whether a daemon is actually behind it.
@@ -4546,10 +6767,271 @@ pub(crate) mod doctor {
         }
     }
 
+    /// H1 §2/#276: "if a supported Linux environment has no usable native
+    /// user service manager, `sgt doctor` names that missing host
+    /// prerequisite" — and macOS's `launchctl` gets the equivalent probe.
+    /// Reuses [`crate::platform::service::detect_systemd_status`]/
+    /// [`detect_launchd_status`] — the identical probe `sgt daemon
+    /// install-service`'s own enablement step runs, so the two can never
+    /// disagree about whether a manager is reachable. `Warn`, never `Fail`,
+    /// in every non-`Reachable` case: a dev host with no service manager is
+    /// legal (§17.5's degraded-daemon doctrine, the same posture `docker`'s
+    /// row already takes for a missing capability).
+    fn host_service_manager_check() -> Check {
+        #[cfg(target_os = "macos")]
+        {
+            let Some(uid) = super::macos_uid() else {
+                return Check::warn(
+                    "host_service_manager",
+                    "could not determine this user's UID (`id -u` failed)",
+                    "run `id -u` manually to see why the probe cannot run; without it launchd \
+                     reachability cannot be checked",
+                );
+            };
+            host_service_manager_report(
+                crate::platform::service::detect_launchd_status(uid),
+                "launchd",
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            host_service_manager_report(
+                crate::platform::service::detect_systemd_status(),
+                "a systemd user manager",
+            )
+        }
+    }
+
+    /// The three-way report shape [`host_service_manager_check`]'s two
+    /// platform arms share — so the wording (and the "dev hosts are legal"
+    /// posture) can never drift between them.
+    fn host_service_manager_report(
+        status: crate::platform::service::ManagerStatus,
+        name: &str,
+    ) -> Check {
+        use crate::platform::service::ManagerStatus;
+
+        match status {
+            ManagerStatus::Reachable => Check::ok(
+                "host_service_manager",
+                format!(
+                    "{name} is reachable — `sgt daemon install-service` can enable the \
+                     generated unit"
+                ),
+            ),
+            ManagerStatus::PresentNoUserSession { detail } => Check::warn(
+                "host_service_manager",
+                format!("{name} is present but not reachable from this session: {detail}"),
+                "the common bare SSH/cron shape (no user D-Bus/GUI session) — dev hosts are \
+                 legal without one; `sgt daemon install-service` still writes the unit/plist, \
+                 it just cannot enable it until a reachable session exists",
+            ),
+            ManagerStatus::Absent => Check::warn(
+                "host_service_manager",
+                format!("no {name} was found on PATH"),
+                "dev hosts are legal without one — `sgt daemon` in the foreground remains the \
+                 development/diagnostic path (H1 §2); `sgt daemon install-service` still writes \
+                 the unit/plist for later",
+            ),
+        }
+    }
+
+    /// H1 §6's cutover gate: does this estate still carry daemon state
+    /// under its own `.sergeant/data` from before a host runtime root
+    /// existed — `daemon.lock`/`runtime.json`/`journal/`, the exact three
+    /// markers [`daemon`]'s own module owns the names of. `Warn`, not
+    /// `Fail`, in this wave: cutover is not flipped until W2/W3 land (this
+    /// row exists and is tested ahead of that, per the brief).
+    fn legacy_estate_runtime_check(estate_root: Option<&Path>) -> Check {
+        let Some(estate_root) = estate_root else {
+            return Check::ok(
+                "legacy_estate_runtime",
+                "not an estate root — nothing to check",
+            );
+        };
+        // The cutover gate only makes sense once a host runtime root
+        // concept resolves at all on this host — reuses the exact same
+        // ladder `sgt daemon install-service` resolves against, never a
+        // second copy.
+        if super::resolve_host_runtime_dir(None, |name| std::env::var_os(name)).is_err() {
+            return Check::ok(
+                "legacy_estate_runtime",
+                "host runtime root does not resolve on this host (see the `environment` check \
+                 above) — nothing to compare against",
+            );
+        }
+        let legacy_dir = estate_root.join(crate::domain::manifest::DEFAULT_ESTATE_DATA_DIR);
+        let mut found = Vec::new();
+        if legacy_dir.join(daemon::DAEMON_LOCK_FILE).exists() {
+            found.push(daemon::DAEMON_LOCK_FILE.to_string());
+        }
+        if legacy_dir.join(daemon::DESCRIPTOR_FILE).exists() {
+            found.push(daemon::DESCRIPTOR_FILE.to_string());
+        }
+        if legacy_dir.join("journal").is_dir() {
+            found.push("journal/".to_string());
+        }
+        if found.is_empty() {
+            Check::ok(
+                "legacy_estate_runtime",
+                format!(
+                    "no estate-local daemon state found at {}",
+                    legacy_dir.display()
+                ),
+            )
+        } else {
+            Check::warn(
+                "legacy_estate_runtime",
+                format!(
+                    "estate-local daemon state still present at {}: {}",
+                    legacy_dir.display(),
+                    found.join(", "),
+                ),
+                "H1 §6's cutover gate — reconcile or abandon before relying on host mode: stop \
+                 any daemon still running against this estate-local data dir (`sgt daemon stop \
+                 --data-dir <that dir>`), let non-terminal Work drain or explicitly abandon it, \
+                 then re-submit under host mode once it is available; this row stays a warning, \
+                 not a failure, until cutover itself is flipped (W2/W3)",
+            )
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
         use crate::platform::fs_locking::Reliability;
+
+        fn write_package(root: &Path, rel: &str, name: &str, stages: &[&str]) -> PathBuf {
+            let dir = root.join(rel).join(name);
+            std::fs::create_dir_all(&dir).expect("package dir");
+            std::fs::write(
+                dir.join("workflow.toml"),
+                format!(
+                    "[workflow]\nname = {name:?}\nversion = \"1.0.0\"\nstages = [{}]\n",
+                    stages
+                        .iter()
+                        .map(|s| format!("{s:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+            .expect("write workflow.toml");
+            dir
+        }
+
+        fn write_context_stage(package_dir: &Path, id: &str) {
+            let dir = package_dir.join(id);
+            std::fs::create_dir_all(&dir).expect("stage dir");
+            std::fs::write(dir.join("CONTEXT.md"), "stage context\n").expect("write CONTEXT.md");
+        }
+
+        /// A package whose every stage-shaped directory is named in `stages`
+        /// stays silent — the "declared-everything package is silent"
+        /// acceptance case.
+        #[test]
+        fn a_fully_declared_package_warns_about_nothing() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["00-only"]);
+            write_context_stage(&package, "00-only");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Ok, "{check:?}");
+        }
+
+        /// One stage-shaped directory nobody declared warns, naming both the
+        /// package and the directory — the "one undeclared leaf dir warns"
+        /// acceptance case.
+        #[test]
+        fn an_undeclared_leaf_directory_warns_naming_package_and_directory() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["00-only"]);
+            write_context_stage(&package, "00-only");
+            write_context_stage(&package, "05-orphan");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Warn, "{check:?}");
+            assert!(
+                check.detail.contains("solo") && check.detail.contains("05-orphan"),
+                "must name both the package and the orphaned directory: {}",
+                check.detail
+            );
+            assert!(
+                check
+                    .remedy
+                    .as_deref()
+                    .is_some_and(|r| r.contains("stages")),
+                "{check:?}"
+            );
+        }
+
+        /// An undeclared directory that is itself a nested package (its own
+        /// `workflow.toml`) warns once, naming it as the whole unreachable
+        /// subtree rather than silently saying nothing about what's under
+        /// it — the "undeclared nested-package dir warns naming the whole
+        /// subtree" acceptance case.
+        #[test]
+        fn an_undeclared_nested_package_warns_naming_the_whole_subtree() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["00-only"]);
+            write_context_stage(&package, "00-only");
+            let orphan_nested = write_package(&package, ".", "05-orphan-nested", &["00-inner"]);
+            write_context_stage(&orphan_nested, "00-inner");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Warn, "{check:?}");
+            assert!(
+                check.detail.contains("05-orphan-nested") && check.detail.contains("subtree"),
+                "must name the undeclared nested package and call out the whole subtree: {}",
+                check.detail
+            );
+            assert!(
+                !check.detail.contains("00-inner"),
+                "an undeclared nested package's own contents are not enumerated separately — \
+                 one row names the whole subtree: {}",
+                check.detail
+            );
+        }
+
+        /// Declared nesting recurses: a *declared* nested package's own
+        /// undeclared leaf still warns, naming the full path from the
+        /// package root.
+        #[test]
+        fn a_declared_nested_packages_own_undeclared_leaf_still_warns() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["10-nested"]);
+            let nested = write_package(&package, ".", "10-nested", &["00-inner"]);
+            write_context_stage(&nested, "00-inner");
+            write_context_stage(&nested, "05-inner-orphan");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Warn, "{check:?}");
+            assert!(
+                check.detail.contains("10-nested") && check.detail.contains("05-inner-orphan"),
+                "must name the full nested path: {}",
+                check.detail
+            );
+        }
+
+        /// A dot-directory (`.git`, editor swap dirs) inside a package is
+        /// never mistaken for an undeclared stage.
+        #[test]
+        fn a_dot_directory_inside_a_package_is_skipped() {
+            let root = tempfile::TempDir::new().expect("tempdir");
+            let package = write_package(root.path(), ".sergeant/workflows", "solo", &["00-only"]);
+            write_context_stage(&package, "00-only");
+            write_context_stage(&package, ".hidden");
+
+            let check = undeclared_stage_dirs_check(Some(root.path()));
+            assert_eq!(check.status, Status::Ok, "{check:?}");
+        }
+
+        /// Outside an estate root, the check is silently a no-op — same
+        /// posture as every other estate-threaded row.
+        #[test]
+        fn outside_an_estate_root_the_check_is_a_silent_ok() {
+            let check = undeclared_stage_dirs_check(None);
+            assert_eq!(check.status, Status::Ok);
+        }
 
         /// #85, ADR 0003 D6: a confirmed-bad filesystem is `Fail`, and the
         /// remedy names the filesystem. Reverting the `Unreliable` match arm
@@ -5075,6 +7557,172 @@ pub(crate) mod doctor {
 mod tests {
     use super::*;
 
+    /// A bare-bones HTTP/1.1 responder for a fixed script of (method, path)
+    /// -> (status, body) triples, answered once each, in order. The
+    /// method/path label is documentation only, never read; the actual
+    /// server is the shared fixture at `crate::test_support::
+    /// spawn_scripted_http_server` (R2: one site for `cli`'s and `api`'s
+    /// scripted-HTTP-server tests, S6 client-request-retry).
+    fn spawn_scripted_http_server(script: Vec<(&'static str, u16, &'static str)>) -> String {
+        let script = script
+            .into_iter()
+            .map(|(_method_and_path, status, body)| (status, body))
+            .collect();
+        crate::test_support::spawn_scripted_http_server(script).0
+    }
+
+    /// F-IN-02: a **definitive** 404 (`unknown_scan`) from the daemon is
+    /// not the same fact as losing contact with it, and the poll loop must
+    /// not say the scan "may still be running" once the daemon has just
+    /// said it holds no record of it at all — the same defect this whole
+    /// front door was built to remove, restated in the other direction.
+    ///
+    /// Reverting the dedicated `ClientError::Api { status: 404, code:
+    /// "unknown_scan", .. }` arm (collapsing it back into the generic
+    /// `Err(e)` retry arm) makes this test fail: the error message would
+    /// read "may still be running" instead of "no record of scan".
+    #[tokio::test]
+    async fn a_definitive_unknown_scan_404_is_never_reported_as_may_still_be_running() {
+        let accepted = json!({
+            "scan_id": "01FAKESCAN00000000000000",
+            "total_sources": 1,
+            "state": "in_progress",
+            "scanned": [],
+        })
+        .to_string();
+        let not_found = json!({
+            "error": {
+                "code": "unknown_scan",
+                "message": "no scan 01FAKESCAN00000000000000 is tracked by this daemon",
+            }
+        })
+        .to_string();
+        let endpoint = spawn_scripted_http_server(vec![
+            (
+                "POST /v1/intelligence/scan",
+                202,
+                Box::leak(accepted.into_boxed_str()),
+            ),
+            (
+                "GET /v1/intelligence/scan/01FAKESCAN00000000000000",
+                404,
+                Box::leak(not_found.into_boxed_str()),
+            ),
+        ]);
+        let client = ApiClient::new(&endpoint, "fake-token").expect("client");
+
+        let err = run_intelligence_scan(&client, None, false)
+            .await
+            .expect_err("a 404 unknown_scan must surface as an error, not a silent success");
+        let message = err.to_string();
+        assert!(
+            message.contains("no record of scan"),
+            "must name the definitive 404 for what it is: {message}"
+        );
+        assert!(
+            !message.contains("may still be running"),
+            "a definitive 404 must never be reported with the lost-contact retry message: \
+             {message}"
+        );
+    }
+
+    /// A fake daemon that accepts a scan, then drops `hangups` consecutive
+    /// poll connections with no response at all (a real transport failure —
+    /// `reqwest` sees a connection reset, not a status code), before
+    /// finally answering `completed`. `hangups` is deliberately dialable
+    /// past the retired `POLL_FAILURES_TOLERATED = 5` so a test using a
+    /// count above it can only pass if nothing in the poll loop is still
+    /// counting.
+    fn spawn_flaky_scan_server(hangups: usize) -> String {
+        let scan_id = "01FLAKYSCAN000000000000000";
+        let accepted = json!({
+            "scan_id": scan_id,
+            "total_sources": 1,
+            "state": "in_progress",
+            "scanned": [],
+        })
+        .to_string();
+        let completed = json!({
+            "scan_id": scan_id,
+            "state": "completed",
+            "scanned": [{"name": "notes", "state": "unchanged"}],
+        })
+        .to_string();
+        let mut script: Vec<(&'static str, u16, &'static str)> = Vec::with_capacity(hangups + 2);
+        script.push((
+            "POST /v1/intelligence/scan",
+            202,
+            Box::leak(accepted.into_boxed_str()),
+        ));
+        // `hangups` hangup entries, each answered by the shared server's
+        // `status: 0` sentinel — see this function's own doc comment above.
+        for _ in 0..hangups {
+            script.push(("GET /v1/intelligence/scan/poll", 0, ""));
+        }
+        script.push((
+            "GET /v1/intelligence/scan/poll",
+            200,
+            Box::leak(completed.into_boxed_str()),
+        ));
+        spawn_scripted_http_server(script)
+    }
+
+    /// S6 scan-follow-retry, the AMENDMENT (owner, 2026-08-30): "A dropped
+    /// connection to a live daemon is retried indefinitely... Distinguish
+    /// the two by state, not by a count." Eight consecutive lost polls is
+    /// past the retired `POLL_FAILURES_TOLERATED = 5` bound; the daemon this
+    /// client is bound to (this test process's own PID) never stops being
+    /// alive, so the follow must keep going and see the scan complete
+    /// rather than declaring the daemon gone on the sixth failure.
+    #[tokio::test]
+    async fn a_run_of_lost_polls_against_a_live_daemon_is_retried_not_treated_as_the_daemon_being_gone()
+     {
+        let endpoint = spawn_flaky_scan_server(8);
+        let client = ApiClient::new(&endpoint, "fake-token")
+            .expect("client")
+            .with_pid(std::process::id());
+
+        run_intelligence_scan(&client, None, false).await.expect(
+            "eight lost polls against a provably live daemon must never end the follow; \
+                 the scan itself completed and the loop must have seen that",
+        );
+    }
+
+    /// The other half of the same rule: a poll failure against a daemon
+    /// whose PID has actually exited must end the follow immediately —
+    /// "by state, not by a count" cuts both ways. One lost poll is enough
+    /// once the state check itself says the daemon is gone; it must not
+    /// wait for a count that no longer exists.
+    #[tokio::test]
+    async fn a_lost_poll_against_a_daemon_whose_pid_has_exited_ends_the_follow_at_once() {
+        let mut dead = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        let dead_pid = dead.id();
+        dead.wait().expect("the process must have a pid to reap");
+        assert!(
+            !daemon::pid_alive(dead_pid),
+            "the reaped process must read as dead, or this test measures nothing"
+        );
+
+        // One accepted POST, one dropped poll, then nothing further — a
+        // second poll must never be sent once the state check already
+        // found the daemon gone.
+        let endpoint = spawn_flaky_scan_server(1_000_000);
+        let client = ApiClient::new(&endpoint, "fake-token")
+            .expect("client")
+            .with_pid(dead_pid);
+
+        let err = run_intelligence_scan(&client, None, false)
+            .await
+            .expect_err("a lost poll against a dead daemon's PID must end the follow, not retry");
+        let message = err.to_string();
+        assert!(
+            message.contains(&dead_pid.to_string()) && message.to_lowercase().contains("exited"),
+            "the refusal must name the pid and say it exited, not guess from a count: {message}"
+        );
+    }
+
     /// #96: a human-rendered transcript must show *when* each turn
     /// happened, not just what it said — the exact gap that let a
     /// ceiling-interrupted turn (#90) read as still in progress.
@@ -5187,5 +7835,134 @@ mod tests {
         );
         assert_eq!(list_state_label(&listed_work("failed", None)), "failed");
         assert_eq!(list_state_label(&listed_work("running", None)), "running");
+    }
+
+    /// D2/#80: `resolve_host_runtime_dir`'s ladder is `--data-dir` flag,
+    /// then `SGT_DATA_DIR`, then the platform fallback — the flag wins even
+    /// when both env and `HOME` would resolve to something else, mirroring
+    /// `resolve_data_dir`'s own flag>env>* precedence with no estate rung at
+    /// all (the host runtime root never depends on cwd or an estate).
+    #[test]
+    fn resolve_host_runtime_dir_flag_outranks_env_and_fallback() {
+        let probe = |name: &str| match name {
+            "SGT_DATA_DIR" => Some(OsString::from("/env/data")),
+            "HOME" => Some(OsString::from("/home/x")),
+            _ => None,
+        };
+        let (dir, source) =
+            resolve_host_runtime_dir(Some(PathBuf::from("/flag/data")), probe).unwrap();
+        assert_eq!(dir, PathBuf::from("/flag/data"));
+        assert_eq!(source, DataDirSource::Flag);
+    }
+
+    /// `SGT_DATA_DIR` outranks the platform fallback tail when no flag is
+    /// given — the second rung of the same ladder.
+    #[test]
+    fn resolve_host_runtime_dir_env_outranks_the_platform_fallback() {
+        let probe = |name: &str| match name {
+            "SGT_DATA_DIR" => Some(OsString::from("/env/data")),
+            "HOME" => Some(OsString::from("/home/x")),
+            _ => None,
+        };
+        let (dir, source) = resolve_host_runtime_dir(None, probe).unwrap();
+        assert_eq!(dir, PathBuf::from("/env/data"));
+        assert_eq!(source, DataDirSource::Env);
+    }
+
+    /// With neither flag nor `SGT_DATA_DIR` set, the ladder falls all the
+    /// way through to `platform::data_dir::fallback_dir` — the same
+    /// pre-estate tail `resolve_data_dir` reaches at its own last rung
+    /// (#82). Asserting equality against `fallback_dir`'s own result
+    /// (rather than a hardcoded path) keeps this test honest under
+    /// whichever convention (`CURRENT`) the host actually compiles for, and
+    /// exercises both-conventions discipline (ADR 0002 D3) by delegating
+    /// rather than re-deriving a second copy of the freedesktop/macOS
+    /// branch here — `platform::data_dir`'s own tests are what actually
+    /// exercise the `MACOS` arm on a non-macOS host.
+    #[test]
+    fn resolve_host_runtime_dir_falls_through_to_the_platform_fallback() {
+        let probe = |name: &str| {
+            if name == "HOME" {
+                Some(OsString::from("/home/x"))
+            } else {
+                None
+            }
+        };
+        let (dir, source) = resolve_host_runtime_dir(None, probe).unwrap();
+        assert_eq!(source, DataDirSource::PlatformFallback);
+        assert_eq!(dir, crate::platform::data_dir::fallback_dir(probe).unwrap());
+    }
+
+    /// W4c panel finding: `spawn_daemon_error` used to have no test proving
+    /// either half of #275's own deliverable actually happens. This drives
+    /// [`spawn_daemon_error_with`] — the injectable core — with a `NotFound`
+    /// error and a `home` whose `.cargo/bin` exists but is absent from
+    /// `path`, then checks *both* halves against the one call: the returned
+    /// message names the missing dir (the diagnostic half), and the exact
+    /// same reason is what landed in the log file (the logging half).
+    /// Deleting the `path_diagnostic` computation (reverting it to always
+    /// `None`) fails the first assertion; deleting the `writeln!` in
+    /// `spawn_daemon_error_with` (reverting the logging half) fails the
+    /// second — each half is independently revert-sensitive.
+    #[test]
+    fn spawn_daemon_error_names_missing_path_dirs_in_both_message_and_log() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".cargo").join("bin")).expect("mk .cargo/bin");
+        let log_path = tmp.path().join("daemon.log");
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open log");
+
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let err = spawn_daemon_error_with(
+            e,
+            log,
+            Some(&home),
+            None, // PATH carries none of the toolchain dirs
+            |d| d.exists(),
+        );
+
+        let message = err.to_string();
+        assert!(
+            message.contains(".cargo/bin") && message.contains("not on PATH"),
+            "message must name the missing PATH dir: {message}"
+        );
+
+        let logged = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(
+            logged.contains("spawn failed:") && logged.contains(".cargo/bin"),
+            "log must carry the same named reason: {logged}"
+        );
+        assert!(
+            logged.contains(&message),
+            "log's reason must match the returned message exactly: log={logged} message={message}"
+        );
+    }
+
+    /// The counterpart to the test above: when none of the toolchain dirs
+    /// exist on disk, `spawn_daemon_error_with` must not fabricate a
+    /// diagnostic — the plain `io::Error` text is the whole message, and
+    /// that same plain text is still what reaches the log.
+    #[test]
+    fn spawn_daemon_error_adds_no_diagnostic_when_no_toolchain_dirs_exist() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let home = tmp.path().join("home-without-toolchain-dirs");
+        let log_path = tmp.path().join("daemon.log");
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("open log");
+
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let err = spawn_daemon_error_with(e, log, Some(&home), None, |d| d.exists());
+
+        let message = err.to_string();
+        assert_eq!(message, "cannot spawn daemon: No such file or directory");
+        let logged = std::fs::read_to_string(&log_path).expect("read log");
+        assert!(logged.contains(&message), "log must match: {logged}");
     }
 }

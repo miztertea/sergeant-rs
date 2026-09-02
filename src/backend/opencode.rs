@@ -187,6 +187,7 @@ use super::{
     ExecutionHandle, NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport,
     ResumeRequest, RuntimeScope, StartRequest,
 };
+use crate::backend::child;
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::profile::Profile;
 use crate::platform::process::ProcessArgv;
@@ -2225,6 +2226,10 @@ impl OpencodeBackend {
         let mut command = Command::new(exe);
         command.args(args).stdin(Stdio::null());
         apply_env(&mut command, &self.config.env, None);
+        // #310: `output()` waits, so this child cannot outlive *this call* —
+        // but it can outlive a daemon SIGKILLed during the call, and a
+        // `--help` that never returns is exactly how one gets stuck there.
+        child::harden_probe_child(&mut command);
         let out = command.output().map_err(|e| {
             format!(
                 "capability probe: cannot run {exe:?} {}: {e} (kind: {:?})",
@@ -2244,6 +2249,7 @@ impl OpencodeBackend {
         let mut version_command = Command::new(exe);
         version_command.arg("--version").stdin(Stdio::null());
         apply_env(&mut version_command, &self.config.env, None);
+        child::harden_probe_child(&mut version_command);
         let version_out = match version_command.output() {
             Ok(out) => out,
             Err(e) => {
@@ -2397,9 +2403,20 @@ impl OpencodeBackend {
     /// (`OnceLock`) means this runs at most once per backend either way, so
     /// the extra thread costs nothing that matters.
     fn run_serve_gates(&self) -> ServeGates {
+        // #310: a thread-local does not cross `thread::spawn`, and the probe
+        // walk installs its probe-child owner on the thread it calls
+        // `probe()` from — so the owner is carried across this isolation
+        // boundary by hand. Without this the serve gate's child would still
+        // be hardened (it is spawned through `harden_probe_child` either
+        // way) but invisible to `ProbeChildren::kill_all`, and the daemon's
+        // own `kill` could not reach it.
+        let owner = child::owner();
         std::thread::scope(|scope| {
             scope
-                .spawn(|| self.run_serve_gates_inner())
+                .spawn(move || match owner {
+                    Some(owner) => child::owned_by(owner, || self.run_serve_gates_inner()),
+                    None => self.run_serve_gates_inner(),
+                })
                 .join()
                 .unwrap_or_else(|panic| ServeGates {
                     result: Err(format!(
@@ -2465,6 +2482,9 @@ impl OpencodeBackend {
             self.config.config_content.as_deref(),
             &password,
             readiness,
+            // #310: this child exists only until the fingerprint below is
+            // computed, and must not survive a daemon that dies before then.
+            child::ChildLifetime::Probe,
         );
         let (mut child, base_url) = match spawn {
             Ok(pair) => pair,
@@ -2595,7 +2615,26 @@ impl OpencodeBackend {
     ///   conversation to stay under it, and whether `run -s … --agent …`
     ///   does that was never measured — the same failure `codex.rs` refuses
     ///   `codex_profile` over.
-    fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
+    ///
+    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`]),
+    /// merged **after** the profile so a workflow-authored `Profile.env` key
+    /// cannot shadow what sergeant itself intended to send. It is folded into
+    /// the resolved `env` map here rather than added as a third parameter to
+    /// [`Self::apply_env`], which is deliberately generic over "whatever env
+    /// map was resolved" so a probe call and a turn can never read two
+    /// different configurations — a probe reaches `apply_env` with the map
+    /// this function never touched. RESUME rebuilds the triple via
+    /// [`crate::backend::resume_causation_env`] from
+    /// `ResumeRequest::estate_root` (re-supplied, S2 E6) and the execution id
+    /// on the `handle` every `resume()` already receives — the resolved env
+    /// this produces is what every later turn on the execution reuses, so an
+    /// empty map here silently dropped causation for the rest of the
+    /// execution's life, not only for the reconciliation snapshot.
+    fn launch_config(
+        &self,
+        profile: Option<&Profile>,
+        causation: &BTreeMap<String, String>,
+    ) -> Result<LaunchConfig, BackendError> {
         if let Some(profile) = profile {
             if profile.config_home.is_some() {
                 return Err(self.err_failed(format!(
@@ -2628,6 +2667,9 @@ impl OpencodeBackend {
             for (key, value) in &profile.env {
                 env.insert(key.clone(), value.clone());
             }
+        }
+        for (key, value) in causation {
+            env.insert(key.clone(), value.clone());
         }
         Ok(LaunchConfig { executable, env })
     }
@@ -2979,7 +3021,10 @@ impl OpencodeBackend {
     /// adapter state is removed on every error path.
     fn launch_run(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
         let request = &prepared.request;
-        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let LaunchConfig { executable, env } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         {
             let mut state = self.lock();
             state.executions.insert(
@@ -3066,7 +3111,10 @@ impl OpencodeBackend {
         prepared: &PreparedExecution,
     ) -> Result<ExecutionHandle, BackendError> {
         let request = &prepared.request;
-        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let LaunchConfig { executable, env } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         let budgets = self.config.serve_budgets.unwrap_or_default();
         let config_content = self.config.config_content.clone();
         let password = opencode_serve::mint_server_password();
@@ -3078,6 +3126,10 @@ impl OpencodeBackend {
             config_content.as_deref(),
             &password,
             budgets.readiness,
+            // Owned for the whole execution (§3.1), so deliberately *not*
+            // hardened: `PR_SET_PDEATHSIG` fires on the spawning thread's
+            // death, and this thread returns long before the turn ends.
+            child::ChildLifetime::Execution,
         )
         .map_err(|e| self.err_failed(format!("serve launch refused (phase: spawn): {e}")))?;
 
@@ -3543,46 +3595,16 @@ fn observe_serve(runtime: &ServeRuntime) -> Observation {
     }
 }
 
-/// Kill a turn's whole process group (mirrors `codex.rs::kill_process_group`,
-/// §5.5): `SIGKILL` to the negated group id recorded at spawn, through a
-/// shell rather than a `libc`/`nix` dependency for one signal (R5). Through
-/// `/bin/sh -c` specifically, not by spawning `kill` as a program: `kill` is
-/// a shell builtin every POSIX shell has, while `kill(1)` as an executable on
-/// `PATH` is a package a host need not install, and `Command::new("kill")`
-/// fails with `ENOENT` on such a host — a silent no-op if the caller drops
-/// the result.
+/// Kill a turn's whole process group, by the pgid recorded at spawn (§5.5).
 ///
-/// Nothing gates this on the leader being alive, and that is the whole
-/// point: the group routinely outlives its leader (a command the turn
-/// started in the background survives the opencode process once it has
-/// exited and been reaped — exactly probe 11's finding), so the group id is
-/// signalled unconditionally and `ESRCH` (an already-empty group) is
-/// success, not an error to report.
+/// One line, because #310 moved the implementation to
+/// [`crate::backend::child::kill_process_group`] — three adapters carried a
+/// byte-identical private copy of it and the probe path needed a fourth (R2).
+/// The behaviour and every reason for it are documented there; this alias
+/// stays so the call sites in this module keep reading as adapter-local
+/// vocabulary.
 fn kill_process_group(pgid: Option<u32>) {
-    let Some(pgid) = pgid else { return };
-    #[cfg(unix)]
-    {
-        if let Err(e) = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("kill -KILL -{pgid}"))
-            .output()
-        {
-            tracing::warn!(
-                pgid,
-                error = %e,
-                "could not run the process-group kill; the turn's direct child is all that \
-                 INTERRUPT reached — any commands it spawned may still be running"
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tracing::warn!(
-            pgid,
-            "no process-group signal mechanism on this platform; killing only the direct \
-             child — any commands it spawned may still be running"
-        );
-    }
+    crate::backend::child::kill_process_group(pgid);
 }
 
 /// The group kill above plus `Child::kill()` on the direct child as a belt,
@@ -4487,7 +4509,10 @@ impl Backend for OpencodeBackend {
         }
         // Validated without keeping the result: LAUNCH re-resolves it, so the
         // two phases can never disagree about it.
-        self.launch_config(request.profile.as_ref())?;
+        self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         Ok(PreparedExecution {
             execution_id: request.execution_id.clone(),
             native_id: None,
@@ -4649,7 +4674,10 @@ impl Backend for OpencodeBackend {
                 return Ok(());
             }
         }
-        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let LaunchConfig { executable, env } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::resume_causation_env(request, &handle.execution_id),
+        )?;
         if run_export(
             &executable,
             &request.cwd,
@@ -5092,6 +5120,7 @@ mod tests {
             execute: None,
             instruction_policy: Default::default(),
             bindings,
+            estate_root: None,
         }
     }
 
@@ -5589,10 +5618,12 @@ mod tests {
         let processes = vec![
             ProcessArgv {
                 pid: 1,
+                ppid: None,
                 argv: vec!["run".to_string(), "-s".to_string(), "ses_abc".to_string()],
             },
             ProcessArgv {
                 pid: 2,
+                ppid: None,
                 argv: vec!["run".to_string(), "-s".to_string(), "ses_abc".to_string()],
             },
         ];

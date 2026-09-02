@@ -1,0 +1,37 @@
+[
+  {
+    "byte_start": 0,
+    "byte_end": 733,
+    "line_start": 1,
+    "line_end": 29,
+    "content": "//! A small synthetic Rust fixture for the chunker corpus, not lifted from\n//! any real source file. ASCII-only by construction, so char offsets and\n//! byte offsets coincide (see build_chunk_fixtures.py's own note).\n\nuse std::collections::HashMap;\n\n/// One entry the ledger tracks.\npub struct Entry {\n    pub key: String,\n    pub value: i64,\n    pub tag: Option<String>,\n}\n\nimpl Entry {\n    pub fn new(key: &str, value: i64) -> Self {\n        Entry {\n            key: key.to_string(),\n            value,\n            tag: None,\n        }\n    }\n\n    pub fn with_tag(mut self, tag: &str) -> Self {\n        self.tag = Some(tag.to_string());\n        self\n    }\n}\n\n/// A tiny in-memory ledger used only to give the chunker something with\n"
+  },
+  {
+    "byte_start": 733,
+    "byte_end": 1124,
+    "line_start": 30,
+    "line_end": 44,
+    "content": "/// real shape: several functions, a struct, an enum, and a small amount of\n/// control flow, spread across enough bytes to force at least one merge\n/// boundary at the desired chunk length.\npub struct Ledger {\n    entries: HashMap<String, Entry>,\n    total: i64,\n}\n\n#[derive(Debug, Clone, PartialEq, Eq)]\npub enum LedgerError {\n    NotFound(String),\n    DuplicateKey(String),\n}\n\nimpl Ledger"
+  },
+  {
+    "byte_start": 1125,
+    "byte_end": 1867,
+    "line_start": 44,
+    "line_end": 69,
+    "content": "{\n    pub fn new() -> Self {\n        Ledger {\n            entries: HashMap::new(),\n            total: 0,\n        }\n    }\n\n    pub fn insert(&mut self, entry: Entry) -> Result<(), LedgerError> {\n        if self.entries.contains_key(&entry.key) {\n            return Err(LedgerError::DuplicateKey(entry.key.clone()));\n        }\n        self.total += entry.value;\n        self.entries.insert(entry.key.clone(), entry);\n        Ok(())\n    }\n\n    pub fn remove(&mut self, key: &str) -> Result<Entry, LedgerError> {\n        match self.entries.remove(key) {\n            Some(entry) => {\n                self.total -= entry.value;\n                Ok(entry)\n            }\n            None => Err(LedgerError::NotFound(key.to_string())),\n        }\n    }"
+  },
+  {
+    "byte_start": 1873,
+    "byte_end": 2419,
+    "line_start": 71,
+    "line_end": 93,
+    "content": "pub fn total(&self) -> i64 {\n        self.total\n    }\n\n    pub fn tagged(&self, tag: &str) -> Vec<&Entry> {\n        let mut out = Vec::new();\n        for entry in self.entries.values() {\n            if entry.tag.as_deref() == Some(tag) {\n                out.push(entry);\n            }\n        }\n        out\n    }\n}\n\nfn describe(error: &LedgerError) -> String {\n    match error {\n        LedgerError::NotFound(key) => format!(\"no such entry: {key}\"),\n        LedgerError::DuplicateKey(key) => format!(\"duplicate key: {key}\"),\n    }\n}\n\n#[cfg(test)]"
+  },
+  {
+    "byte_start": 2420,
+    "byte_end": 3060,
+    "line_start": 94,
+    "line_end": 114,
+    "content": "mod tests {\n    use super::*;\n\n    #[test]\n    fn insert_then_remove_round_trips() {\n        let mut ledger = Ledger::new();\n        ledger.insert(Entry::new(\"a\", 10)).unwrap();\n        assert_eq!(ledger.total(), 10);\n        let removed = ledger.remove(\"a\").unwrap();\n        assert_eq!(removed.value, 10);\n        assert_eq!(ledger.total(), 0);\n    }\n\n    #[test]\n    fn duplicate_insert_is_an_error() {\n        let mut ledger = Ledger::new();\n        ledger.insert(Entry::new(\"a\", 1)).unwrap();\n        let err = ledger.insert(Entry::new(\"a\", 2)).unwrap_err();\n        assert_eq!(err, LedgerError::DuplicateKey(\"a\".to_string()));\n    }\n}"
+  }
+]

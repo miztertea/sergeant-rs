@@ -1,0 +1,16 @@
+# Hand-counted TOML fixture for the F5 corpus gate.
+schema = 1
+name = "fixture"
+
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[server.tls]
+enabled = false
+
+[[repo]]
+name = "alpha"
+
+[[repo]]
+name = "beta"

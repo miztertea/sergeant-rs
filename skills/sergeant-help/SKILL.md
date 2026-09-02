@@ -70,10 +70,17 @@ Every row below names a primary source that resolves inside any estate
    `run`, `work`, `respond`, `retry`, `extend`, `cancel`, `watch`,
    `analytics`, `tui`, `doctor`, `init`, `repo`, `group`. Bare `sgt` (no
    subcommand) is a homepage, not a listed subcommand (ADR 0010); the
-   embedded dashboard and its `web` verb are gone (ADR 0011). Every
-   subcommand but `init` and `doctor` is estate-scoped: run it from the
-   exact estate root, or name that root with the global `-C <estate-root>`
-   instead of `cd`-ing there — reading `--help` itself never needs either.
+   embedded dashboard and its `web` verb are gone (ADR 0011). `init` and
+   `doctor` need no estate at all; `status`, `tui`, `work show`/`list`/
+   `transcript`, `watch`, and every `daemon` verb are host-scoped (H1 §5) —
+   they reach the one host daemon from any directory, no estate root
+   required (`watch` still defaults to the addressed estate's events when
+   cwd/`-C` is one, `--all` widens it). Every other subcommand (`run`,
+   `respond`, `retry`, `extend`, `cancel`, `work reap`/`sweep`/`retained`,
+   `analytics`, `repo`, `group`, `workflow`) is estate-scoped: run it from
+   the exact estate root, or name that root with the global
+   `-C <estate-root>` instead of `cd`-ing there — reading `--help` itself
+   never needs any of this.
 5. Answer with the exact command, required preconditions, expected evidence,
    and links to repository-relative documentation paths.
 6. If sources disagree, use this precedence:
@@ -111,7 +118,7 @@ confirmation for them and the user explicitly requested them.
 |---|---|
 | Primary document missing | Report its expected path and stop before guessing. |
 | Command behavior differs from documentation | Report the mismatch, trust the measured `--help`/observed behavior, and name the stale doc as a fix candidate — don't silently paper over it. |
-| A command the user ran refused with the root gate ("no estate found in ...", or "this command must be run from the estate root") | Say plainly what the refusal means — sergeant does not search parent directories for an estate and does not fall back to a plain Git checkout — and repeat the remedy the refusal itself names: `cd <estate-root>`, `sgt -C <estate-root> <command>`, or `sgt init` if this directory should become an estate. Never suggest running the command from a parent, a `repos/<name>` mount, or a Work surface; only `sgt --help`, `--version`, `sgt init`, and `sgt doctor` work outside an estate at all. |
+| A command the user ran refused with the root gate ("no estate found in ...", or "this command must be run from the estate root") | Say plainly what the refusal means — sergeant does not search parent directories for an estate and does not fall back to a plain Git checkout — and repeat the remedy the refusal itself names: `cd <estate-root>`, `sgt -C <estate-root> <command>`, or `sgt init` if this directory should become an estate. Never suggest running the command from a parent, a `repos/<name>` mount, or a Work surface; the root gate applies only to estate-scoped commands — `sgt --help`, `--version`, `sgt init`, `sgt doctor`, and the host-scoped bucket (`sgt status`, `sgt tui`, `sgt work show`/`list`/`transcript`, `sgt watch`, every `sgt daemon` verb) all work outside an estate too. |
 | A submission was refused by the Git preflight (a dirty or detached `repos/<name>` mount) | Report the mount's own named remedy verbatim — commit or stash it (`git -C <mount> status`), or check it out onto the intended branch (`git -C <mount> switch <branch>`). Name `--override-git-preflight` only as what it is: a per-submission waiver of a dirty or detached mount and nothing else, basing the Work on the committed HEAD; it is unavailable when the mount has no commit to pin, and it never waives any other preflight finding. |
 | Question actually requires estate/repo state | Load `estate-navigation` (`sgt repo list`, `sgt doctor`) rather than answering from memory. |
 | Question actually requires submitting or mutating work | Hand off per `AGENTS.md`'s routing table / `sgt run`; this skill stays strictly read-only. |

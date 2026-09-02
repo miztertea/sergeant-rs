@@ -1,0 +1,26 @@
+A small synthetic plain-text fixture for the chunker corpus.
+
+This file exists only to exercise the line-fallback path: no tree-sitter
+grammar applies to plain text, so the chunker must fall back to merging
+whole lines up to the desired chunk length instead of walking a parse
+tree. ASCII-only, like the other fixtures in this corpus, so char offsets
+and byte offsets coincide and the golden data captured from semble's own
+chunker is directly comparable to this port's byte-offset output.
+
+The content below is filler, repeated with small variations so the file
+is long enough to force at least one merge boundary at the desired chunk
+length of seven hundred fifty characters, without being anywhere near the
+size of a real source file.
+
+Paragraph one talks about ledgers. A ledger holds entries. Each entry has
+a key, a value, and an optional tag. Entries can be inserted, removed, and
+looked up by tag. None of this is real, it only needs a rough shape.
+
+Paragraph two talks about chunkers. A chunker takes bytes and a language
+and returns a list of chunks. Each chunk has text, a byte span, and a
+line span. The chunker should not care what the bytes mean, only how long
+each candidate span is relative to the desired chunk length.
+
+Paragraph three is the last one. It exists purely to push the file past
+the point where a single merge boundary is not enough, so the golden data
+this fixture produces actually exercises more than one output chunk.

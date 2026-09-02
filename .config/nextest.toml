@@ -1,0 +1,65 @@
+# Repository-wide nextest configuration (`.config/nextest.toml` at the Cargo
+# workspace root — nextest's own documented location for checked-in,
+# shared-with-every-user config). CI runs a bare `cargo nextest run --locked`
+# (`.github/workflows/ci.yml`) with `cargo-nextest@0.9.99` pinned in the same
+# job, so everything here must be valid for that version and must apply to the
+# `default` profile: CI names no profile, and neither does a developer typing
+# `cargo nextest run`.
+
+# --- The one heavy test in the suite, scheduled alone (#258) -----------------
+#
+# `m7_docker_executor::large_captured_output_does_not_grow_this_process_
+# proportionally` streams ~256 MiB of combined stdout/stderr out of a real
+# container through the capture path. Measured on this repo's own CI on
+# 2026-08-29, three unrelated suites failed in the same job *while that test
+# was running long beside them*:
+#
+#   estate_routes::get_doctor_matches_the_shape_sgt_doctor_json_already_prints
+#       -> Transport("error sending request") after >60 s
+#   m9_watch::w7_stream_closure_is_honest_and_never_restarts_the_daemon
+#       -> daemon_pids().len() == 2, expected 1
+#   y6a_estate_scoped_scan::a_registered_repository_is_scanned_through_the_
+#       git_path_and_map_symbol_resolves_a_real_function
+#       -> reqwest .../v1/intelligence/scan TimedOut
+#
+# All three pass in isolation. The heavy test itself took 283.3 s in that job
+# against 88.6 s solo, so it was being starved *and* starving everything
+# beside it.
+#
+# `threads-required = "num-test-threads"` reserves the entire thread budget
+# nextest is running with, so this test is scheduled with no siblings at all.
+#
+# DELIBERATELY NOT A TEST GROUP. A `[test-groups]` entry's `max-threads` caps
+# concurrency *within* the group; this test's problem is contention with
+# everything *outside* any group it could belong to, which a group cannot
+# express. Do not "simplify" this into a group — it would not do the same
+# thing.
+#
+# The filter is the narrowest one that works: this single test, in this single
+# binary. The rest of `m7_docker_executor` (the next-slowest test in it is
+# ~22 s) keeps running in parallel with the suite.
+[[profile.default.overrides]]
+filter = 'binary_id(=sergeant-rs::m7_docker_executor) and test(=large_captured_output_does_not_grow_this_process_proportionally)'
+threads-required = "num-test-threads"
+
+# --- The two real-daemon+semantic-model tests, scheduled alone (S6
+#     pidless-and-related, seam 3) --------------------------------------------
+#
+# `s6_semantic_crossing::a_real_search_through_the_daemon_answers_inside_
+# sgts_own_budget` and `a_search_over_an_index_with_no_stored_vectors_says_
+# so_at_the_crossing` each start a real daemon and load a real semantic
+# model. Both pass solo (this lane, `9bf1eda6`: ~70 s and ~72 s, matching
+# `brief-pidless-and-related.md`'s cited ~71 s), and both hit nextest's own
+# external 120 s TIMEOUT under full-suite thread contention
+# (`/var/tmp/sgt-test-tmp/fullsweep-full.log`, this lane, same head:
+# `TERMINATING [>120.000s]` / `TIMEOUT [ 120.0xxs]` for each, twice in that
+# log). That is exactly #258's starvation shape above — a heavy test
+# competing for the same thread budget as everything scheduled beside it —
+# not a defect in either test.
+#
+# Same remedy, same reason a `[test-groups]` entry would not do the same
+# thing: `threads-required = "num-test-threads"` reserves the whole thread
+# budget so both are scheduled with no siblings.
+[[profile.default.overrides]]
+filter = 'binary_id(=sergeant-rs::s6_semantic_crossing) and (test(=a_real_search_through_the_daemon_answers_inside_sgts_own_budget) or test(=a_search_over_an_index_with_no_stored_vectors_says_so_at_the_crossing))'
+threads-required = "num-test-threads"

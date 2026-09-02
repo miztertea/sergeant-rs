@@ -1,0 +1,23 @@
+[
+  {
+    "byte_start": 0,
+    "byte_end": 221,
+    "line_start": 1,
+    "line_end": 14,
+    "content": "# A small synthetic Python fixture for the chunker corpus. ASCII-only.\n\nimport json\nfrom dataclasses import dataclass, field\n\n\n@dataclass\nclass Entry:\n    key: str\n    value: int\n    tag: str | None = None\n\n\nclass Ledger:"
+  },
+  {
+    "byte_start": 226,
+    "byte_end": 935,
+    "line_start": 15,
+    "line_end": 35,
+    "content": "\"\"\"A tiny in-memory ledger, only for corpus shape.\"\"\"\n\n    def __init__(self):\n        self.entries: dict[str, Entry] = {}\n        self.total = 0\n\n    def insert(self, entry: Entry) -> None:\n        if entry.key in self.entries:\n            raise KeyError(f\"duplicate key: {entry.key}\")\n        self.entries[entry.key] = entry\n        self.total += entry.value\n\n    def remove(self, key: str) -> Entry:\n        if key not in self.entries:\n            raise KeyError(f\"no such entry: {key}\")\n        entry = self.entries.pop(key)\n        self.total -= entry.value\n        return entry\n\n    def tagged(self, tag: str) -> list[Entry]:\n        return [entry for entry in self.entries.values() if entry.tag == tag]"
+  },
+  {
+    "byte_start": 941,
+    "byte_end": 1504,
+    "line_start": 37,
+    "line_end": 58,
+    "content": "def to_json(self) -> str:\n        return json.dumps(\n            {key: entry.value for key, entry in self.entries.items()}\n        )\n\n\ndef describe(error: KeyError) -> str:\n    return f\"ledger error: {error}\"\n\n\ndef load_from_dict(data: dict) -> Ledger:\n    ledger = Ledger()\n    for key, value in data.items():\n        ledger.insert(Entry(key=key, value=value))\n    return ledger\n\n\nif __name__ == \"__main__\":\n    ledger = Ledger()\n    ledger.insert(Entry(key=\"a\", value=10))\n    ledger.insert(Entry(key=\"b\", value=20, tag=\"important\"))\n    print(ledger.to_json())"
+  }
+]

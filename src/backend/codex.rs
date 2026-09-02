@@ -124,6 +124,7 @@ use super::{
     ExecutionHandle, NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport,
     ResumeRequest, RuntimeScope, StartRequest,
 };
+use crate::backend::child;
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::profile::Profile;
 use crate::platform::process::ProcessArgv;
@@ -2823,7 +2824,7 @@ impl CodexBackend {
 
     fn run_probe(&self) -> ProbeOutcome {
         let exe = &self.config.executable;
-        let version_out = match Command::new(exe).arg("--version").output() {
+        let version_out = match probe_output(exe, &["--version"]) {
             Ok(out) => out,
             Err(e) => {
                 return ProbeOutcome {
@@ -2860,7 +2861,7 @@ impl CodexBackend {
             VersionProvenance::BelowFloor
         };
 
-        let exec_help = match Command::new(exe).args(["exec", "--help"]).output() {
+        let exec_help = match probe_output(exe, &["exec", "--help"]) {
             Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
             Err(e) => {
                 return ProbeOutcome {
@@ -2875,10 +2876,7 @@ impl CodexBackend {
                 };
             }
         };
-        let resume_help = match Command::new(exe)
-            .args(["exec", "resume", "--help"])
-            .output()
-        {
+        let resume_help = match probe_output(exe, &["exec", "resume", "--help"]) {
             Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
             Err(e) => {
                 return ProbeOutcome {
@@ -2995,10 +2993,7 @@ impl CodexBackend {
     }
 
     fn run_auth_probe(&self) -> AuthState {
-        match Command::new(&self.config.executable)
-            .args(["login", "status"])
-            .output()
-        {
+        match probe_output(&self.config.executable, &["login", "status"]) {
             // Re-measured while wiring the live suite (this is *not* what an
             // interactive shell shows): `codex login status` writes its
             // answer to **stderr**, not stdout, when it is not attached to a
@@ -3058,9 +3053,7 @@ impl CodexBackend {
     /// `stdio://`. Token-free.
     fn gate_g1_help(&self) -> Result<(), String> {
         let exe = &self.config.executable;
-        let out = Command::new(exe)
-            .args(["app-server", "--help"])
-            .output()
+        let out = probe_output(exe, &["app-server", "--help"])
             .map_err(|e| format!("G1: cannot run {exe:?} app-server --help: {e}"))?;
         if !out.status.success() {
             return Err(format!(
@@ -3085,10 +3078,13 @@ impl CodexBackend {
         let exe = &self.config.executable;
         let scratch = self.config.data_dir.join(".codex-appserver-schema-probe");
         let _ = std::fs::remove_dir_all(&scratch);
-        let out = Command::new(exe)
+        let mut command = Command::new(exe);
+        command
             .args(["app-server", "generate-json-schema", "--out"])
             .arg(&scratch)
-            .arg("--experimental")
+            .arg("--experimental");
+        child::harden_probe_child(&mut command);
+        let out = command
             .output()
             .map_err(|e| format!("G2: cannot run {exe:?} app-server generate-json-schema: {e}"))?;
         if !out.status.success() {
@@ -3126,6 +3122,9 @@ impl CodexBackend {
             &self.config.data_dir,
             &self.config.env,
             self.config.codex_home.as_deref(),
+            // #310: this child exists only for the `initialize` round trip
+            // below, and must not survive a daemon that dies during it.
+            child::ChildLifetime::Probe,
             |_handle, _line| {},
         )
         .map_err(|e| format!("G4: {e}"))?;
@@ -3231,7 +3230,23 @@ impl CodexBackend {
     /// split/w5-codex-commit-path named: the field used to be read straight
     /// off `self.config` at every LAUNCH call site, so no profile could ever
     /// change it.
-    fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
+    ///
+    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`] at
+    /// START, [`crate::backend::resume_causation_env`] at RESUME), merged
+    /// **after** the profile — the same last-writer-wins discipline
+    /// `CODEX_HOME` already gets at the spawn site, and for the same reason:
+    /// a workflow-authored `Profile.env` key must not shadow what sergeant
+    /// itself intended to send. RESUME rebuilds the triple from
+    /// `ResumeRequest::estate_root` (re-supplied, S2 E6) and the execution id
+    /// on the `handle` every `resume()` already receives — the env this
+    /// produces is what every later turn on the execution reuses, so an
+    /// empty map here was a permanent loss of causation past the restart,
+    /// not just a gap in the reconciliation snapshot.
+    fn launch_config(
+        &self,
+        profile: Option<&Profile>,
+        causation: &BTreeMap<String, String>,
+    ) -> Result<LaunchConfig, BackendError> {
         if let Some(profile) = profile
             && profile.options.contains_key("codex_profile")
         {
@@ -3263,6 +3278,9 @@ impl CodexBackend {
                 Ok(None) => {}
                 Err(e) => return Err(self.err_failed(format!("profile {:?}: {e}", profile.name))),
             }
+        }
+        for (key, value) in causation {
+            env.insert(key.clone(), value.clone());
         }
         Ok(LaunchConfig {
             executable,
@@ -3670,7 +3688,10 @@ impl CodexBackend {
             env,
             codex_home,
             network_access,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         // #259: re-resolved here rather than trusting PREPARE's own check —
         // `launch_config`'s own doc comment states the same rule ("LAUNCH
         // re-resolves it, so the two phases can never disagree").
@@ -3730,7 +3751,10 @@ impl CodexBackend {
             env,
             codex_home,
             network_access,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         // #259, mirrored from `launch_exec` — resolved fresh here rather
         // than trusted from PREPARE.
         let git_worktree_common_dirs = self.resolve_git_worktree_common_dirs(&request.bindings)?;
@@ -3757,6 +3781,10 @@ impl CodexBackend {
             &request.cwd,
             &env,
             codex_home.as_deref(),
+            // Owned for the whole execution, so deliberately *not* hardened:
+            // `PR_SET_PDEATHSIG` fires on the spawning thread's death, and
+            // this thread returns long before the turn ends.
+            child::ChildLifetime::Execution,
             move |handle, line| appserver_on_line(&ctx, &cb_cell, handle, line),
         )
         .map_err(|e| self.err_failed(format!("cannot spawn app-server child: {e}")))?;
@@ -4121,61 +4149,31 @@ impl CodexBackend {
     }
 }
 
-/// Kill a turn's whole process group (§5.5): `SIGKILL` to the negated group
-/// id recorded at spawn, through a shell rather than a `libc`/`nix`
-/// dependency for one signal — the reason `tests/support/mod.rs` gives (R5).
+/// One bounded probe invocation, hardened per #310.
 ///
-/// Through `/bin/sh -c` specifically, and not by spawning `kill` as a program.
-/// `kill` is a **shell builtin** that every POSIX shell is required to have,
-/// while `kill(1)` as an executable on `PATH` is a package that a host need
-/// not install — and `Command::new("kill")` fails with `ENOENT` on such a
-/// host, which is a silent no-op when the caller drops the result. That is
-/// not hypothetical: it is measured, and it is why this call reports a spawn
-/// failure instead of discarding it. `/bin/sh` is an absolute path for the
-/// same reason, so a `PATH` this process never chose cannot decide whether
-/// INTERRUPT works.
+/// Every gate in this adapter that is a plain "run it and read the text" call
+/// goes through here rather than building its own `Command`, so none of them
+/// can forget [`child::harden_probe_child`]. `output()` waits, so the child
+/// cannot outlive *this call* — but it can outlive a daemon `SIGKILL`ed
+/// during it, and a `--help` or a `login status` that never returns is
+/// exactly how one gets stuck there.
+fn probe_output(exe: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let mut command = Command::new(exe);
+    command.args(args);
+    child::harden_probe_child(&mut command);
+    command.output()
+}
+
+/// Kill a turn's whole process group, by the pgid recorded at spawn (§5.5).
 ///
-/// **Nothing gates this on the leader being alive**, and that is the whole
-/// point. The group is what INTERRUPT promises to kill, and the group
-/// routinely outlives its leader: a command the turn started in the
-/// background survives the codex process, and once that process has exited
-/// and the reader has reaped it, every liveness test one could run — the
-/// turn's `TurnState`, `try_wait`, the child handle at all — says "nothing to
-/// kill" about a group that is still very much running. So the group id is
-/// signalled unconditionally and `ESRCH` (an already-empty group) is success,
-/// not an error to report: the shell's *exit status* is deliberately not
-/// consulted, because "no such group" and "killed the group" are the same
-/// outcome here. Failing to run the kill at all is not — that one is logged.
-///
-/// Signalling a recorded id after its leader is gone is safe as well as
-/// necessary: Linux keeps a pid number allocated for as long as any process
-/// still uses it as a process-group id, so while there is anything in this
-/// group to kill, this id cannot have come to mean another one.
+/// One line, because #310 moved the implementation to
+/// [`crate::backend::child::kill_process_group`] — three adapters carried a
+/// byte-identical private copy of it and the probe path needed a fourth (R2).
+/// The behaviour and every reason for it are documented there; this alias
+/// stays so the call sites in this module keep reading as adapter-local
+/// vocabulary.
 fn kill_process_group(pgid: Option<u32>) {
-    let Some(pgid) = pgid else { return };
-    #[cfg(unix)]
-    {
-        if let Err(e) = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("kill -KILL -{pgid}"))
-            .output()
-        {
-            tracing::warn!(
-                pgid,
-                error = %e,
-                "could not run the process-group kill; the turn's direct child is all that \
-                 INTERRUPT reached — any commands it spawned may still be running"
-            );
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tracing::warn!(
-            pgid,
-            "no process-group signal mechanism on this platform; killing only the direct \
-             child — any commands it spawned may still be running"
-        );
-    }
+    crate::backend::child::kill_process_group(pgid);
 }
 
 /// The group kill above plus `Child::kill()` on the direct child as a belt,
@@ -4462,7 +4460,10 @@ impl Backend for CodexBackend {
         // Validates (in particular, refuses a codex-native profile layer)
         // without keeping the result: LAUNCH re-resolves it, so the two
         // phases can never disagree about it.
-        self.launch_config(request.profile.as_ref())?;
+        self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         if !request.bindings.is_empty() {
             self.resolve_git_worktree_common_dirs(&request.bindings)?;
         }
@@ -4680,7 +4681,10 @@ impl Backend for CodexBackend {
             env,
             codex_home,
             network_access,
-        } = self.launch_config(request.profile.as_ref())?;
+        } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::resume_causation_env(request, &handle.execution_id),
+        )?;
         // #259: NOT resolved here. A re-adopted execution's `turns` starts
         // at 1, so the `execution.turns == 0` gate that reads this field for
         // argv construction never fires for it — the grant is provably dead
@@ -5309,6 +5313,7 @@ mod tests {
             execute: None,
             instruction_policy: Default::default(),
             bindings,
+            estate_root: None,
         }
     }
 
@@ -5474,10 +5479,12 @@ mod tests {
         let processes = vec![
             ProcessArgv {
                 pid: 10,
+                ppid: None,
                 argv: vec!["exec".to_string(), "-C".to_string(), "/work".to_string()],
             },
             ProcessArgv {
                 pid: 20,
+                ppid: None,
                 argv: vec!["exec".to_string(), "resume".to_string(), "t1".to_string()],
             },
         ];
@@ -5496,6 +5503,7 @@ mod tests {
     fn turn_liveness_among_reports_surface_ambiguous_for_a_first_turn_process() {
         let processes = vec![ProcessArgv {
             pid: 30,
+            ppid: None,
             argv: vec!["exec".to_string(), "-C".to_string(), "/work".to_string()],
         }];
         let liveness = turn_liveness_among("t1", Some(Path::new("/work")), 999, Some(processes));
@@ -5512,6 +5520,7 @@ mod tests {
     fn turn_liveness_among_is_dead_with_no_matching_process() {
         let processes = vec![ProcessArgv {
             pid: 1,
+            ppid: None,
             argv: vec!["other-program".to_string()],
         }];
         assert_eq!(
@@ -5524,6 +5533,7 @@ mod tests {
     fn turn_liveness_among_skips_the_callers_own_pid() {
         let processes = vec![ProcessArgv {
             pid: 42,
+            ppid: None,
             argv: vec!["exec".to_string(), "resume".to_string(), "t1".to_string()],
         }];
         assert_eq!(
@@ -6049,7 +6059,7 @@ mod tests {
             options,
         };
         let err = backend
-            .launch_config(Some(&profile))
+            .launch_config(Some(&profile), &BTreeMap::new())
             .expect_err("must be refused");
         let text = err.to_string();
         assert!(text.contains("codex_profile"));
@@ -6072,7 +6082,7 @@ mod tests {
             options: BTreeMap::new(),
         };
         let resolved = backend
-            .launch_config(Some(&profile))
+            .launch_config(Some(&profile), &BTreeMap::new())
             .expect("valid profile");
         assert_eq!(resolved.executable, PathBuf::from("/custom/codex"));
         assert_eq!(resolved.env.get("FOO"), Some(&"bar".to_string()));

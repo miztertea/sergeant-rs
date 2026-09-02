@@ -232,7 +232,7 @@ async fn start_with(
     data_dir: &Path,
     registry: BackendRegistry,
     default: Option<&str>,
-    estate_root: Option<&Path>,
+    _estate_root: Option<&Path>,
 ) -> DaemonHandle {
     daemon::start_with(
         data_dir,
@@ -240,7 +240,6 @@ async fn start_with(
             backends: Arc::new(registry),
             default_backend: default.map(str::to_string),
             claude: None,
-            estate_root: estate_root.map(Path::to_path_buf),
             ..DaemonConfig::default()
         },
     )
@@ -286,10 +285,19 @@ async fn get(client: &reqwest::Client, handle: &DaemonHandle, path: &str) -> Val
         .expect("json body")
 }
 
-/// Submit work whose origin is `cwd`, merging any extra request fields.
+/// Submit work addressed at `estate_root`, whose origin is `cwd`, merging
+/// any extra request fields.
+///
+/// D4: the two are separate parameters on purpose. `estate_root` is what the
+/// daemon plans against (after admitting it); `cwd` is recorded evidence
+/// (§13.3) and decides nothing — which is the fact several tests in this
+/// file exist to pin, and which a helper that derived one from the other
+/// would quietly stop proving. `None` addresses no estate: the captured-
+/// intent path, exactly what a daemon bound to none used to give.
 async fn submit(
     client: &reqwest::Client,
     handle: &DaemonHandle,
+    estate_root: Option<&Path>,
     cwd: &Path,
     intent: &str,
     extra: Value,
@@ -297,6 +305,7 @@ async fn submit(
     let mut body = json!({
         "command_id": ulid(),
         "intent": intent,
+        "estate_root": estate_root,
         "origin": {"client": "cli", "cwd": cwd},
     });
     if let Some(fields) = extra.as_object() {
@@ -526,7 +535,15 @@ async fn t1_a_bound_estate_submit_materializes_a_real_worktree() {
     .await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &estate, "one bound estate", json!({})).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        Some(&estate),
+        &estate,
+        "one bound estate",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     assert_eq!(body["work"]["state"], "active");
@@ -637,6 +654,7 @@ async fn t2_multi_repo_workspace_binds_one_worktree_per_repository() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "multi repo",
         json!({"scope": {"all": true}}),
@@ -751,6 +769,7 @@ async fn r_mvp1_4_mixed_instructions_policy_refuses_at_submit_naming_both_repos(
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "mixed policy",
         json!({"scope": {"all": true}}),
@@ -798,7 +817,15 @@ async fn r_mvp1_4_local_instructions_policy_is_accepted_at_submit_and_reaches_th
     .await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &estate, "local measured", json!({})).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        Some(&estate),
+        &estate,
+        "local measured",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 201, "local must be accepted at submit now: {body}");
     assert_eq!(body["work"]["state"], "active");
 
@@ -856,6 +883,7 @@ async fn r_mvp1_11_a_stage_requiring_ask_refuses_at_submit_over_http() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "needs a real ask",
         json!({"workflow": "asks"}),
@@ -919,6 +947,7 @@ async fn r_mvp1_4_workflow_bound_carries_repositories_and_instruction_identities
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "uniform policy",
         json!({"scope": {"all": true}}),
@@ -983,6 +1012,7 @@ async fn t3_full_run_completes_every_stage_and_retires_the_surface() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "run to completion",
         json!({"workflow": "tiny"}),
@@ -1147,6 +1177,7 @@ async fn t3b_tagged_stage_definitions_are_pinned_and_survive_file_edits_after_bi
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "tagged run",
         json!({"workflow": "tagged-tiny"}),
@@ -1271,6 +1302,7 @@ async fn t4_needs_input_parks_the_run_and_input_resumes_it() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "ask me something",
         json!({"workflow": "tiny"}),
@@ -1368,6 +1400,7 @@ async fn t10_a_stage_completed_without_its_declared_output_is_reprompted_then_ne
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "finish without the declared output",
         json!({"workflow": "tiny"}),
@@ -1494,6 +1527,7 @@ async fn t11_a_present_but_untyped_declared_artifact_is_refused_the_same_way_as_
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "finish with untyped prose instead of a typed table",
         json!({"workflow": "tiny"}),
@@ -1623,6 +1657,7 @@ async fn the_finalize_sweep_removes_evidence_class_output_and_keeps_promote_clas
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "sweep evidence, keep promote",
         json!({"workflow": "sweep"}),
@@ -1676,6 +1711,145 @@ async fn the_finalize_sweep_removes_evidence_class_output_and_keeps_promote_clas
     handle.shutdown().await;
 }
 
+/// #297, the two-Work sequence: a Work's finalize sweep must never touch a
+/// stage-output directory that is not one of the *running* workflow's own
+/// declared stages.
+///
+/// Reported from a real downstream estate: `stage_output_dirs` walks the
+/// worktree and keys by composed directory path, consulting no catalog, so
+/// a `<dir>/output/` an *earlier, unrelated* Work already merged into the
+/// base branch reads as a stage of this run. It has no `output/README.md`
+/// in this workflow's package — it is not in this package at all — so
+/// `declared_output_disposition`'s "silence promotes nothing" default
+/// classifies it `Evidence`, and the sweep copies it out, `remove_dir_all`s
+/// it, and commits the deletion. Merging that branch deletes another Work's
+/// evidence upstream, silently.
+///
+/// `99-foreign/output/leftover.md` stands in for that already-merged
+/// evidence: seeded and committed into the mount before submit, exactly as
+/// a previous Work's merge would have left it. `sweep` declares only
+/// `00-evidence`. Judged on observable state — the file on the branch, the
+/// finalize commit's own diff, and the retained-evidence area — not on the
+/// guard's reasoning. `00-evidence` is asserted swept in the same run, so a
+/// filter that simply matched nothing could not pass this test either.
+#[tokio::test]
+async fn the_finalize_sweep_leaves_an_undeclared_stage_directory_alone() {
+    let repos = TempDir::new().expect("tempdir");
+    let data = TempDir::new().expect("tempdir");
+    let estate = repos.path().join("solo-estate");
+    let (mount, _head) = support::scaffold_solo_estate(&estate, "solo");
+    write_workflow(&estate, "sweep", &[("00-evidence", "first stage context")]);
+
+    // This run's own declared stage output.
+    std::fs::create_dir_all(mount.join("00-evidence/output")).expect("output dir");
+    std::fs::write(
+        mount.join("00-evidence/output/notes.md"),
+        "scratch working notes\n",
+    )
+    .expect("seed evidence artifact");
+    // Another Work's evidence, already merged into the base branch. Not a
+    // declared stage of `sweep`.
+    std::fs::create_dir_all(mount.join("99-foreign/output")).expect("foreign output dir");
+    std::fs::write(
+        mount.join("99-foreign/output/leftover.md"),
+        "another Work's merged evidence\n",
+    )
+    .expect("seed foreign artifact");
+    support::git(&mount, &["add", "-A"]);
+    support::git(
+        &mount,
+        &["commit", "-m", "seed this run's output and a prior Work's"],
+    );
+
+    let (registry, _fake) = one_fake([FakeStep::complete()]);
+    let handle = start_with(
+        data.path(),
+        registry,
+        Some(FAKE_BACKEND_NAME),
+        Some(&estate),
+    )
+    .await;
+    let client = http();
+
+    let (_, body) = submit(
+        &client,
+        &handle,
+        Some(&estate),
+        &estate,
+        "sweep only what this workflow declares",
+        json!({"workflow": "sweep"}),
+    )
+    .await;
+    let work_id = body["work"]["id"].as_str().expect("work id").to_string();
+    let surface_root = PathBuf::from(body["surface"]["root"].as_str().expect("surface root"));
+
+    let final_body = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+    assert_eq!(
+        final_body["work"]["state"], "completed",
+        "the sweep's own commit leaves the worktree clean: {final_body}"
+    );
+    let branch = format!("sergeant/{work_id}");
+
+    // The declared stage was swept — without this the assertions below
+    // would also pass on a filter that matched nothing at all.
+    let evidence_still_present = Command::new("git")
+        .args(["show", &format!("{branch}:00-evidence/output/notes.md")])
+        .current_dir(&mount)
+        .output()
+        .expect("run git")
+        .status
+        .success();
+    assert!(
+        !evidence_still_present,
+        "the running workflow's own evidence-class output must still be swept"
+    );
+
+    // The foreign directory is untouched on the branch, byte for byte.
+    assert_eq!(
+        git(
+            &mount,
+            &["show", &format!("{branch}:99-foreign/output/leftover.md")]
+        ),
+        "another Work's merged evidence",
+        "#297: another Work's already-merged evidence must survive this Work's sweep"
+    );
+
+    // ...and the finalize commit's own diff deletes nothing of it.
+    let sweep_commit = git(
+        &mount,
+        &[
+            "log",
+            &branch,
+            "--format=%H",
+            "--grep=sergeant: finalize sweep",
+        ],
+    );
+    assert!(
+        !sweep_commit.is_empty(),
+        "the sweep must have made its finalize commit at all"
+    );
+    let swept_diff = git(
+        &mount,
+        &["show", "--name-status", "--format=", &sweep_commit],
+    );
+    assert!(
+        !swept_diff.contains("99-foreign"),
+        "#297: the finalize sweep's diff must not touch an undeclared directory: {swept_diff}"
+    );
+    assert!(
+        swept_diff.contains("00-evidence/output/notes.md"),
+        "the declared stage's removal is what this commit is for: {swept_diff}"
+    );
+
+    // Nor is it laundered into this Work's retained evidence.
+    assert!(
+        !surface_root.join("solo.output/99-foreign").exists(),
+        "an undeclared directory must not be copied out as this Work's evidence"
+    );
+
+    handle.shutdown().await;
+}
+
 /// F-IN-01: the finalize sweep's commit must be scoped to the `output/`
 /// dirs it actually swept, not the whole worktree (`git add -A`) — else
 /// stray dirty/untracked content the actor left *elsewhere* in the
@@ -1718,6 +1892,7 @@ async fn a_finalize_sweep_never_launders_unrelated_dirty_content_into_its_own_co
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "evidence plus a stray mess",
         json!({"workflow": "sweep"}),
@@ -1810,7 +1985,6 @@ async fn deferred_finish_does_not_let_the_engine_observe_a_conclusion_before_lau
             backends: Arc::new(registry),
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll: Duration::from_millis(20),
-            estate_root: Some(estate.clone()),
             ..DaemonConfig::default()
         },
     )
@@ -1821,6 +1995,7 @@ async fn deferred_finish_does_not_let_the_engine_observe_a_conclusion_before_lau
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "resolves over real polls",
         json!({"workflow": "tiny"}),
@@ -1896,6 +2071,7 @@ async fn a_resumed_stage_journals_a_queued_item_and_the_live_send_as_one_turn() 
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "queue then answer live",
         json!({"workflow": "tiny"}),
@@ -1979,6 +2155,7 @@ async fn t5_failure_records_the_reason_and_retry_re_enters_the_stage() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "fail then retry",
         json!({"workflow": "tiny"}),
@@ -2080,6 +2257,7 @@ async fn t6_cancel_mid_stage_leaves_no_zombie_work_state() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "cancel me mid stage",
         json!({"workflow": "tiny"}),
@@ -2273,7 +2451,7 @@ async fn t7_routing_precedence_and_structured_failure() {
         ),
     ];
     for (handle, cwd, extra, expected_backend, expected_source) in cases {
-        let (status, body) = submit(&client, handle, cwd, "route me", extra).await;
+        let (status, body) = submit(&client, handle, Some(cwd), cwd, "route me", extra).await;
         assert_eq!(status, 201, "submit failed: {body}");
         assert_eq!(
             body["backend"], expected_backend,
@@ -2288,6 +2466,7 @@ async fn t7_routing_precedence_and_structured_failure() {
     let (status, body) = submit(
         &client,
         &plain_handle,
+        Some(&plain),
         &plain,
         "unknown backend",
         // Since W2 the daemon registers a real Opencode adapter by default
@@ -2326,7 +2505,15 @@ async fn t7_routing_precedence_and_structured_failure() {
     let data = TempDir::new().expect("tempdir");
     let registry = BackendRegistry::new().with(Arc::new(FakeBackend::new("claude")));
     let handle = start_with(data.path(), registry, None, Some(&plain)).await;
-    let (status, body) = submit(&http(), &handle, &plain, "nothing selected", json!({})).await;
+    let (status, body) = submit(
+        &http(),
+        &handle,
+        Some(&plain),
+        &plain,
+        "nothing selected",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 422, "unroutable work must be refused: {body}");
     assert_eq!(body["error"]["code"], "no_backend_selected");
     // The scripted fake occupies the "claude" slot, so the daemon adds
@@ -2429,6 +2616,7 @@ async fn t7b_a_mixed_harness_workflow_runs_a_then_b_then_a() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "A then B then A",
         json!({"workflow": "mixed"}),
@@ -2512,6 +2700,7 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "unavailable stage harness",
         json!({"workflow": "mixed"}),
@@ -2568,6 +2757,7 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "unknown stage harness",
         json!({"workflow": "mixed"}),
@@ -2616,6 +2806,7 @@ async fn t7c_an_unusable_stage_harness_fails_before_any_side_effect() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "profile belongs elsewhere",
         json!({"workflow": "mixed"}),
@@ -2666,6 +2857,7 @@ async fn t7d_retry_and_restart_replay_the_pinned_stage_decision() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "retry the pinned stage",
         json!({"workflow": "mixed"}),
@@ -2794,6 +2986,7 @@ async fn t7f_a_bound_stage_whose_harness_left_the_daemon_blocks_rather_than_subs
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "the harness leaves between the bind and the stage",
         json!({"workflow": "mixed"}),
@@ -2934,20 +3127,23 @@ async fn t7e_every_harness_a_run_will_use_is_probed_before_the_lock_is_taken() {
         ),
         Some(FAKE_BACKEND_NAME.to_string()),
         data.path(),
-    )
-    // §5.2: the estate is bound to the engine, not read off the request.
-    // `cwd` below is still set because a real submission carries one, but it
-    // decides nothing — deleting `with_estate_root` leaves this engine
-    // planning against no estate at all and `plan` answering `Ok(None)`.
-    .with_estate_root(estate.clone());
+    );
     assert_eq!(alt.probe_count(), 0, "cold, as a fresh registry is");
 
+    // D10: the estate is a per-call argument, not an engine field. §5.2 is
+    // unchanged — `cwd` below is still set because a real submission carries
+    // one, and it still decides nothing. What decides is the *addressed*
+    // root passed here; pass `None` instead and `plan` answers `Ok(None)`,
+    // exactly as an unbound engine used to.
     let plan = engine
-        .plan(&SubmitContext {
-            cwd: Some(&estate),
-            workflow: Some("mixed"),
-            ..SubmitContext::default()
-        })
+        .plan(
+            Some(&estate),
+            &SubmitContext {
+                cwd: Some(&estate),
+                workflow: Some("mixed"),
+                ..SubmitContext::default()
+            },
+        )
         .expect("plan")
         .expect("a estate");
     assert!(
@@ -2990,6 +3186,7 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "survives the restart",
         json!({"workflow": "tiny", "backend": "durable"}),
@@ -3001,6 +3198,7 @@ async fn t8_restart_resumes_unambiguous_work_and_blocks_ambiguous_work() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "loses its session",
         json!({"workflow": "tiny", "backend": "volatile"}),
@@ -3197,7 +3395,6 @@ async fn a_known_never_forgotten_execution_whose_signal_never_arrives_parks_rath
             default_backend: Some(FAKE_BACKEND_NAME.to_string()),
             completion_poll: poll,
             turn_ceiling: ceiling,
-            estate_root: Some(estate.clone()),
             ..DaemonConfig::default()
         },
     )
@@ -3208,6 +3405,7 @@ async fn a_known_never_forgotten_execution_whose_signal_never_arrives_parks_rath
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "never resolves on its own",
         json!({"workflow": "tiny"}),
@@ -3283,6 +3481,7 @@ async fn native_liveness_never_decides_work_state_in_either_direction() {
     let (_, body) = submit(
         &http(),
         &handle,
+        Some(&estate),
         &estate,
         "exited but silent",
         json!({"workflow": "tiny"}),
@@ -3308,6 +3507,7 @@ async fn native_liveness_never_decides_work_state_in_either_direction() {
     let (_, body) = submit(
         &http(),
         &handle,
+        Some(&estate),
         &estate,
         "alive but done",
         json!({"workflow": "tiny"}),
@@ -3357,7 +3557,6 @@ async fn native_liveness_after_interrupt_never_decides_work_state_either_way() {
                 default_backend: Some(FAKE_BACKEND_NAME.to_string()),
                 completion_poll: poll,
                 turn_ceiling: ceiling,
-                estate_root: Some(estate.to_path_buf()),
                 ..DaemonConfig::default()
             },
         )
@@ -3367,6 +3566,7 @@ async fn native_liveness_after_interrupt_never_decides_work_state_either_way() {
         let (_, body) = submit(
             &client,
             &handle,
+            Some(estate),
             estate,
             "overdue by construction",
             json!({"workflow": "tiny"}),
@@ -3456,6 +3656,7 @@ async fn waiting_and_blocked_park_the_work_and_retry_re_enters() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "park me",
         json!({"workflow": "tiny"}),
@@ -3517,6 +3718,7 @@ async fn cancelling_a_failed_work_does_not_rewrite_the_stage_failure() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "fail then cancel",
         json!({"workflow": "tiny"}),
@@ -3572,6 +3774,7 @@ async fn a_dirty_worktree_is_retained_and_recorded_at_teardown() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "leaves a mess",
         json!({"workflow": "tiny"}),
@@ -3655,6 +3858,7 @@ async fn retained_lists_a_dirty_teardown_and_reap_disposes_of_it_only_when_confi
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "leaves a mess for #109",
         json!({"workflow": "tiny"}),
@@ -3781,6 +3985,7 @@ async fn a_stranded_completion_is_not_reported_as_plain_completed() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "declares a commit, never makes one",
         json!({"workflow": "tiny"}),
@@ -3914,6 +4119,7 @@ async fn a_run_that_ends_on_the_wrong_branch_completes_dirty_and_keeps_both_bran
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "commits somewhere else entirely",
         json!({"workflow": "tiny"}),
@@ -4055,6 +4261,7 @@ async fn a_stage_that_opts_in_receives_the_branch_status_fact_others_do_not() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "opt in to the branch status fact",
         json!({"workflow": "tiny"}),
@@ -4167,6 +4374,7 @@ async fn a_repository_that_cannot_be_materialized_rolls_back_the_ones_that_could
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "half a surface",
         json!({"scope": {"all": true}}),
@@ -4285,7 +4493,15 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
     )
     .await;
     let client = http();
-    let (status, body) = submit(&client, &handle, &estate, "split surfaces root", json!({})).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        Some(&estate),
+        &estate,
+        "split surfaces root",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 201, "submit failed: {body}");
     assert_eq!(
         body["work"]["state"], "active",
@@ -4343,6 +4559,7 @@ async fn r_mvp1_1_surfaces_root_is_split_from_data_dir_and_the_checkout_guard_fo
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "unsplit still refuses",
         json!({}),
@@ -4466,6 +4683,7 @@ async fn retry_rebuilds_from_base_sha_when_the_retained_branch_is_gone() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "branch vanishes before retry",
         json!({"workflow": "tiny"}),
@@ -4637,6 +4855,7 @@ async fn a_worktree_git_refuses_to_remove_is_retained_with_the_error_and_journal
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "git cannot delete this worktree",
         json!({"workflow": "tiny"}),
@@ -4740,6 +4959,7 @@ async fn cancelling_a_blocked_work_retires_the_stage_it_was_parked_in() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "block then cancel",
         json!({"workflow": "tiny"}),
@@ -4802,6 +5022,7 @@ async fn a_backend_that_cannot_start_the_next_stage_blocks_with_the_stage_named(
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "lose the backend mid run",
         json!({"workflow": "tiny"}),
@@ -4876,6 +5097,7 @@ async fn input_for_a_forgotten_execution_blocks_with_the_stage_named() {
     let (_, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "answer a session that did not survive",
         json!({"workflow": "tiny"}),
@@ -4959,6 +5181,7 @@ async fn a_backend_that_cannot_observe_its_execution_fails_the_work_closed() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "observe me if you can",
         json!({"workflow": "tiny"}),
@@ -5018,6 +5241,7 @@ async fn an_unknown_native_state_blocks_even_when_the_signal_says_completed() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "complete me from an unknown context",
         json!({"workflow": "tiny"}),
@@ -5103,6 +5327,7 @@ async fn a_workflow_name_that_escapes_the_workflows_directory_is_refused_at_subm
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "read someone else's workflow",
         json!({"workflow": "../../elsewhere/.sergeant/workflows/outside"}),
@@ -5162,6 +5387,7 @@ async fn a_profile_is_launch_configuration_carried_to_the_backend() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "with a profile",
         json!({"profile": "enterprise"}),
@@ -5183,6 +5409,7 @@ async fn a_profile_is_launch_configuration_carried_to_the_backend() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "unknown profile",
         json!({"profile": "nope"}),
@@ -5233,6 +5460,7 @@ async fn a_profile_that_names_another_backend_is_refused_with_the_tier_that_rout
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "a profile for a backend this work is not routed to",
         json!({"profile": "elsewhere"}),
@@ -5297,7 +5525,15 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     // A cwd this daemon's estate knows nothing about is the same answer, not
     // an error — the cwd was never what decided it.
     let elsewhere = TempDir::new().expect("tempdir");
-    let (status, body) = submit(&client, &handle, elsewhere.path(), "not a repo", json!({})).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        None,
+        elsewhere.path(),
+        "not a repo",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 201);
     assert_eq!(body["work"]["state"], "pending");
     assert!(body["surface"].is_null());
@@ -5307,6 +5543,7 @@ async fn a_submission_with_no_workspace_is_captured_but_still_routed() {
     let (status, body) = submit(
         &client,
         &handle,
+        None,
         elsewhere.path(),
         "route me nowhere",
         // Deliberately not the bare canonical name "opencode": since the
@@ -5379,7 +5616,15 @@ async fn a_multi_repo_estate_refuses_an_empty_scope_with_the_7_1_remedy() {
     .await;
     let client = http();
 
-    let (status, body) = submit(&client, &handle, &estate, "no scope at all", json!({})).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        Some(&estate),
+        &estate,
+        "no scope at all",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 422, "an empty scope must refuse: {body}");
     assert_eq!(body["error"]["code"], "missing_scope");
     assert_eq!(body["error"]["repo_count"], 2);
@@ -5439,6 +5684,7 @@ async fn run_all_resolves_every_repository_and_journals_the_request_form() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "everything, explicitly",
         json!({"scope": {"all": true}}),
@@ -5563,12 +5809,22 @@ async fn a_crash_inside_the_submit_window_fails_closed_with_the_git_evidence() {
 /// that silently means nothing is worse than a refusal.
 ///
 /// The daemon starts on a *valid* manifest and each case rewrites it
-/// underneath: §5.1 admits the estate root before the data dir is even
-/// created, so a daemon started against a broken manifest would never come up
-/// at all and there would be no submit to refuse. Re-reading the manifest at
-/// every `plan` — the root is what startup pins, not the file's contents — is
-/// what makes the edit visible here, and it is the same property `sgt repo
-/// add` relies on to reach a running daemon.
+/// underneath. Re-reading the manifest on every submission is what makes the
+/// edit visible here, and it is the same property `sgt repo add` relies on
+/// to reach a running daemon — H1 only moved *where* that re-read happens
+/// (per admitted estate rather than once per daemon), not whether it does.
+///
+/// **Two refusals, and the split between them is the point (H1 D4).** A
+/// submission is now admitted before it is planned, so a manifest fault the
+/// *exact-root check* can see — an unknown key, a schema violation — is
+/// caught at admission and refused as `invalid_estate`: the estate itself is
+/// inadmissible, so nothing about it is served, not merely this submission.
+/// A fault only the strict load can see — a declared repository with no
+/// mount, a legacy `path` key — is `Estate::admit`'s deliberate blind spot
+/// ("a broken repo blocks Works targeting it, not the estate") and still
+/// surfaces from `Engine::plan` as `workspace_error`. Both are 422 and both
+/// name the offending line; asserting *which* is what keeps the two checks
+/// from quietly collapsing into one.
 #[tokio::test]
 async fn a_malformed_workspace_file_fails_closed() {
     let repos = TempDir::new().expect("tempdir");
@@ -5591,9 +5847,20 @@ async fn a_malformed_workspace_file_fails_closed() {
         "[estate]\nname = \"solo\"\ndefault_backends = \"fake\"\n\n[[repo]]\nname = \"solo\"\n",
     )
     .expect("sergeant.toml");
-    let (status, body) = submit(&http(), &handle, &estate, "typo in config", json!({})).await;
+    let (status, body) = submit(
+        &http(),
+        &handle,
+        Some(&estate),
+        &estate,
+        "typo in config",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 422, "a typo'd key must not be ignored: {body}");
-    assert_eq!(body["error"]["code"], "workspace_error");
+    assert_eq!(
+        body["error"]["code"], "invalid_estate",
+        "a schema fault makes the estate itself inadmissible: {body}"
+    );
     assert!(
         body["error"]["message"]
             .as_str()
@@ -5604,14 +5871,29 @@ async fn a_malformed_workspace_file_fails_closed() {
 
     // A declared repository with no mount at `repos/<name>` is refused too
     // (§6.1: the mount is derived, so "declared but absent" is the only shape
-    // a missing repository can now take).
+    // a missing repository can now take) — and this is the case on the *plan*
+    // side of the split above: `Estate::admit` never resolves mounts, by
+    // design, so the estate stays admissible and only the Work targeting the
+    // absent repository is refused.
     std::fs::write(
         &manifest,
         "[estate]\nname = \"solo\"\n\n[[repo]]\nname = \"ghost\"\n",
     )
     .expect("sergeant.toml");
-    let (status, body) = submit(&http(), &handle, &estate, "missing repo", json!({})).await;
+    let (status, body) = submit(
+        &http(),
+        &handle,
+        Some(&estate),
+        &estate,
+        "missing repo",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 422);
+    assert_eq!(
+        body["error"]["code"], "workspace_error",
+        "a missing mount is a repository problem, not an estate-identity one: {body}"
+    );
     assert!(
         body["error"]["message"]
             .as_str()
@@ -5632,9 +5914,20 @@ async fn a_malformed_workspace_file_fails_closed() {
          [[repo]]\nname = \"solo\"\npath = \".\"\n",
     )
     .expect("sergeant.toml");
-    let (status, body) = submit(&http(), &handle, &estate, "a path key survives", json!({})).await;
+    let (status, body) = submit(
+        &http(),
+        &handle,
+        Some(&estate),
+        &estate,
+        "a path key survives",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 422, "a declared path must be refused: {body}");
-    assert_eq!(body["error"]["code"], "workspace_error");
+    assert_eq!(
+        body["error"]["code"], "invalid_estate",
+        "the legacy `path` key is a schema fault, so it too is caught at          admission rather than at plan: {body}"
+    );
     let message = body["error"]["message"].as_str().expect("message");
     assert!(
         message.contains("solo") && message.contains("`path`"),
@@ -5724,7 +6017,15 @@ async fn t9_a_repository_with_a_submodule_completes_and_tears_down_clean() {
     )
     .await;
     let client = http();
-    let (status, body) = submit(&client, &handle, &estate, "check the submodule", json!({})).await;
+    let (status, body) = submit(
+        &client,
+        &handle,
+        Some(&estate),
+        &estate,
+        "check the submodule",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 201, "submit failed: {body}");
     let work_id = body["work"]["id"].as_str().expect("work id").to_string();
     let worktree = PathBuf::from(
@@ -5824,6 +6125,7 @@ async fn t9b_a_linked_worktree_as_a_repository_mount_is_refused_at_submit() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "bind from a linked worktree",
         json!({"workflow": "tiny"}),
@@ -5914,6 +6216,7 @@ async fn t9c_a_symlinked_estate_root_materializes_and_completes() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&via_symlink),
         &via_symlink,
         "bind through a symlink",
         json!({"workflow": "tiny"}),
@@ -5975,6 +6278,7 @@ async fn t9d_a_path_with_a_space_and_non_ascii_completes_and_tears_down() {
     let (status, body) = submit(
         &client,
         &handle,
+        Some(&estate),
         &estate,
         "a path with a space",
         json!({"workflow": "tiny"}),
@@ -6190,6 +6494,7 @@ async fn scope_resolution_is_identical_across_the_cli_and_a_direct_api_submissio
     let (status, api_body) = submit(
         &client,
         &handle,
+        Some(&api_root),
         &api_root,
         "direct api scope.group",
         json!({"scope": {"group": "pair"}}),

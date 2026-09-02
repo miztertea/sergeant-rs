@@ -57,13 +57,35 @@ use crate::domain::event::Event;
 use crate::domain::work::{
     KIND_COMMAND_ACCEPTED, KIND_COMMAND_REJECTED, KIND_WORK_SUBMITTED, WorkState,
 };
-use crate::runtime::analytics::{self, AnalyticsError, AnalyticsFold};
+use crate::runtime::atlas::db::{AnalyticsError, AnalyticsFold};
 use crate::runtime::fsutil::{create_dir_all_durable, write_atomic};
 use crate::runtime::integrity::IntegrityDisposition;
 use crate::runtime::journal::{Journal, JournalError, Replay, SegmentBound};
 use crate::runtime::projection::{
     Projection, ProjectionError, WorkIndexRow, WorkRegistry, work_registry_reducer,
 };
+
+/// Directory under the data dir holding disposable projections (§21).
+///
+/// Since S5 W1c this directory holds exactly one thing — the FloorState
+/// cache below. The DuckDB projection that used to sit beside it
+/// (the old `sergeant` projection file) is gone: `ops` is a schema inside
+/// Atlas's own database, which A1 §5 names as the estate's one physical
+/// database. The
+/// constant lives here rather than in a deleted module because the cache is
+/// now its only reason to exist, and moving the cache itself was explicitly
+/// out of W1c's scope (R1).
+///
+/// The disposability contract is unchanged *for this directory*: deleting
+/// `projections/` still loses nothing, because a missing FloorState cache is
+/// a full replay. It is Atlas's database file whose deletion is no longer free —
+/// see [`crate::runtime::atlas::db`].
+pub const PROJECTIONS_DIR: &str = "projections";
+
+/// The projections directory for a data dir.
+pub fn projections_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(PROJECTIONS_DIR)
+}
 
 /// File name of the startup cache inside `projections/`.
 pub const FLOOR_STATE_FILE: &str = "floor-state.json";
@@ -192,8 +214,8 @@ impl ReplaySink for RegistrySink<'_> {
 /// start. DuckDB's contents are therefore a pure function of `(W_seq, tail]`
 /// whether this start hit the cache or did a full replay — a cache-miss
 /// start must not populate more history than a cache-hit start, or
-/// `tests/m5_projections.rs`'s "delete the file, restart, identical
-/// results" acceptance would be flaky-by-design.
+/// `tests/m5_projections.rs`'s "delete the Atlas database file, restart, identical
+/// `ops` results" acceptance would be flaky-by-design.
 pub struct AnalyticsSink<'a> {
     fold: Option<AnalyticsFold<'a>>,
     from_seq: u64,
@@ -530,6 +552,17 @@ pub struct FloorWorkRow {
     pub updated_at: String,
     /// Same as [`WorkIndexRow::last_seq`].
     pub last_seq: u64,
+    /// Same as [`WorkIndexRow::estate_root`] — H1 D1's per-Work estate
+    /// coordinate, carried across the window so a cache-hit start does not
+    /// forget which estate a below-window Work belongs to.
+    ///
+    /// `#[serde(default)]` rather than a schema bump: a v2 cache written
+    /// before this field existed reads back `None`, which is exactly what
+    /// the field already means everywhere else ("not recorded") — unlike
+    /// `first_seq`, whose absence would have made pruning permanently inert
+    /// and therefore had to be a named miss.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estate_root: Option<String>,
     /// W3 §3.1: first seq this process has ever seen for this Work — the
     /// field without which a cache-hit start cannot compute the prune
     /// horizon's no-straddle predicate at all (see
@@ -908,6 +941,7 @@ impl Plan {
                             created_at: row.created_at.clone(),
                             updated_at: row.updated_at.clone(),
                             last_seq: row.last_seq,
+                            estate_root: row.estate_root.clone(),
                         },
                     );
                 }
@@ -1036,7 +1070,7 @@ impl Plan {
 
 /// The projections directory's `floor-state.json` path for `data_dir`.
 fn floor_state_path(data_dir: &Path) -> PathBuf {
-    analytics::projections_dir(data_dir).join(FLOOR_STATE_FILE)
+    projections_dir(data_dir).join(FLOOR_STATE_FILE)
 }
 
 /// Stream a file through BLAKE3 in [`HASH_CHUNK`]-sized pieces — never
@@ -1105,6 +1139,7 @@ fn build_floor_state(
             updated_at: row.updated_at.clone(),
             last_seq: row.last_seq,
             first_seq: first_seq.get(&row.id).copied().unwrap_or(0),
+            estate_root: row.estate_root.clone(),
         })
         .collect();
     works.sort_unstable_by(|a, b| a.id.cmp(&b.id));
@@ -1281,6 +1316,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             last_seq,
+            estate_root: None,
         }
     }
 
@@ -1368,17 +1404,113 @@ mod tests {
     /// prefix `Plan::resolve` should accept.
     fn build_journal_and_cache(dir: &Path) -> (Journal, FloorState) {
         let mut journal = Journal::open_with(dir, 1).expect("open");
-        for n in 1..=20 {
+        for n in 1u32..=20 {
             journal
-                .append(draft(
-                    KIND_WORK_SUBMITTED,
-                    Some(&format!("w{n}")),
-                    submit_payload(&format!("w{n}"), "pending"),
-                ))
+                .append(
+                    draft(
+                        KIND_WORK_SUBMITTED,
+                        Some(&format!("w{n}")),
+                        submit_payload(&format!("w{n}"), "pending"),
+                    )
+                    // H1 D1: alternate the estate coordinate so any test
+                    // built on this fixture is standing on a *multi*-estate
+                    // journal, which is what a host journal actually is.
+                    .with_workspace_id(if n.is_multiple_of(2) {
+                        "/estates/billing"
+                    } else {
+                        "/estates/payments"
+                    }),
+                )
                 .expect("append");
         }
         let cache = cache_for(&journal);
         (journal, cache)
+    }
+
+    /// H1 D1/D10: a Work's estate coordinate must survive the startup
+    /// window. On a cache-hit start the below-window Works are seeded from
+    /// `FloorWorkRow`, never replayed — so without the coordinate on that
+    /// row, `Engine::commit` and recovery would both silently see "no
+    /// estate" for every Work older than the window, which is the exact
+    /// shape of the silent failure D10 exists to close.
+    #[test]
+    fn the_per_work_estate_coordinate_survives_the_startup_window() {
+        let expected = |id: &str| {
+            let n: u32 = id.trim_start_matches('w').parse().expect("w<n> id");
+            if n.is_multiple_of(2) {
+                "/estates/billing"
+            } else {
+                "/estates/payments"
+            }
+        };
+        let dir = TempDir::new().expect("tempdir");
+        let (journal, seed_cache) = build_journal_and_cache(dir.path());
+
+        // First start: full replay, every coordinate folded from the
+        // envelope, and the cache this start would leave behind.
+        let mut registry = crate::runtime::projection::work_registry_projection();
+        drive(
+            Plan::Full {
+                floor_seq: 1,
+                window_seq: 0,
+                miss: CacheMiss::Absent,
+            }
+            .replay(&journal)
+            .expect("replay"),
+            &mut [&mut RegistrySink(&mut registry)],
+        )
+        .expect("drive");
+        for (id, row) in &registry.state().work_index {
+            assert_eq!(row.estate_root.as_deref(), Some(expected(id)), "{id}");
+        }
+        let first_seq: BTreeMap<String, u64> = registry
+            .state()
+            .work_index
+            .keys()
+            .map(|id| (id.clone(), 1))
+            .collect();
+        // The cache this start would leave behind, built through the real
+        // mapping (`build_floor_state` is exactly what `next_cache` calls;
+        // the horizon is handed in directly, as the sibling
+        // `build_floor_state_*` tests do, because this fixture's Works are
+        // all still `pending` and therefore pin the computed one at 0).
+        let cache = build_floor_state(
+            &journal.segment_bounds().expect("bounds"),
+            seed_cache.binding.summarized_through_seq,
+            registry.state(),
+            &LedgerSink::default(),
+            &CapabilitySink::default(),
+            &first_seq,
+        )
+        .expect("build_floor_state")
+        .expect("H > 0 must produce a cache");
+        assert!(
+            !cache.works.is_empty(),
+            "the fixture must really summarize some Works below the window"
+        );
+
+        // Second start, cache hit: below-window Works are *seeded*, never
+        // replayed. Without the coordinate on `FloorWorkRow` every one of
+        // them would silently read back as "no estate".
+        write_cache(dir.path(), &cache);
+        let plan = Plan::resolve(dir.path(), &journal, false).expect("resolve");
+        assert!(matches!(plan, Plan::Windowed { .. }), "{plan:?}");
+        let mut registry = plan.seed_registry();
+        let seeded: Vec<String> = registry.state().work_index.keys().cloned().collect();
+        assert!(!seeded.is_empty(), "the cache must seed some index rows");
+        drive(
+            plan.replay(&journal).expect("replay"),
+            &mut [&mut RegistrySink(&mut registry)],
+        )
+        .expect("drive");
+        for (id, row) in &registry.state().work_index {
+            assert_eq!(
+                row.estate_root.as_deref(),
+                Some(expected(id)),
+                "{id} lost its estate coordinate across the window (seeded: {})",
+                seeded.contains(id)
+            );
+        }
     }
 
     /// The cache half of [`build_journal_and_cache`], on its own, so a test
@@ -1418,7 +1550,7 @@ mod tests {
     }
 
     fn write_cache(data_dir: &Path, cache: &FloorState) {
-        std::fs::create_dir_all(analytics::projections_dir(data_dir)).expect("mkdir");
+        std::fs::create_dir_all(projections_dir(data_dir)).expect("mkdir");
         std::fs::write(
             floor_state_path(data_dir),
             serde_json::to_vec_pretty(cache).expect("serialize"),
@@ -1474,7 +1606,7 @@ mod tests {
     fn resolve_reports_malformed_on_garbage_json() {
         let dir = TempDir::new().expect("tempdir");
         let (journal, _cache) = build_journal_and_cache(dir.path());
-        std::fs::create_dir_all(analytics::projections_dir(dir.path())).expect("mkdir");
+        std::fs::create_dir_all(projections_dir(dir.path())).expect("mkdir");
         std::fs::write(floor_state_path(dir.path()), b"not json").expect("write garbage");
 
         let plan = Plan::resolve(dir.path(), &journal, false).expect("resolve");

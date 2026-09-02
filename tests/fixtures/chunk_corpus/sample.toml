@@ -1,0 +1,51 @@
+# A small synthetic TOML fixture for the chunker corpus. ASCII-only.
+
+[package]
+name = "chunk-fixture"
+version = "0.1.0"
+edition = "2021"
+description = "not a real package, only chunker corpus input"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tree-sitter = "0.26"
+
+[dev-dependencies]
+proptest = "1"
+
+[[bin]]
+name = "fixture-one"
+path = "src/bin/one.rs"
+
+[[bin]]
+name = "fixture-two"
+path = "src/bin/two.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[workspace]
+members = ["crates/one", "crates/two", "crates/three"]
+
+[workspace.metadata.fixture]
+owner = "chunk-corpus"
+note = "small and synthetic, not lifted from any real config file"
+
+[[table_array]]
+id = 1
+name = "first"
+
+[[table_array]]
+id = 2
+name = "second"
+
+[[table_array]]
+id = 3
+name = "third"

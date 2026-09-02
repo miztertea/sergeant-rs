@@ -236,6 +236,7 @@ use super::{
     ExecutionHandle, NativeEvent, NativeState, Observation, PreparedExecution, ProbeReport,
     ResumeRequest, RuntimeScope, StartRequest,
 };
+use crate::backend::child;
 use crate::domain::event::{EventDraft, EventSource};
 use crate::domain::profile::Profile;
 use crate::runtime::blob::BlobStore;
@@ -316,12 +317,17 @@ const STDERR_DRAIN_BUDGET: Duration = Duration::from_secs(5);
 /// zero-interaction the way the doc comment above it claims** — an
 /// unauthenticated `agy` (no cached credentials under the effective
 /// `settings_home`/`HOME`) answers it by printing an OAuth URL and blocking
-/// on an interactive login for up to 60s before giving up on its own. `run_probe`
-/// runs synchronously inside daemon registration (`daemon::start_with`,
-/// before the descriptor is published), so an unbounded wait here is exactly
-/// the class of regression this project already tracks for a blocking HTTP
-/// client built during registration — its subprocess analogue, on any host
-/// that has `agy` installed but not yet logged in. Five seconds is
+/// on an interactive login for up to 60s before giving up on its own.
+/// `run_probe` runs inside the daemon's startup backend probe walk, which
+/// since #293 happens *after* the runtime descriptor is published and
+/// alongside a daemon that is already serving — so an unbounded wait here no
+/// longer delays the descriptor the way it did when registration was
+/// synchronous. It is still bounded, for two reasons the reordering did not
+/// retire: the walk holds this backend's routing gate closed
+/// (`backend::ProbeGate`) until its evidence lands, and a stopping daemon has
+/// to wait out whatever probe child is in flight. An unbounded wait would put
+/// an interactive login prompt on both, on any host that has `agy` installed
+/// but is not logged in. Five seconds is
 /// generous headroom over the sub-second reply a real, authenticated `agy`
 /// gave in measurement; a probe that cannot answer inside it is killed and
 /// treated exactly like any other probe failure — best-effort by
@@ -3081,6 +3087,10 @@ impl AgyBackend {
             &self.config.env,
             self.config.settings_home.as_deref(),
         );
+        // #310: `output()` waits, so this child cannot outlive *this call* —
+        // but it can outlive a daemon SIGKILLed during the call, and a
+        // `--help` that never returns is exactly how one gets stuck there.
+        child::harden_probe_child(&mut command);
         let out = command.output().map_err(|e| {
             format!(
                 "capability probe: cannot run {exe:?} {}: {e} (kind: {:?})",
@@ -3112,10 +3122,25 @@ impl AgyBackend {
             &self.config.env,
             self.config.settings_home.as_deref(),
         );
-        let Ok(mut child) = command.spawn() else {
+        // #310: this is a *full* `agy` invocation, not a `--help`, so it can
+        // spawn children of its own and it can block indefinitely on an
+        // interactive login prompt. Hardened and group-led so the kill below
+        // reaches whatever it started, and so a daemon SIGKILLed while this
+        // is in flight takes it with it instead of reparenting it to init.
+        child::harden_probe_child(&mut command);
+        let Ok(mut spawned) = command.spawn() else {
             return ConfigProbe::default();
         };
-        let Some(mut stdout) = child.stdout.take() else {
+        let stdout = spawned.stdout.take();
+        let stderr = spawned.stderr.take();
+        // Owns the child from here on. Every exit from this function below —
+        // the early return, the budget expiry, the ordinary answer, a panic
+        // in the parse — goes through this guard's `Drop`, which is the only
+        // cleanup an early return cannot skip. Before #310 the `stdout.take()`
+        // arm returned with the child still running and nothing at all
+        // holding it.
+        let probe_child = ConfigProbeChild::adopt(spawned);
+        let Some(mut stdout) = stdout else {
             return ConfigProbe::default();
         };
         // Piped but deliberately unread here: a probe that never touches this
@@ -3123,31 +3148,28 @@ impl AgyBackend {
         // its own thread purely so a child that writes to it does not block on
         // (or SIGPIPE from) a closed pipe while this call is still waiting on
         // stdout.
-        if let Some(mut stderr) = child.stderr.take() {
+        if let Some(mut stderr) = stderr {
             std::thread::spawn(move || {
                 let mut sink = Vec::new();
                 let _ = stderr.read_to_end(&mut sink);
             });
         }
-        let child = Arc::new(Mutex::new(child));
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = stdout.read_to_end(&mut buf);
             let _ = tx.send(buf);
         });
-        let stdout_bytes = match rx.recv_timeout(CONFIG_PROBE_BUDGET) {
-            Ok(buf) => buf,
-            Err(_) => {
-                // Most likely cause, per the measurement in `CONFIG_PROBE_BUDGET`'s
-                // doc: an unauthenticated `agy` blocked this call on an
-                // interactive login prompt. Killed and treated as any other
-                // probe failure — never propagated as a hang.
-                let _ = child.lock().expect("agy config-probe child lock").kill();
-                Vec::new()
-            }
-        };
-        let _ = child.lock().expect("agy config-probe child lock").wait();
+        // An expired budget yields no bytes at all. Most likely cause, per the
+        // measurement in `CONFIG_PROBE_BUDGET`'s doc: an unauthenticated `agy`
+        // blocked this call on an interactive login prompt. Killed by the
+        // guard below and treated as any other probe failure — never
+        // propagated as a hang.
+        let stdout_bytes = rx.recv_timeout(CONFIG_PROBE_BUDGET).unwrap_or_default();
+        // Explicit, at the completion point, rather than left to scope end:
+        // the measurement is finished, so the child has no further reason to
+        // exist and the parse below must not run while it does.
+        drop(probe_child);
         serde_json::from_slice::<Value>(&stdout_bytes)
             .map(|value| decode_config_probe(&value))
             .unwrap_or_default()
@@ -3162,6 +3184,7 @@ impl AgyBackend {
             &self.config.env,
             self.config.settings_home.as_deref(),
         );
+        child::harden_probe_child(&mut version_command);
         let version_out = match version_command.output() {
             Ok(out) => out,
             Err(e) => {
@@ -3310,7 +3333,26 @@ impl AgyBackend {
     /// §14 applied to this CLI. `config_home` is **refused here, not ignored**:
     /// no agy config-home *variable* was measured, and honouring the field by
     /// guessing one would make the human's launch decision silently do nothing.
-    fn launch_config(&self, profile: Option<&Profile>) -> Result<LaunchConfig, BackendError> {
+    ///
+    /// `causation` is S2 E6's triple ([`crate::backend::causation_env`]),
+    /// merged **after** the profile so a workflow-authored `Profile.env` key
+    /// cannot shadow what sergeant itself intended to send. It is folded into
+    /// the resolved `env` map here rather than added as a third parameter to
+    /// [`Self::apply_env`], which is deliberately generic over "whatever env
+    /// map was resolved" so a probe call and a turn can never read two
+    /// different configurations — a probe reaches `apply_env` with the map
+    /// this function never touched. RESUME rebuilds the triple via
+    /// [`crate::backend::resume_causation_env`] from
+    /// `ResumeRequest::estate_root` (re-supplied, S2 E6) and the execution id
+    /// on the `handle` every `resume()` already receives — the resolved env
+    /// this produces is what every later turn on the execution reuses, so an
+    /// empty map here silently dropped causation for the rest of the
+    /// execution's life, not only for the reconciliation snapshot.
+    fn launch_config(
+        &self,
+        profile: Option<&Profile>,
+        causation: &BTreeMap<String, String>,
+    ) -> Result<LaunchConfig, BackendError> {
         if let Some(profile) = profile {
             if profile.config_home.is_some() {
                 return Err(self.err_failed(format!(
@@ -3344,6 +3386,9 @@ impl AgyBackend {
             for (key, value) in &profile.env {
                 env.insert(key.clone(), value.clone());
             }
+        }
+        for (key, value) in causation {
+            env.insert(key.clone(), value.clone());
         }
         Ok(LaunchConfig { executable, env })
     }
@@ -4129,37 +4174,54 @@ impl AgyBackend {
 
 // ------------------------------------------------------------ turn reader
 
-/// Send `SIGKILL` to a whole process group.
+/// One `agy -p /config` probe child, killed group-first and reaped when this
+/// guard drops (#310 requirement 2: a probe's child dies when the probe
+/// completes, with a `Drop` backstop covering every path that is not the
+/// ordinary one — an early return, an expired budget, a panic in the parse).
 ///
-/// Nothing gates this on the leader being alive, and that is the point: the
-/// group can outlive its leader (opencode probe 11), so the group id is
-/// signalled unconditionally and `ESRCH` (an already-empty group) is success,
-/// not an error to report.
-fn kill_process_group(pgid: Option<u32>) {
-    let Some(pgid) = pgid else { return };
-    #[cfg(unix)]
-    {
-        if let Err(e) = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("kill -KILL -{pgid}"))
-            .output()
-        {
-            tracing::warn!(
-                pgid,
-                error = %e,
-                "could not run the process-group kill; the turn's direct child is all that \
-                 INTERRUPT reached — any commands it spawned may still be running"
-            );
+/// The group goes first for the reason [`kill_process_group`] documents: this
+/// is a whole agent invocation, not a `--help`, so it may have started
+/// commands of its own, and a group routinely outlives its leader.
+struct ConfigProbeChild {
+    child: Child,
+    pgid: u32,
+    /// Deregisters this pgid from the owning probe walk's live set. Held,
+    /// never read.
+    _registration: child::ProbeChildRegistration,
+}
+
+impl ConfigProbeChild {
+    fn adopt(spawned: Child) -> Self {
+        let pgid = spawned.id();
+        Self {
+            child: spawned,
+            pgid,
+            _registration: child::register_probe_child(pgid),
         }
     }
-    #[cfg(not(unix))]
-    {
-        tracing::warn!(
-            pgid,
-            "no process-group signal mechanism on this platform; killing only the direct child \
-             — any commands it spawned may still be running"
-        );
+}
+
+impl Drop for ConfigProbeChild {
+    fn drop(&mut self) {
+        kill_process_group(Some(self.pgid));
+        let _ = self.child.kill();
+        // Reaped, not merely signalled: an un-`wait`ed child becomes a zombie
+        // the instant it exits, and a zombie still answers `kill(pid, 0)` as
+        // alive — which is exactly what an orphan check would then report.
+        let _ = self.child.wait();
     }
+}
+
+/// Kill a turn's whole process group, by the pgid recorded at spawn.
+///
+/// One line, because #310 moved the implementation to
+/// [`crate::backend::child::kill_process_group`] — three adapters carried a
+/// byte-identical private copy of it and the probe path needed a fourth (R2).
+/// The behaviour and every reason for it are documented there; this alias
+/// stays so the call sites in this module keep reading as adapter-local
+/// vocabulary.
+fn kill_process_group(pgid: Option<u32>) {
+    crate::backend::child::kill_process_group(pgid);
 }
 
 /// The group kill above plus `Child::kill()` on the direct child as a belt, for
@@ -5038,7 +5100,10 @@ impl Backend for AgyBackend {
         }
         // Validated without keeping the result: LAUNCH re-resolves it, so the
         // two phases can never disagree about it.
-        self.launch_config(request.profile.as_ref())?;
+        self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         // Refused here rather than at LAUNCH so it costs nothing and is
         // journaled before any process exists — and refused against the
         // transport this execution will ACTUALLY launch on, since the loop
@@ -5063,7 +5128,10 @@ impl Backend for AgyBackend {
     /// context nothing created.
     fn launch(&self, prepared: &PreparedExecution) -> Result<ExecutionHandle, BackendError> {
         let request = &prepared.request;
-        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let LaunchConfig { executable, env } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::causation_env(request),
+        )?;
         let transport = self.transport_resolution().transport;
         {
             let mut state = self.lock();
@@ -5317,7 +5385,10 @@ impl Backend for AgyBackend {
         if let Some(model) = &request.model {
             preflight_model_pin(model).map_err(|reason| self.err_failed(reason))?;
         }
-        let LaunchConfig { executable, env } = self.launch_config(request.profile.as_ref())?;
+        let LaunchConfig { executable, env } = self.launch_config(
+            request.profile.as_ref(),
+            &crate::backend::resume_causation_env(request, &handle.execution_id),
+        )?;
         let mut state = self.lock();
         if let Some(existing) = state.executions.get(&handle.execution_id) {
             if existing.conversation_id.as_deref() != Some(conversation_id.as_str()) {
@@ -5788,6 +5859,7 @@ mod tests {
             execute: None,
             instruction_policy: Default::default(),
             bindings,
+            estate_root: None,
         }
     }
 
@@ -7373,8 +7445,8 @@ mod tests {
     /// places an `admission_test` name may resolve. Reading them as text is how
     /// [`every_admission_test_name_resolves_to_a_real_test`] turns "the ledger
     /// cites a real test" from a claim in a commit message into something the
-    /// build enforces (the same trick `tests/coverage_stage_membership.rs` uses
-    /// on suite wiring). `include_str!` of this very file is deliberate.
+    /// build enforces (the same trick `tests/c2_light/coverage_stage_membership.rs`
+    /// uses on suite wiring). `include_str!` of this very file is deliberate.
     const THIS_MODULE_SOURCE: &str = include_str!("agy.rs");
     const INTEGRATION_SUITE_SOURCE: &str = include_str!("../../tests/agy_backend.rs");
 

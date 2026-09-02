@@ -247,9 +247,16 @@ Rules:
    the fuller source document). It pulls text into the current actor's
    stage context; it does not create a child stage, checkpoint, or durable
    identity. A `@@name` reference used to imply "and then run that other
-   procedure as a sub-workflow" is a violation of scope — true nested
-   workflows do not exist yet; that intent must be recorded as an
-   engine-gap claim, not smuggled through a context reference.
+   procedure as a sub-workflow" is a violation of scope — `@@name`
+   composition was never, and is not now, the mechanism for that. An
+   author who wants real nested execution within the same Work names a
+   stage directory that carries its own `workflow.toml` (engine-level
+   recursion); an author whose need is separately durable submits child
+   Work instead, under the conditions AGENTS.md's ESTATE section states
+   (host-atlas r3 ratification, ruling 2 — the same ruling ratified both
+   primitives). Neither is a `@@name` reference, and reaching for one to
+   imply either is still the same violation of scope this rule has
+   always named.
 2. Sergeant pins the textual `@@name` token in the referring `CONTEXT.md`,
    but at this milestone does **not** pin the transitive contents of
    `common/contexts/<name>.md` at replay time beyond what Git and the work

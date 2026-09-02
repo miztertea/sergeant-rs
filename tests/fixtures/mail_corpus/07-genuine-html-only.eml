@@ -1,0 +1,10 @@
+From: Alice Adams <alice@example.com>
+To: Bob Bianchi <bob@example.com>
+Subject: HTML-only status update
+Date: Mon, 12 Jan 2026 09:20:00 +0000
+Message-ID: <fixture07-html-only@example.com>
+MIME-Version: 1.0
+Content-Type: text/html; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+<html><body><p>Hello Bob,</p><p>This message has <b>no</b> multipart/alternative wrapper and no text/plain part anywhere in the wire bytes &mdash; it is a single physically-HTML part.</p><p>Regards,<br/>Alice</p></body></html>

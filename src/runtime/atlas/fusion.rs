@@ -1,0 +1,1358 @@
+//! S5 W4 — A2 §7's Reciprocal Rank Fusion and A2 §8's deterministic
+//! reranking.
+//!
+//! # The fusion is one expression (A2 §7, decision A2-08, **R6**)
+//!
+//! A2 §7, verbatim: *"Fuse lexical and semantic rank lists with simple RRF
+//! rather than trying to normalize incomparable score scales:
+//! `RRF(d) = Σ 1 / (k + rank_i(d))`. This is intentionally one expression,
+//! then deterministic reranking."* A2-08's rung is **R6** — *"Rank fusion
+//! can remain a simple deterministic expression; no framework needed"* — and
+//! [`rrf_contribution`] is that one expression. There is no weight, no
+//! pluggable scorer, no registry of rankers: [`fuse`] takes exactly the two
+//! lists A2 §7 names and returns one list.
+//!
+//! **No number in this module is tunable by a caller** — [`RRF_K`] is a
+//! constant with its provenance stated, and nothing else here is a number at
+//! all. A2 §14's *"Do not expose raw retrieval weight tuning"* is met by
+//! there being nothing to expose (and A2 §16's *"trained/learned reranker"*
+//! and *"live self-tuning from Work outcomes"* non-goals by there being
+//! nothing that learns).
+//!
+//! # Where determinism actually breaks, and the rule for each
+//!
+//! `RRF(d) = Σ 1/(k + rank_i(d))` is exactly reproducible; the four hazards
+//! are all around it, and each one has a rule here and a test in
+//! `tests/w4_rrf_fusion.rs`:
+//!
+//! | # | Hazard | The rule |
+//! |---|---|---|
+//! | 1 | candidate collection order | [`fuse`] re-sorts **both** inputs with their own stated `rank_order`/`rank_semantic` before assigning any rank, so `rank_i(d)` is a function of the hits and never of the order a caller happened to hand them over in |
+//! | 2 | tie-breaking | one stated key — [`FusedHit::tie_break_key`], the *same* `(source_name, relative_path, ordinal, unit_key)` W2 and W3b each pinned — applied at every sort in this module |
+//! | 3 | float summation order | the sum has exactly two terms and they are added in a fixed source order (lexical, then semantic) by [`Accumulator::total`]; a missing list contributes a literal `0.0` rather than being skipped, so the expression is the same shape for every candidate |
+//! | 4 | `HashMap` iteration | there is no `HashMap` here. Candidates accumulate in a [`BTreeMap`] keyed by `(generation_id, unit_key)` |
+//!
+//! **And the rule binds the per-source lists, not just the fused one.**
+//! `rank_i(d)` is an INPUT: a wobbly BM25 or cosine ordering silently changes
+//! the fused result even when the fusion itself is perfect. W2 pinned
+//! `lexical::rank_order` and W3b pinned `semantic::rank_semantic`, and hazard
+//! 1 above is [`fuse`] refusing to *trust* that pinning — it re-applies it.
+//!
+//! Why this matters beyond tidiness: A2 §4 makes a daemon-owned query result
+//! *"derived evidence with query identity/input generation/result hash"*, and
+//! A2 §13 requires a search trace to record *"result evidence IDs + ranks"*.
+//! A nondeterministic ranker cannot honour either — the hash would not
+//! reproduce, and the recorded ranks would describe one run rather than the
+//! query.
+//!
+//! # A2 §8's nine signals
+//!
+//! §8 says *"After RRF, reuse A1 structure/provenance rather than training
+//! another ranker"* and lists nine. [`RerankSignals`] has one field per line
+//! of that list, **in the contract's own order**, and
+//! [`RerankSignals::priority`] is the rerank key. Three of the nine are
+//! structurally uniform within any one answer in this architecture rather
+//! than absent — that is recorded on each field, not hidden. See
+//! [`RerankSignals`]'s own doc for the field-by-field account.
+//!
+//! # The prohibition
+//!
+//! *"The reranker must never silently cross an authority/source filter merely
+//! because a candidate scores well."* [`fuse`] is a pure function of two
+//! already-filtered lists: **it has no store handle, so it cannot fetch a
+//! candidate**, and every candidate in its output came from one of its two
+//! inputs. `AtlasDb::fused_search` builds those two inputs from one
+//! `LexicalQuery` — one filter value, both halves — and the structural
+//! reading a *second* list makes necessary is the one
+//! `tests/w4_rrf_fusion.rs::
+//! an_inadmissible_unit_that_wins_the_semantic_list_never_reaches_the_fused_answer`
+//! makes non-vacuous: the decoy is shown ranking first, in the semantic list
+//! and in the fused answer, with the filter open, and absent from both with
+//! it closed.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::domain::source::{AuthorityClass, SourceKind};
+
+use crate::runtime::atlas::lexical::{LexicalHit, UnitCoordinate, query_terms, rank_order};
+use crate::runtime::atlas::semantic::{SemanticHit, rank_semantic};
+
+/// RRF's `k`.
+///
+/// **Provenance: this is the published default, not a measurement of this
+/// corpus.** `k = 60` is the value Cormack, Clarke and Büttcher's 2009 SIGIR
+/// paper introduced RRF with, and it is used here because no corpus of
+/// Sergeant evidence units has been measured against any other. When one is,
+/// this constant is the thing a measurement replaces; until then it is
+/// honest to say it was inherited rather than derived — exactly the account
+/// [`crate::runtime::atlas::lexical::BM25_K1`] gives of its own value.
+///
+/// It is a `const`, not a field and not a config key: A2 §14 forbids exposing
+/// raw retrieval weight tuning, and a constant nobody can set is the cheapest
+/// way to mean it (**R6**).
+pub const RRF_K: f64 = 60.0;
+
+/// One list's contribution to a candidate's fused score: `1 / (k + rank)`.
+///
+/// `rank` is **1-based** — the best hit in a list has rank 1 — so the first
+/// hit of a list contributes `1/61` rather than `1/60`. A 0-based rank would
+/// make the two spellings of "best" differ by a whole `k`-step and make this
+/// constant mean something else than the literature's.
+pub fn rrf_contribution(rank: usize) -> f64 {
+    1.0 / (RRF_K + rank as f64)
+}
+
+/// Is this query a bare symbol rather than prose? — semble's
+/// `ranking/boosting.py::is_symbol_query`.
+///
+/// semble spells it as one anchored regex over the stripped query; the same
+/// rule in Rust is: **one whitespace-free token**, made of identifier
+/// characters and namespace separators, that is either namespace-qualified,
+/// starts with an underscore, or carries an uppercase letter or an
+/// underscore. semble's own comment states the discriminating case — *"plain
+/// lowercase words (e.g. `session`) are NL, not symbols"* — and that is the
+/// case this function exists to get right.
+///
+/// Not [`crate::runtime::atlas::lexical::is_identifier_like`] (R2 checked and
+/// rejected): that predicate is true when **any** compound inside a longer
+/// text is identifier-shaped, so it calls *"how is SourceKind validated"* an
+/// identifier query. semble deliberately calls that prose. The two answer
+/// different questions and both are wanted — `is_identifier_like` still
+/// decides A2 §8's *"definition over reference when query is
+/// identifier-like"* signal.
+pub fn is_symbol_query(query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() || query.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let namespaced = ["::", "->", "\\", "."]
+        .iter()
+        .any(|separator| query.contains(separator));
+    if !query
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || namespaced && !c.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    namespaced
+        || query.starts_with('_')
+        || query.contains('_')
+        || query.chars().any(|c| c.is_ascii_uppercase())
+}
+
+/// The A2 §8 signal multipliers, and the path/saturation penalties — **the
+/// rerank as a score adjustment rather than an ordering key**.
+///
+/// # Why the ordering key had to go
+///
+/// [`RerankSignals::priority`]'s `[bool; 9]`, compared lexicographically
+/// before the fused score was consulted at all, meant **one fired boolean
+/// outranked any score gap**. Measured on the real estate: `sgt search
+/// "bounded judgment ladder"` returned `scripts/probe-env.sh#2`
+/// (`rrf = 0.006269652`, lexical rank 1404) above a candidate at
+/// `rrf = 0.022043160` — 28% of the score, first place. And because signal 5
+/// (`same_section_as_anchor`) is compared before signal 7 (`canonical_path`),
+/// four `tests/*.rs` helpers named `source` outranked `src/domain/source.rs`,
+/// which was the best-fused candidate of the six.
+///
+/// semble adjusts the score and sorts once by the adjusted value
+/// (`semble/ranking/penalties.py::rerank_topk`,
+/// `semble/ranking/boosting.py`). That is what this does.
+///
+/// # Provenance of every number here (R5, with one R7 mapping stated)
+///
+/// **Every constant below is a value semble ships**, in an installed
+/// dependency A2 §5/§7 already cite as prior art ([EXT-SEMBLE]). None of them
+/// was fitted to any Sergeant corpus — fitting them to our own bench would be
+/// the *live self-tuning from Work outcomes* A2 §16 forbids, and is
+/// deliberately not done.
+///
+/// | Here | semble | semble's own name |
+/// |---|---|---|
+/// | [`BOOST_EXACT_MATCH`] `3.0` | `boosting.py` | `_DEFINITION_BOOST_MULTIPLIER` |
+/// | [`BOOST_DEFINITION`] `1.5` | `boosting.py::_definition_tier` | the stem-match tier bump |
+/// | [`BOOST_WORK_CHANGED`] `1.5` | same | same |
+/// | [`BOOST_ADJACENCY`] `1.2` | `boosting.py` | `1 + _FILE_COHERENCE_BOOST_FRAC` |
+/// | [`PENALTY_NON_CANONICAL`] `0.3` | `penalties.py` | `_STRONG_PENALTY` |
+/// | [`FILE_SATURATION_DECAY`] `0.5` | `penalties.py` | `_FILE_SATURATION_DECAY` |
+///
+/// **What is R7 and not R5: which semble constant each A2 §8 signal maps
+/// to.** semble has no *Work-changed* or *structural-relationship* notion, so
+/// signals 4, 5 and 6 are mapped by stated analogy — 4 to the definition-tier
+/// bump (a provenance-strength signal), 5 and 6 to the file-coherence factor
+/// (both are adjacency signals). The numbers are adopted; the mapping is this
+/// module's judgement and is written down here so a reader can dispute it.
+///
+/// # A2 §14 and §16 are still met
+///
+/// None of these is a field, a flag or a config key — A2 §14's *"do not
+/// expose raw retrieval weight tuning in workflow files"* is met the way
+/// [`RRF_K`] meets it, by there being nothing to expose. Nothing here learns:
+/// the multipliers are constants in the binary, identical for every query and
+/// every estate, which is what separates an adopted configuration from A2
+/// §16's forbidden *trained/learned reranker*.
+pub const BOOST_EXACT_MATCH: f64 = 3.0;
+
+/// Signal 2, *"definition over reference when query is identifier-like"* —
+/// see [`BOOST_EXACT_MATCH`] for the provenance of every multiplier.
+pub const BOOST_DEFINITION: f64 = 1.5;
+
+/// Signal 4, *"Work-changed unit"*. See [`BOOST_EXACT_MATCH`].
+pub const BOOST_WORK_CHANGED: f64 = 1.5;
+
+/// Signal 6, *"inbound/outbound structural relationship"* with the anchor.
+/// See [`BOOST_EXACT_MATCH`].
+///
+/// **Signal 5 deliberately does not use this, or any factor.** It is
+/// *"same module/package/document section"* measured against the anchor, and
+/// `same_section` is reflexive, so as a multiplier it pays the top-RRF
+/// candidate for being where RRF already put it — the measured `BM25_K1`
+/// inversion. Suppressing it on the anchor alone only moves the distortion
+/// to its neighbours. The file-level preference A2 §8 asks for is supplied
+/// instead by [`FILE_COHERENCE_BOOST_FRAC`], which is anchor-free and
+/// computed identically for every file. Signal 6 has no such problem: a unit
+/// has no `source.edges` relationship with itself.
+pub const BOOST_ADJACENCY: f64 = 1.2;
+
+/// semble's `_FILE_COHERENCE_BOOST_FRAC` — *"fraction of max_score added to
+/// each file's top chunk, scaled by its aggregate candidate score"*
+/// (`boosting.py::boost_multi_chunk_files`). A file several of whose chunks
+/// are candidates is more likely to be what the query is about; its single
+/// best chunk gets the boost, and [`FILE_SATURATION_DECAY`] holds the rest
+/// down. See [`BOOST_EXACT_MATCH`] for the provenance rule.
+pub const FILE_COHERENCE_BOOST_FRAC: f64 = 0.2;
+
+/// Signal 7's negative half: a test/example/legacy path multiplies its score
+/// by this. semble's `_STRONG_PENALTY`. See [`BOOST_EXACT_MATCH`].
+pub const PENALTY_NON_CANONICAL: f64 = 0.3;
+
+/// Each chunk of a file after the first is decayed by this, per excess chunk
+/// — semble's `_FILE_SATURATION_DECAY` at `_FILE_SATURATION_THRESHOLD = 1`.
+/// Without it one file takes the whole answer: nine of ten slots, measured.
+/// See [`BOOST_EXACT_MATCH`].
+pub const FILE_SATURATION_DECAY: f64 = 0.5;
+
+/// Which of A2 §7's two rank lists a candidate appeared in, and at what rank.
+///
+/// Kept on every [`FusedHit`] because A2 §13's trace records *"result
+/// evidence IDs + ranks"* — the fused score alone cannot say whether a hit
+/// arrived through BM25, through cosine, or through both, and "both" is the
+/// interesting answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RankOrigins {
+    /// 1-based rank in the lexical list, or `None` if it did not appear.
+    pub lexical: Option<usize>,
+    /// 1-based rank in the semantic list, or `None` if it did not appear.
+    pub semantic: Option<usize>,
+}
+
+/// A2 §8's nine signals, one field per line of the contract's list, **in the
+/// contract's own order** — which is also [`Self::priority`]'s order.
+///
+/// > exact symbol / heading / filename match
+/// > definition over reference when query is identifier-like
+/// > source explicitly selected by caller
+/// > Work-changed unit
+/// > same module/package/document section
+/// > inbound/outbound structural relationship
+/// > canonical implementation vs test/example/legacy path
+/// > knowledge source when `--type knowledge` requested
+/// > current exact generation over stale generation unless caller pinned stale
+///
+/// # Every one of the nine is computed; three of them are structurally
+/// uniform, and that is recorded rather than hidden
+///
+/// [`Self::caller_selected_source`], [`Self::knowledge_source_requested`] and
+/// [`Self::current_generation`] are true for **every** candidate of any one
+/// answer, or false for every candidate, and therefore never reorder
+/// anything. That is not an omission and not a stub — it is what A2-01
+/// (*"Filter source/authority/content/Work world before ranking"*) does to
+/// them. A preference the admissibility filter has already turned into a
+/// **boundary** cannot also be a ranking hint, because nothing on the wrong
+/// side of it survives to be ranked:
+///
+/// * *source explicitly selected by caller* — `SourceSelector::Named`/
+///   `Exact`/`WorkBase` are filters, so a hit from an unselected source does
+///   not exist to be outranked
+///   (`AtlasDb::admissible_generations`'s `WHERE`).
+/// * *knowledge source when `--type knowledge` requested* —
+///   `Admissibility::kind` is the same: `--type knowledge` admits
+///   `local_knowledge` generations and nothing else.
+/// * *current exact generation over stale generation* —
+///   `AtlasDb::confirm_scan` evicts a source's previous confirmed generation
+///   in the same transaction that promotes its successor, and eviction
+///   deletes the content rows, so **no stale generation is ever admissible**
+///   to begin with. Under `SourceSelector::Exact` — A2 §8's *"unless the
+///   caller pinned stale"* — the signal is deliberately set true for every
+///   candidate so the preference cannot fire against the pin.
+///
+/// They are still computed and still carried, because a signal that is
+/// uniform *today* is a different thing from one that is missing: it appears
+/// in the trace A2 §13 asks for, it discriminates the instant supersession
+/// ever keeps two confirmed generations of one source, and its being uniform
+/// is a checkable claim rather than a comment
+/// (`tests/w4_rrf_fusion.rs::
+/// the_three_filter_shaped_signals_are_uniform_because_admissibility_already_applied_them`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RerankSignals {
+    /// **1.** A query term is exactly this unit's symbol, heading/title, file
+    /// name or file stem — [`exact_match`].
+    pub exact_match: bool,
+    /// **2.** The query is identifier-like
+    /// ([`crate::runtime::atlas::lexical::is_identifier_like`]) and this
+    /// candidate is a grammar-claimed definition site rather than a prose
+    /// mention of the identifier.
+    ///
+    /// **The named gap in this signal is what A1 indexes, not what it
+    /// stores.** A1 records reference sites in `source.edges`, but
+    /// `indexable_units` derives retrievable units from `source.occurrences`
+    /// (definition sites) and `source.units`/`context.row_units` (prose and
+    /// row text) only — so a code *reference* is not a candidate at all, and
+    /// this signal discriminates "the definition" from "a document that
+    /// mentions the name". Destination for the fuller reading: indexing
+    /// `source.edges` as retrievable units is an A1-side change (a new unit
+    /// family), out of scope for W4 and not smuggled in as a ranking
+    /// workaround.
+    pub definition_over_reference: bool,
+    /// **3.** The caller named a source (`--source`, `--source@sha`,
+    /// `--work`). Uniform — see the type's own doc.
+    pub caller_selected_source: bool,
+    /// **4.** The unit's path is one the Work has **changed** — its
+    /// overlay-generation content hash differs from the base generation's
+    /// hash at the same path (F-SF-01) — not merely one visible under the
+    /// overlay's source name, which every unchanged path under it is too.
+    /// Reachable since S5 W1d made the overlay reflect in-flight changes
+    /// rather than a freshly-cut worktree.
+    pub work_changed_unit: bool,
+    /// **5.** Same module/package/document section as the top RRF candidate —
+    /// [`same_section`].
+    pub same_section_as_anchor: bool,
+    /// **6.** An inbound or outbound `source.edges` relationship with the top
+    /// RRF candidate.
+    pub structural_relationship: bool,
+    /// **7.** A canonical implementation path rather than a
+    /// test/example/legacy one — [`is_canonical_path`].
+    pub canonical_path: bool,
+    /// **8.** `--type knowledge` was requested. Uniform — see the type's own
+    /// doc.
+    pub knowledge_source_requested: bool,
+    /// **9.** This is the current confirmed generation of its source (or the
+    /// caller pinned a generation, in which case it is uniformly true).
+    /// Uniform — see the type's own doc.
+    pub current_generation: bool,
+}
+
+impl RerankSignals {
+    /// The nine signals as an array, in A2 §8's own listing order — **A2
+    /// §13's trace enumeration, no longer the ordering key.**
+    ///
+    /// # This used to be the order, and that was the defect
+    ///
+    /// Until the semble-parity port this array was compared
+    /// *lexicographically* and the fused score only broke exact ties, so one
+    /// fired boolean outranked any score gap. Measured on the real estate:
+    /// a candidate at `rrf = 0.006269652` (lexical rank 1404) took first
+    /// place from one at `rrf = 0.022043160`; and because slot 5 is compared
+    /// before slot 7, four `tests/*.rs` helpers outranked the implementation
+    /// file that had out-fused all of them.
+    ///
+    /// The order was never the contract's instruction. A2 §8 says *"Useful
+    /// signals include:"* and then prints nine lines; the precedence was this
+    /// module's inference from the printing order, and it is the inference
+    /// that has been replaced — by [`Self::multiplier`], whose factors are an
+    /// installed dependency's shipped constants rather than any number fitted
+    /// here. `tests/w4_rrf_fusion.rs::
+    /// the_rerank_key_is_a2_section_8s_nine_signals_as_a_score_adjustment`
+    /// pins both halves.
+    pub fn priority(&self) -> [bool; 9] {
+        [
+            self.exact_match,
+            self.definition_over_reference,
+            self.caller_selected_source,
+            self.work_changed_unit,
+            self.same_section_as_anchor,
+            self.structural_relationship,
+            self.canonical_path,
+            self.knowledge_source_requested,
+            self.current_generation,
+        ]
+    }
+
+    /// How many of the nine fired — for a trace to render, never for
+    /// ordering. [`Self::multiplier`] is the order.
+    pub fn fired(&self) -> usize {
+        self.priority().iter().filter(|fired| **fired).count()
+    }
+
+    /// **A2 §8's nine signals as one multiplicative adjustment** — the
+    /// product of the multipliers of the signals that fired.
+    ///
+    /// Every signal still participates; none of them can outrank an
+    /// arbitrary score gap any more, because each is worth exactly its
+    /// factor. The three signals A2-01 turned into a boundary
+    /// ([`Self::caller_selected_source`],
+    /// [`Self::knowledge_source_requested`], [`Self::current_generation`])
+    /// are uniform across any one answer and are given no factor at all — a
+    /// constant factor on every candidate cannot reorder anything, and
+    /// pretending otherwise would be a weight with no effect.
+    ///
+    /// **Signal 5 carries no factor either**, for a different reason: it is
+    /// measured against the anchor and `same_section` is reflexive, so a
+    /// factor on it pays the top-RRF candidate for being itself. See
+    /// [`BOOST_ADJACENCY`]'s own doc and
+    /// [`FILE_COHERENCE_BOOST_FRAC`], which supplies that preference without
+    /// an anchor.
+    ///
+    /// Signal 7 is **not** here — it is [`Self::path_penalty`], applied in a
+    /// later stage, for the reason that method states.
+    pub fn multiplier(&self) -> f64 {
+        let mut factor = 1.0;
+        if self.exact_match {
+            factor *= BOOST_EXACT_MATCH;
+        }
+        if self.definition_over_reference {
+            factor *= BOOST_DEFINITION;
+        }
+        if self.work_changed_unit {
+            factor *= BOOST_WORK_CHANGED;
+        }
+        if self.structural_relationship {
+            factor *= BOOST_ADJACENCY;
+        }
+        factor
+    }
+
+    /// **Signal 7 on its own**, because semble applies path penalties in a
+    /// different *stage* from its boosts: `search.py` runs
+    /// `boost_multi_chunk_files` and `apply_query_boost` first and only then
+    /// `rerank_topk(..., penalise_paths=True)`. The order matters — a boost
+    /// computed relative to the answer's maximum must be computed before the
+    /// penalty, or a penalised candidate is charged twice.
+    ///
+    /// Stated positively in A2 §8 (*"canonical implementation vs
+    /// test/example/legacy path"*) and negatively here, which is semble's
+    /// spelling (`penalties.py::_file_path_penalty`): canonical is the norm
+    /// at `1.0`, everything else multiplies by [`PENALTY_NON_CANONICAL`].
+    pub fn path_penalty(&self) -> f64 {
+        if self.canonical_path {
+            1.0
+        } else {
+            PENALTY_NON_CANONICAL
+        }
+    }
+}
+
+/// One fused candidate: A2 §7's score, the ranks it was computed from, the
+/// A2 §8 signals that reranked it, and the A1 coordinate every hit in this
+/// system carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FusedHit {
+    /// `Σ 1/(k + rank_i(d))` over the lists this candidate appeared in.
+    pub rrf: f64,
+    /// The **reranked** score: [`Self::rrf`] times A2 §8's signal
+    /// multipliers, times the path penalty, times the file-saturation decay.
+    /// `0.0` until [`rerank`] runs — [`fuse`] produces A2 §7's answer and
+    /// nothing more, which is what keeps the two steps separable and
+    /// separately testable.
+    pub adjusted: f64,
+    /// Which lists it appeared in, and where — A2 §13's *"result evidence IDs
+    /// + ranks"*.
+    pub origins: RankOrigins,
+    /// A2 §8's nine signals for this candidate. All false until
+    /// `AtlasDb::fused_search` computes them; [`fuse`] itself does not, and
+    /// cannot — six of the nine need the query, the filter or the store.
+    pub signals: RerankSignals,
+    /// The declared source.
+    pub source_name: String,
+    /// **A2 §17 item 8** — the source's kind, carried through the fusion
+    /// unchanged from whichever input list the candidate arrived in. Both
+    /// inputs carry it, and both agree: `fuse` joins on
+    /// `(generation_id, unit_key)`, and a generation has exactly one
+    /// `source_kind` row in `source.generations`.
+    pub source_kind: SourceKind,
+    /// **A2 §17 item 8's other half** — the source's authority class. See
+    /// [`crate::runtime::atlas::lexical::LexicalHit::authority_class`].
+    pub authority_class: AuthorityClass,
+    /// The exact SourceGeneration this unit belongs to.
+    pub generation_id: String,
+    /// That generation's content identity.
+    pub content_key: String,
+    /// The index's own per-generation unit identity.
+    pub unit_key: String,
+    /// A1's coordinate for the unit itself.
+    pub coordinate: UnitCoordinate,
+}
+
+impl FusedHit {
+    /// **The same stated tie-break key both input lists use** —
+    /// `(source_name, relative_path, ordinal, unit_key)`, see
+    /// [`crate::runtime::atlas::lexical::LexicalHit::tie_break_key`] and
+    /// [`crate::runtime::atlas::semantic::SemanticHit::tie_break_key`].
+    ///
+    /// Same key at all three levels on purpose: two lists that broke ties
+    /// differently would already have handed `fuse` a `rank_i(d)` that
+    /// depended on which half a tied unit reached first, and a fused list
+    /// that broke them a third way would undo the agreement.
+    pub fn tie_break_key(&self) -> (&str, &str, u64, &str) {
+        (
+            &self.source_name,
+            self.coordinate.relative_path(),
+            self.coordinate.ordinal(),
+            &self.unit_key,
+        )
+    }
+}
+
+/// Order two candidates by **A2 §7's fused score alone**: score descending by
+/// [`f64::total_cmp`], then [`FusedHit::tie_break_key`] ascending.
+///
+/// This is the order A2 §7 produces and A2 §8's *"then deterministic
+/// reranking"* consumes — [`rerank`] is the second step, and the two are
+/// separate functions so a reader (and a test) can see the fused order before
+/// any signal touched it.
+pub fn rrf_order(left: &FusedHit, right: &FusedHit) -> std::cmp::Ordering {
+    right
+        .rrf
+        .total_cmp(&left.rrf)
+        .then_with(|| left.tie_break_key().cmp(&right.tie_break_key()))
+}
+
+/// A2 §8's order: **[`FusedHit::adjusted`] descending, then the stated
+/// tie-break key** — one sort over one number, exactly as semble's
+/// `rerank_topk` sorts over its penalised scores.
+///
+/// Only meaningful after [`rerank`] has filled `adjusted`; on a list fresh
+/// from [`fuse`] every `adjusted` is `0.0` and this degenerates to the
+/// tie-break key, which is why [`rerank`] computes and sorts in one call
+/// rather than exposing a comparator a caller could apply too early.
+pub fn rerank_order(left: &FusedHit, right: &FusedHit) -> std::cmp::Ordering {
+    right
+        .adjusted
+        .total_cmp(&left.adjusted)
+        .then_with(|| left.tie_break_key().cmp(&right.tie_break_key()))
+}
+
+/// A candidate under accumulation. Two `Option`s rather than a `Vec` of
+/// contributions: A2 §7 fuses exactly the two lists §7 names, and a `Vec`
+/// would be the beginning of the ranker framework A2-08's **R6** says not to
+/// build.
+struct Accumulator {
+    hit: FusedHit,
+}
+
+impl Accumulator {
+    /// A fresh candidate's skeleton, from the five identifying fields
+    /// [`LexicalHit`] and [`SemanticHit`] both carry (F-SI-01: the two call
+    /// sites in [`fuse`] differed only in which of `origins.lexical`/
+    /// `origins.semantic` they went on to set). `origins` starts at
+    /// [`RankOrigins::default`] and is mutated in place by the caller —
+    /// there is exactly one copy of it, so there is nothing left to
+    /// overwrite at [`fuse`]'s finalize step the way a second, accumulator-
+    /// level copy once required (F-SI-02).
+    fn new(
+        source_name: &str,
+        source_kind: SourceKind,
+        authority_class: AuthorityClass,
+        generation_id: &str,
+        content_key: &str,
+        unit_key: &str,
+        coordinate: &UnitCoordinate,
+    ) -> Self {
+        Accumulator {
+            hit: FusedHit {
+                rrf: 0.0,
+                adjusted: 0.0,
+                origins: RankOrigins::default(),
+                signals: RerankSignals::default(),
+                source_name: source_name.to_string(),
+                source_kind,
+                authority_class,
+                generation_id: generation_id.to_string(),
+                content_key: content_key.to_string(),
+                unit_key: unit_key.to_string(),
+                coordinate: coordinate.clone(),
+            },
+        }
+    }
+
+    /// A2 §7's expression, verbatim: `Σ 1/(k + rank_i(d))` over two lists
+    /// each RRF'd independently.
+    ///
+    /// **semble's α blend was ported here and then reverted, measured.** Its
+    /// `search.py` weights the two halves `α·sem + (1−α)·bm25` with α = 0.3
+    /// for symbol queries and 0.5 otherwise. Over the 52-question set it
+    /// moved p@1 and p@5 by exactly nothing, in both directions of the
+    /// ablation, because α ≠ 0.5 only for symbol queries and that category
+    /// is already answered perfectly (8/8) with and without it. Recorded as
+    /// unmeasurable on this corpus rather than as harmful — a question set
+    /// with symbol questions we get *wrong* could still justify it — and
+    /// removed rather than kept, which also restores A2 §7's own one
+    /// expression exactly as the contract prints it.
+    ///
+    /// Hazard 3 — **float summation order.** Two terms, added in one fixed
+    /// order (lexical, then semantic), with an absent list contributing a
+    /// literal `0.0` rather than being skipped. `a + b` and `b + a` differ in
+    /// f64 whenever rounding differs, so the order is written down here once
+    /// instead of falling out of whichever list a candidate happened to be
+    /// found in first.
+    fn total(&self) -> f64 {
+        let lexical = self.hit.origins.lexical.map_or(0.0, rrf_contribution);
+        let semantic = self.hit.origins.semantic.map_or(0.0, rrf_contribution);
+        lexical + semantic
+    }
+}
+
+/// A2 §7, the whole of it: fuse a lexical and a semantic rank list into one
+/// ordered list of candidates.
+///
+/// # Determinism, in the order the hazards appear
+///
+/// 1. **Candidate collection order.** Both inputs are re-sorted with their
+///    own stated orders ([`rank_order`], [`rank_semantic`]) before any rank
+///    is assigned, so `rank_i(d)` is a function of the hits themselves. A
+///    caller that hands over a shuffled list gets the same answer as one that
+///    hands over a sorted one.
+/// 2. **Tie-breaking.** [`rrf_order`], the same stated key both inputs use.
+/// 3. **Float summation order.** [`Accumulator::total`].
+/// 4. **`HashMap` iteration.** The accumulator is a [`BTreeMap`] keyed by
+///    `(generation_id, unit_key)` — the identity both halves already agree on
+///    (`tests/w3b_semantic_retrieval.rs::
+///    a_semantic_hit_and_a_lexical_hit_on_the_same_unit_carry_the_identical_coordinate`
+///    is why that join is sound).
+///
+/// # The prohibition, structurally
+///
+/// This function takes no store handle and performs no lookup. Every hit it
+/// returns came from one of its two arguments, both of which were produced
+/// inside A2 §2's admissibility filter — so *"the reranker must never
+/// silently cross an authority/source filter"* is a property of the
+/// signature, not of a check someone has to remember.
+///
+/// Signals are left at [`RerankSignals::default`] (all false); the caller
+/// computes them and calls [`rerank`].
+pub fn fuse(lexical: &[LexicalHit], semantic: &[SemanticHit]) -> Vec<FusedHit> {
+    let mut lexical: Vec<&LexicalHit> = lexical.iter().collect();
+    lexical.sort_by(|a, b| rank_order(a, b));
+    let mut semantic: Vec<&SemanticHit> = semantic.iter().collect();
+    semantic.sort_by(|a, b| rank_semantic(a, b));
+
+    let mut candidates: BTreeMap<(String, String), Accumulator> = BTreeMap::new();
+    for (index, hit) in lexical.iter().enumerate() {
+        candidates
+            .entry((hit.generation_id.clone(), hit.unit_key.clone()))
+            .or_insert_with(|| {
+                Accumulator::new(
+                    &hit.source_name,
+                    hit.source_kind,
+                    hit.authority_class,
+                    &hit.generation_id,
+                    &hit.content_key,
+                    &hit.unit_key,
+                    &hit.coordinate,
+                )
+            })
+            .hit
+            .origins
+            .lexical = Some(index + 1);
+    }
+    for (index, hit) in semantic.iter().enumerate() {
+        candidates
+            .entry((hit.generation_id.clone(), hit.unit_key.clone()))
+            .or_insert_with(|| {
+                Accumulator::new(
+                    &hit.source_name,
+                    hit.source_kind,
+                    hit.authority_class,
+                    &hit.generation_id,
+                    &hit.content_key,
+                    &hit.unit_key,
+                    &hit.coordinate,
+                )
+            })
+            .hit
+            .origins
+            .semantic = Some(index + 1);
+    }
+
+    let mut fused: Vec<FusedHit> = candidates
+        .into_values()
+        .map(|accumulator| {
+            let rrf = accumulator.total();
+            let mut hit = accumulator.hit;
+            hit.rrf = rrf;
+            hit
+        })
+        .collect();
+    fused.sort_by(rrf_order);
+    fused
+}
+
+/// A2 §8's second step, applied to a list [`fuse`] produced and a caller
+/// filled the signals of: **adjust every score, then sort by it once.**
+///
+/// semble's own order (`search.py::search` calling into
+/// `ranking/boosting.py` and `ranking/penalties.py::rerank_topk`):
+///
+/// 1. a file whose chunks score well collectively has its best chunk
+///    boosted, computed from the raw fused score
+///    ([`boost_multi_chunk_files`]) — *first*, before any per-query signal
+///    has touched a single candidate;
+/// 2. each candidate's score is then multiplied by its signal factor
+///    ([`RerankSignals::multiplier`]) — this module's carrier of semble's
+///    exact-match/definition-tier boost (`boosting.py`'s `apply_query_boost`,
+///    symbol branch);
+/// 3. semble's NL query boost is added — `max_score ×
+///    STEM_BOOST_MULTIPLIER × `[`path_stem_match_ratio`] (the same
+///    function's stem branch, mutually exclusive with step 2's symbol
+///    branch in semble, sequential here for the same net effect since a
+///    query is either symbol-shaped or not);
+/// 4. signal 7's path penalty multiplies what is left
+///    ([`RerankSignals::path_penalty`]);
+/// 5. candidates are put in that order;
+/// 6. a greedy pass decays each chunk after the first from an
+///    already-seen file by [`FILE_SATURATION_DECAY`] per excess chunk —
+///    without this one file took nine of ten slots on the real estate;
+/// 7. one final sort by the decayed score.
+///
+/// **Steps 1 and 2 must not swap.** Swapped, a file's own signal-boosted
+/// chunk inflates that file's total, which inflates the *shared*
+/// `max_total` denominator every other file's coherence share (step 1) is
+/// computed against — measured and pinned by `tests/w4_rrf_fusion.rs::
+/// a_files_own_exact_match_does_not_inflate_the_coherence_denominator_other_files_share`.
+///
+/// **Limit-independent by construction.** semble's `rerank_topk` takes
+/// `top_k` and exits the greedy pass early once the remaining scores cannot
+/// beat the k-th best; that early exit is an optimization whose result would
+/// still be a prefix, but it makes the adjusted scores a function of `k`.
+/// This walks every candidate instead, so `adjusted` is a function of the
+/// answer alone and `tests/w4_rrf_fusion.rs::
+/// the_fused_order_does_not_depend_on_the_callers_limit` stays true.
+pub fn rerank(hits: &mut [FusedHit], query: &str) {
+    // Stage 1 — file coherence, computed from the raw fused score.
+    //
+    // semble's own order (`search.py::search`): `boost_multi_chunk_files`
+    // (line 124) runs on the raw alpha-blended/RRF'd `combined_scores`,
+    // *before* `apply_query_boost` (line 126) — the function carrying the
+    // exact-match/definition-tier boost this module ports as
+    // [`RerankSignals::multiplier`] — ever touches a single candidate's
+    // score. Running the multiplier first (the order this stage used to
+    // have) let one file's own exact-match-boosted chunk inflate that
+    // file's `file_total`, which in turn inflated the *shared* `max_total`
+    // denominator every other file's coherence share is computed against —
+    // a candidate with no signal of its own ended up penalised by a boost
+    // it never earned, purely for sharing the answer with a flagged file.
+    // `tests/w4_rrf_fusion.rs::
+    // a_files_own_exact_match_does_not_inflate_the_coherence_denominator_other_files_share`
+    // pins the corrected number by hand.
+    for hit in hits.iter_mut() {
+        hit.adjusted = hit.rrf;
+    }
+    boost_multi_chunk_files(hits);
+    // Stage 2 — A2 §8's signals as boosts, now applied on top of the
+    // coherence-adjusted score. Signal 7 is deliberately not here; it is a
+    // later stage, as in semble.
+    for hit in hits.iter_mut() {
+        hit.adjusted *= hit.signals.multiplier();
+    }
+    // Stage 3 — semble's `apply_query_boost`, NL branch: additive against
+    // the answer's largest score, computed once, before any boost is added.
+    let max_score = hits.iter().map(|hit| hit.adjusted).fold(0.0_f64, f64::max);
+    if max_score > 0.0 {
+        for hit in hits.iter_mut() {
+            let ratio = path_stem_match_ratio(query, hit.coordinate.relative_path());
+            hit.adjusted += max_score * STEM_BOOST_MULTIPLIER * ratio;
+        }
+    }
+    // Stage 4 — path penalties.
+    for hit in hits.iter_mut() {
+        hit.adjusted *= hit.signals.path_penalty();
+    }
+    hits.sort_by(rerank_order);
+
+    let mut seen_per_file: BTreeMap<String, u32> = BTreeMap::new();
+    for hit in hits.iter_mut() {
+        let path = hit.coordinate.relative_path().to_string();
+        let already = seen_per_file.entry(path).or_insert(0);
+        if *already > 0 {
+            hit.adjusted *= FILE_SATURATION_DECAY.powi(*already as i32);
+        }
+        *already += 1;
+    }
+    hits.sort_by(rerank_order);
+}
+
+/// **F-SF-01 / brief-search-three-bugs.md Bug 3** — *"the same (source,
+/// path) twice in one top-5"*: two units of one file surfacing as two
+/// file-level rows (measured: `c02` `blob.rs` ×2, `c07` `preflight.rs` ×2
+/// from a single source).
+///
+/// [`FILE_SATURATION_DECAY`] (applied inside [`rerank`], directly above)
+/// only *discounts* a file's second-and-later chunk — it is semble's own
+/// shape (`penalties.py::rerank_topk`) and semble's shape does not remove a
+/// duplicate, it only makes it less likely to outrank something else. A
+/// file whose two units both score well can still both survive into the
+/// caller's `top_k` after decay; `tests/w4_rrf_fusion.rs::
+/// a_second_chunk_of_the_same_file_is_decayed_so_one_file_cannot_take_every_slot`
+/// pins exactly that (it asserts the crowded file no longer takes *every*
+/// slot, never that it takes only one). The brief's own bug report is a
+/// *file-row* duplicate, not merely a decayed-but-present one, so decay
+/// alone does not close it.
+///
+/// This is the grouping half the brief asks to port alongside decay
+/// (`boosting.py::boost_multi_chunk_files` *"+ rerank's per-file decay"*,
+/// read together): one row per **generation** of a file in the final
+/// answer. `hits` must already be in [`rerank_order`] (i.e. already run
+/// through [`rerank`]), so the first candidate seen for a given
+/// `(source_name, relative_path, generation_id)` is that generation's
+/// best-scoring surviving chunk — the one this keeps, in its already-decided
+/// rank position. **R7** — no existing grouping utility in this crate
+/// collapses by a multi-part key, and a `BTreeSet` membership filter is the
+/// minimum that works.
+///
+/// # Two things this must not collapse, and why `generation_id` is in the
+/// key rather than just `(source_name, relative_path)`
+///
+/// `tests/w4_rrf_fusion.rs::
+/// an_overlay_unit_whose_content_matches_the_base_is_not_marked_work_changed`
+/// queries a Work's base and its overlay generation of the *same*
+/// `docs/ledger.md` under the *same* `source_name` — two rows the caller
+/// must see side by side to compare, not a duplicate. Keying on
+/// `generation_id` too keeps them apart; `(source_name, relative_path)`
+/// alone collapsed them; this was measured, not assumed (the fixture-red
+/// run below).
+///
+/// # What this must not collapse either, and why a native-addressed unit is
+/// exempt outright
+///
+/// `tests/w5_search_surface.rs::
+/// one_local_knowledge_query_spans_a_normalized_docx_and_a_markdown_file`
+/// expects *both* a `.docx`'s whole-document unit and its section units in
+/// one answer — one generation, one `relative_path`, several genuinely
+/// distinct addresses. A section's [`UnitCoordinate::Document::native`] (or
+/// [`UnitCoordinate::Mail::native`]) is, per those fields' own doc,
+/// *"the only address it has"* once the byte span is honestly `0`/`0` — a
+/// unit for which the file's byte range cannot serve as the disambiguator
+/// a plain chunk relies on. A hit that carries one is never folded into
+/// another hit of the same generation; it is always kept, and it is never
+/// what causes an *other* hit to be dropped (`seen.insert` is skipped for
+/// it entirely, in both directions).
+pub fn dedup_file_rows(hits: Vec<FusedHit>) -> Vec<FusedHit> {
+    let mut seen: BTreeSet<(String, String, String)> = BTreeSet::new();
+    hits.into_iter()
+        .filter(|hit| {
+            if has_native_address(&hit.coordinate) {
+                return true;
+            }
+            seen.insert((
+                hit.source_name.clone(),
+                hit.coordinate.relative_path().to_string(),
+                hit.generation_id.clone(),
+            ))
+        })
+        .collect()
+}
+
+/// Whether `coordinate` carries A2 §9's *native coordinate* — see
+/// [`dedup_file_rows`]'s own doc for why that exempts it from grouping.
+/// Only [`UnitCoordinate::Document`] and [`UnitCoordinate::Mail`] have the
+/// field at all; [`UnitCoordinate::Code`] and [`UnitCoordinate::RowText`]
+/// never do, and are always grouped like any ordinary chunk.
+fn has_native_address(coordinate: &UnitCoordinate) -> bool {
+    match coordinate {
+        UnitCoordinate::Document { native, .. } | UnitCoordinate::Mail { native, .. } => {
+            native.is_some()
+        }
+        UnitCoordinate::Code { .. } | UnitCoordinate::RowText { .. } => false,
+    }
+}
+
+/// The minimum fraction of a query's keywords a path must match before the
+/// stem boost applies — semble's `_boost_stem_matches` guard, `0.10`.
+pub const STEM_MATCH_MIN_RATIO: f64 = 0.10;
+
+/// semble's `_STEM_BOOST_MULTIPLIER` — *"additive boost multiplier for NL
+/// queries when file stems match query words"*. A full keyword match is worth
+/// the whole of the answer's largest score. See [`BOOST_EXACT_MATCH`] for the
+/// provenance rule that governs every constant in this module.
+pub const STEM_BOOST_MULTIPLIER: f64 = 1.0;
+
+/// The shortest prefix overlap that counts as a keyword match — semble's
+/// `_count_keyword_matches`, *"allowing prefix overlap (min 3 chars)"*, which
+/// is how `dependency` matches `dependencies`.
+const STEM_MATCH_MIN_PREFIX: usize = 3;
+
+/// semble's `_STOPWORDS`, verbatim — *"common English stopwords excluded from
+/// file-stem matching for NL queries"* (`boosting.py`). Adopted whole (R5)
+/// rather than re-derived: a stopword list is exactly the kind of thing that
+/// looks arbitrary and is not.
+const STOPWORDS: [&str; 30] = [
+    "and", "are", "does", "for", "from", "has", "have", "how", "not", "the", "was", "what", "when",
+    "where", "which", "who", "why", "with", "a", "an", "as", "at", "be", "by", "do", "if", "in",
+    "is", "it", "of",
+];
+
+/// semble's `boosting.py::_boost_stem_matches`, as a multiplier: **how much
+/// of the question is in this file's name.**
+///
+/// Keywords are the query's words longer than two characters that are not
+/// [`STOPWORDS`]; the path's *stem* and its *immediate parent directory* are
+/// tokenized with the retrieval path's own tokenizer
+/// ([`crate::runtime::atlas::lexical::query_terms`], R2 — the same splitting
+/// the index already does, rather than a second identifier splitter); a
+/// keyword counts if it equals a part or shares a
+/// [`STEM_MATCH_MIN_PREFIX`]-character prefix with one in either direction.
+/// The result is `matched/keywords` once that fraction reaches
+/// [`STEM_MATCH_MIN_RATIO`], and `0.0` otherwise. [`rerank`] then **adds**
+/// `ratio × STEM_BOOST_MULTIPLIER × (the answer's largest score)` to the
+/// candidate, which is semble's own form — `boost = max_score *
+/// _STEM_BOOST_MULTIPLIER; boosted[chunk] += boost * match_ratio`. Additive
+/// against the answer's maximum, not multiplicative against the candidate's
+/// own score: a well-named document buried at a tenth of the top score is
+/// lifted to the top by it, which a `×(1 + ratio)` — capped at doubling —
+/// cannot do. That difference was measured: as a multiplier it moved p@5 by
+/// +5 and p@1 not at all.
+///
+/// **Symbol queries get nothing here**, because semble's `apply_query_boost`
+/// sends them down `_boost_symbol_definitions` instead. Our equivalent of
+/// that branch is A2 §8's signal 1, which is a tree-sitter symbol identity
+/// rather than a regex over chunk text, and is stronger; adding a stem boost
+/// on top would double-count it.
+///
+/// # Why this is not a new ranking idea
+///
+/// A2 §8 already asks for *"exact symbol / heading / filename match"*. Signal
+/// 1 implements it as **exact term equality**, which a real document name
+/// like `one-atlas-database-2026-08-29.md` can never satisfy for the question
+/// *"ruling that there is only one atlas database"*. This is the same
+/// contract signal, graded — the shape semble ships and the shape A2 §8's own
+/// words allow.
+pub fn path_stem_match_ratio(query: &str, relative_path: &str) -> f64 {
+    if is_symbol_query(query) {
+        return 0.0;
+    }
+    let keywords: Vec<String> = query
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|word| word.len() > 2)
+        .map(str::to_lowercase)
+        .filter(|word| !STOPWORDS.contains(&word.as_str()))
+        .collect();
+    if keywords.is_empty() {
+        return 0.0;
+    }
+
+    let path = relative_path.rsplit('/').next().unwrap_or(relative_path);
+    let stem = path.split_once('.').map_or(path, |(stem, _)| stem);
+    let parent = match relative_path.rfind('/') {
+        Some(cut) => relative_path[..cut].rsplit('/').next().unwrap_or(""),
+        None => "",
+    };
+    let mut parts = query_terms(stem);
+    parts.extend(query_terms(parent));
+
+    let matched = keywords
+        .iter()
+        .filter(|keyword| {
+            parts.iter().any(|part| {
+                let (short, long) = if keyword.len() <= part.len() {
+                    (keyword.as_str(), part.as_str())
+                } else {
+                    (part.as_str(), keyword.as_str())
+                };
+                short.len() >= STEM_MATCH_MIN_PREFIX && long.starts_with(short)
+            })
+        })
+        .count();
+    let ratio = matched as f64 / keywords.len() as f64;
+    if ratio >= STEM_MATCH_MIN_RATIO {
+        ratio
+    } else {
+        0.0
+    }
+}
+
+/// semble's `boosting.py::boost_multi_chunk_files`: a file whose candidate
+/// chunks score well collectively has its **single best chunk** multiplied by
+/// `1 + FILE_COHERENCE_BOOST_FRAC * (this file's total / the largest file
+/// total)`.
+///
+/// semble adds `boost_unit * file_sum / max_file_sum` where `boost_unit =
+/// max_score * 0.2`; the multiplicative spelling here is the same shape
+/// against each candidate's own score rather than the answer's maximum, which
+/// keeps every adjustment in this module scale-free. Deterministic: a
+/// [`BTreeMap`] keyed by path, and ties for "best chunk" broken by the same
+/// stated key everything else uses.
+fn boost_multi_chunk_files(hits: &mut [FusedHit]) {
+    let mut file_total: BTreeMap<String, f64> = BTreeMap::new();
+    for hit in hits.iter() {
+        *file_total
+            .entry(hit.coordinate.relative_path().to_string())
+            .or_insert(0.0) += hit.adjusted;
+    }
+    let Some(max_total) = file_total
+        .values()
+        .copied()
+        .max_by(|a, b| a.total_cmp(b))
+        .filter(|total| *total > 0.0)
+    else {
+        return;
+    };
+
+    // The best chunk of each file, by adjusted score then the stated key.
+    let mut best: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, hit) in hits.iter().enumerate() {
+        let path = hit.coordinate.relative_path().to_string();
+        let better = match best.get(&path) {
+            Some(current) => {
+                hit.adjusted
+                    .total_cmp(&hits[*current].adjusted)
+                    .then_with(|| hits[*current].tie_break_key().cmp(&hit.tie_break_key()))
+                    == std::cmp::Ordering::Greater
+            }
+            None => true,
+        };
+        if better {
+            best.insert(path, index);
+        }
+    }
+    for (path, index) in best {
+        let share = file_total[&path] / max_total;
+        hits[index].adjusted *= 1.0 + FILE_COHERENCE_BOOST_FRAC * share;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The pure halves of A2 §8's signals — the ones that are a function of the
+// query text and the coordinate, with no store access.
+// ---------------------------------------------------------------------------
+
+/// **Signal 1**, *"exact symbol / heading / filename match"*: one of the
+/// query's distinct terms is exactly this unit's symbol, its heading/title,
+/// its file name, or that file name's stem.
+///
+/// `terms` is [`crate::runtime::atlas::lexical::query_terms`]'s output —
+/// already lowercased, distinct and sorted — and every candidate string is
+/// lowercased here, so "exact" means exact up to the case-folding the whole
+/// retrieval path already does (W2: *"the exact-case spelling survives in the
+/// A1 unit the hit cites, which is where an answer's exactness actually
+/// lives"*).
+///
+/// A `RowText` unit's "name" is its row key — A2 §3's structured-text
+/// coordinate has no heading and no symbol, and the row id is the only name
+/// that coordinate carries.
+///
+/// **The file-name/stem half of this signal fires for any query shape; the
+/// symbol/title half is gated on the whole query looking like a bare symbol
+/// (`query_is_symbol`, i.e. [`is_symbol_query`]).** A file name naming
+/// exactly what a natural-language query is about ("watch" → `watch.rs`,
+/// "preflight" → `preflight.rs`) is `code`-category signal this wave
+/// measured as real — gating it off dropped the `code` category from p@1
+/// 0.700 to 0.450 (`/var/tmp/sgt-test-tmp/sgt_results.json`, this stage's
+/// own first, reverted attempt). A code *symbol* or a document
+/// *title/heading* coincidentally matching one term of an otherwise
+/// unrelated natural-language query is a different, much weaker signal —
+/// that is exactly what semble's `boosting.py::apply_query_boost` reserves
+/// for `is_symbol_query(query)` (matched against the *entire* trimmed query
+/// string; its own comment: *"Plain lowercase words (e.g. 'session') are
+/// NL, not symbols"*), leaving symbol/definition boosting for a
+/// non-symbol-shaped NL query to a narrower, additive, half-strength path
+/// (`_boost_embedded_symbols`) this port does not replicate (R7: adopting
+/// the *gate*, not the additive mechanism behind it — see this module's own
+/// provenance table). Without this half of the gate, a three-word query
+/// like "bounded judgment ladder" earns the full [`BOOST_EXACT_MATCH`]
+/// multiplier for a bash helper function *named* `bounded()`, over the
+/// actually-relevant doctrine section (measured: `sgt search "bounded
+/// judgment ladder"` returning `scripts/probe-env.sh` above `AGENTS.md`'s
+/// own Bounded-Judgment Ladder section).
+///
+/// **Not [`crate::runtime::atlas::lexical::is_identifier_like`] (F-SF-01):**
+/// that predicate is true when *any* compound inside a longer text is
+/// identifier-shaped, so a multi-word NL query with one embedded
+/// identifier-shaped term (this file's own worked example, *"how is
+/// SourceKind validated"*) would pass it and open the full symbol/title
+/// boost — exactly the class of defect this signal exists to avoid. The
+/// caller passes [`is_symbol_query`] instead, which is gated on the *entire*
+/// query looking like a symbol, not on any one compound inside it.
+pub fn exact_match(terms: &[String], coordinate: &UnitCoordinate, query_is_symbol: bool) -> bool {
+    let mut file_names: Vec<String> = Vec::new();
+    let path = coordinate.relative_path();
+    if let Some(file_name) = path.rsplit('/').next() {
+        file_names.push(file_name.to_lowercase());
+        if let Some((stem, _)) = file_name.split_once('.') {
+            file_names.push(stem.to_lowercase());
+        }
+    }
+    if any_term_matches(&file_names, terms) {
+        return true;
+    }
+    if !query_is_symbol {
+        return false;
+    }
+    let mut names: Vec<String> = Vec::new();
+    match coordinate {
+        UnitCoordinate::Code { symbol, .. } => names.push(symbol.to_lowercase()),
+        UnitCoordinate::Document { title, .. } | UnitCoordinate::Mail { title, .. } => {
+            if let Some(title) = title {
+                names.push(title.to_lowercase());
+            }
+        }
+        UnitCoordinate::RowText { row_key, .. } => names.push(row_key.to_lowercase()),
+    }
+    any_term_matches(&names, terms)
+}
+
+/// F-SI-01: the shared match predicate behind both halves of
+/// [`exact_match`] — one of `names` (already lowercased) equals one of
+/// `terms` (already lowercased and distinct). Factored out so the
+/// file-name/stem check and the symbol/title check share one definition of
+/// "exact" instead of carrying the same closure twice.
+fn any_term_matches(names: &[String], terms: &[String]) -> bool {
+    names
+        .iter()
+        .any(|name| !name.is_empty() && terms.iter().any(|term| term == name))
+}
+
+/// The path segments and file-name shapes that make a path a
+/// test/example/legacy one rather than a canonical implementation — **signal
+/// 7**'s whole vocabulary, in one place so a test can read it.
+///
+/// A directory-segment match, not a substring match: `src/contest/mod.rs`
+/// contains "test" and is not a test path. `tests/w4_rrf_fusion.rs::
+/// the_canonical_path_vocabulary_matches_segments_not_substrings` is what
+/// keeps that true.
+pub const NON_CANONICAL_SEGMENTS: [&str; 11] = [
+    "test",
+    "tests",
+    "testing",
+    "spec",
+    "specs",
+    "example",
+    "examples",
+    "fixtures",
+    "benches",
+    "legacy",
+    "deprecated",
+];
+
+/// The file-name shapes that mark a test file living outside any test
+/// directory — Rust's `foo_test.rs`, Python's `test_foo.py`, JavaScript's
+/// `foo.test.js`/`foo.spec.ts`.
+const TEST_FILE_MARKERS: [&str; 4] = ["_test.", "test_", ".test.", ".spec."];
+
+/// **Signal 7**, *"canonical implementation vs test/example/legacy path"*:
+/// true for a path that is neither.
+///
+/// The signal is stated positively (canonical fires, non-canonical does not)
+/// because [`RerankSignals::priority`] compares descending — a `true` outranks
+/// a `false`, and the contract's preference is *for* the canonical one.
+pub fn is_canonical_path(relative_path: &str) -> bool {
+    let lowered = relative_path.to_lowercase();
+    let mut segments: Vec<&str> = lowered.split('/').collect();
+    let file_name = segments.pop().unwrap_or_default();
+    if segments
+        .iter()
+        .any(|segment| NON_CANONICAL_SEGMENTS.contains(segment))
+    {
+        return false;
+    }
+    if TEST_FILE_MARKERS.iter().any(|marker| {
+        file_name.contains(marker) || file_name.starts_with(marker.trim_end_matches('.'))
+    }) {
+        return false;
+    }
+    true
+}
+
+/// **Signal 5**, *"same module/package/document section"*, measured against
+/// the top RRF candidate (the *anchor*).
+///
+/// Two readings, because A2 §3 gives code and prose different coordinates:
+///
+/// * **the same document** — identical `relative_path`. For a document or
+///   mail unit that is A2 §3's *"heading-or-slide/section"* neighbourhood:
+///   two sections of one file. For a row-text unit it is the same dataset
+///   file.
+/// * **the same module/package** — identical parent directory. For code that
+///   is the module or package neighbourhood A2 §8 names; a directory is the
+///   module unit every language in A1's grammar set actually has on disk.
+///
+/// The anchor trivially satisfies this against itself, which is correct: it
+/// is in its own section.
+pub fn same_section(anchor: &UnitCoordinate, other: &UnitCoordinate) -> bool {
+    let anchor_path = anchor.relative_path();
+    let other_path = other.relative_path();
+    if anchor_path == other_path {
+        return true;
+    }
+    parent_of(anchor_path) == parent_of(other_path)
+}
+
+/// The directory part of a relative path, or `""` for a path at the root.
+fn parent_of(relative_path: &str) -> &str {
+    match relative_path.rfind('/') {
+        Some(cut) => &relative_path[..cut],
+        None => "",
+    }
+}
+
+/// The symbol a coordinate names, when it names one — what
+/// `source.edges.target` is matched against for **signal 6**.
+pub fn symbol_of(coordinate: &UnitCoordinate) -> Option<&str> {
+    match coordinate {
+        UnitCoordinate::Code { symbol, .. } => Some(symbol.as_str()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn code(path: &str, symbol: &str) -> UnitCoordinate {
+        UnitCoordinate::Code {
+            relative_path: path.to_string(),
+            language: "rust".to_string(),
+            label: "function".to_string(),
+            symbol: symbol.to_string(),
+            ordinal: 0,
+            byte_start: 0,
+            byte_end: 1,
+        }
+    }
+
+    #[test]
+    fn the_expression_is_one_over_k_plus_a_one_based_rank() {
+        assert_eq!(rrf_contribution(1), 1.0 / (RRF_K + 1.0));
+        assert_eq!(rrf_contribution(2), 1.0 / (RRF_K + 2.0));
+        assert!(rrf_contribution(1) > rrf_contribution(2));
+    }
+
+    #[test]
+    fn appearing_in_both_lists_outscores_appearing_in_one_at_the_same_rank() {
+        assert!(rrf_contribution(1) + rrf_contribution(1) > rrf_contribution(1));
+    }
+
+    #[test]
+    fn a_test_directory_or_a_test_file_name_is_not_a_canonical_path() {
+        assert!(is_canonical_path("src/runtime/atlas/fusion.rs"));
+        assert!(!is_canonical_path("tests/w4_rrf_fusion.rs"));
+        assert!(!is_canonical_path("crates/a/examples/demo.rs"));
+        assert!(!is_canonical_path("src/legacy/old.rs"));
+        assert!(!is_canonical_path("src/parser_test.rs"));
+        assert!(!is_canonical_path("src/test_parser.py"));
+        assert!(!is_canonical_path("web/app.test.ts"));
+        // A segment match, never a substring match.
+        assert!(is_canonical_path("src/contest/mod.rs"));
+        assert!(is_canonical_path("src/latest.rs"));
+    }
+
+    #[test]
+    fn same_section_is_the_same_file_or_the_same_directory() {
+        let a = code("src/payments/retry.rs", "retry");
+        let b = code("src/payments/charge.rs", "charge");
+        let c = code("src/config/loader.rs", "load");
+        assert!(same_section(&a, &a));
+        assert!(same_section(&a, &b));
+        assert!(!same_section(&a, &c));
+    }
+
+    #[test]
+    fn an_exact_symbol_or_file_name_match_fires_only_when_the_whole_query_looks_like_a_symbol() {
+        let terms = vec!["retry".to_string()];
+        // Gate open: the caller asserts the whole query looked like a bare
+        // symbol (e.g. `retry_policy`, `RetryPolicy`) — name-equality logic
+        // is unchanged from before this test.
+        assert!(exact_match(
+            &terms,
+            &code("src/payments/charge.rs", "retry"),
+            true
+        ));
+        assert!(exact_match(
+            &terms,
+            &code("src/payments/retry.rs", "other"),
+            true
+        ));
+        assert!(!exact_match(
+            &terms,
+            &code("src/payments/retrying.rs", "retry_policy"),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_single_incidental_term_match_does_not_fire_for_a_natural_language_query() {
+        // d01/d05/m01's reproduced defect (orientation, af3ec467): a
+        // three-word NL query like "bounded judgment ladder" contains the
+        // term "bounded", which happens to equal a bash helper's symbol
+        // name. semble's own `is_symbol_query` (boosting.py) requires the
+        // *whole* query to look identifier-shaped before this signal fires
+        // at all — a plain lowercase NL query never qualifies. This is
+        // that same gate: name-equality alone, on an NL query, must not
+        // fire the signal, even though the term literally equals the name.
+        let terms = vec![
+            "bounded".to_string(),
+            "judgment".to_string(),
+            "ladder".to_string(),
+        ];
+        assert!(
+            !exact_match(&terms, &code("scripts/probe-env.sh", "bounded"), false),
+            "an incidental single-term match on a natural-language query must not fire"
+        );
+    }
+
+    #[test]
+    fn a_file_name_match_still_fires_for_a_natural_language_query() {
+        // Gating the *whole* signal on query shape (this stage's first,
+        // reverted attempt — see `exact_match`'s own doc) took the `code`
+        // category from p@1 0.700 to 0.450: many code-category questions
+        // ("git preflight checks before a work is admitted", "watch for
+        // work transitions over server sent events") are natural-language
+        // *and* legitimately named by the file they're asking about. The
+        // file-name/stem half of this signal must keep firing regardless
+        // of query shape — only the symbol/title half is gated.
+        let terms = vec![
+            "git".to_string(),
+            "preflight".to_string(),
+            "checks".to_string(),
+        ];
+        assert!(
+            exact_match(&terms, &code("src/runtime/preflight.rs", "run"), false),
+            "a file-stem match must fire even on a natural-language query"
+        );
+    }
+
+    #[test]
+    fn is_identifier_like_and_is_symbol_query_diverge_on_an_embedded_identifier() {
+        use crate::runtime::atlas::lexical::is_identifier_like;
+
+        // F-SF-01: a multi-word NL query with one identifier-shaped
+        // compound (this file's own worked example) is identifier-like —
+        // `is_identifier_like` looks at *any* compound — but is not itself
+        // a symbol query — `is_symbol_query` requires the *whole* trimmed
+        // query to be one identifier-shaped token. `exact_match`'s
+        // symbol/title gate must use the latter, not the former, or this
+        // query would open the full exact-match boost for any unit merely
+        // named "sourcekind".
+        let query = "how is SourceKind validated";
+        assert!(
+            is_identifier_like(query),
+            "the repro query must actually be identifier-like by that predicate, \
+             or this test proves nothing about the divergence"
+        );
+        assert!(
+            !is_symbol_query(query),
+            "a multi-word NL query is never a bare symbol query"
+        );
+
+        let terms = vec![
+            "how".to_string(),
+            "is".to_string(),
+            "sourcekind".to_string(),
+            "validated".to_string(),
+        ];
+        let unrelated = code("src/somewhere/unrelated.rs", "SourceKind");
+        assert!(
+            !exact_match(&terms, &unrelated, is_symbol_query(query)),
+            "the symbol/title boost must not fire for an embedded-identifier NL query"
+        );
+    }
+}

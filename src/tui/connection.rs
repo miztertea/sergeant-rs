@@ -129,7 +129,11 @@ pub enum Attach {
 /// caller (first attach, `r`, and the backoff loop) reacts to the outcome
 /// differently, through [`reconnected`].
 pub async fn try_attach(client: &ApiClient, from: u64) -> Attach {
-    match client.stream_events(from).await {
+    // No estate filter: the TUI's own estate-filter wiring is W4d's
+    // deliverable (H1 sprint plan), not this wave's — `sgt watch`'s D6
+    // filter (`src/watch.rs`) is the only client this wave routes onto the
+    // new `estate_root` parameter.
+    match client.stream_events(from, None).await {
         Ok(stream) => Attach::Opened(stream),
         Err(e) if is_auth_failure(&e) => Attach::AuthFailed(e.to_string()),
         Err(e) => Attach::Retry(e.to_string()),

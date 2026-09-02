@@ -59,9 +59,12 @@ static CONTEXTS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/.sergeant/comm
 static WORKFLOWS: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/.sergeant/workflows");
 
 /// The comment markers delimiting `AGENTS.md`'s sgt-owned managed section.
-/// See [`write_agents_md`].
-const MANAGED_BEGIN: &str = "<!-- sgt:managed:begin -->";
-const MANAGED_END: &str = "<!-- sgt:managed:end -->";
+/// See [`write_agents_md`]. `pub(crate)`: `cli::doctor::doc_routes_check`
+/// (#282) needs the exact same markers to scope its own sgt-owned-content
+/// rule to the managed span, never a second, independently-typed copy of
+/// the marker strings.
+pub(crate) const MANAGED_BEGIN: &str = "<!-- sgt:managed:begin -->";
+pub(crate) const MANAGED_END: &str = "<!-- sgt:managed:end -->";
 
 /// What went wrong writing the distro. Distinct from a bare [`io::Error`]
 /// because the managed-`AGENTS.md` case (below) is not an I/O fault at all
