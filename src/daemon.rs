@@ -362,6 +362,23 @@ pub struct DaemonHandle {
 }
 
 impl DaemonHandle {
+    /// Whether the in-process task serving this daemon is still running.
+    ///
+    /// This is [`DaemonHandle`]'s answer to the question
+    /// [`crate::api::ApiClient::send_with_retry`] asks of a `pid`: is the
+    /// thing on the other end of a failed request provably still there?
+    /// There is no `pid` to check here — this daemon is a `tokio` task in
+    /// the *same* OS process as the caller, not a separate one — so
+    /// liveness reads off the serving task's own [`tokio::task::JoinHandle`]
+    /// instead: alive for as long as that task has not finished, dead once
+    /// it has (whether by orderly [`Self::shutdown`], an abrupt
+    /// [`Self::kill`], or an internal panic). Never a duration: this reads
+    /// the task's own completion state, not how long a caller has been
+    /// waiting for one.
+    pub fn is_alive(&self) -> bool {
+        !self.served.is_finished()
+    }
+
     /// Signal graceful shutdown and wait for the daemon to finish cleanup.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
@@ -2068,6 +2085,67 @@ mod tests {
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
     use std::time::Duration;
+
+    /// `DaemonHandle::is_alive` (wave `transport-timeout-is-not-a-verdict`,
+    /// 2026-09-02): the in-process liveness carrier `tests/`'s
+    /// `scan_to_completion` needs before it may retry a transport error
+    /// (`send_with_retry`'s own doc comment, `src/api.rs::~7754`, names the
+    /// shape — alive ⇒ retry, dead ⇒ fail naming it). `DaemonHandle` has no
+    /// `pid` (it is a `tokio` task in the *same* OS process, unlike
+    /// `send_with_retry`'s out-of-process client), so liveness reads off the
+    /// serving task's own `JoinHandle` instead: alive while that task has not
+    /// finished, dead once it has. Constructed directly here (`mod tests`
+    /// shares `DaemonHandle`'s private fields via `use super::*`) rather than
+    /// through `start_with`, so this is a fast, deterministic unit test of
+    /// the accessor alone — no real daemon, no network, no sleep.
+    #[tokio::test]
+    async fn is_alive_reads_the_serving_task_join_handle_not_a_pid() {
+        // A task that never returns: `is_alive()` must read `true` for as
+        // long as it has not been polled to completion.
+        let live = DaemonHandle {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            token: "t".to_string(),
+            shutdown_tx: None,
+            served: tokio::spawn(std::future::pending::<()>()),
+            probe_children: ProbeChildren::new(),
+        };
+        assert!(
+            live.is_alive(),
+            "a serving task that never completes must read as alive"
+        );
+        live.served.abort();
+
+        // A task that has already finished: `is_alive()` must read `false`.
+        // The loop below observes the join handle's own `is_finished()`
+        // state rather than assuming a fixed duration is enough time for the
+        // scheduler to have polled the spawned no-op task to completion —
+        // exactly the "wait on state, never on time" shape this wave's own
+        // governing ruling requires of `tests/`, applied to this new
+        // accessor's own test.
+        let dead = DaemonHandle {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            token: "t".to_string(),
+            shutdown_tx: None,
+            served: tokio::spawn(async {}),
+            probe_children: ProbeChildren::new(),
+        };
+        let mut observed_finished = false;
+        for _ in 0..200 {
+            if dead.served.is_finished() {
+                observed_finished = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            observed_finished,
+            "the spawned no-op task never reached is_finished() within 200 yields"
+        );
+        assert!(
+            !dead.is_alive(),
+            "a serving task that has already finished must read as not alive"
+        );
+    }
 
     /// **Re-scoped, not deleted** (brief deliverable 4): this test used to be
     /// `a_descriptor_is_usable_only_from_the_estate_it_is_bound_to`, proving
