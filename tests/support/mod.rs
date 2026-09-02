@@ -550,14 +550,20 @@ where
 /// fork-to-exec window can overlap this one's write. Retry until the exec
 /// stops being refused, or surface any other failure immediately.
 pub fn wait_until_executable(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while let Err(e) = std::process::Command::new(path).arg("--version").output() {
-        assert!(
-            e.raw_os_error() == Some(26) && Instant::now() < deadline,
-            "the stand-in at {path:?} is not runnable: {e}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // Deliberately NOT HANG_BUDGET: this retries ONE specific, fast-resolving
+    // transient (a sibling test's fork-to-exec window overlapping this
+    // write) -- any other failure still surfaces immediately below, and a
+    // genuinely stuck ETXTBSY would be a real bug worth failing fast on
+    // rather than waiting two minutes to report.
+    wait_until_sync(
+        &format!("the stand-in at {path:?} never became runnable"),
+        Duration::from_secs(10),
+        || match std::process::Command::new(path).arg("--version").output() {
+            Ok(_) => true,
+            Err(e) if e.raw_os_error() == Some(26) => false,
+            Err(e) => panic!("the stand-in at {path:?} is not runnable: {e}"),
+        },
+    );
 }
 
 // ------------------------------------------------- recording git shim (§18)
@@ -815,7 +821,6 @@ pub struct CrossProcessLock {
 }
 
 const STALE_AFTER: Duration = Duration::from_secs(60);
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 impl CrossProcessLock {
     /// Block until the named lock is held exclusively by this call.
@@ -825,14 +830,18 @@ impl CrossProcessLock {
     /// use the same name to actually serialize against each other.
     pub fn acquire(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!("sgt-test-lock-{name}"));
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            match std::fs::OpenOptions::new()
+        wait_until_sync(
+            &format!(
+                "cross-process lock {path:?} held for over {HANG_BUDGET:?}; a holder is stuck \
+                 or STALE_AFTER needs raising"
+            ),
+            HANG_BUDGET,
+            || match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Self { path },
+                Ok(_) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let stale = std::fs::metadata(&path)
                         .ok()
@@ -844,19 +853,13 @@ impl CrossProcessLock {
                         // killed, not just the test failed. Reclaim rather
                         // than deadlock every future run.
                         let _ = std::fs::remove_file(&path);
-                        continue;
                     }
-                    if Instant::now() > deadline {
-                        panic!(
-                            "cross-process lock {path:?} held for over 120s; \
-                             a holder is stuck or STALE_AFTER needs raising"
-                        );
-                    }
-                    std::thread::sleep(POLL_INTERVAL);
+                    false
                 }
                 Err(e) => panic!("acquire cross-process lock {path:?}: {e}"),
-            }
-        }
+            },
+        );
+        Self { path }
     }
 }
 

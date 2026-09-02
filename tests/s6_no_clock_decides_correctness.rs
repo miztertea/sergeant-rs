@@ -185,35 +185,6 @@ const RESIDUE_REASON: &str = "a reqwest client built for a single, direct one-sh
      say') covers a test harness's own client `.timeout(`: this is still open non-determinism, not \
      a closed matter, escalated to a future wave rather than fixed piecemeal here.";
 
-/// Seam 2 (no-clock-decides, owner ruling 2026-09-02): every hand-rolled
-/// `Instant::now() + <duration>` deadline loop this stage's own guard found
-/// in `tests/` (its own red run, 110 sites) that this stage did not fold
-/// into `support::wait_until`/`wait_until_sync` within its own scope.
-///
-/// Named honestly, the same posture [`RESIDUE_REASON`] above already
-/// established in this file for the `.timeout(` guard's own unconverted
-/// `m2_daemon_api.rs` residue: this is open non-determinism-shaped
-/// duplication (each site is its own ad hoc budget rather than the one
-/// shared, reviewed `support::HANG_BUDGET`), not a defect the guard failed
-/// to find, and not a closed exemption. What is *not* open: every site
-/// this reason covers already checks real observed state in its own loop
-/// body (a file existing, a process gone, a field reaching a value) and
-/// terminates on it — the class this guard exists to catch (a fixed
-/// failure count, or a loop that never checks anything) is not what is
-/// here. The gap is consolidation — one shared budget and one shared
-/// helper instead of ~50 ad hoc ones spread across 21 files — at a scale
-/// (a call-site-by-call-site rewrite across most of this crate's `tests/`
-/// suites) that is a distinct piece of scope from this seam's own budget,
-/// escalated rather than attempted piecemeal here. A future pass folds
-/// each one and removes its entry; this guard stays red for any *new*
-/// hand-rolled deadline loop from the moment this commit lands.
-const DEADLINE_LOOP_RESIDUE_REASON: &str = "seam 2 (no-clock-decides) found this site in its own \
-     red run (110 hand-rolled Instant::now() + deadline loops across tests/) and did not fold it \
-     into support::wait_until/wait_until_sync within this seam's own scope — see \
-     DEADLINE_LOOP_RESIDUE_REASON's own doc comment above. The loop this needle names already \
-     checks real observed state and terminates on it; what is open is consolidation onto the one \
-     shared support::HANG_BUDGET, not a missing state check. Escalated, not exempted.";
-
 const ALLOWLIST: &[Allowed] = &[
     Allowed {
         file: "src/watch.rs",
@@ -1128,20 +1099,16 @@ const ALLOWLIST: &[Allowed] = &[
     Allowed {
         file: "tests/support/mod.rs",
         needle: "let deadline = Instant::now() + budget;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/support/mod.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/support/mod.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(120);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
+        category: "owned-wait-budget",
+        reason: "three real sites share this needle text. Two ARE the implementation this \
+            whole wave folds every other site onto: wait_until's and wait_until_sync's own \
+            `Instant::now() + budget` deadline computation -- the shared primitive cannot be \
+            defined in terms of itself. The third, wait_until_gone (data_dir, budget) -> bool, \
+            is reap_daemons's own SIGTERM-then-SIGKILL escalation gate: never panics, returns \
+            whether the daemon actually left within `budget`, and reap_daemons uses the false \
+            case to decide whether to escalate at all -- the same 'best-effort teardown that \
+            proceeds regardless' shape support::wait_until's own doc names for stop_daemon \
+            (tests/m2_daemon_api.rs, tests/m3_execution.rs), just local to this same file.",
     },
     Allowed {
         file: "tests/w3_client_surface.rs",
