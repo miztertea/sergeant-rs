@@ -287,7 +287,16 @@ fn every_direct_journal_writer_in_the_api_absorbs_before_releasing_its_hold() {
             .unwrap_or(lines.len());
         let name = lines[start].trim().to_string();
         let body = lines[start..end].join("\n");
-        if !body.contains("absorb_journaled") {
+        // F-SI-02 (fix-confirmed, 2026-09-02) factored the repeated
+        // "thread a `CoreWriteGuard` through `with_atlas_write`, then
+        // `absorb_journaled`/drop/match on the result" shape out of these
+        // functions' own bodies and into `with_atlas_write_and_core`, so a
+        // writer's own text no longer contains the literal call — it
+        // delegates to that helper instead. `with_atlas_write_and_core`
+        // itself is checked below to still contain the literal call, so
+        // this branch cannot be satisfied by a helper that stopped
+        // absorbing.
+        if !body.contains("absorb_journaled") && !body.contains("with_atlas_write_and_core(") {
             writers.push(format!("{} (line {})", name, i + 1));
         }
     }
@@ -297,6 +306,23 @@ fn every_direct_journal_writer_in_the_api_absorbs_before_releasing_its_hold() {
         "these functions in src/api.rs append straight through `&mut …journal` and never \
          call `Core::absorb_journaled`, so they release the hold with the registry behind \
          the journal and wedge the next commit (#334): {writers:#?}"
+    );
+
+    // The escape hatch above only holds if the helper it names still
+    // absorbs — pin that directly so a future edit to
+    // `with_atlas_write_and_core` that drops the call cannot go unnoticed.
+    let helper_start = api.find("async fn with_atlas_write_and_core").expect(
+        "with_atlas_write_and_core must still exist for the escape hatch above to mean \
+             anything",
+    );
+    let helper_end = api[helper_start..]
+        .find("\nasync fn ")
+        .map(|rel| helper_start + rel)
+        .unwrap_or(api.len());
+    assert!(
+        api[helper_start..helper_end].contains("absorb_journaled"),
+        "with_atlas_write_and_core no longer calls Core::absorb_journaled — every writer that \
+         delegates to it for #334's fold is now silently unabsorbed"
     );
 }
 
