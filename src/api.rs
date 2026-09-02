@@ -554,30 +554,28 @@ impl std::ops::DerefMut for CoreWriteGuard {
     }
 }
 
+/// Shared body for both guards' `Drop`: the journal poisoned itself on the
+/// way out of `flush`, so this is a report, not a decision — every later
+/// append is already refused and the daemon is failing closed.
+fn log_flush_failure(result: Result<(), CoreError>) {
+    if let Err(error) = result {
+        tracing::error!(
+            %error,
+            "the core-lock hold's group commit failed; the journal is \
+             poisoned and further appends are refused"
+        );
+    }
+}
+
 impl Drop for CoreWriteGuard {
     fn drop(&mut self) {
-        if let Err(error) = self.0.flush() {
-            tracing::error!(
-                %error,
-                "the core-lock hold's group commit failed; the journal is \
-                 poisoned and further appends are refused"
-            );
-        }
+        log_flush_failure(self.0.flush());
     }
 }
 
 impl Drop for CoreGuard<'_> {
     fn drop(&mut self) {
-        if let Err(error) = self.inner.flush() {
-            // The journal poisoned itself on the way out of `sync`, so this
-            // is a report, not a decision: every later append is already
-            // refused and the daemon is failing closed.
-            tracing::error!(
-                %error,
-                "the core-lock hold's group commit failed; the journal is \
-                 poisoned and further appends are refused"
-            );
-        }
+        log_flush_failure(self.inner.flush());
     }
 }
 
