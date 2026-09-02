@@ -68,7 +68,7 @@ use sergeant_rs::runtime::journal::Journal;
 use sergeant_rs::tui::{self, Action, App, Destination};
 
 mod support;
-use support::DataDir;
+use support::{DataDir, wait_until_sync};
 
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
@@ -3368,11 +3368,11 @@ fn dead_pid() -> u32 {
     let mut child = Command::new("true").spawn().expect("spawn");
     let pid = child.id();
     child.wait().expect("wait");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while daemon::pid_alive(pid) {
-        assert!(Instant::now() < deadline, "pid {pid} never went away");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until_sync(
+        &format!("pid {pid} to go away"),
+        Duration::from_secs(5),
+        || !daemon::pid_alive(pid),
+    );
     pid
 }
 

@@ -475,9 +475,18 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// crate's one shared polling helper for tests/ — the fold-in point for
 /// what used to be three near-duplicates
 /// (`tests/w4_doctor_journal_growth.rs::wait_until`/`wait_until_all_settled`,
-/// and every hand-rolled `while Instant::now() < deadline { ...; sleep(...)
-/// }` loop this wave converted — see
-/// `tests/s6_no_clock_decides_correctness.rs`'s tests/-side guard).
+/// and any hand-rolled `while Instant::now() < deadline { ...; sleep(...) }`
+/// loop that shares this exact contract — a side-effect-free predicate and
+/// a panic on timeout, e.g. `tests/m6_surfaces.rs::dead_pid`. A hand-rolled
+/// loop that must *not* panic on timeout — a best-effort teardown wait that
+/// proceeds regardless (`stop_daemon` in `tests/m2_daemon_api.rs` and
+/// `tests/m3_execution.rs`), or one that must run cleanup before failing
+/// (`tests/m6_surfaces.rs`'s TUI-survival wait), or one living in a
+/// standalone helper binary with no access to `tests/support`
+/// (`tests/c4_repo_lock.rs`'s lock-holder) — is a different shape, not this
+/// helper's fold-in target, and stays hand-rolled; see
+/// `tests/s6_no_clock_decides_correctness.rs`'s tests/-side guard for the
+/// allowlist that covers those.
 pub async fn wait_until<F, Fut>(what: &str, budget: Duration, mut predicate: F)
 where
     F: FnMut() -> Fut,
