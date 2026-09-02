@@ -469,6 +469,22 @@ fn wait_until_gone(data_dir: &Path, budget: Duration) -> bool {
 /// new one (R2).
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// **The one shared hang budget** every [`wait_until`]/[`wait_until_sync`]
+/// call site in `tests/` is expected to use, per the owner ruling
+/// (`no-nondeterministic-tests-2026-09-02.md`, "no-clock-decides" wave,
+/// seam 2): *"A wait budget only ends a hang, is sized for 'never
+/// finishes' (>= 120 s), and reports 'never observed' by name."*
+///
+/// This is **not** a floor or a ceiling any test may assert against — it
+/// is the point at which this suite gives up waiting for a predicate that
+/// was never going to become true, and says so by name. A site whose
+/// budget was smaller "because the operation is normally fast" was
+/// deciding a verdict by clock, which is exactly what the ruling forbids;
+/// folding every such site onto this one constant is seam 2's fold-in
+/// (`tests/s6_no_clock_decides_correctness.rs` enforces it, allowlisting
+/// only the class-C sites where a duration *is* the behavior under test).
+pub const HANG_BUDGET: Duration = Duration::from_secs(120);
+
 /// Poll an async `predicate` at [`WAIT_POLL_INTERVAL`] until it returns
 /// `true`, bounded by an **owned wait budget** (S6, brief-sleep-and-hope.md
 /// item 2): `budget` only terminates the wait — on exhaustion this panics

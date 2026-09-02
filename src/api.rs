@@ -60,7 +60,7 @@ use crate::runtime::atlas::db::{self as atlas_db, AtlasDb, AtlasError, SourceSta
 use crate::runtime::atlas::db::{Analytics, AnalyticsError, CANNED_QUERIES};
 use crate::runtime::atlas::external_git::ExternalGitSource;
 use crate::runtime::atlas::fusion as atlas_fusion;
-use crate::runtime::atlas::git::EstateGitSource;
+use crate::runtime::atlas::git::{EstateGitScan, EstateGitSource};
 use crate::runtime::atlas::lane::{
     acquire_external_git_on_lane, scan_estate_git_on_lane, scan_local_knowledge_on_lane,
     scan_work_overlay_on_lane,
@@ -73,8 +73,8 @@ use crate::runtime::atlas::scan::KnowledgeSource;
 use crate::runtime::atlas::semantic as atlas_semantic;
 use crate::runtime::atlas::trace as atlas_trace;
 use crate::runtime::engine::{
-    Engine, EngineError, KIND_TURN_CEILING_INTERRUPTED, KIND_TURN_ENVELOPE_EXTENDED,
-    Next as EngineNext, Step, SubmitContext, SurfaceOutcome,
+    Engine, EngineError, IntelligenceError, KIND_TURN_CEILING_INTERRUPTED,
+    KIND_TURN_ENVELOPE_EXTENDED, Next as EngineNext, Step, SubmitContext, SurfaceOutcome,
 };
 use crate::runtime::graph::{
     KIND_CONVERSATION_ASK, KIND_CONVERSATION_ASSISTANT_COMPLETED, KIND_CONVERSATION_TURN_ENDED,
@@ -524,6 +524,48 @@ impl std::ops::DerefMut for CoreGuard<'_> {
     }
 }
 
+/// [`CoreGuard`]'s owned twin — seam 4 (no-clock-decides): a hold that has
+/// to move into [`with_atlas_write`]'s `spawn_blocking` closure rather than
+/// live behind a borrow of the caller's stack, because that closure must be
+/// `Send + 'static`. Same one guarantee [`CoreGuard`]'s own `Drop` gives:
+/// the open group's single fsync runs no matter how the hold ends —
+/// success, an early `with_atlas_write` error that never invokes the
+/// closure at all, or a panic on the blocking-pool thread the closure ran
+/// on (`Drop` runs on the unwind path there exactly as it would on this
+/// one).
+struct CoreWriteGuard(tokio::sync::OwnedMutexGuard<Core>);
+
+impl CoreWriteGuard {
+    async fn acquire(core: &Arc<tokio::sync::Mutex<Core>>) -> Self {
+        Self(Arc::clone(core).lock_owned().await)
+    }
+}
+
+impl std::ops::Deref for CoreWriteGuard {
+    type Target = Core;
+    fn deref(&self) -> &Core {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for CoreWriteGuard {
+    fn deref_mut(&mut self) -> &mut Core {
+        &mut self.0
+    }
+}
+
+impl Drop for CoreWriteGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.flush() {
+            tracing::error!(
+                %error,
+                "the core-lock hold's group commit failed; the journal is \
+                 poisoned and further appends are refused"
+            );
+        }
+    }
+}
+
 impl Drop for CoreGuard<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.inner.flush() {
@@ -643,6 +685,24 @@ pub struct ScanProgress {
     /// Finished per-source rows, in completion order — the same rows the
     /// synchronous response used to return all at once.
     rows: Vec<Value>,
+    /// The source currently being written into Atlas (embedding included),
+    /// or `None` between sources and before/after the whole scan.
+    ///
+    /// **Seam 4's own regression signal, not merely an operator nicety.**
+    /// `run_estate_scan` sets this immediately before the per-source write
+    /// and clears it immediately after, bracketing exactly the span that
+    /// used to run `SemanticEngine::embed` inline on the runtime's own
+    /// worker thread. A duration can never prove that span ran off that
+    /// thread (the ruling this wave applies forbids deciding a verdict by
+    /// clock either way) — but this field can: it is only ever observable
+    /// to a concurrent poll if the daemon's runtime could schedule that
+    /// poll *while* the write was in flight. Before the fix, the write
+    /// held the one thread the poll also needed, so this field was always
+    /// `None` by the time any poll actually got to run; after the fix, the
+    /// poll and the write are two different pieces of work the runtime can
+    /// interleave, so a poll landing during a real (multi-hundred-ms or
+    /// longer) write reliably sees it set.
+    writing_source: Option<String>,
 }
 
 /// The daemon's live scan-progress map (see [`ApiState::scans`]).
@@ -671,6 +731,7 @@ impl ScanTracker {
             completed: None,
             planned,
             rows: Vec::new(),
+            writing_source: None,
         };
         self.lock().insert(scan_id.to_string(), progress.clone());
         progress
@@ -682,6 +743,17 @@ impl ScanTracker {
     fn push(&self, scan_id: &str, row: Value) {
         if let Some(progress) = self.lock().get_mut(scan_id) {
             progress.rows.push(row);
+        }
+    }
+
+    /// [`ScanProgress::writing_source`]'s setter, bracketing exactly the
+    /// per-source write this seam's fix moves off the runtime's worker
+    /// thread. `None` clears it — called on every exit path (success or
+    /// error) so a source that fails to write never leaves a stale name
+    /// behind.
+    fn set_writing(&self, scan_id: &str, source: Option<&str>) {
+        if let Some(progress) = self.lock().get_mut(scan_id) {
+            progress.writing_source = source.map(str::to_string);
         }
     }
 
@@ -738,6 +810,7 @@ fn scan_status_json(scan_id: &str, progress: &ScanProgress) -> Value {
         "completed_sources": progress.rows.len(),
         "sources": progress.planned,
         "scanned": progress.rows,
+        "writing_source": progress.writing_source,
     })
 }
 
@@ -756,6 +829,12 @@ struct ScanReport {
 impl ScanReport {
     fn push(&self, row: Value) {
         self.tracker.push(&self.scan_id, row);
+    }
+
+    /// Bracket a per-source write with [`ScanTracker::set_writing`],
+    /// clearing it on every exit path — see [`ScanProgress::writing_source`].
+    fn set_writing(&self, source: Option<&str>) {
+        self.tracker.set_writing(&self.scan_id, source);
     }
 }
 
@@ -5042,20 +5121,51 @@ struct ScanRequest {
 }
 
 /// Open (creating if absent) the mutable Atlas handle under `state.atlas`'s
-/// lock, run `f`, and turn a store failure into this file's one error shape.
-/// The write-side twin of [`with_atlas`] — that function refuses to create
-/// the file for a mere read; a scan is the one call site allowed to bring
-/// the store into existence, because writing to it is the entire point of
-/// calling this.
+/// lock, run `f` **off the runtime's worker thread**, and turn a store or
+/// job failure into this file's one error shape. The write-side twin of
+/// [`with_atlas`] — that function refuses to create the file for a mere
+/// read; a scan is the one call site allowed to bring the store into
+/// existence, because writing to it is the entire point of calling this.
+///
+/// **Seam 4 (no-clock-decides): `f` runs under
+/// [`Engine::run_intelligence`]**, matching that method's own shape
+/// exactly (R2) rather than inventing a second one — an intelligence-lane
+/// permit, then `spawn_blocking`, for the same reason
+/// `run_intelligence`'s own doc already states: a write here can call all
+/// the way down into `AtlasDb::index_generation`'s `SemanticEngine::embed`,
+/// CPU work with no `await` inside it, so run inline it would hold this
+/// runtime's worker thread for the batch's whole duration and starve
+/// every unrelated future sharing it — measured live,
+/// `tests/s6_scan_answers_while_embedding.rs`. `state.atlas`'s `Arc` is
+/// cloned so the lock can be retaken with `blocking_lock` on the
+/// blocking-pool thread `spawn_blocking` runs on, which is exactly the use
+/// tokio's own docs show for it (not a tokio worker thread, so none of
+/// [`CoreGuard::acquire_blocking`]'s async-context hazard applies here);
+/// `f` itself only ever needs `&mut AtlasDb`, never anything from the
+/// caller's own stack, so every call site hands this an owned, `'static`
+/// closure rather than one borrowing a local.
 async fn with_atlas_write<T>(
     state: &ApiState,
-    f: impl FnOnce(&mut AtlasDb) -> T,
-) -> Result<T, AtlasError> {
-    let mut guard = state.atlas.lock().await;
-    if guard.is_none() {
-        *guard = Some(state.analytics.lock().await.atlas()?);
+    f: impl FnOnce(&mut AtlasDb) -> T + Send + 'static,
+) -> Result<T, AtlasError>
+where
+    T: Send + 'static,
+{
+    {
+        let mut guard = state.atlas.lock().await;
+        if guard.is_none() {
+            *guard = Some(state.analytics.lock().await.atlas()?);
+        }
     }
-    Ok(f(guard.as_mut().expect("opened above")))
+    let atlas = Arc::clone(&state.atlas);
+    state
+        .engine
+        .run_intelligence(move || {
+            let mut guard = atlas.blocking_lock();
+            f(guard.as_mut().expect("opened above"))
+        })
+        .await
+        .map_err(|e: IntelligenceError| AtlasError::WriteJob(e.to_string()))
 }
 
 /// [`with_atlas_write`] for a hook that must stay invisible on an
@@ -5826,34 +5936,38 @@ async fn run_estate_scan(
             }
         };
         let counts = scanned.scan.counts();
-        let mut core = CoreGuard::acquire(&state.core).await;
-        let outcome = with_atlas_write(&state, |atlas| {
-            record_scan(
-                atlas,
-                &mut core.journal,
-                &scanned.scan,
-                None,
-                &estate_binding,
-            )
+        let EstateGitScan { scan, drift, .. } = scanned;
+        let core = CoreWriteGuard::acquire(&state.core).await;
+        report.set_writing(Some(&name));
+        let estate_binding_owned = estate_binding.clone();
+        let outcome = with_atlas_write(&state, move |atlas| {
+            let mut core = core;
+            let result = record_scan(atlas, &mut core.journal, &scan, None, &estate_binding_owned);
+            (result, core)
         })
         .await;
-        // The scan appended `source.scanned` straight to the journal;
-        // the registry has to be caught up before this hold ends or the
-        // next `Core::commit` fails on contiguity.
-        if let Err(e) = core.absorb_journaled() {
-            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
-        }
-        drop(core);
+        report.set_writing(None);
         match outcome {
-            Ok(Ok(record)) => report.push(scan_record_json(
-                "estate_git",
-                &name,
-                &record,
-                &counts,
-                scanned.drift.as_ref(),
-            )),
-            Ok(Err(e)) => {
-                report.push(json!({"source": name, "kind": "estate_git", "error": e.to_string()}))
+            Ok((record_result, mut core)) => {
+                // The scan appended `source.scanned` straight to the journal;
+                // the registry has to be caught up before this hold ends or
+                // the next `Core::commit` fails on contiguity.
+                if let Err(e) = core.absorb_journaled() {
+                    tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+                }
+                drop(core);
+                match record_result {
+                    Ok(record) => report.push(scan_record_json(
+                        "estate_git",
+                        &name,
+                        &record,
+                        &counts,
+                        drift.as_ref(),
+                    )),
+                    Err(e) => report.push(
+                        json!({"source": name, "kind": "estate_git", "error": e.to_string()}),
+                    ),
+                }
             }
             Err(e) => report.push(json!({
                 "source": name, "kind": "estate_git", "error": format!("atlas unavailable: {e}"),
@@ -5899,33 +6013,43 @@ async fn run_estate_scan(
             }
         };
         let counts = scan.counts();
-        // One `CoreGuard` acquire covers the whole of `record_scan`'s three
-        // steps (stage, journal, confirm — R2, not re-derived here): the
-        // journal's own summary write needs `&mut core.journal`, and the
-        // guard's `Drop` is what fsyncs it durable before this loop moves to
-        // the next source.
-        let mut core = CoreGuard::acquire(&state.core).await;
-        let outcome = with_atlas_write(&state, |atlas| {
-            record_scan(atlas, &mut core.journal, &scan, None, &estate_binding)
+        // One `CoreWriteGuard` acquire covers the whole of `record_scan`'s
+        // three steps (stage, journal, confirm — R2, not re-derived here):
+        // the journal's own summary write needs `&mut core.journal`, and
+        // the guard's `Drop` is what fsyncs it durable before this loop
+        // moves to the next source.
+        let core = CoreWriteGuard::acquire(&state.core).await;
+        report.set_writing(Some(&name));
+        let estate_binding_owned = estate_binding.clone();
+        let outcome = with_atlas_write(&state, move |atlas| {
+            let mut core = core;
+            let result = record_scan(atlas, &mut core.journal, &scan, None, &estate_binding_owned);
+            (result, core)
         })
         .await;
-        // The scan appended `source.scanned` straight to the journal;
-        // the registry has to be caught up before this hold ends or the
-        // next `Core::commit` fails on contiguity.
-        if let Err(e) = core.absorb_journaled() {
-            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
-        }
-        drop(core);
+        report.set_writing(None);
         match outcome {
-            Ok(Ok(record)) => report.push(scan_record_json(
-                "local_knowledge",
-                &name,
-                &record,
-                &counts,
-                None,
-            )),
-            Ok(Err(e)) => report
-                .push(json!({"source": name, "kind": "local_knowledge", "error": e.to_string()})),
+            Ok((record_result, mut core)) => {
+                // The scan appended `source.scanned` straight to the
+                // journal; the registry has to be caught up before this
+                // hold ends or the next `Core::commit` fails on contiguity.
+                if let Err(e) = core.absorb_journaled() {
+                    tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+                }
+                drop(core);
+                match record_result {
+                    Ok(record) => report.push(scan_record_json(
+                        "local_knowledge",
+                        &name,
+                        &record,
+                        &counts,
+                        None,
+                    )),
+                    Err(e) => report.push(json!({
+                        "source": name, "kind": "local_knowledge", "error": e.to_string(),
+                    })),
+                }
+            }
             Err(e) => report.push(json!({
                 "source": name, "kind": "local_knowledge",
                 "error": format!("atlas unavailable: {e}"),
@@ -6001,28 +6125,36 @@ async fn run_estate_scan(
             }
         };
         let counts = acquired.scan.counts();
-        let mut core = CoreGuard::acquire(&state.core).await;
-        let outcome = with_atlas_write(&state, |atlas| {
-            record_external_git_scan(atlas, &mut core.journal, &acquired, None)
+        let core = CoreWriteGuard::acquire(&state.core).await;
+        report.set_writing(Some(&name));
+        let outcome = with_atlas_write(&state, move |atlas| {
+            let mut core = core;
+            let result = record_external_git_scan(atlas, &mut core.journal, &acquired, None);
+            (result, core)
         })
         .await;
-        // The scan appended `source.scanned` straight to the journal;
-        // the registry has to be caught up before this hold ends or the
-        // next `Core::commit` fails on contiguity.
-        if let Err(e) = core.absorb_journaled() {
-            tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
-        }
-        drop(core);
+        report.set_writing(None);
         match outcome {
-            Ok(Ok(record)) => report.push(scan_record_json(
-                "external_git",
-                &name,
-                &record,
-                &counts,
-                None,
-            )),
-            Ok(Err(e)) => {
-                report.push(json!({"source": name, "kind": "external_git", "error": e.to_string()}))
+            Ok((record_result, mut core)) => {
+                // The scan appended `source.scanned` straight to the
+                // journal; the registry has to be caught up before this
+                // hold ends or the next `Core::commit` fails on contiguity.
+                if let Err(e) = core.absorb_journaled() {
+                    tracing::error!(error = %e, "folding a scan's journal summary into the registry failed");
+                }
+                drop(core);
+                match record_result {
+                    Ok(record) => report.push(scan_record_json(
+                        "external_git",
+                        &name,
+                        &record,
+                        &counts,
+                        None,
+                    )),
+                    Err(e) => report.push(json!({
+                        "source": name, "kind": "external_git", "error": e.to_string(),
+                    })),
+                }
             }
             Err(e) => report.push(json!({
                 "source": name, "kind": "external_git",
@@ -6261,9 +6393,12 @@ async fn intelligence_add_source(
         }
     };
     let coverage = acquired.scan.counts();
-    let mut core = CoreGuard::acquire(&state.core).await;
-    let recorded = with_atlas_write(&state, |atlas| {
-        record_external_git_scan(atlas, &mut core.journal, &acquired, None)
+    let source_name = acquired.scan.source_name.clone();
+    let core = CoreWriteGuard::acquire(&state.core).await;
+    let recorded = with_atlas_write(&state, move |atlas| {
+        let mut core = core;
+        let result = record_external_git_scan(atlas, &mut core.journal, &acquired, None);
+        (result, core)
     })
     .await;
     // #334: the acquisition appended `source.scanned` straight to the
@@ -6272,24 +6407,28 @@ async fn intelligence_add_source(
     // whatever Work command happens to come next. The same three lines every
     // other direct-journal writer in this file already carried; this handler
     // was written without them, which is the whole of #334.
-    if let Err(e) = core.absorb_journaled() {
-        tracing::error!(error = %e, "folding an external-git scan's journal summary into the registry failed");
-    }
-    drop(core);
     match recorded {
-        Ok(Ok(record)) => Json(scan_record_json(
-            "external_git",
-            &acquired.scan.source_name,
-            &record,
-            &coverage,
-            None,
-        ))
-        .into_response(),
-        Ok(Err(e)) => error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "atlas_unavailable",
-            e.to_string(),
-        ),
+        Ok((record_result, mut core)) => {
+            if let Err(e) = core.absorb_journaled() {
+                tracing::error!(error = %e, "folding an external-git scan's journal summary into the registry failed");
+            }
+            drop(core);
+            match record_result {
+                Ok(record) => Json(scan_record_json(
+                    "external_git",
+                    &source_name,
+                    &record,
+                    &coverage,
+                    None,
+                ))
+                .into_response(),
+                Err(e) => error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "atlas_unavailable",
+                    e.to_string(),
+                ),
+            }
+        }
         Err(e) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "atlas_unavailable",
