@@ -668,6 +668,25 @@ const ALLOWLIST: &[Allowed] = &[
                   outcome is decided by `wait_for_settled_within` below, a real state wait.",
     },
     Allowed {
+        file: "tests/support/mod.rs",
+        needle: "std::thread::sleep(std::time::Duration::from_millis(10));",
+        category: "cadence",
+        reason: "each of 8 spawned threads holds `CrossProcessLock` for a fixed slice so the \
+                  others have a real window to race for it — the point under test is mutual \
+                  exclusion, measured by the peak overlap counter checked after every thread \
+                  joins, never by this hold's length.",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "std::thread::sleep(Duration::from_secs(3600));",
+        category: "owned-wait-budget",
+        reason: "the role helper's own comment above this loop: 'block forever — the parent \
+                  kills this process; that is the event under test'. There is no state to check \
+                  because the fixture is deliberately not supposed to end on its own; what is \
+                  under test is the parent's kill, asserted separately, never this loop's \
+                  own return.",
+    },
+    Allowed {
         file: "tests/w3_client_surface.rs",
         needle: "std::thread::sleep(Duration::from_millis(300));",
         category: "cadence",
@@ -908,9 +927,11 @@ fn all_test_files() -> Vec<PathBuf> {
 
 /// One raw `sleep(` call found by a real `syn` parse (`full` + `visit`,
 /// 3.0.3 — already resolved transitively via `async-trait`, R5), with the
-/// one fact this guard's classification turns on: was it lexically inside a
-/// `while`/`loop`/`for` construct — the shape that can terminate on
-/// *observed state* the loop body itself checks — or bare.
+/// one fact this guard's classification turns on: does the `while`/`loop`/
+/// `for` construct directly containing it actually check *observed state*
+/// and terminate on it — a non-trivial `while` condition, or a body-level
+/// conditional break/continue/return/panic ([`loop_body_checks_state`]) —
+/// or is it bare, or lexically inside a loop that never checks anything.
 ///
 /// A brace/regex scanner is explicitly rejected (brief-sleep-and-hope.md
 /// item 1: "a real parse... beats a brace scanner that a reformat evades")
@@ -935,28 +956,128 @@ struct SleepSite {
     in_state_loop: bool,
 }
 
+/// Whether `path` names a panic-family macro (`panic!`, `assert!`,
+/// `assert_eq!`, `assert_ne!`, `unreachable!`) — the "panics on it" half of
+/// this module's own "checks real observed state every iteration and
+/// returns/panics on it" claim (doc above).
+fn is_panic_macro_path(path: &syn::Path) -> bool {
+    path.segments.last().is_some_and(|s| {
+        matches!(
+            s.ident.to_string().as_str(),
+            "panic" | "assert" | "assert_eq" | "assert_ne" | "unreachable"
+        )
+    })
+}
+
+/// Whether a `while` loop's condition is the literal `true` — the shape
+/// that (like a bare `loop {}`) contributes no state check of its own, so
+/// [`loop_body_checks_state`] must find one in the body instead.
+fn is_literal_true(cond: &syn::Expr) -> bool {
+    matches!(
+        cond,
+        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(b), .. }) if b.value
+    )
+}
+
+/// Whether `block` — a loop body — contains a `break`, `continue`,
+/// `return`, or panic-family macro call that is *conditional*: reached only
+/// through an `if` or `match` inside `block`, not a bare unconditional one.
+/// This is the structural form of this module's own claim that a counted
+/// loop "checks real observed state every iteration and returns/panics on
+/// it" (doc above) — a `for _ in 0..N { sleep(...) }` with no such
+/// conditional has nothing deciding correctness; it is a fixed-count
+/// busy-wait wearing the `owned-wait-budget` shape, not the real thing.
+/// Does not descend into a loop or closure nested inside `block` — that
+/// construct must justify its own `sleep` independently.
+fn loop_body_checks_state(block: &syn::Block) -> bool {
+    struct CheckFinder {
+        in_conditional: u32,
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for CheckFinder {
+        fn visit_expr_while(&mut self, _node: &'ast syn::ExprWhile) {}
+        fn visit_expr_loop(&mut self, _node: &'ast syn::ExprLoop) {}
+        fn visit_expr_for_loop(&mut self, _node: &'ast syn::ExprForLoop) {}
+        fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {}
+
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            self.in_conditional += 1;
+            visit::visit_expr_if(self, node);
+            self.in_conditional -= 1;
+        }
+
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            self.in_conditional += 1;
+            visit::visit_expr_match(self, node);
+            self.in_conditional -= 1;
+        }
+
+        fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
+            if self.in_conditional > 0 {
+                self.found = true;
+            }
+            visit::visit_expr_break(self, node);
+        }
+
+        fn visit_expr_continue(&mut self, node: &'ast syn::ExprContinue) {
+            if self.in_conditional > 0 {
+                self.found = true;
+            }
+            visit::visit_expr_continue(self, node);
+        }
+
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if self.in_conditional > 0 {
+                self.found = true;
+            }
+            visit::visit_expr_return(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            if self.in_conditional > 0 && is_panic_macro_path(&node.path) {
+                self.found = true;
+            }
+            visit::visit_macro(self, node);
+        }
+    }
+
+    let mut finder = CheckFinder {
+        in_conditional: 0,
+        found: false,
+    };
+    finder.visit_block(block);
+    finder.found
+}
+
 struct SleepVisitor {
-    loop_depth: u32,
+    /// Whether the loop directly containing the current position — the
+    /// innermost one, per [`loop_body_checks_state`]'s doc — has been shown
+    /// to check state and branch on it. Empty outside any loop.
+    loop_checks_state: Vec<bool>,
     sites: Vec<SleepSite>,
 }
 
 impl<'ast> Visit<'ast> for SleepVisitor {
     fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
-        self.loop_depth += 1;
+        let checks = !is_literal_true(&node.cond) || loop_body_checks_state(&node.body);
+        self.loop_checks_state.push(checks);
         visit::visit_expr_while(self, node);
-        self.loop_depth -= 1;
+        self.loop_checks_state.pop();
     }
 
     fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
-        self.loop_depth += 1;
+        self.loop_checks_state
+            .push(loop_body_checks_state(&node.body));
         visit::visit_expr_loop(self, node);
-        self.loop_depth -= 1;
+        self.loop_checks_state.pop();
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
-        self.loop_depth += 1;
+        self.loop_checks_state
+            .push(loop_body_checks_state(&node.body));
         visit::visit_expr_for_loop(self, node);
-        self.loop_depth -= 1;
+        self.loop_checks_state.pop();
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
@@ -967,7 +1088,7 @@ impl<'ast> Visit<'ast> for SleepVisitor {
         if is_sleep {
             self.sites.push(SleepSite {
                 line: node.span().start().line,
-                in_state_loop: self.loop_depth > 0,
+                in_state_loop: self.loop_checks_state.last().copied().unwrap_or(false),
             });
         }
         visit::visit_expr_call(self, node);
@@ -977,7 +1098,7 @@ impl<'ast> Visit<'ast> for SleepVisitor {
 fn sleep_sites(text: &str) -> Vec<SleepSite> {
     let file = syn::parse_file(text).unwrap_or_else(|e| panic!("parse: {e}"));
     let mut visitor = SleepVisitor {
-        loop_depth: 0,
+        loop_checks_state: Vec::new(),
         sites: Vec::new(),
     };
     visitor.visit_file(&file);
@@ -1096,5 +1217,63 @@ async fn polls_for_state() {
         now_covered.is_empty(),
         "the same bare sleep, once given a matching allowlist entry, must no longer be \
          flagged: {now_covered:?}"
+    );
+}
+
+/// F-TH-01: lexical nesting inside a `while`/`loop`/`for` is not by itself
+/// proof of a state check — a `for _ in 0..N { sleep(...) }` with no
+/// conditional exit is a fixed-count busy-wait, indistinguishable in effect
+/// from the forbidden bare `POLL_FAILURES_TOLERATED` shape (this module's
+/// own doc, above), and the guard must flag it exactly as it would flag a
+/// bare sleep. The doctrine-sanctioned counterexample right above it — a
+/// `for` loop whose body *does* check state and conditionally returns —
+/// must still pass, so the fix is the conditional exit, not merely being
+/// inside a loop.
+#[test]
+fn the_sleep_guard_fails_on_a_state_blind_loop_even_though_it_is_lexically_a_loop() {
+    let state_blind = "\
+async fn hopes_five_times() {
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+";
+    let violations = unallowed_test_sleeps("tests/x_example.rs", state_blind, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "a fixed-count loop whose body never checks state and never conditionally exits must \
+         still be flagged — lexical nesting alone is not a state check"
+    );
+
+    let state_blind_bare_loop = "\
+async fn spins_forever() {
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+";
+    let bare_loop_violations =
+        unallowed_test_sleeps("tests/x_example.rs", state_blind_bare_loop, ALLOWLIST);
+    assert!(
+        !bare_loop_violations.is_empty(),
+        "a bare `loop` with no conditional break/return/panic must still be flagged"
+    );
+
+    let genuinely_checked = "\
+async fn polls_five_times() {
+    for _ in 0..5 {
+        if some_background_task_finished() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+";
+    let checked_violations =
+        unallowed_test_sleeps("tests/x_example.rs", genuinely_checked, ALLOWLIST);
+    assert!(
+        checked_violations.is_empty(),
+        "a fixed-count loop whose body conditionally returns on real state must not be \
+         flagged: {checked_violations:?}"
     );
 }
