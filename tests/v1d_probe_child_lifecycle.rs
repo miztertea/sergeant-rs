@@ -55,11 +55,6 @@ const ROLE_ENV: &str = "SGT_V1D_ROLE";
 /// Where the role helper writes the pid of the child it spawned.
 const ROLE_PIDFILE_ENV: &str = "SGT_V1D_PIDFILE";
 
-/// How long any poll in this suite waits before calling it a hang. A
-/// deadline guard, not a latency pin: nothing here asserts anything was
-/// *fast*, only that it happened at all.
-const DEADLINE: Duration = Duration::from_secs(30);
-
 // --------------------------------------------------------------- role helper
 
 /// A no-op in an ordinary run; the parent half of test 1 when re-executed
@@ -138,19 +133,23 @@ fn start_role(role: &str, pidfile: &Path) -> (std::process::Child, u32) {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn the role helper");
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        if let Ok(text) = std::fs::read_to_string(pidfile)
-            && let Ok(pid) = text.trim().parse::<u32>()
-        {
-            return (helper, pid);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the {role:?} role helper never published a child pid"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut pid_result = None;
+    support::wait_until_sync(
+        &format!("the {role:?} role helper never published a child pid"),
+        support::HANG_BUDGET,
+        || {
+            if let Ok(text) = std::fs::read_to_string(pidfile)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                pid_result = Some(pid);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    let pid = pid_result.expect("wait_until_sync only returns after its predicate succeeds");
+    (helper, pid)
 }
 
 fn wait_until_gone(pid: u32, budget: Duration) -> bool {
@@ -190,7 +189,7 @@ fn a_hardened_probe_child_dies_when_its_parent_process_is_sigkilled() {
     hard_kill(helper_pid);
     let _ = helper.wait();
 
-    let gone = wait_until_gone(child_pid, DEADLINE);
+    let gone = wait_until_gone(child_pid, support::HANG_BUDGET);
     if !gone {
         hard_kill(child_pid);
     }
@@ -329,40 +328,44 @@ fn a_hard_killed_daemon_leaves_no_probe_descendant_alive() {
     // the leak lived in, and waiting for the walk to finish would close it.
     let mut captured: Vec<u32> = Vec::new();
     let mut caught_persistent: Vec<(u32, String)> = Vec::new();
-    let mut caught_the_leaker = false;
-    let deadline = Instant::now() + DEADLINE;
-    while Instant::now() < deadline && !caught_the_leaker {
-        for pid in descendants(daemon_pid) {
-            if !captured.contains(&pid) {
-                captured.push(pid);
+    // wait_until_sync's own panic on timeout is generic (names only the
+    // `what` given to it, per this wave's own established tradeoff) --
+    // the rich "persistent children seen / all descendants seen" dump the
+    // original hand-rolled loop's `assert!` carried on failure cannot
+    // survive the fold. `what` keeps the substance of what was expected.
+    support::wait_until_sync(
+        &format!(
+            "the probe walk never showed an `opencode serve --port 0` child under daemon \
+             {daemon_pid}. That child is the species #310 is about, and a run that never saw \
+             one cannot evidence the fix — so this fails rather than passing vacuously. Check \
+             that the opencode adapter is still registered at daemon start and still resolves \
+             its transport through the serve gate."
+        ),
+        support::HANG_BUDGET,
+        || {
+            let mut caught_the_leaker = false;
+            for pid in descendants(daemon_pid) {
+                if !captured.contains(&pid) {
+                    captured.push(pid);
+                }
+                let Some(argv) = argv_of(pid) else { continue };
+                if is_persistent_probe_child(&argv)
+                    && !caught_persistent.iter().any(|(seen, _)| *seen == pid)
+                {
+                    caught_persistent.push((pid, argv.join(" ")));
+                }
+                caught_the_leaker |= is_opencode_serve_child(&argv);
             }
-            let Some(argv) = argv_of(pid) else { continue };
-            if is_persistent_probe_child(&argv)
-                && !caught_persistent.iter().any(|(seen, _)| *seen == pid)
-            {
-                caught_persistent.push((pid, argv.join(" ")));
-            }
-            caught_the_leaker |= is_opencode_serve_child(&argv);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
+            caught_the_leaker
+        },
+    );
 
     hard_kill(daemon_pid);
     let _ = daemon.wait();
 
-    assert!(
-        caught_the_leaker,
-        "the probe walk never showed an `opencode serve --port 0` child under daemon \
-         {daemon_pid} within {DEADLINE:?} (persistent children seen: {caught_persistent:?}; \
-         all descendants seen: {captured:?}). That child is the species #310 is about, and \
-         a run that never saw one cannot evidence the fix — so this fails rather than \
-         passing vacuously. Check that the opencode adapter is still registered at daemon \
-         start and still resolves its transport through the serve gate."
-    );
-
     // Poll rather than sleep-then-check: the kernel delivers the death signal
     // asynchronously, and a fixed sleep would either be flaky or slow.
-    let gone_by = Instant::now() + DEADLINE;
+    let gone_by = Instant::now() + support::HANG_BUDGET;
     let survivors: Vec<u32> = loop {
         let alive: Vec<u32> = captured
             .iter()
@@ -415,7 +418,15 @@ fn a_completed_probe_walk_leaves_no_child_of_its_own_behind() {
     // The walk is finished when the daemon has been idle of children for a
     // while — asserted as a settled state rather than read from the journal,
     // because what this test is about is processes, not events.
-    let deadline = Instant::now() + DEADLINE;
+    // Deliberately NOT support::wait_until_sync: this loop's own exit is
+    // not this test's verdict either way (its budget just bounds how long
+    // it looks) -- `saw_a_child` and `leftover.is_empty()` below are the
+    // actual assertions, checked from state this loop leaves behind
+    // regardless of whether it exited via the 3s-quiet break or the
+    // deadline. wait_until_sync's panic-on-timeout would add a new failure
+    // mode this test never had (failing here even when the post-loop
+    // state the real assertions check turns out fine).
+    let deadline = Instant::now() + support::HANG_BUDGET;
     let mut quiet_since: Option<Instant> = None;
     let mut saw_a_child = false;
     while Instant::now() < deadline {
@@ -582,7 +593,7 @@ async fn daemon_handle_kill_reaps_a_probe_child_its_walk_still_has_live() {
     .await
     .expect("start the in-process daemon");
 
-    let deadline = Instant::now() + DEADLINE;
+    let deadline = Instant::now() + support::HANG_BUDGET;
     let live = loop {
         let live = direct_serve_children();
         if !live.is_empty() {
@@ -612,8 +623,9 @@ async fn daemon_handle_kill_reaps_a_probe_child_its_walk_still_has_live() {
     assert!(
         !live.is_empty(),
         "the in-process daemon's walk never showed a live `opencode serve` child within \
-         {DEADLINE:?}, so this test cannot evidence the reap — it fails rather than passing \
-         vacuously"
+         {:?}, so this test cannot evidence the reap — it fails rather than passing \
+         vacuously",
+        support::HANG_BUDGET,
     );
     // The kernel's own state letter for each survivor, because the two ways
     // to fail here need different fixes and the pid alone does not say which:

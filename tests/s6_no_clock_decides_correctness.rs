@@ -1264,30 +1264,6 @@ const ALLOWLIST: &[Allowed] = &[
         reason: DEADLINE_LOOP_RESIDUE_REASON,
     },
     Allowed {
-        file: "tests/v1d_probe_child_lifecycle.rs",
-        needle: "let deadline = Instant::now() + DEADLINE;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/v1d_probe_child_lifecycle.rs",
-        needle: "let deadline = Instant::now() + budget;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/v1d_probe_child_lifecycle.rs",
-        needle: "let gone_by = Instant::now() + DEADLINE;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/v1d_probe_child_lifecycle.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/w3_client_surface.rs",
         needle: "let end = Instant::now() + deadline;",
         category: "owned-wait-budget",
@@ -1347,6 +1323,59 @@ const ALLOWLIST: &[Allowed] = &[
             to tests/support/mod.rs), which would shrink the 3-sample stability window from \
             ~750ms to ~60ms and could false-positive mid-batch -- folding this one would change \
             the property under test, not just its budget.",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let deadline = Instant::now() + budget;",
+        category: "owned-wait-budget",
+        reason: "wait_until_gone's own bounded poll: it returns bool (`true` once the pid is \
+            gone, `false` if `budget` elapses with it still alive) rather than panicking either \
+            way. Both callers need the bool: one runs its own cleanup (hard_kill) before \
+            asserting on it with a message this generic helper cannot compose, the other \
+            negates it to prove the CONTROL child survives (an absence-proving wait, the same \
+            shape tests/y1_worker_transport.rs's own kept entry already names) -- the same \
+            'caller decides pass/fail from the returned value' shape as \
+            tests/w4_read_surfaces.rs's own kept entries.",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let gone_by = Instant::now() + support::HANG_BUDGET;",
+        category: "owned-wait-budget",
+        reason: "the survivor-collection loop after the #310 leaker assertion: it returns \
+            whichever pids are still alive when the budget elapses (possibly none), never \
+            panicking itself -- the caller's own assert!(survivors.is_empty(), ...) below is \
+            the actual verdict, with its own richer message (process states, argv). Budget \
+            consolidated onto the one shared support::HANG_BUDGET (was a locally-named \
+            DEADLINE = 30s duplicating it) even though the loop shape itself stays hand-rolled.",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
+        category: "owned-wait-budget",
+        reason: "two sites share this needle text (both already consolidated onto the one \
+            shared support::HANG_BUDGET, was a locally-named DEADLINE = 30s duplicating it): \
+            (1) the quiet-descendants loop in \
+            a_completed_probe_walk_leaves_no_child_of_its_own_behind -- its own exit is not \
+            this test's verdict either way (saw_a_child/leftover.is_empty() below are, checked \
+            from state this loop leaves behind regardless of why it exited); folding it into \
+            wait_until_sync's panic-on-timeout would add a new failure mode this test never \
+            had. (2) daemon_handle_kill_reaps_a_probe_child_its_walk_still_has_live's own \
+            async wait for a live serve child -- returns an empty Vec on timeout rather than \
+            panicking, and the caller's own assert!(!live.is_empty(), ...) is the verdict, same \
+            shape as (1).",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "owned-wait-budget",
+        reason: "the_data_dir_guard_leaves_no_descendant_of_its_daemons_alive's own capture \
+            window: `deadline - Duration::from_secs(7)` is read inside the loop body to keep \
+            listening for at least 3 of this window's 10 seconds once something has been \
+            captured, a relationship anchored to this loop's own 10s span -- routing it through \
+            support::HANG_BUDGET (120s) would silently change the 3-second minimum-listen \
+            window this loop's own early-exit math depends on, not just relax an unrelated \
+            ceiling. The loop itself never panics (it always proceeds to the survivors check \
+            below, the same 'caller decides pass/fail' shape as this file's other kept sites).",
     },
 ];
 
