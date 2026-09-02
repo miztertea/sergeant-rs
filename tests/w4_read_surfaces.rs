@@ -148,8 +148,7 @@ async fn submit_simple(
 }
 
 async fn wait_until_all_settled(http: &reqwest::Client, handle: &DaemonHandle) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+    support::wait_until("works never settled", support::HANG_BUDGET, || async {
         let system: Value = support::send_while_alive(
             "list",
             || {
@@ -162,19 +161,15 @@ async fn wait_until_all_settled(http: &reqwest::Client, handle: &DaemonHandle) {
         .json()
         .await
         .expect("json");
-        let all_done = system["works"]
+        system["works"]
             .as_array()
             .map(|rows| {
                 rows.iter()
                     .all(|w| w["state"] == "completed" || w["state"] == "failed")
             })
-            .unwrap_or(false);
-        if all_done {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("works never settled");
+            .unwrap_or(false)
+    })
+    .await;
 }
 
 /// Build a journal over the cap so a restart's startup-triggered prune (W3

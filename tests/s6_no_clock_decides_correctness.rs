@@ -1336,14 +1336,24 @@ const ALLOWLIST: &[Allowed] = &[
     Allowed {
         file: "tests/w4_read_surfaces.rs",
         needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
+        category: "owned-wait-budget",
+        reason: "read_raw_sse_frames's own bounded collector: unlike every wait_until_sync \
+            fold-in target, it does NOT panic when its own budget elapses -- it returns \
+            whatever frames it collected so far, and every caller asserts on the returned \
+            Vec's own length/content with its own message (e.g. 'expected at least the floor \
+            frame: {frames:?}'). This is the class wait_until_sync's own doc names as staying \
+            hand-rolled: a bounded wait whose caller decides pass/fail from the returned value, \
+            not from a panic this helper would raise itself.",
     },
     Allowed {
         file: "tests/w4_read_surfaces.rs",
         needle: "let deadline = Instant::now() + timeout;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
+        category: "owned-wait-budget",
+        reason: "drain_until_closed's own bounded drain: it returns a bool (`true` once the \
+            stream actually closed, `false` if `timeout` elapsed with it still open) rather \
+            than panicking either way -- its one caller decides what the outcome means \
+            ('the stream must close after the error frame, not hang open'). Same shape as \
+            read_raw_sse_frames above: the caller, not this helper, owns the verdict.",
     },
 ];
 
