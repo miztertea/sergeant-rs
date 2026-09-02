@@ -1635,14 +1635,11 @@ fn spawn_bare_daemon(dir: &DataDir) {
         let mut child = child;
         let _ = child.wait();
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while descriptor_of(dir.path()).is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "the bare daemon never published a descriptor"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    support::wait_until_sync(
+        "the bare daemon never published a descriptor",
+        support::HANG_BUDGET,
+        || descriptor_of(dir.path()).is_some(),
+    );
 }
 
 /// Kill a daemon by pid (SIGTERM) and wait for its descriptor to disappear.
@@ -2696,7 +2693,7 @@ async fn sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_dama
     // stream-error control frames arrive, and then the stream closes — no
     // *event* frame (`send_sse`'s own per-journaled-kind vocabulary) ever
     // follows.
-    let mut stream = http
+    let stream = http
         .get(format!("{}/v1/events/stream?from=0", handle.endpoint))
         .bearer_auth(&handle.token)
         .send()
@@ -2707,34 +2704,43 @@ async fn sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_dama
         200,
         "the SSE handshake itself still succeeds"
     );
-    let mut buffer = String::new();
-    let mut saw_error_frame = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let closed = loop {
-        if std::time::Instant::now() >= deadline {
-            panic!("a broken history replay must close the stream promptly, not hang");
-        }
-        match tokio::time::timeout(Duration::from_secs(5), stream.chunk())
-            .await
-            .expect("chunk timeout")
-        {
-            Ok(Some(chunk)) => {
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-                assert!(
-                    !buffer.contains("event: test.seeded") && !buffer.contains("event: work."),
-                    "no *event* frame may ever follow the failed replay: {buffer:?}"
-                );
-                if buffer.contains("event: sergeant.stream_error") {
-                    saw_error_frame = true;
+    // `stream` is a RefCell, not a plain `mut` local: wait_until's predicate
+    // is an `FnMut() -> Fut` whose returned future cannot itself hold a
+    // mutable borrow of a captured variable across its own await points --
+    // the same "captured variable cannot escape `FnMut` closure body" rustc
+    // limitation this wave already worked around for a value result
+    // elsewhere (interior mutability, R2/R3).
+    let stream = std::cell::RefCell::new(stream);
+    let buffer = std::cell::RefCell::new(String::new());
+    let saw_error_frame = std::cell::Cell::new(false);
+    support::wait_until(
+        "a broken history replay must close the stream promptly, not hang",
+        Duration::from_secs(5),
+        || async {
+            match tokio::time::timeout(Duration::from_secs(5), stream.borrow_mut().chunk())
+                .await
+                .expect("chunk timeout")
+            {
+                Ok(Some(chunk)) => {
+                    let mut buffer = buffer.borrow_mut();
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+                    assert!(
+                        !buffer.contains("event: test.seeded") && !buffer.contains("event: work."),
+                        "no *event* frame may ever follow the failed replay: {buffer:?}"
+                    );
+                    if buffer.contains("event: sergeant.stream_error") {
+                        saw_error_frame.set(true);
+                    }
+                    false
                 }
+                Ok(None) | Err(_) => true,
             }
-            Ok(None) => break true,
-            Err(_) => break true,
-        }
-    };
-    assert!(closed, "the stream must eventually close");
+        },
+    )
+    .await;
+    let buffer = buffer.into_inner();
     assert!(
-        saw_error_frame,
+        saw_error_frame.get(),
         "the journal failure must be disclosed as a stream_error control frame \
          (W4 §1.1.3, A6) rather than a silent close: {buffer:?}"
     );
@@ -5494,18 +5500,23 @@ async fn r_mvp1_10_wait_for_state(
     state: &str,
     timeout: Duration,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let body = r_mvp1_10_show(http, handle, work_id).await;
-        if body["work"]["state"] == state {
-            return body;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {work_id} to reach {state:?}; last seen: {body}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let result = std::cell::RefCell::new(None);
+    support::wait_until(
+        &format!("timed out waiting for {work_id} to reach {state:?}"),
+        timeout,
+        || async {
+            let body = r_mvp1_10_show(http, handle, work_id).await;
+            let reached = body["work"]["state"] == state;
+            if reached {
+                *result.borrow_mut() = Some(body);
+            }
+            reached
+        },
+    )
+    .await;
+    result
+        .into_inner()
+        .expect("wait_until only returns after its predicate succeeds")
 }
 
 /// The reason of the most recent `work.blocked` event for `work_id`.

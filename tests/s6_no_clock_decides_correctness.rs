@@ -1126,24 +1126,6 @@ const ALLOWLIST: &[Allowed] = &[
             decides pass/fail, not how long any single poll took.",
     },
     Allowed {
-        file: "tests/m2_daemon_api.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m2_daemon_api.rs",
-        needle: "let deadline = std::time::Instant::now() + Duration::from_secs(5);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m2_daemon_api.rs",
-        needle: "let deadline = Instant::now() + timeout;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/m4_backends.rs",
         needle: "let deadline = Instant::now() + Duration::from_secs(30);",
         category: "deadline-loop-residue",
@@ -1374,6 +1356,21 @@ const ALLOWLIST: &[Allowed] = &[
             teardown wait that proceeds regardless (stop_daemon in tests/m2_daemon_api.rs and \
             tests/m3_execution.rs)'. The while loop never asserts or panics; it just gives the \
             descriptor file up to 10s to disappear and returns either way.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "owned-wait-budget",
+        reason: "two sites share this identical needle text. (1) read_sse_events's own \
+            bounded SSE collector: like tests/w4_read_surfaces.rs::read_raw_sse_frames (its \
+            own kept entry), it returns whatever (seq, kind, data) triples it collected on \
+            timeout rather than panicking -- its own doc: 'until count events (or timeout)'; \
+            every caller asserts on the returned Vec's own length/content with its own \
+            message. (2) stop_daemon's own best-effort teardown wait, named explicitly in \
+            support::wait_until's own doc comment as staying hand-rolled: 'a best-effort \
+            teardown wait that proceeds regardless (stop_daemon in tests/m2_daemon_api.rs and \
+            tests/m3_execution.rs)' -- it never asserts or panics, just gives the descriptor \
+            file up to 10s and returns either way.",
     },
 ];
 
