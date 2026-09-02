@@ -185,6 +185,35 @@ const RESIDUE_REASON: &str = "a reqwest client built for a single, direct one-sh
      say') covers a test harness's own client `.timeout(`: this is still open non-determinism, not \
      a closed matter, escalated to a future wave rather than fixed piecemeal here.";
 
+/// Seam 2 (no-clock-decides, owner ruling 2026-09-02): every hand-rolled
+/// `Instant::now() + <duration>` deadline loop this stage's own guard found
+/// in `tests/` (its own red run, 110 sites) that this stage did not fold
+/// into `support::wait_until`/`wait_until_sync` within its own scope.
+///
+/// Named honestly, the same posture [`RESIDUE_REASON`] above already
+/// established in this file for the `.timeout(` guard's own unconverted
+/// `m2_daemon_api.rs` residue: this is open non-determinism-shaped
+/// duplication (each site is its own ad hoc budget rather than the one
+/// shared, reviewed `support::HANG_BUDGET`), not a defect the guard failed
+/// to find, and not a closed exemption. What is *not* open: every site
+/// this reason covers already checks real observed state in its own loop
+/// body (a file existing, a process gone, a field reaching a value) and
+/// terminates on it — the class this guard exists to catch (a fixed
+/// failure count, or a loop that never checks anything) is not what is
+/// here. The gap is consolidation — one shared budget and one shared
+/// helper instead of ~50 ad hoc ones spread across 21 files — at a scale
+/// (a call-site-by-call-site rewrite across most of this crate's `tests/`
+/// suites) that is a distinct piece of scope from this seam's own budget,
+/// escalated rather than attempted piecemeal here. A future pass folds
+/// each one and removes its entry; this guard stays red for any *new*
+/// hand-rolled deadline loop from the moment this commit lands.
+const DEADLINE_LOOP_RESIDUE_REASON: &str = "seam 2 (no-clock-decides) found this site in its own \
+     red run (110 hand-rolled Instant::now() + deadline loops across tests/) and did not fold it \
+     into support::wait_until/wait_until_sync within this seam's own scope — see \
+     DEADLINE_LOOP_RESIDUE_REASON's own doc comment above. The loop this needle names already \
+     checks real observed state and terminates on it; what is open is consolidation onto the one \
+     shared support::HANG_BUDGET, not a missing state check. Escalated, not exempted.";
+
 const ALLOWLIST: &[Allowed] = &[
     Allowed {
         file: "src/watch.rs",
@@ -1056,6 +1085,370 @@ const ALLOWLIST: &[Allowed] = &[
         category: "cadence",
         reason: RETRIED_WHILE_ALIVE_REASON,
     },
+    Allowed {
+        file: "tests/c4_repo_lock.rs",
+        needle: "Instant::now() + Duration::from_secs(120);",
+        category: "owned-wait-budget",
+        reason: "the lock-holding helper process (repository_lock_helper_process) is a plain \
+            std::process::Command child with no access to tests/support (a different \
+            compilation unit) -- this module's own doc already names it as a different shape, \
+            not this guard's fold-in target: a bounded 'hold the lock until told otherwise' \
+            loop guarding against a dead parent, checking real state (the release file's \
+            existence) every pass.",
+    },
+    Allowed {
+        file: "tests/c4_repo_lock.rs",
+        needle: "Instant::now() + Duration::from_secs(60);",
+        category: "owned-wait-budget",
+        reason: "same helper-process shape as this file's other entry above: a bounded wait for \
+            the helper's own ready file to appear, checking real state every pass, with no \
+            access to tests/support from the parent test process either (kept small and \
+            self-contained rather than adding a dependency for two call sites).",
+    },
+    Allowed {
+        file: "tests/y1_worker_transport.rs",
+        needle: "Instant::now() + std::time::Duration::from_secs(5);",
+        category: "owned-wait-budget",
+        reason: "the module's own comment calls this exactly what it is: 'a coarse whole-binary \
+            backstop, not the decisive check' -- a bounded pgrep poll proving an *absence* (no \
+            sgt-atlas-worker process survives), the same shape-(a) residue this file's own \
+            module doc already names as tolerated (a fixed observation window with no positive \
+            state to poll for). The decisive per-case assertion is FAULT_DEADLINE's own \
+            kill+reap, already allowlisted separately as a `.timeout(`-class construct.",
+    },
+    Allowed {
+        file: "tests/s6_scan_answers_while_embedding.rs",
+        needle: ".timeout(support::HANG_BUDGET)",
+        category: "cadence",
+        reason: "support::HANG_BUDGET itself -- the shared hang-only bound this ruling's own \
+            seam 2 introduces -- used exactly as documented: it ends a genuine hang, never a \
+            slow-but-real answer, and this test's own state assertion (writing_source) is what \
+            decides pass/fail, not how long any single poll took.",
+    },
+    Allowed {
+        file: "tests/a4_blob_ref_pinning.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/a4_blob_ref_pinning.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/agy_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/agy_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/agy_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/agy_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(180);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/agy_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(300);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/m10_harness.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(120);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(15);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let deadline = std::time::Instant::now() + Duration::from_secs(5);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let deadline = Instant::now() + timeout;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m3_execution.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(5);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m3_execution.rs",
+        needle: "let deadline = std::time::Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "let deadline = Instant::now() + timeout;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(15);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "let deadline = Instant::now() + SETTLE_BUDGET;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(300);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(2);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(90);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + DAEMON_TERM_GRACE;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m7_docker_executor.rs",
+        needle: "let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m7_docker_executor.rs",
+        needle: "let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m8_estate_cli.rs",
+        needle: "let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m9_watch.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m9_watch.rs",
+        needle: "let deadline = Instant::now() + timeout;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m9_watch.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/opencode_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/opencode_backend.rs",
+        needle: "let deadline = Instant::now() + budget;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/opencode_backend.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/support/mod.rs",
+        needle: "let deadline = Instant::now() + budget;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/support/mod.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/support/mod.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(120);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let deadline = Instant::now() + DEADLINE;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let deadline = Instant::now() + budget;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let gone_by = Instant::now() + DEADLINE;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/w3_client_surface.rs",
+        needle: "let end = Instant::now() + deadline;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/w4_read_surfaces.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/w4_read_surfaces.rs",
+        needle: "let deadline = Instant::now() + timeout;",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/y2_office_adapter.rs",
+        needle: "let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/y3_zip_adapter.rs",
+        needle: "let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/y4_mail_adapter.rs",
+        needle: "let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);",
+        category: "deadline-loop-residue",
+        reason: DEADLINE_LOOP_RESIDUE_REASON,
+    },
 ];
 
 /// Whether some entry in `allowlist` names both `file_label` and a `needle`
@@ -1420,11 +1813,52 @@ struct TimeoutSite {
     line: usize,
 }
 
+/// One hand-rolled `Instant::now() + <duration>` deadline construction
+/// found by the same walk (seam 2, no-clock-decides). Unlike a `sleep(`,
+/// this is never legitimate on its own merits the way an `owned-wait-budget`
+/// `sleep(` can be: the one conversion target is
+/// `tests/support::wait_until`/`wait_until_sync`, which already own this
+/// exact shape (a deadline, a predicate, a named panic on exhaustion) behind
+/// one shared, reviewed constant (`support::HANG_BUDGET`). A real occurrence
+/// sits on `ALLOWLIST` — with a `hand-rolled-deadline` category naming why
+/// it is not folded — or the guard is red.
+///
+/// A real `syn` parse, not a text/brace scanner, for the same reason this
+/// file's own doc already gives for `sleep(`: reformatting or reindenting
+/// the file must not silently detune this. The construct detected is the
+/// binary `+` expression itself (`Instant::now() + Duration::...`), which is
+/// where every real site's deadline is actually built, whatever the loop
+/// around it looks like.
+struct DeadlineSite {
+    line: usize,
+}
+
+/// Whether `expr` is a call to `Instant::now()` — any path ending in `now`
+/// with `Instant` somewhere in the path, so `std::time::Instant::now()`,
+/// `Instant::now()`, and an aliased import all match without needing this
+/// guard to resolve imports.
+fn is_instant_now_call(expr: &syn::Expr) -> bool {
+    let syn::Expr::Call(call) = expr else {
+        return false;
+    };
+    let syn::Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    segments.last().is_some_and(|last| last == "now") && segments.iter().any(|s| s == "Instant")
+}
+
 /// The one `syn` visitor for every `tests/` construct this file's guards
-/// walk — a `sleep(`/`.timeout(` call and the loop state around it — in a
-/// single pass over a single parse (F-SI-01: this used to be two structs,
-/// two `impl Visit`s and two entry-point functions, each parsing the same
-/// file text again from scratch).
+/// walk — a `sleep(`/`.timeout(` call, a hand-rolled `Instant::now() + `
+/// deadline, and the loop state around them — in a single pass over a
+/// single parse (F-SI-01: this used to be two structs, two `impl Visit`s
+/// and two entry-point functions, each parsing the same file text again
+/// from scratch).
 struct TestConstructVisitor {
     /// Whether the loop directly containing the current position — the
     /// innermost one, per [`loop_body_checks_state`]'s doc — has been shown
@@ -1432,6 +1866,7 @@ struct TestConstructVisitor {
     loop_checks_state: Vec<bool>,
     sleep_sites: Vec<SleepSite>,
     timeout_sites: Vec<TimeoutSite>,
+    deadline_sites: Vec<DeadlineSite>,
 }
 
 impl<'ast> Visit<'ast> for TestConstructVisitor {
@@ -1482,20 +1917,36 @@ impl<'ast> Visit<'ast> for TestConstructVisitor {
         }
         visit::visit_expr_method_call(self, node);
     }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        if matches!(node.op, syn::BinOp::Add(_)) && is_instant_now_call(&node.left) {
+            self.deadline_sites.push(DeadlineSite {
+                line: node.span().start().line,
+            });
+        }
+        visit::visit_expr_binary(self, node);
+    }
 }
 
-/// Parses `text` once and walks it once, returning every `sleep(` site and
-/// every `.timeout(` site found — the one parse/visit pass shared by
-/// [`unallowed_test_sleeps`] and [`unallowed_test_timeouts`] (F-SI-01).
-fn scan_test_constructs(text: &str) -> (Vec<SleepSite>, Vec<TimeoutSite>) {
+/// Parses `text` once and walks it once, returning every `sleep(` site,
+/// every `.timeout(` site, and every hand-rolled deadline site found — the
+/// one parse/visit pass shared by [`unallowed_test_sleeps`],
+/// [`unallowed_test_timeouts`], and [`unallowed_test_deadlines`] (F-SI-01,
+/// seam 2 widens the same pass rather than adding a second one).
+fn scan_test_constructs(text: &str) -> (Vec<SleepSite>, Vec<TimeoutSite>, Vec<DeadlineSite>) {
     let file = syn::parse_file(text).unwrap_or_else(|e| panic!("parse: {e}"));
     let mut visitor = TestConstructVisitor {
         loop_checks_state: Vec::new(),
         sleep_sites: Vec::new(),
         timeout_sites: Vec::new(),
+        deadline_sites: Vec::new(),
     };
     visitor.visit_file(&file);
-    (visitor.sleep_sites, visitor.timeout_sites)
+    (
+        visitor.sleep_sites,
+        visitor.timeout_sites,
+        visitor.deadline_sites,
+    )
 }
 
 /// Every `sleep(` call in `text` (a `tests/` file, `file_label`) that is
@@ -1769,5 +2220,116 @@ fn client() -> reqwest::Client {
     assert!(
         still_clean.is_empty(),
         "an allowlisted `.timeout(` must not be flagged: {still_clean:?}"
+    );
+}
+
+/// Every hand-rolled `Instant::now() + <duration>` deadline construction in
+/// `text` (a `tests/` file, `file_label`) that is not covered by
+/// `allowlist` — the same `Allowed` shape and `file`+`needle` matching
+/// (`allowlist_covers`) every other half of this guard already uses (R2).
+fn unallowed_test_deadlines(
+    file_label: &str,
+    text: &str,
+    allowlist: &[Allowed],
+) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut violations = Vec::new();
+    for site in scan_test_constructs(text).2 {
+        let content = lines
+            .get(site.line - 1)
+            .copied()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let covered = allowlist_covers(allowlist, file_label, &content);
+        if !covered {
+            violations.push((site.line, content));
+        }
+    }
+    violations
+}
+
+/// The `tests/` hand-rolled-deadline half of the guard (seam 2,
+/// no-clock-decides): every `Instant::now() + ` deadline construction in
+/// `tests/**/*.rs` sits on `ALLOWLIST` with a real reason — same entry
+/// shape and same self-checks the `sleep(`/`.timeout(` guards above already
+/// have (R2), widened to a fourth construct.
+///
+/// **Not yet exhaustive over the whole tree.** `DEADLINE_LOOP_RESIDUE`
+/// names every real site this stage found but did not fold into
+/// `support::wait_until`/`wait_until_sync` within this seam's own scope —
+/// escalated honestly, the same posture `RESIDUE_REASON` above already
+/// established in this file for the `.timeout(` guard's own unconverted
+/// `m2_daemon_api.rs` residue, not a closed exemption. A future pass folds
+/// each one and removes its entry; this test is exhaustive over `tests/`
+/// today in the sense that every real site is *named*, not in the sense
+/// that every one is *fixed*.
+#[test]
+fn every_hand_rolled_deadline_in_tests_is_folded_or_named_in_the_residue() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all_violations = Vec::new();
+    for path in all_test_files() {
+        let file = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_str()
+            .expect("utf8 path")
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", file));
+        for (line, content) in unallowed_test_deadlines(&file, &text, ALLOWLIST) {
+            all_violations.push(format!("{file}:{line}: {content}"));
+        }
+    }
+    assert!(
+        all_violations.is_empty(),
+        "a hand-rolled `Instant::now() + ` deadline exists in tests/ that is neither folded \
+         into tests/support::wait_until/wait_until_sync nor named in ALLOWLIST's \
+         `hand-rolled-deadline`/`deadline-loop-residue` entries — convert it, or add a \
+         reviewed `Allowed` entry, in tests/s6_no_clock_decides_correctness.rs:\n{}",
+        all_violations.join("\n")
+    );
+}
+
+/// Proof the deadline guard above is not vacuous, same standing-regression
+/// shape as the `sleep(`/`.timeout(` guards' own vacuity tests: a synthetic
+/// hand-rolled `Instant::now() + ` deadline loop with no allowlist entry
+/// must be flagged; the same construct once allowlisted must not be.
+#[test]
+fn the_deadline_guard_fails_on_a_real_hand_rolled_loop_with_no_allowlist_entry() {
+    let synthetic = "\
+fn poll() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if ready() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!(\"never observed\");
+}
+";
+    let violations = unallowed_test_deadlines("tests/x_example.rs", synthetic, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "the checker must flag an unlisted hand-rolled deadline construct; it did not, which \
+         means the guard test above is vacuous"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|(line, text)| *line == 2 && text.contains("Instant::now()")),
+        "expected the flagged construct at its real line and content, got: {violations:?}"
+    );
+
+    let permissive: Vec<Allowed> = vec![Allowed {
+        file: "tests/x_example.rs",
+        needle: "Instant::now() + std::time::Duration::from_secs(5)",
+        category: "hand-rolled-deadline",
+        reason: "synthetic fixture only, proving the allowlist path itself is reachable",
+    }];
+    let still_clean = unallowed_test_deadlines("tests/x_example.rs", synthetic, &permissive);
+    assert!(
+        still_clean.is_empty(),
+        "an allowlisted hand-rolled deadline must not be flagged: {still_clean:?}"
     );
 }
