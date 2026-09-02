@@ -713,21 +713,27 @@ fn all_test_files() -> Vec<PathBuf> {
 /// One raw `sleep(` call found by a real `syn` parse (`full` + `visit`,
 /// 3.0.3 — already resolved transitively via `async-trait`, R5), with the
 /// one fact this guard's classification turns on: was it lexically inside a
-/// `while`/`loop` construct — the shape that can terminate on *observed
-/// state* the loop body itself checks — or bare.
+/// `while`/`loop`/`for` construct — the shape that can terminate on
+/// *observed state* the loop body itself checks — or bare.
 ///
 /// A brace/regex scanner is explicitly rejected (brief-sleep-and-hope.md
 /// item 1: "a real parse... beats a brace scanner that a reformat evades")
 /// — this walks the actual AST, so reindenting or reformatting the file
 /// cannot silently detune the check the way a column/brace count would.
 ///
-/// A bounded `for _ in 0..N { sleep(...) }` deliberately does **not**
-/// count as "inside a loop" here: iterating a fixed range is itself the
-/// guessed-count shape this doctrine forbids (`POLL_FAILURES_TOLERATED`'s
-/// own class), not a loop that terminates on observed state. Only
-/// `while`/`loop` — which terminate on a condition or an explicit `break`
-/// the body evaluates each iteration, never on having iterated N times —
-/// count.
+/// A bounded `for _ in 0..N { ...check state...; sleep(...) }` counts as
+/// "inside a loop" the same as `while`/`loop`: this crate's own dominant
+/// polling idiom (e.g. `completed_work()` above:
+/// `for _ in 0..200 { if <state>.is_terminal() { return } sleep(25ms) }`)
+/// checks real observed state every iteration and returns/panics on it;
+/// the fixed iteration count times the fixed sleep is just an owned wait
+/// budget spelled as a count instead of an `Instant` deadline (the same
+/// `owned-wait-budget` class the `src/` guard's own `ALLOWLIST` already
+/// recognizes), not the forbidden `POLL_FAILURES_TOLERATED` shape — that
+/// shape substitutes a *failure count* for a state check ("assume the
+/// daemon is gone after 5 failures" instead of asking "is it still
+/// there") rather than checking state every pass and merely bounding how
+/// many passes that check gets.
 struct SleepSite {
     line: usize,
     in_state_loop: bool,
@@ -748,6 +754,12 @@ impl<'ast> Visit<'ast> for SleepVisitor {
     fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
         self.loop_depth += 1;
         visit::visit_expr_loop(self, node);
+        self.loop_depth -= 1;
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.loop_depth += 1;
+        visit::visit_expr_for_loop(self, node);
         self.loop_depth -= 1;
     }
 
