@@ -891,11 +891,7 @@ pub fn spawn_scripted_http_server(
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_clone = attempts.clone();
     std::thread::spawn(move || {
-        let mut entries = script.into_iter();
-        loop {
-            let Some((status, body, delay)) = entries.next() else {
-                break;
-            };
+        for (status, body, delay) in script {
             let Ok((stream, _)) = listener.accept() else {
                 break;
             };

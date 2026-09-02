@@ -139,6 +139,20 @@ struct Allowed {
     reason: &'static str,
 }
 
+/// Shared by every "one-shot client, never through scan_to_completion"
+/// `.timeout(` entry below — see the block comment above those entries for
+/// the full reasoning; kept as one named constant rather than repeated 24
+/// times so a future reader (or `grep`) finds the single real argument
+/// once instead of 24 near-duplicate paragraphs.
+const RESIDUE_REASON: &str = "a reqwest client built for a single, direct one-shot request/response \
+     this test makes itself — never through scan_to_completion's polling loop. A transport-class \
+     failure here would in principle be the same defect class scan_to_completion had, but this \
+     call is never looped and never exposed to a scan's own duration under a starved runner the \
+     way the polled status GET was (run29-test.log, the wave's own brief) — no failure of this \
+     shape has been observed here. Converting all 24 such sites into their own retry-while-alive \
+     callers is materially larger than this wave's stated boundary ('fix at the helper, once'); \
+     named here as reasoned residue for a future wave rather than attempted piecemeal in this one.";
+
 const ALLOWLIST: &[Allowed] = &[
     Allowed {
         file: "src/watch.rs",
@@ -769,6 +783,246 @@ const ALLOWLIST: &[Allowed] = &[
                   proving the caller retries rather than panics) — not a duration this code \
                   decides pass/fail by.",
     },
+    // ---- tests/ `.timeout(` (wave `transport-timeout-is-not-a-verdict`, item 3) ----
+    //
+    // Two shapes, per the wave's own instruction: "convert it to the same
+    // retry-while-alive path... or leave it, say so" for a genuine hang
+    // guard. A third, real shape turned out to need naming too — a client
+    // whose `.timeout(` feeds `scan_to_completion` directly is *already*
+    // converted, one call site up: the retry now lives in the shared
+    // helper (previous commit), so the client's own per-attempt bound is
+    // cadence for that retry, not a verdict in its own right.
+    //
+    // The seven entries below are that first shape — every file whose
+    // `client()`/`http()` builds the client `scan_to_completion` is then
+    // handed.
+    Allowed {
+        file: "tests/s6_semantic_crossing.rs",
+        needle: ".timeout(Duration::from_secs(60))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/s6_scan_front_door.rs",
+        needle: ".timeout(Duration::from_secs(30))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/w1b_overlay_lifecycle_trigger.rs",
+        needle: ".timeout(Duration::from_secs(60))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/w1d_overlay_freshness.rs",
+        needle: ".timeout(Duration::from_secs(60))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/y5_external_git_triggers.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/y6a_estate_scoped_scan.rs",
+        needle: ".timeout(Duration::from_secs(30))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/y6b_online_only.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    // This suite's own regression fixture: the client's `.timeout(` value
+    // *is* the behavior under test — a caller-chosen bound short enough
+    // that a scripted stub's delay reliably outruns it, proving the fix
+    // above retries rather than panics.
+    Allowed {
+        file: "tests/s6_scan_poll_survives_a_transport_timeout.rs",
+        needle: ".timeout(client_timeout)",
+        category: "cadence",
+        reason: "wave `transport-timeout-is-not-a-verdict`'s own regression fixture: the caller \
+                  picks this client's timeout per test (short enough that the scripted stub's \
+                  delay outruns it, or long enough that a hangup never touches it) specifically \
+                  to exercise scan_to_completion's retry-while-alive path — the timeout is the \
+                  input under test, not a duration this suite lets decide its own verdict.",
+    },
+    // The remaining 24 sites: a `reqwest::Client::builder().timeout(...)` built
+    // for ordinary one-shot request/response calls this suite makes directly
+    // (never through scan_to_completion's polling loop) — POST/GET a daemon
+    // endpoint once, `.expect()`/`assert` the answer. Reasoned residue, not a
+    // closed matter (same shape the `sleep(` guard's own doc comment above
+    // already tolerates for its own "shape (b)" entries): a transport-class
+    // failure on any of these would in principle be the identical defect
+    // class scan_to_completion had, but every one of them is a single
+    // request against an in-process, loopback, near-zero-latency daemon —
+    // never looped, never observed to fail in this program's own evidence
+    // (only the *polled* status GET, exposed to a scan's full duration under
+    // a starved runner, has ever actually failed this way; run29-test.log,
+    // the wave's own brief). Converting all 24 into their own
+    // retry-while-alive callers is a materially larger, riskier change than
+    // this wave's stated boundary ("fix at the helper, once") and is left
+    // named here for a future wave rather than attempted piecemeal in this
+    // one.
+    Allowed {
+        file: "tests/c1a_compiled_context.rs",
+        needle: ".timeout(std::time::Duration::from_secs(30))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/c1a_compiled_context.rs",
+        needle: ".timeout(std::time::Duration::from_secs(60))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/c1d_attribution_nesting_audit.rs",
+        needle: ".timeout(std::time::Duration::from_secs(60))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/agy_routing.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/codex_routing.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/opencode_routing.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/t2_workflow_catalog.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/w2fix_probe_ordering.rs",
+        needle: ".timeout(Duration::from_secs(10))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/e_admission_uses_no_network_git.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/e_git_admission.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/i9_floor_pinning.rs",
+        needle: ".timeout(std::time::Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m11_nested_workflow.rs",
+        needle: ".timeout(std::time::Duration::from_secs(30))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m12_child_work.rs",
+        needle: ".timeout(std::time::Duration::from_secs(30))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: ".timeout(Duration::from_secs(10))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m3_execution.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/w3_prune_engine.rs",
+        needle: ".timeout(std::time::Duration::from_secs(20))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/w4_doctor_journal_growth.rs",
+        needle: ".timeout(Duration::from_secs(10))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/w4_read_surfaces.rs",
+        needle: ".timeout(Duration::from_secs(10))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/x4_tabular_map.rs",
+        needle: ".timeout(std::time::Duration::from_secs(10))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
 ];
 
 /// Whether some entry in `allowlist` names both `file_label` and a `needle`
@@ -1345,5 +1599,144 @@ async fn polls_five_times() {
         checked_violations.is_empty(),
         "a fixed-count loop whose body conditionally returns on real state must not be \
          flagged: {checked_violations:?}"
+    );
+}
+
+// ------------------------------------------------------ tests/ .timeout(
+
+/// One `.timeout(` method call found by the same real `syn` parse the
+/// `sleep(` walk above uses (R2). Unlike a `sleep(`, a client-builder
+/// `.timeout(` carries no loop-shape question — there is no "inside a
+/// state-terminating loop" reading of a client's own configured per-request
+/// bound, only "does something explain why this construct exists" — so
+/// every real occurrence sits on `ALLOWLIST` or the guard is red (wave
+/// `transport-timeout-is-not-a-verdict`, item 4: "Client timeouts are the
+/// other half of the same class" `sleep(` already covers).
+struct TimeoutSite {
+    line: usize,
+}
+
+struct TimeoutVisitor {
+    sites: Vec<TimeoutSite>,
+}
+
+impl<'ast> Visit<'ast> for TimeoutVisitor {
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if node.method == "timeout" {
+            // `node.span()` covers the whole receiver chain (from
+            // `reqwest::Client::builder()` through this call) — the method
+            // name's own span is what actually sits on the `.timeout(` line
+            // a reader (and `ALLOWLIST`'s needle matching) expects.
+            self.sites.push(TimeoutSite {
+                line: node.method.span().start().line,
+            });
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+}
+
+fn timeout_sites(text: &str) -> Vec<TimeoutSite> {
+    let file = syn::parse_file(text).unwrap_or_else(|e| panic!("parse: {e}"));
+    let mut visitor = TimeoutVisitor { sites: Vec::new() };
+    visitor.visit_file(&file);
+    visitor.sites
+}
+
+/// Every `.timeout(` call in `text` (a `tests/` file, `file_label`) not
+/// covered by `allowlist` — the same `Allowed` shape and `file`+`needle`
+/// matching (`allowlist_covers`) every other half of this guard already
+/// uses (R2), so the same "matches nothing"/"no real reason" self-checks
+/// cover these entries too without a second, parallel check.
+fn unallowed_test_timeouts(
+    file_label: &str,
+    text: &str,
+    allowlist: &[Allowed],
+) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut violations = Vec::new();
+    for site in timeout_sites(text) {
+        let content = lines
+            .get(site.line - 1)
+            .copied()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let covered = allowlist_covers(allowlist, file_label, &content);
+        if !covered {
+            violations.push((site.line, content));
+        }
+    }
+    violations
+}
+
+/// The `tests/` `.timeout(` half of the guard (brief
+/// `transport-timeout-is-not-a-verdict.md`, item 4): every client-builder
+/// `.timeout(` call in `tests/**/*.rs` sits on `ALLOWLIST` with a real
+/// reason — same entry shape and same self-checks the `sleep(` guard above
+/// already has (R2), widened to a third construct.
+#[test]
+fn every_client_timeout_in_tests_sits_on_an_explicit_allowlist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all_violations = Vec::new();
+    for path in all_test_files() {
+        let file = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_str()
+            .expect("utf8 path")
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", file));
+        for (line, content) in unallowed_test_timeouts(&file, &text, ALLOWLIST) {
+            all_violations.push(format!("{file}:{line}: {content}"));
+        }
+    }
+    assert!(
+        all_violations.is_empty(),
+        "a `.timeout(` call exists in tests/ with no ALLOWLIST entry explaining why it is not a \
+         duration deciding an expected-success test's verdict — convert the caller to retry \
+         while the daemon is alive (tests/support/mod.rs::scan_to_completion) or add a reviewed \
+         `Allowed` entry naming why it is genuinely behavioral (a hang guard, a stalled-backend \
+         test), in tests/s6_no_clock_decides_correctness.rs:\n{}",
+        all_violations.join("\n")
+    );
+}
+
+/// Proof the `.timeout(` guard above is not vacuous, same standing-
+/// regression shape as the `sleep(` guard's own vacuity test: a synthetic
+/// client-builder `.timeout(` with no allowlist entry must be flagged; the
+/// same call once allowlisted must not be.
+#[test]
+fn the_timeout_guard_fails_on_an_unallowlisted_client_timeout() {
+    let synthetic = "\
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect(\"client\")
+}
+";
+    let violations = unallowed_test_timeouts("tests/x_example.rs", synthetic, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "the checker must flag an unlisted client `.timeout(` construct; it did not, which \
+         means the guard test above is vacuous"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|(line, text)| *line == 3 && text.contains("timeout")),
+        "expected the flagged construct at its real line and content, got: {violations:?}"
+    );
+
+    let permissive: Vec<Allowed> = vec![Allowed {
+        file: "tests/x_example.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: "synthetic fixture only, proving the allowlist path itself is reachable",
+    }];
+    let still_clean = unallowed_test_timeouts("tests/x_example.rs", synthetic, &permissive);
+    assert!(
+        still_clean.is_empty(),
+        "an allowlisted `.timeout(` must not be flagged: {still_clean:?}"
     );
 }

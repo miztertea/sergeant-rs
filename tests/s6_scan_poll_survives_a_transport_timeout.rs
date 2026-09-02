@@ -41,7 +41,11 @@ fn stalling_client(client_timeout: Duration) -> reqwest::Client {
 #[tokio::test]
 async fn a_status_poll_that_stalls_past_the_client_timeout_is_retried_not_panicked() {
     let (endpoint, attempts) = support::spawn_scripted_http_server(vec![
-        (202, r#"{"scan_id":"abc123","state":"running","scanned":[]}"#, Duration::ZERO),
+        (
+            202,
+            r#"{"scan_id":"abc123","state":"running","scanned":[]}"#,
+            Duration::ZERO,
+        ),
         // Stalls 600ms past the client's 150ms timeout: the client aborts
         // this connection before this (late, unreceived) answer is written.
         (
@@ -61,7 +65,10 @@ async fn a_status_poll_that_stalls_past_the_client_timeout_is_retried_not_panick
     let (status, report) =
         support::scan_to_completion(&http, &endpoint, "stub-token", &json!({}), || true).await;
 
-    assert!(status.is_success(), "expected a success status, got {status}");
+    assert!(
+        status.is_success(),
+        "expected a success status, got {status}"
+    );
     assert_eq!(
         report["state"], "completed",
         "the stalled-then-answered scan must complete: {report}"
@@ -84,7 +91,11 @@ async fn a_status_poll_that_stalls_past_the_client_timeout_is_retried_not_panick
 #[should_panic(expected = "the daemon is no longer alive")]
 async fn a_status_poll_transport_failure_against_a_dead_daemon_fails_at_once() {
     let (endpoint, _attempts) = support::spawn_scripted_http_server(vec![
-        (202, r#"{"scan_id":"abc123","state":"running","scanned":[]}"#, Duration::ZERO),
+        (
+            202,
+            r#"{"scan_id":"abc123","state":"running","scanned":[]}"#,
+            Duration::ZERO,
+        ),
         (0, "", Duration::ZERO), // hangup: connection reset, not a status
     ]);
     let http = stalling_client(Duration::from_secs(5));
