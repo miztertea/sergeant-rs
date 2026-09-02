@@ -186,20 +186,18 @@ fn spawn_turn_stand_in(session_id: &str) -> std::process::Child {
 /// exercise (`backend::claude::session_liveness`) is built on — rather than
 /// a second, locally `/proc`-only copy.
 fn wait_until_execd(pid: u32, needle: &str, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let execd = sergeant_rs::platform::process::running_processes()
-            .into_iter()
-            .flatten()
-            .any(|process| {
-                process.pid == pid && process.argv.iter().any(|arg| arg.contains(needle))
-            });
-        if execd {
-            return;
-        }
-        assert!(Instant::now() < deadline, "{what} never exec'd");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    support::wait_until_sync(
+        &format!("{what} never exec'd"),
+        support::HANG_BUDGET,
+        || {
+            sergeant_rs::platform::process::running_processes()
+                .into_iter()
+                .flatten()
+                .any(|process| {
+                    process.pid == pid && process.argv.iter().any(|arg| arg.contains(needle))
+                })
+        },
+    );
 }
 
 /// What the installed CLI says about authentication (`claude auth status
@@ -463,26 +461,26 @@ fn wait_for_events(
     execution_id: &str,
     count: usize,
 ) -> Vec<Event> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let mine: Vec<Event> = {
-            let core = shared.blocking_lock();
-            all_events(&core)
-                .into_iter()
-                .filter(|e| e.execution_id.as_deref() == Some(execution_id))
-                .collect()
-        };
-        if mine.len() >= count {
-            return mine;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "only {} of {count} events for {execution_id}: {:?}",
-            mine.len(),
-            mine.iter().map(|e| &e.kind).collect::<Vec<_>>()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        &format!("events for {execution_id} never reached {count}"),
+        support::HANG_BUDGET,
+        || {
+            let mine: Vec<Event> = {
+                let core = shared.blocking_lock();
+                all_events(&core)
+                    .into_iter()
+                    .filter(|e| e.execution_id.as_deref() == Some(execution_id))
+                    .collect()
+            };
+            let done = mine.len() >= count;
+            if done {
+                result = Some(mine);
+            }
+            done
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// A stub `claude` that answers the capability probe, **records every
@@ -654,8 +652,8 @@ impl StubClaude {
     /// settle it was supposed to outlast on a loaded 2-core runner (BS2R-05);
     /// the gate makes the ordering an event, not a bet. A parked turn that is
     /// never released proceeds on its own after ~20 s — inside
-    /// `SETTLE_BUDGET`, so a test bug degrades to the old wall-clock shape
-    /// instead of hanging the suite.
+    /// `support::HANG_BUDGET`, so a test bug degrades to the old wall-clock
+    /// shape instead of hanging the suite.
     fn stalls_until_released(&self) -> &Self {
         std::fs::write(&self.stall, b"gate\n").expect("write stall marker");
         self
@@ -728,19 +726,20 @@ impl StubClaude {
     /// Block until `count` launches have been recorded (the reader thread
     /// finishes asynchronously), then return them.
     fn wait_for_launches(&self, count: usize) -> Vec<Launch> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let launches = self.launches();
-            if launches.len() >= count {
-                return launches;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "only {} of {count} launches recorded",
-                launches.len()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            &format!("launches recorded never reached {count}"),
+            support::HANG_BUDGET,
+            || {
+                let launches = self.launches();
+                let done = launches.len() >= count;
+                if done {
+                    result = Some(launches);
+                }
+                done
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 }
 
@@ -876,18 +875,20 @@ fn wait_settled(
     handle: &ExecutionHandle,
     timeout: Duration,
 ) -> sergeant_rs::backend::Observation {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let observation = backend.observe(handle).expect("observe");
-        if observation.native != NativeState::Running {
-            return observation;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "turn did not settle within {timeout:?}: {observation:?}"
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        &format!("turn did not settle within {timeout:?}"),
+        timeout,
+        || {
+            let observation = backend.observe(handle).expect("observe");
+            let settled = observation.native != NativeState::Running;
+            if settled {
+                result = Some(observation);
+            }
+            settled
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// The live-adapter config for this container: real `claude`, scratch data
@@ -1151,34 +1152,38 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
     // And the adapter's normalized events reached the journal — read back
     // through the live daemon's own API, which is also what proves the
     // committer is not wedged behind the core lock.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let events = loop {
-        let body: Value = client
-            .get(format!("{}/v1/events", handle.endpoint))
-            .bearer_auth(&handle.token)
-            .send()
-            .await
-            .expect("events")
-            .json()
-            .await
-            .expect("json");
-        let events: Vec<Event> = body["events"]
-            .as_array()
-            .expect("events")
-            .iter()
-            .map(|e| serde_json::from_value(e.clone()).expect("event"))
-            .filter(|e: &Event| e.execution_id.as_deref() == Some(execution_id.as_str()))
-            .collect();
-        if events.iter().any(|e| e.kind == "usage.updated") {
-            break events;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the turn's events never reached the journal: {:?}",
-            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let events_result = std::cell::RefCell::new(None);
+    support::wait_until(
+        "the turn's events never reached the journal",
+        support::HANG_BUDGET,
+        || async {
+            let body: Value = client
+                .get(format!("{}/v1/events", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("events")
+                .json()
+                .await
+                .expect("json");
+            let events: Vec<Event> = body["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .map(|e| serde_json::from_value(e.clone()).expect("event"))
+                .filter(|e: &Event| e.execution_id.as_deref() == Some(execution_id.as_str()))
+                .collect();
+            let reached = events.iter().any(|e| e.kind == "usage.updated");
+            if reached {
+                *events_result.borrow_mut() = Some(events);
+            }
+            reached
+        },
+    )
+    .await;
+    let events = events_result
+        .into_inner()
+        .expect("wait_until only returns after its predicate succeeds");
     handle.shutdown().await;
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     assert!(
@@ -1227,13 +1232,6 @@ async fn the_real_adapter_journals_from_the_daemon_request_path() {
 // mutation, so "exactly one, the submit" is checkable rather than a claim
 // about how the test was written). Polling a read view for the transition is
 // allowed; causing it with a POST is the thing being ruled out.
-
-/// How long the driven-turn tests wait for the daemon to settle a turn that
-/// ended on its own. The driver's cadence is 200 ms and a released turn ends
-/// within a replay's runtime, so this covers a loaded machine (and the ~20 s
-/// self-release of a gate a buggy test forgot to open) while a genuinely
-/// stuck stage still fails the test rather than the suite's patience.
-const SETTLE_BUDGET: Duration = Duration::from_secs(30);
 
 /// Start a daemon **bound to `estate_root`** (§5.1) whose only backend is the
 /// real Claude adapter over `stub`.
@@ -1394,18 +1392,23 @@ async fn poll_work_until(
     what: &str,
     done: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + SETTLE_BUDGET;
-    loop {
-        let shown = show_over_api(http, handle, work_id).await;
-        if done(&shown) {
-            return shown;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{what} never happened within {SETTLE_BUDGET:?} — this is issue #46's stall: {shown}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let result = std::cell::RefCell::new(None);
+    support::wait_until(
+        &format!("{what} never happened — this is issue #46's stall"),
+        support::HANG_BUDGET,
+        || async {
+            let shown = show_over_api(http, handle, work_id).await;
+            let reached = done(&shown);
+            if reached {
+                *result.borrow_mut() = Some(shown);
+            }
+            reached
+        },
+    )
+    .await;
+    result
+        .into_inner()
+        .expect("wait_until only returns after its predicate succeeds")
 }
 
 /// How many mutations a client has asked this daemon to perform on `work_id`.
@@ -1498,28 +1501,33 @@ async fn a_turn_that_ends_after_launch_settle_completes_and_cascades_with_no_cli
     // parked at the (unreleased) gate and cannot emit a byte, and the
     // committer channel is FIFO, so nothing of turn 1's can trail past its
     // own `usage.updated`.
-    let deadline = Instant::now() + SETTLE_BUDGET;
-    let events = loop {
-        let events = events_over_api(&http, &handle, &work_id).await;
-        let cascade_started = events.iter().any(|e| {
-            e.kind == "execution.started" && e.payload["execution"]["stage_id"] == "10-implement"
-        });
-        let user_turns = events
-            .iter()
-            .filter(|e| e.kind == "conversation.user")
-            .count();
-        let turn_tail_landed = events.iter().any(|e| e.kind == "conversation.turn.ended")
-            && events.iter().any(|e| e.kind == "usage.updated");
-        if cascade_started && user_turns >= 2 && turn_tail_landed {
-            break events;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the cascade's launch never finished landing in the journal: {:?}",
-            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let events_result = std::cell::RefCell::new(None);
+    support::wait_until(
+        "the cascade's launch never finished landing in the journal",
+        support::HANG_BUDGET,
+        || async {
+            let events = events_over_api(&http, &handle, &work_id).await;
+            let cascade_started = events.iter().any(|e| {
+                e.kind == "execution.started"
+                    && e.payload["execution"]["stage_id"] == "10-implement"
+            });
+            let user_turns = events
+                .iter()
+                .filter(|e| e.kind == "conversation.user")
+                .count();
+            let turn_tail_landed = events.iter().any(|e| e.kind == "conversation.turn.ended")
+                && events.iter().any(|e| e.kind == "usage.updated");
+            let reached = cascade_started && user_turns >= 2 && turn_tail_landed;
+            if reached {
+                *events_result.borrow_mut() = Some(events);
+            }
+            reached
+        },
+    )
+    .await;
+    let events = events_result
+        .into_inner()
+        .expect("wait_until only returns after its predicate succeeds");
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     assert!(
         kinds.contains(&"conversation.turn.ended"),
@@ -1718,19 +1726,23 @@ async fn a_crash_after_the_turn_ended_is_re_derived_at_restart() {
 
     // Stand inside the window: the turn has ended and been journaled, and
     // nothing has acted on it.
-    let deadline = Instant::now() + SETTLE_BUDGET;
-    let ended = loop {
-        let events = events_over_api(&http, &handle, &work_id).await;
-        if events.iter().any(|e| e.kind == "conversation.turn.ended") {
-            break events;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the stub's turn never ended: {:?}",
-            events.iter().map(|e| &e.kind).collect::<Vec<_>>()
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let ended_result = std::cell::RefCell::new(None);
+    support::wait_until(
+        "the stub's turn never ended",
+        support::HANG_BUDGET,
+        || async {
+            let events = events_over_api(&http, &handle, &work_id).await;
+            let reached = events.iter().any(|e| e.kind == "conversation.turn.ended");
+            if reached {
+                *ended_result.borrow_mut() = Some(events);
+            }
+            reached
+        },
+    )
+    .await;
+    let ended = ended_result
+        .into_inner()
+        .expect("wait_until only returns after its predicate succeeds");
     let kinds: Vec<&str> = ended.iter().map(|e| e.kind.as_str()).collect();
     assert!(
         !kinds.contains(&"stage.completed") && !kinds.contains(&"stage.blocked"),
@@ -4558,19 +4570,20 @@ fn a4_restart_reports_a_still_running_turn_as_running_not_exited() {
     // still be carrying an inherited copy of an argv for a moment. Liveness
     // is a property of the machine, so the assertion is on where it settles,
     // with a deadline — not on the first sample after the kill.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let settled = loop {
-        let settled = claude.observe(&handle).expect("observe");
-        if settled.native == NativeState::Exited {
-            break settled;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no process carries the session any more, but liveness never \
-             settled: {settled:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let mut result = None;
+    support::wait_until_sync(
+        "no process carries the session any more, but liveness never settled",
+        support::HANG_BUDGET,
+        || {
+            let settled = claude.observe(&handle).expect("observe");
+            let exited = settled.native == NativeState::Exited;
+            if exited {
+                result = Some(settled);
+            }
+            exited
+        },
+    );
+    let settled = result.expect("wait_until_sync only returns after its predicate succeeds");
     assert!(
         settled
             .evidence
@@ -6821,15 +6834,20 @@ fn a5_real_claude_reports_an_actor_authored_question_as_needs_input() {
     };
     let handle = backend.start(&request).expect("start");
 
-    let deadline = Instant::now() + Duration::from_secs(300);
-    let observation = loop {
+    // This opt-in live test's own budget exceeds support::HANG_BUDGET on
+    // purpose, same reasoning as tests/agy_backend.rs's own two live-turn
+    // waits: a real model turn's own round trip is the thing being waited
+    // on here.
+    let mut result = None;
+    support::wait_until_sync("the turn never finished", Duration::from_secs(300), || {
         let observation = backend.observe(&handle).expect("observe");
-        if observation.native != NativeState::Running {
-            break observation;
+        let settled = observation.native != NativeState::Running;
+        if settled {
+            result = Some(observation);
         }
-        assert!(Instant::now() < deadline, "the turn never finished");
-        std::thread::sleep(Duration::from_millis(500));
-    };
+        settled
+    });
+    let observation = result.expect("wait_until_sync only returns after its predicate succeeds");
     backend.stop(&handle).expect("stop").wait();
 
     let withdrawn: Vec<EventDraft> = emitted
@@ -6980,24 +6998,27 @@ fn bs2_default_mode_headless_turn_cannot_write_without_an_explicit_permission_mo
 
     // The archived raw transcript is the adapter's own evidence for the
     // denial, not just this test's absence-of-file inference.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let usage = loop {
-        let found = {
-            let core = shared.blocking_lock();
-            all_events(&core).into_iter().find(|e| {
-                e.execution_id.as_deref() == Some(request.execution_id.as_str())
-                    && e.kind == "usage.updated"
-            })
-        };
-        if let Some(event) = found {
-            break event;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "usage.updated was never journaled"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let mut result = None;
+    support::wait_until_sync(
+        "usage.updated was never journaled",
+        support::HANG_BUDGET,
+        || {
+            let found = {
+                let core = shared.blocking_lock();
+                all_events(&core).into_iter().find(|e| {
+                    e.execution_id.as_deref() == Some(request.execution_id.as_str())
+                        && e.kind == "usage.updated"
+                })
+            };
+            if let Some(event) = found {
+                result = Some(event);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    let usage = result.expect("wait_until_sync only returns after its predicate succeeds");
     let raw_ref = usage.payload["raw"]
         .as_str()
         .expect("raw blob ref journaled");
