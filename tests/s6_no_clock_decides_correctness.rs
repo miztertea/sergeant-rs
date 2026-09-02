@@ -1407,15 +1407,34 @@ fn loop_body_checks_state(block: &syn::Block) -> bool {
     finder.found
 }
 
-struct SleepVisitor {
+/// One `.timeout(` method call found by the same walk as [`SleepSite`]
+/// (F-SI-01: folded into the one [`TestConstructVisitor`] below rather than
+/// a second, parallel struct/impl/fn pipeline — Ponytail R2). Unlike a
+/// `sleep(`, a client-builder `.timeout(` carries no loop-shape question —
+/// there is no "inside a state-terminating loop" reading of a client's own
+/// configured per-request bound, only "does something explain why this
+/// construct exists" — so every real occurrence sits on `ALLOWLIST` or the
+/// guard is red (wave `transport-timeout-is-not-a-verdict`, item 4: "Client
+/// timeouts are the other half of the same class" `sleep(` already covers).
+struct TimeoutSite {
+    line: usize,
+}
+
+/// The one `syn` visitor for every `tests/` construct this file's guards
+/// walk — a `sleep(`/`.timeout(` call and the loop state around it — in a
+/// single pass over a single parse (F-SI-01: this used to be two structs,
+/// two `impl Visit`s and two entry-point functions, each parsing the same
+/// file text again from scratch).
+struct TestConstructVisitor {
     /// Whether the loop directly containing the current position — the
     /// innermost one, per [`loop_body_checks_state`]'s doc — has been shown
     /// to check state and branch on it. Empty outside any loop.
     loop_checks_state: Vec<bool>,
-    sites: Vec<SleepSite>,
+    sleep_sites: Vec<SleepSite>,
+    timeout_sites: Vec<TimeoutSite>,
 }
 
-impl<'ast> Visit<'ast> for SleepVisitor {
+impl<'ast> Visit<'ast> for TestConstructVisitor {
     fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
         let checks = !is_literal_true(&node.cond) || loop_body_checks_state(&node.body);
         self.loop_checks_state.push(checks);
@@ -1443,23 +1462,40 @@ impl<'ast> Visit<'ast> for SleepVisitor {
             syn::Expr::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "sleep")
         );
         if is_sleep {
-            self.sites.push(SleepSite {
+            self.sleep_sites.push(SleepSite {
                 line: node.span().start().line,
                 in_state_loop: self.loop_checks_state.last().copied().unwrap_or(false),
             });
         }
         visit::visit_expr_call(self, node);
     }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if node.method == "timeout" {
+            // `node.span()` covers the whole receiver chain (from
+            // `reqwest::Client::builder()` through this call) — the method
+            // name's own span is what actually sits on the `.timeout(` line
+            // a reader (and `ALLOWLIST`'s needle matching) expects.
+            self.timeout_sites.push(TimeoutSite {
+                line: node.method.span().start().line,
+            });
+        }
+        visit::visit_expr_method_call(self, node);
+    }
 }
 
-fn sleep_sites(text: &str) -> Vec<SleepSite> {
+/// Parses `text` once and walks it once, returning every `sleep(` site and
+/// every `.timeout(` site found — the one parse/visit pass shared by
+/// [`unallowed_test_sleeps`] and [`unallowed_test_timeouts`] (F-SI-01).
+fn scan_test_constructs(text: &str) -> (Vec<SleepSite>, Vec<TimeoutSite>) {
     let file = syn::parse_file(text).unwrap_or_else(|e| panic!("parse: {e}"));
-    let mut visitor = SleepVisitor {
+    let mut visitor = TestConstructVisitor {
         loop_checks_state: Vec::new(),
-        sites: Vec::new(),
+        sleep_sites: Vec::new(),
+        timeout_sites: Vec::new(),
     };
     visitor.visit_file(&file);
-    visitor.sites
+    (visitor.sleep_sites, visitor.timeout_sites)
 }
 
 /// Every `sleep(` call in `text` (a `tests/` file, `file_label`) that is
@@ -1475,7 +1511,7 @@ fn unallowed_test_sleeps(
 ) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut violations = Vec::new();
-    for site in sleep_sites(text) {
+    for site in scan_test_constructs(text).0 {
         if site.in_state_loop {
             continue;
         }
@@ -1637,44 +1673,6 @@ async fn polls_five_times() {
 
 // ------------------------------------------------------ tests/ .timeout(
 
-/// One `.timeout(` method call found by the same real `syn` parse the
-/// `sleep(` walk above uses (R2). Unlike a `sleep(`, a client-builder
-/// `.timeout(` carries no loop-shape question — there is no "inside a
-/// state-terminating loop" reading of a client's own configured per-request
-/// bound, only "does something explain why this construct exists" — so
-/// every real occurrence sits on `ALLOWLIST` or the guard is red (wave
-/// `transport-timeout-is-not-a-verdict`, item 4: "Client timeouts are the
-/// other half of the same class" `sleep(` already covers).
-struct TimeoutSite {
-    line: usize,
-}
-
-struct TimeoutVisitor {
-    sites: Vec<TimeoutSite>,
-}
-
-impl<'ast> Visit<'ast> for TimeoutVisitor {
-    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        if node.method == "timeout" {
-            // `node.span()` covers the whole receiver chain (from
-            // `reqwest::Client::builder()` through this call) — the method
-            // name's own span is what actually sits on the `.timeout(` line
-            // a reader (and `ALLOWLIST`'s needle matching) expects.
-            self.sites.push(TimeoutSite {
-                line: node.method.span().start().line,
-            });
-        }
-        visit::visit_expr_method_call(self, node);
-    }
-}
-
-fn timeout_sites(text: &str) -> Vec<TimeoutSite> {
-    let file = syn::parse_file(text).unwrap_or_else(|e| panic!("parse: {e}"));
-    let mut visitor = TimeoutVisitor { sites: Vec::new() };
-    visitor.visit_file(&file);
-    visitor.sites
-}
-
 /// Every `.timeout(` call in `text` (a `tests/` file, `file_label`) not
 /// covered by `allowlist` — the same `Allowed` shape and `file`+`needle`
 /// matching (`allowlist_covers`) every other half of this guard already
@@ -1687,7 +1685,7 @@ fn unallowed_test_timeouts(
 ) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut violations = Vec::new();
-    for site in timeout_sites(text) {
+    for site in scan_test_constructs(text).1 {
         let content = lines
             .get(site.line - 1)
             .copied()
