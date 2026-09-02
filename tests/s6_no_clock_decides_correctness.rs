@@ -41,6 +41,9 @@
 
 use std::path::{Path, PathBuf};
 
+use syn::spanned::Spanned as _;
+use syn::visit::{self, Visit};
+
 /// Every `.rs` file under `src/`, walked the same way
 /// `tests/a1_floor_awareness.rs::all_src_files` already does (R2 — reuse,
 /// not reinvent) — this guard's actual file scope, rather than a hand-kept
@@ -669,5 +672,223 @@ async fn run_intelligence_scan_reintroduces_the_defect() {
         still_flagged.iter().any(|(line, _)| *line == 3),
         "the paired `while Instant::now() < deadline` line has no entry in `permissive` and \
          must still be flagged: {still_flagged:?}"
+    );
+}
+
+// ---------------------------------------------------------------- tests/
+
+/// Every `.rs` file under `tests/`, walked recursively. Unlike `src/`,
+/// integration test files carry no `#[cfg(test)]` boundary — every line of
+/// an integration-test file *is* test code, so the whole file is in scope
+/// (brief-sleep-and-hope.md item 1: "extend the no-clock structural guard
+/// to `tests/`").
+fn all_test_files() -> Vec<PathBuf> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut found = Vec::new();
+    let mut stack = vec![dir];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read tests") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                // `tests/fixtures/` is data corpora this suite reads as
+                // *input* (deliberately malformed Rust included, e.g.
+                // `tslp_corpus/malformed/broken.rs` — the corpus gate's own
+                // red-side fixture per its own doc comment), never test
+                // code the guard should itself parse and classify.
+                if path.file_name().is_some_and(|n| n == "fixtures") {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// One raw `sleep(` call found by a real `syn` parse (`full` + `visit`,
+/// 3.0.3 — already resolved transitively via `async-trait`, R5), with the
+/// one fact this guard's classification turns on: was it lexically inside a
+/// `while`/`loop` construct — the shape that can terminate on *observed
+/// state* the loop body itself checks — or bare.
+///
+/// A brace/regex scanner is explicitly rejected (brief-sleep-and-hope.md
+/// item 1: "a real parse... beats a brace scanner that a reformat evades")
+/// — this walks the actual AST, so reindenting or reformatting the file
+/// cannot silently detune the check the way a column/brace count would.
+///
+/// A bounded `for _ in 0..N { sleep(...) }` deliberately does **not**
+/// count as "inside a loop" here: iterating a fixed range is itself the
+/// guessed-count shape this doctrine forbids (`POLL_FAILURES_TOLERATED`'s
+/// own class), not a loop that terminates on observed state. Only
+/// `while`/`loop` — which terminate on a condition or an explicit `break`
+/// the body evaluates each iteration, never on having iterated N times —
+/// count.
+struct SleepSite {
+    line: usize,
+    in_state_loop: bool,
+}
+
+struct SleepVisitor {
+    loop_depth: u32,
+    sites: Vec<SleepSite>,
+}
+
+impl<'ast> Visit<'ast> for SleepVisitor {
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.loop_depth += 1;
+        visit::visit_expr_while(self, node);
+        self.loop_depth -= 1;
+    }
+
+    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        self.loop_depth += 1;
+        visit::visit_expr_loop(self, node);
+        self.loop_depth -= 1;
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        let is_sleep = matches!(
+            &*node.func,
+            syn::Expr::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "sleep")
+        );
+        if is_sleep {
+            self.sites.push(SleepSite {
+                line: node.span().start().line,
+                in_state_loop: self.loop_depth > 0,
+            });
+        }
+        visit::visit_expr_call(self, node);
+    }
+}
+
+fn sleep_sites(text: &str) -> Vec<SleepSite> {
+    let file = syn::parse_file(text).unwrap_or_else(|e| panic!("parse: {e}"));
+    let mut visitor = SleepVisitor {
+        loop_depth: 0,
+        sites: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.sites
+}
+
+/// Every `sleep(` call in `text` (a `tests/` file, `file_label`) that is
+/// neither inside a state-terminating `while`/`loop` nor covered by
+/// `allowlist` — reusing the exact same `Allowed` shape and `file`+`needle`
+/// matching the `src/` guard above already uses (R2), so the same
+/// "matches nothing"/"no real reason" self-checks in the test below cover
+/// these entries too without a second, parallel check.
+fn unallowed_test_sleeps(
+    file_label: &str,
+    text: &str,
+    allowlist: &[Allowed],
+) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut violations = Vec::new();
+    for site in sleep_sites(text) {
+        if site.in_state_loop {
+            continue;
+        }
+        let content = lines
+            .get(site.line - 1)
+            .copied()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let covered = allowlist
+            .iter()
+            .any(|a| a.file == file_label && content.contains(a.needle));
+        if !covered {
+            violations.push((site.line, content));
+        }
+    }
+    violations
+}
+
+/// The `tests/` half of the guard (brief-sleep-and-hope.md item 1): every
+/// raw `sleep(` call in `tests/**/*.rs` sits inside a loop that can
+/// terminate on observed state, or on `ALLOWLIST` with a real reason — same
+/// entry shape and same self-checks the `src/` guard above already has
+/// (R2), just widened to a second file set and a second construct.
+#[test]
+fn every_sleep_in_tests_sits_inside_a_terminating_loop_or_an_explicit_allowlist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all_violations = Vec::new();
+    for path in all_test_files() {
+        let file = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_str()
+            .expect("utf8 path")
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", file));
+        for (line, content) in unallowed_test_sleeps(&file, &text, ALLOWLIST) {
+            all_violations.push(format!("{file}:{line}: {content}"));
+        }
+    }
+    assert!(
+        all_violations.is_empty(),
+        "a `sleep(` call exists in tests/ that is neither inside a state-terminating \
+         while/loop nor explained by an ALLOWLIST entry — convert it to wait on the state it \
+         is hoping for (tests/support/mod.rs::wait_until), or add a reviewed `Allowed` entry \
+         naming why it is genuinely behavioral, in \
+         tests/s6_no_clock_decides_correctness.rs:\n{}",
+        all_violations.join("\n")
+    );
+}
+
+/// Proof the sleep guard above is not vacuous, same standing-regression
+/// shape as `the_guard_fails_on_a_real_deadline_decides_a_verdict_construct_with_no_allowlist_entry`
+/// above: a synthetic bare `sleep(` with no loop and no allowlist entry
+/// must be flagged; the same call once inside a `while` loop, or once
+/// allowlisted, must not be.
+#[test]
+fn the_sleep_guard_fails_on_a_bare_sleep_with_no_loop_and_no_allowlist_entry() {
+    let bare = "\
+async fn hopes_for_the_best() {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(some_background_task_finished());
+}
+";
+    let violations = unallowed_test_sleeps("tests/x_example.rs", bare, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "the checker must flag a bare sleep-then-assert with no loop and no allowlist entry; \
+         it did not, which means the guard test above is vacuous"
+    );
+    assert!(
+        violations.iter().any(|(line, _)| *line == 2),
+        "expected the flagged construct at its real line, got: {violations:?}"
+    );
+
+    let in_loop = "\
+async fn polls_for_state() {
+    while !some_background_task_finished() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+";
+    let loop_violations = unallowed_test_sleeps("tests/x_example.rs", in_loop, ALLOWLIST);
+    assert!(
+        loop_violations.is_empty(),
+        "a sleep inside a while loop that terminates on observed state must not be flagged: \
+         {loop_violations:?}"
+    );
+
+    let allowlisted: Vec<Allowed> = vec![Allowed {
+        file: "tests/x_example.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(200)).await;",
+        category: "cadence",
+        reason: "synthetic fixture only, proving the tests/ allowlist path itself is reachable",
+    }];
+    let now_covered = unallowed_test_sleeps("tests/x_example.rs", bare, &allowlisted);
+    assert!(
+        now_covered.is_empty(),
+        "the same bare sleep, once given a matching allowlist entry, must no longer be \
+         flagged: {now_covered:?}"
     );
 }
