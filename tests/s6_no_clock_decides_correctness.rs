@@ -1330,12 +1330,6 @@ const ALLOWLIST: &[Allowed] = &[
         reason: DEADLINE_LOOP_RESIDUE_REASON,
     },
     Allowed {
-        file: "tests/m8_estate_cli.rs",
-        needle: "let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/m9_watch.rs",
         needle: "let deadline = Instant::now() + Duration::from_secs(10);",
         category: "deadline-loop-residue",
