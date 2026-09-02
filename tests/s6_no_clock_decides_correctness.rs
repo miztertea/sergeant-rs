@@ -1,22 +1,35 @@
-//! S6 scan-follow-retry: the structural guard the AMENDMENT (owner,
-//! 2026-08-30, `knowledge/evidence/resources/host-atlas-s6-series/
-//! brief-scan-front-door.md`) asks for — "a prose prohibition is what let
-//! this class recur. Pin it: a structural test that fails when the rule is
-//! violated."
+//! **The owner's ruling** (2026-09-02,
+//! `knowledge/rulings/owner-rulings/tests-must-be-deterministic-2026-09-02.md`
+//! in the workspace): "Tests must be deterministic. Time is non
+//! deterministic, it's an arbitrary duration." A test's verdict may depend
+//! only on observed state. A sleep followed by an assertion is a defect at
+//! any length — lengthening it moves the failure to a slower machine, it
+//! does not remove it. Waiting happens on state, never on time: the test
+//! observes the thing it is waiting for and proceeds when it sees it. A
+//! wait budget is a termination bound, not a verdict — the only reason a
+//! bounded wait exists is so a hung test ends instead of holding CI to its
+//! cap; exhausting it reports "state X was never observed within the
+//! bound," never a silent pass and never a claim that the code was slow.
+//! This file is the structural guard for that ruling, over both halves of
+//! the crate's own Rust: `src/`, where the class first recurred, and
+//! `tests/`, which the ruling names explicitly as the gap that let it
+//! reach a release (item 4 below).
 //!
-//! **The rule.** "Elapsed time may never decide whether something is
-//! correct... `POLL_FAILURES_TOLERATED = 5` — a guessed number standing in
-//! for 'the daemon is gone'. Ask the real question instead: is the daemon
-//! still there? ... Distinguish the two by state, not by a count." Cadence
+//! **`src/`: the scan-follow-retry guard.** Grown out of the AMENDMENT
+//! (owner, 2026-08-30, `knowledge/evidence/resources/host-atlas-s6-series/
+//! brief-scan-front-door.md`) — "a prose prohibition is what let this class
+//! recur. Pin it: a structural test that fails when the rule is violated."
+//! "Elapsed time may never decide whether something is correct...
+//! `POLL_FAILURES_TOLERATED = 5` — a guessed number standing in for 'the
+//! daemon is gone'. Ask the real question instead: is the daemon still
+//! there? ... Distinguish the two by state, not by a count." Cadence
 //! (`SCAN_POLL`) and reporting a duration are explicitly permitted; a count
-//! or deadline that a caller's own success/failure branches on is not.
-//!
-//! **What this test covers, and says so rather than implying more.** Per
+//! or deadline that a caller's own success/failure branches on is not. Per
 //! the AMENDMENT's own text (`brief-scan-front-door.md:130`, "every
 //! `Instant`/`deadline`/`elapsed` construct in the crate sits on an
 //! explicit allowlist") and its closing instruction
 //! (`brief-scan-front-door.md:145-147`, "this covers *this* crate's Rust;
-//! it does not reach the shell scripts under `scripts/`"): this guard walks
+//! it does not reach the shell scripts under `scripts/`"): this half walks
 //! the **production code** (everything before each file's own
 //! `#[cfg(test)]` test-module boundary — this crate's own convention, see
 //! e.g. `src/cli.rs:7553`) of every `.rs` file under `src/` — the whole
@@ -24,11 +37,11 @@
 //! outside this walk for exactly the reason the AMENDMENT names, not a
 //! second, invented carve-out.
 //!
-//! **Every real construct this widened walk finds sits on `ALLOWLIST`
-//! below, each with its own reviewed category and reason** — there is no
-//! file-level exemption for any production `.rs` file, including the ones
-//! that bound a process or resource this code directly owns and must
-//! reclaim (a spawned child killed past its own budget in
+//! **Every real construct this walk finds sits on `ALLOWLIST` below, each
+//! with its own reviewed category and reason** — there is no file-level
+//! exemption for any production `.rs` file, including the ones that bound
+//! a process or resource this code directly owns and must reclaim (a
+//! spawned child killed past its own budget in
 //! `src/runtime/atlas/worker.rs`, whose own module doc frames its deadline
 //! as a "HANG guard"; a filesystem lock's acquisition timeout in
 //! `src/runtime/repolock.rs`/`src/runtime/fsutil.rs`; a supervised git
@@ -38,6 +51,48 @@
 //! reason — but it is not exempted from the guard the way an earlier
 //! version of this file exempted it by file name; it is allowlisted like
 //! everything else, on its own reviewed merits.
+//!
+//! **`tests/`: the sleep guard (wave `brief-sleep-and-hope.md`,
+//! 2026-09-02).** The `src/` guard above walked only production code; the
+//! test suite's own sleeps were the actual gap, and the release failure
+//! that proved it is named in the ruling: release run 33591670053, Gate D,
+//! `tests/c2_light/e_periodic_sweep.rs`'s 200 ms sleep, which slept then
+//! asserted a background tick had fired — passing on a fast dry-run
+//! runner an hour earlier and failing on CI's slower one. `all_test_files`
+//! walks every `.rs` file under `tests/` recursively, excluding
+//! `tests/fixtures/` — data corpora this suite reads as *input* (including
+//! deliberately malformed Rust, e.g. a corpus gate's own red-side fixture),
+//! never test code for this guard to itself parse and classify. Unlike
+//! `src/`, an integration-test file carries no `#[cfg(test)]` boundary, so
+//! the whole file is in scope.
+//!
+//! A `sleep(` call is legitimate only inside a loop whose body actually
+//! checks observed state and terminates on it (`loop_body_checks_state`):
+//! a `while` condition that is not a bare `true`, or — for `loop`, `for`,
+//! and a `while true` — a `break`/`continue`/`return`/panic reached only
+//! through a conditional inside the body. Lexical nesting alone is not a
+//! state check: a fixed-count `for _ in 0..N { sleep(...) }` with no
+//! conditional exit is a fixed-count busy-wait, indistinguishable in
+//! effect from the forbidden `POLL_FAILURES_TOLERATED` shape, and the
+//! guard flags it exactly as it would a bare sleep outside any loop.
+//!
+//! Every sleep that fails that test and is not converted sits on
+//! `ALLOWLIST` (the same `Allowed` shape and `allowlist_covers` check the
+//! `src/` half already uses, R2). Two shapes recur in the `tests/` section
+//! of `ALLOWLIST`, named per entry rather than once: (a) a fixed
+//! observation window proving an **absence** — nothing happened — which
+//! has no positive state to poll for because the assertion itself is
+//! "still nothing by now"; (b) pacing one action against another, or
+//! against a subprocess that exposes no readiness signal, where the delay
+//! spaces two things rather than deciding an outcome. Say plainly: shape
+//! (b) is the *same non-determinism* as the defect this wave fixed — a
+//! duration standing in for a signal that was never actually observed —
+//! and it is tolerated only as an enumerated, reasoned residue, never a
+//! sanctioned pattern. Each such site is a product finding (a missing
+//! readiness signal on the thing being paced against) awaiting its own
+//! fix, not a closed matter. The one conversion target for a genuine wait
+//! on state is `tests/support/mod.rs::wait_until`/`wait_until_sync`;
+//! reach for it before reaching for the allowlist.
 
 use std::path::{Path, PathBuf};
 
