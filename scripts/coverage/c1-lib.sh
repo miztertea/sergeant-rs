@@ -21,7 +21,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 cov_stage_begin c1
 
-cov_run cargo llvm-cov --no-report --lib --locked || cov_fail "the unit tests failed under instrumentation"
+cov_run cargo llvm-cov nextest --no-report --lib --locked || cov_fail "the unit tests failed under instrumentation"
 
 # One test binary ran, so one profraw is the floor. Zero means the binary
 # never flushed — a crash, an abort, or a profile pattern pointing somewhere
