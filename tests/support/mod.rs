@@ -459,6 +459,63 @@ fn wait_until_gone(data_dir: &Path, budget: Duration) -> bool {
     }
 }
 
+/// How often [`wait_until`]/[`wait_until_sync`] re-check their predicate.
+/// Cadence only — never itself a bound on correctness (S6 doctrine,
+/// `tests/s6_no_clock_decides_correctness.rs`'s own module doc): the
+/// existing `wait_until` this folds in (`tests/w4_doctor_journal_growth.rs`)
+/// already polled at 20ms, so this reuses that value rather than picking a
+/// new one (R2).
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Poll an async `predicate` at [`WAIT_POLL_INTERVAL`] until it returns
+/// `true`, bounded by an **owned wait budget** (S6, brief-sleep-and-hope.md
+/// item 2): `budget` only terminates the wait — on exhaustion this panics
+/// naming `what` (the state it was waiting for) and the budget itself,
+/// it never silently returns as though the state had arrived. This is the
+/// crate's one shared polling helper for tests/ — the fold-in point for
+/// what used to be three near-duplicates
+/// (`tests/w4_doctor_journal_growth.rs::wait_until`/`wait_until_all_settled`,
+/// and every hand-rolled `while Instant::now() < deadline { ...; sleep(...)
+/// }` loop this wave converted — see
+/// `tests/s6_no_clock_decides_correctness.rs`'s tests/-side guard).
+pub async fn wait_until<F, Fut>(what: &str, budget: Duration, mut predicate: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + budget;
+    loop {
+        if predicate().await {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wait_until timed out after {budget:?} waiting for: {what}"
+        );
+        tokio::time::sleep(WAIT_POLL_INTERVAL).await;
+    }
+}
+
+/// The synchronous twin of [`wait_until`], for a suite whose predicate is
+/// not itself async (a blocking read, a process/file check) and so has no
+/// reason to pull an executor into the wait.
+pub fn wait_until_sync<F>(what: &str, budget: Duration, mut predicate: F)
+where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + budget;
+    loop {
+        if predicate() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wait_until_sync timed out after {budget:?} waiting for: {what}"
+        );
+        std::thread::sleep(WAIT_POLL_INTERVAL);
+    }
+}
+
 /// #83: a freshly written, freshly `chmod +x`'d stand-in script can
 /// transiently fail `execve(2)` with `ETXTBSY` ("text file busy", `os error
 /// 26`) while another handle on the same inode is still open for writing —
