@@ -754,6 +754,21 @@ const ALLOWLIST: &[Allowed] = &[
                   does not otherwise read; what is actually asserted is the watcher's own \
                   captured output, checked separately after this delay.",
     },
+    Allowed {
+        file: "tests/support/mod.rs",
+        needle: "std::thread::sleep(delay);",
+        category: "cadence",
+        reason: "wave `transport-timeout-is-not-a-verdict`: inside `spawn_scripted_http_server`, \
+                  holding one *scripted stub connection's* response for a caller-chosen `delay` \
+                  before writing it — the delay is an input the test author picked (how long \
+                  this stub connection stalls), never a verdict the stub computes about the \
+                  request it is answering. The ruling's own carve-out \
+                  (`tests-must-be-deterministic-2026-09-02.md`, 'What this does not say') names \
+                  exactly this shape: time in the product's behavior *under test*, which this \
+                  stub's caller sets (usually to stall past a client's own timeout on purpose, \
+                  proving the caller retries rather than panics) — not a duration this code \
+                  decides pass/fail by.",
+    },
 ];
 
 /// Whether some entry in `allowlist` names both `file_label` and a `needle`

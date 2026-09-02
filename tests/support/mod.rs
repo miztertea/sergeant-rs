@@ -23,6 +23,8 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -848,6 +850,87 @@ impl Drop for CrossProcessLock {
     }
 }
 
+/// A bare-bones HTTP/1.1 responder for a fixed script of `(status, body,
+/// delay)` triples, answered once each, in order of *acceptance*, each
+/// response held for `delay` before it is written to its own connection's
+/// socket — on its own thread, so one entry's delay never blocks accepting
+/// the next connection (the very thing this helper exists to let a caller's
+/// retry race against: a stalled poll and its own retry's fresh connection
+/// must be independently schedulable, or the retry would inherit the stall
+/// it is supposed to survive).
+///
+/// R2: the same shape as `crate::test_support::spawn_scripted_http_server`
+/// (`src/lib.rs`) — accept, read (and discard) whatever request arrives,
+/// answer the next scripted entry — ported here rather than reused because
+/// that one lives in a `#[cfg(test)] pub(crate)` module only this crate's
+/// own unit tests (`cargo test --lib`) can reach; `tests/` integration
+/// binaries are separately-compiled external crates that see only this
+/// library's `pub` surface, confirmed by that module's own doc comment
+/// (`00-orient` §4d). Neither existing scripted-server helper
+/// (`spawn_scripted_http_server`, `spawn_flaky_scan_server`) has ever had a
+/// delay parameter; this wave's own regression test — a status poll that
+/// must stall past the caller's client timeout, then answer — is the
+/// reason one exists at all.
+///
+/// `status: 0` is the same hangup sentinel the `src/lib.rs` version uses:
+/// accept, read, drop the connection with no response written — a
+/// connection reset, not a status code.
+///
+/// The delay is itself an allowlisted `sleep(` (`tests/
+/// s6_no_clock_decides_correctness.rs`'s own `ALLOWLIST`): it is a fixed
+/// **input** the test author chose — how long this stub holds one
+/// connection's response — not a verdict the stub computes; the ruling's
+/// own carve-out (`tests-must-be-deterministic-2026-09-02.md`, "What this
+/// does not say") names exactly this shape: "time in the product's
+/// behavior under test... inputs the test sets".
+pub fn spawn_scripted_http_server(
+    script: Vec<(u16, &'static str, Duration)>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    let addr = listener.local_addr().expect("local addr");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+    std::thread::spawn(move || {
+        let mut entries = script.into_iter();
+        loop {
+            let Some((status, body, delay)) = entries.next() else {
+                break;
+            };
+            let Ok((stream, _)) = listener.accept() else {
+                break;
+            };
+            attempts_clone.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf); // discard the request itself
+                if status == 0 {
+                    drop(stream); // hangup: no response written at all
+                    return;
+                }
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                let reason = match status {
+                    200 => "OK",
+                    202 => "Accepted",
+                    404 => "Not Found",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+    (format!("http://{addr}"), attempts)
+}
+
 /// Drive `POST /v1/intelligence/scan` to completion and hand back the
 /// finished report (S6 scan front door).
 ///
@@ -887,6 +970,30 @@ impl Drop for CrossProcessLock {
 /// duration: a status poll answering anything but `200` is terminal and is
 /// reported as such below, not polled through.
 ///
+/// **A *transport*-class failure on the status poll — a lost connection, a
+/// client-side `.timeout()` expiring before any response arrives — is a
+/// second thing this loop must not treat as terminal** (wave
+/// `transport-timeout-is-not-a-verdict`, 2026-09-02; release run
+/// 33665140069, Gate B: one poll outran the caller's client's own timeout
+/// on a starved runner, and a bare `.expect()` turned that into a panic
+/// indistinguishable from a dead daemon). It never *is* a real answer from
+/// the daemon — no HTTP status has been received at all — so it carries the
+/// same "no time bound of its own" property the rest of this loop already
+/// has: `is_alive` (mirroring `src/api.rs::send_with_retry`'s own PID
+/// check, R2, adapted to this in-process caller's join-handle liveness —
+/// `DaemonHandle::is_alive`, S6 `transport-timeout-is-not-a-verdict`) is
+/// asked whether the daemon is still there, and for as long as it says yes
+/// the poll is simply retried, cadence-paced, exactly as a real "not
+/// completed yet" answer already is a few lines below. No separate owned
+/// retry budget is added on top of that — this function already rejected
+/// one for the very reason a transport error is now held to the same
+/// standard as everything else it polls through: a bound here would still
+/// be claiming a fact about the daemon's answer speed that only a runner,
+/// not this helper, can honestly report (see above). Only when `is_alive`
+/// reports the daemon gone does a transport error become terminal, named
+/// as such rather than as "lost contact" (that wording is `send_with_retry`'s
+/// own for its different, out-of-process failure).
+///
 /// Returns the status and body of whatever last answered: the acceptance
 /// itself when it carries no `scan_id` (the estate declares nothing to
 /// scan — a real, immediate answer), otherwise the terminal poll, whose
@@ -896,6 +1003,7 @@ pub async fn scan_to_completion(
     endpoint: &str,
     token: &str,
     body: &serde_json::Value,
+    is_alive: impl Fn() -> bool,
 ) -> (reqwest::StatusCode, serde_json::Value) {
     let response = http
         .post(format!("{endpoint}/v1/intelligence/scan"))
@@ -912,12 +1020,31 @@ pub async fn scan_to_completion(
     let mut last: serde_json::Value;
     let mut last_status: reqwest::StatusCode;
     loop {
-        let response = http
+        let response = match http
             .get(format!("{endpoint}/v1/intelligence/scan/{scan_id}"))
             .bearer_auth(token)
             .send()
             .await
-            .expect("scan status request");
+        {
+            Ok(response) => response,
+            Err(e) => {
+                // A transport failure is never a real answer, so it can
+                // never be the terminal `404`/non-success case a few lines
+                // below either — the only fact that can end this wait is
+                // whether the daemon that would eventually answer is still
+                // there.
+                assert!(
+                    is_alive(),
+                    "GET {endpoint}/v1/intelligence/scan/{scan_id}: the daemon is no longer \
+                     alive ({e}); no amount of further polling can complete this scan"
+                );
+                // Cadence only, same as the "not completed yet" pace below:
+                // the daemon is alive, so this transport failure is retried,
+                // not decided.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         last_status = response.status();
         last = response.json().await.expect("json body");
         // A poll that does not answer `200` is terminal, not slow. The only

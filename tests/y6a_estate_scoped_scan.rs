@@ -177,7 +177,10 @@ async fn a_registered_repository_is_scanned_through_the_git_path_and_map_symbol_
         "estate_root": estate_dir.path(),
     });
     let (status, response) =
-        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body, || {
+            handle.is_alive()
+        })
+        .await;
     assert_eq!(status, 200, "{response}");
     let scanned = response["scanned"].as_array().expect("scanned array");
     assert_eq!(
@@ -301,7 +304,10 @@ async fn a_knowledge_source_copy_of_the_same_content_is_still_reported_local_kno
         "estate_root": estate_dir.path(),
     });
     let (status, response) =
-        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body, || {
+            handle.is_alive()
+        })
+        .await;
     assert_eq!(status, 200, "{response}");
     let row = &response["scanned"][0];
     assert_eq!(
