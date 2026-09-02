@@ -682,6 +682,17 @@ const ALLOWLIST: &[Allowed] = &[
     },
 ];
 
+/// Whether some entry in `allowlist` names both `file_label` and a `needle`
+/// that occurs in `line` — the one membership check both the `src/` guard
+/// (`unallowed_time_constructs`) and the `tests/` guard
+/// (`unallowed_test_sleeps`) apply, so the two guards share it rather than
+/// each carrying its own copy (R6).
+fn allowlist_covers(allowlist: &[Allowed], file_label: &str, line: &str) -> bool {
+    allowlist
+        .iter()
+        .any(|a| a.file == file_label && line.contains(a.needle))
+}
+
 /// Every `Instant::now()`, `.elapsed()`, or `deadline`-named construct in
 /// `text`'s **production code** — everything before this crate's own
 /// `#[cfg(test)]` test-module convention, when present — that is not
@@ -739,9 +750,7 @@ fn unallowed_time_constructs(
         if !is_construct {
             continue;
         }
-        let covered = allowlist
-            .iter()
-            .any(|a| a.file == file_label && line.contains(a.needle));
+        let covered = allowlist_covers(allowlist, file_label, line);
         if !covered {
             violations.push((i + 1, line.trim().to_string()));
         }
@@ -998,9 +1007,7 @@ fn unallowed_test_sleeps(
             .unwrap_or("")
             .trim()
             .to_string();
-        let covered = allowlist
-            .iter()
-            .any(|a| a.file == file_label && content.contains(a.needle));
+        let covered = allowlist_covers(allowlist, file_label, &content);
         if !covered {
             violations.push((site.line, content));
         }
