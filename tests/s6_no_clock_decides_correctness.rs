@@ -1144,18 +1144,6 @@ const ALLOWLIST: &[Allowed] = &[
         reason: DEADLINE_LOOP_RESIDUE_REASON,
     },
     Allowed {
-        file: "tests/m3_execution.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(5);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m3_execution.rs",
-        needle: "let deadline = std::time::Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/m4_backends.rs",
         needle: "let deadline = Instant::now() + Duration::from_secs(30);",
         category: "deadline-loop-residue",
@@ -1376,6 +1364,16 @@ const ALLOWLIST: &[Allowed] = &[
             window this loop's own early-exit math depends on, not just relax an unrelated \
             ceiling. The loop itself never panics (it always proceeds to the survivors check \
             below, the same 'caller decides pass/fail' shape as this file's other kept sites).",
+    },
+    Allowed {
+        file: "tests/m3_execution.rs",
+        needle: "let deadline = std::time::Instant::now() + Duration::from_secs(10);",
+        category: "owned-wait-budget",
+        reason: "stop_daemon's own best-effort teardown wait, named explicitly in \
+            support::wait_until's own doc comment as staying hand-rolled: 'a best-effort \
+            teardown wait that proceeds regardless (stop_daemon in tests/m2_daemon_api.rs and \
+            tests/m3_execution.rs)'. The while loop never asserts or panics; it just gives the \
+            descriptor file up to 10s to disappear and returns either way.",
     },
 ];
 

@@ -2019,18 +2019,15 @@ async fn deferred_finish_does_not_let_the_engine_observe_a_conclusion_before_lau
     assert_eq!(body["stage"]["status"], "active");
     let execution_id = fake.starts()[0].execution_id.clone();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let shown = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
-        if shown["work"]["state"] == "completed" {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the settled outcome never surfaced: {shown}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    support::wait_until(
+        "the settled outcome never surfaced",
+        support::HANG_BUDGET,
+        || async {
+            let shown = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+            shown["work"]["state"] == "completed"
+        },
+    )
+    .await;
     let completed = events_of(data.path(), &work_id, KIND_STAGE_COMPLETED);
     assert_eq!(completed[0].payload["detail"], "ran the migration");
     assert!(
