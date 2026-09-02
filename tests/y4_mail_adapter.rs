@@ -33,6 +33,8 @@ use sergeant_rs::runtime::atlas::mail::MAIL_EXTRACTOR;
 use sergeant_rs::runtime::atlas::worker::{WorkerIdentity, WorkerOutcome, WorkerSpawn, run_worker};
 use sergeant_rs::runtime::engine::Engine;
 
+mod support;
+
 const SGT_ATLAS_WORKER: &str = env!("CARGO_BIN_EXE_sgt-atlas-worker");
 
 /// Generous on either of the two-environment rule's hosts; short enough that
@@ -319,22 +321,18 @@ async fn a_sealed_message_is_refused_through_the_real_subprocess() {
 /// No `sgt-atlas-worker` process may survive this suite.
 #[test]
 fn no_worker_process_survives_the_mail_adapter_walk() {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let output = std::process::Command::new("pgrep")
-            .arg("-f")
-            .arg("sgt-atlas-worker")
-            .output();
-        let Ok(output) = output else {
-            return;
-        };
-        let listing = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if listing.is_empty() {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("an sgt-atlas-worker process is still alive after the grace period: {listing}");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
+    support::wait_until_sync(
+        "no sgt-atlas-worker process still alive after the grace period",
+        support::HANG_BUDGET,
+        || {
+            let output = std::process::Command::new("pgrep")
+                .arg("-f")
+                .arg("sgt-atlas-worker")
+                .output();
+            let Ok(output) = output else {
+                return true;
+            };
+            String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        },
+    );
 }
