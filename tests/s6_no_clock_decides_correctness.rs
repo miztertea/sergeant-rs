@@ -1431,18 +1431,6 @@ const ALLOWLIST: &[Allowed] = &[
         category: "deadline-loop-residue",
         reason: DEADLINE_LOOP_RESIDUE_REASON,
     },
-    Allowed {
-        file: "tests/y3_zip_adapter.rs",
-        needle: "let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/y4_mail_adapter.rs",
-        needle: "let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
 ];
 
 /// Whether some entry in `allowlist` names both `file_label` and a `needle`
