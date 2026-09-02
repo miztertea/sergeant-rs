@@ -1126,36 +1126,6 @@ const ALLOWLIST: &[Allowed] = &[
             decides pass/fail, not how long any single poll took.",
     },
     Allowed {
-        file: "tests/m6_surfaces.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m6_surfaces.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m6_surfaces.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(90);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m6_surfaces.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m6_surfaces.rs",
-        needle: "let deadline = Instant::now() + DAEMON_TERM_GRACE;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/support/mod.rs",
         needle: "let deadline = Instant::now() + budget;",
         category: "deadline-loop-residue",
@@ -1334,6 +1304,56 @@ const ALLOWLIST: &[Allowed] = &[
             support::wait_until_sync's `FnMut() -> bool` predicate shape, and the thread's own \
             exit (timeout or a captured trace POST) is not this test's verdict either way: the \
             main thread's own assert! after `collector.join()` is.",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
+        category: "owned-wait-budget",
+        reason: "the live-SSE-tail test's own event-consuming loop: each pass calls \
+            `stream.next_event()` (its own inner 5s tokio::time::timeout, awaited directly), \
+            not a side-effect-free state check -- the shape support::wait_until's predicate \
+            (`FnMut() -> Fut<Output = bool>`, polled with its own sleep-based backoff) does not \
+            fit. The loop accumulates `asked_to_refresh` across possibly-many events and can \
+            exit either by finding the target event or by the deadline; the post-loop \
+            assert!(asked_to_refresh, ...) is the actual verdict either way.",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
+        category: "owned-wait-budget",
+        reason: "the add-repo overlay test's own background-poll loop: `app` is a plain local \
+            `&mut` used both before and after this wait across many more call sites in the same \
+            test, and support::wait_until's predicate is `FnMut() -> Fut` -- its returned \
+            future cannot hold a mutable borrow of a captured variable across its own await \
+            points ('captured variable cannot escape `FnMut` closure body'). Where that bit a \
+            value captured ONLY inside the wait elsewhere in this wave, a \
+            std::cell::RefCell scoped to just that wait was the narrow fix; wrapping `app` \
+            itself for this one call would thread interior mutability through a value this \
+            whole test otherwise owns directly. Budget consolidated onto the shared \
+            support::HANG_BUDGET even though the loop shape stays.",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "owned-wait-budget",
+        reason: "two sites share this needle text, both named (directly or by shape) in \
+            support::wait_until's own doc comment as staying hand-rolled. (1) the pty-hangup \
+            test's own TUI-survival wait -- support::wait_until's doc names it explicitly: \
+            'one that must run cleanup before failing (tests/m6_surfaces.rs's TUI-survival \
+            wait)'; it never panics itself, `survived = pid_alive(tui)` after the loop decides, \
+            and the caller kills the survivor before asserting. (2) SpawnedDaemon::start_at's \
+            own descriptor-poll: kills and reaps its own child before panicking on timeout, the \
+            same 'must run cleanup before failing' shape.",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + DAEMON_TERM_GRACE;",
+        category: "owned-wait-budget",
+        reason: "SpawnedDaemon::stop's own SIGTERM-then-SIGKILL escalation: never panics, \
+            returns a DaemonStop describing which signal actually worked -- the same \
+            'best-effort teardown that proceeds regardless' shape support::wait_until's own \
+            doc names for stop_daemon (tests/m2_daemon_api.rs, tests/m3_execution.rs), just \
+            with an escalation action on timeout instead of a bare return.",
     },
 ];
 
