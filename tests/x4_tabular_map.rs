@@ -76,6 +76,8 @@ use sergeant_rs::runtime::atlas::tabular::{
 };
 use sergeant_rs::runtime::journal::Journal;
 
+mod support;
+
 const SGT: &str = env!("CARGO_BIN_EXE_sgt");
 
 // ---------------------------------------------------------------- helpers
@@ -212,15 +214,20 @@ async fn sgt_while_serving(cwd: &Path, data_dir: &Path, args: &[&str]) -> Run {
 
 /// One authenticated `GET` against a running daemon, as status + body.
 async fn get(handle: &DaemonHandle, path: &str) -> (reqwest::StatusCode, Value) {
-    let response = reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .expect("client")
-        .get(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("request");
+        .expect("client");
+    let response = support::send_while_alive(
+        "get",
+        || {
+            client
+                .get(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = response.status();
     let body = response.text().await.expect("body");
     (

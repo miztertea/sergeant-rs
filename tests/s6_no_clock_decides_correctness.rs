@@ -139,19 +139,51 @@ struct Allowed {
     reason: &'static str,
 }
 
-/// Shared by every "one-shot client, never through scan_to_completion"
-/// `.timeout(` entry below — see the block comment above those entries for
-/// the full reasoning; kept as one named constant rather than repeated 24
-/// times so a future reader (or `grep`) finds the single real argument
-/// once instead of 24 near-duplicate paragraphs.
+/// Shared by every converted one-shot `.timeout(` entry below — see the
+/// block comment above those entries for the full reasoning; kept as one
+/// named constant rather than repeated so a future reader (or `grep`) finds
+/// the single real argument once.
+///
+/// F-SF-01 (review of this wave): the text that used to live here argued
+/// these 23 sites could stay non-deterministic because "no failure of this
+/// shape has been observed here" — exactly the runner-speed-dependent
+/// argument the ruling rejects (a fast dry-run passing says nothing about a
+/// starved runner) — plus a scope-narrowing claim ("materially larger than
+/// this wave's stated boundary") that cited no J-rung. Both premises were
+/// false distinctions, not settled ground, so they are not repeated here:
+/// every one of these sites now goes through `support::send_while_alive`
+/// (`tests/support/mod.rs`), the one-shot analogue of
+/// `scan_to_completion`'s own retry-while-alive loop — reused (Ponytail
+/// R2), not reinvented — and is thereby converted under the ruling's own
+/// text rather than exempted from it.
+const RETRIED_WHILE_ALIVE_REASON: &str = "converted (F-SF-01): this client is passed to \
+     `support::send_while_alive`, which retries a transport-class failure — including this \
+     client's own `.timeout(` expiring — for as long as the daemon is alive, exactly as \
+     `scan_to_completion` already does for its own status poll. The bound named by this needle is \
+     now a per-attempt cadence for that retry loop, never a verdict this file decides on its own; \
+     a POST this loop can retry is idempotent by the endpoint's own `command_id` dedup (proven by \
+     this file's or a sibling's own below-window/pruned-command_id-retry assertions) or is not \
+     retried at all (see the call site's own comment where that applies).";
+
+/// The one occurrence F-SF-01's fix pass left unconverted: `m2_daemon_api.rs`
+/// makes hundreds of direct, ad hoc `.send()` calls spread across its own
+/// ~5000 lines and dozens of tests — unlike every other entry below, there
+/// is no small, shared `get`/`post`/`submit` choke point a fix could route
+/// through, and many of those calls assert on structured error bodies
+/// (401/404 status, not a transport outcome) where retry-while-alive
+/// semantics do not apply uniformly. Converting it is the same class of fix
+/// as the 23 above, at a scale (a call-site-by-call-site rewrite of a
+/// 5000-line file) that is a distinct piece of scope from this fix pass, not
+/// a difference of principle — escalated rather than attempted piecemeal
+/// here, and named honestly below as still-open non-determinism rather than
+/// as a closed exemption.
 const RESIDUE_REASON: &str = "a reqwest client built for a single, direct one-shot request/response \
-     this test makes itself — never through scan_to_completion's polling loop. A transport-class \
-     failure here would in principle be the same defect class scan_to_completion had, but this \
-     call is never looped and never exposed to a scan's own duration under a starved runner the \
-     way the polled status GET was (run29-test.log, the wave's own brief) — no failure of this \
-     shape has been observed here. Converting all 24 such sites into their own retry-while-alive \
-     callers is materially larger than this wave's stated boundary ('fix at the helper, once'); \
-     named here as reasoned residue for a future wave rather than attempted piecemeal in this one.";
+     this test makes itself — never through scan_to_completion's polling loop, and never through \
+     support::send_while_alive either (see this constant's own doc comment above: no small choke \
+     point exists in this file to route the fix through). A transport-class failure here is the \
+     same defect class scan_to_completion had, and no exemption in the ruling ('What this does not \
+     say') covers a test harness's own client `.timeout(`: this is still open non-determinism, not \
+     a closed matter, escalated to a future wave rather than fixed piecemeal here.";
 
 const ALLOWLIST: &[Allowed] = &[
     Allowed {
@@ -880,100 +912,101 @@ const ALLOWLIST: &[Allowed] = &[
                   to exercise scan_to_completion's retry-while-alive path — the timeout is the \
                   input under test, not a duration this suite lets decide its own verdict.",
     },
-    // The remaining 24 sites: a `reqwest::Client::builder().timeout(...)` built
-    // for ordinary one-shot request/response calls this suite makes directly
-    // (never through scan_to_completion's polling loop) — POST/GET a daemon
-    // endpoint once, `.expect()`/`assert` the answer. Reasoned residue, not a
-    // closed matter (same shape the `sleep(` guard's own doc comment above
-    // already tolerates for its own "shape (b)" entries): a transport-class
-    // failure on any of these would in principle be the identical defect
-    // class scan_to_completion had, but every one of them is a single
-    // request against an in-process, loopback, near-zero-latency daemon —
-    // never looped, never observed to fail in this program's own evidence
-    // (only the *polled* status GET, exposed to a scan's full duration under
-    // a starved runner, has ever actually failed this way; run29-test.log,
-    // the wave's own brief). Converting all 24 into their own
-    // retry-while-alive callers is a materially larger, riskier change than
-    // this wave's stated boundary ("fix at the helper, once") and is left
-    // named here for a future wave rather than attempted piecemeal in this
-    // one.
+    // The remaining 24 sites (F-SF-01): a `reqwest::Client::builder()
+    // .timeout(...)` built for ordinary one-shot request/response calls this
+    // suite makes directly (never through scan_to_completion's polling
+    // loop) — POST/GET a daemon endpoint once, `.expect()`/`assert` the
+    // answer. 23 of the 24 are now converted, not merely allowlisted: each
+    // one's client is passed to `support::send_while_alive`
+    // (`tests/support/mod.rs`), the one-shot analogue of
+    // `scan_to_completion`'s own retry-while-alive loop, so a transport
+    // failure here is retried while the daemon is alive exactly as the
+    // polled status GET already is, instead of deciding the test's outcome.
+    // The one remaining site (`tests/m2_daemon_api.rs`) has no small choke
+    // point to route the fix through and is left as reasoned, still-open
+    // residue — see `RESIDUE_REASON`'s own doc comment above.
     Allowed {
         file: "tests/c1a_compiled_context.rs",
         needle: ".timeout(std::time::Duration::from_secs(30))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/c1a_compiled_context.rs",
         needle: ".timeout(std::time::Duration::from_secs(60))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/c1d_attribution_nesting_audit.rs",
         needle: ".timeout(std::time::Duration::from_secs(60))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/c2_light/agy_routing.rs",
         needle: ".timeout(Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/c2_light/codex_routing.rs",
         needle: ".timeout(Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/c2_light/opencode_routing.rs",
         needle: ".timeout(Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/c2_light/t2_workflow_catalog.rs",
         needle: ".timeout(Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/c2_light/w2fix_probe_ordering.rs",
         needle: ".timeout(Duration::from_secs(10))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: "converted (F-SF-01) for its two idempotent GETs (`healthz`, the pending-window \
+                  `list`), both now through `support::send_while_alive`. The one non-idempotent \
+                  call this file makes — the pending-window submission, which creates a Work — is \
+                  deliberately *not* retried here: see that call site's own comment. It no longer \
+                  uses this client (or any `.timeout(` of its own) at all, so the only duration in \
+                  play for it is `RENDEZVOUS`, the test's real, single termination bound.",
     },
     Allowed {
         file: "tests/e_admission_uses_no_network_git.rs",
         needle: ".timeout(Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/e_git_admission.rs",
         needle: ".timeout(Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/i9_floor_pinning.rs",
         needle: ".timeout(std::time::Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/m11_nested_workflow.rs",
         needle: ".timeout(std::time::Duration::from_secs(30))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/m12_child_work.rs",
         needle: ".timeout(std::time::Duration::from_secs(30))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/m2_daemon_api.rs",
@@ -984,44 +1017,44 @@ const ALLOWLIST: &[Allowed] = &[
     Allowed {
         file: "tests/m3_execution.rs",
         needle: ".timeout(Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/m5_projections.rs",
         needle: ".timeout(Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/m6_surfaces.rs",
         needle: ".timeout(Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/w3_prune_engine.rs",
         needle: ".timeout(std::time::Duration::from_secs(20))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/w4_doctor_journal_growth.rs",
         needle: ".timeout(Duration::from_secs(10))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/w4_read_surfaces.rs",
         needle: ".timeout(Duration::from_secs(10))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
     Allowed {
         file: "tests/x4_tabular_map.rs",
         needle: ".timeout(std::time::Duration::from_secs(10))",
-        category: "reporting",
-        reason: RESIDUE_REASON,
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
     },
 ];
 

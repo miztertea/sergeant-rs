@@ -561,18 +561,27 @@ async fn the_real_daemon_journal_pins() {
         .build()
         .expect("client");
     for _ in 0..12 {
-        let resp = http
-            .post(format!("{}/v1/work", handle.endpoint))
-            .bearer_auth(&handle.token)
-            .json(&json!({
-                "command_id": ulid(),
-                "intent": "i9 acceptance work",
-                "estate_root": root.path(),
-                "origin": {"client": "cli", "cwd": root.path()},
-            }))
-            .send()
-            .await
-            .expect("submit");
+        // Built once, outside the retry closure below: the endpoint dedupes
+        // a submit by `command_id` (proven by
+        // `a_below_window_command_id_is_refused_by_name_through_a_real_http_retry`
+        // below), so retrying this exact body on a transport failure replays
+        // the same submission rather than risking a second Work.
+        let body = json!({
+            "command_id": ulid(),
+            "intent": "i9 acceptance work",
+            "estate_root": root.path(),
+            "origin": {"client": "cli", "cwd": root.path()},
+        });
+        let resp = support::send_while_alive(
+            "submit",
+            || {
+                http.post(format!("{}/v1/work", handle.endpoint))
+                    .bearer_auth(&handle.token)
+                    .json(&body)
+            },
+            || handle.is_alive(),
+        )
+        .await;
         assert_eq!(
             resp.status(),
             reqwest::StatusCode::CREATED,
@@ -583,15 +592,18 @@ async fn the_real_daemon_journal_pins() {
     // Give the fake backend's async completion a moment to settle every
     // submitted work before stopping.
     for _ in 0..50 {
-        let system: serde_json::Value = http
-            .get(format!("{}/v1/work", handle.endpoint))
-            .bearer_auth(&handle.token)
-            .send()
-            .await
-            .expect("list")
-            .json()
-            .await
-            .expect("json");
+        let system: serde_json::Value = support::send_while_alive(
+            "list",
+            || {
+                http.get(format!("{}/v1/work", handle.endpoint))
+                    .bearer_auth(&handle.token)
+            },
+            || handle.is_alive(),
+        )
+        .await
+        .json()
+        .await
+        .expect("json");
         let all_done = system
             .as_array()
             .map(|rows| {
@@ -895,13 +907,16 @@ async fn a_below_window_command_id_is_refused_by_name_through_a_real_http_retry(
         let script: Vec<FakeStep> = (0..14).map(|_| FakeStep::complete()).collect();
         let (handle, _fake) = start_fake_tiny_segments(data.path(), root.path(), script).await;
 
-        let resp = http
-            .post(format!("{}/v1/work", handle.endpoint))
-            .bearer_auth(&handle.token)
-            .json(&submit_body)
-            .send()
-            .await
-            .expect("submit the early command");
+        let resp = support::send_while_alive(
+            "submit the early command",
+            || {
+                http.post(format!("{}/v1/work", handle.endpoint))
+                    .bearer_auth(&handle.token)
+                    .json(&submit_body)
+            },
+            || handle.is_alive(),
+        )
+        .await;
         assert_eq!(
             resp.status(),
             reqwest::StatusCode::CREATED,
@@ -915,29 +930,39 @@ async fn a_below_window_command_id_is_refused_by_name_through_a_real_http_retry(
             .to_string();
 
         for _ in 0..12 {
-            let resp = http
-                .post(format!("{}/v1/work", handle.endpoint))
-                .bearer_auth(&handle.token)
-                .json(&json!({
-                    "command_id": ulid(),
-                    "intent": "padding work",
-                    "origin": {"client": "cli", "cwd": root.path()},
-                }))
-                .send()
-                .await
-                .expect("submit padding");
+            // Built once, outside the retry closure, for the same reason as
+            // the sibling loop above: a fixed `command_id` makes a retried
+            // submit a replay of the same command, never a second Work.
+            let padding_body = json!({
+                "command_id": ulid(),
+                "intent": "padding work",
+                "origin": {"client": "cli", "cwd": root.path()},
+            });
+            let resp = support::send_while_alive(
+                "submit padding",
+                || {
+                    http.post(format!("{}/v1/work", handle.endpoint))
+                        .bearer_auth(&handle.token)
+                        .json(&padding_body)
+                },
+                || handle.is_alive(),
+            )
+            .await;
             assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
         }
         for _ in 0..50 {
-            let system: serde_json::Value = http
-                .get(format!("{}/v1/work", handle.endpoint))
-                .bearer_auth(&handle.token)
-                .send()
-                .await
-                .expect("list")
-                .json()
-                .await
-                .expect("json");
+            let system: serde_json::Value = support::send_while_alive(
+                "list",
+                || {
+                    http.get(format!("{}/v1/work", handle.endpoint))
+                        .bearer_auth(&handle.token)
+                },
+                || handle.is_alive(),
+            )
+            .await
+            .json()
+            .await
+            .expect("json");
             let all_done = system
                 .as_array()
                 .map(|rows| {
@@ -978,13 +1003,16 @@ async fn a_below_window_command_id_is_refused_by_name_through_a_real_http_retry(
     // command_id is now below the window, served from `Core::floor_ledger`.
     let (handle, _fake) =
         start_fake_tiny_segments(data.path(), root.path(), Vec::<FakeStep>::new()).await;
-    let resp = http
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&submit_body)
-        .send()
-        .await
-        .expect("retry the below-window command");
+    let resp = support::send_while_alive(
+        "retry the below-window command",
+        || {
+            http.post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&submit_body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::CONFLICT,

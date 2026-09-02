@@ -1062,6 +1062,45 @@ pub async fn scan_to_completion(
     }
 }
 
+/// The one-shot analogue of [`scan_to_completion`]'s retry-while-alive
+/// transport handling (S6 `transport-timeout-is-not-a-verdict`, F-SF-01),
+/// reused here (Ponytail R2) rather than duplicated at each call site that
+/// makes a single direct request/response call against an in-process daemon
+/// it does not itself loop through.
+///
+/// A client-side `.timeout()` expiring, or any other transport-class
+/// failure, is never a real answer from the daemon — no HTTP status was
+/// received — so it is not treated as terminal while `is_alive` still says
+/// the daemon is there: the call is simply retried, cadence-paced, exactly
+/// as [`scan_to_completion`]'s own status poll already does for its
+/// transport failures. Only when `is_alive` reports the daemon gone does a
+/// transport error become the terminal, named failure ("no amount of
+/// further retrying can complete this request"), never a silent pass and
+/// never an assertion that the daemon was slow — the same distinction the
+/// ruling draws for a wait budget (item 3).
+///
+/// `build` constructs a fresh request each attempt, since a
+/// [`reqwest::RequestBuilder`] is consumed by [`reqwest::RequestBuilder::send`].
+pub async fn send_while_alive(
+    what: &str,
+    build: impl Fn() -> reqwest::RequestBuilder,
+    is_alive: impl Fn() -> bool,
+) -> reqwest::Response {
+    loop {
+        match build().send().await {
+            Ok(response) => return response,
+            Err(e) => {
+                assert!(
+                    is_alive(),
+                    "{what}: the daemon is no longer alive ({e}); no amount of further \
+                     retrying can complete this request"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
+}
+
 /// One cited function, sliced the way an acceptance register's citation
 /// guard needs to read it: the attributes written above its signature, and
 /// its body.

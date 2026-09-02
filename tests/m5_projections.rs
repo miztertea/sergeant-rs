@@ -150,36 +150,48 @@ async fn start_fake(
 }
 
 async fn post(handle: &DaemonHandle, path: &str, body: Value) -> (reqwest::StatusCode, Value) {
-    let resp = http()
-        .post(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("request");
+    let resp = support::send_while_alive(
+        "post",
+        || {
+            http()
+                .post(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = resp.status();
     (status, resp.json().await.expect("json body"))
 }
 
 async fn get(handle: &DaemonHandle, path: &str) -> Value {
-    http()
-        .get(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("request")
-        .json()
-        .await
-        .expect("json body")
+    support::send_while_alive(
+        "get",
+        || {
+            http()
+                .get(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await
+    .json()
+    .await
+    .expect("json body")
 }
 
 async fn get_status(handle: &DaemonHandle, path: &str) -> (reqwest::StatusCode, Value) {
-    let resp = http()
-        .get(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("request");
+    let resp = support::send_while_alive(
+        "get_status",
+        || {
+            http()
+                .get(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = resp.status();
     (status, resp.json().await.expect("json body"))
 }

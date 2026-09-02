@@ -93,20 +93,23 @@ async fn submit(
     command_id: &str,
     intent: &str,
 ) -> Value {
-    let resp = http
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&json!({
-            "command_id": command_id,
-            "intent": intent,
-            // D4: the estate this submission addresses. `cwd` stays §13.3
-            // recorded evidence, deciding nothing.
-            "estate_root": root,
-            "origin": {"client": "cli", "cwd": root},
-        }))
-        .send()
-        .await
-        .expect("submit");
+    let resp = support::send_while_alive(
+        "submit",
+        || {
+            http.post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&json!({
+                    "command_id": command_id,
+                    "intent": intent,
+                    // D4: the estate this submission addresses. `cwd` stays
+                    // §13.3 recorded evidence, deciding nothing.
+                    "estate_root": root,
+                    "origin": {"client": "cli", "cwd": root},
+                }))
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::CREATED,
@@ -125,13 +128,16 @@ async fn submit_simple(
     command_id: &str,
     intent: &str,
 ) -> Value {
-    let resp = http
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&json!({"command_id": command_id, "intent": intent}))
-        .send()
-        .await
-        .expect("submit");
+    let resp = support::send_while_alive(
+        "submit",
+        || {
+            http.post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&json!({"command_id": command_id, "intent": intent}))
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::CREATED,
@@ -144,15 +150,18 @@ async fn submit_simple(
 async fn wait_until_all_settled(http: &reqwest::Client, handle: &DaemonHandle) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        let system: Value = http
-            .get(format!("{}/v1/work", handle.endpoint))
-            .bearer_auth(&handle.token)
-            .send()
-            .await
-            .expect("list")
-            .json()
-            .await
-            .expect("json");
+        let system: Value = support::send_while_alive(
+            "list",
+            || {
+                http.get(format!("{}/v1/work", handle.endpoint))
+                    .bearer_auth(&handle.token)
+            },
+            || handle.is_alive(),
+        )
+        .await
+        .json()
+        .await
+        .expect("json");
         let all_done = system["works"]
             .as_array()
             .map(|rows| {
@@ -281,15 +290,18 @@ async fn event_history_response_carries_floor_seq_and_is_one_on_an_unpruned_jour
     let http = client();
     submit_simple(&http, &handle, &ulid(), "hello").await;
 
-    let body: Value = http
-        .get(format!("{}/v1/events", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("events")
-        .json()
-        .await
-        .expect("json");
+    let body: Value = support::send_while_alive(
+        "events",
+        || {
+            http.get(format!("{}/v1/events", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await
+    .json()
+    .await
+    .expect("json");
     assert_eq!(
         body["floor_seq"], 1,
         "an unpruned journal's floor is 1, unconditionally present: {body}"
@@ -305,12 +317,15 @@ async fn event_history_below_the_floor_is_served_from_the_floor_with_floor_seq_s
     let (handle, _pruned, _retained, _retention) = pruned_fixture(&data, &root).await;
     let http = client();
 
-    let resp = http
-        .get(format!("{}/v1/events?from=0", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("events from=0 on a pruned journal");
+    let resp = support::send_while_alive(
+        "events from=0 on a pruned journal",
+        || {
+            http.get(format!("{}/v1/events?from=0", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
@@ -343,12 +358,15 @@ async fn sse_stream_sends_a_floor_frame_before_history_on_every_connection() {
     let http = client();
     submit_simple(&http, &handle, &ulid(), "hello").await;
 
-    let mut stream = http
-        .get(format!("{}/v1/events/stream?from=0", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("sse connect");
+    let mut stream = support::send_while_alive(
+        "sse connect",
+        || {
+            http.get(format!("{}/v1/events/stream?from=0", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(stream.status(), 200);
 
     let frames = read_raw_sse_frames(&mut stream, 1).await;
@@ -370,12 +388,15 @@ async fn sse_floor_frame_never_sets_an_sse_id() {
     let http = client();
     submit_simple(&http, &handle, &ulid(), "hello").await;
 
-    let mut stream = http
-        .get(format!("{}/v1/events/stream?from=0", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("sse connect");
+    let mut stream = support::send_while_alive(
+        "sse connect",
+        || {
+            http.get(format!("{}/v1/events/stream?from=0", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let frames = read_raw_sse_frames(&mut stream, 1).await;
     assert_eq!(
         frames[0].id, None,
@@ -396,25 +417,31 @@ async fn sse_floor_frame_carries_the_actual_pruned_floor_on_a_pruned_journal() {
     // floor_seq — the daemon still holds the journal's exclusive lock, so a
     // second `Journal::open` here would contend with it (`w3_prune_engine.rs`'s
     // own tests only ever reopen the journal *after* `handle.shutdown()`).
-    let expected_floor = http
-        .get(format!("{}/v1/events", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("events")
-        .json::<Value>()
-        .await
-        .expect("json")["floor_seq"]
+    let expected_floor = support::send_while_alive(
+        "events",
+        || {
+            http.get(format!("{}/v1/events", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await
+    .json::<Value>()
+    .await
+    .expect("json")["floor_seq"]
         .as_u64()
         .expect("floor_seq");
     assert!(expected_floor > 1);
 
-    let mut stream = http
-        .get(format!("{}/v1/events/stream?from=0", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("sse connect");
+    let mut stream = support::send_while_alive(
+        "sse connect",
+        || {
+            http.get(format!("{}/v1/events/stream?from=0", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let frames = read_raw_sse_frames(&mut stream, 1).await;
     assert_eq!(frames[0].event, "sergeant.floor");
     assert_eq!(frames[0].data["floor_seq"], expected_floor);
@@ -447,12 +474,15 @@ async fn sse_stream_sends_an_error_frame_before_closing_on_a_journal_failure() {
     text.push_str("{ \"not\": \"an event\" }\n");
     std::fs::write(&segment, text).expect("append malformed line");
 
-    let mut stream = http
-        .get(format!("{}/v1/events/stream?from=0", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("sse connect");
+    let mut stream = support::send_while_alive(
+        "sse connect",
+        || {
+            http.get(format!("{}/v1/events/stream?from=0", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(stream.status(), 200, "the handshake itself still succeeds");
 
     // The floor frame still arrives (computed from segment listing alone,
@@ -482,11 +512,12 @@ async fn sse_stream_sends_an_error_frame_before_closing_on_a_journal_failure() {
     );
 
     // The daemon itself is undamaged.
-    let health = http
-        .get(format!("{}/healthz", handle.endpoint))
-        .send()
-        .await
-        .expect("healthz after corrupted replay");
+    let health = support::send_while_alive(
+        "healthz after corrupted replay",
+        || http.get(format!("{}/healthz", handle.endpoint)),
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(health.status(), 200);
 
     handle.shutdown().await;
@@ -501,12 +532,15 @@ async fn show_work_on_a_pruned_id_answers_pruned_with_its_date_and_policy() {
     let (handle, pruned, _retained, retention) = pruned_fixture(&data, &root).await;
     let http = client();
 
-    let resp = http
-        .get(format!("{}/v1/work/{pruned}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("show pruned work");
+    let resp = support::send_while_alive(
+        "show pruned work",
+        || {
+            http.get(format!("{}/v1/work/{pruned}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
@@ -536,12 +570,15 @@ async fn show_work_on_a_never_existing_id_still_404s() {
     let http = client();
 
     let never_existed = ulid();
-    let resp = http
-        .get(format!("{}/v1/work/{never_existed}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("show unknown work");
+    let resp = support::send_while_alive(
+        "show unknown work",
+        || {
+            http.get(format!("{}/v1/work/{never_existed}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::NOT_FOUND,
@@ -565,12 +602,15 @@ async fn work_graph_on_a_pruned_id_answers_pruned_with_its_date_and_policy() {
     let (handle, pruned, _retained, retention) = pruned_fixture(&data, &root).await;
     let http = client();
 
-    let resp = http
-        .get(format!("{}/v1/graph/work/{pruned}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("graph pruned work");
+    let resp = support::send_while_alive(
+        "graph pruned work",
+        || {
+            http.get(format!("{}/v1/graph/work/{pruned}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
@@ -600,12 +640,15 @@ async fn work_graph_on_a_never_existing_id_still_404s() {
     let http = client();
 
     let never_existed = ulid();
-    let resp = http
-        .get(format!("{}/v1/graph/work/{never_existed}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("graph unknown work");
+    let resp = support::send_while_alive(
+        "graph unknown work",
+        || {
+            http.get(format!("{}/v1/graph/work/{never_existed}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::NOT_FOUND,
@@ -624,12 +667,15 @@ async fn work_transcript_on_a_pruned_work_answers_pruned_with_empty_turns() {
     let (handle, pruned, _retained, _retention) = pruned_fixture(&data, &root).await;
     let http = client();
 
-    let resp = http
-        .get(format!("{}/v1/work/{pruned}/transcript", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("transcript of a pruned work");
+    let resp = support::send_while_alive(
+        "transcript of a pruned work",
+        || {
+            http.get(format!("{}/v1/work/{pruned}/transcript", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: Value = resp.json().await.expect("json");
     assert_eq!(body["state"], "pruned");
@@ -646,12 +692,15 @@ async fn work_transcript_on_a_retained_work_survives_a_prune() {
     let (handle, _pruned, retained, _retention) = pruned_fixture(&data, &root).await;
     let http = client();
 
-    let resp = http
-        .get(format!("{}/v1/work/{retained}/transcript", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("transcript of a retained work after a prune");
+    let resp = support::send_while_alive(
+        "transcript of a retained work after a prune",
+        || {
+            http.get(format!("{}/v1/work/{retained}/transcript", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,
@@ -860,15 +909,18 @@ async fn work_transcript_over_http_skips_a_corrupted_segment_before_the_works_ow
     )
     .expect("append malformed line to the oldest segment");
 
-    let resp = http
-        .get(format!(
-            "{}/v1/work/{recent_id}/transcript",
-            handle.endpoint
-        ))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("transcript over http");
+    let resp = support::send_while_alive(
+        "transcript over http",
+        || {
+            http.get(format!(
+                "{}/v1/work/{recent_id}/transcript",
+                handle.endpoint
+            ))
+            .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::OK,

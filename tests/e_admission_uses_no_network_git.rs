@@ -108,19 +108,23 @@ async fn a_whole_admission_never_runs_a_network_or_branch_changing_git_command()
         .timeout(Duration::from_secs(20))
         .build()
         .expect("client");
-    let response = client
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&json!({
-            "command_id": ulid::Ulid::generate().to_string(),
-            "intent": "admit two clean mounts",
-            "scope": {"all": true},
-            "estate_root": estate,
-            "origin": {"client": "cli"},
-        }))
-        .send()
-        .await
-        .expect("request");
+    let response = support::send_while_alive(
+        "admit two clean mounts",
+        || {
+            client
+                .post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&json!({
+                    "command_id": ulid::Ulid::generate().to_string(),
+                    "intent": "admit two clean mounts",
+                    "scope": {"all": true},
+                    "estate_root": estate,
+                    "origin": {"client": "cli"},
+                }))
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = response.status();
     let body: Value = response.json().await.expect("json body");
 

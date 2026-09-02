@@ -260,13 +260,17 @@ async fn post(
     path: &str,
     body: Value,
 ) -> (reqwest::StatusCode, Value) {
-    let resp = client
-        .post(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("request");
+    let resp = support::send_while_alive(
+        "post",
+        || {
+            client
+                .post(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = resp.status();
     let value: Value = resp.json().await.expect("json body");
     (status, value)
@@ -274,15 +278,19 @@ async fn post(
 
 /// GET a path from the daemon.
 async fn get(client: &reqwest::Client, handle: &DaemonHandle, path: &str) -> Value {
-    client
-        .get(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("request")
-        .json()
-        .await
-        .expect("json body")
+    support::send_while_alive(
+        "get",
+        || {
+            client
+                .get(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await
+    .json()
+    .await
+    .expect("json body")
 }
 
 /// Submit work addressed at `estate_root`, whose origin is `cwd`, merging

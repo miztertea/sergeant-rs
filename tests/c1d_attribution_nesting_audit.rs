@@ -982,13 +982,17 @@ async fn submit(
     if let Some(parent) = claimed_parent {
         body["claimed_parent_work_id"] = Value::String(parent.to_string());
     }
-    let response = client
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("request");
+    let response = support::send_while_alive(
+        "submit",
+        || {
+            client
+                .post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = response.status();
     let value: Value = response.json().await.expect("json body");
     assert_eq!(status, 201, "submit rejected: {value}");

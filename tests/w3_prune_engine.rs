@@ -73,21 +73,30 @@ async fn submit(
     root: &Path,
     command_id: &str,
     intent: &str,
+    is_alive: impl Fn() -> bool,
 ) -> serde_json::Value {
-    let resp = http
-        .post(format!("{endpoint}/v1/work"))
-        .bearer_auth(token)
-        .json(&json!({
-            "command_id": command_id,
-            "intent": intent,
-            // D4: the estate this submission addresses. `cwd` stays §13.3
-            // recorded evidence, deciding nothing.
-            "estate_root": root,
-            "origin": {"client": "cli", "cwd": root},
-        }))
-        .send()
-        .await
-        .expect("submit");
+    // Built once, outside the retry closure below: the endpoint dedupes a
+    // submit by `command_id` (proven by this file's own N12 assertions on a
+    // pruned command_id retry), so retrying this exact body on a transport
+    // failure replays the same submission rather than risking a second Work.
+    let body = json!({
+        "command_id": command_id,
+        "intent": intent,
+        // D4: the estate this submission addresses. `cwd` stays §13.3
+        // recorded evidence, deciding nothing.
+        "estate_root": root,
+        "origin": {"client": "cli", "cwd": root},
+    });
+    let resp = support::send_while_alive(
+        "submit",
+        || {
+            http.post(format!("{endpoint}/v1/work"))
+                .bearer_auth(token)
+                .json(&body)
+        },
+        is_alive,
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::CREATED,
@@ -97,18 +106,23 @@ async fn submit(
     resp.json().await.expect("json")
 }
 
-async fn wait_until_all_settled(http: &reqwest::Client, endpoint: &str, token: &str) {
+async fn wait_until_all_settled(
+    http: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    is_alive: impl Fn() -> bool,
+) {
     let mut last: serde_json::Value = serde_json::Value::Null;
     for _ in 0..200 {
-        let system: serde_json::Value = http
-            .get(format!("{endpoint}/v1/work"))
-            .bearer_auth(token)
-            .send()
-            .await
-            .expect("list")
-            .json()
-            .await
-            .expect("json");
+        let system: serde_json::Value = support::send_while_alive(
+            "list",
+            || http.get(format!("{endpoint}/v1/work")).bearer_auth(token),
+            &is_alive,
+        )
+        .await
+        .json()
+        .await
+        .expect("json");
         let all_done = system["works"]
             .as_array()
             .map(|rows| {
@@ -178,12 +192,13 @@ async fn a_start_on_an_over_cap_journal_prunes_before_serving() {
                 root.path(),
                 &cmd,
                 &format!("prune fixture work {n}"),
+                || handle.is_alive(),
             )
             .await;
             command_ids.push(cmd);
             work_ids.push(body["work"]["id"].as_str().expect("work id").to_string());
         }
-        wait_until_all_settled(&http, &handle.endpoint, &handle.token).await;
+        wait_until_all_settled(&http, &handle.endpoint, &handle.token, || handle.is_alive()).await;
         handle.shutdown().await;
     }
 
@@ -212,17 +227,20 @@ async fn a_start_on_an_over_cap_journal_prunes_before_serving() {
     // N12: a pruned command's id is refused by name over a *real* HTTP
     // retry — never re-executed, never a fabricated 200.
     let pruned_command_id = &command_ids[0];
-    let resp = http
-        .post(format!("{}/v1/work", handle2.endpoint))
-        .bearer_auth(&handle2.token)
-        .json(&json!({
-            "command_id": pruned_command_id,
-            "intent": "must be refused by name, not re-executed",
-            "origin": {"client": "cli", "cwd": root.path()},
-        }))
-        .send()
-        .await
-        .expect("retry a pruned command_id");
+    let resp = support::send_while_alive(
+        "retry a pruned command_id",
+        || {
+            http.post(format!("{}/v1/work", handle2.endpoint))
+                .bearer_auth(&handle2.token)
+                .json(&json!({
+                    "command_id": pruned_command_id,
+                    "intent": "must be refused by name, not re-executed",
+                    "origin": {"client": "cli", "cwd": root.path()},
+                }))
+        },
+        || handle2.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::CONFLICT,
@@ -240,12 +258,15 @@ async fn a_start_on_an_over_cap_journal_prunes_before_serving() {
     // that never existed at all (`show_work_on_a_never_existing_id_still_404s`
     // in `tests/w4_read_surfaces.rs` is the test that proves the two stay
     // distinguished).
-    let resp = http
-        .get(format!("{}/v1/work/{}", handle2.endpoint, work_ids[0]))
-        .bearer_auth(&handle2.token)
-        .send()
-        .await
-        .expect("show a pruned work");
+    let resp = support::send_while_alive(
+        "show a pruned work",
+        || {
+            http.get(format!("{}/v1/work/{}", handle2.endpoint, work_ids[0]))
+                .bearer_auth(&handle2.token)
+        },
+        || handle2.is_alive(),
+    )
+    .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await.expect("json");
     assert_eq!(body["state"], "pruned");
@@ -391,11 +412,12 @@ async fn a_start_after_a_prune_with_no_cache_still_serves() {
                 root.path(),
                 &ulid(),
                 &format!("post-prune restart fixture work {n}"),
+                || handle.is_alive(),
             )
             .await;
             work_ids.push(body["work"]["id"].as_str().expect("work id").to_string());
         }
-        wait_until_all_settled(&http, &handle.endpoint, &handle.token).await;
+        wait_until_all_settled(&http, &handle.endpoint, &handle.token, || handle.is_alive()).await;
         handle.shutdown().await;
     }
 
@@ -449,15 +471,18 @@ async fn a_start_after_a_prune_with_no_cache_still_serves() {
     // lean on: the retained Works are all there, and the pruned ones still
     // answer by name from residue the pass re-folded out of the surviving
     // `prune.completed`.
-    let system: serde_json::Value = http
-        .get(format!("{}/v1/work", handle3.endpoint))
-        .bearer_auth(&handle3.token)
-        .send()
-        .await
-        .expect("list works")
-        .json()
-        .await
-        .expect("json");
+    let system: serde_json::Value = support::send_while_alive(
+        "list works",
+        || {
+            http.get(format!("{}/v1/work", handle3.endpoint))
+                .bearer_auth(&handle3.token)
+        },
+        || handle3.is_alive(),
+    )
+    .await
+    .json()
+    .await
+    .expect("json");
     let listed = system["works"].as_array().expect("works array");
     assert_eq!(
         listed.len(),
@@ -466,12 +491,15 @@ async fn a_start_after_a_prune_with_no_cache_still_serves() {
     );
 
     let pruned_work_id = &work_ids[0];
-    let resp = http
-        .get(format!("{}/v1/work/{}", handle3.endpoint, pruned_work_id))
-        .bearer_auth(&handle3.token)
-        .send()
-        .await
-        .expect("show a pruned work in life 3");
+    let resp = support::send_while_alive(
+        "show a pruned work in life 3",
+        || {
+            http.get(format!("{}/v1/work/{}", handle3.endpoint, pruned_work_id))
+                .bearer_auth(&handle3.token)
+        },
+        || handle3.is_alive(),
+    )
+    .await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = resp.json().await.expect("json");
     assert_eq!(
@@ -520,11 +548,12 @@ async fn a_rotation_crossing_the_cap_arms_a_prune_within_one_tick() {
             root.path(),
             &cmd,
             &format!("rotation-triggered prune fixture {n}"),
+            || handle.is_alive(),
         )
         .await;
         command_ids.push(cmd);
     }
-    wait_until_all_settled(&http, &handle.endpoint, &handle.token).await;
+    wait_until_all_settled(&http, &handle.endpoint, &handle.token, || handle.is_alive()).await;
 
     // No restart anywhere in this test: poll the lock-free doctor journal
     // check until the floor has actually moved above 1 — proof the
@@ -532,15 +561,18 @@ async fn a_rotation_crossing_the_cap_arms_a_prune_within_one_tick() {
     // driver's own 200 ms ticks, never waiting on a restart to do it.
     let mut floor_seq = 1u64;
     for _ in 0..100 {
-        let report: serde_json::Value = http
-            .get(format!("{}/v1/doctor", handle.endpoint))
-            .bearer_auth(&handle.token)
-            .send()
-            .await
-            .expect("doctor")
-            .json()
-            .await
-            .expect("json");
+        let report: serde_json::Value = support::send_while_alive(
+            "doctor",
+            || {
+                http.get(format!("{}/v1/doctor", handle.endpoint))
+                    .bearer_auth(&handle.token)
+            },
+            || handle.is_alive(),
+        )
+        .await
+        .json()
+        .await
+        .expect("json");
         let detail = report["checks"]
             .as_array()
             .expect("checks array")
@@ -574,17 +606,20 @@ async fn a_rotation_crossing_the_cap_arms_a_prune_within_one_tick() {
     // shutdown — the same N12 proof as the startup-triggered sibling test,
     // here demonstrating the rotation-triggered path reached the same
     // observable state without one.
-    let resp = http
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&json!({
-            "command_id": command_ids[0],
-            "intent": "must be refused by name, live, no restart",
-            "origin": {"client": "cli", "cwd": root.path()},
-        }))
-        .send()
-        .await
-        .expect("retry a pruned command_id");
+    let resp = support::send_while_alive(
+        "retry a pruned command_id",
+        || {
+            http.post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&json!({
+                    "command_id": command_ids[0],
+                    "intent": "must be refused by name, live, no restart",
+                    "origin": {"client": "cli", "cwd": root.path()},
+                }))
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::CONFLICT,

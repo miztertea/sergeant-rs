@@ -23,6 +23,8 @@ use tempfile::TempDir;
 
 use sergeant_rs::daemon::{self, DaemonHandle};
 
+use crate::support;
+
 fn http() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
@@ -115,26 +117,34 @@ fn write_root_catalog(root: &Path, rows: &[(&str, &str)]) {
 }
 
 async fn get_status(handle: &DaemonHandle, path: &str) -> (reqwest::StatusCode, Value) {
-    let resp = http()
-        .get(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("request");
+    let resp = support::send_while_alive(
+        "get_status",
+        || {
+            http()
+                .get(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = resp.status();
     (status, resp.json().await.expect("json body"))
 }
 
 async fn events(handle: &DaemonHandle) -> Vec<Value> {
-    let body: Value = http()
-        .get(format!("{}/v1/events", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("request")
-        .json()
-        .await
-        .expect("json body");
+    let body: Value = support::send_while_alive(
+        "events",
+        || {
+            http()
+                .get(format!("{}/v1/events", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await
+    .json()
+    .await
+    .expect("json body");
     body["events"].as_array().cloned().unwrap_or_default()
 }
 

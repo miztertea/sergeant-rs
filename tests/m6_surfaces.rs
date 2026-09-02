@@ -229,13 +229,17 @@ async fn submit(
         "estate_root": estate_root,
         "origin": {"client": "cli", "cwd": cwd},
     });
-    let response = http()
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("submit");
+    let response = support::send_while_alive(
+        "submit",
+        || {
+            http()
+                .post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(response.status(), 201, "submit must be accepted");
     let value: Value = response.json().await.expect("json");
     value["work"]["id"].as_str().expect("work id").to_string()
