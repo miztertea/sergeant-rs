@@ -1126,30 +1126,6 @@ const ALLOWLIST: &[Allowed] = &[
             decides pass/fail, not how long any single poll took.",
     },
     Allowed {
-        file: "tests/m5_projections.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(2);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m5_projections.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m5_projections.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m5_projections.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/m6_surfaces.rs",
         needle: "let deadline = Instant::now() + Duration::from_secs(20);",
         category: "deadline-loop-residue",
@@ -1335,6 +1311,29 @@ const ALLOWLIST: &[Allowed] = &[
             teardown wait that proceeds regardless (stop_daemon in tests/m2_daemon_api.rs and \
             tests/m3_execution.rs)' -- it never asserts or panics, just gives the descriptor \
             file up to 10s and returns either way.",
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "owned-wait-budget",
+        reason: "wait_for_a_quiet_journal's own single-sample stability check (`len == \
+            previous` at a 250ms cadence): its own doc explains at length why the 250ms yield \
+            interval is load-bearing on a current-thread runtime (the committer's fair \
+            tokio::sync::Mutex needs the runtime to actually turn between samples) -- the same \
+            'the cadence itself is the property under test' reasoning \
+            tests/m9_watch.rs::r_watch_10a's own kept entry already establishes. \
+            support::wait_until's own poll cadence is different and not tunable per call site.",
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
+        category: "owned-wait-budget",
+        reason: "otlp_export_reaches_a_collector_listening_on_the_configured_endpoint's own \
+            background TCP accept-loop thread: it is a stand-in collector SERVER, not a wait \
+            for a condition -- `listener.accept()` inside the loop has nothing in common with \
+            support::wait_until_sync's `FnMut() -> bool` predicate shape, and the thread's own \
+            exit (timeout or a captured trace POST) is not this test's verdict either way: the \
+            main thread's own assert! after `collector.join()` is.",
     },
 ];
 
