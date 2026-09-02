@@ -1416,8 +1416,18 @@ const ALLOWLIST: &[Allowed] = &[
     Allowed {
         file: "tests/w3_client_surface.rs",
         needle: "let end = Instant::now() + deadline;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
+        category: "owned-wait-budget",
+        reason: "the module's own `wait_for` helper, after this wave's fold, has exactly one \
+            surviving caller: the D6 scoped-watch test's own decisive assertion that \
+            estate A's watch stays *silent* on estate B's transition within a fixed 800ms \
+            window (`assert!(!quiet, ...)`) -- the same shape-(a) residue \
+            `tests/y1_worker_transport.rs`'s own kept entry above already names: a fixed \
+            observation window proving an absence, with no positive state to poll for and no \
+            'eventually true or panic' contract to fold into (wait_until_sync panics when the \
+            predicate never becomes true, which is exactly the passing case here). The other \
+            two former callers of `wait_for` (daemon-stop confirmation, the --all watch match) \
+            wanted a genuine 'eventually true' wait and were folded directly onto \
+            support::wait_until_sync/HANG_BUDGET in this same commit.",
     },
     Allowed {
         file: "tests/w4_read_surfaces.rs",
