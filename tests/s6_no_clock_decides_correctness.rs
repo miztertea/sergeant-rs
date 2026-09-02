@@ -1168,12 +1168,6 @@ const ALLOWLIST: &[Allowed] = &[
         reason: DEADLINE_LOOP_RESIDUE_REASON,
     },
     Allowed {
-        file: "tests/c2_light/m10_harness.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/codex_backend.rs",
         needle: "let deadline = Instant::now() + Duration::from_secs(10);",
         category: "deadline-loop-residue",
