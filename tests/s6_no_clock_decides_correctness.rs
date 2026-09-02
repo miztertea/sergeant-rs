@@ -1126,36 +1126,6 @@ const ALLOWLIST: &[Allowed] = &[
             decides pass/fail, not how long any single poll took.",
     },
     Allowed {
-        file: "tests/agy_backend.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/agy_backend.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/agy_backend.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/agy_backend.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(180);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/agy_backend.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(300);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/codex_backend.rs",
         needle: "let deadline = Instant::now() + Duration::from_secs(10);",
         category: "deadline-loop-residue",
