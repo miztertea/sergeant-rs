@@ -1,22 +1,35 @@
-//! S6 scan-follow-retry: the structural guard the AMENDMENT (owner,
-//! 2026-08-30, `knowledge/evidence/resources/host-atlas-s6-series/
-//! brief-scan-front-door.md`) asks for — "a prose prohibition is what let
-//! this class recur. Pin it: a structural test that fails when the rule is
-//! violated."
+//! **The owner's ruling** (2026-09-02,
+//! `knowledge/rulings/owner-rulings/tests-must-be-deterministic-2026-09-02.md`
+//! in the workspace): "Tests must be deterministic. Time is non
+//! deterministic, it's an arbitrary duration." A test's verdict may depend
+//! only on observed state. A sleep followed by an assertion is a defect at
+//! any length — lengthening it moves the failure to a slower machine, it
+//! does not remove it. Waiting happens on state, never on time: the test
+//! observes the thing it is waiting for and proceeds when it sees it. A
+//! wait budget is a termination bound, not a verdict — the only reason a
+//! bounded wait exists is so a hung test ends instead of holding CI to its
+//! cap; exhausting it reports "state X was never observed within the
+//! bound," never a silent pass and never a claim that the code was slow.
+//! This file is the structural guard for that ruling, over both halves of
+//! the crate's own Rust: `src/`, where the class first recurred, and
+//! `tests/`, which the ruling names explicitly as the gap that let it
+//! reach a release (item 4 below).
 //!
-//! **The rule.** "Elapsed time may never decide whether something is
-//! correct... `POLL_FAILURES_TOLERATED = 5` — a guessed number standing in
-//! for 'the daemon is gone'. Ask the real question instead: is the daemon
-//! still there? ... Distinguish the two by state, not by a count." Cadence
+//! **`src/`: the scan-follow-retry guard.** Grown out of the AMENDMENT
+//! (owner, 2026-08-30, `knowledge/evidence/resources/host-atlas-s6-series/
+//! brief-scan-front-door.md`) — "a prose prohibition is what let this class
+//! recur. Pin it: a structural test that fails when the rule is violated."
+//! "Elapsed time may never decide whether something is correct...
+//! `POLL_FAILURES_TOLERATED = 5` — a guessed number standing in for 'the
+//! daemon is gone'. Ask the real question instead: is the daemon still
+//! there? ... Distinguish the two by state, not by a count." Cadence
 //! (`SCAN_POLL`) and reporting a duration are explicitly permitted; a count
-//! or deadline that a caller's own success/failure branches on is not.
-//!
-//! **What this test covers, and says so rather than implying more.** Per
+//! or deadline that a caller's own success/failure branches on is not. Per
 //! the AMENDMENT's own text (`brief-scan-front-door.md:130`, "every
 //! `Instant`/`deadline`/`elapsed` construct in the crate sits on an
 //! explicit allowlist") and its closing instruction
 //! (`brief-scan-front-door.md:145-147`, "this covers *this* crate's Rust;
-//! it does not reach the shell scripts under `scripts/`"): this guard walks
+//! it does not reach the shell scripts under `scripts/`"): this half walks
 //! the **production code** (everything before each file's own
 //! `#[cfg(test)]` test-module boundary — this crate's own convention, see
 //! e.g. `src/cli.rs:7553`) of every `.rs` file under `src/` — the whole
@@ -24,11 +37,11 @@
 //! outside this walk for exactly the reason the AMENDMENT names, not a
 //! second, invented carve-out.
 //!
-//! **Every real construct this widened walk finds sits on `ALLOWLIST`
-//! below, each with its own reviewed category and reason** — there is no
-//! file-level exemption for any production `.rs` file, including the ones
-//! that bound a process or resource this code directly owns and must
-//! reclaim (a spawned child killed past its own budget in
+//! **Every real construct this walk finds sits on `ALLOWLIST` below, each
+//! with its own reviewed category and reason** — there is no file-level
+//! exemption for any production `.rs` file, including the ones that bound
+//! a process or resource this code directly owns and must reclaim (a
+//! spawned child killed past its own budget in
 //! `src/runtime/atlas/worker.rs`, whose own module doc frames its deadline
 //! as a "HANG guard"; a filesystem lock's acquisition timeout in
 //! `src/runtime/repolock.rs`/`src/runtime/fsutil.rs`; a supervised git
@@ -38,8 +51,53 @@
 //! reason — but it is not exempted from the guard the way an earlier
 //! version of this file exempted it by file name; it is allowlisted like
 //! everything else, on its own reviewed merits.
+//!
+//! **`tests/`: the sleep guard (wave `brief-sleep-and-hope.md`,
+//! 2026-09-02).** The `src/` guard above walked only production code; the
+//! test suite's own sleeps were the actual gap, and the release failure
+//! that proved it is named in the ruling: release run 33591670053, Gate D,
+//! `tests/c2_light/e_periodic_sweep.rs`'s 200 ms sleep, which slept then
+//! asserted a background tick had fired — passing on a fast dry-run
+//! runner an hour earlier and failing on CI's slower one. `all_test_files`
+//! walks every `.rs` file under `tests/` recursively, excluding
+//! `tests/fixtures/` — data corpora this suite reads as *input* (including
+//! deliberately malformed Rust, e.g. a corpus gate's own red-side fixture),
+//! never test code for this guard to itself parse and classify. Unlike
+//! `src/`, an integration-test file carries no `#[cfg(test)]` boundary, so
+//! the whole file is in scope.
+//!
+//! A `sleep(` call is legitimate only inside a loop whose body actually
+//! checks observed state and terminates on it (`loop_body_checks_state`):
+//! a `while` condition that is not a bare `true`, or — for `loop`, `for`,
+//! and a `while true` — a `break`/`continue`/`return`/panic reached only
+//! through a conditional inside the body. Lexical nesting alone is not a
+//! state check: a fixed-count `for _ in 0..N { sleep(...) }` with no
+//! conditional exit is a fixed-count busy-wait, indistinguishable in
+//! effect from the forbidden `POLL_FAILURES_TOLERATED` shape, and the
+//! guard flags it exactly as it would a bare sleep outside any loop.
+//!
+//! Every sleep that fails that test and is not converted sits on
+//! `ALLOWLIST` (the same `Allowed` shape and `allowlist_covers` check the
+//! `src/` half already uses, R2). Two shapes recur in the `tests/` section
+//! of `ALLOWLIST`, named per entry rather than once: (a) a fixed
+//! observation window proving an **absence** — nothing happened — which
+//! has no positive state to poll for because the assertion itself is
+//! "still nothing by now"; (b) pacing one action against another, or
+//! against a subprocess that exposes no readiness signal, where the delay
+//! spaces two things rather than deciding an outcome. Say plainly: shape
+//! (b) is the *same non-determinism* as the defect this wave fixed — a
+//! duration standing in for a signal that was never actually observed —
+//! and it is tolerated only as an enumerated, reasoned residue, never a
+//! sanctioned pattern. Each such site is a product finding (a missing
+//! readiness signal on the thing being paced against) awaiting its own
+//! fix, not a closed matter. The one conversion target for a genuine wait
+//! on state is `tests/support/mod.rs::wait_until`/`wait_until_sync`;
+//! reach for it before reaching for the allowlist.
 
 use std::path::{Path, PathBuf};
+
+use syn::spanned::Spanned as _;
+use syn::visit::{self, Visit};
 
 /// Every `.rs` file under `src/`, walked the same way
 /// `tests/a1_floor_awareness.rs::all_src_files` already does (R2 — reuse,
@@ -490,7 +548,224 @@ const ALLOWLIST: &[Allowed] = &[
                   already allowlisted at `src/api.rs`'s `due_interrupts` call site, not a guess \
                   standing in for unknown remote state.",
     },
+    // ------------------------------------------------ tests/ (S6, item 3)
+    //
+    // Every entry below is a `sleep(` this wave's real syn-based walk found
+    // outside any while/loop/for construct and judged genuinely behavioral
+    // rather than converting to `support::wait_until` — brief-sleep-and-hope.md
+    // item 3: "A site whose sleep is genuinely behavioral... goes on the
+    // allowlist with the reason written for a reader who disagrees — the
+    // panel will." Two shapes recur and are named per entry rather than once:
+    // (a) a fixed observation window proving an ABSENCE (nothing happened),
+    // which has no positive state to poll for because the assertion itself
+    // is "still nothing by now"; (b) deliberately spacing two actions (a
+    // scripted delay, a race setup) where the delay's role is pacing, not a
+    // verdict.
+    Allowed {
+        file: "tests/c4_repo_lock.rs",
+        needle: "std::thread::sleep(hold_for);",
+        category: "cadence",
+        reason: "spaces this thread's own release of a lock *it* holds so the acquisition \
+                  under test is genuinely waiting on a live foreign holder when it starts, not \
+                  deciding whether that acquisition succeeded — `repolock::acquire`'s own \
+                  `taken` result decides that, checked separately below.",
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "std::thread::sleep(Duration::from_millis(200));",
+        category: "cadence",
+        reason: "paces a spawned scripted-stub thread's own turn-release relative to `launch`, \
+                  modelling a backend that takes a moment to accept before it starts — the \
+                  assertion below (`launch must succeed`) is decided by `launch`'s own Result, \
+                  never by this delay.",
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "std::thread::sleep(Duration::from_millis(500));",
+        category: "cadence",
+        reason: "paces the interrupt relative to a just-sent long turn so the interrupt lands \
+                  mid-stream rather than before the turn starts producing output — what the \
+                  interrupt actually did is decided by `observe`'s reported signal below, never \
+                  by this delay's exact length.",
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "std::thread::sleep(Duration::from_millis(400));",
+        category: "cadence",
+        reason: "a second pacing delay before interrupt, immediately after a `while` loop \
+                  (already state-terminating, not flagged) that confirmed the turn had started; \
+                  this widens the mid-stream window the same way the entry above does, and the \
+                  interrupt's outcome is still decided by `observe`, not by this sleep.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "std::thread::sleep(Duration::from_millis(300));",
+        category: "cadence",
+        reason: "spaces two racing client spawns (racer A, then this delay, then racer B) to \
+                  deliberately construct the race the test exercises; both clients' own exit \
+                  status is asserted afterward, never a property of this delay's length.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(50)).await;",
+        category: "cadence",
+        reason: "a task-scheduling race between the spawned `handle.shutdown()` future and \
+                  this test releasing an already-confirmed-stalled observe (confirmed via \
+                  `fake.await_stalled_observes` immediately above, a real state wait, not \
+                  flagged): the fake's gate API reports how many observers are stalled but has \
+                  no distinct signal for 'shutdown specifically is now the one blocked on it' \
+                  as opposed to any other in-flight caller. Adding that signal touches \
+                  `src/backend/fake.rs`, out of this wave's scope (brief: 'do not touch src/ \
+                  unless a test's wait has no observable state to wait on — then that is a \
+                  product finding'); flagged here rather than converted, for the panel to weigh \
+                  whether that signal is worth adding in a later wave.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(300)).await;",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence — no leaked permit lets B \
+                  admit while A's stop is only requested, not yet confirmed stopped (the \
+                  comment above this line: 'enough to catch a leaked permit without making the \
+                  test itself slow'). There is no positive state to wait on since the property \
+                  under test is precisely that nothing (an illegitimate admission) happens \
+                  within the window.",
+    },
+    Allowed {
+        file: "tests/m3_execution.rs",
+        needle: "tokio::time::sleep(poll * 2).await;",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence — the work must still read \
+                  `active`, never having concluded early on an ambiguous signal (the comment \
+                  above: 'a signal that never arrives must never read as a conclusion on its \
+                  own'). No positive state to wait on: the property under test is that nothing \
+                  (a premature conclusion) has happened by this point.",
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(1000)).await;",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence (TH-5 test-honesty finding, \
+                  named in the comment above): the completion driver must journal nothing \
+                  across ~5 polling ticks of quiet. No positive state exists to wait on — the \
+                  property under test is that the journal stays exactly as long as it was.",
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "std::thread::sleep(Duration::from_millis(750));",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence: no write lands after `stop` \
+                  has already returned and `observe` already reports `Exited` (both checked \
+                  above, real state, not flagged). No positive state to wait on — the property \
+                  under test is that the directory listing stays byte-identical.",
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "std::thread::sleep(Duration::from_secs(6));",
+        category: "cadence",
+        reason: "a live external-API test (`claude_live_enabled`-gated, not exercised without \
+                  a live credential) modelling how long a real turn needs to run before it is \
+                  genuinely mid-generation, not merely just-started — the comment above cites a \
+                  measured ~3.5s to first API activity. Converting to poll `observe()` for \
+                  `Running` risks catching the turn the instant client-side state flips to \
+                  Running, which per that same measurement can precede real generation activity \
+                  — exactly the race this test needs to not have. Left as a measured, \
+                  provenance-cited delay rather than guess-converted against a live surface this \
+                  environment cannot exercise to verify the replacement is actually safe.",
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "std::thread::sleep(Duration::from_millis(200));",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence (the comment above: 'give a \
+                  wrongly-still-spawned background thread a chance to run before asserting, so \
+                  a regression that double-fires is actually caught'). No positive state to \
+                  wait on — the property under test is that the counter does not increment a \
+                  second time.",
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(750)).await;",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence, after `shutdown` has already \
+                  returned (real state, not this timer): a disabled daemon's export task must \
+                  not have dialed the collector. No positive state to wait on — the property \
+                  under test is that the collector's hit counter stays at zero.",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "std::thread::sleep(Duration::from_secs(1));",
+        category: "cadence",
+        reason: "paces hanging up the pty until after the watch has had a chance to install \
+                  itself (the comment above: 'the watch installs itself as the loop starts; \
+                  hang up after it has'), a TUI subprocess with no externally observable \
+                  'watch installed' signal short of parsing its own rendered output — the \
+                  decisive assertion below (`pid_alive`) is a real state check, not this delay.",
+    },
+    Allowed {
+        file: "tests/opencode_backend.rs",
+        needle: "std::thread::sleep(Duration::from_millis(100));",
+        category: "cadence",
+        reason: "paces a directly-spawned stub subprocess (not this crate's own backend) until \
+                  it has reached its own internal stall loop, the comment above: 'give the stub \
+                  a moment to reach its own stall loop' — an external process with no exposed \
+                  readiness signal; what the test actually asserts comes later, checked against \
+                  the backend's own observed state, never this delay.",
+    },
+    Allowed {
+        file: "tests/opencode_backend.rs",
+        needle: "std::thread::sleep(Duration::from_secs(2));",
+        category: "cadence",
+        reason: "paces an abort against a live shell tool (`sleep 30 && echo done-sleeping`) so \
+                  the tool has genuinely started before it is interrupted — the file's own later \
+                  comment on this same test documents this transport's abort/settle timing as \
+                  live-measured with no prior figure to cite more precisely; the actual \
+                  outcome is decided by `wait_for_settled_within` below, a real state wait.",
+    },
+    Allowed {
+        file: "tests/support/mod.rs",
+        needle: "std::thread::sleep(std::time::Duration::from_millis(10));",
+        category: "cadence",
+        reason: "each of 8 spawned threads holds `CrossProcessLock` for a fixed slice so the \
+                  others have a real window to race for it — the point under test is mutual \
+                  exclusion, measured by the peak overlap counter checked after every thread \
+                  joins, never by this hold's length.",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "std::thread::sleep(Duration::from_secs(3600));",
+        category: "owned-wait-budget",
+        reason: "the role helper's own comment above this loop: 'block forever — the parent \
+                  kills this process; that is the event under test'. There is no state to check \
+                  because the fixture is deliberately not supposed to end on its own; what is \
+                  under test is the parent's kill, asserted separately, never this loop's \
+                  own return.",
+    },
+    Allowed {
+        file: "tests/w3_client_surface.rs",
+        needle: "std::thread::sleep(Duration::from_millis(300));",
+        category: "cadence",
+        reason: "both occurrences in this file (before triggering B's transition, and again \
+                  before the second `--all` watcher): pace triggering a Work transition until \
+                  after a just-spawned `sgt watch` subprocess has attached (read the journal \
+                  head, opened its SSE stream) — the comment above: 'otherwise this is racing \
+                  an unstarted subscriber, not testing the filter'. The subprocess exposes no \
+                  readiness signal short of parsing its own piped stdout stream, which this test \
+                  does not otherwise read; what is actually asserted is the watcher's own \
+                  captured output, checked separately after this delay.",
+    },
 ];
+
+/// Whether some entry in `allowlist` names both `file_label` and a `needle`
+/// that occurs in `line` — the one membership check both the `src/` guard
+/// (`unallowed_time_constructs`) and the `tests/` guard
+/// (`unallowed_test_sleeps`) apply, so the two guards share it rather than
+/// each carrying its own copy (R6).
+fn allowlist_covers(allowlist: &[Allowed], file_label: &str, line: &str) -> bool {
+    allowlist
+        .iter()
+        .any(|a| a.file == file_label && line.contains(a.needle))
+}
 
 /// Every `Instant::now()`, `.elapsed()`, or `deadline`-named construct in
 /// `text`'s **production code** — everything before this crate's own
@@ -549,9 +824,7 @@ fn unallowed_time_constructs(
         if !is_construct {
             continue;
         }
-        let covered = allowlist
-            .iter()
-            .any(|a| a.file == file_label && line.contains(a.needle));
+        let covered = allowlist_covers(allowlist, file_label, line);
         if !covered {
             violations.push((i + 1, line.trim().to_string()));
         }
@@ -669,5 +942,393 @@ async fn run_intelligence_scan_reintroduces_the_defect() {
         still_flagged.iter().any(|(line, _)| *line == 3),
         "the paired `while Instant::now() < deadline` line has no entry in `permissive` and \
          must still be flagged: {still_flagged:?}"
+    );
+}
+
+// ---------------------------------------------------------------- tests/
+
+/// Every `.rs` file under `tests/`, walked recursively. Unlike `src/`,
+/// integration test files carry no `#[cfg(test)]` boundary — every line of
+/// an integration-test file *is* test code, so the whole file is in scope
+/// (brief-sleep-and-hope.md item 1: "extend the no-clock structural guard
+/// to `tests/`").
+fn all_test_files() -> Vec<PathBuf> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut found = Vec::new();
+    let mut stack = vec![dir];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read tests") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                // `tests/fixtures/` is data corpora this suite reads as
+                // *input* (deliberately malformed Rust included, e.g.
+                // `tslp_corpus/malformed/broken.rs` — the corpus gate's own
+                // red-side fixture per its own doc comment), never test
+                // code the guard should itself parse and classify.
+                if path.file_name().is_some_and(|n| n == "fixtures") {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// One raw `sleep(` call found by a real `syn` parse (`full` + `visit`,
+/// 3.0.3 — already resolved transitively via `async-trait`, R5), with the
+/// one fact this guard's classification turns on: does the `while`/`loop`/
+/// `for` construct directly containing it actually check *observed state*
+/// and terminate on it — a non-trivial `while` condition, or a body-level
+/// conditional break/continue/return/panic ([`loop_body_checks_state`]) —
+/// or is it bare, or lexically inside a loop that never checks anything.
+///
+/// A brace/regex scanner is explicitly rejected (brief-sleep-and-hope.md
+/// item 1: "a real parse... beats a brace scanner that a reformat evades")
+/// — this walks the actual AST, so reindenting or reformatting the file
+/// cannot silently detune the check the way a column/brace count would.
+///
+/// A bounded `for _ in 0..N { ...check state...; sleep(...) }` counts as
+/// "inside a loop" the same as `while`/`loop`: this crate's own dominant
+/// polling idiom (e.g. `completed_work()` above:
+/// `for _ in 0..200 { if <state>.is_terminal() { return } sleep(25ms) }`)
+/// checks real observed state every iteration and returns/panics on it;
+/// the fixed iteration count times the fixed sleep is just an owned wait
+/// budget spelled as a count instead of an `Instant` deadline (the same
+/// `owned-wait-budget` class the `src/` guard's own `ALLOWLIST` already
+/// recognizes), not the forbidden `POLL_FAILURES_TOLERATED` shape — that
+/// shape substitutes a *failure count* for a state check ("assume the
+/// daemon is gone after 5 failures" instead of asking "is it still
+/// there") rather than checking state every pass and merely bounding how
+/// many passes that check gets.
+struct SleepSite {
+    line: usize,
+    in_state_loop: bool,
+}
+
+/// Whether `path` names a panic-family macro (`panic!`, `assert!`,
+/// `assert_eq!`, `assert_ne!`, `unreachable!`) — the "panics on it" half of
+/// this module's own "checks real observed state every iteration and
+/// returns/panics on it" claim (doc above).
+fn is_panic_macro_path(path: &syn::Path) -> bool {
+    path.segments.last().is_some_and(|s| {
+        matches!(
+            s.ident.to_string().as_str(),
+            "panic" | "assert" | "assert_eq" | "assert_ne" | "unreachable"
+        )
+    })
+}
+
+/// Whether a `while` loop's condition is the literal `true` — the shape
+/// that (like a bare `loop {}`) contributes no state check of its own, so
+/// [`loop_body_checks_state`] must find one in the body instead.
+fn is_literal_true(cond: &syn::Expr) -> bool {
+    matches!(
+        cond,
+        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(b), .. }) if b.value
+    )
+}
+
+/// Whether `block` — a loop body — contains a `break`, `continue`,
+/// `return`, or panic-family macro call that is *conditional*: reached only
+/// through an `if` or `match` inside `block`, not a bare unconditional one.
+/// This is the structural form of this module's own claim that a counted
+/// loop "checks real observed state every iteration and returns/panics on
+/// it" (doc above) — a `for _ in 0..N { sleep(...) }` with no such
+/// conditional has nothing deciding correctness; it is a fixed-count
+/// busy-wait wearing the `owned-wait-budget` shape, not the real thing.
+/// Does not descend into a loop or closure nested inside `block` — that
+/// construct must justify its own `sleep` independently.
+fn loop_body_checks_state(block: &syn::Block) -> bool {
+    struct CheckFinder {
+        in_conditional: u32,
+        found: bool,
+    }
+
+    impl<'ast> Visit<'ast> for CheckFinder {
+        fn visit_expr_while(&mut self, _node: &'ast syn::ExprWhile) {}
+        fn visit_expr_loop(&mut self, _node: &'ast syn::ExprLoop) {}
+        fn visit_expr_for_loop(&mut self, _node: &'ast syn::ExprForLoop) {}
+        fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {}
+
+        fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+            self.in_conditional += 1;
+            visit::visit_expr_if(self, node);
+            self.in_conditional -= 1;
+        }
+
+        fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+            self.in_conditional += 1;
+            visit::visit_expr_match(self, node);
+            self.in_conditional -= 1;
+        }
+
+        fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
+            if self.in_conditional > 0 {
+                self.found = true;
+            }
+            visit::visit_expr_break(self, node);
+        }
+
+        fn visit_expr_continue(&mut self, node: &'ast syn::ExprContinue) {
+            if self.in_conditional > 0 {
+                self.found = true;
+            }
+            visit::visit_expr_continue(self, node);
+        }
+
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if self.in_conditional > 0 {
+                self.found = true;
+            }
+            visit::visit_expr_return(self, node);
+        }
+
+        fn visit_macro(&mut self, node: &'ast syn::Macro) {
+            if self.in_conditional > 0 && is_panic_macro_path(&node.path) {
+                self.found = true;
+            }
+            visit::visit_macro(self, node);
+        }
+    }
+
+    let mut finder = CheckFinder {
+        in_conditional: 0,
+        found: false,
+    };
+    finder.visit_block(block);
+    finder.found
+}
+
+struct SleepVisitor {
+    /// Whether the loop directly containing the current position — the
+    /// innermost one, per [`loop_body_checks_state`]'s doc — has been shown
+    /// to check state and branch on it. Empty outside any loop.
+    loop_checks_state: Vec<bool>,
+    sites: Vec<SleepSite>,
+}
+
+impl<'ast> Visit<'ast> for SleepVisitor {
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        let checks = !is_literal_true(&node.cond) || loop_body_checks_state(&node.body);
+        self.loop_checks_state.push(checks);
+        visit::visit_expr_while(self, node);
+        self.loop_checks_state.pop();
+    }
+
+    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        self.loop_checks_state
+            .push(loop_body_checks_state(&node.body));
+        visit::visit_expr_loop(self, node);
+        self.loop_checks_state.pop();
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.loop_checks_state
+            .push(loop_body_checks_state(&node.body));
+        visit::visit_expr_for_loop(self, node);
+        self.loop_checks_state.pop();
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        let is_sleep = matches!(
+            &*node.func,
+            syn::Expr::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "sleep")
+        );
+        if is_sleep {
+            self.sites.push(SleepSite {
+                line: node.span().start().line,
+                in_state_loop: self.loop_checks_state.last().copied().unwrap_or(false),
+            });
+        }
+        visit::visit_expr_call(self, node);
+    }
+}
+
+fn sleep_sites(text: &str) -> Vec<SleepSite> {
+    let file = syn::parse_file(text).unwrap_or_else(|e| panic!("parse: {e}"));
+    let mut visitor = SleepVisitor {
+        loop_checks_state: Vec::new(),
+        sites: Vec::new(),
+    };
+    visitor.visit_file(&file);
+    visitor.sites
+}
+
+/// Every `sleep(` call in `text` (a `tests/` file, `file_label`) that is
+/// neither inside a state-terminating `while`/`loop` nor covered by
+/// `allowlist` — reusing the exact same `Allowed` shape and `file`+`needle`
+/// matching the `src/` guard above already uses (R2), so the same
+/// "matches nothing"/"no real reason" self-checks in the test below cover
+/// these entries too without a second, parallel check.
+fn unallowed_test_sleeps(
+    file_label: &str,
+    text: &str,
+    allowlist: &[Allowed],
+) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut violations = Vec::new();
+    for site in sleep_sites(text) {
+        if site.in_state_loop {
+            continue;
+        }
+        let content = lines
+            .get(site.line - 1)
+            .copied()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let covered = allowlist_covers(allowlist, file_label, &content);
+        if !covered {
+            violations.push((site.line, content));
+        }
+    }
+    violations
+}
+
+/// The `tests/` half of the guard (brief-sleep-and-hope.md item 1): every
+/// raw `sleep(` call in `tests/**/*.rs` sits inside a loop that can
+/// terminate on observed state, or on `ALLOWLIST` with a real reason — same
+/// entry shape and same self-checks the `src/` guard above already has
+/// (R2), just widened to a second file set and a second construct.
+#[test]
+fn every_sleep_in_tests_sits_inside_a_terminating_loop_or_an_explicit_allowlist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all_violations = Vec::new();
+    for path in all_test_files() {
+        let file = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_str()
+            .expect("utf8 path")
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", file));
+        for (line, content) in unallowed_test_sleeps(&file, &text, ALLOWLIST) {
+            all_violations.push(format!("{file}:{line}: {content}"));
+        }
+    }
+    assert!(
+        all_violations.is_empty(),
+        "a `sleep(` call exists in tests/ that is neither inside a state-terminating \
+         while/loop nor explained by an ALLOWLIST entry — convert it to wait on the state it \
+         is hoping for (tests/support/mod.rs::wait_until), or add a reviewed `Allowed` entry \
+         naming why it is genuinely behavioral, in \
+         tests/s6_no_clock_decides_correctness.rs:\n{}",
+        all_violations.join("\n")
+    );
+}
+
+/// Proof the sleep guard above is not vacuous, same standing-regression
+/// shape as `the_guard_fails_on_a_real_deadline_decides_a_verdict_construct_with_no_allowlist_entry`
+/// above: a synthetic bare `sleep(` with no loop and no allowlist entry
+/// must be flagged; the same call once inside a `while` loop, or once
+/// allowlisted, must not be.
+#[test]
+fn the_sleep_guard_fails_on_a_bare_sleep_with_no_loop_and_no_allowlist_entry() {
+    let bare = "\
+async fn hopes_for_the_best() {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(some_background_task_finished());
+}
+";
+    let violations = unallowed_test_sleeps("tests/x_example.rs", bare, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "the checker must flag a bare sleep-then-assert with no loop and no allowlist entry; \
+         it did not, which means the guard test above is vacuous"
+    );
+    assert!(
+        violations.iter().any(|(line, _)| *line == 2),
+        "expected the flagged construct at its real line, got: {violations:?}"
+    );
+
+    let in_loop = "\
+async fn polls_for_state() {
+    while !some_background_task_finished() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+";
+    let loop_violations = unallowed_test_sleeps("tests/x_example.rs", in_loop, ALLOWLIST);
+    assert!(
+        loop_violations.is_empty(),
+        "a sleep inside a while loop that terminates on observed state must not be flagged: \
+         {loop_violations:?}"
+    );
+
+    let allowlisted: Vec<Allowed> = vec![Allowed {
+        file: "tests/x_example.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(200)).await;",
+        category: "cadence",
+        reason: "synthetic fixture only, proving the tests/ allowlist path itself is reachable",
+    }];
+    let now_covered = unallowed_test_sleeps("tests/x_example.rs", bare, &allowlisted);
+    assert!(
+        now_covered.is_empty(),
+        "the same bare sleep, once given a matching allowlist entry, must no longer be \
+         flagged: {now_covered:?}"
+    );
+}
+
+/// F-TH-01: lexical nesting inside a `while`/`loop`/`for` is not by itself
+/// proof of a state check — a `for _ in 0..N { sleep(...) }` with no
+/// conditional exit is a fixed-count busy-wait, indistinguishable in effect
+/// from the forbidden bare `POLL_FAILURES_TOLERATED` shape (this module's
+/// own doc, above), and the guard must flag it exactly as it would flag a
+/// bare sleep. The doctrine-sanctioned counterexample right above it — a
+/// `for` loop whose body *does* check state and conditionally returns —
+/// must still pass, so the fix is the conditional exit, not merely being
+/// inside a loop.
+#[test]
+fn the_sleep_guard_fails_on_a_state_blind_loop_even_though_it_is_lexically_a_loop() {
+    let state_blind = "\
+async fn hopes_five_times() {
+    for _ in 0..5 {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+";
+    let violations = unallowed_test_sleeps("tests/x_example.rs", state_blind, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "a fixed-count loop whose body never checks state and never conditionally exits must \
+         still be flagged — lexical nesting alone is not a state check"
+    );
+
+    let state_blind_bare_loop = "\
+async fn spins_forever() {
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+";
+    let bare_loop_violations =
+        unallowed_test_sleeps("tests/x_example.rs", state_blind_bare_loop, ALLOWLIST);
+    assert!(
+        !bare_loop_violations.is_empty(),
+        "a bare `loop` with no conditional break/return/panic must still be flagged"
+    );
+
+    let genuinely_checked = "\
+async fn polls_five_times() {
+    for _ in 0..5 {
+        if some_background_task_finished() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+";
+    let checked_violations =
+        unallowed_test_sleeps("tests/x_example.rs", genuinely_checked, ALLOWLIST);
+    assert!(
+        checked_violations.is_empty(),
+        "a fixed-count loop whose body conditionally returns on real state must not be \
+         flagged: {checked_violations:?}"
     );
 }

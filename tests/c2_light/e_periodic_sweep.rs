@@ -176,11 +176,35 @@ async fn periodic_sweep_walks_every_admitted_estate_and_mutates_nothing() {
     assert!(before_a.contains("sergeant/"), "{before_a}");
     assert!(before_b.contains("sergeant/"), "{before_b}");
 
-    // Several completion-poll ticks, each one periodic-sweep-eligible —
-    // enough for the background caller to have walked both estates at least
-    // once if it iterates the registry at all.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // S6 (brief-sleep-and-hope.md): wait on the actual state the old fixed
+    // 200ms sleep was hoping for — both estates present in the sweep log —
+    // rather than guessing a duration is enough. Budget provenance: the CI
+    // failure this converts away from (release run 33591670053, Gate D)
+    // was this exact 200ms sleep losing its race under `cargo llvm-cov`
+    // instrumentation; 10s is generous relative to the `completion_poll:
+    // Duration::from_millis(15)` cadence configured above, which is what
+    // actually drives how often `maybe_run_periodic_sweep` gets a chance to
+    // fire, matching the budget shape `support::wait_until`'s own callers
+    // already use (`tests/w4_doctor_journal_growth.rs`, 10s).
+    let root_a_display = root_a.path().display().to_string();
+    let root_b_display = root_b.path().display().to_string();
+    support::wait_until(
+        "the periodic sweep caller has logged running against both admitted estates",
+        Duration::from_secs(10),
+        || async {
+            let swept = sweep_log.swept_estates();
+            swept.iter().any(|e| e == &root_a_display) && swept.iter().any(|e| e == &root_b_display)
+        },
+    )
+    .await;
 
+    // Decisive, now on a provably different basis than incidental timing
+    // margin: the wait above already proved the caller ran against both
+    // mounts (reverting the `maybe_run_periodic_sweep` wiring in
+    // `drive_completions` makes that wait time out, rather than merely
+    // making these assertions pass vacuously the way the old sleep let
+    // them). What remains to check is the property the caller must not
+    // have: classification never mutates.
     assert_eq!(
         before_a,
         refs_in(&mount_a),
@@ -190,23 +214,6 @@ async fn periodic_sweep_walks_every_admitted_estate_and_mutates_nothing() {
         before_b,
         refs_in(&mount_b),
         "estate B's ref store must be byte-identical after periodic sweep ticks"
-    );
-
-    // Decisive: the periodic caller must actually have executed against
-    // both mounts, not merely have left them unmutated by never firing at
-    // all. Reverting the `maybe_run_periodic_sweep` wiring in
-    // `drive_completions` makes this fail while the ref-store assertions
-    // above keep passing vacuously.
-    let swept = sweep_log.swept_estates();
-    let root_a_display = root_a.path().display().to_string();
-    let root_b_display = root_b.path().display().to_string();
-    assert!(
-        swept.iter().any(|e| e == &root_a_display),
-        "periodic sweep caller never logged running against estate A ({root_a_display}); swept: {swept:?}"
-    );
-    assert!(
-        swept.iter().any(|e| e == &root_b_display),
-        "periodic sweep caller never logged running against estate B ({root_b_display}); swept: {swept:?}"
     );
 
     handle.shutdown().await;

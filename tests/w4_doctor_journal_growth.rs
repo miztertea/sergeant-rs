@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -103,36 +103,39 @@ async fn submit(
     resp.json().await.expect("json")
 }
 
-async fn wait_until<F: Fn(&Value) -> bool>(http: &reqwest::Client, handle: &DaemonHandle, ok: F) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        let system: Value = http
-            .get(format!("{}/v1/work", handle.endpoint))
-            .bearer_auth(&handle.token)
-            .send()
-            .await
-            .expect("list")
-            .json()
-            .await
-            .expect("json");
-        if ok(&system) {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("condition never became true");
+/// `GET /v1/work`'s system snapshot, fresh on each call — the one HTTP
+/// round trip [`wait_until_all_settled`] and the inline `support::wait_until`
+/// call below each poll through.
+async fn work_system(http: &reqwest::Client, handle: &DaemonHandle) -> Value {
+    http.get(format!("{}/v1/work", handle.endpoint))
+        .bearer_auth(&handle.token)
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json")
 }
 
+/// S6 fold (brief-sleep-and-hope.md item 2): this used to be a local
+/// `wait_until`/`wait_until_all_settled` pair, now calling the crate's one
+/// shared `support::wait_until` instead of a second/third near-duplicate.
 async fn wait_until_all_settled(http: &reqwest::Client, handle: &DaemonHandle) {
-    wait_until(http, handle, |system| {
-        system["works"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .all(|w| w["state"] == "completed" || w["state"] == "failed")
-            })
-            .unwrap_or(false)
-    })
+    support::wait_until(
+        "every work in the system reaches completed or failed",
+        Duration::from_secs(10),
+        || async {
+            work_system(http, handle)
+                .await
+                .get("works")
+                .and_then(Value::as_array)
+                .map(|rows| {
+                    rows.iter()
+                        .all(|w| w["state"] == "completed" || w["state"] == "failed")
+                })
+                .unwrap_or(false)
+        },
+    )
     .await;
 }
 
@@ -241,13 +244,21 @@ async fn journal_growth_warns_when_a_prune_is_stalled_and_names_the_blocking_wor
     for n in 0..5 {
         submit(&http, &handle, root.path(), &ulid(), &format!("work {n}")).await;
     }
-    wait_until(&http, &handle, |system| {
-        system["works"].as_array().is_some_and(|rows| {
-            rows.iter().all(|w| {
-                w["state"] == "completed" || w["state"] == "failed" || w["state"] == "needs_input"
-            }) && rows.iter().any(|w| w["state"] == "needs_input")
-        })
-    })
+    support::wait_until(
+        "all 5 works settle (completed/failed/needs_input) with exactly one stuck at needs_input",
+        Duration::from_secs(10),
+        || async {
+            work_system(&http, &handle).await["works"]
+                .as_array()
+                .is_some_and(|rows| {
+                    rows.iter().all(|w| {
+                        w["state"] == "completed"
+                            || w["state"] == "failed"
+                            || w["state"] == "needs_input"
+                    }) && rows.iter().any(|w| w["state"] == "needs_input")
+                })
+        },
+    )
     .await;
     // Read the stuck Work's own id back from the daemon rather than assuming
     // script-step order matches submission order.

@@ -346,6 +346,19 @@ sha2 = "0.10.9"
 # *fixture writer* and nothing else: no test opens Atlas's own store with it,
 # which is what `tests/x1_atlas_substrate.rs`'s one-owner assertion is about.
 duckdb = { version = "1", features = ["bundled", "json", "parquet"] }
+# S6 sleep-and-hope: `tests/s6_no_clock_decides_correctness.rs`'s tests/-side
+# guard needs a real parse of `sleep(` call sites (a brace/regex scanner is
+# evadable by reformatting — brief-sleep-and-hope.md item 1) rather than
+# guessing loop membership from indentation. `syn 3.0.3` is already resolved
+# into this exact build's `Cargo.lock` transitively (`async-trait 3.0.3` ->
+# `syn`), so naming it here adds ZERO packages to the resolved graph (R5,
+# verified below) — pinned to the exact transitive version already present.
+syn = { version = "3.0.3", features = ["full", "visit"] }
+# Paired with the `syn` entry above: `Span::start()`'s line number (used to
+# report a flagged `sleep(` site by file:line) needs proc-macro2's fallback
+# span-tracking, off by default outside a real proc-macro. Also already
+# resolved transitively at this exact version (via `syn`/`quote`) — R5.
+proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 
 # Packaging mechanics for release.yml (proposal §10: "`dist` may own packaging
 # mechanics. Sergeant owns release authority."). `ci = "github"` still selects
