@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -262,17 +262,20 @@ impl StubOpencode {
     }
 
     fn wait_for_grandchild_pid(&self) -> u32 {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(pid) = self.grandchild_pid() {
-                return pid;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "grandchild pid was never recorded"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            "grandchild pid was never recorded",
+            support::HANG_BUDGET,
+            || {
+                if let Some(pid) = self.grandchild_pid() {
+                    result = Some(pid);
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 
     fn launches(&self) -> Vec<Launch> {
@@ -309,35 +312,37 @@ impl StubOpencode {
     }
 
     fn wait_for_run_launches(&self, count: usize) -> Vec<Launch> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let launches = self.run_launches();
-            if launches.len() >= count {
-                return launches;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "only {} of {count} turn launches recorded",
-                launches.len()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            &format!("turn launches recorded never reached {count}"),
+            support::HANG_BUDGET,
+            || {
+                let launches = self.run_launches();
+                let done = launches.len() >= count;
+                if done {
+                    result = Some(launches);
+                }
+                done
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 
     fn wait_for_launches(&self, count: usize) -> Vec<Launch> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let launches = self.launches();
-            if launches.len() >= count {
-                return launches;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "only {} of {count} launches recorded",
-                launches.len()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            &format!("launches recorded never reached {count}"),
+            support::HANG_BUDGET,
+            || {
+                let launches = self.launches();
+                let done = launches.len() >= count;
+                if done {
+                    result = Some(launches);
+                }
+                done
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 }
 
@@ -447,20 +452,26 @@ fn sink() -> (sergeant_rs::backend::EventSink, Arc<Mutex<Vec<EventDraft>>>) {
 }
 
 fn wait_for_kind(events: &Arc<Mutex<Vec<EventDraft>>>, kind: &str) -> EventDraft {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(found) = events
-            .lock()
-            .expect("lock")
-            .iter()
-            .find(|event| event.kind == kind)
-            .cloned()
-        {
-            return found;
-        }
-        assert!(Instant::now() < deadline, "no {kind} event arrived");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        &format!("no {kind} event arrived"),
+        support::HANG_BUDGET,
+        || {
+            let found = events
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|event| event.kind == kind)
+                .cloned();
+            if let Some(found) = found {
+                result = Some(found);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 fn events_of_kind(events: &Arc<Mutex<Vec<EventDraft>>>, kind: &str) -> Vec<EventDraft> {
@@ -492,18 +503,20 @@ fn wait_for_settled_within(
     handle: &ExecutionHandle,
     budget: Duration,
 ) -> sergeant_rs::backend::Observation {
-    let deadline = Instant::now() + budget;
-    loop {
-        let observation = backend.observe(handle).expect("observe");
-        if observation.native != NativeState::Running {
-            return observation;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "turn never settled within {budget:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        &format!("turn never settled within {budget:?}"),
+        budget,
+        || {
+            let observation = backend.observe(handle).expect("observe");
+            let settled = observation.native != NativeState::Running;
+            if settled {
+                result = Some(observation);
+            }
+            settled
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// W3: poll until the stage parks on a `NeedsInput` signal (§7.1/§7.2) —
@@ -511,18 +524,20 @@ fn wait_for_settled_within(
 /// and would never return for a parked serve gate, since the native context
 /// is still genuinely running while parked.
 fn wait_for_needs_input(backend: &OpencodeBackend, handle: &ExecutionHandle) -> Observation {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let observation = backend.observe(handle).expect("observe");
-        if matches!(observation.signal, BackendSignal::NeedsInput { .. }) {
-            return observation;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "stage never parked on NeedsInput: {observation:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        "stage never parked on NeedsInput",
+        support::HANG_BUDGET,
+        || {
+            let observation = backend.observe(handle).expect("observe");
+            let parked = matches!(observation.signal, BackendSignal::NeedsInput { .. });
+            if parked {
+                result = Some(observation);
+            }
+            parked
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// LAUNCH one execution against a stub, with the sink already installed.
@@ -1320,20 +1335,16 @@ fn opencode_interrupt_kills_the_process_group() {
 
     backend.interrupt(&handle).expect("interrupt").wait();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if !pid_alive(grandchild_pid) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
+    support::wait_until_sync(
+        &format!(
             "grandchild pid {grandchild_pid} survived INTERRUPT: the whole turn process group \
              should have been killed, not just the direct child (opencode leader) -- if \
              `interrupt`/`kill_inflight_turn` were reverted to a plain `Child::kill()`, this is \
              exactly the failure that would reproduce (probe 11)"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+        ),
+        support::HANG_BUDGET,
+        || !pid_alive(grandchild_pid),
+    );
     backend.stop(&handle).expect("stop").wait();
 }
 
@@ -2248,16 +2259,11 @@ fn pid_is_alive(pid: u32) -> bool {
 /// Polls [`pid_is_alive`] until it reports the pid gone, or panics naming the
 /// still-alive pid once `budget` elapses.
 fn wait_for_pid_death(pid: u32, budget: Duration) {
-    let deadline = Instant::now() + budget;
-    loop {
-        if !pid_is_alive(pid) {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("pid {pid} is still alive in the process table after {budget:?}");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    support::wait_until_sync(
+        &format!("pid {pid} is still alive in the process table"),
+        budget,
+        || !pid_is_alive(pid),
+    );
 }
 
 /// The plan for `serve_stub_end_to_end_launch_turn_interrupt_history_and_
@@ -2575,15 +2581,10 @@ fn serve_permission_asked_parks_the_stage_and_the_reply_relays_to_the_deprecated
 
     // The gate clears: a later OBSERVE stops reporting NeedsInput, and the
     // permission_replied dispatch fired its own harness_error event.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    support::wait_until_sync("the gate never cleared", support::HANG_BUDGET, || {
         let observation = backend.observe(&handle).expect("observe");
-        if !matches!(observation.signal, BackendSignal::NeedsInput { .. }) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the gate never cleared");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        !matches!(observation.signal, BackendSignal::NeedsInput { .. })
+    });
     assert_eq!(
         wait_for_kind(&events, "conversation.turn.harness_error").payload["phase"],
         "permission_asked",
@@ -2651,35 +2652,25 @@ fn serve_question_asked_parks_as_actor_authored_and_the_reply_relays_to_its_endp
         .send(&handle, "Blue")
         .expect("send answer relays to /question/{id}/reply");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    support::wait_until_sync("the gate never cleared", support::HANG_BUDGET, || {
         let observation = backend.observe(&handle).expect("observe");
-        if !matches!(observation.signal, BackendSignal::NeedsInput { .. }) {
-            break;
-        }
-        assert!(Instant::now() < deadline, "the gate never cleared");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        !matches!(observation.signal, BackendSignal::NeedsInput { .. })
+    });
     // Bounded wait, not an instantaneous read: the gate clearing (the reply
     // POST landing) and the `question.replied` SSE frame's journaling ride
     // different paths — the SSE reader journals asynchronously, and release
     // run 18's instrumented Gate D runner observed the gate clear before the
     // frame was journaled. The property stays the same (the frame MUST be
     // dispatched and journaled); only the ordering assumption goes.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let replied = events_of_kind(&events, "conversation.turn.harness_error")
-            .into_iter()
-            .find(|e| e.payload["phase"] == "question_replied");
-        if replied.is_some() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the question.replied SSE frame must have been dispatched and journaled"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    support::wait_until_sync(
+        "the question.replied SSE frame must have been dispatched and journaled",
+        support::HANG_BUDGET,
+        || {
+            events_of_kind(&events, "conversation.turn.harness_error")
+                .into_iter()
+                .any(|e| e.payload["phase"] == "question_replied")
+        },
+    );
     backend.stop(&handle).expect("stop").wait();
 }
 

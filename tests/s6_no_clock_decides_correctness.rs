@@ -1276,24 +1276,6 @@ const ALLOWLIST: &[Allowed] = &[
         reason: DEADLINE_LOOP_RESIDUE_REASON,
     },
     Allowed {
-        file: "tests/opencode_backend.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/opencode_backend.rs",
-        needle: "let deadline = Instant::now() + budget;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/opencode_backend.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/support/mod.rs",
         needle: "let deadline = Instant::now() + budget;",
         category: "deadline-loop-residue",
