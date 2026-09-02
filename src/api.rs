@@ -7648,6 +7648,20 @@ pub struct ApiClient {
 /// [`daemon::pid_alive`] keeps saying yes.
 use crate::cli::SCAN_POLL as REQUEST_RETRY;
 
+/// How many multiples of [`client_timeout()`] `send_with_retry` will keep
+/// retrying a transport failure against a still-live PID before giving up
+/// (S6 retry-owned-budget). Reused, not guessed (R2): the *unit* is the
+/// per-attempt timeout this crate already ships and documents, so raising
+/// [`CLIENT_TIMEOUT_ENV`] to accommodate a slower daemon widens this budget
+/// along with it rather than leaving a second, silently-stale number behind.
+/// 3x is enough headroom above a single transient hangup (this crate's own
+/// finite-retry tests need at most a handful) without turning a genuinely
+/// stuck daemon into a long hang for a one-shot CLI verb — the AMENDMENT's
+/// own complaint. `run_intelligence_scan`'s own poll loop (`src/cli.rs`)
+/// stays unbudgeted on purpose (00-orient boundary): it is long-lived and
+/// interactive, this is not.
+const REQUEST_RETRY_BUDGET_MULTIPLE: u32 = 3;
+
 impl ApiClient {
     /// Build a client for a daemon endpoint and its bearer token.
     ///
@@ -7679,7 +7693,9 @@ impl ApiClient {
     /// Bind this client to the PID of the daemon its descriptor named (S6
     /// scan-follow-retry). `None` (the default from [`Self::new`]) means no
     /// PID is known — a caller with no PID to check can never *prove* the
-    /// daemon is gone, so it must not claim to.
+    /// daemon alive or dead, so [`Self::send_with_retry`] does not retry for
+    /// it at all (S6 pidless-and-related, seam 1, Captain ruling J4,
+    /// superseding F-IN-01): retry is earned by having a PID to check.
     pub fn with_pid(mut self, pid: u32) -> Self {
         self.pid = Some(pid);
         self
@@ -7732,30 +7748,87 @@ impl ApiClient {
     /// Transport`], so a real answer from the daemon — including its 404
     /// `unknown_scan` special case — is always returned immediately,
     /// retried or not) at [`REQUEST_RETRY`] cadence for as long as this
-    /// client's bound [`Self::pid`] is alive.
+    /// client's bound [`Self::pid`] is alive. A client with no bound PID
+    /// makes exactly one attempt (S6 pidless-and-related, seam 1, below).
     ///
     /// S6 client-request-retry, the AMENDMENT (owner, 2026-08-30): "time is
     /// not a correctness signal" — distinguish a doomed request from a
     /// merely unlucky one by the daemon's own liveness, not by a guessed
-    /// retry count or duration. A client with no bound PID cannot prove the
-    /// daemon dead ([`Self::with_pid`]'s own doc comment), so it also
-    /// retries — absence of evidence is never treated as evidence the
-    /// daemon is gone. This generalizes `run_intelligence_scan`'s own poll
-    /// loop retry (`src/cli.rs`) onto every verb below, R2: one shared site.
+    /// retry count or duration. This generalizes `run_intelligence_scan`'s
+    /// own poll loop retry (`src/cli.rs`) onto every verb below, R2: one
+    /// shared site.
+    ///
+    /// S6 pidless-and-related, seam 1 (Captain ruling, J4, superseding
+    /// F-IN-01's "a pid-less client can never prove the daemon dead, so it
+    /// also retries"): that invariant was wrong as product behavior — a
+    /// real TUI user with a stale runtime descriptor would hang forever
+    /// against a permanently refused endpoint. Retry is earned by having a
+    /// PID to check; a pid-less client gets the original single-attempt
+    /// behavior instead (transport error surfaces immediately, honest and
+    /// actionable), matching the pre-`F-IN-01` behavior `cbffaf3b` first
+    /// introduced (`brief-pidless-and-related.md`, seam 1).
+    ///
+    /// S6 retry-owned-budget: liveness alone is not license to retry
+    /// forever. On top of the dead-PID short-circuit above, this loop also
+    /// owns an overall wait budget
+    /// ([`REQUEST_RETRY_BUDGET_MULTIPLE`] × [`client_timeout()`]) — a
+    /// caller-local resource this one call owns for its own lifetime, the
+    /// same "owned-wait-budget" shape `src/cli.rs`'s spawn/drain/term
+    /// grace periods already use, never a guess at the daemon's remote
+    /// state. Exhausting the budget against a still-provably-live PID ends
+    /// the request naming exactly that — alive but not answering — never
+    /// "lost contact", which stays reserved for the dead-PID case: the two
+    /// are different failures and must read differently. Neither this
+    /// budget nor the dead-PID check applies to a pid-less client — it
+    /// never reaches this loop's second iteration at all.
     async fn send_with_retry<F>(&self, build: F) -> Result<Value, ClientError>
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
+        // F-IN-02: an operator-raised SGT_CLIENT_TIMEOUT_SECS is unbounded
+        // above (`timeout_from` only ever raises it), so a naive `* 3` can
+        // overflow `Duration`'s internal representation and panic. Saturate
+        // at `Duration::MAX` instead — an unreachably large budget is exactly
+        // as inert as a panic would have been catastrophic.
+        let budget = client_timeout()
+            .checked_mul(REQUEST_RETRY_BUDGET_MULTIPLE)
+            .unwrap_or(Duration::MAX);
+        // `Instant`'s `Add<Duration>` panics on overflow of the platform's
+        // own time representation exactly like `Duration`'s multiplication
+        // above used to — a saturated `Duration::MAX` budget still panics
+        // one line later if built with `+`. Use `checked_add` and treat an
+        // overflowing deadline as "no deadline": a pid-less client never
+        // reaches this deadline check at all (it fails fast on the first
+        // transport error, per seam 1 below), so `None` here only changes
+        // behavior for a pid-bearing client whose budget deadline
+        // overflowed, letting it keep retrying rather than panicking.
+        let budget_deadline = Instant::now().checked_add(budget);
         loop {
             match build().send().await {
                 Ok(response) => return Self::into_value(response).await,
                 Err(e) => {
-                    if let Some(pid) = self.pid
-                        && !crate::daemon::pid_alive(pid)
-                    {
+                    // S6 pidless-and-related, seam 1 (Captain ruling, J4,
+                    // superseding F-IN-01): retry is earned by having a PID
+                    // to check. A pid-less client can never prove the
+                    // daemon alive or dead, so it gets the original
+                    // single-attempt behavior — fail fast, honest and
+                    // actionable — rather than looping on absence of
+                    // evidence.
+                    let Some(pid) = self.pid else {
+                        return Err(e.into());
+                    };
+                    if !crate::daemon::pid_alive(pid) {
                         return Err(ClientError::Transport(format!(
                             "lost contact with the daemon ({e}); the daemon process (pid \
                              {pid}) has exited, so the request ended when it did"
+                        )));
+                    }
+                    if let Some(deadline) = budget_deadline
+                        && Instant::now() >= deadline
+                    {
+                        return Err(ClientError::Transport(format!(
+                            "the daemon (pid {pid}) is alive but did not answer within this \
+                             request's {budget:?} retry budget ({e})"
                         )));
                     }
                     tokio::time::sleep(REQUEST_RETRY).await;
@@ -8389,6 +8462,103 @@ mod tests {
         );
     }
 
+    /// S6 retry-owned-budget (`00-orient`): a request-level transport
+    /// failure against a still-live PID must not retry forever —
+    /// `send_with_retry` owns a wait budget on top of its existing
+    /// per-attempt `client_timeout()`, and gives up naming the daemon
+    /// alive-but-not-answering once that budget is exhausted, never "lost
+    /// contact" (that wording stays reserved for the already-correct
+    /// dead-PID case above). The scripted server below never stops hanging
+    /// up, so today's code (no owned budget) retries unboundedly; this
+    /// test's own outer `tokio::time::timeout` is scaffolding to make that
+    /// red observable in one run rather than a genuine hang, per
+    /// `00-orient`'s own instruction — it is not the product budget itself.
+    #[tokio::test]
+    async fn get_gives_up_naming_the_daemon_alive_but_not_answering_once_the_retry_budget_is_exhausted()
+     {
+        let (endpoint, attempts) = spawn_flaky_http_server(1_000_000, 200, r#"{"ok":true}"#);
+        let client = ApiClient::new(&endpoint, "fake-token")
+            .expect("client")
+            .with_pid(std::process::id());
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            client.get("/v1/whatever"),
+        )
+        .await
+        .expect(
+            "send_with_retry must return well inside this test's own 60s scaffold deadline; a \
+             timeout here means the owned budget itself is missing or too generous, exactly \
+             the defect this wave fixes",
+        );
+
+        let err = outcome.expect_err(
+            "a live-but-never-answering daemon must eventually fail the request once the \
+             owned retry budget is exhausted, not succeed",
+        );
+        match err {
+            ClientError::Transport(ref message) => {
+                assert!(
+                    message.contains("did not answer") || message.contains("not answering"),
+                    "expected the budget-exhausted wording, got: {message}"
+                );
+                assert!(
+                    !message.contains("has exited") && !message.contains("lost contact"),
+                    "budget exhaustion against a still-live pid must never say the daemon \
+                     exited or contact was lost — that wording is reserved for the dead-pid \
+                     case, got: {message}"
+                );
+            }
+            other => panic!("expected ClientError::Transport, got {other:?}"),
+        }
+        assert!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "must have retried more than once before giving up"
+        );
+    }
+
+    /// S6 pidless-and-related, seam 1 (Captain ruling, J4, superseding
+    /// F-IN-01): retry is earned by having a PID to check. A pid-less
+    /// client can never prove the daemon dead *or* alive, so unlike a
+    /// `with_pid` client it gets no retry loop at all — one attempt, and a
+    /// transport failure surfaces immediately. This is the pre-existing
+    /// behavior `cbffaf3b` had before F-IN-01 layered pid-less retrying on
+    /// top of it, restored because a real TUI user against a permanently
+    /// refused endpoint must see the error, not hang forever
+    /// (`brief-pidless-and-related.md`, seam 1). One scripted hangup is
+    /// enough: a client that wrongly retried would still be sleeping when
+    /// this test's own scaffold deadline below fires.
+    #[tokio::test]
+    async fn get_fails_at_once_with_no_bound_pid_and_never_retries() {
+        let (endpoint, attempts) = spawn_flaky_http_server(1, 200, r#"{"ok":true}"#);
+        let client = ApiClient::new(&endpoint, "fake-token").expect("client");
+        assert_eq!(
+            client.pid(),
+            None,
+            "this test only measures the pid-less path"
+        );
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.get("/v1/whatever"),
+        )
+        .await
+        .expect(
+            "a pid-less client must fail on its first attempt, well inside this test's own 5s \
+             scaffold deadline — a hang here means it wrongly retried",
+        );
+
+        result.expect_err(
+            "a client with no bound PID can never prove the daemon alive or dead, so it must \
+             fail fast on the first transport error rather than retry",
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must have made exactly one attempt — no retry without a PID to check"
+        );
+    }
+
     fn scaffold_estate_manifest(root: &std::path::Path, name: &str) {
         std::fs::create_dir_all(root.join("repos").join("solo")).expect("mount dir");
         std::fs::write(
@@ -8650,6 +8820,85 @@ mod tests {
             );
             assert_eq!(warning.lines().count(), 1, "one line: {warning}");
         }
+    }
+
+    /// F-IN-02: `timeout_from` only ever raises the timeout above
+    /// [`CLIENT_TIMEOUT`], with no upper cap, so an operator-supplied
+    /// `SGT_CLIENT_TIMEOUT_SECS` near `u64::MAX` must not let
+    /// `send_with_retry`'s `client_timeout() * REQUEST_RETRY_BUDGET_MULTIPLE`
+    /// panic on `Duration` multiplication overflow — it must saturate to
+    /// `Duration::MAX` instead, exactly like `send_with_retry`'s own
+    /// `checked_mul(...).unwrap_or(Duration::MAX)`.
+    #[test]
+    fn extreme_client_timeout_does_not_overflow_the_retry_budget_multiplication() {
+        let (extreme, _) = timeout_from(Some(&u64::MAX.to_string()));
+        assert_eq!(
+            extreme,
+            Duration::from_secs(u64::MAX),
+            "an unbounded raise must be honored verbatim by timeout_from itself"
+        );
+
+        let budget = extreme
+            .checked_mul(REQUEST_RETRY_BUDGET_MULTIPLE)
+            .unwrap_or(Duration::MAX);
+
+        assert_eq!(
+            budget,
+            Duration::MAX,
+            "the retry budget must saturate rather than panic when the per-attempt timeout is \
+             large enough that multiplying it by REQUEST_RETRY_BUDGET_MULTIPLE would overflow \
+             Duration's own representation"
+        );
+    }
+
+    /// S6 full-sweep re-verify: `extreme_client_timeout_does_not_overflow_the_retry_budget_multiplication`
+    /// above only pins that `budget` itself saturates to `Duration::MAX`
+    /// rather than panicking. `send_with_retry` then built its deadline as
+    /// `Instant::now() + budget` — and `Instant`'s `Add<Duration>` panics on
+    /// overflow of the platform's underlying time representation exactly
+    /// the way `Duration`'s own multiplication used to, so a saturated
+    /// `Duration::MAX` budget still panicked one line later. This drives a
+    /// real request through `send_with_retry` (via `get`) with
+    /// `SGT_CLIENT_TIMEOUT_SECS` raised so far that
+    /// `REQUEST_RETRY_BUDGET_MULTIPLE * client_timeout()` saturates to
+    /// `Duration::MAX` — the same probe the wave's re-verify used, reached
+    /// through the real call path rather than a standalone expression.
+    /// Nextest gives every test its own process, so mutating this env var
+    /// here does not leak into any other test.
+    #[tokio::test]
+    async fn duration_max_budget_does_not_panic_the_retry_deadline_construction() {
+        // Safety: nextest runs this test in its own process, so no other
+        // test observes this mutation.
+        unsafe {
+            std::env::set_var(CLIENT_TIMEOUT_ENV, u64::MAX.to_string());
+        }
+        assert_eq!(
+            client_timeout()
+                .checked_mul(REQUEST_RETRY_BUDGET_MULTIPLE)
+                .unwrap_or(Duration::MAX),
+            Duration::MAX,
+            "this test only measures what it claims to if the raised timeout actually \
+             saturates the retry budget"
+        );
+
+        // The first attempt answers immediately: this test is only about
+        // surviving `budget_deadline`'s construction before the loop ever
+        // gets that far, not about retry behavior.
+        let (endpoint, _attempts) = spawn_flaky_http_server(0, 200, r#"{"ok":true}"#);
+        let client = ApiClient::new(&endpoint, "fake-token")
+            .expect("client")
+            .with_pid(std::process::id());
+
+        let result = client.get("/v1/whatever").await;
+
+        assert_eq!(
+            result.expect(
+                "a saturated Duration::MAX retry budget must not panic while constructing \
+                 send_with_retry's deadline; use Instant::checked_add and treat an overflowing \
+                 budget as \"no deadline\" instead"
+            ),
+            json!({"ok": true}),
+        );
     }
 
     /// `data:` lines belonging to one SSE frame are joined by a literal `\n`

@@ -41,3 +41,25 @@
 [[profile.default.overrides]]
 filter = 'binary_id(=sergeant-rs::m7_docker_executor) and test(=large_captured_output_does_not_grow_this_process_proportionally)'
 threads-required = "num-test-threads"
+
+# --- The two real-daemon+semantic-model tests, scheduled alone (S6
+#     pidless-and-related, seam 3) --------------------------------------------
+#
+# `s6_semantic_crossing::a_real_search_through_the_daemon_answers_inside_
+# sgts_own_budget` and `a_search_over_an_index_with_no_stored_vectors_says_
+# so_at_the_crossing` each start a real daemon and load a real semantic
+# model. Both pass solo (this lane, `9bf1eda6`: ~70 s and ~72 s, matching
+# `brief-pidless-and-related.md`'s cited ~71 s), and both hit nextest's own
+# external 120 s TIMEOUT under full-suite thread contention
+# (`/var/tmp/sgt-test-tmp/fullsweep-full.log`, this lane, same head:
+# `TERMINATING [>120.000s]` / `TIMEOUT [ 120.0xxs]` for each, twice in that
+# log). That is exactly #258's starvation shape above — a heavy test
+# competing for the same thread budget as everything scheduled beside it —
+# not a defect in either test.
+#
+# Same remedy, same reason a `[test-groups]` entry would not do the same
+# thing: `threads-required = "num-test-threads"` reserves the whole thread
+# budget so both are scheduled with no siblings.
+[[profile.default.overrides]]
+filter = 'binary_id(=sergeant-rs::s6_semantic_crossing) and (test(=a_real_search_through_the_daemon_answers_inside_sgts_own_budget) or test(=a_search_over_an_index_with_no_stored_vectors_says_so_at_the_crossing))'
+threads-required = "num-test-threads"

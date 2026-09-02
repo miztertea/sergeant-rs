@@ -145,6 +145,39 @@ const ALLOWLIST: &[Allowed] = &[
     },
     Allowed {
         file: "src/api.rs",
+        needle: "let budget_deadline = Instant::now().checked_add(budget);",
+        category: "owned-wait-budget",
+        reason: "bounds `send_with_retry`'s own overall wait for a single one-shot request \
+                  this call owns, on top of its existing per-attempt `client_timeout()` — the \
+                  request-owned budget itself (S6 retry-owned-budget), not a guess at the \
+                  daemon's own remote progress. Exhausting it against a still-live PID \
+                  (`daemon::pid_alive`, checked immediately above in source order) ends the \
+                  request naming exactly that; the pid-alive check, a state fact, is what \
+                  actually distinguishes stuck from gone, same shape as `SPAWN_WAIT`/\
+                  `DRAIN_TIMEOUT`/`STOP_TERM_GRACE` above. `checked_add` (not `+`) because a \
+                  saturated `Duration::MAX` budget would otherwise overflow `Instant`'s own \
+                  internal representation and panic; the `None` case reads as \"no deadline\", \
+                  the same open-ended wait the pid-less path below already gets.",
+    },
+    Allowed {
+        file: "src/api.rs",
+        needle: "if let Some(deadline) = budget_deadline",
+        category: "owned-wait-budget",
+        reason: "unwraps the request-retry budget deadline set up above; S6 pidless-and-related \
+                  seam 1 (Captain ruling, J4) split the old single `&&` chain into its own \
+                  early return on a dead pid followed by this `if`, so the `Some`/`None` split \
+                  on the budget deadline now heads its own statement rather than continuing an \
+                  outer condition. `None` (an overflowing budget) still short-circuits this \
+                  whole `if` so the budget is treated as absent rather than compared against.",
+    },
+    Allowed {
+        file: "src/api.rs",
+        needle: "&& Instant::now() >= deadline",
+        category: "owned-wait-budget",
+        reason: "the paired check for the request-retry budget immediately above.",
+    },
+    Allowed {
+        file: "src/api.rs",
         needle: "let overdue = state.engine.due_interrupts(&core, Instant::now());",
         category: "scheduling",
         reason: "the current wall-clock instant is the *input* to an operator-scheduled \

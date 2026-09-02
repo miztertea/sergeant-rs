@@ -1258,6 +1258,41 @@ fn related_refuses_an_anchor_the_admissibility_filter_excludes() {
     );
 }
 
+/// **S6 pidless-and-related, seam 2 — the CLI path stays working.**
+/// `related_query`'s HTTP handler (`src/api.rs`) parses the coordinate
+/// `sgt search` prints via `UnitAddress::parse`, which recovers the
+/// path-based key (`UnitCoordinate::path_key`), never `db::unit_key`'s
+/// digest-or-canonical-path dedup identity. `5fc63f56` fixed exactly this
+/// path; the fix for the two tests above (matching on `db::unit_key` too,
+/// for direct Rust-API callers like [`RelatedRequest`]'s other two tests
+/// here) must not regress it — pinned directly so a future change to
+/// `related`'s anchor match sees this break, not just a CLI smoke test.
+#[test]
+fn related_still_resolves_the_printed_path_coordinate_the_cli_parses() {
+    let estate = estate();
+    let answer = estate.search(SPANNING_TERM, &only_library(), None);
+    let anchor = answer.hits.first().expect("an anchor hit").clone();
+    let path_key = anchor.coordinate.path_key();
+
+    let filter = only_library();
+    let related = estate
+        .db
+        .related(&RelatedRequest {
+            source_name: &anchor.source_name,
+            unit_key: &path_key,
+            filter: &filter,
+            family: None,
+            limit: 10,
+            semantic: SemanticRequest::Requested,
+            attribution: Attribution::Unmanaged,
+        })
+        .expect("related")
+        .expect("the path-keyed coordinate the CLI round-trips through must still resolve");
+
+    assert_eq!(related.anchor.unit_key, anchor.unit_key);
+    assert_eq!(related.anchor.source_name, anchor.source_name);
+}
+
 // ============================================================ the surface
 
 /// **A2 §14's prohibition, structurally**: *"Do not expose raw retrieval

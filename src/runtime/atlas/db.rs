@@ -4303,15 +4303,25 @@ impl AtlasDb {
         else {
             return Ok(None);
         };
-        // A2 §9: `request.unit_key` is the path-based coordinate a human
-        // typed (what `sgt search` prints, `UnitCoordinate::path_key`), not
-        // `db::unit_key`'s digest-or-canonical-path dedup identity — the two
-        // diverge for exactly the units the projection-identity wave (S6)
-        // changed. Match on the path key, never on the internal identity.
-        let Some(unit) = indexable_units(&self.conn, &generation.id)?
-            .into_iter()
-            .find(|unit| unit.coordinate().path_key() == request.unit_key)
-        else {
+        // S6 pidless-and-related, seam 2: `request.unit_key` is
+        // overloaded, not single-shaped. `related_query`'s HTTP handler
+        // (`src/api.rs`) parses the coordinate `sgt search` prints via
+        // `UnitAddress::parse`, which recovers `UnitCoordinate::path_key`'s
+        // path-based form (A2 §9 — `5fc63f56`'s fix, kept). A direct
+        // Rust-API caller instead already holds a `FusedHit`/`RelatedAnchor`
+        // and passes its `unit_key` verbatim — `db::unit_key`'s
+        // digest-or-canonical-path dedup identity, the pre-`5fc63f56`
+        // match. The two shapes are not provably disjoint in the general
+        // case (a content-digest identity is an arbitrary hex string, not
+        // one structurally incapable of equalling some file's relative
+        // path), so resolve them in a fixed, documented order rather than
+        // one `.find()` pass whose winner would otherwise depend on
+        // `indexable_units`' row order: `path_key` — the address a human
+        // typed or the CLI round-tripped — is checked across every unit
+        // first, and `db::unit_key` — the internal dedup identity — is
+        // checked only if no unit's `path_key` matched.
+        let units = indexable_units(&self.conn, &generation.id)?;
+        let Some(unit) = resolve_anchor_unit(units, request.unit_key) else {
             return Ok(None);
         };
         let anchor = RelatedAnchor {
@@ -6308,6 +6318,7 @@ fn identity_of(identity: Option<String>, generation_id: &str, relative_path: &st
 
 /// One unit on its way into the index — the stored row plus the text that
 /// row contributes.
+#[derive(Clone)]
 struct IndexableUnit {
     source_name: String,
     family: LexicalFamily,
@@ -6375,6 +6386,27 @@ impl IndexableUnit {
             },
         }
     }
+}
+
+/// [`AtlasDb::related`]'s anchor lookup: `requested_key` may name a unit by
+/// either [`UnitCoordinate::path_key`] (what a human typed or the CLI
+/// round-tripped) or [`unit_key`] (the internal dedup identity a direct
+/// Rust-API caller already holds — see the call site's comment). The two
+/// key spaces are not provably disjoint, so a unit is never chosen by a
+/// single `.find()` pass whose winner would depend on `units`' row order:
+/// every unit's `path_key` is checked first, across the whole list, and
+/// `unit_key` is checked only if no `path_key` matched. A unit whose
+/// `unit_key` happens to equal a different unit's `path_key` therefore
+/// always resolves to the `path_key` owner, deterministically —
+/// `related_anchor_resolution_prefers_path_key_over_a_colliding_unit_key`
+/// pins this.
+fn resolve_anchor_unit(units: Vec<IndexableUnit>, requested_key: &str) -> Option<IndexableUnit> {
+    let path_key_index = units
+        .iter()
+        .position(|unit| unit.coordinate().path_key() == requested_key);
+    let index =
+        path_key_index.or_else(|| units.iter().position(|unit| unit.unit_key == requested_key))?;
+    units.into_iter().nth(index)
 }
 
 /// Column/field names as one stored value: JSON, so a name containing a comma
@@ -9839,6 +9871,63 @@ mod tests {
     fn open_declares_exactly_the_atlas_schema_namespaces() {
         let atlas = AtlasDb::open_in_memory().expect("atlas");
         assert_eq!(atlas.schema_names().expect("schemas"), SCHEMAS);
+    }
+
+    /// A minimal [`IndexableUnit`], every optional field `None`/empty, for
+    /// [`resolve_anchor_unit`]'s tests below — no DB, no `AtlasDb::open`.
+    fn document_unit(unit_key: &str, relative_path: &str, ordinal: u64) -> IndexableUnit {
+        IndexableUnit {
+            source_name: "s".to_string(),
+            family: LexicalFamily::Document,
+            unit_key: unit_key.to_string(),
+            relative_path: relative_path.to_string(),
+            ordinal,
+            title: None,
+            symbol: None,
+            language: None,
+            label: None,
+            dataset_key: None,
+            row_key: None,
+            fields: None,
+            byte_start: None,
+            byte_end: None,
+            native: None,
+            text: String::new(),
+        }
+    }
+
+    /// F-IN-02 (S6 pidless-and-related, seam 2): `path_key` and `unit_key`
+    /// are two different key spaces that are not provably disjoint. Build
+    /// the collision directly — a unit whose `unit_key` is literally the
+    /// string another unit's `path_key` renders as — and assert the
+    /// `path_key` owner always wins, deterministically, regardless of which
+    /// unit [`indexable_units`] would have listed first.
+    #[test]
+    fn related_anchor_resolution_prefers_path_key_over_a_colliding_unit_key() {
+        let requested = "document:owns-the-path-key#0";
+        let path_key_owner = document_unit("unrelated-dedup-identity", "owns-the-path-key", 0);
+        let unit_key_owner = document_unit(requested, "some/other/file.md", 0);
+        assert_eq!(path_key_owner.coordinate().path_key(), requested);
+
+        // path_key owner listed second: still wins.
+        let units = vec![unit_key_owner.clone(), path_key_owner.clone()];
+        let resolved = resolve_anchor_unit(units, requested).expect("a match");
+        assert_eq!(resolved.relative_path, "owns-the-path-key");
+
+        // path_key owner listed first: still wins (not merely "first in the
+        // list").
+        let units = vec![path_key_owner.clone(), unit_key_owner.clone()];
+        let resolved = resolve_anchor_unit(units, requested).expect("a match");
+        assert_eq!(resolved.relative_path, "owns-the-path-key");
+
+        // No path_key match at all: the unit_key match is used.
+        let units = vec![unit_key_owner.clone()];
+        let resolved = resolve_anchor_unit(units, requested).expect("a match");
+        assert_eq!(resolved.relative_path, "some/other/file.md");
+
+        // Neither matches: no anchor.
+        let units = vec![path_key_owner, unit_key_owner];
+        assert!(resolve_anchor_unit(units, "nothing-matches-this").is_none());
     }
 
     /// The DDL is idempotent, because reopening the file is the normal path.
