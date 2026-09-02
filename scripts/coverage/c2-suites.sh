@@ -514,6 +514,14 @@ cov_stage_begin c2-s6_scan_poll_survives_a_transport_timeout
 cov_run cargo llvm-cov --no-report --test s6_scan_poll_survives_a_transport_timeout --locked || cov_fail "s6_scan_poll_survives_a_transport_timeout failed under instrumentation"
 cov_stage_end 1 "the s6_scan_poll_survives_a_transport_timeout test binary must write its own profile"
 
+# S6 seam 4, wired at birth (the #231 lesson): the embed path must not starve
+# the runtime — `run_estate_scan`'s inline `SemanticEngine::embed` call must
+# not stall a concurrent `GET /v1/intelligence/scan/{id}` sharing the same
+# runtime worker. A real daemon, no clock deciding the verdict. Floor 1.
+cov_stage_begin c2-s6_scan_answers_while_embedding
+cov_run cargo llvm-cov --no-report --test s6_scan_answers_while_embedding --locked || cov_fail "s6_scan_answers_while_embedding failed under instrumentation"
+cov_stage_end 1 "the s6_scan_answers_while_embedding test binary must write its own profile"
+
 # S6 #334, wired at birth (the #231 lesson): the journal's fold is not allowed
 # to fall behind the journal. In-process tests over a real journal and a real
 # Atlas in a tempdir, driving the production `record_scan` direct-journal
