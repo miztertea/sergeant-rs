@@ -164,17 +164,15 @@ fn spawn_bare_daemon(estate: &Path, data_dir: &DataDir) {
         let mut child = child;
         let _ = child.wait();
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while daemon::read_descriptor(data_dir.path())
-        .expect("read descriptor")
-        .is_none()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the bare daemon never published a descriptor"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    support::wait_until_sync(
+        "the bare daemon never published a descriptor",
+        support::HANG_BUDGET,
+        || {
+            daemon::read_descriptor(data_dir.path())
+                .expect("read descriptor")
+                .is_some()
+        },
+    );
 }
 
 /// Run `sgt` to completion from `cwd` against `data_dir`. Every caller but
@@ -361,16 +359,9 @@ impl Drop for WatchProc {
     }
 }
 
-fn wait_for_hold_ready(hold: &Path, timeout: Duration) -> bool {
+fn wait_for_hold_ready(hold: &Path, timeout: Duration, what: &str) {
     let ready = format!("{}.ready", hold.display());
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if Path::new(&ready).exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    false
+    support::wait_until_sync(what, timeout, || Path::new(&ready).exists());
 }
 
 fn release_hold(hold: &Path) {
@@ -503,9 +494,10 @@ fn w3_a_transition_forced_inside_the_held_window_is_reported_exactly_once() {
         &[("SGT_WATCH_TEST_HOLD", hold.to_str().unwrap())],
         &["--json", "watch", &id, "--follow"],
     );
-    assert!(
-        wait_for_hold_ready(&hold, Duration::from_secs(10)),
-        "the client must touch <path>.ready after attaching — the hold must actually engage"
+    wait_for_hold_ready(
+        &hold,
+        Duration::from_secs(10),
+        "the client must touch <path>.ready after attaching — the hold must actually engage",
     );
 
     // The forcing transition: proven (by .ready above) to land after attach,
@@ -568,9 +560,10 @@ fn w4_a_stale_trigger_does_not_produce_stale_meaning() {
         &[("SGT_WATCH_TEST_HOLD", hold.to_str().unwrap())],
         &["--json", "watch", &id],
     );
-    assert!(
-        wait_for_hold_ready(&hold, Duration::from_secs(10)),
-        "the hold must actually engage"
+    wait_for_hold_ready(
+        &hold,
+        Duration::from_secs(10),
+        "the hold must actually engage",
     );
 
     let responded = sgt(

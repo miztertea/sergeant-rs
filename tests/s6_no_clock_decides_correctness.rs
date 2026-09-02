@@ -1246,24 +1246,6 @@ const ALLOWLIST: &[Allowed] = &[
         reason: DEADLINE_LOOP_RESIDUE_REASON,
     },
     Allowed {
-        file: "tests/m9_watch.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m9_watch.rs",
-        needle: "let deadline = Instant::now() + timeout;",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
-        file: "tests/m9_watch.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
-        category: "deadline-loop-residue",
-        reason: DEADLINE_LOOP_RESIDUE_REASON,
-    },
-    Allowed {
         file: "tests/support/mod.rs",
         needle: "let deadline = Instant::now() + budget;",
         category: "deadline-loop-residue",
@@ -1342,6 +1324,29 @@ const ALLOWLIST: &[Allowed] = &[
             than panicking either way -- its one caller decides what the outcome means \
             ('the stream must close after the error frame, not hang open'). Same shape as \
             read_raw_sse_frames above: the caller, not this helper, owns the verdict.",
+    },
+    Allowed {
+        file: "tests/m9_watch.rs",
+        needle: "let deadline = Instant::now() + timeout;",
+        category: "owned-wait-budget",
+        reason: "WatchProc::wait_timeout's own bounded poll: it returns None on timeout \
+            rather than panicking, and its one caller (expect_exit) kills the child and runs \
+            its own cleanup before panicking with a message this generic helper cannot compose \
+            (`{what}: process did not exit within {timeout:?}`) -- the same 'must run cleanup \
+            before failing' shape wait_until_sync's own doc names as staying hand-rolled.",
+    },
+    Allowed {
+        file: "tests/m9_watch.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "owned-wait-budget",
+        reason: "r_watch_10a's own journal-stability wait: three CONSECUTIVE 250ms-apart \
+            samples must read the same length before this loop calls the journal settled -- \
+            the comment above names the 250ms cadence itself as load-bearing ('long enough to \
+            outlast committer batching, far shorter than any real gap'). \
+            support::wait_until_sync polls at its own fixed WAIT_POLL_INTERVAL (20ms, private \
+            to tests/support/mod.rs), which would shrink the 3-sample stability window from \
+            ~750ms to ~60ms and could false-positive mid-batch -- folding this one would change \
+            the property under test, not just its budget.",
     },
 ];
 
