@@ -8476,6 +8476,17 @@ mod tests {
     use crate::domain::event::EVENT_SCHEMA;
     use crate::runtime::projection::work_registry_projection;
 
+    /// Seam 3 (no-clock-decides, owner ruling 2026-09-02): the one shared
+    /// hang-only scaffold bound this module's tests use around a call that
+    /// must eventually return but is not itself the thing under test —
+    /// `>= 120s`, the same magnitude as `tests/support::HANG_BUDGET`, for
+    /// the same reason (a wait budget only ends a hang and names "never
+    /// observed"; it never decides a verdict by how fast it returns). This
+    /// file's unit tests cannot depend on `tests/support` (a different
+    /// compilation unit), so the constant is duplicated here rather than
+    /// shared — the value, not the mechanism, is what has to match.
+    const HANG_TEST_SCAFFOLD: std::time::Duration = std::time::Duration::from_secs(120);
+
     /// `hangups` hangup entries followed by one `(status, body)` answer —
     /// the shared fixture at `crate::test_support::
     /// spawn_scripted_http_server` (R2: one site for `cli`'s and `api`'s
@@ -8608,10 +8619,18 @@ mod tests {
     /// alive-but-not-answering once that budget is exhausted, never "lost
     /// contact" (that wording stays reserved for the already-correct
     /// dead-PID case above). The scripted server below never stops hanging
-    /// up, so today's code (no owned budget) retries unboundedly; this
-    /// test's own outer `tokio::time::timeout` is scaffolding to make that
-    /// red observable in one run rather than a genuine hang, per
-    /// `00-orient`'s own instruction — it is not the product budget itself.
+    /// up, so a build with no owned budget retries unboundedly.
+    ///
+    /// Seam 3 (no-clock-decides, owner ruling 2026-09-02): the outer
+    /// `tokio::time::timeout` below is scaffolding that only ends a hang —
+    /// it is not, and never was, the product budget itself
+    /// (`send_with_retry`'s own budget is what this test actually
+    /// verifies, via the error variant and wording asserted after it).
+    /// Resized from the original 60s to [`HANG_TEST_SCAFFOLD`]'s >= 120s,
+    /// matching `tests/support::HANG_BUDGET`'s own magnitude and reason: a
+    /// scaffold sized for "should be fast" is a slowness detector, which
+    /// is a verdict; sized for "never finishes", it only reports "never
+    /// observed" by name.
     #[tokio::test]
     async fn get_gives_up_naming_the_daemon_alive_but_not_answering_once_the_retry_budget_is_exhausted()
      {
@@ -8620,16 +8639,13 @@ mod tests {
             .expect("client")
             .with_pid(std::process::id());
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            client.get("/v1/whatever"),
-        )
-        .await
-        .expect(
-            "send_with_retry must return well inside this test's own 60s scaffold deadline; a \
-             timeout here means the owned budget itself is missing or too generous, exactly \
-             the defect this wave fixes",
-        );
+        let outcome = tokio::time::timeout(HANG_TEST_SCAFFOLD, client.get("/v1/whatever"))
+            .await
+            .expect(
+                "send_with_retry must return well inside this test's own hang-only scaffold \
+             deadline; a timeout here means the owned budget itself is missing or too \
+             generous, exactly the defect this wave fixes",
+            );
 
         let err = outcome.expect_err(
             "a live-but-never-answering daemon must eventually fail the request once the \
