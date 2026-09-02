@@ -3079,26 +3079,29 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
 // R-N0-4's newest budget: "no external I/O, process wait, or thread join under
 // the core lock". A negative about a lock cannot be asserted by timing a fast
 // path — it has to be provoked. So these tests park an executor *inside* an
-// external effect, indefinitely, and then ask the daemon to serve unrelated
-// requests. If the lock were held across the effect, they would never answer.
+// external effect, indefinitely (the rendezvous below proves it, a state, not
+// a duration), and then ask the daemon to serve unrelated requests. If the
+// lock were held across the effect, they would never answer — the daemon
+// releases the stall only *after* awaiting them, so a held lock is a genuine
+// deadlock, not a slow answer, and `timed`'s wait is a hang-only bound on
+// exactly that.
+//
+// Seam 1 (no-clock-decides, owner ruling 2026-09-02) removes what used to sit
+// on top of that: a 200ms budget that turned "answered at all" into "answered
+// within N ms", so a request queued briefly behind a real (bounded, released)
+// hold failed the same way a permanently blocked one would. That extra
+// sensitivity was itself the forbidden shape — a duration deciding a verdict
+// — so it is an approved tradeoff to lose it (J5) rather than a state this
+// suite is missing: proving "briefly queued, not permanently blocked" would
+// need a new product signal (whether a request was ever waiting on the core
+// lock), which is a bigger addition than this seam's boundary covers and is
+// reported here rather than built.
 
-/// How long an unrelated request may take while an executor is parked inside
-/// an external effect.
-///
-/// §22.6 bounds this by "the explicitly allowed journal commit interval",
-/// measured at ~2 ms/event, and the requests below are answered in ~2 ms when
-/// the boundary holds. The budget was one second — ~500× the value the
-/// milestone reports (N3-08), which meant a regression that made independent
-/// requests take 900 ms passed unchanged.
-///
-/// 200 ms instead: two orders of magnitude above the honest cost of a
-/// contended journal commit, and two orders below the failure this exists to
-/// catch. Deliberately not tighter — these suites run in parallel, and a
-/// scheduler hiccup under `cargo test -j` is not the regression being looked
-/// for. It is also now tight enough to catch a *queued* request rather than
-/// only a permanently blocked one: one `git worktree add` on a real monorepo
-/// under the guard would exceed it.
-const INDEPENDENT_REQUEST_BUDGET: Duration = Duration::from_millis(200);
+/// [`support::HANG_BUDGET`], duplicated as a hang-only bound around an
+/// otherwise-unbounded await, not a verdict on how fast that await returns —
+/// see the module note above. `timed`'s callers still print the elapsed
+/// [`Duration`] it returns (diagnostic only; nothing here asserts on it).
+const INDEPENDENT_REQUEST_BUDGET: Duration = support::HANG_BUDGET;
 
 /// Seed a data dir with a run parked in `blocked` on `00-only`, so a `retry`
 /// through the API reserves and launches a second attempt.
@@ -4468,20 +4471,26 @@ async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blo
         "A's launch never reached its gate"
     );
 
-    // The decisive check: B's retry into the full lane must answer well
-    // inside a short bound, without waiting on A's still-held launch.
-    let started = Instant::now();
-    let status_b = tokio::time::timeout(Duration::from_secs(2), retry(work_b))
+    // The decisive check (seam 1, no-clock-decides): B's retry into the full
+    // lane must answer *at all* here — a state proof, not a stopwatch one.
+    // `fake.release_launches()` is not called until well after this await
+    // (see below), so A's launch is still, provably, held at this exact
+    // point in the test's own control flow: if the old bug were back
+    // (`crank`'s `Launch` arm blocking the client's own request on
+    // execution-lane admission), this await would simply never return,
+    // because nothing releases A until after it. `support::HANG_BUDGET`
+    // bounds that "never returns" into a named report rather than a
+    // permanent hang; it decides nothing about how fast a real return must
+    // be — the elapsed `Duration` this used to compare against `< 1s` is
+    // gone, not resized.
+    let status_b = tokio::time::timeout(support::HANG_BUDGET, retry(work_b))
         .await
-        .expect("B's retry blocked on execution-lane admission instead of returning promptly")
+        .expect(
+            "B's retry never observed within the hang-only budget — the execution lane's \
+                 own admission is blocking the client's request rather than returning promptly",
+        )
         .expect("B retry task");
-    let elapsed = started.elapsed();
     assert!(status_b.is_success(), "B's retry answered {status_b}");
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "B's retry took {elapsed:?} — it must return as soon as the lane wait is journaled, \
-         not once a slot actually frees"
-    );
 
     let show_b: Value = http
         .get(format!("{}/v1/work/{work_b}", handle.endpoint))
