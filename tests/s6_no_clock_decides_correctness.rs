@@ -493,6 +493,193 @@ const ALLOWLIST: &[Allowed] = &[
                   already allowlisted at `src/api.rs`'s `due_interrupts` call site, not a guess \
                   standing in for unknown remote state.",
     },
+    // ------------------------------------------------ tests/ (S6, item 3)
+    //
+    // Every entry below is a `sleep(` this wave's real syn-based walk found
+    // outside any while/loop/for construct and judged genuinely behavioral
+    // rather than converting to `support::wait_until` — brief-sleep-and-hope.md
+    // item 3: "A site whose sleep is genuinely behavioral... goes on the
+    // allowlist with the reason written for a reader who disagrees — the
+    // panel will." Two shapes recur and are named per entry rather than once:
+    // (a) a fixed observation window proving an ABSENCE (nothing happened),
+    // which has no positive state to poll for because the assertion itself
+    // is "still nothing by now"; (b) deliberately spacing two actions (a
+    // scripted delay, a race setup) where the delay's role is pacing, not a
+    // verdict.
+    Allowed {
+        file: "tests/c4_repo_lock.rs",
+        needle: "std::thread::sleep(hold_for);",
+        category: "cadence",
+        reason: "spaces this thread's own release of a lock *it* holds so the acquisition \
+                  under test is genuinely waiting on a live foreign holder when it starts, not \
+                  deciding whether that acquisition succeeded — `repolock::acquire`'s own \
+                  `taken` result decides that, checked separately below.",
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "std::thread::sleep(Duration::from_millis(200));",
+        category: "cadence",
+        reason: "paces a spawned scripted-stub thread's own turn-release relative to `launch`, \
+                  modelling a backend that takes a moment to accept before it starts — the \
+                  assertion below (`launch must succeed`) is decided by `launch`'s own Result, \
+                  never by this delay.",
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "std::thread::sleep(Duration::from_millis(500));",
+        category: "cadence",
+        reason: "paces the interrupt relative to a just-sent long turn so the interrupt lands \
+                  mid-stream rather than before the turn starts producing output — what the \
+                  interrupt actually did is decided by `observe`'s reported signal below, never \
+                  by this delay's exact length.",
+    },
+    Allowed {
+        file: "tests/codex_backend.rs",
+        needle: "std::thread::sleep(Duration::from_millis(400));",
+        category: "cadence",
+        reason: "a second pacing delay before interrupt, immediately after a `while` loop \
+                  (already state-terminating, not flagged) that confirmed the turn had started; \
+                  this widens the mid-stream window the same way the entry above does, and the \
+                  interrupt's outcome is still decided by `observe`, not by this sleep.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "std::thread::sleep(Duration::from_millis(300));",
+        category: "cadence",
+        reason: "spaces two racing client spawns (racer A, then this delay, then racer B) to \
+                  deliberately construct the race the test exercises; both clients' own exit \
+                  status is asserted afterward, never a property of this delay's length.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(50)).await;",
+        category: "cadence",
+        reason: "a task-scheduling race between the spawned `handle.shutdown()` future and \
+                  this test releasing an already-confirmed-stalled observe (confirmed via \
+                  `fake.await_stalled_observes` immediately above, a real state wait, not \
+                  flagged): the fake's gate API reports how many observers are stalled but has \
+                  no distinct signal for 'shutdown specifically is now the one blocked on it' \
+                  as opposed to any other in-flight caller. Adding that signal touches \
+                  `src/backend/fake.rs`, out of this wave's scope (brief: 'do not touch src/ \
+                  unless a test's wait has no observable state to wait on — then that is a \
+                  product finding'); flagged here rather than converted, for the panel to weigh \
+                  whether that signal is worth adding in a later wave.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(300)).await;",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence — no leaked permit lets B \
+                  admit while A's stop is only requested, not yet confirmed stopped (the \
+                  comment above this line: 'enough to catch a leaked permit without making the \
+                  test itself slow'). There is no positive state to wait on since the property \
+                  under test is precisely that nothing (an illegitimate admission) happens \
+                  within the window.",
+    },
+    Allowed {
+        file: "tests/m3_execution.rs",
+        needle: "tokio::time::sleep(poll * 2).await;",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence — the work must still read \
+                  `active`, never having concluded early on an ambiguous signal (the comment \
+                  above: 'a signal that never arrives must never read as a conclusion on its \
+                  own'). No positive state to wait on: the property under test is that nothing \
+                  (a premature conclusion) has happened by this point.",
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(1000)).await;",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence (TH-5 test-honesty finding, \
+                  named in the comment above): the completion driver must journal nothing \
+                  across ~5 polling ticks of quiet. No positive state exists to wait on — the \
+                  property under test is that the journal stays exactly as long as it was.",
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "std::thread::sleep(Duration::from_millis(750));",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence: no write lands after `stop` \
+                  has already returned and `observe` already reports `Exited` (both checked \
+                  above, real state, not flagged). No positive state to wait on — the property \
+                  under test is that the directory listing stays byte-identical.",
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "std::thread::sleep(Duration::from_secs(6));",
+        category: "cadence",
+        reason: "a live external-API test (`claude_live_enabled`-gated, not exercised without \
+                  a live credential) modelling how long a real turn needs to run before it is \
+                  genuinely mid-generation, not merely just-started — the comment above cites a \
+                  measured ~3.5s to first API activity. Converting to poll `observe()` for \
+                  `Running` risks catching the turn the instant client-side state flips to \
+                  Running, which per that same measurement can precede real generation activity \
+                  — exactly the race this test needs to not have. Left as a measured, \
+                  provenance-cited delay rather than guess-converted against a live surface this \
+                  environment cannot exercise to verify the replacement is actually safe.",
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "std::thread::sleep(Duration::from_millis(200));",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence (the comment above: 'give a \
+                  wrongly-still-spawned background thread a chance to run before asserting, so \
+                  a regression that double-fires is actually caught'). No positive state to \
+                  wait on — the property under test is that the counter does not increment a \
+                  second time.",
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "tokio::time::sleep(Duration::from_millis(750)).await;",
+        category: "cadence",
+        reason: "a bounded observation window proving an absence, after `shutdown` has already \
+                  returned (real state, not this timer): a disabled daemon's export task must \
+                  not have dialed the collector. No positive state to wait on — the property \
+                  under test is that the collector's hit counter stays at zero.",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "std::thread::sleep(Duration::from_secs(1));",
+        category: "cadence",
+        reason: "paces hanging up the pty until after the watch has had a chance to install \
+                  itself (the comment above: 'the watch installs itself as the loop starts; \
+                  hang up after it has'), a TUI subprocess with no externally observable \
+                  'watch installed' signal short of parsing its own rendered output — the \
+                  decisive assertion below (`pid_alive`) is a real state check, not this delay.",
+    },
+    Allowed {
+        file: "tests/opencode_backend.rs",
+        needle: "std::thread::sleep(Duration::from_millis(100));",
+        category: "cadence",
+        reason: "paces a directly-spawned stub subprocess (not this crate's own backend) until \
+                  it has reached its own internal stall loop, the comment above: 'give the stub \
+                  a moment to reach its own stall loop' — an external process with no exposed \
+                  readiness signal; what the test actually asserts comes later, checked against \
+                  the backend's own observed state, never this delay.",
+    },
+    Allowed {
+        file: "tests/opencode_backend.rs",
+        needle: "std::thread::sleep(Duration::from_secs(2));",
+        category: "cadence",
+        reason: "paces an abort against a live shell tool (`sleep 30 && echo done-sleeping`) so \
+                  the tool has genuinely started before it is interrupted — the file's own later \
+                  comment on this same test documents this transport's abort/settle timing as \
+                  live-measured with no prior figure to cite more precisely; the actual \
+                  outcome is decided by `wait_for_settled_within` below, a real state wait.",
+    },
+    Allowed {
+        file: "tests/w3_client_surface.rs",
+        needle: "std::thread::sleep(Duration::from_millis(300));",
+        category: "cadence",
+        reason: "both occurrences in this file (before triggering B's transition, and again \
+                  before the second `--all` watcher): pace triggering a Work transition until \
+                  after a just-spawned `sgt watch` subprocess has attached (read the journal \
+                  head, opened its SSE stream) — the comment above: 'otherwise this is racing \
+                  an unstarted subscriber, not testing the filter'. The subprocess exposes no \
+                  readiness signal short of parsing its own piped stdout stream, which this test \
+                  does not otherwise read; what is actually asserted is the watcher's own \
+                  captured output, checked separately after this delay.",
+    },
 ];
 
 /// Every `Instant::now()`, `.elapsed()`, or `deadline`-named construct in
