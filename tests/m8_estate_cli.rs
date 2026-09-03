@@ -1580,19 +1580,21 @@ fn write_two_stage_workflow(root: &Path) {
 /// (`FakeBackend::next_step`'s own default) — this is a short poll for the
 /// daemon's async completion driver to catch up, not a wait for an actor.
 fn wait_for_state(cwd: &Path, data_dir: &Path, id: &str, state: &str) -> Value {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let shown = run(cwd, Some(data_dir), &[], &["--json", "work", "show", id]);
-        let body = shown.json();
-        if body["work"]["state"] == state {
-            return body;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "work {id} never reached {state:?}: {body}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
+    let mut reached: Option<Value> = None;
+    support::wait_until_sync(
+        &format!("work {id} never reached {state:?}"),
+        support::HANG_BUDGET,
+        || {
+            let shown = run(cwd, Some(data_dir), &[], &["--json", "work", "show", id]);
+            let body = shown.json();
+            let is_state = body["work"]["state"] == state;
+            if is_state {
+                reached = Some(body);
+            }
+            is_state
+        },
+    );
+    reached.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// guard-map: `sgt work transcript` is reachable end to end through the real

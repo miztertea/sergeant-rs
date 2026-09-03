@@ -274,6 +274,7 @@ async fn a_real_search_through_the_daemon_answers_inside_sgts_own_budget() {
             "command_id": ulid::Ulid::generate().to_string(),
             "estate_root": estate.path(),
         }),
+        || handle.is_alive(),
     )
     .await;
     assert!(status.is_success(), "scan refused: {report}");
@@ -402,6 +403,7 @@ async fn a_search_over_an_index_with_no_stored_vectors_says_so_at_the_crossing()
             "command_id": ulid::Ulid::generate().to_string(),
             "estate_root": estate.path(),
         }),
+        || handle.is_alive(),
     )
     .await;
     assert!(status.is_success(), "scan refused: {report}");

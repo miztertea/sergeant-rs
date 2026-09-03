@@ -81,19 +81,22 @@ async fn submit(
     command_id: &str,
     intent: &str,
 ) -> Value {
-    let resp = http
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&json!({
-            "command_id": command_id,
-            "intent": intent,
-            // D4: the estate this submission addresses.
-            "estate_root": root,
-            "origin": {"client": "cli", "cwd": root},
-        }))
-        .send()
-        .await
-        .expect("submit");
+    let resp = support::send_while_alive(
+        "submit",
+        || {
+            http.post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&json!({
+                    "command_id": command_id,
+                    "intent": intent,
+                    // D4: the estate this submission addresses.
+                    "estate_root": root,
+                    "origin": {"client": "cli", "cwd": root},
+                }))
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::CREATED,
@@ -107,14 +110,18 @@ async fn submit(
 /// round trip [`wait_until_all_settled`] and the inline `support::wait_until`
 /// call below each poll through.
 async fn work_system(http: &reqwest::Client, handle: &DaemonHandle) -> Value {
-    http.get(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("list")
-        .json()
-        .await
-        .expect("json")
+    support::send_while_alive(
+        "list",
+        || {
+            http.get(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await
+    .json()
+    .await
+    .expect("json")
 }
 
 /// S6 fold (brief-sleep-and-hope.md item 2): this used to be a local
@@ -123,7 +130,7 @@ async fn work_system(http: &reqwest::Client, handle: &DaemonHandle) -> Value {
 async fn wait_until_all_settled(http: &reqwest::Client, handle: &DaemonHandle) {
     support::wait_until(
         "every work in the system reaches completed or failed",
-        Duration::from_secs(10),
+        support::HANG_BUDGET,
         || async {
             work_system(http, handle)
                 .await
@@ -246,7 +253,7 @@ async fn journal_growth_warns_when_a_prune_is_stalled_and_names_the_blocking_wor
     }
     support::wait_until(
         "all 5 works settle (completed/failed/needs_input) with exactly one stuck at needs_input",
-        Duration::from_secs(10),
+        support::HANG_BUDGET,
         || async {
             work_system(&http, &handle).await["works"]
                 .as_array()
@@ -262,15 +269,18 @@ async fn journal_growth_warns_when_a_prune_is_stalled_and_names_the_blocking_wor
     .await;
     // Read the stuck Work's own id back from the daemon rather than assuming
     // script-step order matches submission order.
-    let system: Value = http
-        .get(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("list")
-        .json()
-        .await
-        .expect("json");
+    let system: Value = support::send_while_alive(
+        "list",
+        || {
+            http.get(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await
+    .json()
+    .await
+    .expect("json");
     let stuck_id = system["works"]
         .as_array()
         .expect("works array")

@@ -139,6 +139,52 @@ struct Allowed {
     reason: &'static str,
 }
 
+/// Shared by every converted one-shot `.timeout(` entry below — see the
+/// block comment above those entries for the full reasoning; kept as one
+/// named constant rather than repeated so a future reader (or `grep`) finds
+/// the single real argument once.
+///
+/// F-SF-01 (review of this wave): the text that used to live here argued
+/// these 23 sites could stay non-deterministic because "no failure of this
+/// shape has been observed here" — exactly the runner-speed-dependent
+/// argument the ruling rejects (a fast dry-run passing says nothing about a
+/// starved runner) — plus a scope-narrowing claim ("materially larger than
+/// this wave's stated boundary") that cited no J-rung. Both premises were
+/// false distinctions, not settled ground, so they are not repeated here:
+/// every one of these sites now goes through `support::send_while_alive`
+/// (`tests/support/mod.rs`), the one-shot analogue of
+/// `scan_to_completion`'s own retry-while-alive loop — reused (Ponytail
+/// R2), not reinvented — and is thereby converted under the ruling's own
+/// text rather than exempted from it.
+const RETRIED_WHILE_ALIVE_REASON: &str = "converted (F-SF-01): this client is passed to \
+     `support::send_while_alive`, which retries a transport-class failure — including this \
+     client's own `.timeout(` expiring — for as long as the daemon is alive, exactly as \
+     `scan_to_completion` already does for its own status poll. The bound named by this needle is \
+     now a per-attempt cadence for that retry loop, never a verdict this file decides on its own; \
+     a POST this loop can retry is idempotent by the endpoint's own `command_id` dedup (proven by \
+     this file's or a sibling's own below-window/pruned-command_id-retry assertions) or is not \
+     retried at all (see the call site's own comment where that applies).";
+
+/// The one occurrence F-SF-01's fix pass left unconverted: `m2_daemon_api.rs`
+/// makes hundreds of direct, ad hoc `.send()` calls spread across its own
+/// ~5000 lines and dozens of tests — unlike every other entry below, there
+/// is no small, shared `get`/`post`/`submit` choke point a fix could route
+/// through, and many of those calls assert on structured error bodies
+/// (401/404 status, not a transport outcome) where retry-while-alive
+/// semantics do not apply uniformly. Converting it is the same class of fix
+/// as the 23 above, at a scale (a call-site-by-call-site rewrite of a
+/// 5000-line file) that is a distinct piece of scope from this fix pass, not
+/// a difference of principle — escalated rather than attempted piecemeal
+/// here, and named honestly below as still-open non-determinism rather than
+/// as a closed exemption.
+const RESIDUE_REASON: &str = "a reqwest client built for a single, direct one-shot request/response \
+     this test makes itself — never through scan_to_completion's polling loop, and never through \
+     support::send_while_alive either (see this constant's own doc comment above: no small choke \
+     point exists in this file to route the fix through). A transport-class failure here is the \
+     same defect class scan_to_completion had, and no exemption in the ruling ('What this does not \
+     say') covers a test harness's own client `.timeout(`: this is still open non-determinism, not \
+     a closed matter, escalated to a future wave rather than fixed piecemeal here.";
+
 const ALLOWLIST: &[Allowed] = &[
     Allowed {
         file: "src/watch.rs",
@@ -754,6 +800,769 @@ const ALLOWLIST: &[Allowed] = &[
                   does not otherwise read; what is actually asserted is the watcher's own \
                   captured output, checked separately after this delay.",
     },
+    Allowed {
+        file: "tests/support/mod.rs",
+        needle: "std::thread::sleep(delay);",
+        category: "cadence",
+        reason: "wave `transport-timeout-is-not-a-verdict`: inside `spawn_scripted_http_server`, \
+                  holding one *scripted stub connection's* response for a caller-chosen `delay` \
+                  before writing it — the delay is an input the test author picked (how long \
+                  this stub connection stalls), never a verdict the stub computes about the \
+                  request it is answering. The ruling's own carve-out \
+                  (`tests-must-be-deterministic-2026-09-02.md`, 'What this does not say') names \
+                  exactly this shape: time in the product's behavior *under test*, which this \
+                  stub's caller sets (usually to stall past a client's own timeout on purpose, \
+                  proving the caller retries rather than panics) — not a duration this code \
+                  decides pass/fail by.",
+    },
+    // ---- tests/ `.timeout(` (wave `transport-timeout-is-not-a-verdict`, item 3) ----
+    //
+    // Two shapes, per the wave's own instruction: "convert it to the same
+    // retry-while-alive path... or leave it, say so" for a genuine hang
+    // guard. A third, real shape turned out to need naming too — a client
+    // whose `.timeout(` feeds `scan_to_completion` directly is *already*
+    // converted, one call site up: the retry now lives in the shared
+    // helper (previous commit), so the client's own per-attempt bound is
+    // cadence for that retry, not a verdict in its own right.
+    //
+    // The seven entries below are that first shape — every file whose
+    // `client()`/`http()` builds the client `scan_to_completion` is then
+    // handed.
+    Allowed {
+        file: "tests/s6_semantic_crossing.rs",
+        needle: ".timeout(Duration::from_secs(60))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/s6_scan_front_door.rs",
+        needle: ".timeout(Duration::from_secs(30))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/w1b_overlay_lifecycle_trigger.rs",
+        needle: ".timeout(Duration::from_secs(60))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/w1d_overlay_freshness.rs",
+        needle: ".timeout(Duration::from_secs(60))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/y5_external_git_triggers.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/y6a_estate_scoped_scan.rs",
+        needle: ".timeout(Duration::from_secs(30))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    Allowed {
+        file: "tests/y6b_online_only.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: "this client is handed straight to scan_to_completion (tests/support/mod.rs), \
+                  whose status poll now retries a transport-class failure — including this \
+                  client's own timeout expiring — for as long as the daemon is alive; the bound \
+                  here is a per-attempt cadence for that retry loop, not a verdict this file \
+                  decides on its own.",
+    },
+    // This suite's own regression fixture: the client's `.timeout(` value
+    // *is* the behavior under test — a caller-chosen bound short enough
+    // that a scripted stub's delay reliably outruns it, proving the fix
+    // above retries rather than panics.
+    Allowed {
+        file: "tests/s6_scan_poll_survives_a_transport_timeout.rs",
+        needle: ".timeout(client_timeout)",
+        category: "cadence",
+        reason: "wave `transport-timeout-is-not-a-verdict`'s own regression fixture: the caller \
+                  picks this client's timeout per test (short enough that the scripted stub's \
+                  delay outruns it, or long enough that a hangup never touches it) specifically \
+                  to exercise scan_to_completion's retry-while-alive path — the timeout is the \
+                  input under test, not a duration this suite lets decide its own verdict.",
+    },
+    // The remaining 24 sites (F-SF-01): a `reqwest::Client::builder()
+    // .timeout(...)` built for ordinary one-shot request/response calls this
+    // suite makes directly (never through scan_to_completion's polling
+    // loop) — POST/GET a daemon endpoint once, `.expect()`/`assert` the
+    // answer. 23 of the 24 are now converted, not merely allowlisted: each
+    // one's client is passed to `support::send_while_alive`
+    // (`tests/support/mod.rs`), the one-shot analogue of
+    // `scan_to_completion`'s own retry-while-alive loop, so a transport
+    // failure here is retried while the daemon is alive exactly as the
+    // polled status GET already is, instead of deciding the test's outcome.
+    // The one remaining site (`tests/m2_daemon_api.rs`) has no small choke
+    // point to route the fix through and is left as reasoned, still-open
+    // residue — see `RESIDUE_REASON`'s own doc comment above.
+    Allowed {
+        file: "tests/c1a_compiled_context.rs",
+        needle: ".timeout(std::time::Duration::from_secs(30))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/c1a_compiled_context.rs",
+        needle: ".timeout(std::time::Duration::from_secs(60))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/c1d_attribution_nesting_audit.rs",
+        needle: ".timeout(std::time::Duration::from_secs(60))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/agy_routing.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/codex_routing.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/opencode_routing.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/t2_workflow_catalog.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/c2_light/w2fix_probe_ordering.rs",
+        needle: ".timeout(Duration::from_secs(10))",
+        category: "cadence",
+        reason: "converted (F-SF-01) for its two idempotent GETs (`healthz`, the pending-window \
+                  `list`), both now through `support::send_while_alive`. The one non-idempotent \
+                  call this file makes — the pending-window submission, which creates a Work — is \
+                  deliberately *not* retried here: see that call site's own comment. It no longer \
+                  uses this client (or any `.timeout(` of its own) at all, so the only duration in \
+                  play for it is `RENDEZVOUS`, the test's real, single termination bound.",
+    },
+    Allowed {
+        file: "tests/e_admission_uses_no_network_git.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/e_git_admission.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/i9_floor_pinning.rs",
+        needle: ".timeout(std::time::Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/m11_nested_workflow.rs",
+        needle: ".timeout(std::time::Duration::from_secs(30))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/m12_child_work.rs",
+        needle: ".timeout(std::time::Duration::from_secs(30))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: ".timeout(Duration::from_secs(10))",
+        category: "reporting",
+        reason: RESIDUE_REASON,
+    },
+    Allowed {
+        file: "tests/m3_execution.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/w3_prune_engine.rs",
+        needle: ".timeout(std::time::Duration::from_secs(20))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/w4_doctor_journal_growth.rs",
+        needle: ".timeout(Duration::from_secs(10))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/w4_read_surfaces.rs",
+        needle: ".timeout(Duration::from_secs(10))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/x4_tabular_map.rs",
+        needle: ".timeout(std::time::Duration::from_secs(10))",
+        category: "cadence",
+        reason: RETRIED_WHILE_ALIVE_REASON,
+    },
+    Allowed {
+        file: "tests/c4_repo_lock.rs",
+        needle: "Instant::now() + Duration::from_secs(120);",
+        category: "owned-wait-budget",
+        reason: "the lock-holding helper process (repository_lock_helper_process) is a plain \
+            std::process::Command child with no access to tests/support (a different \
+            compilation unit) -- this module's own doc already names it as a different shape, \
+            not this guard's fold-in target: a bounded 'hold the lock until told otherwise' \
+            loop guarding against a dead parent, checking real state (the release file's \
+            existence) every pass.",
+    },
+    Allowed {
+        file: "tests/c4_repo_lock.rs",
+        needle: "Instant::now() + Duration::from_secs(60);",
+        category: "owned-wait-budget",
+        reason: "same helper-process shape as this file's other entry above: a bounded wait for \
+            the helper's own ready file to appear, checking real state every pass, with no \
+            access to tests/support from the parent test process either (kept small and \
+            self-contained rather than adding a dependency for two call sites).",
+    },
+    Allowed {
+        file: "tests/y1_worker_transport.rs",
+        needle: "Instant::now() + std::time::Duration::from_secs(5);",
+        category: "owned-wait-budget",
+        reason: "the module's own comment calls this exactly what it is: 'a coarse whole-binary \
+            backstop, not the decisive check' -- a bounded pgrep poll proving an *absence* (no \
+            sgt-atlas-worker process survives), the same shape-(a) residue this file's own \
+            module doc already names as tolerated (a fixed observation window with no positive \
+            state to poll for). The decisive per-case assertion is FAULT_DEADLINE's own \
+            kill+reap, already allowlisted separately as a `.timeout(`-class construct.",
+    },
+    Allowed {
+        file: "tests/s6_scan_answers_while_embedding.rs",
+        needle: ".timeout(support::HANG_BUDGET)",
+        category: "cadence",
+        reason: "support::HANG_BUDGET itself -- the shared hang-only bound this ruling's own \
+            seam 2 introduces -- used exactly as documented: it ends a genuine hang, never a \
+            slow-but-real answer, and this test's own state assertion (writing_source) is what \
+            decides pass/fail, not how long any single poll took.",
+    },
+    Allowed {
+        file: "tests/support/mod.rs",
+        needle: "let deadline = Instant::now() + budget;",
+        category: "owned-wait-budget",
+        reason: "three real sites share this needle text. Two ARE the implementation this \
+            whole wave folds every other site onto: wait_until's and wait_until_sync's own \
+            `Instant::now() + budget` deadline computation -- the shared primitive cannot be \
+            defined in terms of itself. The third, wait_until_gone (data_dir, budget) -> bool, \
+            is reap_daemons's own SIGTERM-then-SIGKILL escalation gate: never panics, returns \
+            whether the daemon actually left within `budget`, and reap_daemons uses the false \
+            case to decide whether to escalate at all -- the same 'best-effort teardown that \
+            proceeds regardless' shape support::wait_until's own doc names for stop_daemon \
+            (tests/m2_daemon_api.rs, tests/m3_execution.rs), just local to this same file.",
+    },
+    Allowed {
+        file: "tests/w3_client_surface.rs",
+        needle: "let end = Instant::now() + deadline;",
+        category: "owned-wait-budget",
+        reason: "the module's own `wait_for` helper, after this wave's fold, has exactly one \
+            surviving caller: the D6 scoped-watch test's own decisive assertion that \
+            estate A's watch stays *silent* on estate B's transition within a fixed 800ms \
+            window (`assert!(!quiet, ...)`) -- the same shape-(a) residue \
+            `tests/y1_worker_transport.rs`'s own kept entry above already names: a fixed \
+            observation window proving an absence, with no positive state to poll for and no \
+            'eventually true or panic' contract to fold into (wait_until_sync panics when the \
+            predicate never becomes true, which is exactly the passing case here). The other \
+            two former callers of `wait_for` (daemon-stop confirmation, the --all watch match) \
+            wanted a genuine 'eventually true' wait and were folded directly onto \
+            support::wait_until_sync/HANG_BUDGET in this same commit.",
+    },
+    Allowed {
+        file: "tests/w4_read_surfaces.rs",
+        needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
+        category: "owned-wait-budget",
+        reason: "two sites share this needle text (F-SF-01 fix pass), both stateful multi-await \
+            accumulators over the same `&mut reqwest::Response`, same shape as \
+            tests/m2_daemon_api.rs::read_sse_events's own kept entry: giving a wait_until \
+            closure mutable access to `resp` across its own `.await` points needs the \
+            RefCell-wrapped-stream pattern this wave already used elsewhere, which itself trips \
+            clippy::await_holding_refcell_ref -- verified directly (`cargo check` on the literal \
+            wait_until rewrite of drain_until_closed fails with 'captured variable cannot \
+            escape `FnMut` closure body'). Both are now folded to the extent the shape allows: \
+            budget consolidated onto support::HANG_BUDGET (was a bespoke 10s / caller-supplied \
+            timeout), and both now panic naming the exact shortfall -- \
+            read_raw_sse_frames names the frame count never observed, drain_until_closed names \
+            the stream never closing -- rather than returning a value for the caller's own \
+            assert to catch.",
+    },
+    Allowed {
+        file: "tests/m9_watch.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "owned-wait-budget",
+        reason: "r_watch_10a's own journal-stability wait: three CONSECUTIVE 250ms-apart \
+            samples must read the same length before this loop calls the journal settled -- \
+            the comment above names the 250ms cadence itself as load-bearing ('long enough to \
+            outlast committer batching, far shorter than any real gap'). \
+            support::wait_until_sync polls at its own fixed WAIT_POLL_INTERVAL (20ms, private \
+            to tests/support/mod.rs), which would shrink the 3-sample stability window from \
+            ~750ms to ~60ms and could false-positive mid-batch -- folding this one would change \
+            the property under test, not just its budget.",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let deadline = Instant::now() + budget;",
+        category: "owned-wait-budget",
+        reason: "wait_until_gone's own bounded poll: it returns bool (`true` once the pid is \
+            gone, `false` if `budget` elapses with it still alive) rather than panicking either \
+            way. Both callers need the bool: one runs its own cleanup (hard_kill) before \
+            asserting on it with a message this generic helper cannot compose, the other \
+            negates it to prove the CONTROL child survives (an absence-proving wait, the same \
+            shape tests/y1_worker_transport.rs's own kept entry already names) -- the same \
+            'caller decides pass/fail from the returned value' shape as \
+            tests/w4_read_surfaces.rs's own kept entries.",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let gone_by = Instant::now() + support::HANG_BUDGET;",
+        category: "owned-wait-budget",
+        reason: "the survivor-collection loop after the #310 leaker assertion: it returns \
+            whichever pids are still alive when the budget elapses (possibly none), never \
+            panicking itself -- the caller's own assert!(survivors.is_empty(), ...) below is \
+            the actual verdict, with its own richer message (process states, argv). Budget \
+            consolidated onto the one shared support::HANG_BUDGET (was a locally-named \
+            DEADLINE = 30s duplicating it) even though the loop shape itself stays hand-rolled.",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
+        category: "owned-wait-budget",
+        reason: "the quiet-descendants loop in \
+            a_completed_probe_walk_leaves_no_child_of_its_own_behind (already consolidated onto \
+            the shared support::HANG_BUDGET, was a locally-named DEADLINE = 30s duplicating it): \
+            its own exit is not this test's verdict either way \
+            (saw_a_child/leftover.is_empty() below are, checked from state this loop leaves \
+            behind regardless of why it exited); folding it into wait_until_sync's \
+            panic-on-timeout would add a new failure mode this test never had. \
+            (F-SF-01 fix pass: this needle's other former site, \
+            daemon_handle_kill_reaps_a_probe_child_its_walk_still_has_live's own wait for a \
+            live serve child, has been folded onto support::wait_until directly -- it needed \
+            no cleanup-before-fail exception once traced through: a timeout there means no \
+            child was ever found, so there is nothing yet spawned for that test's own \
+            survivor-kill loop to miss.)",
+    },
+    Allowed {
+        file: "tests/v1d_probe_child_lifecycle.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        category: "owned-wait-budget",
+        reason: "the_data_dir_guard_leaves_no_descendant_of_its_daemons_alive's own capture \
+            window: `deadline - Duration::from_secs(7)` is read inside the loop body to keep \
+            listening for at least 3 of this window's 10 seconds once something has been \
+            captured, a relationship anchored to this loop's own 10s span -- routing it through \
+            support::HANG_BUDGET (120s) would silently change the 3-second minimum-listen \
+            window this loop's own early-exit math depends on, not just relax an unrelated \
+            ceiling. The loop itself never panics (it always proceeds to the survivors check \
+            below, the same 'caller decides pass/fail' shape as this file's other kept sites).",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
+        category: "owned-wait-budget",
+        reason: "read_sse_events's own bounded, stateful SSE collector (F-SF-01 fix pass): its \
+            own stop_daemon-shaped sibling entry that used to share this file's deadline needle \
+            has been folded into support::wait_until_sync directly; this one stays, narrowly, \
+            because it is not a side-effect-free predicate wait_until's `FnMut() -> Fut<bool>` \
+            shape covers -- it accumulates parsed frames into `events` across many chunk reads, \
+            and the only way to give a closure mutable access to that accumulator across its own \
+            `.await` points is the RefCell-wrapped-stream pattern this same file already uses \
+            elsewhere (tests/m2_daemon_api.rs's history-replay wait, ~line 2723) -- which itself \
+            holds that RefCell borrow across an `.await`, a real clippy::await_holding_refcell_ref \
+            violation already present in this file before this fix pass (verified: `cargo clippy \
+            --test m2_daemon_api` fails on it at HEAD, unrelated to this entry). Replicating a \
+            known-broken pattern to force this site through the same helper would trade one \
+            defect for another, so the loop stays hand-rolled; the budget is now the shared \
+            support::HANG_BUDGET (was a bespoke 10s) and the loop now panics naming the exact \
+            shortfall by count when the budget elapses, rather than silently returning a short \
+            Vec for the caller's own assert to catch -- the determinism the ruling asks for, \
+            just not routed through wait_until's own body.",
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "owned-wait-budget",
+        reason: "wait_for_a_quiet_journal's own single-sample stability check (`len == \
+            previous` at a 250ms cadence): its own doc explains at length why the 250ms yield \
+            interval is load-bearing on a current-thread runtime (the committer's fair \
+            tokio::sync::Mutex needs the runtime to actually turn between samples) -- the same \
+            'the cadence itself is the property under test' reasoning \
+            tests/m9_watch.rs::r_watch_10a's own kept entry already establishes. \
+            support::wait_until's own poll cadence is different and not tunable per call site.",
+    },
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
+        category: "owned-wait-budget",
+        reason: "otlp_export_reaches_a_collector_listening_on_the_configured_endpoint's own \
+            background TCP accept-loop thread: it is a stand-in collector SERVER, not a wait \
+            for a condition -- `listener.accept()` inside the loop has nothing in common with \
+            support::wait_until_sync's `FnMut() -> bool` predicate shape, and the thread's own \
+            exit (timeout or a captured trace POST) is not this test's verdict either way: the \
+            main thread's own assert! after `collector.join()` is.",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
+        category: "owned-wait-budget",
+        reason: "two sites share this needle text (F-SF-01 fix pass consolidated the first \
+            onto support::HANG_BUDGET, was a bespoke 20s). (1) the live-SSE-tail test's own \
+            event-consuming loop: each pass calls `stream.next_event()` (its own inner 5s \
+            tokio::time::timeout, awaited directly), not a side-effect-free state check -- the \
+            shape support::wait_until's predicate (`FnMut() -> Fut<Output = bool>`, polled with \
+            its own sleep-based backoff) does not fit. The loop accumulates `asked_to_refresh` \
+            across possibly-many events and can exit either by finding the target event or by \
+            the deadline; the post-loop assert!(asked_to_refresh, ...) is the actual verdict \
+            either way. (2) the add-repo overlay test's own background-poll loop: `app` is a \
+            plain local `&mut` used both before and after this wait across many more call sites \
+            in the same test, and support::wait_until's predicate is `FnMut() -> Fut` -- its \
+            returned future cannot hold a mutable borrow of a captured variable across its own \
+            await points ('captured variable cannot escape `FnMut` closure body'). Where that \
+            bit a value captured ONLY inside the wait elsewhere in this wave, a \
+            std::cell::RefCell scoped to just that wait was the narrow fix; wrapping `app` \
+            itself for this one call would thread interior mutability through a value this \
+            whole test otherwise owns directly.",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + Duration::from_secs(30);",
+        category: "owned-wait-budget",
+        reason: "two sites share this needle text, both named (directly or by shape) in \
+            support::wait_until's own doc comment as staying hand-rolled. (1) the pty-hangup \
+            test's own TUI-survival wait -- support::wait_until's doc names it explicitly: \
+            'one that must run cleanup before failing (tests/m6_surfaces.rs's TUI-survival \
+            wait)'; it never panics itself, `survived = pid_alive(tui)` after the loop decides, \
+            and the caller kills the survivor before asserting. (2) SpawnedDaemon::start_at's \
+            own descriptor-poll: kills and reaps its own child before panicking on timeout, the \
+            same 'must run cleanup before failing' shape.",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let deadline = Instant::now() + DAEMON_TERM_GRACE;",
+        category: "owned-wait-budget",
+        reason: "SpawnedDaemon::stop's own SIGTERM-then-SIGKILL escalation: never panics, \
+            returns a DaemonStop describing which signal actually worked -- the same \
+            'best-effort teardown that proceeds regardless' shape support::wait_until's own \
+            doc names for stop_daemon (tests/m2_daemon_api.rs, tests/m3_execution.rs), just \
+            with an escalation action on timeout instead of a bare return.",
+    },
+    // ---- tests/ free-function `timeout(` (wave `timeout-the-function`, item 2) ----
+    //
+    // The visitor arm added this wave catches `tokio::time::timeout(dur,
+    // fut)` — every real occurrence, whatever shape it turns out to be.
+    // Three shapes recur: (a) a pure hang backstop around an operation this
+    // test otherwise decides by state alone -- raised onto the shared
+    // support::HANG_BUDGET and named here as exactly that; (b) a per-chunk
+    // read timeout nested *inside* an outer support::HANG_BUDGET-bounded
+    // accumulation loop (the outer loop's own deadline is what actually
+    // decides "never observed", already allowlisted separately as a
+    // hand-rolled-deadline construct) -- kept at its own smaller literal,
+    // named as a nested hang guard rather than the loop's own verdict; (c)
+    // a duration that is itself the behavior under test (a product-
+    // configured grace period being proven honored) -- named and verified
+    // against the actual product constant, never assumed.
+    Allowed {
+        file: "tests/s6_scan_front_door.rs",
+        needle: "let joined = tokio::time::timeout(",
+        category: "owned-wait-budget",
+        reason: "shape (a): wraps `tokio::spawn(scan_to_completion(...))` so a broken 404 \
+            detection reads as a named test failure ('a poll loop that ignores the status \
+            polls a dead id until something outside the test kills it') rather than a hung \
+            job the runner has no separate timeout for. Raised from a bespoke 15s onto \
+            support::HANG_BUDGET; the success path exits long before either bound, so widening \
+            it changes nothing about what a passing run observes.",
+    },
+    Allowed {
+        file: "tests/x3a_git_plumbing.rs",
+        needle: "let finished = tokio::time::timeout(support::HANG_BUDGET, scan_while_saturated)",
+        category: "owned-wait-budget",
+        reason: "shape (a): the parked job's own completion is awaited directly (no polling \
+            loop) once `drop(first)` has already freed the permit that was blocking it -- the \
+            bound only catches a broken lane-release regression turning this into a hang. \
+            Raised from a bespoke 30s onto support::HANG_BUDGET.",
+    },
+    Allowed {
+        file: "tests/y1_worker_transport.rs",
+        needle: "tokio::time::timeout(support::HANG_BUDGET, async {",
+        category: "owned-wait-budget",
+        reason: "shape (a): the whole four-fault-case loop's own outer backstop -- if \
+            supervision's deadline enforcement were broken (a hung worker never actually \
+            killed), the per-case FAULT_DEADLINE (400ms) would never fire and this catches it \
+            instead of the suite hanging forever, the same 'coarse whole-binary backstop, not \
+            the decisive check' shape this file's own kept Instant::now()+5s entry above \
+            already names. Raised from a locally-named TEST_OUTER_BOUND (20s, no independent \
+            reason beyond 'generous') onto support::HANG_BUDGET, removing the now-redundant \
+            local const (R6).",
+    },
+    Allowed {
+        file: "tests/m6_surfaces.rs",
+        needle: "let event = tokio::time::timeout(Duration::from_secs(5), stream.next_event())",
+        category: "owned-wait-budget",
+        reason: "shape (b): the live-SSE-tail test's own per-poll read, nested inside the \
+            outer `let deadline = Instant::now() + support::HANG_BUDGET;` accumulation loop \
+            already allowlisted above (this same file's own two-site entry explains why the \
+            loop stays hand-rolled) -- `stream.next_event()` is awaited directly, not through a \
+            wait_until predicate, so this 5s only bounds one stuck read; the outer loop's own \
+            exhaustion is the actual 'never observed' verdict.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let chunk = tokio::time::timeout(Duration::from_secs(10), resp.chunk())",
+        category: "owned-wait-budget",
+        reason: "shape (b): read_sse_events's own per-chunk read, nested inside its own \
+            `let deadline = Instant::now() + support::HANG_BUDGET;` accumulation loop \
+            (already allowlisted above under that needle) -- this 10s only bounds one stuck \
+            chunk read; the outer loop's own exhaustion assertion ('never observed {count} SSE \
+            events') is the real verdict.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "tokio::time::timeout(support::HANG_BUDGET, handle.shutdown())",
+        category: "owned-wait-budget",
+        reason: "shape (a): `shutdown_completes_with_a_live_sse_client_attached`'s own decisive \
+            check is that `handle.shutdown()` resolves at all with a live SSE tail attached -- \
+            a pure hang backstop, no polling loop and nothing else in the test branches on how \
+            long it took. Raised from a bespoke 15s onto support::HANG_BUDGET.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let closed = tokio::time::timeout(support::HANG_BUDGET, stream.chunk())",
+        category: "owned-wait-budget",
+        reason: "shape (a): the same test's follow-up check that the now-shut-down daemon's \
+            stream actually closes (`Ok(None) | Err(_)`) rather than dangling -- one read, no \
+            loop, a pure hang backstop. Raised from a bespoke 5s onto support::HANG_BUDGET.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let chunk = tokio::time::timeout(support::HANG_BUDGET, stream.chunk())",
+        category: "owned-wait-budget",
+        reason: "shape (a)+(b) combined, wave `timeout-the-function` item 1: the history-\
+            replay wait's own hand-rolled loop (restructured off `support::wait_until`'s \
+            RefCell-wrapped-stream shape to fix clippy::await_holding_refcell_ref, see that \
+            commit) -- both the outer `let deadline = Instant::now() + support::HANG_BUDGET;` \
+            (needle already covered above) and this per-chunk read now share the one constant \
+            rather than the two bespoke 5s values the RefCell version used; nothing in this \
+            loop decides pass/fail by how long a single chunk read took.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "match tokio::time::timeout(INDEPENDENT_REQUEST_BUDGET, future).await {",
+        category: "owned-wait-budget",
+        reason: "INDEPENDENT_REQUEST_BUDGET (this file, `const INDEPENDENT_REQUEST_BUDGET: \
+            Duration = support::HANG_BUDGET;`) is already a transparent alias for the shared \
+            constant -- verified by reading the declaration directly, not assumed from the \
+            name -- so this is shape (a) under its own local name rather than a second, \
+            divergent budget.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let outcome = tokio::time::timeout(SHUTDOWN_BUDGET, &mut shutdown).await;",
+        category: "owned-wait-budget",
+        reason: "shape (c): `SHUTDOWN_BUDGET` (`const SHUTDOWN_BUDGET: Duration = \
+            Duration::from_secs(9);`, local to each of the two tests using this needle) is the \
+            duration under test, not a hang backstop -- each test's own doc comment states it \
+            directly: 'the daemon's own grace is 5s; this is that plus room for a loaded \
+            machine, and still under m6's 10s SIGTERM grace.' Verified, not assumed: \
+            `src/daemon.rs`'s `DRIVER_SHUTDOWN_GRACE`/`PROBE_WALK_SHUTDOWN_GRACE` are both \
+            literally `Duration::from_secs(5)`, and `src/cli.rs`'s `STOP_TERM_GRACE` is \
+            `Duration::from_secs(15)` (m6's own SIGTERM grace, wider than the 9s claimed here \
+            but still the outer bound this 9s must stay under) -- so 9s really is the product's \
+            own configured shutdown grace plus a fixed margin, proven honored, exactly the \
+            'a duration IS the behavior under test' carve-out the ruling's own text allows.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let _ = tokio::time::timeout(SHUTDOWN_BUDGET, shutdown).await;",
+        category: "owned-wait-budget",
+        reason: "the paired best-effort re-join (after the panic message above already fired, \
+            \"bounded like the wait it drains\") for the SHUTDOWN_BUDGET entry immediately \
+            above -- same constant, same verified provenance.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let retried_b = tokio::time::timeout(support::HANG_BUDGET, async {",
+        category: "owned-wait-budget",
+        reason: "shape (a), two sites share this needle text \
+            (`t_execution_lane_permit_releases_on_a_daemon_side_launch_error` and \
+            `t_execution_lane_permit_releases_on_execution_failure`): each wraps a single, \
+            direct HTTP POST with no polling loop -- 'B's retry must not hang' is the whole \
+            decisive check, named in both tests' own comments ('A bounded timeout -- not a \
+            bare .await -- is what turns \"the permit leaked\" into a named test failure \
+            instead of a wedged suite'). Raised from a bespoke 10s onto support::HANG_BUDGET.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let status_b = tokio::time::timeout(support::HANG_BUDGET, retry_b)",
+        category: "owned-wait-budget",
+        reason: "shape (a): joins an already-spawned retry task after the stop-confirmation \
+            handshake above -- 'B's retry never answered after A's stop was confirmed -- the \
+            permit leaked' is a hang backstop on a task that is otherwise expected to have \
+            already finished by the time this join runs. Raised from a bespoke 10s onto \
+            support::HANG_BUDGET.",
+    },
+    Allowed {
+        file: "tests/m2_daemon_api.rs",
+        needle: "let status_b = tokio::time::timeout(support::HANG_BUDGET, retry(work_b))",
+        category: "owned-wait-budget",
+        reason: "shape (a), pre-existing (not introduced this wave): the test's own comment \
+            already explains it in full -- 'support::HANG_BUDGET bounds that \"never returns\" \
+            into a named report rather than a permanent hang; it decides nothing about how \
+            fast a real return must be.' Named here only because the free-function visitor arm \
+            added this wave now walks it; no code changed at this site.",
+    },
+    Allowed {
+        file: "tests/w4_read_surfaces.rs",
+        needle: "let chunk = match tokio::time::timeout(Duration::from_secs(10), resp.chunk()).await {",
+        category: "owned-wait-budget",
+        reason: "shape (b): read_raw_sse_frames's own per-chunk read, nested inside its own \
+            `let deadline = Instant::now() + support::HANG_BUDGET;` accumulation loop (already \
+            allowlisted above, two-site entry) -- this 10s only bounds one stuck chunk read; \
+            the outer loop's own exhaustion assertion is the real verdict.",
+    },
+    Allowed {
+        file: "tests/w4_read_surfaces.rs",
+        needle: "match tokio::time::timeout(Duration::from_secs(2), resp.chunk()).await {",
+        category: "owned-wait-budget",
+        reason: "shape (b): drain_until_closed's own per-chunk read, nested inside its own \
+            `let deadline = Instant::now() + support::HANG_BUDGET;` loop (same allowlisted \
+            entry as read_raw_sse_frames above, shared by this file's two-site entry) -- a \
+            stuck chunk read retries (`Err(_) => continue`) rather than deciding anything; the \
+            outer loop's own assert! on every pass is what can actually fail.",
+    },
+    Allowed {
+        file: "tests/c2_light/w2fix_probe_ordering.rs",
+        needle: "let handle = tokio::time::timeout(RENDEZVOUS, starting)",
+        category: "owned-wait-budget",
+        reason: "shape (a), two sites share this needle text: RENDEZVOUS is this file's own \
+            named alias for support::HANG_BUDGET (`const RENDEZVOUS: Duration = \
+            support::HANG_BUDGET;`, raised this wave from a bespoke 30s) -- the file's own doc \
+            comment on the const already states the shape directly: 'a deadlock guard, not a \
+            latency pin: nothing here asserts that any operation was fast, only that it \
+            happened at all before the suite gave up.'",
+    },
+    Allowed {
+        file: "tests/c2_light/w2fix_probe_ordering.rs",
+        needle: "let response = tokio::time::timeout(RENDEZVOUS, submit)",
+        category: "owned-wait-budget",
+        reason: "the third RENDEZVOUS call site, same constant and same reasoning as this \
+            file's other kept entry above.",
+    },
+    // ---- tests/ wait_until/wait_until_sync literal budgets (wave `timeout-the-function`,
+    // item 3) ----
+    //
+    // The owner ruling's own text: "Budgets in tests/ are one shared,
+    // generous constant unless allowlisted with a reason." Every entry
+    // below is a `wait_until`/`wait_until_sync` call whose budget
+    // genuinely differs from support::HANG_BUDGET, in either direction,
+    // with the reason already written at the call site itself (this wave
+    // added no new reasoning at these five sites — only the entry that
+    // names it here) — a real occurrence the guard's new arm now correctly
+    // finds, not a new exception being carved out.
+    Allowed {
+        file: "tests/m5_projections.rs",
+        needle: "Duration::from_secs(2),",
+        category: "owned-wait-budget",
+        reason: "smaller than support::HANG_BUDGET on purpose, per the site's own comment \
+            immediately above: 'Deliberately NOT support::HANG_BUDGET: this retry absorbs ONE \
+            legitimate transient (a torn tail mid-write), and the short 2s window is itself the \
+            point -- any Malformed error that isn't a torn tail still panics on first sight, \
+            exactly as before.' Widening this to HANG_BUDGET would let a genuinely-corrupt \
+            journal masquerade as a torn tail for two minutes before this test finally failed.",
+    },
+    Allowed {
+        file: "tests/agy_backend.rs",
+        needle: "Duration::from_secs(180),",
+        category: "owned-wait-budget",
+        reason: "larger than support::HANG_BUDGET on purpose, per the site's own comment \
+            immediately above: 'This opt-in live test's own budget exceeds support::HANG_BUDGET \
+            on purpose: a real second live-model turn's own round trip is the thing being \
+            waited on here, and has been observed to run past 120s on a loaded host.'",
+    },
+    Allowed {
+        file: "tests/agy_backend.rs",
+        needle: "Duration::from_secs(300),",
+        category: "owned-wait-budget",
+        reason: "larger than support::HANG_BUDGET on purpose, per the site's own comment \
+            immediately above: 'Same reasoning as the resumed-turn live wait above: this opt-in \
+            live loop test's own budget exceeds support::HANG_BUDGET on purpose, for a real \
+            model turn's own observed round trip.'",
+    },
+    Allowed {
+        file: "tests/m4_backends.rs",
+        needle: "support::wait_until_sync(\"the turn never finished\", Duration::from_secs(300), || {",
+        category: "owned-wait-budget",
+        reason: "larger than support::HANG_BUDGET on purpose, per the site's own comment \
+            immediately above: 'This opt-in live test's own budget exceeds support::HANG_BUDGET \
+            on purpose, same reasoning as tests/agy_backend.rs's own two live-turn waits: a real \
+            model turn's own round trip is the thing being waited on here.'",
+    },
+    Allowed {
+        file: "tests/support/mod.rs",
+        needle: "Duration::from_secs(10),",
+        category: "owned-wait-budget",
+        reason: "wait_until_executable's own retry, smaller than support::HANG_BUDGET on \
+            purpose, per the site's own comment immediately above: 'Deliberately NOT \
+            HANG_BUDGET: this retries ONE specific, fast-resolving transient (a sibling test's \
+            fork-to-exec window overlapping this write) -- any other failure still surfaces \
+            immediately below, and a genuinely stuck ETXTBSY would be a real bug worth failing \
+            fast on rather than waiting two minutes to report.'",
+    },
 ];
 
 /// Whether some entry in `allowlist` names both `file_label` and a `needle`
@@ -1105,15 +1914,181 @@ fn loop_body_checks_state(block: &syn::Block) -> bool {
     finder.found
 }
 
-struct SleepVisitor {
+/// One `.timeout(` method call found by the same walk as [`SleepSite`]
+/// (F-SI-01: folded into the one [`TestConstructVisitor`] below rather than
+/// a second, parallel struct/impl/fn pipeline — Ponytail R2). Unlike a
+/// `sleep(`, a client-builder `.timeout(` carries no loop-shape question —
+/// there is no "inside a state-terminating loop" reading of a client's own
+/// configured per-request bound, only "does something explain why this
+/// construct exists" — so every real occurrence sits on `ALLOWLIST` or the
+/// guard is red (wave `transport-timeout-is-not-a-verdict`, item 4: "Client
+/// timeouts are the other half of the same class" `sleep(` already covers).
+struct TimeoutSite {
+    line: usize,
+}
+
+/// One hand-rolled `Instant::now() + <duration>` deadline construction
+/// found by the same walk (seam 2, no-clock-decides). Unlike a `sleep(`,
+/// this is never legitimate on its own merits the way an `owned-wait-budget`
+/// `sleep(` can be: the one conversion target is
+/// `tests/support::wait_until`/`wait_until_sync`, which already own this
+/// exact shape (a deadline, a predicate, a named panic on exhaustion) behind
+/// one shared, reviewed constant (`support::HANG_BUDGET`). A real occurrence
+/// sits on `ALLOWLIST` — with a `hand-rolled-deadline` category naming why
+/// it is not folded — or the guard is red.
+///
+/// A real `syn` parse, not a text/brace scanner, for the same reason this
+/// file's own doc already gives for `sleep(`: reformatting or reindenting
+/// the file must not silently detune this. The construct detected is the
+/// binary `+` expression itself (`Instant::now() + Duration::...`), which is
+/// where every real site's deadline is actually built, whatever the loop
+/// around it looks like.
+struct DeadlineSite {
+    line: usize,
+}
+
+/// Whether `expr` is a call to `Instant::now()` — any path ending in `now`
+/// with `Instant` somewhere in the path, so `std::time::Instant::now()`,
+/// `Instant::now()`, and an aliased import all match without needing this
+/// guard to resolve imports.
+fn is_instant_now_call(expr: &syn::Expr) -> bool {
+    let syn::Expr::Call(call) = expr else {
+        return false;
+    };
+    let syn::Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    let segments: Vec<String> = path
+        .path
+        .segments
+        .iter()
+        .map(|s| s.ident.to_string())
+        .collect();
+    segments.last().is_some_and(|last| last == "now") && segments.iter().any(|s| s == "Instant")
+}
+
+/// Whether `func` is the free-function `tokio::time::timeout(dur, fut)` (or
+/// `time::timeout(`/a bare `timeout(` reached via `use tokio::time::timeout`)
+/// — a path whose last segment is `timeout`, matched without resolving
+/// imports the same way [`is_instant_now_call`] matches `Instant::now()`
+/// above (R2). Every real `.rs` file walked by this guard imports this
+/// symbol only from `tokio::time`, so the bare last-segment match carries no
+/// false-positive risk within this crate's own `tests/` tree; a stricter
+/// "and `time` appears somewhere in the path" check (mirroring
+/// `is_instant_now_call`'s own `Instant` check) is skipped only because the
+/// bare `timeout(` alias form has no `time` segment in its path at all to
+/// check.
+fn is_timeout_call(func: &syn::Expr) -> bool {
+    let syn::Expr::Path(path) = func else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "timeout")
+}
+
+/// One `wait_until`/`wait_until_sync` call whose own budget argument (the
+/// visitor's own check, immediately below, confirms it is a `Duration::
+/// from_*` literal before recording a site here) is not a named, shared
+/// constant — wave `timeout-the-function`, item 3. Deliberately its own
+/// site/needle line (the *literal's* line, not the call's own first line —
+/// see the visitor arm below), because a real call site spans several lines
+/// and `ALLOWLIST`'s needle matching reads the one line the guard reports.
+struct WaitBudgetSite {
+    line: usize,
+}
+
+/// Whether `func` is exactly `wait_until` or `wait_until_sync` — never
+/// `wait_until_gone`, `wait_until_executable`, or `wait_until_all_settled`,
+/// which are distinct helpers with their own already-reasoned budget shapes
+/// (`tests/s6_no_clock_decides_correctness.rs`'s own `ALLOWLIST` entries
+/// for `wait_until_gone`'s callers; `wait_until_executable`'s own inline
+/// "Deliberately NOT HANG_BUDGET" comment) — an exact last-segment match,
+/// not a prefix, so this guard does not reach past its own two named
+/// functions into a same-shaped sibling on purpose.
+fn is_wait_budget_call(func: &syn::Expr) -> bool {
+    let syn::Expr::Path(path) = func else {
+        return false;
+    };
+    path.path
+        .segments
+        .last()
+        .is_some_and(|s| s.ident == "wait_until" || s.ident == "wait_until_sync")
+}
+
+/// Whether `arg` is itself a `Duration::from_*` call, or a `+`/`-`
+/// combination of such calls (`Duration::from_secs(5) + Duration::ZERO`) —
+/// a literal budget picked at this one call site rather than a named,
+/// shared constant (`support::HANG_BUDGET`, a locally reasoned `const
+/// SHUTDOWN_BUDGET`, or a plain identifier/parameter). Recurses through
+/// `syn::Expr::Paren` and `syn::Expr::Binary` so a derived-but-still-
+/// literal expression is caught the same as a bare call (F-IN-01: this
+/// guard used to match only a bare `Expr::Call`, so
+/// `Duration::from_secs(5) + Duration::ZERO` silently bypassed it). A
+/// local variable or a helper function returning a `Duration` still
+/// bypasses this check on purpose — resolving those needs constant
+/// propagation across bindings, which is dataflow analysis this guard does
+/// not do (out of this wave's bound: no new abstraction beyond one more
+/// visitor arm). Any path whose last segment starts with `from_` and which
+/// mentions `Duration` somewhere in the path, the same import-agnostic
+/// shape [`is_instant_now_call`] already uses for `Instant` above (R2) —
+/// `Duration::from_secs`, `std::time::Duration::from_millis`, an aliased
+/// import, all match without this guard resolving imports. A bare
+/// `Duration::ZERO`/`Duration::MAX` path constant (no `from_` call) is
+/// also treated as literal so it does not defeat the `+` recursion above.
+fn is_duration_from_literal(arg: &syn::Expr) -> bool {
+    match arg {
+        syn::Expr::Paren(paren) => is_duration_from_literal(&paren.expr),
+        syn::Expr::Binary(bin) => {
+            is_duration_from_literal(&bin.left) || is_duration_from_literal(&bin.right)
+        }
+        syn::Expr::Call(call) => {
+            let syn::Expr::Path(path) = &*call.func else {
+                return false;
+            };
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            segments
+                .last()
+                .is_some_and(|last| last.starts_with("from_"))
+                && segments.iter().any(|s| s == "Duration")
+        }
+        syn::Expr::Path(path) => {
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            segments.len() >= 2 && segments.iter().any(|s| s == "Duration")
+        }
+        _ => false,
+    }
+}
+
+/// The one `syn` visitor for every `tests/` construct this file's guards
+/// walk — a `sleep(`/`.timeout(`/`wait_until(`-budget call, a hand-rolled
+/// `Instant::now() + ` deadline, and the loop state around them — in a
+/// single pass over a single parse (F-SI-01: this used to be two structs,
+/// two `impl Visit`s and two entry-point functions, each parsing the same
+/// file text again from scratch).
+struct TestConstructVisitor {
     /// Whether the loop directly containing the current position — the
     /// innermost one, per [`loop_body_checks_state`]'s doc — has been shown
     /// to check state and branch on it. Empty outside any loop.
     loop_checks_state: Vec<bool>,
-    sites: Vec<SleepSite>,
+    sleep_sites: Vec<SleepSite>,
+    timeout_sites: Vec<TimeoutSite>,
+    deadline_sites: Vec<DeadlineSite>,
+    wait_budget_sites: Vec<WaitBudgetSite>,
 }
 
-impl<'ast> Visit<'ast> for SleepVisitor {
+impl<'ast> Visit<'ast> for TestConstructVisitor {
     fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
         let checks = !is_literal_true(&node.cond) || loop_body_checks_state(&node.body);
         self.loop_checks_state.push(checks);
@@ -1141,23 +2116,95 @@ impl<'ast> Visit<'ast> for SleepVisitor {
             syn::Expr::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "sleep")
         );
         if is_sleep {
-            self.sites.push(SleepSite {
+            self.sleep_sites.push(SleepSite {
                 line: node.span().start().line,
                 in_state_loop: self.loop_checks_state.last().copied().unwrap_or(false),
             });
         }
+        if is_timeout_call(&node.func) {
+            // Wave `timeout-the-function`, item 2: the free-function
+            // `tokio::time::timeout(dur, fut)` form escaped this guard
+            // entirely before this arm existed — only the client-builder
+            // `.timeout(` method call below was walked. Same `TimeoutSite`
+            // shape and the same `ALLOWLIST` the method-call arm already
+            // feeds (F-SI-01/R2): one construct class, one site list,
+            // whichever syntax reached it.
+            self.timeout_sites.push(TimeoutSite {
+                line: node.span().start().line,
+            });
+        }
+        if is_wait_budget_call(&node.func)
+            && node.args.len() >= 2
+            && is_duration_from_literal(&node.args[1])
+        {
+            // Wave `timeout-the-function`, item 3: a `wait_until`/
+            // `wait_until_sync` call whose own budget argument is a
+            // `Duration::from_*` literal rather than a named, shared
+            // constant (`support::HANG_BUDGET` or a locally reasoned
+            // `const`) is exactly the "smaller because normally fast"
+            // shape the owner ruling forbids — flagged at the literal's own
+            // line so a multi-line call's `ALLOWLIST` needle can match the
+            // literal text a reader (and `grep`) actually sees.
+            self.wait_budget_sites.push(WaitBudgetSite {
+                line: node.args[1].span().start().line,
+            });
+        }
         visit::visit_expr_call(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if node.method == "timeout" {
+            // `node.span()` covers the whole receiver chain (from
+            // `reqwest::Client::builder()` through this call) — the method
+            // name's own span is what actually sits on the `.timeout(` line
+            // a reader (and `ALLOWLIST`'s needle matching) expects.
+            self.timeout_sites.push(TimeoutSite {
+                line: node.method.span().start().line,
+            });
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        if matches!(node.op, syn::BinOp::Add(_)) && is_instant_now_call(&node.left) {
+            self.deadline_sites.push(DeadlineSite {
+                line: node.span().start().line,
+            });
+        }
+        visit::visit_expr_binary(self, node);
     }
 }
 
-fn sleep_sites(text: &str) -> Vec<SleepSite> {
+/// Parses `text` once and walks it once, returning every `sleep(` site,
+/// every `.timeout(`/free-function `timeout(` site, every hand-rolled
+/// deadline site, and every literal-budget `wait_until`/`wait_until_sync`
+/// site found — the one parse/visit pass shared by [`unallowed_test_sleeps`],
+/// [`unallowed_test_timeouts`], [`unallowed_test_deadlines`], and
+/// [`unallowed_test_wait_budgets`] (F-SI-01, wave `timeout-the-function`
+/// widens the same pass rather than adding a second one).
+fn scan_test_constructs(
+    text: &str,
+) -> (
+    Vec<SleepSite>,
+    Vec<TimeoutSite>,
+    Vec<DeadlineSite>,
+    Vec<WaitBudgetSite>,
+) {
     let file = syn::parse_file(text).unwrap_or_else(|e| panic!("parse: {e}"));
-    let mut visitor = SleepVisitor {
+    let mut visitor = TestConstructVisitor {
         loop_checks_state: Vec::new(),
-        sites: Vec::new(),
+        sleep_sites: Vec::new(),
+        timeout_sites: Vec::new(),
+        deadline_sites: Vec::new(),
+        wait_budget_sites: Vec::new(),
     };
     visitor.visit_file(&file);
-    visitor.sites
+    (
+        visitor.sleep_sites,
+        visitor.timeout_sites,
+        visitor.deadline_sites,
+        visitor.wait_budget_sites,
+    )
 }
 
 /// Every `sleep(` call in `text` (a `tests/` file, `file_label`) that is
@@ -1173,7 +2220,7 @@ fn unallowed_test_sleeps(
 ) -> Vec<(usize, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let mut violations = Vec::new();
-    for site in sleep_sites(text) {
+    for site in scan_test_constructs(text).0 {
         if site.in_state_loop {
             continue;
         }
@@ -1330,5 +2377,400 @@ async fn polls_five_times() {
         checked_violations.is_empty(),
         "a fixed-count loop whose body conditionally returns on real state must not be \
          flagged: {checked_violations:?}"
+    );
+}
+
+// ------------------------------------------------------ tests/ .timeout(
+
+/// Every `.timeout(` call in `text` (a `tests/` file, `file_label`) not
+/// covered by `allowlist` — the same `Allowed` shape and `file`+`needle`
+/// matching (`allowlist_covers`) every other half of this guard already
+/// uses (R2), so the same "matches nothing"/"no real reason" self-checks
+/// cover these entries too without a second, parallel check.
+fn unallowed_test_timeouts(
+    file_label: &str,
+    text: &str,
+    allowlist: &[Allowed],
+) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut violations = Vec::new();
+    for site in scan_test_constructs(text).1 {
+        let content = lines
+            .get(site.line - 1)
+            .copied()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let covered = allowlist_covers(allowlist, file_label, &content);
+        if !covered {
+            violations.push((site.line, content));
+        }
+    }
+    violations
+}
+
+/// The `tests/` `.timeout(` half of the guard (brief
+/// `transport-timeout-is-not-a-verdict.md`, item 4): every client-builder
+/// `.timeout(` call in `tests/**/*.rs` sits on `ALLOWLIST` with a real
+/// reason — same entry shape and same self-checks the `sleep(` guard above
+/// already has (R2), widened to a third construct.
+#[test]
+fn every_client_timeout_in_tests_sits_on_an_explicit_allowlist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all_violations = Vec::new();
+    for path in all_test_files() {
+        let file = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_str()
+            .expect("utf8 path")
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", file));
+        for (line, content) in unallowed_test_timeouts(&file, &text, ALLOWLIST) {
+            all_violations.push(format!("{file}:{line}: {content}"));
+        }
+    }
+    assert!(
+        all_violations.is_empty(),
+        "a `.timeout(` call exists in tests/ with no ALLOWLIST entry explaining why it is not a \
+         duration deciding an expected-success test's verdict — convert the caller to retry \
+         while the daemon is alive (tests/support/mod.rs::scan_to_completion) or add a reviewed \
+         `Allowed` entry naming why it is genuinely behavioral (a hang guard, a stalled-backend \
+         test), in tests/s6_no_clock_decides_correctness.rs:\n{}",
+        all_violations.join("\n")
+    );
+}
+
+/// Proof the `.timeout(` guard above is not vacuous, same standing-
+/// regression shape as the `sleep(` guard's own vacuity test: a synthetic
+/// client-builder `.timeout(` with no allowlist entry must be flagged; the
+/// same call once allowlisted must not be.
+#[test]
+fn the_timeout_guard_fails_on_an_unallowlisted_client_timeout() {
+    let synthetic = "\
+fn client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .expect(\"client\")
+}
+";
+    let violations = unallowed_test_timeouts("tests/x_example.rs", synthetic, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "the checker must flag an unlisted client `.timeout(` construct; it did not, which \
+         means the guard test above is vacuous"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|(line, text)| *line == 3 && text.contains("timeout")),
+        "expected the flagged construct at its real line and content, got: {violations:?}"
+    );
+
+    let permissive: Vec<Allowed> = vec![Allowed {
+        file: "tests/x_example.rs",
+        needle: ".timeout(Duration::from_secs(20))",
+        category: "cadence",
+        reason: "synthetic fixture only, proving the allowlist path itself is reachable",
+    }];
+    let still_clean = unallowed_test_timeouts("tests/x_example.rs", synthetic, &permissive);
+    assert!(
+        still_clean.is_empty(),
+        "an allowlisted `.timeout(` must not be flagged: {still_clean:?}"
+    );
+}
+
+/// Wave `timeout-the-function`, item 2: the guard above walked only the
+/// client-builder `.timeout(` *method* call — `tokio::time::timeout(dur,
+/// fut)` (and its `time::timeout(`/bare `timeout(` aliases, `use
+/// tokio::time::timeout`) is a free *function* call (`syn::ExprCall`, not
+/// `syn::ExprMethodCall`) and escaped `visit_expr_method_call` entirely.
+/// Same standing-regression shape as every other vacuity test in this file:
+/// a synthetic free-function `timeout(` with no allowlist entry must be
+/// flagged; the same call once allowlisted must not be.
+#[test]
+fn the_timeout_guard_fails_on_an_unallowlisted_free_function_timeout() {
+    let synthetic = "\
+async fn waits_forever(fut: impl std::future::Future<Output = ()>) {
+    tokio::time::timeout(Duration::from_secs(10), fut)
+        .await
+        .expect(\"never observed\");
+}
+";
+    let violations = unallowed_test_timeouts("tests/x_example.rs", synthetic, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "the checker must flag an unlisted free-function `tokio::time::timeout(` construct; it \
+         did not, which means the guard is blind to this shape (only the client-builder \
+         `.timeout(` method call is walked)"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|(line, text)| *line == 2 && text.contains("timeout")),
+        "expected the flagged construct at its real line and content, got: {violations:?}"
+    );
+
+    let permissive: Vec<Allowed> = vec![Allowed {
+        file: "tests/x_example.rs",
+        needle: "tokio::time::timeout(Duration::from_secs(10), fut)",
+        category: "cadence",
+        reason: "synthetic fixture only, proving the allowlist path itself is reachable",
+    }];
+    let still_clean = unallowed_test_timeouts("tests/x_example.rs", synthetic, &permissive);
+    assert!(
+        still_clean.is_empty(),
+        "an allowlisted free-function `timeout(` must not be flagged: {still_clean:?}"
+    );
+}
+
+/// Every hand-rolled `Instant::now() + <duration>` deadline construction in
+/// `text` (a `tests/` file, `file_label`) that is not covered by
+/// `allowlist` — the same `Allowed` shape and `file`+`needle` matching
+/// (`allowlist_covers`) every other half of this guard already uses (R2).
+fn unallowed_test_deadlines(
+    file_label: &str,
+    text: &str,
+    allowlist: &[Allowed],
+) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut violations = Vec::new();
+    for site in scan_test_constructs(text).2 {
+        let content = lines
+            .get(site.line - 1)
+            .copied()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let covered = allowlist_covers(allowlist, file_label, &content);
+        if !covered {
+            violations.push((site.line, content));
+        }
+    }
+    violations
+}
+
+/// The `tests/` hand-rolled-deadline half of the guard (seam 2,
+/// no-clock-decides): every `Instant::now() + ` deadline construction in
+/// `tests/**/*.rs` sits on `ALLOWLIST` with a real reason — same entry
+/// shape and same self-checks the `sleep(`/`.timeout(` guards above already
+/// have (R2), widened to a fourth construct.
+///
+/// **Not yet exhaustive over the whole tree.** `DEADLINE_LOOP_RESIDUE`
+/// names every real site this stage found but did not fold into
+/// `support::wait_until`/`wait_until_sync` within this seam's own scope —
+/// escalated honestly, the same posture `RESIDUE_REASON` above already
+/// established in this file for the `.timeout(` guard's own unconverted
+/// `m2_daemon_api.rs` residue, not a closed exemption. A future pass folds
+/// each one and removes its entry; this test is exhaustive over `tests/`
+/// today in the sense that every real site is *named*, not in the sense
+/// that every one is *fixed*.
+#[test]
+fn every_hand_rolled_deadline_in_tests_is_folded_or_named_in_the_residue() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all_violations = Vec::new();
+    for path in all_test_files() {
+        let file = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_str()
+            .expect("utf8 path")
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", file));
+        for (line, content) in unallowed_test_deadlines(&file, &text, ALLOWLIST) {
+            all_violations.push(format!("{file}:{line}: {content}"));
+        }
+    }
+    assert!(
+        all_violations.is_empty(),
+        "a hand-rolled `Instant::now() + ` deadline exists in tests/ that is neither folded \
+         into tests/support::wait_until/wait_until_sync nor named in ALLOWLIST's \
+         `hand-rolled-deadline`/`deadline-loop-residue` entries — convert it, or add a \
+         reviewed `Allowed` entry, in tests/s6_no_clock_decides_correctness.rs:\n{}",
+        all_violations.join("\n")
+    );
+}
+
+/// Proof the deadline guard above is not vacuous, same standing-regression
+/// shape as the `sleep(`/`.timeout(` guards' own vacuity tests: a synthetic
+/// hand-rolled `Instant::now() + ` deadline loop with no allowlist entry
+/// must be flagged; the same construct once allowlisted must not be.
+#[test]
+fn the_deadline_guard_fails_on_a_real_hand_rolled_loop_with_no_allowlist_entry() {
+    let synthetic = "\
+fn poll() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if ready() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!(\"never observed\");
+}
+";
+    let violations = unallowed_test_deadlines("tests/x_example.rs", synthetic, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "the checker must flag an unlisted hand-rolled deadline construct; it did not, which \
+         means the guard test above is vacuous"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|(line, text)| *line == 2 && text.contains("Instant::now()")),
+        "expected the flagged construct at its real line and content, got: {violations:?}"
+    );
+
+    let permissive: Vec<Allowed> = vec![Allowed {
+        file: "tests/x_example.rs",
+        needle: "Instant::now() + std::time::Duration::from_secs(5)",
+        category: "hand-rolled-deadline",
+        reason: "synthetic fixture only, proving the allowlist path itself is reachable",
+    }];
+    let still_clean = unallowed_test_deadlines("tests/x_example.rs", synthetic, &permissive);
+    assert!(
+        still_clean.is_empty(),
+        "an allowlisted hand-rolled deadline must not be flagged: {still_clean:?}"
+    );
+}
+
+// ------------------------------------------- tests/ wait_until literal budgets
+
+/// Every `wait_until`/`wait_until_sync` call in `text` (a `tests/` file,
+/// `file_label`) whose own budget argument is a `Duration::from_*` literal
+/// and is not covered by `allowlist` — the same `Allowed` shape and
+/// `file`+`needle` matching (`allowlist_covers`) every other half of this
+/// guard already uses (R2).
+fn unallowed_test_wait_budgets(
+    file_label: &str,
+    text: &str,
+    allowlist: &[Allowed],
+) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut violations = Vec::new();
+    for site in scan_test_constructs(text).3 {
+        let content = lines
+            .get(site.line - 1)
+            .copied()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let covered = allowlist_covers(allowlist, file_label, &content);
+        if !covered {
+            violations.push((site.line, content));
+        }
+    }
+    violations
+}
+
+/// The `tests/` `wait_until`/`wait_until_sync` half of the guard (wave
+/// `timeout-the-function`, item 3): every such call's own budget argument
+/// is a named, shared constant — `support::HANG_BUDGET`, or a locally
+/// reasoned `const` — or the literal sits on `ALLOWLIST` with a real reason
+/// (the shared-budget doctrine `support::HANG_BUDGET`'s own doc already
+/// states: "one shared, generous constant unless allowlisted with a
+/// reason"). Same entry shape and same self-checks the `sleep(`/`.timeout(`/
+/// deadline guards above already have (R2), widened to a fifth construct.
+#[test]
+fn every_wait_until_budget_in_tests_is_a_named_constant_or_an_explicit_allowlist() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut all_violations = Vec::new();
+    for path in all_test_files() {
+        let file = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_str()
+            .expect("utf8 path")
+            .replace('\\', "/");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", file));
+        for (line, content) in unallowed_test_wait_budgets(&file, &text, ALLOWLIST) {
+            all_violations.push(format!("{file}:{line}: {content}"));
+        }
+    }
+    assert!(
+        all_violations.is_empty(),
+        "a `wait_until`/`wait_until_sync` call exists in tests/ whose own budget argument is a \
+         `Duration::from_*` literal rather than a named constant — raise it to \
+         support::HANG_BUDGET, or add a reviewed `Allowed` entry naming why this call site's \
+         own budget genuinely differs from the shared one, in \
+         tests/s6_no_clock_decides_correctness.rs:\n{}",
+        all_violations.join("\n")
+    );
+}
+
+/// Proof the wait-budget guard above is not vacuous, same standing-
+/// regression shape as every other guard's own vacuity test in this file: a
+/// synthetic `wait_until_sync` call with a literal `Duration::from_secs`
+/// budget and no allowlist entry must be flagged; the same call with its
+/// budget replaced by a named constant, or once allowlisted, must not be.
+#[test]
+fn the_wait_budget_guard_fails_on_an_unallowlisted_literal_budget() {
+    let synthetic = "\
+fn poll() {
+    support::wait_until_sync(\"never observed\", Duration::from_secs(5), || ready());
+}
+";
+    let violations = unallowed_test_wait_budgets("tests/x_example.rs", synthetic, ALLOWLIST);
+    assert!(
+        !violations.is_empty(),
+        "the checker must flag an unlisted literal `wait_until_sync` budget; it did not, which \
+         means the guard test above is vacuous"
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|(line, text)| *line == 2 && text.contains("Duration::from_secs(5)")),
+        "expected the flagged construct at its real line and content, got: {violations:?}"
+    );
+
+    let named_constant = "\
+fn poll() {
+    support::wait_until_sync(\"never observed\", support::HANG_BUDGET, || ready());
+}
+";
+    let clean = unallowed_test_wait_budgets("tests/x_example.rs", named_constant, ALLOWLIST);
+    assert!(
+        clean.is_empty(),
+        "a wait_until_sync budget that is a named constant, not a literal, must not be \
+         flagged: {clean:?}"
+    );
+
+    let derived = "\
+fn poll() {
+    support::wait_until_sync(\"never observed\", Duration::from_secs(5) + Duration::ZERO, || ready());
+}
+";
+    let derived_violations = unallowed_test_wait_budgets("tests/x_example.rs", derived, ALLOWLIST);
+    assert!(
+        !derived_violations.is_empty(),
+        "a `+`-derived budget built from `Duration::from_*` literals must still be flagged \
+         (F-IN-01): the checker must not be evadable by wrapping the literal in a binary \
+         expression, but it did not flag: {derived_violations:?}"
+    );
+
+    let unrelated_helper = "\
+fn poll() {
+    wait_until_gone(pid, Duration::from_secs(5));
+}
+";
+    let gone_clean = unallowed_test_wait_budgets("tests/x_example.rs", unrelated_helper, ALLOWLIST);
+    assert!(
+        gone_clean.is_empty(),
+        "wait_until_gone is a distinct helper with its own already-reasoned budget shape and \
+         must never be caught by this guard: {gone_clean:?}"
+    );
+
+    let permissive: Vec<Allowed> = vec![Allowed {
+        file: "tests/x_example.rs",
+        needle: "Duration::from_secs(5)",
+        category: "cadence",
+        reason: "synthetic fixture only, proving the allowlist path itself is reachable",
+    }];
+    let still_clean = unallowed_test_wait_budgets("tests/x_example.rs", synthetic, &permissive);
+    assert!(
+        still_clean.is_empty(),
+        "an allowlisted literal wait_until_sync budget must not be flagged: {still_clean:?}"
     );
 }

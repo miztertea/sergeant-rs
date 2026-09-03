@@ -426,6 +426,14 @@ pub enum AtlasError {
         /// The generation the caller named.
         generation_id: String,
     },
+    /// The blocking write job [`with_atlas_write`](crate::api) hands to
+    /// [`crate::runtime::engine::Engine::run_intelligence`] panicked, was
+    /// cancelled, or the intelligence lane was closed (shutdown) before it
+    /// ran. Named separately from every other variant here because it is
+    /// not a store-content failure at all — the write itself may never
+    /// have started.
+    #[error("atlas write job did not complete: {0}")]
+    WriteJob(String),
 }
 
 /// The schema-namespace DDL, applied on every open.

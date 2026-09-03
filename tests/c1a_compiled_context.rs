@@ -758,13 +758,17 @@ async fn submit_tiny(handle: &sergeant_rs::daemon::DaemonHandle, estate: &Path) 
         "origin": {"client": "cli", "cwd": estate},
         "workflow": "tiny",
     });
-    let response = client
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("request");
+    let response = support::send_while_alive(
+        "submit_tiny",
+        || {
+            client
+                .post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = response.status();
     let value: Value = response.json().await.expect("json body");
     assert_eq!(status, 201, "submit rejected: {value}");
@@ -980,13 +984,17 @@ async fn an_execute_stage_launch_is_never_compiled() {
         "origin": {"client": "cli", "cwd": &estate},
         "workflow": "mixed",
     });
-    let response = client
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("request");
+    let response = support::send_while_alive(
+        "submit execute-stage-never-compiled",
+        || {
+            client
+                .post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = response.status();
     let value: Value = response.json().await.expect("json body");
     assert_eq!(status, 201, "submit rejected: {value}");

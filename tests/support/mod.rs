@@ -23,6 +23,8 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -467,6 +469,22 @@ fn wait_until_gone(data_dir: &Path, budget: Duration) -> bool {
 /// new one (R2).
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// **The one shared hang budget** every [`wait_until`]/[`wait_until_sync`]
+/// call site in `tests/` is expected to use, per the owner ruling
+/// (`no-nondeterministic-tests-2026-09-02.md`, "no-clock-decides" wave,
+/// seam 2): *"A wait budget only ends a hang, is sized for 'never
+/// finishes' (>= 120 s), and reports 'never observed' by name."*
+///
+/// This is **not** a floor or a ceiling any test may assert against — it
+/// is the point at which this suite gives up waiting for a predicate that
+/// was never going to become true, and says so by name. A site whose
+/// budget was smaller "because the operation is normally fast" was
+/// deciding a verdict by clock, which is exactly what the ruling forbids;
+/// folding every such site onto this one constant is seam 2's fold-in
+/// (`tests/s6_no_clock_decides_correctness.rs` enforces it, allowlisting
+/// only the class-C sites where a duration *is* the behavior under test).
+pub const HANG_BUDGET: Duration = Duration::from_secs(120);
+
 /// Poll an async `predicate` at [`WAIT_POLL_INTERVAL`] until it returns
 /// `true`, bounded by an **owned wait budget** (S6, brief-sleep-and-hope.md
 /// item 2): `budget` only terminates the wait — on exhaustion this panics
@@ -478,10 +496,8 @@ const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// and any hand-rolled `while Instant::now() < deadline { ...; sleep(...) }`
 /// loop that shares this exact contract — a side-effect-free predicate and
 /// a panic on timeout, e.g. `tests/m6_surfaces.rs::dead_pid`. A hand-rolled
-/// loop that must *not* panic on timeout — a best-effort teardown wait that
-/// proceeds regardless (`stop_daemon` in `tests/m2_daemon_api.rs` and
-/// `tests/m3_execution.rs`), or one that must run cleanup before failing
-/// (`tests/m6_surfaces.rs`'s TUI-survival wait), or one living in a
+/// loop that must *not* panic on timeout — one that must run cleanup before
+/// failing (`tests/m6_surfaces.rs`'s TUI-survival wait), or one living in a
 /// standalone helper binary with no access to `tests/support`
 /// (`tests/c4_repo_lock.rs`'s lock-holder) — is a different shape, not this
 /// helper's fold-in target, and stays hand-rolled; see
@@ -532,14 +548,20 @@ where
 /// fork-to-exec window can overlap this one's write. Retry until the exec
 /// stops being refused, or surface any other failure immediately.
 pub fn wait_until_executable(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while let Err(e) = std::process::Command::new(path).arg("--version").output() {
-        assert!(
-            e.raw_os_error() == Some(26) && Instant::now() < deadline,
-            "the stand-in at {path:?} is not runnable: {e}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // Deliberately NOT HANG_BUDGET: this retries ONE specific, fast-resolving
+    // transient (a sibling test's fork-to-exec window overlapping this
+    // write) -- any other failure still surfaces immediately below, and a
+    // genuinely stuck ETXTBSY would be a real bug worth failing fast on
+    // rather than waiting two minutes to report.
+    wait_until_sync(
+        &format!("the stand-in at {path:?} never became runnable"),
+        Duration::from_secs(10),
+        || match std::process::Command::new(path).arg("--version").output() {
+            Ok(_) => true,
+            Err(e) if e.raw_os_error() == Some(26) => false,
+            Err(e) => panic!("the stand-in at {path:?} is not runnable: {e}"),
+        },
+    );
 }
 
 // ------------------------------------------------- recording git shim (§18)
@@ -797,7 +819,6 @@ pub struct CrossProcessLock {
 }
 
 const STALE_AFTER: Duration = Duration::from_secs(60);
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 impl CrossProcessLock {
     /// Block until the named lock is held exclusively by this call.
@@ -807,14 +828,18 @@ impl CrossProcessLock {
     /// use the same name to actually serialize against each other.
     pub fn acquire(name: &str) -> Self {
         let path = std::env::temp_dir().join(format!("sgt-test-lock-{name}"));
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            match std::fs::OpenOptions::new()
+        wait_until_sync(
+            &format!(
+                "cross-process lock {path:?} held for over {HANG_BUDGET:?}; a holder is stuck \
+                 or STALE_AFTER needs raising"
+            ),
+            HANG_BUDGET,
+            || match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_) => return Self { path },
+                Ok(_) => true,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let stale = std::fs::metadata(&path)
                         .ok()
@@ -826,19 +851,13 @@ impl CrossProcessLock {
                         // killed, not just the test failed. Reclaim rather
                         // than deadlock every future run.
                         let _ = std::fs::remove_file(&path);
-                        continue;
                     }
-                    if Instant::now() > deadline {
-                        panic!(
-                            "cross-process lock {path:?} held for over 120s; \
-                             a holder is stuck or STALE_AFTER needs raising"
-                        );
-                    }
-                    std::thread::sleep(POLL_INTERVAL);
+                    false
                 }
                 Err(e) => panic!("acquire cross-process lock {path:?}: {e}"),
-            }
-        }
+            },
+        );
+        Self { path }
     }
 }
 
@@ -846,6 +865,83 @@ impl Drop for CrossProcessLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// A bare-bones HTTP/1.1 responder for a fixed script of `(status, body,
+/// delay)` triples, answered once each, in order of *acceptance*, each
+/// response held for `delay` before it is written to its own connection's
+/// socket — on its own thread, so one entry's delay never blocks accepting
+/// the next connection (the very thing this helper exists to let a caller's
+/// retry race against: a stalled poll and its own retry's fresh connection
+/// must be independently schedulable, or the retry would inherit the stall
+/// it is supposed to survive).
+///
+/// R2: the same shape as `crate::test_support::spawn_scripted_http_server`
+/// (`src/lib.rs`) — accept, read (and discard) whatever request arrives,
+/// answer the next scripted entry — ported here rather than reused because
+/// that one lives in a `#[cfg(test)] pub(crate)` module only this crate's
+/// own unit tests (`cargo test --lib`) can reach; `tests/` integration
+/// binaries are separately-compiled external crates that see only this
+/// library's `pub` surface, confirmed by that module's own doc comment
+/// (`00-orient` §4d). Neither existing scripted-server helper
+/// (`spawn_scripted_http_server`, `spawn_flaky_scan_server`) has ever had a
+/// delay parameter; this wave's own regression test — a status poll that
+/// must stall past the caller's client timeout, then answer — is the
+/// reason one exists at all.
+///
+/// `status: 0` is the same hangup sentinel the `src/lib.rs` version uses:
+/// accept, read, drop the connection with no response written — a
+/// connection reset, not a status code.
+///
+/// The delay is itself an allowlisted `sleep(` (`tests/
+/// s6_no_clock_decides_correctness.rs`'s own `ALLOWLIST`): it is a fixed
+/// **input** the test author chose — how long this stub holds one
+/// connection's response — not a verdict the stub computes; the ruling's
+/// own carve-out (`tests-must-be-deterministic-2026-09-02.md`, "What this
+/// does not say") names exactly this shape: "time in the product's
+/// behavior under test... inputs the test sets".
+pub fn spawn_scripted_http_server(
+    script: Vec<(u16, &'static str, Duration)>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake daemon");
+    let addr = listener.local_addr().expect("local addr");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_clone = attempts.clone();
+    std::thread::spawn(move || {
+        for (status, body, delay) in script {
+            let Ok((stream, _)) = listener.accept() else {
+                break;
+            };
+            attempts_clone.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let mut stream = stream;
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf); // discard the request itself
+                if status == 0 {
+                    drop(stream); // hangup: no response written at all
+                    return;
+                }
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                let reason = match status {
+                    200 => "OK",
+                    202 => "Accepted",
+                    404 => "Not Found",
+                    _ => "Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+    (format!("http://{addr}"), attempts)
 }
 
 /// Drive `POST /v1/intelligence/scan` to completion and hand back the
@@ -887,6 +983,30 @@ impl Drop for CrossProcessLock {
 /// duration: a status poll answering anything but `200` is terminal and is
 /// reported as such below, not polled through.
 ///
+/// **A *transport*-class failure on the status poll — a lost connection, a
+/// client-side `.timeout()` expiring before any response arrives — is a
+/// second thing this loop must not treat as terminal** (wave
+/// `transport-timeout-is-not-a-verdict`, 2026-09-02; release run
+/// 33665140069, Gate B: one poll outran the caller's client's own timeout
+/// on a starved runner, and a bare `.expect()` turned that into a panic
+/// indistinguishable from a dead daemon). It never *is* a real answer from
+/// the daemon — no HTTP status has been received at all — so it carries the
+/// same "no time bound of its own" property the rest of this loop already
+/// has: `is_alive` (mirroring `src/api.rs::send_with_retry`'s own PID
+/// check, R2, adapted to this in-process caller's join-handle liveness —
+/// `DaemonHandle::is_alive`, S6 `transport-timeout-is-not-a-verdict`) is
+/// asked whether the daemon is still there, and for as long as it says yes
+/// the poll is simply retried, cadence-paced, exactly as a real "not
+/// completed yet" answer already is a few lines below. No separate owned
+/// retry budget is added on top of that — this function already rejected
+/// one for the very reason a transport error is now held to the same
+/// standard as everything else it polls through: a bound here would still
+/// be claiming a fact about the daemon's answer speed that only a runner,
+/// not this helper, can honestly report (see above). Only when `is_alive`
+/// reports the daemon gone does a transport error become terminal, named
+/// as such rather than as "lost contact" (that wording is `send_with_retry`'s
+/// own for its different, out-of-process failure).
+///
 /// Returns the status and body of whatever last answered: the acceptance
 /// itself when it carries no `scan_id` (the estate declares nothing to
 /// scan — a real, immediate answer), otherwise the terminal poll, whose
@@ -896,6 +1016,7 @@ pub async fn scan_to_completion(
     endpoint: &str,
     token: &str,
     body: &serde_json::Value,
+    is_alive: impl Fn() -> bool,
 ) -> (reqwest::StatusCode, serde_json::Value) {
     let response = http
         .post(format!("{endpoint}/v1/intelligence/scan"))
@@ -912,12 +1033,31 @@ pub async fn scan_to_completion(
     let mut last: serde_json::Value;
     let mut last_status: reqwest::StatusCode;
     loop {
-        let response = http
+        let response = match http
             .get(format!("{endpoint}/v1/intelligence/scan/{scan_id}"))
             .bearer_auth(token)
             .send()
             .await
-            .expect("scan status request");
+        {
+            Ok(response) => response,
+            Err(e) => {
+                // A transport failure is never a real answer, so it can
+                // never be the terminal `404`/non-success case a few lines
+                // below either — the only fact that can end this wait is
+                // whether the daemon that would eventually answer is still
+                // there.
+                assert!(
+                    is_alive(),
+                    "GET {endpoint}/v1/intelligence/scan/{scan_id}: the daemon is no longer \
+                     alive ({e}); no amount of further polling can complete this scan"
+                );
+                // Cadence only, same as the "not completed yet" pace below:
+                // the daemon is alive, so this transport failure is retried,
+                // not decided.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
         last_status = response.status();
         last = response.json().await.expect("json body");
         // A poll that does not answer `200` is terminal, not slow. The only
@@ -936,6 +1076,45 @@ pub async fn scan_to_completion(
         }
         // Display/poll cadence only: no outcome depends on this value.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The one-shot analogue of [`scan_to_completion`]'s retry-while-alive
+/// transport handling (S6 `transport-timeout-is-not-a-verdict`, F-SF-01),
+/// reused here (Ponytail R2) rather than duplicated at each call site that
+/// makes a single direct request/response call against an in-process daemon
+/// it does not itself loop through.
+///
+/// A client-side `.timeout()` expiring, or any other transport-class
+/// failure, is never a real answer from the daemon — no HTTP status was
+/// received — so it is not treated as terminal while `is_alive` still says
+/// the daemon is there: the call is simply retried, cadence-paced, exactly
+/// as [`scan_to_completion`]'s own status poll already does for its
+/// transport failures. Only when `is_alive` reports the daemon gone does a
+/// transport error become the terminal, named failure ("no amount of
+/// further retrying can complete this request"), never a silent pass and
+/// never an assertion that the daemon was slow — the same distinction the
+/// ruling draws for a wait budget (item 3).
+///
+/// `build` constructs a fresh request each attempt, since a
+/// [`reqwest::RequestBuilder`] is consumed by [`reqwest::RequestBuilder::send`].
+pub async fn send_while_alive(
+    what: &str,
+    build: impl Fn() -> reqwest::RequestBuilder,
+    is_alive: impl Fn() -> bool,
+) -> reqwest::Response {
+    loop {
+        match build().send().await {
+            Ok(response) => return response,
+            Err(e) => {
+                assert!(
+                    is_alive(),
+                    "{what}: the daemon is no longer alive ({e}); no amount of further \
+                     retrying can complete this request"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
 }
 

@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -243,40 +242,39 @@ fn drive_one_recorded_claude_turn(data_dir: &Path) -> (Event, Event) {
         })
         .expect("start");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let observation = backend.observe(&handle).expect("observe");
-        if observation.native != sergeant_rs::backend::NativeState::Running {
-            break;
-        }
-        assert!(Instant::now() < deadline, "turn did not settle");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    support::wait_until_sync("turn did not settle", support::HANG_BUDGET, || {
+        backend.observe(&handle).expect("observe").native
+            != sergeant_rs::backend::NativeState::Running
+    });
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let core = shared.blocking_lock();
-        let events: Vec<Event> = core
-            .journal
-            .replay()
-            .expect("replay")
-            .collect::<Result<_, _>>()
-            .expect("events");
-        let ended = events
-            .iter()
-            .find(|e| e.kind == "conversation.turn.ended")
-            .cloned();
-        let usage = events.iter().find(|e| e.kind == "usage.updated").cloned();
-        if let (Some(ended), Some(usage)) = (ended, usage) {
-            return (ended, usage);
-        }
-        drop(core);
-        assert!(
-            Instant::now() < deadline,
-            "turn.ended/usage.updated never journaled"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        "turn.ended/usage.updated never journaled",
+        support::HANG_BUDGET,
+        || {
+            let core = shared.blocking_lock();
+            let events: Vec<Event> = core
+                .journal
+                .replay()
+                .expect("replay")
+                .collect::<Result<_, _>>()
+                .expect("events");
+            drop(core);
+            let ended = events
+                .iter()
+                .find(|e| e.kind == "conversation.turn.ended")
+                .cloned();
+            let usage = events.iter().find(|e| e.kind == "usage.updated").cloned();
+            match (ended, usage) {
+                (Some(ended), Some(usage)) => {
+                    result = Some((ended, usage));
+                    true
+                }
+                _ => false,
+            }
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 #[test]
@@ -381,40 +379,39 @@ fn drive_one_recorded_codex_turn(data_dir: &Path) -> (Event, Event) {
         })
         .expect("start");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let observation = backend.observe(&handle).expect("observe");
-        if observation.native != sergeant_rs::backend::NativeState::Running {
-            break;
-        }
-        assert!(Instant::now() < deadline, "turn did not settle");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    support::wait_until_sync("turn did not settle", support::HANG_BUDGET, || {
+        backend.observe(&handle).expect("observe").native
+            != sergeant_rs::backend::NativeState::Running
+    });
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let core = shared.blocking_lock();
-        let events: Vec<Event> = core
-            .journal
-            .replay()
-            .expect("replay")
-            .collect::<Result<_, _>>()
-            .expect("events");
-        let ended = events
-            .iter()
-            .find(|e| e.kind == "conversation.turn.ended")
-            .cloned();
-        let usage = events.iter().find(|e| e.kind == "usage.updated").cloned();
-        if let (Some(ended), Some(usage)) = (ended, usage) {
-            return (ended, usage);
-        }
-        drop(core);
-        assert!(
-            Instant::now() < deadline,
-            "turn.ended/usage.updated never journaled"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        "turn.ended/usage.updated never journaled",
+        support::HANG_BUDGET,
+        || {
+            let core = shared.blocking_lock();
+            let events: Vec<Event> = core
+                .journal
+                .replay()
+                .expect("replay")
+                .collect::<Result<_, _>>()
+                .expect("events");
+            drop(core);
+            let ended = events
+                .iter()
+                .find(|e| e.kind == "conversation.turn.ended")
+                .cloned();
+            let usage = events.iter().find(|e| e.kind == "usage.updated").cloned();
+            match (ended, usage) {
+                (Some(ended), Some(usage)) => {
+                    result = Some((ended, usage));
+                    true
+                }
+                _ => false,
+            }
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 #[test]
@@ -519,18 +516,13 @@ fn drive_one_recorded_opencode_turn(data_dir: &Path) -> Event {
         })
         .expect("start");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let observation = backend.observe(&handle).expect("observe");
-        if observation.native != sergeant_rs::backend::NativeState::Running {
-            break;
-        }
-        assert!(Instant::now() < deadline, "turn did not settle");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    support::wait_until_sync("turn did not settle", support::HANG_BUDGET, || {
+        backend.observe(&handle).expect("observe").native
+            != sergeant_rs::backend::NativeState::Running
+    });
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let mut result = None;
+    support::wait_until_sync("turn.ended never journaled", support::HANG_BUDGET, || {
         let core = shared.blocking_lock();
         let events: Vec<Event> = core
             .journal
@@ -538,17 +530,20 @@ fn drive_one_recorded_opencode_turn(data_dir: &Path) -> Event {
             .expect("replay")
             .collect::<Result<_, _>>()
             .expect("events");
+        drop(core);
         let ended = events
             .iter()
             .find(|e| e.kind == "conversation.turn.ended")
             .cloned();
-        if let Some(ended) = ended {
-            return ended;
+        match ended {
+            Some(ended) => {
+                result = Some(ended);
+                true
+            }
+            None => false,
         }
-        drop(core);
-        assert!(Instant::now() < deadline, "turn.ended never journaled");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    });
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 #[test]
@@ -643,18 +638,13 @@ fn drive_one_recorded_agy_turn(data_dir: &Path) -> Event {
         })
         .expect("start");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let observation = backend.observe(&handle).expect("observe");
-        if observation.native != sergeant_rs::backend::NativeState::Running {
-            break;
-        }
-        assert!(Instant::now() < deadline, "turn did not settle");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    support::wait_until_sync("turn did not settle", support::HANG_BUDGET, || {
+        backend.observe(&handle).expect("observe").native
+            != sergeant_rs::backend::NativeState::Running
+    });
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
+    let mut result = None;
+    support::wait_until_sync("turn.ended never journaled", support::HANG_BUDGET, || {
         let core = shared.blocking_lock();
         let events: Vec<Event> = core
             .journal
@@ -662,17 +652,20 @@ fn drive_one_recorded_agy_turn(data_dir: &Path) -> Event {
             .expect("replay")
             .collect::<Result<_, _>>()
             .expect("events");
+        drop(core);
         let ended = events
             .iter()
             .find(|e| e.kind == "conversation.turn.ended")
             .cloned();
-        if let Some(ended) = ended {
-            return ended;
+        match ended {
+            Some(ended) => {
+                result = Some(ended);
+                true
+            }
+            None => false,
         }
-        drop(core);
-        assert!(Instant::now() < deadline, "turn.ended never journaled");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    });
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 #[test]
@@ -807,15 +800,20 @@ fn docker_live_arm_recovers_both_refs_and_matches_the_fixtures_shape() {
     let prepared = backend.prepare(&req).expect("prepare");
     let handle = backend.launch(&prepared).expect("launch");
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let observation = loop {
-        let observation = backend.observe(&handle).expect("observe");
-        if observation.native == sergeant_rs::backend::NativeState::Exited {
-            break observation;
-        }
-        assert!(Instant::now() < deadline, "container did not exit in time");
-        std::thread::sleep(Duration::from_millis(150));
-    };
+    let mut result = None;
+    support::wait_until_sync(
+        "container did not exit in time",
+        support::HANG_BUDGET,
+        || {
+            let observation = backend.observe(&handle).expect("observe");
+            let exited = observation.native == sergeant_rs::backend::NativeState::Exited;
+            if exited {
+                result = Some(observation);
+            }
+            exited
+        },
+    );
+    let observation = result.expect("wait_until_sync only returns after its predicate succeeds");
     let _ = Command::new("docker").args(["rm", "-f", &name]).output();
 
     let sergeant_rs::backend::BackendSignal::StageCompleted {

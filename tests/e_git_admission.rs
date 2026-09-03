@@ -83,13 +83,17 @@ async fn submit(
             body[key] = value.clone();
         }
     }
-    let resp = client
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("request");
+    let resp = support::send_while_alive(
+        "submit",
+        || {
+            client
+                .post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = resp.status();
     (status, resp.json().await.expect("json body"))
 }

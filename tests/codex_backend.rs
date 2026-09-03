@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -505,17 +505,20 @@ exit \"$(cat \"$script_file.exit_code\")\"; fi\n        \
     }
 
     fn wait_for_grandchild_pid(&self) -> u32 {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(pid) = self.grandchild_pid() {
-                return pid;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "grandchild pid was never recorded"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            "grandchild pid was never recorded",
+            support::HANG_BUDGET,
+            || {
+                if let Some(pid) = self.grandchild_pid() {
+                    result = Some(pid);
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 
     fn launches(&self) -> Vec<Launch> {
@@ -542,19 +545,20 @@ exit \"$(cat \"$script_file.exit_code\")\"; fi\n        \
     }
 
     fn wait_for_launches(&self, count: usize) -> Vec<Launch> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let launches = self.launches();
-            if launches.len() >= count {
-                return launches;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "only {} of {count} launches recorded",
-                launches.len()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            &format!("launches recorded never reached {count}"),
+            support::HANG_BUDGET,
+            || {
+                let launches = self.launches();
+                let done = launches.len() >= count;
+                if done {
+                    result = Some(launches);
+                }
+                done
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 }
 
@@ -621,20 +625,26 @@ fn sink() -> (sergeant_rs::backend::EventSink, Arc<Mutex<Vec<EventDraft>>>) {
 }
 
 fn wait_for_kind(events: &Arc<Mutex<Vec<EventDraft>>>, kind: &str) -> EventDraft {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(found) = events
-            .lock()
-            .expect("lock")
-            .iter()
-            .find(|e| e.kind == kind)
-            .cloned()
-        {
-            return found;
-        }
-        assert!(Instant::now() < deadline, "no {kind} event arrived");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        &format!("no {kind} event arrived"),
+        support::HANG_BUDGET,
+        || {
+            let found = events
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|e| e.kind == kind)
+                .cloned();
+            if let Some(found) = found {
+                result = Some(found);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 // -------------------------------------------------------------- §2 probe
@@ -1662,20 +1672,20 @@ fn codex_interrupt_kills_the_process_group_after_the_leader_exited() {
 /// field is the one the group kill had to hit) and as they stand now. A CI
 /// run that fails here is meant to be readable without a second run.
 fn assert_group_died(grandchild_pid: u32, ordering: &str, before: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if !pid_alive(grandchild_pid) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
+    // wait_until_sync's own panic names `what` computed once, up front --
+    // it cannot embed a diagnosis snapshot taken lazily at the moment of
+    // failure the way the original hand-rolled loop's `assert!` did. The
+    // "after" facts this used to report on failure are dropped rather than
+    // shown stale/mislabeled; `before` (the caller's own pre-INTERRUPT
+    // snapshot) is kept, since that one really is fixed at call time.
+    support::wait_until_sync(
+        &format!(
             "grandchild pid {grandchild_pid} survived INTERRUPT ({ordering}): the whole turn \
-             process group should have been killed, not just the direct child.\n  {before}\n  \
-             {after}",
-            after = interrupt_diagnosis("after", grandchild_pid),
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+             process group should have been killed, not just the direct child.\n  {before}"
+        ),
+        support::HANG_BUDGET,
+        || !pid_alive(grandchild_pid),
+    );
 }
 
 /// The whole picture around a grandchild, for a failure message that
@@ -1919,15 +1929,16 @@ fn a_bad_model_pin_observes_as_failed_with_the_api_message() {
     let handle = backend
         .launch(&prepared)
         .expect("launch, since thread.started still arrives first");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let observation = loop {
+    let mut result = None;
+    support::wait_until_sync("turn never settled", support::HANG_BUDGET, || {
         let observation = backend.observe(&handle).expect("observe");
-        if observation.native != NativeState::Running {
-            break observation;
+        let settled = observation.native != NativeState::Running;
+        if settled {
+            result = Some(observation);
         }
-        assert!(Instant::now() < deadline, "turn never settled");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+        settled
+    });
+    let observation = result.expect("wait_until_sync only returns after its predicate succeeds");
     match observation.signal {
         sergeant_rs::backend::BackendSignal::Failed { reason } => {
             assert!(reason.contains("gpt-5.6-nonexistent-model"), "{reason}");
@@ -2241,21 +2252,25 @@ fn wait_for_observation(
     what: &str,
     ready: impl Fn(&sergeant_rs::backend::Observation) -> bool,
 ) -> sergeant_rs::backend::Observation {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let observation = backend.observe(handle).expect("observe");
-        if ready(&observation) {
-            return observation;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{what}: never observed; last evidence was {:?} (native {:?}, signal {:?})",
-            observation.evidence,
-            observation.native,
-            observation.signal,
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // wait_until_sync's own panic names `what` computed once, up front --
+    // it cannot embed the last-polled observation's evidence/native/signal
+    // the way the original hand-rolled loop's `assert!` did on every
+    // failing pass. That trailing diagnostic is dropped; `what` (the
+    // caller's own description of what it was waiting for) is kept.
+    let mut result = None;
+    support::wait_until_sync(
+        &format!("{what}: never observed"),
+        support::HANG_BUDGET,
+        || {
+            let observation = backend.observe(handle).expect("observe");
+            let ok = ready(&observation);
+            if ok {
+                result = Some(observation);
+            }
+            ok
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// Every event of `kind` captured so far.
@@ -2276,21 +2291,25 @@ fn wait_for_event(
     what: &str,
     matches: impl Fn(&EventDraft) -> bool,
 ) -> EventDraft {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(found) = events_of_kind(events, kind).into_iter().find(&matches) {
-            return found;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{what}: no matching {kind} event arrived; saw {:?}",
-            events_of_kind(events, kind)
-                .iter()
-                .map(|e| e.payload.clone())
-                .collect::<Vec<_>>()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // Same tradeoff as wait_for_observation above: the "saw {payloads}"
+    // trailing diagnostic, freshly recomputed on every failing pass by the
+    // original hand-rolled loop, cannot survive the fold (wait_until_sync's
+    // panic names only the `what` given to it up front).
+    let mut result = None;
+    support::wait_until_sync(
+        &format!("{what}: no matching {kind} event arrived"),
+        support::HANG_BUDGET,
+        || {
+            let found = events_of_kind(events, kind).into_iter().find(&matches);
+            if let Some(found) = found {
+                result = Some(found);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// §3.6 test 4: the captured `thread/start` params carry exactly `cwd`,
@@ -2926,19 +2945,20 @@ fn appserver_a_stray_notification_for_the_displaced_turn_never_taints_the_new_on
 
     // Turn 2 must still reach its own, genuine settlement -- the straggler
     // must not have already finalized it as `failed` in the meantime.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let ended = loop {
-        let ended = events_of_kind(&events, "conversation.turn.ended");
-        if ended.len() >= 2 {
-            break ended;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "turn 2 never reached its own settlement; saw {:?}",
-            ended.iter().map(|e| e.payload.clone()).collect::<Vec<_>>()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let mut result = None;
+    support::wait_until_sync(
+        "turn 2 never reached its own settlement",
+        support::HANG_BUDGET,
+        || {
+            let ended = events_of_kind(&events, "conversation.turn.ended");
+            let done = ended.len() >= 2;
+            if done {
+                result = Some(ended);
+            }
+            done
+        },
+    );
+    let ended = result.expect("wait_until_sync only returns after its predicate succeeds");
     // Exactly two turns ever ended, and turn 2's own outcome is `completed`
     // -- the straggler's `failed` status never touched it.
     assert_eq!(
@@ -3069,23 +3089,26 @@ fn appserver_interrupt_kills_the_process_group_when_the_rpc_fails() {
 
     backend.interrupt(&handle).expect("interrupt").wait();
 
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let downgraded = loop {
-        if let Some(found) = events
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|e| e.payload["phase"] == "interrupt_downgraded")
-            .cloned()
-        {
-            break found;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "interrupt_downgraded was never journaled"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let mut result = None;
+    support::wait_until_sync(
+        "interrupt_downgraded was never journaled",
+        support::HANG_BUDGET,
+        || {
+            let found = events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.payload["phase"] == "interrupt_downgraded")
+                .cloned();
+            if let Some(found) = found {
+                result = Some(found);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    let downgraded = result.expect("wait_until_sync only returns after its predicate succeeds");
     assert_eq!(downgraded.kind, "conversation.turn.harness_error");
 
     let observation = wait_for_observation(
@@ -3186,9 +3209,9 @@ fn spawn_decoy_process(extra_args: &[&str]) -> std::process::Child {
         .spawn()
         .expect("spawn decoy process");
     let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let execd = sergeant_rs::platform::process::running_processes()
+    let mut result = Some(child);
+    support::wait_until_sync("decoy process never exec'd", support::HANG_BUDGET, || {
+        sergeant_rs::platform::process::running_processes()
             .into_iter()
             .flatten()
             .any(|process| {
@@ -3196,13 +3219,11 @@ fn spawn_decoy_process(extra_args: &[&str]) -> std::process::Child {
                     && extra_args
                         .iter()
                         .all(|needle| process.argv.iter().any(|arg| arg == needle))
-            });
-        if execd {
-            return child;
-        }
-        assert!(Instant::now() < deadline, "decoy process never exec'd");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+            })
+    });
+    result
+        .take()
+        .expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// Kill and reap a decoy spawned by [`spawn_decoy_process`]. Blocked on its
@@ -3436,19 +3457,18 @@ fn write_vanishing_stub(dir: &Path, name: &str, body: &str) -> PathBuf {
     // through to their trailing `exit 1`, consuming nothing), retrying only
     // on `ETXTBSY` (os error 26) — the same transient "still has the file
     // open for writing" window `wait_until_executable` itself retries on.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match std::process::Command::new(&path)
+    support::wait_until_sync(
+        &format!("the vanishing stub at {path:?} never became runnable"),
+        support::HANG_BUDGET,
+        || match std::process::Command::new(&path)
             .arg("--warm-up-only-matches-no-branch")
             .output()
         {
-            Ok(_) => break,
-            Err(e) if e.raw_os_error() == Some(26) && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            Ok(_) => true,
+            Err(e) if e.raw_os_error() == Some(26) => false,
             Err(e) => panic!("the vanishing stub at {path:?} is not runnable: {e}"),
-        }
-    }
+        },
+    );
     path
 }
 
@@ -4235,15 +4255,16 @@ fn wait_for_settled(
     backend: &CodexBackend,
     handle: &ExecutionHandle,
 ) -> sergeant_rs::backend::Observation {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
+    let mut result = None;
+    support::wait_until_sync("live turn never settled", support::HANG_BUDGET, || {
         let observation = backend.observe(handle).expect("observe");
-        if observation.native != NativeState::Running {
-            return observation;
+        let settled = observation.native != NativeState::Running;
+        if settled {
+            result = Some(observation);
         }
-        assert!(Instant::now() < deadline, "live turn never settled");
-        std::thread::sleep(Duration::from_millis(200));
-    }
+        settled
+    });
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// W3: the app-server counterpart of [`wait_for_settled`]. Neither `native`
@@ -4263,23 +4284,19 @@ fn wait_for_appserver_settled(
     events: &Arc<Mutex<Vec<EventDraft>>>,
     already_ended: usize,
 ) -> sergeant_rs::backend::Observation {
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        let ended_count = events
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| e.kind == "conversation.turn.ended")
-            .count();
-        if ended_count > already_ended {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "live app-server turn never settled"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    support::wait_until_sync(
+        "live app-server turn never settled",
+        support::HANG_BUDGET,
+        || {
+            let ended_count = events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == "conversation.turn.ended")
+                .count();
+            ended_count > already_ended
+        },
+    );
     backend.observe(handle).expect("observe")
 }
 
@@ -4441,22 +4458,19 @@ fn live_codex_resume_recalls_a_nonce_across_processes() {
 /// per the trait doc — so a SEND issued the instant after INTERRUPT returns
 /// can legitimately still see `InFlight`).
 fn send_retrying(backend: &CodexBackend, handle: &ExecutionHandle, input: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        match backend.send(handle, input) {
-            Ok(()) => return,
+    support::wait_until_sync(
+        "second send never became possible",
+        support::HANG_BUDGET,
+        || match backend.send(handle, input) {
+            Ok(()) => true,
             Err(BackendError::Failed { detail, .. })
                 if detail.contains("already has a turn in flight") =>
             {
-                assert!(
-                    Instant::now() < deadline,
-                    "second send never became possible"
-                );
-                std::thread::sleep(Duration::from_millis(100));
+                false
             }
             Err(e) => panic!("send failed: {e:?}"),
-        }
-    }
+        },
+    );
 }
 
 #[test]
@@ -4787,19 +4801,13 @@ fn live_appserver_interrupt_yields_an_interrupted_terminal() {
     let handle = backend.launch(&prepared).expect("launch");
     // Bounded wait for genuine mid-flight proof (item/started or a delta),
     // never a fixed sleep — §2.2 step 2's own requirement.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if events
+    support::wait_until_sync("turn never even started", support::HANG_BUDGET, || {
+        events
             .lock()
             .unwrap()
             .iter()
             .any(|e| e.kind == "conversation.user")
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "turn never even started");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    });
     std::thread::sleep(Duration::from_millis(400));
     backend.interrupt(&handle).expect("interrupt").wait();
     let observation = wait_for_appserver_settled(&backend, &handle, &events, 0);

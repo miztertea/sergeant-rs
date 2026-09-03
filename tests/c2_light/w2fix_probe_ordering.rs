@@ -46,8 +46,11 @@ use support::DataDir;
 
 /// How long a rendezvous may take before the test calls it a hang. This is a
 /// deadlock guard, not a latency pin: nothing here asserts that any operation
-/// was *fast*, only that it happened at all before the suite gave up.
-const RENDEZVOUS: Duration = Duration::from_secs(30);
+/// was *fast*, only that it happened at all before the suite gave up. Wave
+/// `timeout-the-function` (S6, item 2): raised from a bespoke 30s onto the
+/// crate's one shared hang-only bound, `support::HANG_BUDGET` — this is
+/// exactly the "ends a hang, decides nothing" shape that bound exists for.
+const RENDEZVOUS: Duration = support::HANG_BUDGET;
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -150,11 +153,12 @@ async fn the_descriptor_is_published_while_a_backend_probe_is_still_running() {
 
     // Published *and* live: a descriptor pointing at a socket nobody is
     // accepting on would trade one broken promise for another.
-    let health = client()
-        .get(format!("{}/healthz", descriptor.endpoint))
-        .send()
-        .await
-        .expect("healthz request");
+    let health = support::send_while_alive(
+        "healthz",
+        || client().get(format!("{}/healthz", descriptor.endpoint)),
+        || daemon::pid_alive(descriptor.pid),
+    )
+    .await;
     assert!(
         health.status().is_success(),
         "the daemon is already serving"
@@ -183,7 +187,19 @@ async fn a_submission_during_probe_pending_lands_after_the_probe_it_needs() {
 
     let http = client();
     let submit = {
-        let http = http.clone();
+        // This POST is not idempotent (it creates a Work), so it cannot be
+        // retried the way the GETs in this file are: `support::
+        // send_while_alive` is deliberately not used here. What made this
+        // call non-deterministic instead was a second, shorter deadline
+        // racing the legitimate one — `client()`'s own 10s transport
+        // timeout could fire before the daemon answers (this submission is
+        // held open until the probe below releases it), while the
+        // `RENDEZVOUS`-bounded `tokio::time::timeout` a few lines down is
+        // already the real, single termination bound for this wait. A
+        // client with no timeout of its own removes the arbitrary duration
+        // that used to be able to decide this call's outcome, leaving
+        // `RENDEZVOUS` as the one bound in force.
+        let http = reqwest::Client::new();
         let endpoint = descriptor.endpoint.clone();
         let token = descriptor.token.clone();
         tokio::spawn(async move {
@@ -202,15 +218,18 @@ async fn a_submission_during_probe_pending_lands_after_the_probe_it_needs() {
     // The daemon is serving reads in the pending window — and the submission
     // is genuinely still pending in it. Asserted on the daemon's own state
     // rather than on `is_finished()`, so nothing here depends on scheduling.
-    let listed: Value = http
-        .get(format!("{}/v1/work", descriptor.endpoint))
-        .bearer_auth(&descriptor.token)
-        .send()
-        .await
-        .expect("list request")
-        .json()
-        .await
-        .expect("list json");
+    let listed: Value = support::send_while_alive(
+        "list",
+        || {
+            http.get(format!("{}/v1/work", descriptor.endpoint))
+                .bearer_auth(&descriptor.token)
+        },
+        || daemon::pid_alive(descriptor.pid),
+    )
+    .await
+    .json()
+    .await
+    .expect("list json");
     assert_eq!(
         listed["works"].as_array().map(Vec::len),
         Some(0),

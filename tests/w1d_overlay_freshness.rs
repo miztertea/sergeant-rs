@@ -276,6 +276,7 @@ async fn a_running_works_modified_file_is_findable_through_work_scope() {
             "command_id": ulid::Ulid::generate().to_string(),
             "estate_root": estate.path(),
         }),
+        || handle.is_alive(),
     )
     .await;
     assert_eq!(status, 200, "{body}");

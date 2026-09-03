@@ -229,13 +229,17 @@ async fn submit(
         "estate_root": estate_root,
         "origin": {"client": "cli", "cwd": cwd},
     });
-    let response = http()
-        .post(format!("{}/v1/work", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("submit");
+    let response = support::send_while_alive(
+        "submit",
+        || {
+            http()
+                .post(format!("{}/v1/work", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     assert_eq!(response.status(), 201, "submit must be accepted");
     let value: Value = response.json().await.expect("json");
     value["work"]["id"].as_str().expect("work id").to_string()
@@ -440,7 +444,7 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         "the new work must not be on screen before the TUI hears about it"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + support::HANG_BUDGET;
     let mut asked_to_refresh = false;
     while Instant::now() < deadline {
         let event = tokio::time::timeout(Duration::from_secs(5), stream.next_event())
@@ -936,7 +940,20 @@ async fn t3_estate_add_repo_reaches_the_real_api_off_the_render_loop() {
         "the overlay stays open showing the spinner until the background add finishes"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // Deliberately NOT support::wait_until: `app` is a plain local `&mut`
+    // used both before and after this wait across many more call sites in
+    // this test, and wait_until's predicate is `FnMut() -> Fut` -- its
+    // returned future cannot hold a mutable borrow of a captured variable
+    // across its own await points (rustc: "captured variable cannot escape
+    // `FnMut` closure body"). Where that limitation bit a value the test
+    // captures ONLY inside the wait (tests/m2_daemon_api.rs,
+    // tests/m4_backends.rs, tests/m5_projections.rs, elsewhere in this
+    // file), a std::cell::RefCell scoped to just that wait was the narrow
+    // fix; wrapping `app` itself in one for this call's sake would mean
+    // threading interior mutability through a value this whole test
+    // otherwise owns directly -- a larger, more invasive change than this
+    // one seam, not the narrowest honest equivalent.
+    let deadline = Instant::now() + support::HANG_BUDGET;
     let needs_refresh = loop {
         let needs_refresh = app.poll_background();
         if app.estate.pending_repo_add.is_none() {
@@ -1300,21 +1317,21 @@ fn t1_a_tui_whose_terminal_hangs_up_does_not_outlive_it() {
     // Wait until the session is actually up — the alternate-screen switch in
     // the typescript is the terminal half; the process itself is found the
     // same way the daemon reaper finds daemons.
-    let deadline = Instant::now() + Duration::from_secs(90);
     let mut tui = None;
-    while Instant::now() < deadline {
-        let painted = std::fs::read(&typescript)
-            .map(|bytes| String::from_utf8_lossy(&bytes).contains("[?1049h"))
-            .unwrap_or(false);
-        if painted {
-            tui = tui_pid(data.path());
-            if tui.is_some() {
-                break;
+    support::wait_until_sync(
+        "the TUI must come up under the pty",
+        support::HANG_BUDGET,
+        || {
+            let painted = std::fs::read(&typescript)
+                .map(|bytes| String::from_utf8_lossy(&bytes).contains("[?1049h"))
+                .unwrap_or(false);
+            if painted {
+                tui = tui_pid(data.path());
             }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let tui = tui.expect("the TUI must come up under the pty");
+            tui.is_some()
+        },
+    );
+    let tui = tui.expect("wait_until_sync only returns after its predicate succeeds");
     // The watch installs itself as the loop starts; hang up after it has.
     std::thread::sleep(Duration::from_secs(1));
     assert!(
@@ -3370,7 +3387,7 @@ fn dead_pid() -> u32 {
     child.wait().expect("wait");
     wait_until_sync(
         &format!("pid {pid} to go away"),
-        Duration::from_secs(5),
+        support::HANG_BUDGET,
         || !daemon::pid_alive(pid),
     );
     pid

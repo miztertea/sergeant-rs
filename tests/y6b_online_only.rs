@@ -117,7 +117,10 @@ async fn an_online_only_placeholder_is_a_named_gap_row_through_the_real_scan_tri
         "estate_root": estate_dir.path(),
     });
     let (status, response) =
-        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body, || {
+            handle.is_alive()
+        })
+        .await;
     assert_eq!(status, 200, "{response}");
     let scanned = response["scanned"].as_array().expect("scanned array");
     assert_eq!(scanned.len(), 1, "{response}");
@@ -179,7 +182,10 @@ async fn a_genuinely_empty_file_is_not_misreported_as_a_placeholder_through_the_
         "estate_root": estate_dir.path(),
     });
     let (status, response) =
-        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body).await;
+        support::scan_to_completion(&http, &handle.endpoint, &handle.token, &body, || {
+            handle.is_alive()
+        })
+        .await;
     assert_eq!(status, 200, "{response}");
     let row = &response["scanned"][0];
     assert_eq!(

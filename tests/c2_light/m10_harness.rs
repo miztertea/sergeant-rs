@@ -10,7 +10,6 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -70,11 +69,17 @@ struct Launch {
 }
 
 fn read_launch(record: &Path) -> Launch {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(text) = std::fs::read_to_string(record)
-            && text.lines().any(|l| l == "end")
-        {
+    let mut result: Option<Launch> = None;
+    support::wait_until_sync(
+        &format!("no launch recorded at {record:?}"),
+        support::HANG_BUDGET,
+        || {
+            let Ok(text) = std::fs::read_to_string(record) else {
+                return false;
+            };
+            if !text.lines().any(|l| l == "end") {
+                return false;
+            }
             let mut launch = Launch::default();
             for line in text.lines() {
                 match line.split_once(' ') {
@@ -88,14 +93,11 @@ fn read_launch(record: &Path) -> Launch {
                     _ => {}
                 }
             }
-            return launch;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no launch recorded at {record:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+            result = Some(launch);
+            true
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// D2: `sgt claude` **execs**, it does not fork-and-supervise. This is the

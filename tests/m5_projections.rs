@@ -150,36 +150,48 @@ async fn start_fake(
 }
 
 async fn post(handle: &DaemonHandle, path: &str, body: Value) -> (reqwest::StatusCode, Value) {
-    let resp = http()
-        .post(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("request");
+    let resp = support::send_while_alive(
+        "post",
+        || {
+            http()
+                .post(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = resp.status();
     (status, resp.json().await.expect("json body"))
 }
 
 async fn get(handle: &DaemonHandle, path: &str) -> Value {
-    http()
-        .get(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("request")
-        .json()
-        .await
-        .expect("json body")
+    support::send_while_alive(
+        "get",
+        || {
+            http()
+                .get(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await
+    .json()
+    .await
+    .expect("json body")
 }
 
 async fn get_status(handle: &DaemonHandle, path: &str) -> (reqwest::StatusCode, Value) {
-    let resp = http()
-        .get(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("request");
+    let resp = support::send_while_alive(
+        "get_status",
+        || {
+            http()
+                .get(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = resp.status();
     (status, resp.json().await.expect("json body"))
 }
@@ -220,19 +232,27 @@ async fn submit(handle: &DaemonHandle, cwd: &Path, intent: &str, extra: Value) -
 /// sight, exactly as before — real corruption is never something a retry
 /// fixes, and pretending otherwise would only hide it.
 fn journal_events(data_dir: &Path) -> Vec<Event> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match Journal::replay_data_dir(data_dir)
+    // Deliberately NOT support::HANG_BUDGET: this retry absorbs ONE
+    // legitimate transient (a torn tail mid-write), and the short 2s window
+    // is itself the point -- any Malformed error that isn't a torn tail
+    // still panics on first sight, exactly as before.
+    let mut result = None;
+    support::wait_until_sync(
+        "journal replay kept seeing a torn tail",
+        Duration::from_secs(2),
+        || match Journal::replay_data_dir(data_dir)
             .expect("replay")
             .collect::<Result<Vec<Event>, _>>()
         {
-            Ok(events) => return events,
-            Err(e) if e.is_possible_torn_tail() && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
+            Ok(events) => {
+                result = Some(events);
+                true
             }
+            Err(e) if e.is_possible_torn_tail() => false,
             Err(e) => panic!("journal replay failed: {e}"),
-        }
-    }
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// Every canned query plus the table counts, as one comparable blob. This is
@@ -1476,20 +1496,23 @@ async fn wait_for_spans(
     exporter: &InMemorySpanExporter,
     count: usize,
 ) -> Vec<opentelemetry_sdk::trace::SpanData> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let spans = exporter.get_finished_spans().expect("spans");
-        if spans.len() >= count {
-            return spans;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "only {} of {count} spans were exported: {:?}",
-            spans.len(),
-            spans.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let result = std::cell::RefCell::new(None);
+    support::wait_until(
+        &format!("spans exported never reached {count}"),
+        support::HANG_BUDGET,
+        || async {
+            let spans = exporter.get_finished_spans().expect("spans");
+            let done = spans.len() >= count;
+            if done {
+                *result.borrow_mut() = Some(spans);
+            }
+            done
+        },
+    )
+    .await;
+    result
+        .into_inner()
+        .expect("wait_until only returns after its predicate succeeds")
 }
 
 fn exported_metric_names(exporter: &InMemoryMetricExporter) -> BTreeSet<String> {
@@ -1929,17 +1952,15 @@ fn spawn_bare_daemon(data_dir: &DataDir, estate_root: &Path) {
         let mut child = child;
         let _ = child.wait();
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while daemon::read_descriptor(data_dir.path())
-        .expect("read descriptor")
-        .is_none()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the bare daemon never published a descriptor"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    support::wait_until_sync(
+        "the bare daemon never published a descriptor",
+        support::HANG_BUDGET,
+        || {
+            daemon::read_descriptor(data_dir.path())
+                .expect("read descriptor")
+                .is_some()
+        },
+    );
 }
 
 /// Run `sgt` against a data dir and an estate root, returning stdout — the
@@ -2453,19 +2474,24 @@ async fn wait_for_a_quiet_journal(data_dir: &Path) {
 /// exposed — `cli::main` builds a multi-thread runtime, where a woken task
 /// always has a worker to run on.
 async fn wait_for_kinds(data_dir: &Path, kinds: &[&str]) -> Vec<Event> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let events = journal_events(data_dir);
-        let seen: BTreeSet<&str> = events.iter().map(|e| e.kind.as_str()).collect();
-        if kinds.iter().all(|kind| seen.contains(kind)) {
-            return events;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "only saw {seen:?}, waiting for {kinds:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let result = std::cell::RefCell::new(None);
+    support::wait_until(
+        &format!("journal never showed every kind in {kinds:?}"),
+        support::HANG_BUDGET,
+        || async {
+            let events = journal_events(data_dir);
+            let seen: BTreeSet<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+            let done = kinds.iter().all(|kind| seen.contains(kind));
+            if done {
+                *result.borrow_mut() = Some(events);
+            }
+            done
+        },
+    )
+    .await;
+    result
+        .into_inner()
+        .expect("wait_until only returns after its predicate succeeds")
 }
 
 /// The contract's third Unknown: is the OTLP path smoke-testable offline?

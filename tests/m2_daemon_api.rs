@@ -1308,7 +1308,7 @@ async fn duplicate_cancel_command_id_replays_the_recorded_outcome() {
 async fn read_sse_events(resp: &mut reqwest::Response, count: usize) -> Vec<(u64, String, Value)> {
     let mut buffer = String::new();
     let mut events = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + support::HANG_BUDGET;
     while events.len() < count && Instant::now() < deadline {
         let chunk = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
             .await
@@ -1336,6 +1336,12 @@ async fn read_sse_events(resp: &mut reqwest::Response, count: usize) -> Vec<(u64
             }
         }
     }
+    assert!(
+        events.len() >= count,
+        "read_sse_events: never observed {count} SSE events within {:?} (got {})",
+        support::HANG_BUDGET,
+        events.len()
+    );
     events
 }
 
@@ -1456,7 +1462,7 @@ async fn shutdown_completes_with_a_live_sse_client_attached() {
         "the SSE client must be attached before shutdown"
     );
 
-    tokio::time::timeout(Duration::from_secs(15), handle.shutdown())
+    tokio::time::timeout(support::HANG_BUDGET, handle.shutdown())
         .await
         .expect("shutdown must not block on a live SSE tail");
 
@@ -1474,7 +1480,7 @@ async fn shutdown_completes_with_a_live_sse_client_attached() {
     );
 
     // The stream itself ends rather than dangling on a dead daemon.
-    let closed = tokio::time::timeout(Duration::from_secs(5), stream.chunk())
+    let closed = tokio::time::timeout(support::HANG_BUDGET, stream.chunk())
         .await
         .expect("the SSE stream must be closed by shutdown, not left open");
     assert!(
@@ -1635,14 +1641,11 @@ fn spawn_bare_daemon(dir: &DataDir) {
         let mut child = child;
         let _ = child.wait();
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while descriptor_of(dir.path()).is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "the bare daemon never published a descriptor"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    support::wait_until_sync(
+        "the bare daemon never published a descriptor",
+        support::HANG_BUDGET,
+        || descriptor_of(dir.path()).is_some(),
+    );
 }
 
 /// Kill a daemon by pid (SIGTERM) and wait for its descriptor to disappear.
@@ -1651,10 +1654,11 @@ fn stop_daemon(dir: &Path) {
         let _ = std::process::Command::new("kill")
             .arg(descriptor.pid.to_string())
             .status();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while daemon::descriptor_path(dir).exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        support::wait_until_sync(
+            "daemon descriptor removed after SIGTERM",
+            support::HANG_BUDGET,
+            || !daemon::descriptor_path(dir).exists(),
+        );
     }
 }
 
@@ -2696,7 +2700,7 @@ async fn sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_dama
     // stream-error control frames arrive, and then the stream closes — no
     // *event* frame (`send_sse`'s own per-journaled-kind vocabulary) ever
     // follows.
-    let mut stream = http
+    let stream = http
         .get(format!("{}/v1/events/stream?from=0", handle.endpoint))
         .bearer_auth(&handle.token)
         .send()
@@ -2707,17 +2711,26 @@ async fn sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_dama
         200,
         "the SSE handshake itself still succeeds"
     );
+    // Hand-rolled rather than routed through support::wait_until (wave
+    // `timeout-the-function`, item 1): the earlier RefCell-wrapped-stream
+    // version of this loop held that RefCell's borrow across its own
+    // `.await` — a real clippy::await_holding_refcell_ref, this branch's
+    // own (introduced by the fold that first wrote this loop), not the
+    // pre-existing one `read_sse_events`'s own kept ALLOWLIST entry already
+    // names for a different site. A plain `mut` local needs no interior
+    // mutability at all once the loop is not living inside a `FnMut`
+    // closure, so the RefCell/Cell wrapping — and the clippy violation it
+    // caused — goes away with it, same shape as `read_sse_events` and
+    // `read_raw_sse_frames` above/elsewhere in this file.
+    let mut stream = stream;
     let mut buffer = String::new();
     let mut saw_error_frame = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let closed = loop {
-        if std::time::Instant::now() >= deadline {
-            panic!("a broken history replay must close the stream promptly, not hang");
-        }
-        match tokio::time::timeout(Duration::from_secs(5), stream.chunk())
+    let deadline = Instant::now() + support::HANG_BUDGET;
+    loop {
+        let chunk = tokio::time::timeout(support::HANG_BUDGET, stream.chunk())
             .await
-            .expect("chunk timeout")
-        {
+            .expect("chunk timeout");
+        match chunk {
             Ok(Some(chunk)) => {
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 assert!(
@@ -2728,11 +2741,14 @@ async fn sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_dama
                     saw_error_frame = true;
                 }
             }
-            Ok(None) => break true,
-            Err(_) => break true,
+            Ok(None) | Err(_) => break,
         }
-    };
-    assert!(closed, "the stream must eventually close");
+        assert!(
+            Instant::now() < deadline,
+            "a broken history replay must close the stream promptly, not hang (budget {:?})",
+            support::HANG_BUDGET
+        );
+    }
     assert!(
         saw_error_frame,
         "the journal failure must be disclosed as a stream_error control frame \
@@ -3079,26 +3095,29 @@ fn resolve_data_dir_falls_back_through_sgt_data_dir_then_xdg_then_home() {
 // R-N0-4's newest budget: "no external I/O, process wait, or thread join under
 // the core lock". A negative about a lock cannot be asserted by timing a fast
 // path — it has to be provoked. So these tests park an executor *inside* an
-// external effect, indefinitely, and then ask the daemon to serve unrelated
-// requests. If the lock were held across the effect, they would never answer.
+// external effect, indefinitely (the rendezvous below proves it, a state, not
+// a duration), and then ask the daemon to serve unrelated requests. If the
+// lock were held across the effect, they would never answer — the daemon
+// releases the stall only *after* awaiting them, so a held lock is a genuine
+// deadlock, not a slow answer, and `timed`'s wait is a hang-only bound on
+// exactly that.
+//
+// Seam 1 (no-clock-decides, owner ruling 2026-09-02) removes what used to sit
+// on top of that: a 200ms budget that turned "answered at all" into "answered
+// within N ms", so a request queued briefly behind a real (bounded, released)
+// hold failed the same way a permanently blocked one would. That extra
+// sensitivity was itself the forbidden shape — a duration deciding a verdict
+// — so it is an approved tradeoff to lose it (J5) rather than a state this
+// suite is missing: proving "briefly queued, not permanently blocked" would
+// need a new product signal (whether a request was ever waiting on the core
+// lock), which is a bigger addition than this seam's boundary covers and is
+// reported here rather than built.
 
-/// How long an unrelated request may take while an executor is parked inside
-/// an external effect.
-///
-/// §22.6 bounds this by "the explicitly allowed journal commit interval",
-/// measured at ~2 ms/event, and the requests below are answered in ~2 ms when
-/// the boundary holds. The budget was one second — ~500× the value the
-/// milestone reports (N3-08), which meant a regression that made independent
-/// requests take 900 ms passed unchanged.
-///
-/// 200 ms instead: two orders of magnitude above the honest cost of a
-/// contended journal commit, and two orders below the failure this exists to
-/// catch. Deliberately not tighter — these suites run in parallel, and a
-/// scheduler hiccup under `cargo test -j` is not the regression being looked
-/// for. It is also now tight enough to catch a *queued* request rather than
-/// only a permanently blocked one: one `git worktree add` on a real monorepo
-/// under the guard would exceed it.
-const INDEPENDENT_REQUEST_BUDGET: Duration = Duration::from_millis(200);
+/// [`support::HANG_BUDGET`], duplicated as a hang-only bound around an
+/// otherwise-unbounded await, not a verdict on how fast that await returns —
+/// see the module note above. `timed`'s callers still print the elapsed
+/// [`Duration`] it returns (diagnostic only; nothing here asserts on it).
+const INDEPENDENT_REQUEST_BUDGET: Duration = support::HANG_BUDGET;
 
 /// Seed a data dir with a run parked in `blocked` on `00-only`, so a `retry`
 /// through the API reserves and launches a second attempt.
@@ -4087,8 +4106,10 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
     // gate at all (there is only one slot, A holds it) — it parks *before*
     // ever reaching LAUNCH, on the lane itself.
     let retry_b = retry(work_b);
-    let b_waiting = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    support::wait_until(
+        "B never reported `waiting` while the lane was held by A",
+        support::HANG_BUDGET,
+        || async {
             let show: Value = client()
                 .get(format!("{}/v1/work/{work_b}", handle.endpoint))
                 .bearer_auth(&handle.token)
@@ -4098,17 +4119,10 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
                 .json()
                 .await
                 .expect("show B json");
-            if show["work"]["state"] == "waiting" {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+            show["work"]["state"] == "waiting"
+        },
+    )
     .await;
-    assert!(
-        b_waiting.is_ok(),
-        "B never reported `waiting` while the lane was held by A"
-    );
     // Only one launch ever reached the fake's gate — B's is genuinely
     // parked earlier, on the lane, not queued behind A inside the backend.
     assert!(
@@ -4125,8 +4139,10 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
     assert!(status_b.is_success(), "B's retry answered {status_b}");
 
     // Both actually finish (B's admission unblocked once A released).
-    let both_completed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    support::wait_until(
+        "both Works must reach completed",
+        support::HANG_BUDGET,
+        || async {
             let list: Value = client()
                 .get(format!("{}/v1/work", handle.endpoint))
                 .bearer_auth(&handle.token)
@@ -4141,7 +4157,7 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
             // artifact of this test's fixture, not of the lane feature under
             // test, which only cares that both Works reached a completed
             // disposition rather than staying `active`/`waiting`.
-            let done = list["works"]
+            list["works"]
                 .as_array()
                 .expect("works")
                 .iter()
@@ -4150,15 +4166,11 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
                         .as_str()
                         .is_some_and(|s| s.starts_with("completed"))
                 })
-                .count();
-            if done == 2 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+                .count()
+                == 2
+        },
+    )
     .await;
-    assert!(both_completed.is_ok(), "both Works must reach completed");
 
     handle.shutdown().await;
 
@@ -4232,7 +4244,7 @@ async fn t_execution_lane_permit_releases_on_a_daemon_side_launch_error() {
     // The decisive check: B's retry must not hang. A bounded timeout — not
     // a bare `.await` — is what turns "the permit leaked" into a named test
     // failure instead of a wedged suite.
-    let retried_b = tokio::time::timeout(Duration::from_secs(10), async {
+    let retried_b = tokio::time::timeout(support::HANG_BUDGET, async {
         http.post(format!("{}/v1/work/{work_b}/retry", handle.endpoint))
             .bearer_auth(&handle.token)
             .json(&json!({"command_id": ulid()}))
@@ -4289,7 +4301,7 @@ async fn t_execution_lane_permit_releases_on_execution_failure() {
         .expect("show A json");
     assert_eq!(show_a["work"]["state"], "failed", "A must fail: {show_a}");
 
-    let retried_b = tokio::time::timeout(Duration::from_secs(10), async {
+    let retried_b = tokio::time::timeout(support::HANG_BUDGET, async {
         http.post(format!("{}/v1/work/{work_b}/retry", handle.endpoint))
             .bearer_auth(&handle.token)
             .json(&json!({"command_id": ulid()}))
@@ -4408,7 +4420,7 @@ async fn t_execution_lane_permit_stays_held_until_stop_is_confirmed_not_merely_r
     let status_a2 = cancel_a.await.expect("cancel A task");
     assert!(status_a2.is_success(), "cancel A answered {status_a2}");
 
-    let status_b = tokio::time::timeout(Duration::from_secs(10), retry_b)
+    let status_b = tokio::time::timeout(support::HANG_BUDGET, retry_b)
         .await
         .expect("B's retry never answered after A's stop was confirmed — the permit leaked")
         .expect("B retry task");
@@ -4468,20 +4480,26 @@ async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blo
         "A's launch never reached its gate"
     );
 
-    // The decisive check: B's retry into the full lane must answer well
-    // inside a short bound, without waiting on A's still-held launch.
-    let started = Instant::now();
-    let status_b = tokio::time::timeout(Duration::from_secs(2), retry(work_b))
+    // The decisive check (seam 1, no-clock-decides): B's retry into the full
+    // lane must answer *at all* here — a state proof, not a stopwatch one.
+    // `fake.release_launches()` is not called until well after this await
+    // (see below), so A's launch is still, provably, held at this exact
+    // point in the test's own control flow: if the old bug were back
+    // (`crank`'s `Launch` arm blocking the client's own request on
+    // execution-lane admission), this await would simply never return,
+    // because nothing releases A until after it. `support::HANG_BUDGET`
+    // bounds that "never returns" into a named report rather than a
+    // permanent hang; it decides nothing about how fast a real return must
+    // be — the elapsed `Duration` this used to compare against `< 1s` is
+    // gone, not resized.
+    let status_b = tokio::time::timeout(support::HANG_BUDGET, retry(work_b))
         .await
-        .expect("B's retry blocked on execution-lane admission instead of returning promptly")
+        .expect(
+            "B's retry never observed within the hang-only budget — the execution lane's \
+                 own admission is blocking the client's request rather than returning promptly",
+        )
         .expect("B retry task");
-    let elapsed = started.elapsed();
     assert!(status_b.is_success(), "B's retry answered {status_b}");
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "B's retry took {elapsed:?} — it must return as soon as the lane wait is journaled, \
-         not once a slot actually frees"
-    );
 
     let show_b: Value = http
         .get(format!("{}/v1/work/{work_b}", handle.endpoint))
@@ -4504,8 +4522,10 @@ async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blo
     let status_a = retry_a.await.expect("A retry task");
     assert!(status_a.is_success(), "A's retry answered {status_a}");
 
-    let both_completed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    support::wait_until(
+        "both Works must reach completed",
+        support::HANG_BUDGET,
+        || async {
             let list: Value = client()
                 .get(format!("{}/v1/work", handle.endpoint))
                 .bearer_auth(&handle.token)
@@ -4515,7 +4535,7 @@ async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blo
                 .json()
                 .await
                 .expect("list json");
-            let done = list["works"]
+            list["works"]
                 .as_array()
                 .expect("works")
                 .iter()
@@ -4524,15 +4544,11 @@ async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blo
                         .as_str()
                         .is_some_and(|s| s.starts_with("completed"))
                 })
-                .count();
-            if done == 2 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+                .count()
+                == 2
+        },
+    )
     .await;
-    assert!(both_completed.is_ok(), "both Works must reach completed");
 
     handle.shutdown().await;
 }
@@ -4674,19 +4690,28 @@ async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blo
 /// instead. Historical absolute numbers, kept as history and no longer
 /// asserted anywhere: `knowledge/evidence/perf/t12-lane-era-throughput-2026-08-26.md`
 /// (18.9–100.5 works/s) and `.../macbook-arrival-git-spawn-2026-08-15.md`.
+///
+/// **Seam 3 (no-clock-decides, owner ruling 2026-09-02) supersedes the
+/// ratio floor and the `ATTEMPTS` retry above.** The ruling's own first
+/// consequence names this exact test: *"A throughput floor is a duration
+/// verdict however it is normalized; a retry inside a test is
+/// non-determinism hidden, not removed. The throughput number is
+/// recorded, never asserted."* `SUBMIT_COST_CEILING_GIT_UNITS`'s own
+/// derivation (above) is kept as history, not a contract — the ratio
+/// design was real work and the doc stays as evidence of what was known
+/// at the time, per the ruling's own "Standing angle". What this test
+/// asserts now is exactly the state the ratio existed to protect
+/// underneath the timing: every submission in the burst reaches
+/// `completed`. The measured cost-in-units and rate are still computed
+/// and printed — a recorded figure, not a gate — because they remain
+/// useful evidence for a human reading a CI log, just no longer a thing
+/// this test can fail on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t12_submission_throughput_has_an_automated_floor() {
+async fn t12_every_submission_in_a_burst_completes_under_the_repository_guard() {
     const BURST: usize = 25;
-    /// Per-submission cost of the guarded section, in `git worktree add`s.
-    /// Derived in the doc comment above from the 2026-08-29 measurements in
-    /// sergeant-rs-workspace's `knowledge/evidence/perf/t12-ratio-guard-2026-08-29.md`:
-    /// worst healthy 8.8, worst +86 ms regression 17.5.
-    const SUBMIT_COST_CEILING_GIT_UNITS: f64 = 12.0;
-    /// Samples of the in-run unit per attempt. Odd, and the median is taken:
-    /// one scheduler hiccup must not move the unit in either direction.
+    /// Samples of the in-run unit. Odd, and the median is taken: one
+    /// scheduler hiccup must not move the unit in either direction.
     const UNIT_SAMPLES: usize = 5;
-    /// A breach is retried, not fatal — see "Best of ATTEMPTS" above.
-    const ATTEMPTS: usize = 3;
 
     let dir = TempDir::new().expect("tempdir");
     let estate = TempDir::new().expect("tempdir");
@@ -4696,187 +4721,163 @@ async fn t12_submission_throughput_has_an_automated_floor() {
     let handle = start_with_fake_bound(dir.path(), &fake, Some(estate.path())).await;
     let http = client();
 
-    let mut observed: Vec<String> = Vec::with_capacity(ATTEMPTS);
-    let mut passed = false;
-    for attempt in 1..=ATTEMPTS {
-        // W4b's execution lane (`Engine::try_admit_execution`, `src/runtime/engine.rs`,
-        // J3 ratified) means a launch that finds the lane full is handed off to a
-        // detached task (`api::crank_inner`'s `EngineNext::Launch` arm, `src/api.rs`)
-        // and the submit's HTTP response returns immediately with the Work left
-        // `waiting` — the response body no longer means "this Work is done" the way
-        // it did before the lane existed. Reading completion from the submit response
-        // body (the original shape of this test) is exactly the regression N3R2-04's
-        // own doc comment above warns about: it measures the HTTP surface, not the
-        // submit path's whole operation. So the burst is driven to terminal below,
-        // and the ratio is taken over the accept phase — the span the repository
-        // guard is actually contended in.
-        let started = Instant::now();
-        let mut inflight = Vec::with_capacity(BURST);
-        for _ in 0..BURST {
-            let http = http.clone();
-            let endpoint = handle.endpoint.clone();
-            let token = handle.token.clone();
-            let repo = repo.clone();
-            let estate_root = estate.path().to_path_buf();
-            inflight.push(tokio::spawn(async move {
-                let response = http
-                    .post(format!("{endpoint}/v1/work"))
-                    .bearer_auth(token)
-                    .json(&json!({
-                        "command_id": ulid(),
-                        "intent": "throughput floor",
-                        "backend": FAKE_BACKEND_NAME,
-                        // D4: `cwd` is the mount; the addressed estate is its root.
-                        "estate_root": estate_root,
-                        "origin": {"client": "cli", "cwd": repo},
-                    }))
-                    .send()
-                    .await
-                    .expect("submit");
-                let status = response.status();
-                let body: Value = response.json().await.expect("submit json");
-                (status, body)
-            }));
-        }
-        let mut created = 0usize;
-        let mut work_ids = Vec::with_capacity(BURST);
-        for task in inflight {
-            let (status, body) = task.await.expect("submit task");
-            if status.is_success() {
-                created += 1;
-                work_ids.push(
-                    body["work"]["id"]
-                        .as_str()
-                        .expect("accepted submission carries a work id")
-                        .to_string(),
-                );
-            }
-        }
-        // The accept phase: every submission answered. This is the span an
-        // effect serialized under the repository guard can hide in.
-        let accept_phase = started.elapsed();
-        assert_eq!(created, BURST, "every submission must be accepted");
-
-        let poll_deadline = Instant::now() + Duration::from_secs(30);
-        let mut states: Vec<String> = Vec::new();
-        loop {
-            states.clear();
-            let mut all_terminal = true;
-            for id in &work_ids {
-                let body: Value = http
-                    .get(format!("{}/v1/work/{id}", handle.endpoint))
-                    .bearer_auth(&handle.token)
-                    .send()
-                    .await
-                    .expect("work show")
-                    .json()
-                    .await
-                    .expect("work show json");
-                let state = body["work"]["state"]
+    // W4b's execution lane (`Engine::try_admit_execution`, `src/runtime/engine.rs`,
+    // J3 ratified) means a launch that finds the lane full is handed off to a
+    // detached task (`api::crank_inner`'s `EngineNext::Launch` arm, `src/api.rs`)
+    // and the submit's HTTP response returns immediately with the Work left
+    // `waiting` — the response body no longer means "this Work is done" the way
+    // it did before the lane existed. Reading completion from the submit response
+    // body (the original shape of this test) is exactly the regression N3R2-04's
+    // own doc comment above warns about: it measures the HTTP surface, not the
+    // submit path's whole operation. So the burst is driven to terminal below,
+    // and the recorded cost is taken over the accept phase — the span the
+    // repository guard is actually contended in.
+    let started = Instant::now();
+    let mut inflight = Vec::with_capacity(BURST);
+    for _ in 0..BURST {
+        let http = http.clone();
+        let endpoint = handle.endpoint.clone();
+        let token = handle.token.clone();
+        let repo = repo.clone();
+        let estate_root = estate.path().to_path_buf();
+        inflight.push(tokio::spawn(async move {
+            let response = http
+                .post(format!("{endpoint}/v1/work"))
+                .bearer_auth(token)
+                .json(&json!({
+                    "command_id": ulid(),
+                    "intent": "throughput floor",
+                    "backend": FAKE_BACKEND_NAME,
+                    // D4: `cwd` is the mount; the addressed estate is its root.
+                    "estate_root": estate_root,
+                    "origin": {"client": "cli", "cwd": repo},
+                }))
+                .send()
+                .await
+                .expect("submit");
+            let status = response.status();
+            let body: Value = response.json().await.expect("submit json");
+            (status, body)
+        }));
+    }
+    let mut created = 0usize;
+    let mut work_ids = Vec::with_capacity(BURST);
+    for task in inflight {
+        let (status, body) = task.await.expect("submit task");
+        if status.is_success() {
+            created += 1;
+            work_ids.push(
+                body["work"]["id"]
                     .as_str()
-                    .expect("work has a state")
-                    .to_string();
-                if !matches!(state.as_str(), "completed" | "failed" | "canceled") {
-                    all_terminal = false;
-                }
-                states.push(state);
-            }
-            if all_terminal {
-                break;
-            }
-            // L7 revert-sensitivity: a lane that never releases a permit (the
-            // exact shape a leaked `execution_permits` entry or a re-broken
-            // `resume_after_execution_lane` edge would produce) wedges here
-            // rather than silently passing — this loop does not have a "give up
-            // and read whatever the response body already said" fallback the
-            // way the pre-lane-era version of this test effectively did.
-            assert!(
-                Instant::now() < poll_deadline,
-                "burst did not reach a terminal state within 30s — the execution lane \
-                 wedged (states observed: {states:?})"
+                    .expect("accepted submission carries a work id")
+                    .to_string(),
             );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let elapsed = started.elapsed();
-
-        let completed = states.iter().filter(|s| s.as_str() == "completed").count();
-        // The whole point is that the measured operation is the whole operation: a
-        // burst that parked in `waiting` and was never driven on would have shown
-        // up here as a non-`completed` terminal state, not as this test's request
-        // timing out. This is also what keeps the estate binding honest — without
-        // it the burst above could be answering `Ok(None)` and the ratio would be
-        // a ratio about the HTTP surface.
-        assert_eq!(
-            completed, BURST,
-            "every submission must have run its workflow to completion — otherwise \
-             this is not measuring the submit path the budget was measured on \
-             (attempt {attempt}, states observed: {states:?})"
-        );
-
-        // The in-run unit: one `git worktree add` against the same repository, on
-        // this host, now. Not an exact replica of what the submit path does under
-        // the guard (that one is `--no-checkout` plus a later `reset --hard`,
-        // `runtime::surface`) — it does not need to be. It needs to be the same
-        // class of operation, a git subprocess mutating the same repository's
-        // worktree registry, so that whatever makes the guarded section slow on a
-        // given target (git-spawn cost on macOS, #128; a loaded CI runner; an
-        // instrumented build) makes the unit slow with it. Measured per attempt,
-        // after that attempt's burst has settled, so it cannot perturb what it is
-        // a unit for and cannot go stale if load changes between attempts.
-        let scratch = TempDir::new().expect("tempdir");
-        let mut unit_samples_ms: Vec<f64> = Vec::with_capacity(UNIT_SAMPLES);
-        for i in 0..UNIT_SAMPLES {
-            let target = scratch.path().join(format!("unit-{attempt}-{i}"));
-            let at = Instant::now();
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .args(["worktree", "add", "--detach"])
-                .arg(&target)
-                .output()
-                .expect("git worktree add (the in-run unit)");
-            assert!(
-                out.status.success(),
-                "the in-run unit must actually run: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            unit_samples_ms.push(at.elapsed().as_secs_f64() * 1000.0);
-        }
-        unit_samples_ms.sort_by(f64::total_cmp);
-        let unit_ms = unit_samples_ms[UNIT_SAMPLES / 2];
-
-        let per_submission_ms = accept_phase.as_secs_f64() * 1000.0 / BURST as f64;
-        let cost_in_units = per_submission_ms / unit_ms;
-        let rate = BURST as f64 / elapsed.as_secs_f64();
-        let line = format!(
-            "attempt {attempt}: {cost_in_units:.1} units \
-             ({per_submission_ms:.1} ms/submission over a {BURST}-burst ÷ a {unit_ms:.1} ms \
-             `git worktree add`); whole span {elapsed:?} = {rate:.1} works/s, recorded not asserted"
-        );
-        eprintln!("t12 {line} (ceiling {SUBMIT_COST_CEILING_GIT_UNITS} units)");
-        observed.push(line);
-        if cost_in_units <= SUBMIT_COST_CEILING_GIT_UNITS {
-            passed = true;
-            break;
         }
     }
-    handle.shutdown().await;
+    // The accept phase: every submission answered. This is the span an
+    // effect serialized under the repository guard can hide in.
+    let accept_phase = started.elapsed();
+    assert_eq!(created, BURST, "every submission must be accepted");
 
-    assert!(
-        passed,
-        "a submission cost more than {SUBMIT_COST_CEILING_GIT_UNITS} `git worktree add`s \
-         under the repository guard on every one of {ATTEMPTS} attempts — an external effect \
-         has been put back under `runtime::surface::with_repository`, where it caps throughput \
-         at 1/d whatever the host speed. Observed: {observed:#?}. Derivation (2026-08-29, \
-         sergeant-rs-workspace's knowledge/evidence/perf/t12-ratio-guard-2026-08-29.md): \
-         healthy 2.4-8.8 units across idle / CPU-hogged / fsync-hogged / 2-core / \
-         2-core-plus-hogs conditions; the same conditions with 86 ms — N3R2-04's own number — \
-         serialized under that guard measure 17.5-64.9; 12.0 sits 1.4x above the worst healthy \
-         and 1.5x below the worst regression. This replaced an absolute 8.0 works/s floor that \
-         failed and passed on one unchanged commit purely on runner load (#278, GH runs \
-         33250519400 / 33251738966), and it is a ratio precisely so that a slow host moves both \
-         of its terms."
+    let states = std::cell::RefCell::new(Vec::<String>::new());
+    support::wait_until(
+        "every submission in the burst reaches a terminal state — a lane that never \
+         releases a permit (the exact shape a leaked `execution_permits` entry or a \
+         re-broken `resume_after_execution_lane` edge would produce) wedges here rather \
+         than silently passing",
+        support::HANG_BUDGET,
+        || {
+            let http = &http;
+            let handle = &handle;
+            let work_ids = &work_ids;
+            let states = &states;
+            async move {
+                let mut current = Vec::with_capacity(work_ids.len());
+                let mut all_terminal = true;
+                for id in work_ids {
+                    let body: Value = http
+                        .get(format!("{}/v1/work/{id}", handle.endpoint))
+                        .bearer_auth(&handle.token)
+                        .send()
+                        .await
+                        .expect("work show")
+                        .json()
+                        .await
+                        .expect("work show json");
+                    let state = body["work"]["state"]
+                        .as_str()
+                        .expect("work has a state")
+                        .to_string();
+                    if !matches!(state.as_str(), "completed" | "failed" | "canceled") {
+                        all_terminal = false;
+                    }
+                    current.push(state);
+                }
+                *states.borrow_mut() = current;
+                all_terminal
+            }
+        },
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let states = states.into_inner();
+
+    let completed = states.iter().filter(|s| s.as_str() == "completed").count();
+    // The whole point is that the measured operation is the whole operation: a
+    // burst that parked in `waiting` and was never driven on would have shown
+    // up here as a non-`completed` terminal state, not as this test's request
+    // timing out. This is also what keeps the estate binding honest — without
+    // it the burst above could be answering `Ok(None)` and the recorded cost
+    // would be a number about the HTTP surface.
+    assert_eq!(
+        completed, BURST,
+        "every submission must have run its workflow to completion — otherwise this is \
+         not measuring the submit path the recorded cost below is about (states \
+         observed: {states:?})"
     );
+
+    // The in-run unit: one `git worktree add` against the same repository, on
+    // this host, now. Not an exact replica of what the submit path does under
+    // the guard (that one is `--no-checkout` plus a later `reset --hard`,
+    // `runtime::surface`) — it does not need to be. It needs to be the same
+    // class of operation, a git subprocess mutating the same repository's
+    // worktree registry, so that whatever makes the guarded section slow on a
+    // given target (git-spawn cost on macOS, #128; a loaded CI runner; an
+    // instrumented build) makes the unit slow with it. Measured after the
+    // burst has settled, so it cannot perturb what it is a unit for.
+    let scratch = TempDir::new().expect("tempdir");
+    let mut unit_samples_ms: Vec<f64> = Vec::with_capacity(UNIT_SAMPLES);
+    for i in 0..UNIT_SAMPLES {
+        let target = scratch.path().join(format!("unit-{i}"));
+        let at = Instant::now();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "--detach"])
+            .arg(&target)
+            .output()
+            .expect("git worktree add (the in-run unit)");
+        assert!(
+            out.status.success(),
+            "the in-run unit must actually run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        unit_samples_ms.push(at.elapsed().as_secs_f64() * 1000.0);
+    }
+    unit_samples_ms.sort_by(f64::total_cmp);
+    let unit_ms = unit_samples_ms[UNIT_SAMPLES / 2];
+
+    let per_submission_ms = accept_phase.as_secs_f64() * 1000.0 / BURST as f64;
+    let cost_in_units = per_submission_ms / unit_ms;
+    let rate = BURST as f64 / elapsed.as_secs_f64();
+    eprintln!(
+        "t12 (recorded, not asserted — #278 superseded by \
+         sergeant-rs-workspace's knowledge/rulings/owner-rulings/no-nondeterministic-tests-2026-09-02.md): \
+         {cost_in_units:.1} units ({per_submission_ms:.1} ms/submission over a {BURST}-burst \
+         ÷ a {unit_ms:.1} ms `git worktree add`); whole span {elapsed:?} = {rate:.1} works/s"
+    );
+
+    handle.shutdown().await;
 }
 
 /// An estate the submit path can actually run in: one mount with a commit and
@@ -5500,18 +5501,23 @@ async fn r_mvp1_10_wait_for_state(
     state: &str,
     timeout: Duration,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let body = r_mvp1_10_show(http, handle, work_id).await;
-        if body["work"]["state"] == state {
-            return body;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {work_id} to reach {state:?}; last seen: {body}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let result = std::cell::RefCell::new(None);
+    support::wait_until(
+        &format!("timed out waiting for {work_id} to reach {state:?}"),
+        timeout,
+        || async {
+            let body = r_mvp1_10_show(http, handle, work_id).await;
+            let reached = body["work"]["state"] == state;
+            if reached {
+                *result.borrow_mut() = Some(body);
+            }
+            reached
+        },
+    )
+    .await;
+    result
+        .into_inner()
+        .expect("wait_until only returns after its predicate succeeds")
 }
 
 /// The reason of the most recent `work.blocked` event for `work_id`.

@@ -260,13 +260,17 @@ async fn post(
     path: &str,
     body: Value,
 ) -> (reqwest::StatusCode, Value) {
-    let resp = client
-        .post(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .json(&body)
-        .send()
-        .await
-        .expect("request");
+    let resp = support::send_while_alive(
+        "post",
+        || {
+            client
+                .post(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .json(&body)
+        },
+        || handle.is_alive(),
+    )
+    .await;
     let status = resp.status();
     let value: Value = resp.json().await.expect("json body");
     (status, value)
@@ -274,15 +278,19 @@ async fn post(
 
 /// GET a path from the daemon.
 async fn get(client: &reqwest::Client, handle: &DaemonHandle, path: &str) -> Value {
-    client
-        .get(format!("{}{path}", handle.endpoint))
-        .bearer_auth(&handle.token)
-        .send()
-        .await
-        .expect("request")
-        .json()
-        .await
-        .expect("json body")
+    support::send_while_alive(
+        "get",
+        || {
+            client
+                .get(format!("{}{path}", handle.endpoint))
+                .bearer_auth(&handle.token)
+        },
+        || handle.is_alive(),
+    )
+    .await
+    .json()
+    .await
+    .expect("json body")
 }
 
 /// Submit work addressed at `estate_root`, whose origin is `cwd`, merging
@@ -2011,18 +2019,15 @@ async fn deferred_finish_does_not_let_the_engine_observe_a_conclusion_before_lau
     assert_eq!(body["stage"]["status"], "active");
     let execution_id = fake.starts()[0].execution_id.clone();
 
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let shown = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
-        if shown["work"]["state"] == "completed" {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the settled outcome never surfaced: {shown}"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    support::wait_until(
+        "the settled outcome never surfaced",
+        support::HANG_BUDGET,
+        || async {
+            let shown = get(&client, &handle, &format!("/v1/work/{work_id}")).await;
+            shown["work"]["state"] == "completed"
+        },
+    )
+    .await;
     let completed = events_of(data.path(), &work_id, KIND_STAGE_COMPLETED);
     assert_eq!(completed[0].payload["detail"], "ran the migration");
     assert!(
@@ -6563,9 +6568,10 @@ fn stop_daemon(data_dir: &Path) {
         let _ = Command::new("kill")
             .arg(descriptor.pid.to_string())
             .status();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while daemon::descriptor_path(data_dir).exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        support::wait_until_sync(
+            "daemon descriptor removed after SIGTERM",
+            support::HANG_BUDGET,
+            || !daemon::descriptor_path(data_dir).exists(),
+        );
     }
 }

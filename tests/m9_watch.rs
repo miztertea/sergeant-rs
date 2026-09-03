@@ -164,17 +164,15 @@ fn spawn_bare_daemon(estate: &Path, data_dir: &DataDir) {
         let mut child = child;
         let _ = child.wait();
     });
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while daemon::read_descriptor(data_dir.path())
-        .expect("read descriptor")
-        .is_none()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "the bare daemon never published a descriptor"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    support::wait_until_sync(
+        "the bare daemon never published a descriptor",
+        support::HANG_BUDGET,
+        || {
+            daemon::read_descriptor(data_dir.path())
+                .expect("read descriptor")
+                .is_some()
+        },
+    );
 }
 
 /// Run `sgt` to completion from `cwd` against `data_dir`. Every caller but
@@ -322,28 +320,22 @@ impl WatchProc {
     }
 
     /// Poll for exit rather than blocking indefinitely: a bug that leaves
-    /// the process running must fail this test loudly, not hang the suite.
-    fn wait_timeout(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                return Some(status);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
+    /// the process running must fail this test loudly, not hang the suite
+    /// (F-SF-01 fix pass: folded onto support::wait_until_sync -- `Drop`
+    /// below already unconditionally kills+reaps the child, including
+    /// during this panic's own unwind, so no separate pre-panic cleanup
+    /// step is needed here; `timeout` stays caller-supplied, every call
+    /// site passes 10s, rather than the shared support::HANG_BUDGET: a
+    /// process just told to exit and still alive after a generous
+    /// multi-second window is the defect under test, not a hang this
+    /// suite should wait 120s to confirm).
     fn expect_exit(&mut self, timeout: Duration, what: &str) -> std::process::ExitStatus {
-        match self.wait_timeout(timeout) {
-            Some(status) => status,
-            None => {
-                self.kill();
-                panic!("{what}: process did not exit within {timeout:?}");
-            }
-        }
+        let mut status = None;
+        support::wait_until_sync(what, timeout, || {
+            status = self.child.try_wait().ok().flatten();
+            status.is_some()
+        });
+        status.expect("wait_until_sync only returns after the predicate observed Some(status)")
     }
 
     fn kill(&mut self) {
@@ -361,16 +353,9 @@ impl Drop for WatchProc {
     }
 }
 
-fn wait_for_hold_ready(hold: &Path, timeout: Duration) -> bool {
+fn wait_for_hold_ready(hold: &Path, timeout: Duration, what: &str) {
     let ready = format!("{}.ready", hold.display());
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if Path::new(&ready).exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    false
+    support::wait_until_sync(what, timeout, || Path::new(&ready).exists());
 }
 
 fn release_hold(hold: &Path) {
@@ -503,9 +488,10 @@ fn w3_a_transition_forced_inside_the_held_window_is_reported_exactly_once() {
         &[("SGT_WATCH_TEST_HOLD", hold.to_str().unwrap())],
         &["--json", "watch", &id, "--follow"],
     );
-    assert!(
-        wait_for_hold_ready(&hold, Duration::from_secs(10)),
-        "the client must touch <path>.ready after attaching — the hold must actually engage"
+    wait_for_hold_ready(
+        &hold,
+        Duration::from_secs(10),
+        "the client must touch <path>.ready after attaching — the hold must actually engage",
     );
 
     // The forcing transition: proven (by .ready above) to land after attach,
@@ -568,9 +554,10 @@ fn w4_a_stale_trigger_does_not_produce_stale_meaning() {
         &[("SGT_WATCH_TEST_HOLD", hold.to_str().unwrap())],
         &["--json", "watch", &id],
     );
-    assert!(
-        wait_for_hold_ready(&hold, Duration::from_secs(10)),
-        "the hold must actually engage"
+    wait_for_hold_ready(
+        &hold,
+        Duration::from_secs(10),
+        "the hold must actually engage",
     );
 
     let responded = sgt(

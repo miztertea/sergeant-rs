@@ -236,6 +236,7 @@ async fn a_bound_work_surface_is_scanned_as_an_overlay_and_evicted_when_it_retir
             "command_id": ulid::Ulid::generate().to_string(),
             "estate_root": estate.path(),
         }),
+        || handle.is_alive(),
     )
     .await;
     assert_eq!(status, 200, "{body}");

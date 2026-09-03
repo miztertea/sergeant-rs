@@ -32,6 +32,8 @@ use sergeant_rs::runtime::atlas::worker::{
 };
 use sergeant_rs::runtime::engine::Engine;
 
+mod support;
+
 /// The real worker binary Cargo built alongside this test binary (`sgt` is
 /// the other one, addressed the same way elsewhere in this suite).
 const SGT_ATLAS_WORKER: &str = env!("CARGO_BIN_EXE_sgt-atlas-worker");
@@ -43,11 +45,6 @@ const NORMAL_DEADLINE: Duration = Duration::from_secs(10);
 /// Deliberately short: this bounds how long the hang/allocate fault cases
 /// keep their worker alive before supervision kills it.
 const FAULT_DEADLINE: Duration = Duration::from_millis(400);
-/// The outer bound the whole test is wrapped in. If supervision's deadline
-/// enforcement were broken (a hung worker never actually killed), the
-/// per-case `FAULT_DEADLINE` above would never fire and this is what would
-/// catch it instead of the test hanging forever.
-const TEST_OUTER_BOUND: Duration = Duration::from_secs(20);
 /// Deliberately generous, and used by exactly one test
 /// ([`an_allocating_worker_is_killed_by_its_address_space_cap_not_the_deadline`]):
 /// the `--fault allocate` mode grows by 8 MiB every 20ms
@@ -261,7 +258,13 @@ const FAULT_CASES: &[FaultCase] = &[
 /// rows appear, and a named coverage row lands describing the failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fault_worker_leaves_the_daemon_up_the_permit_freed_and_a_named_coverage_row() {
-    tokio::time::timeout(TEST_OUTER_BOUND, async {
+    // The outer bound the whole test is wrapped in. If supervision's
+    // deadline enforcement were broken (a hung worker never actually
+    // killed), the per-case FAULT_DEADLINE above would never fire and this
+    // is what would catch it instead of the test hanging forever — wave
+    // `timeout-the-function` (S6, item 2): raised from a bespoke, locally-
+    // named 20s onto the crate's one shared hang-only bound.
+    tokio::time::timeout(support::HANG_BUDGET, async {
         for case in FAULT_CASES {
             let data = TempDir::new().expect("tempdir");
             let engine = Engine::new(Arc::new(BackendRegistry::new()), None, data.path())

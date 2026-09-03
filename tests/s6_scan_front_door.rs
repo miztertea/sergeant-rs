@@ -221,6 +221,7 @@ async fn the_trigger_accepts_and_names_the_scan_instead_of_answering_with_the_wh
         &handle.endpoint,
         &handle.token,
         &json!({"command_id": ulid::Ulid::generate().to_string(), "estate_root": estate.path()}),
+        || handle.is_alive(),
     )
     .await;
     handle.shutdown().await;
@@ -308,6 +309,7 @@ async fn completion_is_reported_by_the_scan_itself_not_counted_from_another_comm
         &handle.endpoint,
         &handle.token,
         &json!({"command_id": ulid::Ulid::generate().to_string(), "estate_root": estate.path()}),
+        || handle.is_alive(),
     )
     .await;
     assert_eq!(status, 200, "{final_state}");
@@ -368,6 +370,7 @@ async fn the_journal_records_the_scan_that_started_and_the_scan_that_completed()
         &handle.endpoint,
         &handle.token,
         &json!({"command_id": ulid::Ulid::generate().to_string(), "estate_root": estate.path()}),
+        || handle.is_alive(),
     )
     .await;
     let scan_id = final_state["scan_id"]
@@ -508,9 +511,9 @@ async fn the_shared_scan_driver_gives_up_when_the_status_endpoint_stops_tracking
     let endpoint = stub_that_accepts_a_scan_then_forgets_it();
     let http = client();
     let joined = tokio::time::timeout(
-        Duration::from_secs(15),
+        support::HANG_BUDGET,
         tokio::spawn(async move {
-            support::scan_to_completion(&http, &endpoint, "stub-token", &json!({})).await
+            support::scan_to_completion(&http, &endpoint, "stub-token", &json!({}), || true).await
         }),
     )
     .await

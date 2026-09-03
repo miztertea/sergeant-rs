@@ -198,9 +198,10 @@ fn host_scoped_verbs_reach_the_daemon_from_a_directory_with_no_estate_above_it()
     stopped.assert_ok("sgt daemon stop from a non-estate cwd");
     assert_eq!(stopped.json()["status"], "stopped");
 
-    assert!(
-        wait_for(Duration::from_secs(15), || data.daemon_pids().is_empty()),
-        "daemon stop must actually stop the daemon"
+    support::wait_until_sync(
+        "daemon stop must actually stop the daemon",
+        support::HANG_BUDGET,
+        || data.daemon_pids().is_empty(),
     );
 }
 
@@ -339,12 +340,10 @@ fn watch_defaults_to_the_addressed_estate_and_all_widens_it_to_the_host() {
     )
     .assert_ok("b transition under --all");
 
-    let matched = wait_for(Duration::from_secs(10), || {
-        matches!(watch_all.try_wait(), Ok(Some(_)))
-    });
-    assert!(
-        matched,
-        "--all must see estate B's transition from inside estate A"
+    support::wait_until_sync(
+        "--all must see estate B's transition from inside estate A",
+        support::HANG_BUDGET,
+        || matches!(watch_all.try_wait(), Ok(Some(_))),
     );
     let status = watch_all.wait().expect("wait for --all watch");
     assert!(

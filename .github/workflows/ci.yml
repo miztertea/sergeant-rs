@@ -79,6 +79,17 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    # Seam 5 (no-clock-decides, owner ruling 2026-09-02): Gate B
+    # (`release.yml`) calls this job, and with no bound here a genuine hang
+    # holds the whole run to GitHub's 6-hour cap. Sized from observed data,
+    # not guessed: sergeant-rs-workspace's
+    # knowledge/evidence/ci/recon-ci-history-2026-09-02.md's 24 sampled
+    # successful runs of this exact job span 566s-2514s wall clock (max
+    # observed x ~2 margin, rounded up) — this bounds only "never
+    # finishes"; it decides nothing about how fast a passing run must be
+    # (`matrix.yml`/`coverage.yml` already carry the same shape at
+    # 60/120 minutes for their own jobs).
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

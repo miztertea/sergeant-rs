@@ -406,19 +406,20 @@ impl StubAgy {
     }
 
     fn wait_for_loop_stdin_lines(&self, count: usize) -> Vec<String> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let lines = self.loop_stdin_lines();
-            if lines.len() >= count {
-                return lines;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "only {} of {count} stdin lines recorded",
-                lines.len()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            &format!("stdin lines recorded never reached {count}"),
+            support::HANG_BUDGET,
+            || {
+                let lines = self.loop_stdin_lines();
+                let done = lines.len() >= count;
+                if done {
+                    result = Some(lines);
+                }
+                done
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 
     /// Only the launches that are loop children (argv[0] is `--print=`).
@@ -430,19 +431,20 @@ impl StubAgy {
     }
 
     fn wait_for_loop_launches(&self, count: usize) -> Vec<Launch> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let launches = self.loop_launches();
-            if launches.len() >= count {
-                return launches;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "only {} of {count} loop launches recorded",
-                launches.len()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            &format!("loop launches recorded never reached {count}"),
+            support::HANG_BUDGET,
+            || {
+                let launches = self.loop_launches();
+                let done = launches.len() >= count;
+                if done {
+                    result = Some(launches);
+                }
+                done
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 
     fn writes_stderr(&self, text: &str) -> &Self {
@@ -466,20 +468,23 @@ impl StubAgy {
     }
 
     fn wait_for_grandchild_pid(&self) -> u32 {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(pid) = std::fs::read_to_string(&self.grandchild_pid)
-                .ok()
-                .and_then(|text| text.trim().parse::<u32>().ok())
-            {
-                return pid;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "grandchild pid was never recorded"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            "grandchild pid was never recorded",
+            support::HANG_BUDGET,
+            || {
+                let pid = std::fs::read_to_string(&self.grandchild_pid)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+                if let Some(pid) = pid {
+                    result = Some(pid);
+                    true
+                } else {
+                    false
+                }
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 
     fn launches(&self) -> Vec<Launch> {
@@ -518,19 +523,20 @@ impl StubAgy {
     }
 
     fn wait_for_turn_launches(&self, count: usize) -> Vec<Launch> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let launches = self.turn_launches();
-            if launches.len() >= count {
-                return launches;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "only {} of {count} turn launches recorded",
-                launches.len()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let mut result = None;
+        support::wait_until_sync(
+            &format!("turn launches recorded never reached {count}"),
+            support::HANG_BUDGET,
+            || {
+                let launches = self.turn_launches();
+                let done = launches.len() >= count;
+                if done {
+                    result = Some(launches);
+                }
+                done
+            },
+        );
+        result.expect("wait_until_sync only returns after its predicate succeeds")
     }
 }
 
@@ -653,19 +659,20 @@ fn conversation_of(capture: &str) -> String {
 
 /// Wait until at least `count` `conversation.turn.ended` events have landed.
 fn wait_for_turns_ended(events: &Arc<Mutex<Vec<EventDraft>>>, count: usize) -> Vec<EventDraft> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let ended = events_of_kind(events, "conversation.turn.ended");
-        if ended.len() >= count {
-            return ended;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "only {} of {count} turns ended",
-            ended.len()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        &format!("turns ended never reached {count}"),
+        support::HANG_BUDGET,
+        || {
+            let ended = events_of_kind(events, "conversation.turn.ended");
+            let done = ended.len() >= count;
+            if done {
+                result = Some(ended);
+            }
+            done
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// LAUNCH one loop execution against a stub replaying `capture`'s turns.
@@ -735,20 +742,26 @@ fn sink() -> (sergeant_rs::backend::EventSink, Arc<Mutex<Vec<EventDraft>>>) {
 }
 
 fn wait_for_kind(events: &Arc<Mutex<Vec<EventDraft>>>, kind: &str) -> EventDraft {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(found) = events
-            .lock()
-            .expect("lock")
-            .iter()
-            .find(|event| event.kind == kind)
-            .cloned()
-        {
-            return found;
-        }
-        assert!(Instant::now() < deadline, "no {kind} event arrived");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut result = None;
+    support::wait_until_sync(
+        &format!("no {kind} event arrived"),
+        support::HANG_BUDGET,
+        || {
+            let found = events
+                .lock()
+                .expect("lock")
+                .iter()
+                .find(|event| event.kind == kind)
+                .cloned();
+            if let Some(found) = found {
+                result = Some(found);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 fn events_of_kind(events: &Arc<Mutex<Vec<EventDraft>>>, kind: &str) -> Vec<EventDraft> {
@@ -765,15 +778,16 @@ fn events_of_kind(events: &Arc<Mutex<Vec<EventDraft>>>, kind: &str) -> Vec<Event
 /// this transport means "the per-turn process has exited" — the only thing that
 /// can end a print-mode turn.
 fn wait_for_settled(backend: &AgyBackend, handle: &ExecutionHandle) -> Observation {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
+    let mut result = None;
+    support::wait_until_sync("turn never settled", support::HANG_BUDGET, || {
         let observation = backend.observe(handle).expect("observe");
-        if observation.native != NativeState::Running {
-            return observation;
+        let settled = observation.native != NativeState::Running;
+        if settled {
+            result = Some(observation);
         }
-        assert!(Instant::now() < deadline, "turn never settled");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+        settled
+    });
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 fn launch_with(
@@ -1954,18 +1968,16 @@ fn a_resumed_turn_whose_init_echoes_a_different_conversation_fails_the_turn() {
     stub.replays(TOOL_USE);
     stub.writes_stderr(RESUME_FORK_WARNING);
     backend.send(&handle, "turn two").expect("send");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let observation = loop {
+    let mut result = None;
+    support::wait_until_sync("the forked turn never failed", support::HANG_BUDGET, || {
         let observation = backend.observe(&handle).expect("observe");
-        if matches!(observation.signal, BackendSignal::Failed { .. }) {
-            break observation;
+        let failed = matches!(observation.signal, BackendSignal::Failed { .. });
+        if failed {
+            result = Some(observation);
         }
-        assert!(
-            Instant::now() < deadline,
-            "the forked turn never failed: {observation:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+        failed
+    });
+    let observation = result.expect("wait_until_sync only returns after its predicate succeeds");
     let BackendSignal::Failed { reason } = observation.signal else {
         unreachable!()
     };
@@ -2167,14 +2179,11 @@ fn agy_interrupt_kills_the_process_group() {
         "the grandchild must be running first"
     );
     backend.interrupt(&handle).expect("interrupt").wait();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while pid_alive(grandchild) {
-        assert!(
-            Instant::now() < deadline,
-            "the grandchild survived the group kill (pid {grandchild})"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    support::wait_until_sync(
+        &format!("the grandchild survived the group kill (pid {grandchild})"),
+        support::HANG_BUDGET,
+        || !pid_alive(grandchild),
+    );
     // A kill we asked for is not a conclusion about the stage, and the
     // conversation stays resumable.
     let observation = backend.observe(&handle).expect("observe");
@@ -2569,22 +2578,19 @@ fn a_loop_child_streams_each_turns_events_before_the_next_is_written() {
     };
     assert_eq!(summary.as_deref(), Some("alpha\n"));
     backend.send(&handle, "and again").expect("send");
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let second = loop {
+    let mut result = None;
+    support::wait_until_sync("turn 2 never settled", support::HANG_BUDGET, || {
         let observation = backend.observe(&handle).expect("observe");
-        if let BackendSignal::StageCompleted {
-            summary: Some(text),
-        } = &observation.signal
-            && text == "bravo\n"
-        {
-            break observation;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "turn 2 never settled: {observation:?}"
+        let done = matches!(
+            &observation.signal,
+            BackendSignal::StageCompleted { summary: Some(text) } if text == "bravo\n"
         );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+        if done {
+            result = Some(observation);
+        }
+        done
+    });
+    let second = result.expect("wait_until_sync only returns after its predicate succeeds");
     assert_eq!(second.native, NativeState::Exited);
 
     let ended = wait_for_turns_ended(&events, 2);
@@ -2632,21 +2638,23 @@ fn a_subagent_record_reaches_the_journal_with_its_child_conversation() {
     wait_for_settled(&backend, &handle);
     backend.send(&handle, "now invoke it").expect("send");
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let completed = loop {
-        let found: Vec<_> = events_of_kind(&events, "tool.completed")
-            .into_iter()
-            .filter(|event| event.payload["name"] == serde_json::json!("subagent:subagent"))
-            .collect();
-        if let Some(event) = found.into_iter().next() {
-            break event;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no subagent tool.completed arrived"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let mut result = None;
+    support::wait_until_sync(
+        "no subagent tool.completed arrived",
+        support::HANG_BUDGET,
+        || {
+            let found = events_of_kind(&events, "tool.completed")
+                .into_iter()
+                .find(|event| event.payload["name"] == serde_json::json!("subagent:subagent"));
+            if let Some(event) = found {
+                result = Some(event);
+                true
+            } else {
+                false
+            }
+        },
+    );
+    let completed = result.expect("wait_until_sync only returns after its predicate succeeds");
     let child = completed.payload["subagent"][0].clone();
     let child_id = child["conversation_id"]
         .as_str()
@@ -2775,15 +2783,16 @@ fn stderr_between_two_turns_is_attributed_adjacent_and_labelled() {
     wait_for_settled(&backend, &handle);
     backend.send(&handle, "again").expect("send");
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let ended = loop {
+    let mut result = None;
+    support::wait_until_sync("turn 2 never ended", support::HANG_BUDGET, || {
         let ended = events_of_kind(&events, "conversation.turn.ended");
-        if ended.len() >= 2 {
-            break ended;
+        let done = ended.len() >= 2;
+        if done {
+            result = Some(ended);
         }
-        assert!(Instant::now() < deadline, "turn 2 never ended");
-        std::thread::sleep(Duration::from_millis(20));
-    };
+        done
+    });
+    let ended = result.expect("wait_until_sync only returns after its predicate succeeds");
     assert!(
         ended[0].payload["stderr"]
             .as_str()
@@ -2943,14 +2952,11 @@ fn loop_interrupt_group_kills_the_child_and_its_grandchild() {
     );
 
     backend.interrupt(&handle).expect("interrupt").wait();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while pid_alive(grandchild) {
-        assert!(
-            Instant::now() < deadline,
-            "the grandchild survived the group kill (pid {grandchild})"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    support::wait_until_sync(
+        &format!("the grandchild survived the group kill (pid {grandchild})"),
+        support::HANG_BUDGET,
+        || !pid_alive(grandchild),
+    );
     // A kill we asked for is not a conclusion about the stage, and W3 A7
     // measured the conversation staying fully resumable afterwards.
     let observation = backend.observe(&handle).expect("observe");
@@ -3353,15 +3359,26 @@ fn live_agy_resume_recalls_a_nonce_and_echoes_the_same_conversation_id() {
             "What was the token I asked you to remember? Reply with only the token.",
         )
         .expect("send");
-    let deadline = Instant::now() + Duration::from_secs(180);
-    let observation = loop {
-        let observation = backend.observe(&handle).expect("observe");
-        if observation.native != NativeState::Running {
-            break observation;
-        }
-        assert!(Instant::now() < deadline, "the resumed turn never settled");
-        std::thread::sleep(Duration::from_millis(200));
-    };
+    // This opt-in live test's own budget exceeds support::HANG_BUDGET on
+    // purpose: a real second live-model turn's own round trip is the thing
+    // being waited on here, and has been observed to run past 120s on a
+    // loaded host -- shrinking it to the shared constant would trade a
+    // real turn's own latency for exactly the impatience-driven flake this
+    // wave exists to remove.
+    let mut result = None;
+    support::wait_until_sync(
+        "the resumed turn never settled",
+        Duration::from_secs(180),
+        || {
+            let observation = backend.observe(&handle).expect("observe");
+            let settled = observation.native != NativeState::Running;
+            if settled {
+                result = Some(observation);
+            }
+            settled
+        },
+    );
+    let observation = result.expect("wait_until_sync only returns after its predicate succeeds");
     let BackendSignal::StageCompleted { summary } = observation.signal else {
         panic!("the resumed turn should complete: {observation:?}")
     };
@@ -3408,17 +3425,24 @@ fn live_loop_config(data_dir: &Path) -> AgyConfig {
 /// the child outlives every turn — so the keyed signal is the turn's own
 /// settled outcome.
 fn wait_for_loop_turn(backend: &AgyBackend, handle: &ExecutionHandle) -> Observation {
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        let observation = backend.observe(handle).expect("observe");
-        if !matches!(observation.signal, BackendSignal::Running)
-            || observation.native == NativeState::Exited
-        {
-            return observation;
-        }
-        assert!(Instant::now() < deadline, "the loop turn never settled");
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    // Same reasoning as the resumed-turn live wait above: this opt-in
+    // live loop test's own budget exceeds support::HANG_BUDGET on purpose,
+    // for a real model turn's own observed round trip.
+    let mut result = None;
+    support::wait_until_sync(
+        "the loop turn never settled",
+        Duration::from_secs(300),
+        || {
+            let observation = backend.observe(handle).expect("observe");
+            let settled = !matches!(observation.signal, BackendSignal::Running)
+                || observation.native == NativeState::Exited;
+            if settled {
+                result = Some(observation);
+            }
+            settled
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
 
 /// Backs the loop's `resume`, `model_selection` and `identity_before_first_turn`

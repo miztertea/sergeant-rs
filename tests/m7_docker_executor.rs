@@ -1448,38 +1448,45 @@ async fn mixed_actor_execute_actor_workflow_completes_with_evidence_handed_forwa
         .expect("work id")
         .to_string();
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let last: serde_json::Value;
-    loop {
-        let polled: serde_json::Value = http
-            .get(format!("{}/v1/work/{work_id}", handle.endpoint))
-            .bearer_auth(&handle.token)
-            .send()
-            .await
-            .expect("show")
-            .json()
-            .await
-            .expect("json");
-        // ADR 0007(b): this test's "20-close" stage is a bare fake actor
-        // that signals completion without ever running `git commit` — it
-        // exists to prove the execute stage's artifact reaches a following
-        // actor through the worktree, not to exercise a real closing
-        // stage's commit procedure. So the branch never advances and the
-        // container's `validated.txt` is left dirty, and the honest label
-        // for that is `completed_dirty`, not plain `completed`.
-        if polled["work"]["state"] == "completed"
-            || polled["work"]["state"] == "completed_dirty"
-            || polled["work"]["state"] == "blocked"
-        {
-            last = polled;
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "work did not settle within budget: {polled}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    }
+    // `last` is a RefCell, not a plain captured `&mut`: the predicate is an
+    // `FnMut() -> Fut` whose returned future cannot itself hold a mutable
+    // borrow across its own `.await` points (rustc: "captured variable
+    // cannot escape `FnMut` closure body") -- interior mutability sidesteps
+    // that without changing wait_until's own signature.
+    let last = std::cell::RefCell::new(None);
+    support::wait_until(
+        "work did not settle within budget",
+        support::HANG_BUDGET,
+        || async {
+            let polled: serde_json::Value = http
+                .get(format!("{}/v1/work/{work_id}", handle.endpoint))
+                .bearer_auth(&handle.token)
+                .send()
+                .await
+                .expect("show")
+                .json()
+                .await
+                .expect("json");
+            // ADR 0007(b): this test's "20-close" stage is a bare fake actor
+            // that signals completion without ever running `git commit` — it
+            // exists to prove the execute stage's artifact reaches a following
+            // actor through the worktree, not to exercise a real closing
+            // stage's commit procedure. So the branch never advances and the
+            // container's `validated.txt` is left dirty, and the honest label
+            // for that is `completed_dirty`, not plain `completed`.
+            let settled = polled["work"]["state"] == "completed"
+                || polled["work"]["state"] == "completed_dirty"
+                || polled["work"]["state"] == "blocked";
+            if settled {
+                *last.borrow_mut() = Some(polled);
+            }
+            settled
+        },
+    )
+    .await;
+    let last = last
+        .into_inner()
+        .expect("wait_until only returns after its predicate succeeds");
 
     assert_eq!(
         last["work"]["state"], "completed_dirty",
@@ -1754,17 +1761,21 @@ fn wait_for_exit(
     backend: &DockerBackend,
     handle: &sergeant_rs::backend::ExecutionHandle,
 ) -> sergeant_rs::backend::Observation {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let observation = backend.observe(handle).expect("observe");
-        if observation.native == sergeant_rs::backend::NativeState::Exited {
-            return observation;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "container for execution {:?} did not exit within budget",
+    let mut result = None;
+    support::wait_until_sync(
+        &format!(
+            "container for execution {:?} did not exit",
             handle.execution_id
-        );
-        std::thread::sleep(std::time::Duration::from_millis(150));
-    }
+        ),
+        support::HANG_BUDGET,
+        || {
+            let observation = backend.observe(handle).expect("observe");
+            let exited = observation.native == sergeant_rs::backend::NativeState::Exited;
+            if exited {
+                result = Some(observation);
+            }
+            exited
+        },
+    );
+    result.expect("wait_until_sync only returns after its predicate succeeds")
 }
