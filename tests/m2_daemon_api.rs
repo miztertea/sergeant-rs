@@ -2711,43 +2711,46 @@ async fn sse_history_replay_error_mid_tail_closes_the_stream_without_daemon_dama
         200,
         "the SSE handshake itself still succeeds"
     );
-    // `stream` is a RefCell, not a plain `mut` local: wait_until's predicate
-    // is an `FnMut() -> Fut` whose returned future cannot itself hold a
-    // mutable borrow of a captured variable across its own await points --
-    // the same "captured variable cannot escape `FnMut` closure body" rustc
-    // limitation this wave already worked around for a value result
-    // elsewhere (interior mutability, R2/R3).
-    let stream = std::cell::RefCell::new(stream);
-    let buffer = std::cell::RefCell::new(String::new());
-    let saw_error_frame = std::cell::Cell::new(false);
-    support::wait_until(
-        "a broken history replay must close the stream promptly, not hang",
-        Duration::from_secs(5),
-        || async {
-            match tokio::time::timeout(Duration::from_secs(5), stream.borrow_mut().chunk())
-                .await
-                .expect("chunk timeout")
-            {
-                Ok(Some(chunk)) => {
-                    let mut buffer = buffer.borrow_mut();
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    assert!(
-                        !buffer.contains("event: test.seeded") && !buffer.contains("event: work."),
-                        "no *event* frame may ever follow the failed replay: {buffer:?}"
-                    );
-                    if buffer.contains("event: sergeant.stream_error") {
-                        saw_error_frame.set(true);
-                    }
-                    false
+    // Hand-rolled rather than routed through support::wait_until (wave
+    // `timeout-the-function`, item 1): the earlier RefCell-wrapped-stream
+    // version of this loop held that RefCell's borrow across its own
+    // `.await` — a real clippy::await_holding_refcell_ref, this branch's
+    // own (introduced by the fold that first wrote this loop), not the
+    // pre-existing one `read_sse_events`'s own kept ALLOWLIST entry already
+    // names for a different site. A plain `mut` local needs no interior
+    // mutability at all once the loop is not living inside a `FnMut`
+    // closure, so the RefCell/Cell wrapping — and the clippy violation it
+    // caused — goes away with it, same shape as `read_sse_events` and
+    // `read_raw_sse_frames` above/elsewhere in this file.
+    let mut stream = stream;
+    let mut buffer = String::new();
+    let mut saw_error_frame = false;
+    let deadline = Instant::now() + support::HANG_BUDGET;
+    loop {
+        let chunk = tokio::time::timeout(support::HANG_BUDGET, stream.chunk())
+            .await
+            .expect("chunk timeout");
+        match chunk {
+            Ok(Some(chunk)) => {
+                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                assert!(
+                    !buffer.contains("event: test.seeded") && !buffer.contains("event: work."),
+                    "no *event* frame may ever follow the failed replay: {buffer:?}"
+                );
+                if buffer.contains("event: sergeant.stream_error") {
+                    saw_error_frame = true;
                 }
-                Ok(None) | Err(_) => true,
             }
-        },
-    )
-    .await;
-    let buffer = buffer.into_inner();
+            Ok(None) | Err(_) => break,
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a broken history replay must close the stream promptly, not hang (budget {:?})",
+            support::HANG_BUDGET
+        );
+    }
     assert!(
-        saw_error_frame.get(),
+        saw_error_frame,
         "the journal failure must be disclosed as a stream_error control frame \
          (W4 §1.1.3, A6) rather than a silent close: {buffer:?}"
     );

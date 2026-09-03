@@ -3211,7 +3211,7 @@ fn spawn_decoy_process(extra_args: &[&str]) -> std::process::Child {
     let pid = child.id();
     let mut result = Some(child);
     support::wait_until_sync("decoy process never exec'd", support::HANG_BUDGET, || {
-        let execd = sergeant_rs::platform::process::running_processes()
+        sergeant_rs::platform::process::running_processes()
             .into_iter()
             .flatten()
             .any(|process| {
@@ -3219,8 +3219,7 @@ fn spawn_decoy_process(extra_args: &[&str]) -> std::process::Child {
                     && extra_args
                         .iter()
                         .all(|needle| process.argv.iter().any(|arg| arg == needle))
-            });
-        execd
+            })
     });
     result
         .take()
