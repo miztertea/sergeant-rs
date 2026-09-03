@@ -1146,16 +1146,6 @@ const ALLOWLIST: &[Allowed] = &[
     },
     Allowed {
         file: "tests/m9_watch.rs",
-        needle: "let deadline = Instant::now() + timeout;",
-        category: "owned-wait-budget",
-        reason: "WatchProc::wait_timeout's own bounded poll: it returns None on timeout \
-            rather than panicking, and its one caller (expect_exit) kills the child and runs \
-            its own cleanup before panicking with a message this generic helper cannot compose \
-            (`{what}: process did not exit within {timeout:?}`) -- the same 'must run cleanup \
-            before failing' shape wait_until_sync's own doc names as staying hand-rolled.",
-    },
-    Allowed {
-        file: "tests/m9_watch.rs",
         needle: "let deadline = Instant::now() + Duration::from_secs(30);",
         category: "owned-wait-budget",
         reason: "r_watch_10a's own journal-stability wait: three CONSECUTIVE 250ms-apart \
