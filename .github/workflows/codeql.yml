@@ -1,10 +1,59 @@
 name: CodeQL
 
-permissions:
-  contents: read
+# Advanced setup, replacing this repo's prior CodeQL *default* setup
+# (languages actions+rust, default query suite, threat_model: remote,
+# weekly). Default setup has no path-scoping control, so every test that
+# sends the daemon's bearer token to the loopback daemon
+# (`.bearer_auth(&handle.token)` over `http://127.0.0.1`) re-triggers
+# rust/cleartext-transmission and rust/cleartext-logging — false positives
+# per the owner ruling of 2026-08-31
+# (knowledge/rulings/owner-rulings/codeql-false-positives-2026-08-31.md in
+# the sergeant-rs-workspace estate): the daemon is loopback-bound behind a
+# bearer token (H1-03, docs/concepts/security-and-trust.md), and the
+# ruling forbids restructuring code to quiet the analyzer. Dismissal is
+# per-alert, so every new test adds more; this workflow instead excludes
+# `tests/` from analysis via `paths-ignore`, per GitHub's docs:
+#
+#   "You can use this option when you run the CodeQL actions on an
+#   interpreted language (Python, Ruby, and JavaScript/TypeScript) or when
+#   you analyze a compiled language without building the code (currently
+#   supported for C/C++, C#, Java and Rust)."
+#   -- https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning
+#
+# `src/` (including the two already-dismissed alerts inside its
+# `#[cfg(test)]` modules under `src/backend/`) stays fully scanned — this
+# workflow changes *which paths* are analyzed, nothing else about the
+# posture: same languages, same default query suite (no `queries`/`packs`
+# override), same `remote` threat model (CodeQL's own default — see the
+# same docs page's "Extending CodeQL coverage with threat models"; not
+# set explicitly here because it is not being changed), same weekly
+# schedule.
+#
+# Once this file is on main, the owner disables default setup out of
+# band (advanced and default setup cannot both upload analyses for the
+# same repository) — do not re-enable default setup after that.
 
 on:
+  # Mirrors ci.yml's pull_request trigger: PR-diff alerting on the same
+  # events CI itself gates on.
+  pull_request:
+    branches: [main]
+  # Unlike ci.yml (which deliberately has no push trigger — its own
+  # comment explains why: a post-merge re-run of the same battery proves
+  # nothing twice), CodeQL needs a push-to-main baseline scan: PR-diff
+  # alerting depends on a scanned main to diff against, which ci.yml's
+  # reasoning about redundant test runs does not apply to.
+  push:
+    branches: [main]
+  # Matches today's default-setup cadence. The exact day/time is a J1
+  # choice (Sunday 03:17 UTC, off-the-hour to avoid the shared top-of-hour
+  # scheduler spike).
+  schedule:
+    - cron: '17 3 * * 0'
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   analyze:
@@ -13,5 +62,28 @@ jobs:
       security-events: write
       contents: read
       actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, rust]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # build-mode: none — per GitHub's docs, Rust is one of the compiled
+      # languages CodeQL can analyze "without requiring a build": "For
+      # C/C++, C#, Java and Rust, CodeQL creates a database without
+      # requiring a build when you enable default setup for code
+      # scanning."
+      # -- https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/codeql-code-scanning-for-compiled-languages
+      # actions is always build-mode: none (interpreted).
+      - uses: github/codeql-action/init@6f5948dfacef28e207b48d0905cf90c03365536d # v3.37.9
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          config: |
+            paths-ignore:
+              - tests
+
+      - uses: github/codeql-action/analyze@6f5948dfacef28e207b48d0905cf90c03365536d # v3.37.9
+        with:
+          category: /language:${{ matrix.language }}
