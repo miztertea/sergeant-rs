@@ -1257,30 +1257,25 @@ const ALLOWLIST: &[Allowed] = &[
     },
     Allowed {
         file: "tests/m6_surfaces.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(20);",
-        category: "owned-wait-budget",
-        reason: "the live-SSE-tail test's own event-consuming loop: each pass calls \
-            `stream.next_event()` (its own inner 5s tokio::time::timeout, awaited directly), \
-            not a side-effect-free state check -- the shape support::wait_until's predicate \
-            (`FnMut() -> Fut<Output = bool>`, polled with its own sleep-based backoff) does not \
-            fit. The loop accumulates `asked_to_refresh` across possibly-many events and can \
-            exit either by finding the target event or by the deadline; the post-loop \
-            assert!(asked_to_refresh, ...) is the actual verdict either way.",
-    },
-    Allowed {
-        file: "tests/m6_surfaces.rs",
         needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
         category: "owned-wait-budget",
-        reason: "the add-repo overlay test's own background-poll loop: `app` is a plain local \
-            `&mut` used both before and after this wait across many more call sites in the same \
-            test, and support::wait_until's predicate is `FnMut() -> Fut` -- its returned \
-            future cannot hold a mutable borrow of a captured variable across its own await \
-            points ('captured variable cannot escape `FnMut` closure body'). Where that bit a \
-            value captured ONLY inside the wait elsewhere in this wave, a \
+        reason: "two sites share this needle text (F-SF-01 fix pass consolidated the first \
+            onto support::HANG_BUDGET, was a bespoke 20s). (1) the live-SSE-tail test's own \
+            event-consuming loop: each pass calls `stream.next_event()` (its own inner 5s \
+            tokio::time::timeout, awaited directly), not a side-effect-free state check -- the \
+            shape support::wait_until's predicate (`FnMut() -> Fut<Output = bool>`, polled with \
+            its own sleep-based backoff) does not fit. The loop accumulates `asked_to_refresh` \
+            across possibly-many events and can exit either by finding the target event or by \
+            the deadline; the post-loop assert!(asked_to_refresh, ...) is the actual verdict \
+            either way. (2) the add-repo overlay test's own background-poll loop: `app` is a \
+            plain local `&mut` used both before and after this wait across many more call sites \
+            in the same test, and support::wait_until's predicate is `FnMut() -> Fut` -- its \
+            returned future cannot hold a mutable borrow of a captured variable across its own \
+            await points ('captured variable cannot escape `FnMut` closure body'). Where that \
+            bit a value captured ONLY inside the wait elsewhere in this wave, a \
             std::cell::RefCell scoped to just that wait was the narrow fix; wrapping `app` \
             itself for this one call would thread interior mutability through a value this \
-            whole test otherwise owns directly. Budget consolidated onto the shared \
-            support::HANG_BUDGET even though the loop shape stays.",
+            whole test otherwise owns directly.",
     },
     Allowed {
         file: "tests/m6_surfaces.rs",

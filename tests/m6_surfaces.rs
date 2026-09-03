@@ -444,7 +444,7 @@ async fn t1_the_tui_renders_and_drives_the_fleet_over_the_api() {
         "the new work must not be on screen before the TUI hears about it"
     );
 
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + support::HANG_BUDGET;
     let mut asked_to_refresh = false;
     while Instant::now() < deadline {
         let event = tokio::time::timeout(Duration::from_secs(5), stream.next_event())
