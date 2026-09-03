@@ -1185,17 +1185,19 @@ const ALLOWLIST: &[Allowed] = &[
         file: "tests/v1d_probe_child_lifecycle.rs",
         needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
         category: "owned-wait-budget",
-        reason: "two sites share this needle text (both already consolidated onto the one \
-            shared support::HANG_BUDGET, was a locally-named DEADLINE = 30s duplicating it): \
-            (1) the quiet-descendants loop in \
-            a_completed_probe_walk_leaves_no_child_of_its_own_behind -- its own exit is not \
-            this test's verdict either way (saw_a_child/leftover.is_empty() below are, checked \
-            from state this loop leaves behind regardless of why it exited); folding it into \
-            wait_until_sync's panic-on-timeout would add a new failure mode this test never \
-            had. (2) daemon_handle_kill_reaps_a_probe_child_its_walk_still_has_live's own \
-            async wait for a live serve child -- returns an empty Vec on timeout rather than \
-            panicking, and the caller's own assert!(!live.is_empty(), ...) is the verdict, same \
-            shape as (1).",
+        reason: "the quiet-descendants loop in \
+            a_completed_probe_walk_leaves_no_child_of_its_own_behind (already consolidated onto \
+            the shared support::HANG_BUDGET, was a locally-named DEADLINE = 30s duplicating it): \
+            its own exit is not this test's verdict either way \
+            (saw_a_child/leftover.is_empty() below are, checked from state this loop leaves \
+            behind regardless of why it exited); folding it into wait_until_sync's \
+            panic-on-timeout would add a new failure mode this test never had. \
+            (F-SF-01 fix pass: this needle's other former site, \
+            daemon_handle_kill_reaps_a_probe_child_its_walk_still_has_live's own wait for a \
+            live serve child, has been folded onto support::wait_until directly -- it needed \
+            no cleanup-before-fail exception once traced through: a timeout there means no \
+            child was ever found, so there is nothing yet spawned for that test's own \
+            survivor-kill loop to miss.)",
     },
     Allowed {
         file: "tests/v1d_probe_child_lifecycle.rs",

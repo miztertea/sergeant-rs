@@ -593,17 +593,30 @@ async fn daemon_handle_kill_reaps_a_probe_child_its_walk_still_has_live() {
     .await
     .expect("start the in-process daemon");
 
-    let deadline = Instant::now() + support::HANG_BUDGET;
-    let live = loop {
-        let live = direct_serve_children();
-        if !live.is_empty() {
-            break live;
-        }
-        if Instant::now() >= deadline {
-            break Vec::new();
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    // No survivor-cleanup gap on timeout: a timeout here means
+    // direct_serve_children() never found a live child, so there is
+    // nothing yet spawned that would need hard_kill below.
+    //
+    // `live` is RefCell-wrapped, not a plain captured `&mut`, because a
+    // `wait_until` predicate's returned future cannot itself hold a
+    // mutable borrow of a captured variable (R2/R3 -- the same interior-
+    // mutability workaround this wave already used elsewhere); the borrow
+    // here is never held across an `.await` (direct_serve_children is
+    // synchronous), so it does not trip clippy::await_holding_refcell_ref.
+    let live = std::cell::RefCell::new(Vec::new());
+    support::wait_until(
+        "the in-process daemon's walk never showed a live `opencode serve` child, so this \
+         test cannot evidence the reap — it fails rather than passing vacuously",
+        support::HANG_BUDGET,
+        || async {
+            let found = direct_serve_children();
+            let has_any = !found.is_empty();
+            *live.borrow_mut() = found;
+            has_any
+        },
+    )
+    .await;
+    let live = live.into_inner();
 
     handle.kill().await;
 
@@ -619,14 +632,6 @@ async fn daemon_handle_kill_reaps_a_probe_child_its_walk_still_has_live() {
     for &pid in &survivors {
         hard_kill(pid);
     }
-
-    assert!(
-        !live.is_empty(),
-        "the in-process daemon's walk never showed a live `opencode serve` child within \
-         {:?}, so this test cannot evidence the reap — it fails rather than passing \
-         vacuously",
-        support::HANG_BUDGET,
-    );
     // The kernel's own state letter for each survivor, because the two ways
     // to fail here need different fixes and the pid alone does not say which:
     // `R`/`S` means the kill never reached it, `Z` means it was killed and
