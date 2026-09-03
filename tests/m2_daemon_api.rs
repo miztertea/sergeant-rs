@@ -1308,7 +1308,7 @@ async fn duplicate_cancel_command_id_replays_the_recorded_outcome() {
 async fn read_sse_events(resp: &mut reqwest::Response, count: usize) -> Vec<(u64, String, Value)> {
     let mut buffer = String::new();
     let mut events = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + support::HANG_BUDGET;
     while events.len() < count && Instant::now() < deadline {
         let chunk = tokio::time::timeout(Duration::from_secs(10), resp.chunk())
             .await
@@ -1336,6 +1336,12 @@ async fn read_sse_events(resp: &mut reqwest::Response, count: usize) -> Vec<(u64
             }
         }
     }
+    assert!(
+        events.len() >= count,
+        "read_sse_events: never observed {count} SSE events within {:?} (got {})",
+        support::HANG_BUDGET,
+        events.len()
+    );
     events
 }
 
@@ -1648,10 +1654,11 @@ fn stop_daemon(dir: &Path) {
         let _ = std::process::Command::new("kill")
             .arg(descriptor.pid.to_string())
             .status();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while daemon::descriptor_path(dir).exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        support::wait_until_sync(
+            "daemon descriptor removed after SIGTERM",
+            support::HANG_BUDGET,
+            || !daemon::descriptor_path(dir).exists(),
+        );
     }
 }
 

@@ -1225,29 +1225,26 @@ const ALLOWLIST: &[Allowed] = &[
             below, the same 'caller decides pass/fail' shape as this file's other kept sites).",
     },
     Allowed {
-        file: "tests/m3_execution.rs",
-        needle: "let deadline = std::time::Instant::now() + Duration::from_secs(10);",
-        category: "owned-wait-budget",
-        reason: "stop_daemon's own best-effort teardown wait, named explicitly in \
-            support::wait_until's own doc comment as staying hand-rolled: 'a best-effort \
-            teardown wait that proceeds regardless (stop_daemon in tests/m2_daemon_api.rs and \
-            tests/m3_execution.rs)'. The while loop never asserts or panics; it just gives the \
-            descriptor file up to 10s to disappear and returns either way.",
-    },
-    Allowed {
         file: "tests/m2_daemon_api.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
         category: "owned-wait-budget",
-        reason: "two sites share this identical needle text. (1) read_sse_events's own \
-            bounded SSE collector: like tests/w4_read_surfaces.rs::read_raw_sse_frames (its \
-            own kept entry), it returns whatever (seq, kind, data) triples it collected on \
-            timeout rather than panicking -- its own doc: 'until count events (or timeout)'; \
-            every caller asserts on the returned Vec's own length/content with its own \
-            message. (2) stop_daemon's own best-effort teardown wait, named explicitly in \
-            support::wait_until's own doc comment as staying hand-rolled: 'a best-effort \
-            teardown wait that proceeds regardless (stop_daemon in tests/m2_daemon_api.rs and \
-            tests/m3_execution.rs)' -- it never asserts or panics, just gives the descriptor \
-            file up to 10s and returns either way.",
+        reason: "read_sse_events's own bounded, stateful SSE collector (F-SF-01 fix pass): its \
+            own stop_daemon-shaped sibling entry that used to share this file's deadline needle \
+            has been folded into support::wait_until_sync directly; this one stays, narrowly, \
+            because it is not a side-effect-free predicate wait_until's `FnMut() -> Fut<bool>` \
+            shape covers -- it accumulates parsed frames into `events` across many chunk reads, \
+            and the only way to give a closure mutable access to that accumulator across its own \
+            `.await` points is the RefCell-wrapped-stream pattern this same file already uses \
+            elsewhere (tests/m2_daemon_api.rs's history-replay wait, ~line 2723) -- which itself \
+            holds that RefCell borrow across an `.await`, a real clippy::await_holding_refcell_ref \
+            violation already present in this file before this fix pass (verified: `cargo clippy \
+            --test m2_daemon_api` fails on it at HEAD, unrelated to this entry). Replicating a \
+            known-broken pattern to force this site through the same helper would trade one \
+            defect for another, so the loop stays hand-rolled; the budget is now the shared \
+            support::HANG_BUDGET (was a bespoke 10s) and the loop now panics naming the exact \
+            shortfall by count when the budget elapses, rather than silently returning a short \
+            Vec for the caller's own assert to catch -- the determinism the ruling asks for, \
+            just not routed through wait_until's own body.",
     },
     Allowed {
         file: "tests/m5_projections.rs",

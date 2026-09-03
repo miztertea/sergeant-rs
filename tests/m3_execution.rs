@@ -6568,9 +6568,10 @@ fn stop_daemon(data_dir: &Path) {
         let _ = Command::new("kill")
             .arg(descriptor.pid.to_string())
             .status();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while daemon::descriptor_path(data_dir).exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        support::wait_until_sync(
+            "daemon descriptor removed after SIGTERM",
+            support::HANG_BUDGET,
+            || !daemon::descriptor_path(data_dir).exists(),
+        );
     }
 }

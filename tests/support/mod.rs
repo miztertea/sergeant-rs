@@ -496,10 +496,8 @@ pub const HANG_BUDGET: Duration = Duration::from_secs(120);
 /// and any hand-rolled `while Instant::now() < deadline { ...; sleep(...) }`
 /// loop that shares this exact contract — a side-effect-free predicate and
 /// a panic on timeout, e.g. `tests/m6_surfaces.rs::dead_pid`. A hand-rolled
-/// loop that must *not* panic on timeout — a best-effort teardown wait that
-/// proceeds regardless (`stop_daemon` in `tests/m2_daemon_api.rs` and
-/// `tests/m3_execution.rs`), or one that must run cleanup before failing
-/// (`tests/m6_surfaces.rs`'s TUI-survival wait), or one living in a
+/// loop that must *not* panic on timeout — one that must run cleanup before
+/// failing (`tests/m6_surfaces.rs`'s TUI-survival wait), or one living in a
 /// standalone helper binary with no access to `tests/support`
 /// (`tests/c4_repo_lock.rs`'s lock-holder) — is a different shape, not this
 /// helper's fold-in target, and stays hand-rolled; see
