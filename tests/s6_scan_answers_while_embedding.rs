@@ -65,20 +65,30 @@
 //! that finishes without ever exposing the field still fails correctly.
 //!
 //! Stopping the async wait early does not make the test's wall time
-//! track only the observation, though: `#[tokio::test]` builds a
-//! single-threaded-by-default `Runtime` whose `Drop` blocks the test
-//! function's own OS thread until every task it spawned — including the
-//! `run_estate_scan` future's detached `spawn_blocking` embed work
-//! (`src/api.rs::run_estate_scan`, no retained `JoinHandle`) — finishes,
-//! confirmed by reading `src/daemon.rs::DaemonHandle::shutdown`, which
-//! awaits only the serve task and two explicitly-bounded joins and never
-//! touches that detached task (00-orient's finding: no `src/` defect at
+//! track only the observation, though. The outer task is a plain
+//! `tokio::spawn(run_estate_scan(...))` (`src/api.rs::intelligence_scan`,
+//! no retained `JoinHandle`), and tokio's own `Runtime::Drop` docs are
+//! explicit that a plain-spawned task is *not* guaranteed to run to
+//! completion — it is cancelled once it next yields. What tokio does
+//! guarantee, separately, is that a closure already dispatched to the
+//! blocking pool via `spawn_blocking` keeps running until it returns; the
+//! embed work reaches that pool through `with_atlas_write` ->
+//! `Engine::run_intelligence`'s own `spawn_blocking` call (its
+//! `JoinHandle` is awaited there, not detached — the only thing detached
+//! is the outer scan task awaiting it). So even if `run_estate_scan`'s
+//! future is itself cancelled on drop before that await resolves, the
+//! dispatched embed closure keeps running on the blocking pool, and
+//! `#[tokio::test]`'s single-threaded-by-default `Runtime::Drop` blocks
+//! the test function's own OS thread on that pool's teardown until it
+//! finishes — confirmed by reading `src/daemon.rs::DaemonHandle::shutdown`,
+//! which awaits only the serve task and two explicitly-bounded joins and
+//! never touches the write job (00-orient's finding: no `src/` defect at
 //! this revision — `handle.shutdown()` below does not wait on the write,
-//! but the runtime's own teardown still does). So this test's tail is
-//! still bounded — by that drain, never by a clock this test asserts
-//! against — which is exactly why `BULK_SOURCES` is kept to the smallest
-//! real corpus that reliably clears the seam, rather than left at
-//! whatever size made the old `completed`-gated wait pass.
+//! but the runtime's blocking-pool teardown still does). So this test's
+//! tail is still bounded — by that drain, never by a clock this test
+//! asserts against — which is exactly why `BULK_SOURCES` is kept to the
+//! smallest real corpus that reliably clears the seam, rather than left
+//! at whatever size made the old `completed`-gated wait pass.
 use std::path::Path;
 use std::sync::Arc;
 
