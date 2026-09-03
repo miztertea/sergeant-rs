@@ -227,7 +227,7 @@ struct RawFrame {
 async fn read_raw_sse_frames(resp: &mut reqwest::Response, count: usize) -> Vec<RawFrame> {
     let mut buffer = String::new();
     let mut frames = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + support::HANG_BUDGET;
     while frames.len() < count && Instant::now() < deadline {
         let chunk = match tokio::time::timeout(Duration::from_secs(10), resp.chunk()).await {
             Ok(Ok(Some(c))) => c,
@@ -256,21 +256,35 @@ async fn read_raw_sse_frames(resp: &mut reqwest::Response, count: usize) -> Vec<
             }
         }
     }
+    assert!(
+        frames.len() >= count,
+        "read_raw_sse_frames: never observed {count} SSE frames within {:?} (got {})",
+        support::HANG_BUDGET,
+        frames.len()
+    );
     frames
 }
 
-/// Read every remaining chunk until the stream closes or a deadline passes.
-/// Returns whether the stream actually closed (vs timed out still open).
-async fn drain_until_closed(resp: &mut reqwest::Response, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+/// Read every remaining chunk until the stream closes, or panic naming the
+/// budget it never closed within. Not routed through support::wait_until:
+/// its `FnMut() -> Fut` predicate cannot hold a mutable borrow of `resp`
+/// across its own `.await` (rustc: "captured variable cannot escape `FnMut`
+/// closure body") without the RefCell-wrapped-stream workaround this same
+/// wave already used elsewhere -- which itself trips
+/// clippy::await_holding_refcell_ref (verified: `cargo check` on the
+/// literal wait_until rewrite fails with exactly this error).
+async fn drain_until_closed(resp: &mut reqwest::Response) {
+    let deadline = Instant::now() + support::HANG_BUDGET;
     loop {
-        if Instant::now() >= deadline {
-            return false;
-        }
+        assert!(
+            Instant::now() < deadline,
+            "drain_until_closed: stream never closed within {:?}",
+            support::HANG_BUDGET
+        );
         match tokio::time::timeout(Duration::from_secs(2), resp.chunk()).await {
             Ok(Ok(Some(_))) => continue,
-            Ok(Ok(None)) => return true,
-            Ok(Err(_)) => return true,
+            Ok(Ok(None)) => return,
+            Ok(Err(_)) => return,
             Err(_) => continue,
         }
     }
@@ -500,11 +514,9 @@ async fn sse_stream_sends_an_error_frame_before_closing_on_a_journal_failure() {
     );
     assert_eq!(frames[1].id, None, "a control frame never sets id:");
 
-    let closed = drain_until_closed(&mut stream, Duration::from_secs(5)).await;
-    assert!(
-        closed,
-        "the stream must close after the error frame, not hang open"
-    );
+    // The stream must close after the error frame, not hang open --
+    // drain_until_closed itself now panics naming the budget if it does not.
+    drain_until_closed(&mut stream).await;
 
     // The daemon itself is undamaged.
     let health = support::send_while_alive(

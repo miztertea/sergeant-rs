@@ -1128,25 +1128,21 @@ const ALLOWLIST: &[Allowed] = &[
     },
     Allowed {
         file: "tests/w4_read_surfaces.rs",
-        needle: "let deadline = Instant::now() + Duration::from_secs(10);",
+        needle: "let deadline = Instant::now() + support::HANG_BUDGET;",
         category: "owned-wait-budget",
-        reason: "read_raw_sse_frames's own bounded collector: unlike every wait_until_sync \
-            fold-in target, it does NOT panic when its own budget elapses -- it returns \
-            whatever frames it collected so far, and every caller asserts on the returned \
-            Vec's own length/content with its own message (e.g. 'expected at least the floor \
-            frame: {frames:?}'). This is the class wait_until_sync's own doc names as staying \
-            hand-rolled: a bounded wait whose caller decides pass/fail from the returned value, \
-            not from a panic this helper would raise itself.",
-    },
-    Allowed {
-        file: "tests/w4_read_surfaces.rs",
-        needle: "let deadline = Instant::now() + timeout;",
-        category: "owned-wait-budget",
-        reason: "drain_until_closed's own bounded drain: it returns a bool (`true` once the \
-            stream actually closed, `false` if `timeout` elapsed with it still open) rather \
-            than panicking either way -- its one caller decides what the outcome means \
-            ('the stream must close after the error frame, not hang open'). Same shape as \
-            read_raw_sse_frames above: the caller, not this helper, owns the verdict.",
+        reason: "two sites share this needle text (F-SF-01 fix pass), both stateful multi-await \
+            accumulators over the same `&mut reqwest::Response`, same shape as \
+            tests/m2_daemon_api.rs::read_sse_events's own kept entry: giving a wait_until \
+            closure mutable access to `resp` across its own `.await` points needs the \
+            RefCell-wrapped-stream pattern this wave already used elsewhere, which itself trips \
+            clippy::await_holding_refcell_ref -- verified directly (`cargo check` on the literal \
+            wait_until rewrite of drain_until_closed fails with 'captured variable cannot \
+            escape `FnMut` closure body'). Both are now folded to the extent the shape allows: \
+            budget consolidated onto support::HANG_BUDGET (was a bespoke 10s / caller-supplied \
+            timeout), and both now panic naming the exact shortfall -- \
+            read_raw_sse_frames names the frame count never observed, drain_until_closed names \
+            the stream never closing -- rather than returning a value for the caller's own \
+            assert to catch.",
     },
     Allowed {
         file: "tests/m9_watch.rs",
