@@ -44,6 +44,41 @@
 //! observes it set. So this test's assertion is `seen_writing == false`
 //! at the end of a whole scan — a fact about whether a window was ever
 //! observable, never about how fast anything answered.
+//!
+//! # Why the wait ends at observation, not at `completed`
+//! (owner ruling `no-nondeterministic-tests-2026-09-02.md`, "a wait
+//! budget only ends a hang" / "a duration never decides a verdict")
+//!
+//! This test's decisive fact is `writing_source` having been seen
+//! non-null on some poll — not that the scan finishes. Waiting for
+//! `state == "completed"` measured a full, real embed (all of
+//! `BULK_SOURCES`) against `support::HANG_BUDGET`, a bound sized for
+//! "never finishes"; under host contention that embed can legitimately
+//! run past 120s even though nothing has hung
+//! (`/var/tmp/hats7/close-starve-final.log:95-96,220-221`: two panics at
+//! 154-156s beside a churning release build, one core). So the polling
+//! predicate below stops the instant `writing_source` is first observed
+//! set — the property under test is proven the moment it is seen, and
+//! nothing about *how long the scan then takes to finish* is part of the
+//! verdict. A terminal `completed` reached before that stays a real
+//! failure (asserted below by the same message either way), so a scan
+//! that finishes without ever exposing the field still fails correctly.
+//!
+//! Stopping the async wait early does not make the test's wall time
+//! track only the observation, though: `#[tokio::test]` builds a
+//! single-threaded-by-default `Runtime` whose `Drop` blocks the test
+//! function's own OS thread until every task it spawned — including the
+//! `run_estate_scan` future's detached `spawn_blocking` embed work
+//! (`src/api.rs::run_estate_scan`, no retained `JoinHandle`) — finishes,
+//! confirmed by reading `src/daemon.rs::DaemonHandle::shutdown`, which
+//! awaits only the serve task and two explicitly-bounded joins and never
+//! touches that detached task (00-orient's finding: no `src/` defect at
+//! this revision — `handle.shutdown()` below does not wait on the write,
+//! but the runtime's own teardown still does). So this test's tail is
+//! still bounded — by that drain, never by a clock this test asserts
+//! against — which is exactly why `BULK_SOURCES` is kept to the smallest
+//! real corpus that reliably clears the seam, rather than left at
+//! whatever size made the old `completed`-gated wait pass.
 use std::path::Path;
 use std::sync::Arc;
 
@@ -61,15 +96,20 @@ fn install_model() {
     support::install_model(MODEL_DIR_ENV);
 }
 
-/// Real repository text, several sources — the same instrument
-/// `tests/s6_semantic_crossing.rs::BULK_SOURCES` uses, for the same reason
-/// (R2): a fixture corpus of a few one-line documents embeds inside any
-/// polling cadence, so the daemon's write path never holds the runtime
-/// long enough for a concurrent poll to land inside it. Real repository
-/// text, scanned source by source, gives every source's own write (embed
-/// included) a real, measurable span — which is exactly the span this
-/// test's polling loop has to survive without a transport failure.
-const BULK_SOURCES: [&str; 5] = ["docs", ".sergeant", "skills", "src", "tests"];
+/// Real repository text, sized to the seam by measurement rather than
+/// guessed (owner brief `brief-observe-then-stop.md`, "Corpus" section,
+/// R1/R6): a fixture corpus of a few one-line documents embeds inside any
+/// polling cadence, so the write path never holds the runtime long enough
+/// for a concurrent poll to land inside it, but a full 5-source real-repo
+/// corpus (the shape this file used before this seam) is far larger than
+/// the property needs and is why the old, `completed`-gated wait ran
+/// 80-115s. Measured directly on this revision, this single directory's
+/// own write span alone — instrumented with `eprintln!`s bracketing every
+/// `writing_source` transition, `/var/tmp/hats7/s6-measure-run2.log` —
+/// ran from t=44ms to t=1.865s (~1.8s), multiple orders of magnitude past
+/// `support::WAIT_POLL_INTERVAL` (20ms) and comfortably inside the
+/// "multi-hundred-ms or longer" the brief asks for; that is the corpus.
+const BULK_SOURCES: [&str; 1] = ["skills"];
 
 fn scaffold_estate(root: &Path) {
     std::fs::create_dir_all(root).expect("estate root");
@@ -122,10 +162,17 @@ fn client() -> reqwest::Client {
 
 /// **The regression this seam exists to close.**
 ///
-/// Posts a scan over several real-text sources with the model installed,
-/// then polls `GET /v1/intelligence/scan/{scan_id}` at
-/// [`support::wait_until`]'s ordinary cadence until the scan reports
-/// `completed`.
+/// Posts a scan over the real-text corpus with the model installed, then
+/// polls `GET /v1/intelligence/scan/{scan_id}` at [`support::wait_until`]'s
+/// ordinary cadence — but, per this file's module doc ("Why the wait ends
+/// at observation, not at `completed`"), the wait stops at the first poll
+/// that observes `writing_source` non-null, not at `state == "completed"`:
+/// waiting for the scan to finish would measure a real, legitimate embed
+/// duration against `support::HANG_BUDGET`, a bound sized only to catch a
+/// hang, which is exactly the verdict-by-duration the owner ruling
+/// forbids. A terminal `completed` reached before `writing_source` was
+/// ever observed set is still the real failure, asserted below by the
+/// same message either way.
 ///
 /// **The assertion is not about the clock at all.** Every poll along the
 /// way records whether the answer's `writing_source` field was non-null
@@ -173,7 +220,8 @@ async fn a_status_get_observes_a_write_in_flight_while_a_scan_is_embedding() {
     let seen_writing = std::cell::Cell::new(false);
 
     support::wait_until(
-        "the scan reaches `completed`",
+        "a status GET observes `writing_source` set while the scan is in flight (a terminal \
+         `completed` observed first is the real failure, asserted below)",
         support::HANG_BUDGET,
         || async {
             let body: Value = support::send_while_alive(
@@ -191,7 +239,7 @@ async fn a_status_get_observes_a_write_in_flight_while_a_scan_is_embedding() {
             if !body["writing_source"].is_null() {
                 seen_writing.set(true);
             }
-            body["state"] == "completed"
+            seen_writing.get() || body["state"] == "completed"
         },
     )
     .await;
