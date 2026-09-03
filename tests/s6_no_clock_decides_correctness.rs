@@ -2017,31 +2017,58 @@ fn is_wait_budget_call(func: &syn::Expr) -> bool {
         .is_some_and(|s| s.ident == "wait_until" || s.ident == "wait_until_sync")
 }
 
-/// Whether `arg` is itself a `Duration::from_*` call — a literal budget
-/// picked at this one call site rather than a named, shared constant
-/// (`support::HANG_BUDGET`, a locally reasoned `const SHUTDOWN_BUDGET`, or
-/// a plain identifier/parameter). Any path whose last segment starts with
-/// `from_` and which mentions `Duration` somewhere in the path, the same
-/// import-agnostic shape [`is_instant_now_call`] already uses for `Instant`
-/// above (R2) — `Duration::from_secs`, `std::time::Duration::from_millis`,
-/// an aliased import, all match without this guard resolving imports.
+/// Whether `arg` is itself a `Duration::from_*` call, or a `+`/`-`
+/// combination of such calls (`Duration::from_secs(5) + Duration::ZERO`) —
+/// a literal budget picked at this one call site rather than a named,
+/// shared constant (`support::HANG_BUDGET`, a locally reasoned `const
+/// SHUTDOWN_BUDGET`, or a plain identifier/parameter). Recurses through
+/// `syn::Expr::Paren` and `syn::Expr::Binary` so a derived-but-still-
+/// literal expression is caught the same as a bare call (F-IN-01: this
+/// guard used to match only a bare `Expr::Call`, so
+/// `Duration::from_secs(5) + Duration::ZERO` silently bypassed it). A
+/// local variable or a helper function returning a `Duration` still
+/// bypasses this check on purpose — resolving those needs constant
+/// propagation across bindings, which is dataflow analysis this guard does
+/// not do (out of this wave's bound: no new abstraction beyond one more
+/// visitor arm). Any path whose last segment starts with `from_` and which
+/// mentions `Duration` somewhere in the path, the same import-agnostic
+/// shape [`is_instant_now_call`] already uses for `Instant` above (R2) —
+/// `Duration::from_secs`, `std::time::Duration::from_millis`, an aliased
+/// import, all match without this guard resolving imports. A bare
+/// `Duration::ZERO`/`Duration::MAX` path constant (no `from_` call) is
+/// also treated as literal so it does not defeat the `+` recursion above.
 fn is_duration_from_literal(arg: &syn::Expr) -> bool {
-    let syn::Expr::Call(call) = arg else {
-        return false;
-    };
-    let syn::Expr::Path(path) = &*call.func else {
-        return false;
-    };
-    let segments: Vec<String> = path
-        .path
-        .segments
-        .iter()
-        .map(|s| s.ident.to_string())
-        .collect();
-    segments
-        .last()
-        .is_some_and(|last| last.starts_with("from_"))
-        && segments.iter().any(|s| s == "Duration")
+    match arg {
+        syn::Expr::Paren(paren) => is_duration_from_literal(&paren.expr),
+        syn::Expr::Binary(bin) => {
+            is_duration_from_literal(&bin.left) || is_duration_from_literal(&bin.right)
+        }
+        syn::Expr::Call(call) => {
+            let syn::Expr::Path(path) = &*call.func else {
+                return false;
+            };
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            segments
+                .last()
+                .is_some_and(|last| last.starts_with("from_"))
+                && segments.iter().any(|s| s == "Duration")
+        }
+        syn::Expr::Path(path) => {
+            let segments: Vec<String> = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect();
+            segments.len() >= 2 && segments.iter().any(|s| s == "Duration")
+        }
+        _ => false,
+    }
 }
 
 /// The one `syn` visitor for every `tests/` construct this file's guards
@@ -2708,6 +2735,19 @@ fn poll() {
         clean.is_empty(),
         "a wait_until_sync budget that is a named constant, not a literal, must not be \
          flagged: {clean:?}"
+    );
+
+    let derived = "\
+fn poll() {
+    support::wait_until_sync(\"never observed\", Duration::from_secs(5) + Duration::ZERO, || ready());
+}
+";
+    let derived_violations = unallowed_test_wait_budgets("tests/x_example.rs", derived, ALLOWLIST);
+    assert!(
+        !derived_violations.is_empty(),
+        "a `+`-derived budget built from `Duration::from_*` literals must still be flagged \
+         (F-IN-01): the checker must not be evadable by wrapping the literal in a binary \
+         expression, but it did not flag: {derived_violations:?}"
     );
 
     let unrelated_helper = "\
