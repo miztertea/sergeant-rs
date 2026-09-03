@@ -54,6 +54,8 @@ use sergeant_rs::runtime::engine::Engine;
 use sergeant_rs::runtime::git::git;
 use sergeant_rs::runtime::journal::Journal;
 
+mod support;
+
 // ---------------------------------------------------------------- fixtures
 
 /// A repository with one commit per `commits` entry, and the SHA of each.
@@ -512,7 +514,7 @@ async fn extraction_runs_bounded_on_the_intelligence_lane_and_never_the_executio
     // Release one permit and the parked job completes — the wait was the lane,
     // not a deadlock.
     drop(first);
-    let finished = tokio::time::timeout(std::time::Duration::from_secs(30), scan_while_saturated)
+    let finished = tokio::time::timeout(support::HANG_BUDGET, scan_while_saturated)
         .await
         .expect("the parked job must run once a permit frees")
         .expect("scan");

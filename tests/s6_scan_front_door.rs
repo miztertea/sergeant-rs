@@ -511,7 +511,7 @@ async fn the_shared_scan_driver_gives_up_when_the_status_endpoint_stops_tracking
     let endpoint = stub_that_accepts_a_scan_then_forgets_it();
     let http = client();
     let joined = tokio::time::timeout(
-        Duration::from_secs(15),
+        support::HANG_BUDGET,
         tokio::spawn(async move {
             support::scan_to_completion(&http, &endpoint, "stub-token", &json!({}), || true).await
         }),

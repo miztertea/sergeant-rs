@@ -46,8 +46,11 @@ use support::DataDir;
 
 /// How long a rendezvous may take before the test calls it a hang. This is a
 /// deadlock guard, not a latency pin: nothing here asserts that any operation
-/// was *fast*, only that it happened at all before the suite gave up.
-const RENDEZVOUS: Duration = Duration::from_secs(30);
+/// was *fast*, only that it happened at all before the suite gave up. Wave
+/// `timeout-the-function` (S6, item 2): raised from a bespoke 30s onto the
+/// crate's one shared hang-only bound, `support::HANG_BUDGET` — this is
+/// exactly the "ends a hang, decides nothing" shape that bound exists for.
+const RENDEZVOUS: Duration = support::HANG_BUDGET;
 
 fn client() -> reqwest::Client {
     reqwest::Client::builder()

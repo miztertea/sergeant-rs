@@ -3387,7 +3387,7 @@ fn dead_pid() -> u32 {
     child.wait().expect("wait");
     wait_until_sync(
         &format!("pid {pid} to go away"),
-        Duration::from_secs(5),
+        support::HANG_BUDGET,
         || !daemon::pid_alive(pid),
     );
     pid

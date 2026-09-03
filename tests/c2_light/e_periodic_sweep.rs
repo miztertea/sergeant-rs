@@ -181,16 +181,16 @@ async fn periodic_sweep_walks_every_admitted_estate_and_mutates_nothing() {
     // rather than guessing a duration is enough. Budget provenance: the CI
     // failure this converts away from (release run 33591670053, Gate D)
     // was this exact 200ms sleep losing its race under `cargo llvm-cov`
-    // instrumentation; 10s is generous relative to the `completion_poll:
-    // Duration::from_millis(15)` cadence configured above, which is what
-    // actually drives how often `maybe_run_periodic_sweep` gets a chance to
-    // fire, matching the budget shape `support::wait_until`'s own callers
-    // already use (`tests/w4_doctor_journal_growth.rs`, 10s).
+    // instrumentation. Wave `timeout-the-function` (S6, item 3): raised
+    // from a bespoke 10s (picked only for being "generous relative to" the
+    // 15ms sweep cadence, the same "smaller because normally fast"
+    // reasoning the owner ruling forbids) onto the crate's one shared
+    // support::HANG_BUDGET.
     let root_a_display = root_a.path().display().to_string();
     let root_b_display = root_b.path().display().to_string();
     support::wait_until(
         "the periodic sweep caller has logged running against both admitted estates",
-        Duration::from_secs(10),
+        support::HANG_BUDGET,
         || async {
             let swept = sweep_log.swept_estates();
             swept.iter().any(|e| e == &root_a_display) && swept.iter().any(|e| e == &root_b_display)

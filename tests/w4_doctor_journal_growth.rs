@@ -130,7 +130,7 @@ async fn work_system(http: &reqwest::Client, handle: &DaemonHandle) -> Value {
 async fn wait_until_all_settled(http: &reqwest::Client, handle: &DaemonHandle) {
     support::wait_until(
         "every work in the system reaches completed or failed",
-        Duration::from_secs(10),
+        support::HANG_BUDGET,
         || async {
             work_system(http, handle)
                 .await
@@ -253,7 +253,7 @@ async fn journal_growth_warns_when_a_prune_is_stalled_and_names_the_blocking_wor
     }
     support::wait_until(
         "all 5 works settle (completed/failed/needs_input) with exactly one stuck at needs_input",
-        Duration::from_secs(10),
+        support::HANG_BUDGET,
         || async {
             work_system(&http, &handle).await["works"]
                 .as_array()

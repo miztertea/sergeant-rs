@@ -1462,7 +1462,7 @@ async fn shutdown_completes_with_a_live_sse_client_attached() {
         "the SSE client must be attached before shutdown"
     );
 
-    tokio::time::timeout(Duration::from_secs(15), handle.shutdown())
+    tokio::time::timeout(support::HANG_BUDGET, handle.shutdown())
         .await
         .expect("shutdown must not block on a live SSE tail");
 
@@ -1480,7 +1480,7 @@ async fn shutdown_completes_with_a_live_sse_client_attached() {
     );
 
     // The stream itself ends rather than dangling on a dead daemon.
-    let closed = tokio::time::timeout(Duration::from_secs(5), stream.chunk())
+    let closed = tokio::time::timeout(support::HANG_BUDGET, stream.chunk())
         .await
         .expect("the SSE stream must be closed by shutdown, not left open");
     assert!(
@@ -4106,8 +4106,10 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
     // gate at all (there is only one slot, A holds it) — it parks *before*
     // ever reaching LAUNCH, on the lane itself.
     let retry_b = retry(work_b);
-    let b_waiting = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    support::wait_until(
+        "B never reported `waiting` while the lane was held by A",
+        support::HANG_BUDGET,
+        || async {
             let show: Value = client()
                 .get(format!("{}/v1/work/{work_b}", handle.endpoint))
                 .bearer_auth(&handle.token)
@@ -4117,17 +4119,10 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
                 .json()
                 .await
                 .expect("show B json");
-            if show["work"]["state"] == "waiting" {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+            show["work"]["state"] == "waiting"
+        },
+    )
     .await;
-    assert!(
-        b_waiting.is_ok(),
-        "B never reported `waiting` while the lane was held by A"
-    );
     // Only one launch ever reached the fake's gate — B's is genuinely
     // parked earlier, on the lane, not queued behind A inside the backend.
     assert!(
@@ -4144,8 +4139,10 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
     assert!(status_b.is_success(), "B's retry answered {status_b}");
 
     // Both actually finish (B's admission unblocked once A released).
-    let both_completed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    support::wait_until(
+        "both Works must reach completed",
+        support::HANG_BUDGET,
+        || async {
             let list: Value = client()
                 .get(format!("{}/v1/work", handle.endpoint))
                 .bearer_auth(&handle.token)
@@ -4160,7 +4157,7 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
             // artifact of this test's fixture, not of the lane feature under
             // test, which only cares that both Works reached a completed
             // disposition rather than staying `active`/`waiting`.
-            let done = list["works"]
+            list["works"]
                 .as_array()
                 .expect("works")
                 .iter()
@@ -4169,15 +4166,11 @@ async fn t_execution_lane_caps_concurrent_launches_second_waits_both_complete() 
                         .as_str()
                         .is_some_and(|s| s.starts_with("completed"))
                 })
-                .count();
-            if done == 2 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+                .count()
+                == 2
+        },
+    )
     .await;
-    assert!(both_completed.is_ok(), "both Works must reach completed");
 
     handle.shutdown().await;
 
@@ -4251,7 +4244,7 @@ async fn t_execution_lane_permit_releases_on_a_daemon_side_launch_error() {
     // The decisive check: B's retry must not hang. A bounded timeout — not
     // a bare `.await` — is what turns "the permit leaked" into a named test
     // failure instead of a wedged suite.
-    let retried_b = tokio::time::timeout(Duration::from_secs(10), async {
+    let retried_b = tokio::time::timeout(support::HANG_BUDGET, async {
         http.post(format!("{}/v1/work/{work_b}/retry", handle.endpoint))
             .bearer_auth(&handle.token)
             .json(&json!({"command_id": ulid()}))
@@ -4308,7 +4301,7 @@ async fn t_execution_lane_permit_releases_on_execution_failure() {
         .expect("show A json");
     assert_eq!(show_a["work"]["state"], "failed", "A must fail: {show_a}");
 
-    let retried_b = tokio::time::timeout(Duration::from_secs(10), async {
+    let retried_b = tokio::time::timeout(support::HANG_BUDGET, async {
         http.post(format!("{}/v1/work/{work_b}/retry", handle.endpoint))
             .bearer_auth(&handle.token)
             .json(&json!({"command_id": ulid()}))
@@ -4427,7 +4420,7 @@ async fn t_execution_lane_permit_stays_held_until_stop_is_confirmed_not_merely_r
     let status_a2 = cancel_a.await.expect("cancel A task");
     assert!(status_a2.is_success(), "cancel A answered {status_a2}");
 
-    let status_b = tokio::time::timeout(Duration::from_secs(10), retry_b)
+    let status_b = tokio::time::timeout(support::HANG_BUDGET, retry_b)
         .await
         .expect("B's retry never answered after A's stop was confirmed — the permit leaked")
         .expect("B retry task");
@@ -4529,8 +4522,10 @@ async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blo
     let status_a = retry_a.await.expect("A retry task");
     assert!(status_a.is_success(), "A's retry answered {status_a}");
 
-    let both_completed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    support::wait_until(
+        "both Works must reach completed",
+        support::HANG_BUDGET,
+        || async {
             let list: Value = client()
                 .get(format!("{}/v1/work", handle.endpoint))
                 .bearer_auth(&handle.token)
@@ -4540,7 +4535,7 @@ async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blo
                 .json()
                 .await
                 .expect("list json");
-            let done = list["works"]
+            list["works"]
                 .as_array()
                 .expect("works")
                 .iter()
@@ -4549,15 +4544,11 @@ async fn t_a_request_into_a_full_execution_lane_returns_promptly_rather_than_blo
                         .as_str()
                         .is_some_and(|s| s.starts_with("completed"))
                 })
-                .count();
-            if done == 2 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+                .count()
+                == 2
+        },
+    )
     .await;
-    assert!(both_completed.is_ok(), "both Works must reach completed");
 
     handle.shutdown().await;
 }
