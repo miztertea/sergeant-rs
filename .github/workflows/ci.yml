@@ -105,7 +105,7 @@ jobs:
       # knowledge/evidence/perf/build-test-speed-2026-08-26.md in the
       # workspace estate). Exact-pinned, same as this repo's other
       # taiki-e/install-action tool installs (coverage.yml, release.yml).
-      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+      - uses: taiki-e/install-action@5bf6ce016fd2e72eefc647cbca1e4213f65955b8 # v2.87.5
         with:
           tool: cargo-nextest@0.9.99
 
