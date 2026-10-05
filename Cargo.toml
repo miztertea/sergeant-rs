@@ -124,7 +124,7 @@ include_dir = { version = "0.7.4", default-features = false }
 # `tokenizers` is unavoidable and is a scoped, dated `deny.toml` exception
 # naming that one ID — owner ruling
 # knowledge/rulings/owner-rulings/model2vec-paste-advisory-2026-08-30.md.
-model2vec-rs = { version = "0.2.1", default-features = false, features = ["local-only"] }
+model2vec-rs = { version = "0.3.0", default-features = false, features = ["local-only"] }
 # S4 Y2 (G3): the office adapter's own recovery watch
 # (`runtime/atlas/office.rs`) needs the `log` facade directly — anydoc's own
 # module doc names it as the sanctioned signal ("Recovery and skipped-content
@@ -150,9 +150,9 @@ log = "0.4"
 # crate's own feature table (`cargo info mail-parser`). Adapter:
 # src/runtime/atlas/mail.rs. Record: tests/fixtures/mail_corpus/SPIKE-G4.md.
 mail-parser = { version = "0.11.8", features = ["full_encoding"] }
-opentelemetry = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
 # §34's TUI stack. The M6 budget names "ratatui + crossterm"; crossterm is
 # deliberately *not* a second direct entry. ratatui 0.30 selects and re-exports
 # its own crossterm (`ratatui::crossterm`), and a separate `crossterm = "0.29"`
@@ -194,7 +194,7 @@ tokio-stream = "0.1"
 # stays avoided, not excepted"). `tests/w3b_model2vec_manifest_pin.rs` fails
 # if this line loses `fancy-regex` or gains `progressbar`, and if
 # `indicatif`/`number_prefix` reappear in `Cargo.lock`.
-tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 toml = "1.1.4"
 toml_edit = { version = "0.25", features = ["parse", "display"] }
 tracing = "0.1.44"
@@ -219,7 +219,7 @@ tracing-subscriber = "0.3"
 # parsers over the network at runtime, which is the same posture F4 forbids
 # for DuckDB extension autoload. Eight direct crates / ten new lock entries
 # buy the six languages F5 names and nothing else (R1 on the other 365).
-tree-sitter = "0.26.13"
+tree-sitter = "0.27.0"
 tree-sitter-bash = "0.25.1"
 tree-sitter-javascript = "0.25.0"
 tree-sitter-md = "0.5.3"
@@ -318,7 +318,7 @@ sergeant-rs = { path = ".", features = ["test-util"] }
 # and inspecting its wire shape) — the version already pinned transitively by
 # axum 0.8's own `http-body-util` dependency.
 http-body-util = "0.1"
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "testing"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics", "testing"] }
 # S3 X3b: `tests/x3b_tslp_corpus.rs` reads its hand-verified expectations from
 # `tests/fixtures/tslp_corpus/manifest.toml`. Both crates are already direct
 # `[dependencies]` of this crate at these exact versions — an integration test
@@ -336,7 +336,7 @@ toml = "1.1.4"
 # anydoc -> sergeant-rs`), so naming it here is R5 (installed dependency),
 # not a new edge in the graph — `blake3` is the crate's own hash and is not
 # SHA-256, so it cannot stand in for this check.
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 # S3 X4 (F4): `tests/x4_tabular_map.rs` writes a real `.parquet` fixture, so
 # the Parquet reader is proven end-to-end on actual Parquet bytes rather than
 # inferred from a linked symbol. Same rung and same arithmetic as the two
