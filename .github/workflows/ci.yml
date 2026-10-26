@@ -53,7 +53,7 @@ jobs:
       - name: rustup component add clippy rustfmt (file-selected toolchain)
         run: rustup component add clippy rustfmt
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ci
 
@@ -96,7 +96,7 @@ jobs:
       - name: rustup toolchain install (rust-toolchain.toml pins the version)
         run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ci
 
@@ -105,7 +105,7 @@ jobs:
       # knowledge/evidence/perf/build-test-speed-2026-08-26.md in the
       # workspace estate). Exact-pinned, same as this repo's other
       # taiki-e/install-action tool installs (coverage.yml, release.yml).
-      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-nextest@0.9.99
 
@@ -155,7 +155,7 @@ jobs:
       - name: rustup toolchain install (rust-toolchain.toml pins the version)
         run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: cargo check
         run: cargo check --locked --all-targets
@@ -192,7 +192,7 @@ jobs:
       - name: rustup toolchain install (the declared MSRV floor)
         run: rustup toolchain install ${{ env.MSRV }} --profile minimal
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: cargo check --locked --all-targets (MSRV floor — check only, no clippy from this job)
         run: cargo +${{ env.MSRV }} check --locked --all-targets

@@ -53,10 +53,10 @@ jobs:
       # action and version this repo's `ci.yml` already installs
       # cargo-nextest with. Both tools install in one step via this
       # action's comma-separated `tool:` list.
-      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-llvm-cov@0.9.0,cargo-nextest@0.9.99
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-directories: target/llvm-cov-target
       - name: measure (the committed convention, stages C0-C4)
