@@ -266,7 +266,7 @@ unicode-normalization = "0.1.25"
 # wave never measured. Also excludes `aes-crypto` — an encrypted entry is
 # refused as unsupported (§NeedsOcr's sibling: content this build declines
 # to open), never decrypted.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # #310: `prctl(PR_SET_PDEATHSIG, SIGKILL)` on a probe child, and nothing else.
 # R3/R4 fail — neither the standard library nor any process API this crate
