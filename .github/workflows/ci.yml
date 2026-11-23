@@ -53,7 +53,7 @@ jobs:
       - name: rustup component add clippy rustfmt (file-selected toolchain)
         run: rustup component add clippy rustfmt
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ci
 
@@ -96,7 +96,7 @@ jobs:
       - name: rustup toolchain install (rust-toolchain.toml pins the version)
         run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ci
 
@@ -105,7 +105,7 @@ jobs:
       # knowledge/evidence/perf/build-test-speed-2026-08-26.md in the
       # workspace estate). Exact-pinned, same as this repo's other
       # taiki-e/install-action tool installs (coverage.yml, release.yml).
-      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2.87.2
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-nextest@0.9.99
 
@@ -155,7 +155,7 @@ jobs:
       - name: rustup toolchain install (rust-toolchain.toml pins the version)
         run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: cargo check
         run: cargo check --locked --all-targets
@@ -192,7 +192,7 @@ jobs:
       - name: rustup toolchain install (the declared MSRV floor)
         run: rustup toolchain install ${{ env.MSRV }} --profile minimal
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: cargo check --locked --all-targets (MSRV floor — check only, no clippy from this job)
         run: cargo +${{ env.MSRV }} check --locked --all-targets
@@ -210,7 +210,7 @@ jobs:
       - name: "cargo metadata --locked (guard: belt-and-suspenders around the action's own --locked argument below)"
         run: cargo metadata --locked --format-version 1 >/dev/null
 
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with:
           arguments: --all-features --locked
           command: check bans licenses sources
@@ -230,4 +230,4 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+      - uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
